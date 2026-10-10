@@ -11,7 +11,7 @@
     }
   ],
   "counts": {
-    "live": 612,
+    "live": 806,
     "offline": 10
   },
   "checks": [
@@ -600,6 +600,1076 @@
       "source": "tests/security/authorization/agent-probes.mjs runAgentProbes"
     },
     {
+      "id": "agent.roboflow.flows.answer.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.answer.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.answer.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.answer.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.answer.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.answer.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.answer.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.answer.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.answer.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.pause.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.pause.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.pause.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.pause.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.pause.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.pause.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.pause.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.pause.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.pause.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.resume.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.resume.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.resume.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.resume.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.resume.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.resume.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.resume.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.resume.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.resume.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.start.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.start.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.start.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.start.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.start.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.start.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.start.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.start.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.start.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.terminate.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.terminate.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.terminate.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.terminate.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.terminate.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.terminate.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.terminate.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.flows.terminate.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.flows.terminate.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generate.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generate.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generate.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generate.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generate.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generate.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generate.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generate.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generate.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.cancel.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.cancel.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generations.cancel.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.cancel.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generations.cancel.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.cancel.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generations.cancel.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.cancel.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generations.cancel.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.start.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.start.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generations.start.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.start.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generations.start.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.start.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generations.start.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.generations.start.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.generations.start.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.message.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.message.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.message.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.message.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.message.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.message.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.message.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.message.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.message.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.pause.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.pause.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.pause.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.pause.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.pause.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.pause.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.pause.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.pause.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.pause.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.resume.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.resume.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.resume.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.resume.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.resume.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.resume.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.resume.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.instances.resume.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.instances.resume.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.create.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.create.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.create.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.create.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.create.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.list.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedule-folders.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.create.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.create.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.create.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.create.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.create.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.delete.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.delete.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.delete.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.delete.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.delete.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.list.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.list.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.list.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.list.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.list.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.run-now.admin-reach",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.run-now.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.run-now.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.run-now.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.run-now.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.run-now.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.run-now.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.run-now.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.run-now.admin-reach"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.update.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.update.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.update.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.update.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.update.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.update.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.update.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.schedules.update.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedules.update.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.create.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.create.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.create.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.create.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.create.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.delete.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.delete.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.delete.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.delete.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.delete.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.update.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.create.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.update.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.update.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.update.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.update.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.update.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.update.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.update.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.update.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.validate.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.validate.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.validate.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.validate.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.validate.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.validate.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.validate.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
+      "id": "agent.roboflow.workflows.validate.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboflow.workflows.validate.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
+    },
+    {
       "id": "agent.robot.list.admin",
       "kind": "live",
       "count": 1,
@@ -646,6 +1716,812 @@
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs agentProbes"
+    },
+    {
+      "id": "agent.roboteam.asset.styles.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.asset.styles.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.asset.styles.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.asset.styles.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.asset.styles.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.asset.styles.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.asset.styles.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.asset.styles.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.asset.styles.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.config.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.config.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.config.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.config.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.config.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.config.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.config.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.config.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.config.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.message-task.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.message-task.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.message-task.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.message-task.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.message-task.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.message-task.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.message-task.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.message-task.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.message-task.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.open-desktop.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.open-desktop.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.open-desktop.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.open-desktop.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.open-desktop.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.open-desktop.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.open-desktop.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.open-desktop.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.open-desktop.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.robot-delete.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.robot-delete.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.robot-delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.robot-delete.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.robot-delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.robot-delete.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.robot-delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.robot-delete.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.robot-delete.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.start-simple-task.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.start-simple-task.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.start-simple-task.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.start-simple-task.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.start-simple-task.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.start-simple-task.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.start-simple-task.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.control.start-simple-task.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.control.start-simple-task.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.logs.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.logs.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.logs.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.logs.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.logs.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.logs.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.logs.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.logs.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.logs.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.flows.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.flows.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.page.flows.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.flows.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.page.flows.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.flows.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.page.flows.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.flows.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.page.flows.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.root.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.root.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.page.root.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.root.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.page.root.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.root.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.page.root.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.page.root.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.page.root.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.robots.create.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.robot.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.robots.create.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.robot.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.robots.create.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.robot.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.robots.create.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.robot.list.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.get.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.get.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.get.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.get.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.get.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.get.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.get.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.get.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.get.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.start.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.start.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.start.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.start.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.start.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.start.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.start.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.start.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.start.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.stop.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.stop.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.stop.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.stop.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.stop.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.stop.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.stop.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.run.stop.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.run.stop.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.session.http.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.session.http.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.session.http.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.session.http.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.session.http.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.session.http.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.session.http.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.session.http.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.session.http.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.status.exempt.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.status.exempt.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.status.exempt.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.status.exempt.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.status.exempt.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.status.exempt.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.status.exempt.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.status.exempt.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.summary.session.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.summary.session.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.summary.session.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.summary.session.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.summary.session.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.summary.session.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.summary.session.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.summary.session.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.summary.session.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.webchat.logs.admin",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.webchat.logs.anonymous",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.webchat.logs.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.webchat.logs.selfRegistered",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.webchat.logs.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.webchat.logs.userA",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.webchat.logs.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
+    },
+    {
+      "id": "agent.roboteam.webchat.logs.userB",
+      "kind": "live",
+      "count": 1,
+      "positiveControlAnyOf": [
+        "agent.roboteam.webchat.logs.admin"
+      ],
+      "boundary": "agents",
+      "source": "tests/security/authorization/agent-probes.mjs runRoboteamProbes"
     },
     {
       "id": "agent.roboTeamAgent.discovery.resources.list.anonymous",

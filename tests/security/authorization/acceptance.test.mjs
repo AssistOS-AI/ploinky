@@ -214,6 +214,61 @@ test('REJECT: a mandatory check that is missing, FAIL, duplicated, or whose posi
     expectReject(run, 'MANDATORY_POSITIVE_CONTROL_FAILED', 'deny without positive');
 });
 
+test('REJECT: the RoboFlow probes are consumed like the other agent probes (failed denial, missing control, missing gap)', () => {
+    const ids = mandatory.checks.filter(c => c.id.startsWith('agent.roboflow.')).map(c => c.id);
+    assert.equal(ids.length, 110, 'the 22 RoboFlow probes contribute 110 mandatory checks');
+    assert.deepEqual(acceptedRun().report.gaps.map(g => g.id).filter(id => id.startsWith('agent.roboflow.')).sort(), expectedGaps.gaps.map(g => g.id).filter(id => id.startsWith('agent.roboflow.')).sort());
+    assert.equal(expectedGaps.gaps.filter(g => g.id.startsWith('agent.roboflow.')).length, 4);
+    // An ordinary user's POST /schedules denial that FAILs rejects the run.
+    let run = acceptedRun();
+    run.report.checks.find(c => c.id === 'agent.roboflow.schedules.create.userA').status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL';
+    run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'failed ordinary-user schedule create denial');
+    // A denial counts only when its administrator control passed in the same run.
+    run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== 'agent.roboflow.schedules.run-now.admin-reach');
+    run.report.counts.PASS = run.report.checks.length;
+    expectReject(run, 'MANDATORY_POSITIVE_CONTROL_FAILED', 'run-now denials without the administrator reach control');
+    // A declared limitation that is not recorded is a missing gap.
+    run = acceptedRun();
+    run.report.gaps = run.report.gaps.filter(g => g.id !== 'agent.roboflow.schedules.run-now.admin-positive');
+    expectReject(run, 'GAP_MISSING', 'run-now administrator positive gap not recorded');
+    // A RoboFlow gap id that is not in the reviewed gap file is unexpected.
+    run = acceptedRun();
+    run.report.gaps.push({ id: 'agent.roboflow.flows.start.admin', reason: 'r', evidence: { kind: 'declared-limitation' } });
+    expectReject(run, 'GAP_UNEXPECTED', 'unlisted RoboFlow gap');
+    // The schedule-folder create positive is a mandatory check now; recording it as a gap again is unexpected.
+    run = acceptedRun();
+    run.report.gaps.push({ id: 'agent.roboflow.schedule-folders.create.admin-positive', reason: 'r', evidence: { kind: 'declared-limitation' } });
+    expectReject(run, 'GAP_UNEXPECTED', 'folder create gap resurrected');
+    assert.ok(mandatory.checks.some(c => c.id === 'agent.roboflow.schedule-folders.create.admin'));
+});
+
+test('REJECT: the RoboTeam family probes are consumed like the other agent probes (failed denial, missing control, missing gap)', () => {
+    const ids = mandatory.checks.filter(c => c.id.startsWith('agent.roboteam.')).map(c => c.id);
+    assert.equal(ids.length, 84, '17 probes: 16 with an administrator control, 5 actors each, minus the unprobed robots.create administrator');
+    assert.equal(expectedGaps.gaps.filter(g => g.id.startsWith('agent.roboteam.')).length, 1);
+    assert.ok(expectedGaps.gaps.some(g => g.id === 'agent.roboteam.session.websocket.live'));
+    let run = acceptedRun();
+    run.report.checks.find(c => c.id === 'agent.roboteam.run.get.selfRegistered').status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL';
+    run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'failed selfRegistered family refusal');
+    run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== 'agent.roboteam.run.get.admin');
+    run.report.counts.PASS = run.report.checks.length;
+    expectReject(run, 'MANDATORY_POSITIVE_CONTROL_FAILED', 'family denial without the administrator reach control');
+    run = acceptedRun();
+    run.report.gaps = run.report.gaps.filter(g => g.id !== 'agent.roboteam.session.websocket.live');
+    expectReject(run, 'GAP_MISSING', 'websocket limitation not recorded');
+    run = acceptedRun();
+    run.report.gaps.push({ id: 'agent.roboteam.session.websocket.denial', reason: 'r', evidence: { kind: 'declared-limitation' } });
+    expectReject(run, 'GAP_UNEXPECTED', 'unlisted RoboTeam gap');
+});
+
 test('C4 acceptance requires the fixture, its positive dependencies and all five feed actors', () => {
     const fixture = 'agent.tool.webmeet_room_list.fixture';
     const feed = 'agent.tool.webmeet_room_events_list';
@@ -1044,7 +1099,7 @@ test('Router workspace-write matrix: all 68 checks are mandatory, counted once a
         assert.ok(['admin', 'userA'].includes(positive.actor), 'the positive is an entitled actor');
     }
     assert.equal(denials.filter(r => r.operation === 'sink-upload').every(r => r.positiveControl === 'router:workspace-upload-owner-positive:admin'), true);
-    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 612, offline: 10 });
+    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 806, offline: 10 });
 });
 
 test('Router workspace-write matrix: no row can be satisfied as an expected gap, and an unavailable denial rejects twice', () => {
