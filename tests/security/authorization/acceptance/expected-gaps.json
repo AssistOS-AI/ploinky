@@ -1717,7 +1717,7 @@
       "id": "agent.roboflow.schedules.run-now.admin-positive",
       "category": "external-inference-provider-git",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:1139",
+      "source": "tests/security/authorization/agent-probes.mjs:1162",
       "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). An administrator POST /api/roboflow/schedules/:id/run-now on a real schedule starts a real workflow (AchillesCLI roboTeamAgent/server/http-server.mjs:319-324, workflow-scheduler.mjs runNow), which is robot and model work the local-only target does not permit. The denials target an absent schedule identifier and depend on the administrator reach control (404 Cron job not found), which proves the administrator passes the gate without launching anything.",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:*:/base-agent-additional-server/roboTeamAgent/3001/*:manifest-policy-family"
@@ -1726,13 +1726,13 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
+      "reviewedBy": "code-reviewer-xhigh B1+B2 review, 2026-10-10: accepted under decision D4b (an administrator run-now positive would start a real workflow and no no-op workflow fixture exists); pending Daniel's confirmation"
     },
     {
       "id": "agent.roboflow.generation.admin-positive",
       "category": "external-inference-provider-git",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:1139",
+      "source": "tests/security/authorization/agent-probes.mjs:1162",
       "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). An administrator POST /api/roboflow/generate, POST /api/roboflow/generations or DELETE /api/roboflow/generations/:id with a real description or generation starts robot and model work (http-server.mjs:283-305, roboflow-service.mjs generateWorkflow and startGeneration). The denials send no description and depend on the administrator reach controls (400 before any robot or model call; 404 for an absent generation).",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:*:/base-agent-additional-server/roboTeamAgent/3001/*:manifest-policy-family"
@@ -1741,14 +1741,14 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
+      "reviewedBy": "code-reviewer-xhigh B1+B2 review, 2026-10-10: accepted under D4b's rationale (would start real robot and model work, no no-op fixture); pending Daniel's confirmation"
     },
     {
       "id": "agent.roboflow.schedule-folders.create.admin-positive",
       "category": "protocol-combination-outside-changed-paths",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:1139",
-      "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). An administrator POST /api/roboflow/schedule-folders creates a workspace directory (http-server.mjs:306-311, schedule-folders.mjs create) and no API removes it, so the run could not clean up what it created. The denials and the administrator reach control send a name containing a slash, which the handler rejects with 400 before any mkdir.",
+      "source": "tests/security/authorization/agent-probes.mjs:1162",
+      "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). An administrator POST /api/roboflow/schedule-folders creates a workspace directory (http-server.mjs:306-311, schedule-folders.mjs create). The directory can be removed through Explorer delete_directory, as resource-probes.mjs does for its own run-owned directory, but the positive is withheld because RoboTeam's schedule-folder root (realpath of PLOINKY_WORKSPACE_ROOT) is not proven from source to be the directory Explorer's file tools operate on (Explorer prefers ASSISTOS_FS_ROOT/MCP_FS_ROOT over PLOINKY_WORKSPACE_ROOT). The denials and the administrator reach control send a name containing a slash, which the handler rejects with 400 before any mkdir.",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:*:/base-agent-additional-server/roboTeamAgent/3001/*:manifest-policy-family"
       ],
@@ -1756,13 +1756,13 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
+      "reviewedBy": "code-reviewer-xhigh B1+B2 review, 2026-10-10: finding that the positive should be implemented (cleanup through Explorer delete_directory); not yet implemented because the RoboTeam/Explorer path identity is not proven from source (see the reason); gap retained pending the coordinator's decision"
     },
     {
       "id": "agent.roboflow.flows.start.positive",
       "category": "external-inference-provider-git",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:1139",
+      "source": "tests/security/authorization/agent-probes.mjs:1162",
       "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). POST /api/roboflow/flows starts a real workflow for any workspace user (http-server.mjs:360-364, no handler role gate). The probes name a workflow type that cannot exist, so a handler that is reached answers 404 workflow not found before any dispatch.",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:*:/base-agent-additional-server/roboTeamAgent/3001/*:manifest-policy-family"
@@ -1771,13 +1771,13 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
+      "reviewedBy": "code-reviewer-xhigh B1+B2 review, 2026-10-10: accepted under D4b's rationale (would start a real workflow, no no-op fixture); pending Daniel's confirmation"
     },
     {
       "id": "agent.roboflow.flows.run-mutations.positive",
       "category": "external-inference-provider-git",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:1139",
+      "source": "tests/security/authorization/agent-probes.mjs:1162",
       "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). Human-input answer, pause, terminate, resume and the instance pause, message and resume operations act on a real running workflow (http-server.mjs:372-408, no handler role gate) and the run owns no workflow to act on. The probes use identifiers that cannot exist, so a reached handler answers 404 workflow run not found.",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:*:/base-agent-additional-server/roboTeamAgent/3001/*:manifest-policy-family"
@@ -1786,7 +1786,7 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
+      "reviewedBy": "code-reviewer-xhigh B1+B2 review, 2026-10-10: accepted under D4b's rationale (needs a real running workflow, no no-op fixture); pending Daniel's confirmation"
     }
   ]
 }

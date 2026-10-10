@@ -235,7 +235,7 @@ test('REJECT: the RoboFlow probes are consumed like the other agent probes (fail
     run = acceptedRun();
     run.report.gaps = run.report.gaps.filter(g => g.id !== 'agent.roboflow.schedules.run-now.admin-positive');
     expectReject(run, 'GAP_MISSING', 'run-now administrator positive gap not recorded');
-    // A recorded limitation must not also be satisfied as a passing check, and an unlisted RoboFlow gap is unexpected.
+    // A RoboFlow gap id that is not in the reviewed gap file is unexpected.
     run = acceptedRun();
     run.report.gaps.push({ id: 'agent.roboflow.flows.start.admin', reason: 'r', evidence: { kind: 'declared-limitation' } });
     expectReject(run, 'GAP_UNEXPECTED', 'unlisted RoboFlow gap');

@@ -7,11 +7,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     ROBOFLOW_BASE, ROBOFLOW_ABSENT, ROBOFLOW_GAPS, roboflowProbes, roboflowCheckDefinitions, roboflowCheckId, roboflowAdminCheckId,
-    runRoboflowProbes, assertRoboflowAdminRefusal, assertRoboflowReach, roboflowScheduleBody, ROBOFLOW_UNPROBED_READS,
+    runRoboflowProbes, assertRoboflowAdminRefusal, assertRoboflowEntitlementRefusal, assertRoboflowReach, roboflowScheduleBody, ROBOFLOW_UNPROBED_READS, ROBOFLOW_ENTITLEMENT_REFUSAL,
 } from './agent-probes.mjs';
 
 const json = (status, body) => ({ status, json: body, headers: {}, text: JSON.stringify(body) });
 const REFUSAL = { ok: false, error: 'administrator role is required' };
+// Decision D13 wording, taken from the production constant so a wording change needs one edit.
+const ENTITLEMENT = { ok: false, error: ROBOFLOW_ENTITLEMENT_REFUSAL.error };
 const ACTORS = ['anonymous', 'selfRegistered', 'userA', 'userB'];
 
 /**
@@ -19,7 +21,7 @@ const ACTORS = ['anonymous', 'selfRegistered', 'userA', 'userB'];
  * `everyoneReaches` removes every gate for every actor (a fully fail-open product). `started` counts
  * the only things the probes must never cause.
  */
-function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, everyoneReaches = false, usersCannotListSchedules = false, adminCreateFails = false, routerRefusesUsers = false } = {}) {
+function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRegisteredRefusal = ENTITLEMENT, everyoneReaches = false, usersCannotListSchedules = false, adminCreateFails = false, routerRefusesUsers = false } = {}) {
     const schedules = [], workflows = [], requests = [];
     const started = { flows: 0, generations: 0, folders: 0 };
     let sequence = 0;
@@ -31,7 +33,7 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, everyo
         assert.ok(full.startsWith(ROBOFLOW_BASE), `unexpected path ${full}`);
         const route = full.slice(ROBOFLOW_BASE.length).split('?')[0];
         if (actor === 'anonymous' && !everyoneReaches) return json(401, { ok: false, error: 'authentication required' });
-        if (actor === 'selfRegistered' && !selfRegisteredReaches && !everyoneReaches) return json(403, { ok: false, error: 'forbidden: workspace access required' });
+        if (actor === 'selfRegistered' && !selfRegisteredReaches && !everyoneReaches) return json(403, selfRegisteredRefusal);
         const refuse = (name) => gate(actor, name);
         let match;
         if (method === 'GET' && route === '/schedule-folders') return refuse('schedule-folders.list') || json(200, { ok: true, folder: '/workspace', folders: [], defaultPath: 'cron-jobs-results' });
@@ -205,12 +207,27 @@ test('a Router refusal cannot stand in for the handler administrator refusal of 
     assert.ok(run.passed.includes('agent.roboflow.schedules.create.anonymous'), 'anonymous still only needs an authorization denial');
 });
 
-test('a selfRegistered user who reaches the handler fails the workspace-route denials and is reported, not relaxed', async () => {
+const selfRegisteredIds = roboflowProbes.map((entry) => roboflowCheckId(entry, 'selfRegistered')).sort();
+
+test('a selfRegistered user who reaches the handler fails every selfRegistered check and is reported, not relaxed', async () => {
     const run = await runWorld({ selfRegisteredReaches: true });
-    const workspace = roboflowProbes.filter((entry) => entry.policy === 'workspace').map((entry) => roboflowCheckId(entry, 'selfRegistered'));
-    assert.deepEqual([...run.failed.keys()].sort(), [...workspace].sort());
-    // The administrator routes are still refused by the handler itself, which is an authorization denial.
-    assert.ok(run.passed.includes('agent.roboflow.schedules.create.selfRegistered'));
+    assert.deepEqual([...run.failed.keys()].sort(), selfRegisteredIds);
+    // The handler's own administrator refusal is not the entitlement refusal (D13), so it is no substitute on administrator routes.
+    assert.match(run.failed.get('agent.roboflow.schedules.create.selfRegistered'), /entitlement refusal/);
+});
+
+test('NEGATIVE: selfRegistered must receive the exact entitlement refusal; a CSRF, origin or login 403 is not accepted', async () => {
+    const good = await runWorld();
+    for (const id of selfRegisteredIds) assert.ok(good.passed.includes(id), id);
+    for (const error of ['csrf token invalid', 'browser origin rejected', 'forbidden: workspace access required', 'administrator role is required', 'Explorer access permission is required to use RoboFlow.', 'explorer access permission is required to use roboflow']) {
+        const run = await runWorld({ selfRegisteredRefusal: { ok: false, error } });
+        assert.deepEqual([...run.failed.keys()].sort(), selfRegisteredIds, error);
+        assert.ok(run.passed.includes('agent.roboflow.schedules.create.anonymous'), 'anonymous keeps assertDenied');
+    }
+    for (const bad of [json(401, ENTITLEMENT), json(403, { ...ENTITLEMENT, ok: true }), json(403, { ok: false, message: ENTITLEMENT.error }), json(200, ENTITLEMENT)]) {
+        assert.throws(() => assertRoboflowEntitlementRefusal(bad), JSON.stringify(bad.json));
+    }
+    assert.doesNotThrow(() => assertRoboflowEntitlementRefusal(json(403, ENTITLEMENT)));
 });
 
 test('a fully fail-open product fails every denial, yet no probe starts work and the run leaves nothing', async () => {
