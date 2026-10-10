@@ -69,6 +69,7 @@ test('Router source references reject stale metadata, wrong anchors, unknown blo
       .map(([id]) => `${file} ${hash.slice(0, 8)} ${id}`)));
   assert.deepEqual(blankStatements, [
     'cli/server/RoutingServer.js 27fb848d internal-agent-control.*',
+    'cli/server/RoutingServer.js 2e5e397b internal-agent-control.*',
     'cli/server/handlers/webtty.js 0c0d70d8 webtty-input.post',
   ]);
 });

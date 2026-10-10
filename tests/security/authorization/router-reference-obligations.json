@@ -2301,6 +2301,123 @@
             "anchor": null,
             "statement": "return {"
           }
+        },
+        "2e5e397b77d807e1d0410c71b817c68b532448973d4709c747474a5c0068b6df": {
+          "root.get": {
+            "line": 771,
+            "anchor": null,
+            "statement": "}"
+          },
+          "root-index.get": {
+            "line": 771,
+            "anchor": null,
+            "statement": "}"
+          },
+          "health.get": {
+            "line": 644,
+            "anchor": null,
+            "statement": "Number.isInteger(error?.status) ? error.status : 502,"
+          },
+          "agent-card.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (!staticAgent) return null;"
+          },
+          "agent-card-slash.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (!staticAgent) return null;"
+          },
+          "mcp-browser-client.get": {
+            "line": 477,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 477,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 433,
+            "anchor": null,
+            "statement": "res,"
+          },
+          "agent-mcp.post": {
+            "line": 742,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-mcp.delete": {
+            "line": 742,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-mcp.get": {
+            "line": 742,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-task-status.get": {
+            "line": 604,
+            "anchor": null,
+            "statement": "// One authorization path for transparent agent routes and agent-port relays."
+          },
+          "agent-task-status-alias.get": {
+            "line": 604,
+            "anchor": null,
+            "statement": "// One authorization path for transparent agent routes and agent-port relays."
+          },
+          "agent-task-cancel.post": {
+            "line": 546,
+            "anchor": null,
+            "statement": "});"
+          },
+          "agent-openai.post": {
+            "line": 589,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 401, {"
+          },
+          "agent-root-websocket.get": {
+            "line": 955,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 986,
+            "anchor": null,
+            "statement": "return;"
+          },
+          "internal-agent-control.*": {
+            "line": 481,
+            "anchor": null,
+            "statement": ""
+          },
+          "reserved--metrics.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--health-internal.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--admin.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--admin-*.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "unix-health.get": {
+            "line": 926,
+            "anchor": null,
+            "statement": "return {"
+          }
         }
       },
       "candidate": "27fb848deaa7824177c9fb16cc265da2b9bb9cc919021fcaacb18580026596a9"
