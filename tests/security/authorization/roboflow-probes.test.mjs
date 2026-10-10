@@ -1,5 +1,5 @@
 // The RoboFlow HTTP probes (agent-probes.mjs runRoboflowProbes) against an offline model of the
-// handlers served by AchillesCLI roboTeamAgent/server/http-server.mjs at 4943549a. A product that
+// handlers served by AchillesCLI roboTeamAgent/server/http-server.mjs at 3cd94b10. A product that
 // answers 2xx to an ordinary user's POST /schedules, or 403 to an ordinary user's GET /schedules, must
 // fail exactly that check; no probe may start work even when the product fails open; nothing the
 // run created may remain; and every schedule the run writes is disabled.

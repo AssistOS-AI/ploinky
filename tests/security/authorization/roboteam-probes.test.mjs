@@ -1,5 +1,5 @@
 // The RoboTeam family probes (agent-probes.mjs runRoboteamProbes, decision D14) against an offline model of the
-// 3001 family at 4943549a plus the entitlement gate. selfRegistered must receive exactly the RoboTeam refusal on every
+// 3001 family at 3cd94b10 plus the entitlement gate. selfRegistered must receive exactly the RoboTeam refusal on every
 // gated route; a Router 401, CSRF or origin refusal does not count; a fail-open gate fails every selfRegistered check and
 // starts nothing; a fixture collision aborts the block before any probe request.
 import test from 'node:test';

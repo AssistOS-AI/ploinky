@@ -814,7 +814,7 @@ export function reconcileAgentRegistry(registry) {
 
 // ---------------------------------------------------------------------------------------------
 // RoboTeam RoboFlow HTTP routes. Source: AchillesCLI roboTeamAgent/server/http-server.mjs,
-// handleRoboFlow, as served at 4943549a (line ranges are cited per probe). The Router requires
+// handleRoboFlow, as served at 3cd94b10 (line ranges are cited per probe). The Router requires
 // authentication for roboTeamAgent/3001/*. The administrator gate is the handler's own
 // isAdminActor check (roboTeamAgent/server/request-identity.mjs), so on administrator routes userA
 // and userB must receive the handler's exact refusal and not merely any 401/403. Routes without an
@@ -843,8 +843,8 @@ export const ROBOFLOW_BASE = '/base-agent-additional-server/roboTeamAgent/3001/a
 export const ROBOFLOW_ADMIN_REFUSAL = Object.freeze({ status: 403, error: 'administrator role is required' });
 /**
  * Decision D13: RoboTeam gates every /api/roboflow* request on the signed Explorer entitlement and refuses a user
- * without it (selfRegistered) with exactly this 403, before any role check. The wording is proposed and is under plan
- * review in AchillesCLI; change it here, in this one place, if the review changes it.
+ * without it (selfRegistered) with exactly this 403, before any role check. The wording is merged in AchillesCLI 3cd94b10
+ * (listing-access.mjs ROBOFLOW_ENTITLEMENT_ERROR); if it ever changes there, change it here, in this one place.
  */
 export const ROBOFLOW_ENTITLEMENT_REFUSAL = Object.freeze({ status: 403, error: 'Explorer access permission is required to use RoboFlow' });
 export const ROBOFLOW_ABSENT = Object.freeze({
@@ -863,42 +863,42 @@ const NO_DESCRIPTION = reach(400, 'description requires 1 to 32768 characters');
 const NO_RUN = reach(404, 'workflow run not found');
 const roboflowProbe = (name, method, route, policy, control, lines, extra = {}) => Object.freeze({ name, method, path: route, policy, control, source: `${ROBOFLOW_SOURCE}:${lines}`, ...extra });
 /**
- * Every mutation served under /api/roboflow at 4943549a, plus GET schedules (D4a: workspace-readable as coded).
+ * Every mutation served under /api/roboflow at 3cd94b10, plus GET schedules (D4a: workspace-readable as coded).
  * policy 'admin': the handler refuses a non-administrator. policy 'workspace': no handler role gate.
  * control 'positive': the administrator performs and observes the real operation. control 'reach': the administrator
  * reaches the handler with a request that cannot start work and receives its exact documented answer (`reach`).
  * Read routes other than GET schedules stay covered by the roboTeamAgent wildcard inventory row (ROBOFLOW_UNPROBED_READS).
  */
 export const roboflowProbes = Object.freeze([
-    roboflowProbe('schedule-folders.list', 'GET', '/schedule-folders', 'admin', 'positive', '306-311'),
-    roboflowProbe('schedule-folders.create', 'POST', '/schedule-folders', 'admin', 'positive', '306-311', { dependsOn: ['schedule-folders.list'] }),
-    roboflowProbe('workflows.validate', 'POST', '/validate', 'admin', 'positive', '279-282'),
-    roboflowProbe('generate', 'POST', '/generate', 'admin', 'reach', '283-289', { reach: NO_DESCRIPTION, gap: ROBOFLOW_GAPS.generation }),
-    roboflowProbe('generations.start', 'POST', '/generations', 'admin', 'reach', '290-293', { reach: NO_DESCRIPTION, gap: ROBOFLOW_GAPS.generation }),
-    roboflowProbe('generations.cancel', 'DELETE', '/generations/:generation', 'admin', 'reach', '300-305', { reach: reach(404, 'generation not found'), gap: ROBOFLOW_GAPS.generation }),
-    roboflowProbe('workflows.create', 'POST', '/workflows', 'admin', 'positive', '340-344'),
-    roboflowProbe('workflows.update', 'PUT', '/workflows/:workflow', 'admin', 'positive', '345-350', { dependsOn: ['workflows.create'] }),
-    roboflowProbe('workflows.delete', 'DELETE', '/workflows/:workflow', 'admin', 'positive', '351-355', { dependsOn: ['workflows.create'] }),
-    roboflowProbe('schedules.create', 'POST', '/schedules', 'admin', 'positive', '315-318', { dependsOn: ['schedule-folders.list'] }),
-    roboflowProbe('schedules.update', 'PUT', '/schedules/:schedule', 'admin', 'positive', '325-335', { dependsOn: ['schedules.create'] }),
-    roboflowProbe('schedules.delete', 'DELETE', '/schedules/:schedule', 'admin', 'positive', '325-335', { dependsOn: ['schedules.create'] }),
-    roboflowProbe('schedules.run-now', 'POST', '/schedules/:schedule/run-now', 'admin', 'reach', '319-324', { reach: reach(404, 'Cron job not found'), gap: ROBOFLOW_GAPS.runNow }),
-    roboflowProbe('schedules.list', 'GET', '/schedules', 'workspace', 'positive', '312-314', { dependsOn: ['schedules.create'] }),
-    roboflowProbe('flows.start', 'POST', '/flows', 'workspace', 'reach', '360-364', { reach: reach(404, 'workflow not found'), gap: ROBOFLOW_GAPS.flowStart }),
-    roboflowProbe('flows.answer', 'POST', '/flows/:flow/human-input/answer', 'workspace', 'reach', '372-376', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
-    roboflowProbe('flows.pause', 'POST', '/flows/:flow/pause', 'workspace', 'reach', '377-381', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
-    roboflowProbe('flows.terminate', 'POST', '/flows/:flow/terminate', 'workspace', 'reach', '382-386', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
-    roboflowProbe('flows.resume', 'POST', '/flows/:flow/resume', 'workspace', 'reach', '387-391', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
-    roboflowProbe('instances.pause', 'POST', '/flows/:flow/instances/:instance/pause', 'workspace', 'reach', '392-396', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
-    roboflowProbe('instances.message', 'POST', '/flows/:flow/instances/:instance/message', 'workspace', 'reach', '397-402', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
-    roboflowProbe('instances.resume', 'POST', '/flows/:flow/instances/:instance/resume', 'workspace', 'reach', '403-408', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
+    roboflowProbe('schedule-folders.list', 'GET', '/schedule-folders', 'admin', 'positive', '332-337'),
+    roboflowProbe('schedule-folders.create', 'POST', '/schedule-folders', 'admin', 'positive', '332-337', { dependsOn: ['schedule-folders.list'] }),
+    roboflowProbe('workflows.validate', 'POST', '/validate', 'admin', 'positive', '305-308'),
+    roboflowProbe('generate', 'POST', '/generate', 'admin', 'reach', '309-315', { reach: NO_DESCRIPTION, gap: ROBOFLOW_GAPS.generation }),
+    roboflowProbe('generations.start', 'POST', '/generations', 'admin', 'reach', '316-319', { reach: NO_DESCRIPTION, gap: ROBOFLOW_GAPS.generation }),
+    roboflowProbe('generations.cancel', 'DELETE', '/generations/:generation', 'admin', 'reach', '326-331', { reach: reach(404, 'generation not found'), gap: ROBOFLOW_GAPS.generation }),
+    roboflowProbe('workflows.create', 'POST', '/workflows', 'admin', 'positive', '366-370'),
+    roboflowProbe('workflows.update', 'PUT', '/workflows/:workflow', 'admin', 'positive', '371-376', { dependsOn: ['workflows.create'] }),
+    roboflowProbe('workflows.delete', 'DELETE', '/workflows/:workflow', 'admin', 'positive', '377-381', { dependsOn: ['workflows.create'] }),
+    roboflowProbe('schedules.create', 'POST', '/schedules', 'admin', 'positive', '341-344', { dependsOn: ['schedule-folders.list'] }),
+    roboflowProbe('schedules.update', 'PUT', '/schedules/:schedule', 'admin', 'positive', '351-361', { dependsOn: ['schedules.create'] }),
+    roboflowProbe('schedules.delete', 'DELETE', '/schedules/:schedule', 'admin', 'positive', '351-361', { dependsOn: ['schedules.create'] }),
+    roboflowProbe('schedules.run-now', 'POST', '/schedules/:schedule/run-now', 'admin', 'reach', '345-350', { reach: reach(404, 'Cron job not found'), gap: ROBOFLOW_GAPS.runNow }),
+    roboflowProbe('schedules.list', 'GET', '/schedules', 'workspace', 'positive', '338-340', { dependsOn: ['schedules.create'] }),
+    roboflowProbe('flows.start', 'POST', '/flows', 'workspace', 'reach', '386-390', { reach: reach(404, 'workflow not found'), gap: ROBOFLOW_GAPS.flowStart }),
+    roboflowProbe('flows.answer', 'POST', '/flows/:flow/human-input/answer', 'workspace', 'reach', '398-402', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
+    roboflowProbe('flows.pause', 'POST', '/flows/:flow/pause', 'workspace', 'reach', '403-407', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
+    roboflowProbe('flows.terminate', 'POST', '/flows/:flow/terminate', 'workspace', 'reach', '408-412', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
+    roboflowProbe('flows.resume', 'POST', '/flows/:flow/resume', 'workspace', 'reach', '413-417', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
+    roboflowProbe('instances.pause', 'POST', '/flows/:flow/instances/:instance/pause', 'workspace', 'reach', '418-422', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
+    roboflowProbe('instances.message', 'POST', '/flows/:flow/instances/:instance/message', 'workspace', 'reach', '423-428', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
+    roboflowProbe('instances.resume', 'POST', '/flows/:flow/instances/:instance/resume', 'workspace', 'reach', '429-434', { reach: NO_RUN, gap: ROBOFLOW_GAPS.flowRuns }),
 ]);
-/** Read routes of the same handler that are not probed here (4943549a, http-server.mjs). */
+/** Read routes of the same handler that are not probed here (3cd94b10, http-server.mjs). */
 export const ROBOFLOW_UNPROBED_READS = Object.freeze([
-    'GET /api/roboflow/creator-skill :272-275', 'GET /api/roboflow/skillsets :276-278', 'GET /api/roboflow/generations/:id :294-299',
-    'GET /api/roboflow/workflows :336-339', 'GET /api/roboflow/flows :356-359', 'GET /api/roboflow/flows/:id :365-371',
-    'GET /api/roboflow/flows/:id/logs/:instance and /invocations/:instance/log :409-415',
-    'GET /flows, /flow-types, /flow-types/new, /flow-types/generate-new (pages) :259-270',
+    'GET /api/roboflow/creator-skill :298-301', 'GET /api/roboflow/skillsets :302-304', 'GET /api/roboflow/generations/:id :320-325',
+    'GET /api/roboflow/workflows :362-365', 'GET /api/roboflow/flows :382-385', 'GET /api/roboflow/flows/:id :391-397',
+    'GET /api/roboflow/flows/:id/logs/:instance and /invocations/:instance/log :435-441',
+    'GET /flows, /flow-types, /flow-types/new, /flow-types/generate-new (pages) :285-296',
 ]);
 const ROBOFLOW_ACTORS = Object.freeze(['anonymous', 'selfRegistered', 'userA', 'userB']);
 const roboflowProbeByName = Object.freeze(Object.fromEntries(roboflowProbes.map((entry) => [entry.name, entry])));
@@ -1229,7 +1229,7 @@ export async function runRoboflowProbes(ctx, { mcp = createResourceMcp(ctx) } = 
 }
 
 // ---------------------------------------------------------------------------------------------
-// RoboTeam family gate (decision D14, AchillesCLI roboTeamAgent/server/http-server.mjs at 4943549a; the table and
+// RoboTeam family gate (decision D14, AchillesCLI roboTeamAgent/server/http-server.mjs at 3cd94b10; the table and
 // reach answers are in the combined D13+D14 SPEC, "Harness additions"). Every gated path of the 3001 family refuses a
 // signed user without the Explorer entitlement with exactly this 403, before any role or route logic.
 // selfRegistered must receive it exactly; anonymous needs an authorization denial (Router 401); userA, userB and
@@ -1253,32 +1253,32 @@ const controlBody = (operation, more = {}) => ({ robotName: ':absent', operation
  * agent-inventory.mjs row id each probe contacts (all of them also match the roboTeamAgent wildcard row in coverage.mjs).
  */
 export const roboteamProbes = Object.freeze([
-    roboteamProbe('page.root', 'GET', '/', Object.freeze({ kind: 'html', status: 200, includes: '<base href=' }), '465'),
-    roboteamProbe('config', 'GET', '/config.js', Object.freeze({ kind: 'text-prefix', status: 200, prefix: 'globalThis.ROBOTEAM_CONFIG=' }), '466-470'),
-    roboteamProbe('asset.styles', 'GET', '/styles.css', Object.freeze({ kind: 'css', status: 200 }), '472'),
-    roboteamProbe('page.flows', 'GET', '/flows', Object.freeze({ kind: 'html', status: 200 }), '259-262'),
-    roboteamProbe('run.get', 'GET', '/api/robots/:absent/run', notFound(), '675-681'),
-    roboteamProbe('run.start', 'POST', '/api/robots/:absent/run', notFound(), '682-686', { body: { mode: 'browser' } }),
-    roboteamProbe('run.stop', 'DELETE', '/api/robots/:absent/run', notFound(), '687-692'),
-    roboteamProbe('logs', 'GET', '/api/robots/:absent/logs', notFound(), '700-705'),
-    roboteamProbe('session.http', 'GET', '/api/robots/:absent/session/', notFound(), '457-464'),
-    roboteamProbe('control.start-simple-task', 'POST', '/api/control', notFound(), '606-611', { body: controlBody('start-simple-task', { task: 'authorization probe, never run' }) }),
-    roboteamProbe('control.open-desktop', 'POST', '/api/control', notFound(), '606-611', { body: controlBody('open-desktop') }),
-    roboteamProbe('control.message-task', 'POST', '/api/control', notFound(), '606-611', { body: controlBody('message-task', { prompt: 'probe' }) }),
-    roboteamProbe('control.robot-delete', 'POST', '/api/control', notFound(), '606-614', { body: controlBody('robot-delete') }),
+    roboteamProbe('page.root', 'GET', '/', Object.freeze({ kind: 'html', status: 200, includes: '<base href=' }), '500'),
+    roboteamProbe('config', 'GET', '/config.js', Object.freeze({ kind: 'text-prefix', status: 200, prefix: 'globalThis.ROBOTEAM_CONFIG=' }), '501-505'),
+    roboteamProbe('asset.styles', 'GET', '/styles.css', Object.freeze({ kind: 'css', status: 200 }), '507'),
+    roboteamProbe('page.flows', 'GET', '/flows', Object.freeze({ kind: 'html', status: 200 }), '285-288'),
+    roboteamProbe('run.get', 'GET', '/api/robots/:absent/run', notFound(), '711-715'),
+    roboteamProbe('run.start', 'POST', '/api/robots/:absent/run', notFound(), '716-722', { body: { mode: 'browser' } }),
+    roboteamProbe('run.stop', 'DELETE', '/api/robots/:absent/run', notFound(), '723-728'),
+    roboteamProbe('logs', 'GET', '/api/robots/:absent/logs', notFound(), '735-740'),
+    roboteamProbe('session.http', 'GET', '/api/robots/:absent/session/', notFound(), '492-499'),
+    roboteamProbe('control.start-simple-task', 'POST', '/api/control', notFound(), '641-646', { body: controlBody('start-simple-task', { task: 'authorization probe, never run' }) }),
+    roboteamProbe('control.open-desktop', 'POST', '/api/control', notFound(), '641-646', { body: controlBody('open-desktop') }),
+    roboteamProbe('control.message-task', 'POST', '/api/control', notFound(), '641-646', { body: controlBody('message-task', { prompt: 'probe' }) }),
+    roboteamProbe('control.robot-delete', 'POST', '/api/control', notFound(), '641-649', { body: controlBody('robot-delete') }),
     // Ordinary users reach the administrator refusal before any create; the administrator is not probed (it would create a robot).
-    roboteamProbe('robots.create', 'POST', '/api/robots', Object.freeze({ kind: 'json-error', status: 403, error: 'administrator role is required' }), '550-552', { body: { name: '' }, adminProbed: false }),
-    roboteamProbe('summary.session', 'GET', `/api/summary?session=${RT_ZERO_UUID}`, notFound('Summary source not found'), '486-488'),
-    roboteamProbe('webchat.logs', 'GET', `/api/webchat/logs/${RT_ZERO_UUID}/${RT_ZERO_UUID_2}`, Object.freeze({ kind: 'text', status: 404, text: 'log not found' }), '516-519'),
-    roboteamProbe('status.exempt', 'GET', '/status', Object.freeze({ kind: 'status-ok', status: 200 }), '443-445', { exempt: true }),
+    roboteamProbe('robots.create', 'POST', '/api/robots', Object.freeze({ kind: 'json-error', status: 403, error: 'administrator role is required' }), '585-587', { body: { name: '' }, adminProbed: false }),
+    roboteamProbe('summary.session', 'GET', `/api/summary?session=${RT_ZERO_UUID}`, notFound('Summary source not found'), '521-523'),
+    roboteamProbe('webchat.logs', 'GET', `/api/webchat/logs/${RT_ZERO_UUID}/${RT_ZERO_UUID_2}`, Object.freeze({ kind: 'text', status: 404, text: 'log not found' }), '551-554'),
+    roboteamProbe('status.exempt', 'GET', '/status', Object.freeze({ kind: 'status-ok', status: 200 }), '470-472', { exempt: true }),
 ]);
 /** Read routes of the family that are not probed live (unit-covered only). */
 export const ROBOTEAM_UNPROBED = Object.freeze([
-    'GET /api/required-skills :494-498 (may prepare DocumentationSkills over the network)',
-    'GET, PATCH /api/robots/:id/conversations/:sid/skills :503-512 (404 shape for an absent robot not pinned)',
-    'GET /summary and /webchat-logs/:s/:m and /conversation-skills* pages :485, :500-502, :514-515',
-    'GET /robots/:id/logs page :694-699',
-    'administrator robot routes: POST /api/robots/:id/terminal, GET /api/robots/:id/models, GET/PATCH /api/robots/:id/coding-agents, POST/DELETE/PATCH /api/robots/:id/skillsets :535-605',
+    'GET /api/required-skills :529-533 (may prepare DocumentationSkills over the network)',
+    'GET, PATCH /api/robots/:id/conversations/:sid/skills :538-547 (404 shape for an absent robot not pinned)',
+    'GET /summary and /webchat-logs/:s/:m and /conversation-skills* pages :520, :535-537, :549-550',
+    'GET /robots/:id/logs page :729-734',
+    'administrator robot routes: POST /api/robots/:id/terminal, GET /api/robots/:id/models, GET/PATCH /api/robots/:id/coding-agents, POST/DELETE/PATCH /api/robots/:id/skillsets :570-640',
     'WebSocket upgrade /api/robots/:id/session/* (see ROBOTEAM_GAPS.websocketLive)',
 ]);
 const roboteamActors = Object.freeze(['anonymous', 'selfRegistered', 'userA', 'userB']);
