@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { agentCatalog, agentInventory } from './agent-inventory.mjs';
+import { assertAllowed, createResourceMcp } from './resource-probes.mjs';
 import { assertDenied, Client, WORKSPACE } from './core.mjs';
 import { GUEST_AGENT_POLICY, WEBASSIST_SESSION_SECRET_TOOLS, guestCookieNameFor, pinnedGuestList } from './guest-agent-policy.mjs';
 
@@ -829,8 +830,11 @@ export function reconcileAgentRegistry(registry) {
 //   - generate and generations send no description (rejected before any robot or model call);
 //   - schedule bodies always carry enabled:false, a run-owned name, the built-in default workflow
 //     and the workspace root folder reported by the admin folder listing (no directory is created);
-//   - schedule-folders create sends a name with a slash (rejected before mkdir).
-// A true administrator positive that would start work, or (schedule-folder create) whose cleanup path is not yet proven, is a
+//   - schedule-folders create by a non-administrator sends a name with a slash (rejected before mkdir).
+// The administrator schedule-folder create makes one run-owned child directly under the RoboTeam root, but only after the
+// root equals Explorer's first allowed root (fail closed otherwise, nothing is created); cleanup is armed before the create
+// and removes it through Explorer delete_directory, then proves absence through both RoboTeam and Explorer.
+// A true administrator positive that would start work is a
 // declared limitation (ROBOFLOW_GAPS) and its denials depend on the administrator reach control,
 // which proves the administrator passes the gate and receives the handler's own exact answer.
 // Everything created is named from ctx.prefix; cleanup is armed before the first creation and
@@ -850,7 +854,6 @@ export const ROBOFLOW_ABSENT = Object.freeze({
 export const ROBOFLOW_GAPS = Object.freeze({
     runNow: 'agent.roboflow.schedules.run-now.admin-positive',
     generation: 'agent.roboflow.generation.admin-positive',
-    folderCreate: 'agent.roboflow.schedule-folders.create.admin-positive',
     flowStart: 'agent.roboflow.flows.start.positive',
     flowRuns: 'agent.roboflow.flows.run-mutations.positive',
 });
@@ -868,7 +871,7 @@ const roboflowProbe = (name, method, route, policy, control, lines, extra = {}) 
  */
 export const roboflowProbes = Object.freeze([
     roboflowProbe('schedule-folders.list', 'GET', '/schedule-folders', 'admin', 'positive', '306-311'),
-    roboflowProbe('schedule-folders.create', 'POST', '/schedule-folders', 'admin', 'reach', '306-311', { reach: reach(400, 'Enter one folder name without slashes'), gap: ROBOFLOW_GAPS.folderCreate }),
+    roboflowProbe('schedule-folders.create', 'POST', '/schedule-folders', 'admin', 'positive', '306-311', { dependsOn: ['schedule-folders.list'] }),
     roboflowProbe('workflows.validate', 'POST', '/validate', 'admin', 'positive', '279-282'),
     roboflowProbe('generate', 'POST', '/generate', 'admin', 'reach', '283-289', { reach: NO_DESCRIPTION, gap: ROBOFLOW_GAPS.generation }),
     roboflowProbe('generations.start', 'POST', '/generations', 'admin', 'reach', '290-293', { reach: NO_DESCRIPTION, gap: ROBOFLOW_GAPS.generation }),
@@ -940,7 +943,7 @@ export const roboflowScheduleBody = (name, folder, extra = {}) => ({
     timing: { kind: 'interval', everyMinutes: 1440 }, folder, ...extra, enabled: false,
 });
 
-export async function runRoboflowProbes(ctx) {
+export async function runRoboflowProbes(ctx, { mcp = createResourceMcp(ctx) } = {}) {
     const P = roboflowProbeByName;
     const recorded = new Set();
     const check = (entry, actor, fn) => { const id = roboflowCheckId(entry, actor); recorded.add(id); return ctx.check(id, fn); };
@@ -957,7 +960,7 @@ export async function runRoboflowProbes(ctx) {
     };
     const schedulesNow = () => readList(P['schedules.list'], 'schedules');
     const workflowsNow = () => readList(WORKFLOW_LIST, 'workflows');
-    const state = { root: null, workflow: null, schedule: null };
+    const state = { root: null, explorerRoot: null, explorerRootError: '', workflow: null, schedule: null };
 
     // Armed before anything is created. Schedules go first: a workflow with schedules cannot be removed.
     ctx.cleanup(async () => {
@@ -1015,9 +1018,46 @@ export async function runRoboflowProbes(ctx) {
         assert.ok(Array.isArray(response.json.folders), 'The folder listing carries a folders array');
         state.root = response.json.folder;
     });
+    // Root compatibility, read-only and before any RoboFlow mutation: the folder create positive is allowed only if the
+    // RoboTeam root is the directory Explorer's file tools operate on. Both are realpaths (workspace-root.mjs,
+    // tool-runtime.mjs); Explorer prefers ASSISTOS_FS_ROOT/MCP_FS_ROOT over PLOINKY_WORKSPACE_ROOT, so equality is checked, not assumed.
+    try {
+        const allowed = assertAllowed(await mcp('admin', 'explorer', 'list_allowed_directories'), 'Explorer allowed roots');
+        state.explorerRoot = String(allowed.rawText || '').split('\n').find((entry) => entry.startsWith('/')) || null;
+        if (!state.explorerRoot) state.explorerRootError = 'Explorer returned no allowed root';
+    } catch (error) { state.explorerRootError = `Explorer allowed roots are unavailable: ${String(error?.message || error).slice(0, 200)}`; }
+    const normalizeRoot = (value) => path.posix.normalize(String(value)).replace(/(.)\/+$/, '$1');
     const folderBody = () => ({ body: { name: 'authorization/probe' } });
     await denyAdminRoute(P['schedule-folders.create'], folderBody);
-    await adminReach(P['schedule-folders.create'], folderBody);
+    await adminControl(P['schedule-folders.create'], async () => {
+        assert.ok(state.root, 'The RoboTeam workspace root is unavailable');
+        assert.ok(state.explorerRoot, state.explorerRootError || 'The Explorer allowed root is unavailable');
+        assert.equal(normalizeRoot(state.root), normalizeRoot(state.explorerRoot),
+            'ROOT_INCOMPATIBLE: the RoboTeam schedule-folder root differs from Explorer\'s first allowed root; nothing was created');
+        const child = owned('folder');
+        const childPath = path.posix.join(normalizeRoot(state.root), child);
+        // Armed before the create. Guarded: only the exact run-owned child directly under the root is ever removed.
+        ctx.cleanup(async () => {
+            assert.equal(path.posix.dirname(childPath), normalizeRoot(state.root), 'Folder cleanup must act directly under the root');
+            assert.equal(path.posix.basename(childPath), child, 'Folder cleanup must act on the exact run-owned child');
+            await ctx.guard();
+            assertAllowed(await mcp('admin', 'explorer', 'delete_directory', { path: childPath }), 'run-owned schedule folder cleanup');
+            const listing = await call('admin', P['schedule-folders.list'], {});
+            assert.equal(listing.status, 200, 'The folder listing must answer after cleanup');
+            assert.equal((listing.json?.folders || []).some((item) => item.name === child), false, 'The run-owned folder is still listed by RoboTeam after cleanup');
+            const explorer = assertAllowed(await mcp('admin', 'explorer', 'list_directory', { path: normalizeRoot(state.root) }), 'Explorer root listing after folder cleanup');
+            assert.equal(String(explorer.rawText || '').split('\n').some((line) => line.replace(/^\[DIR\]\s*/, '').trim() === child), false, 'The run-owned folder is still visible to Explorer after cleanup');
+        });
+        const response = await call('admin', P['schedule-folders.create'], { body: { name: child } });
+        assert.equal(response.status, 201);
+        assert.equal(response.json?.ok, true);
+        assert.equal(response.json.path, child, 'The create answer names the child relative to the root');
+        assert.equal(response.json.folder, childPath, 'The create answer is the root plus the child name');
+        const listing = await call('admin', P['schedule-folders.list'], {});
+        assert.equal((listing.json?.folders || []).some((item) => item.name === child), true, 'RoboTeam lists the created child');
+        const explorer = assertAllowed(await mcp('admin', 'explorer', 'list_directory', { path: normalizeRoot(state.root) }), 'Explorer root listing');
+        assert.equal(String(explorer.rawText || '').split('\n').some((line) => line.replace(/^\[DIR\]\s*/, '').trim() === child), true, 'Explorer sees the same created child');
+    });
 
     // ---- workflow validation and generation (no persistence, no model work) ---------------------
     const draft = () => roboflowGraph(owned('draft'), 'Draft');
@@ -1156,7 +1196,6 @@ export async function runRoboflowProbes(ctx) {
     for (const [id, reason] of [
         [ROBOFLOW_GAPS.runNow, 'An administrator run-now positive would start a real workflow; only the administrator reach (404 for an absent schedule) and the denials are exercised.'],
         [ROBOFLOW_GAPS.generation, 'Workflow generation (generate, generations start and cancel) starts robot and model work; only the administrator reach (400 or 404 before any work) and the denials are exercised.'],
-        [ROBOFLOW_GAPS.folderCreate, 'An administrator schedule-folder create makes a workspace directory; the positive is withheld until the schedule-folder root of RoboTeam is proven to be the directory that the Explorer delete_directory tool can clean up. Only the administrator reach (400 before mkdir) and the denials are exercised.'],
         [ROBOFLOW_GAPS.flowStart, 'An administrator or ordinary-user flow start launches a real workflow; only the reach (404 for an absent workflow type) and the denials are exercised.'],
         [ROBOFLOW_GAPS.flowRuns, 'Answer, pause, terminate, resume and instance operations need a real running flow; only the reach (404 for an absent run) and the denials are exercised.'],
     ]) ctx.recordGap(id, reason, { kind: 'declared-limitation' });

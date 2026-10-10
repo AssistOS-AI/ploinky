@@ -9,6 +9,7 @@ import {
     ROBOFLOW_BASE, ROBOFLOW_ABSENT, ROBOFLOW_GAPS, roboflowProbes, roboflowCheckDefinitions, roboflowCheckId, roboflowAdminCheckId,
     runRoboflowProbes, assertRoboflowAdminRefusal, assertRoboflowEntitlementRefusal, assertRoboflowReach, roboflowScheduleBody, ROBOFLOW_UNPROBED_READS, ROBOFLOW_ENTITLEMENT_REFUSAL,
 } from './agent-probes.mjs';
+import { runOwnedCleanup } from './run-cleanup.mjs';
 
 const json = (status, body) => ({ status, json: body, headers: {}, text: JSON.stringify(body) });
 const REFUSAL = { ok: false, error: 'administrator role is required' };
@@ -21,9 +22,10 @@ const ACTORS = ['anonymous', 'selfRegistered', 'userA', 'userB'];
  * `everyoneReaches` removes every gate for every actor (a fully fail-open product). `started` counts
  * the only things the probes must never cause.
  */
-function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRegisteredRefusal = ENTITLEMENT, everyoneReaches = false, usersCannotListSchedules = false, adminCreateFails = false, routerRefusesUsers = false } = {}) {
-    const schedules = [], workflows = [], requests = [];
-    const started = { flows: 0, generations: 0, folders: 0 };
+function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRegisteredRefusal = ENTITLEMENT, everyoneReaches = false, usersCannotListSchedules = false, adminCreateFails = false, routerRefusesUsers = false,
+    explorerRoot = '/workspace', explorerListFails = false, deleteFails = false, createReturnsFolder = null } = {}) {
+    const schedules = [], workflows = [], requests = [], folders = new Set(), explorerCalls = [];
+    const started = { flows: 0, generations: 0 };
     let sequence = 0;
     const gate = (actor, name) => actor === 'admin' || everyoneReaches || open.has(name) ? null
         : json(403, routerRefusesUsers ? { ok: false, error: 'csrf token invalid' } : REFUSAL);
@@ -36,11 +38,13 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
         if (actor === 'selfRegistered' && !selfRegisteredReaches && !everyoneReaches) return json(403, selfRegisteredRefusal);
         const refuse = (name) => gate(actor, name);
         let match;
-        if (method === 'GET' && route === '/schedule-folders') return refuse('schedule-folders.list') || json(200, { ok: true, folder: '/workspace', folders: [], defaultPath: 'cron-jobs-results' });
+        if (method === 'GET' && route === '/schedule-folders') return refuse('schedule-folders.list') || json(200, { ok: true, folder: '/workspace', folders: [...folders].map((name) => ({ name, path: name })), defaultPath: 'cron-jobs-results' });
         if (method === 'POST' && route === '/schedule-folders') {
             const refused = refuse('schedule-folders.create'); if (refused) return refused;
             if (typeof body?.name !== 'string' || body.name.includes('/')) return json(400, { ok: false, error: 'Enter one folder name without slashes' });
-            started.folders++; return json(201, { ok: true });
+            if (folders.has(body.name)) return json(409, { ok: false, error: 'A folder or file with that name already exists' });
+            folders.add(body.name);
+            return json(201, { ok: true, path: body.name, folder: createReturnsFolder || `/workspace/${body.name}`, folders: [...folders].map((name) => ({ name, path: name })) });
         }
         if (method === 'POST' && route === '/validate') return refuse('workflows.validate') || json(200, { ok: true, graph: { ...body }, coverage: {}, diagnostics: [] });
         if (method === 'POST' && (route === '/generate' || route === '/generations')) {
@@ -106,21 +110,38 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
         }
         return json(404, { ok: false, error: 'not found' });
     }
-    return { handle, schedules, workflows, requests, started };
+    // Explorer file tools (read-only listing, and delete_directory for the run-owned folder), shaped like createResourceMcp results.
+    const explorerOk = (rawText) => ({ failed: false, value: { rawText }, response: { status: 200 } });
+    async function mcp(principal, agent, tool, args = {}) {
+        explorerCalls.push({ principal, agent, tool, args: structuredClone(args) });
+        if (tool === 'list_allowed_directories') return explorerListFails ? { failed: true, value: undefined, response: { status: 503 }, error: 'unavailable' } : explorerOk(`Allowed directories:\n${explorerRoot}`);
+        if (tool === 'list_directory') return explorerOk(args.path === explorerRoot ? [...folders].map((name) => `[DIR] ${name}`).join('\n') : '');
+        if (tool === 'delete_directory') {
+            if (deleteFails) return { failed: true, value: undefined, response: { status: 500 }, error: 'delete refused' };
+            if (args.path.startsWith('/workspace/')) folders.delete(args.path.slice('/workspace/'.length));
+            return explorerOk(`Successfully deleted directory ${args.path}`);
+        }
+        throw new Error(`unexpected Explorer tool ${tool}`);
+    }
+    return { handle, mcp, schedules, workflows, requests, started, folders, explorerCalls };
 }
 
 async function runWorld(options = {}) {
     const world = roboflowWorld(options);
     const passed = [], failed = new Map(), gaps = [], cleanups = [], order = [];
+    const armed = { atFolderCreate: null };
     const ctx = {
-        prefix: 'authz-mk1-0a1b2c3d', report: {}, async guard() {},
+        prefix: 'authz-mk1-0a1b2c3d', report: { cleanup: [] }, secrets: new Set(), async guard() {},
         recordGap: (id, reason, evidence) => gaps.push({ id, reason, evidence }),
         cleanup: (fn) => cleanups.push({ fn, atRequest: world.requests.length }),
-        request: async (actor, request) => world.handle(actor, request),
+        request: async (actor, request) => {
+            if (request.method === 'POST' && request.path.endsWith('/schedule-folders') && request.body?.name === 'authz-mk1-0a1b2c3d-folder') armed.atFolderCreate = cleanups.length;
+            return world.handle(actor, request);
+        },
         async check(id, fn) { order.push(id); try { await fn(); passed.push(id); } catch (error) { failed.set(id, String(error?.message || error)); } },
     };
-    await runRoboflowProbes(ctx);
-    return { world, passed, failed, gaps, cleanups, order, ctx };
+    await runRoboflowProbes(ctx, { mcp: world.mcp });
+    return { world, passed, failed, gaps, cleanups, order, ctx, armed };
 }
 const cleanAll = async (run) => { for (const { fn } of [...run.cleanups].reverse()) await fn(); };
 const byName = (name) => roboflowProbes.find((entry) => entry.name === name);
@@ -170,7 +191,7 @@ test('a faithful product passes every check exactly once, records the declared g
     assert.equal(new Set(run.order).size, run.order.length, 'no check is recorded twice');
     assert.deepEqual(run.gaps.map((gap) => gap.id).sort(), [...new Set(Object.values(ROBOFLOW_GAPS))].sort());
     assert.ok(run.gaps.every((gap) => gap.evidence.kind === 'declared-limitation'));
-    assert.deepEqual(run.world.started, { flows: 0, generations: 0, folders: 0 });
+    assert.deepEqual(run.world.started, { flows: 0, generations: 0 });
     // Positive control: every schedule body the run writes is disabled, and the cleanup exists before the first create.
     const writes = run.world.requests.filter((entry) => /\/schedules(\/cron_[0-9a-f]{24})?$/.test(entry.path) && ['POST', 'PUT'].includes(entry.method));
     assert.ok(writes.length >= 6, 'creates and updates by every actor were exercised');
@@ -182,6 +203,7 @@ test('a faithful product passes every check exactly once, records the declared g
     await cleanAll(run);
     assert.deepEqual(run.world.schedules, []);
     assert.deepEqual(run.world.workflows, []);
+    assert.equal(run.world.folders.size, 0, 'the run-owned folder is gone');
 });
 
 test('NEGATIVE: an ordinary user whose POST /schedules succeeds fails that check, and the leaked schedule is still removed', async () => {
@@ -236,11 +258,12 @@ test('a fully fail-open product fails every denial, yet no probe starts work and
         if (entry.policy === 'admin') for (const actor of ACTORS) assert.ok(run.failed.has(roboflowCheckId(entry, actor)), `${entry.name} ${actor} must fail`);
         else for (const actor of ['anonymous', 'selfRegistered']) assert.ok(run.failed.has(roboflowCheckId(entry, actor)), `${entry.name} ${actor} must fail`);
     }
-    assert.deepEqual(run.world.started, { flows: 0, generations: 0, folders: 0 }, 'nothing was launched');
+    assert.deepEqual(run.world.started, { flows: 0, generations: 0 }, 'nothing was launched');
     assert.ok(run.world.schedules.every((item) => item.enabled === false));
     await cleanAll(run);
     assert.deepEqual(run.world.schedules, []);
     assert.deepEqual(run.world.workflows, []);
+    assert.equal(run.world.folders.size, 0, 'the run-owned folder is gone');
 });
 
 test('an unavailable administrator fixture fails its dependents; it never turns into a pass or a gap', async () => {
@@ -269,4 +292,54 @@ test('schedule payloads are always disabled, whatever the caller asks for', () =
     assert.strictEqual(roboflowScheduleBody('n', '/w').enabled, false);
     assert.strictEqual(roboflowScheduleBody('n', '/w', { enabled: true }).enabled, false);
     assert.equal(roboflowScheduleBody('n', '/w').workflowTypeId, 'default');
+});
+
+const FOLDER_CHECK = 'agent.roboflow.schedule-folders.create.admin';
+const CHILD = 'authz-mk1-0a1b2c3d-folder';
+
+test('folder create positive: matching roots create one run-owned child, cleanup is armed first, guarded, and leaves nothing', async () => {
+    const run = await runWorld();
+    assert.ok(run.passed.includes(FOLDER_CHECK));
+    assert.ok(run.armed.atFolderCreate >= 2, 'the folder cleanup (and the sweep) are registered before the create request');
+    assert.ok(run.world.folders.has(CHILD));
+    const created = run.world.requests.filter((entry) => entry.path.endsWith('/schedule-folders') && entry.body?.name === CHILD);
+    assert.equal(created.length, 1);
+    assert.equal(created[0].actor, 'admin');
+    await cleanAll(run);
+    assert.equal(run.world.folders.size, 0);
+    const deletes = run.world.explorerCalls.filter((call) => call.tool === 'delete_directory');
+    assert.deepEqual(deletes.map((call) => call.args.path), [`/workspace/${CHILD}`], 'only the exact run-owned child is deleted, directly under the root');
+    assert.ok(run.world.explorerCalls.every((call) => call.principal === 'admin' && call.agent === 'explorer'));
+});
+
+test('NEGATIVE: a root mismatch fails the folder create check early, creates nothing and arms no folder cleanup', async () => {
+    for (const options of [{ explorerRoot: '/other/workspace' }, { explorerListFails: true }]) {
+        const run = await runWorld(options);
+        assert.deepEqual([...run.failed.keys()], [FOLDER_CHECK], JSON.stringify(options));
+        assert.match(run.failed.get(FOLDER_CHECK), options.explorerListFails ? /unavailable/ : /ROOT_INCOMPATIBLE/);
+        assert.equal(run.world.folders.size, 0);
+        assert.equal(run.world.requests.some((entry) => entry.path.endsWith('/schedule-folders') && entry.body?.name === CHILD), false, 'no create request was sent');
+        assert.equal(run.world.explorerCalls.some((call) => call.tool === 'delete_directory'), false);
+        assert.equal(run.cleanups.length, 1, 'only the schedule and workflow sweep is armed');
+        assert.deepEqual(run.gaps.map((gap) => gap.id).sort(), [...new Set(Object.values(ROBOFLOW_GAPS))].sort(), 'a mismatch is never converted into a gap');
+    }
+});
+
+test('NEGATIVE: a failed Explorer delete is a recorded cleanup FAILURE and the folder is still reported', async () => {
+    const run = await runWorld({ deleteFails: true });
+    assert.deepEqual([...run.failed], [], 'the run itself passes');
+    await runOwnedCleanup(run.ctx, run.cleanups.map((entry) => entry.fn), { closeStreams() {} });
+    const statuses = run.ctx.report.cleanup.map((entry) => entry.status);
+    assert.deepEqual(statuses.slice().sort(), ['FAIL', 'PASS'], 'exactly the folder cleanup failed');
+    assert.match(run.ctx.report.cleanup.find((entry) => entry.status === 'FAIL').error, /run-owned schedule folder cleanup/);
+    assert.ok(run.world.folders.has(CHILD), 'the undeleted folder is left in place for the operator');
+});
+
+test('NEGATIVE: a create that answers a different path fails the check, and the guarded cleanup still removes only the expected child', async () => {
+    const run = await runWorld({ createReturnsFolder: '/elsewhere/authz-mk1-0a1b2c3d-folder' });
+    assert.deepEqual([...run.failed.keys()], [FOLDER_CHECK]);
+    assert.match(run.failed.get(FOLDER_CHECK), /root plus the child name/);
+    await cleanAll(run);
+    assert.equal(run.world.folders.size, 0);
+    assert.deepEqual(run.world.explorerCalls.filter((call) => call.tool === 'delete_directory').map((call) => call.args.path), [`/workspace/${CHILD}`]);
 });

@@ -1128,10 +1128,12 @@
       "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
     },
     {
-      "id": "agent.roboflow.schedule-folders.create.admin-reach",
+      "id": "agent.roboflow.schedule-folders.create.admin",
       "kind": "live",
       "count": 1,
-      "positiveControlAnyOf": null,
+      "positiveControlAnyOf": [
+        "agent.roboflow.schedule-folders.list.admin"
+      ],
       "boundary": "agents",
       "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
     },
@@ -1140,7 +1142,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.roboflow.schedule-folders.create.admin-reach"
+        "agent.roboflow.schedule-folders.create.admin"
       ],
       "boundary": "agents",
       "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
@@ -1150,7 +1152,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.roboflow.schedule-folders.create.admin-reach"
+        "agent.roboflow.schedule-folders.create.admin"
       ],
       "boundary": "agents",
       "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
@@ -1160,7 +1162,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.roboflow.schedule-folders.create.admin-reach"
+        "agent.roboflow.schedule-folders.create.admin"
       ],
       "boundary": "agents",
       "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"
@@ -1170,7 +1172,7 @@
       "kind": "live",
       "count": 1,
       "positiveControlAnyOf": [
-        "agent.roboflow.schedule-folders.create.admin-reach"
+        "agent.roboflow.schedule-folders.create.admin"
       ],
       "boundary": "agents",
       "source": "tests/security/authorization/agent-probes.mjs runRoboflowProbes"

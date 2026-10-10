@@ -218,7 +218,7 @@ test('REJECT: the RoboFlow probes are consumed like the other agent probes (fail
     const ids = mandatory.checks.filter(c => c.id.startsWith('agent.roboflow.')).map(c => c.id);
     assert.equal(ids.length, 110, 'the 22 RoboFlow probes contribute 110 mandatory checks');
     assert.deepEqual(acceptedRun().report.gaps.map(g => g.id).filter(id => id.startsWith('agent.roboflow.')).sort(), expectedGaps.gaps.map(g => g.id).filter(id => id.startsWith('agent.roboflow.')).sort());
-    assert.equal(expectedGaps.gaps.filter(g => g.id.startsWith('agent.roboflow.')).length, 5);
+    assert.equal(expectedGaps.gaps.filter(g => g.id.startsWith('agent.roboflow.')).length, 4);
     // An ordinary user's POST /schedules denial that FAILs rejects the run.
     let run = acceptedRun();
     run.report.checks.find(c => c.id === 'agent.roboflow.schedules.create.userA').status = 'FAIL';
@@ -239,6 +239,11 @@ test('REJECT: the RoboFlow probes are consumed like the other agent probes (fail
     run = acceptedRun();
     run.report.gaps.push({ id: 'agent.roboflow.flows.start.admin', reason: 'r', evidence: { kind: 'declared-limitation' } });
     expectReject(run, 'GAP_UNEXPECTED', 'unlisted RoboFlow gap');
+    // The schedule-folder create positive is a mandatory check now; recording it as a gap again is unexpected.
+    run = acceptedRun();
+    run.report.gaps.push({ id: 'agent.roboflow.schedule-folders.create.admin-positive', reason: 'r', evidence: { kind: 'declared-limitation' } });
+    expectReject(run, 'GAP_UNEXPECTED', 'folder create gap resurrected');
+    assert.ok(mandatory.checks.some(c => c.id === 'agent.roboflow.schedule-folders.create.admin'));
 });
 
 test('C4 acceptance requires the fixture, its positive dependencies and all five feed actors', () => {
