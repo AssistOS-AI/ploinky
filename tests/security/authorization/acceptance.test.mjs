@@ -214,6 +214,33 @@ test('REJECT: a mandatory check that is missing, FAIL, duplicated, or whose posi
     expectReject(run, 'MANDATORY_POSITIVE_CONTROL_FAILED', 'deny without positive');
 });
 
+test('REJECT: the RoboFlow probes are consumed like the other agent probes (failed denial, missing control, missing gap)', () => {
+    const ids = mandatory.checks.filter(c => c.id.startsWith('agent.roboflow.')).map(c => c.id);
+    assert.equal(ids.length, 110, 'the 22 RoboFlow probes contribute 110 mandatory checks');
+    assert.deepEqual(acceptedRun().report.gaps.map(g => g.id).filter(id => id.startsWith('agent.roboflow.')).sort(), expectedGaps.gaps.map(g => g.id).filter(id => id.startsWith('agent.roboflow.')).sort());
+    assert.equal(expectedGaps.gaps.filter(g => g.id.startsWith('agent.roboflow.')).length, 5);
+    // An ordinary user's POST /schedules denial that FAILs rejects the run.
+    let run = acceptedRun();
+    run.report.checks.find(c => c.id === 'agent.roboflow.schedules.create.userA').status = 'FAIL';
+    run.report.counts = { PASS: run.report.counts.PASS - 1, FAIL: 1, ERROR: 0 };
+    run.report.verdict = 'FAIL';
+    run.exitCode = 1;
+    expectReject(run, 'MANDATORY_NOT_PASS', 'failed ordinary-user schedule create denial');
+    // A denial counts only when its administrator control passed in the same run.
+    run = acceptedRun();
+    run.report.checks = run.report.checks.filter(c => c.id !== 'agent.roboflow.schedules.run-now.admin-reach');
+    run.report.counts.PASS = run.report.checks.length;
+    expectReject(run, 'MANDATORY_POSITIVE_CONTROL_FAILED', 'run-now denials without the administrator reach control');
+    // A declared limitation that is not recorded is a missing gap.
+    run = acceptedRun();
+    run.report.gaps = run.report.gaps.filter(g => g.id !== 'agent.roboflow.schedules.run-now.admin-positive');
+    expectReject(run, 'GAP_MISSING', 'run-now administrator positive gap not recorded');
+    // A recorded limitation must not also be satisfied as a passing check, and an unlisted RoboFlow gap is unexpected.
+    run = acceptedRun();
+    run.report.gaps.push({ id: 'agent.roboflow.flows.start.admin', reason: 'r', evidence: { kind: 'declared-limitation' } });
+    expectReject(run, 'GAP_UNEXPECTED', 'unlisted RoboFlow gap');
+});
+
 test('C4 acceptance requires the fixture, its positive dependencies and all five feed actors', () => {
     const fixture = 'agent.tool.webmeet_room_list.fixture';
     const feed = 'agent.tool.webmeet_room_events_list';

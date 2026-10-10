@@ -1726,7 +1726,7 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
+      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
     },
     {
       "id": "agent.roboflow.generation.admin-positive",
@@ -1741,7 +1741,7 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
+      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
     },
     {
       "id": "agent.roboflow.schedule-folders.create.admin-positive",
@@ -1756,7 +1756,7 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
+      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
     },
     {
       "id": "agent.roboflow.flows.start.positive",
@@ -1771,7 +1771,7 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
+      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
     },
     {
       "id": "agent.roboflow.flows.run-mutations.positive",
@@ -1786,7 +1786,7 @@
       "evidence": {
         "kind": "declared-limitation"
       },
-      "reviewedBy": "pending: independent delta plan review and Codex review of the four acceptance files (plan rev4 step 1)"
+      "reviewedBy": "pending: independent code-reviewer-xhigh review of the Phase B RoboFlow probes (plan 2026-10-10 r5, B2)"
     }
   ]
 }
