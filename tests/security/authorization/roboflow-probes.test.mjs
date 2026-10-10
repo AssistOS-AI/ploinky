@@ -23,8 +23,12 @@ const ACTORS = ['anonymous', 'selfRegistered', 'userA', 'userB'];
  * the only things the probes must never cause.
  */
 function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRegisteredRefusal = ENTITLEMENT, everyoneReaches = false, usersCannotListSchedules = false, adminCreateFails = false, routerRefusesUsers = false,
-    explorerRoot = '/workspace', explorerListFails = false, deleteFails = false, createReturnsFolder = null } = {}) {
-    const schedules = [], workflows = [], requests = [], folders = new Set(), explorerCalls = [];
+    explorerRoot = '/workspace', explorerListFails = false, deleteFails = false, createReturnsFolder = null, preexisting = null } = {}) {
+    const schedules = [], workflows = [], requests = [], folders = new Set(), files = new Set(), symlinks = new Map(), explorerCalls = [];
+    // A pre-existing entry named like the run-owned child: a directory, a file or a symlink (to the named sibling).
+    if (preexisting?.type === 'dir') folders.add(preexisting.name);
+    if (preexisting?.type === 'file') files.add(preexisting.name);
+    if (preexisting?.type === 'symlink') { folders.add(preexisting.target); symlinks.set(preexisting.name, preexisting.target); }
     const started = { flows: 0, generations: 0 };
     let sequence = 0;
     const gate = (actor, name) => actor === 'admin' || everyoneReaches || open.has(name) ? null
@@ -33,16 +37,24 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
     function handle(actor, { method, path: full, body }) {
         requests.push({ actor, method, path: full, body: body === undefined ? undefined : structuredClone(body) });
         assert.ok(full.startsWith(ROBOFLOW_BASE), `unexpected path ${full}`);
-        const route = full.slice(ROBOFLOW_BASE.length).split('?')[0];
+        const [route, query = ''] = full.slice(ROBOFLOW_BASE.length).split('?');
         if (actor === 'anonymous' && !everyoneReaches) return json(401, { ok: false, error: 'authentication required' });
         if (actor === 'selfRegistered' && !selfRegisteredReaches && !everyoneReaches) return json(403, selfRegisteredRefusal);
         const refuse = (name) => gate(actor, name);
         let match;
+        if (method === 'GET' && route === '/schedule-folders' && query.startsWith('path=')) {
+            // ScheduleFolders.directory: lstat each segment; absent 404, symlink or non-directory 400, ordinary directory 200.
+            const refused = refuse('schedule-folders.list'); if (refused) return refused;
+            const name = decodeURIComponent(query.slice(5));
+            if (symlinks.has(name) || files.has(name)) return json(400, { ok: false, error: 'Choose an ordinary workspace folder' });
+            if (!folders.has(name)) return json(404, { ok: false, error: 'Folder not found' });
+            return json(200, { ok: true, path: name, folder: `/workspace/${name}`, folders: [] });
+        }
         if (method === 'GET' && route === '/schedule-folders') return refuse('schedule-folders.list') || json(200, { ok: true, folder: '/workspace', folders: [...folders].map((name) => ({ name, path: name })), defaultPath: 'cron-jobs-results' });
         if (method === 'POST' && route === '/schedule-folders') {
             const refused = refuse('schedule-folders.create'); if (refused) return refused;
             if (typeof body?.name !== 'string' || body.name.includes('/')) return json(400, { ok: false, error: 'Enter one folder name without slashes' });
-            if (folders.has(body.name)) return json(409, { ok: false, error: 'A folder or file with that name already exists' });
+            if (folders.has(body.name) || files.has(body.name) || symlinks.has(body.name)) return json(409, { ok: false, error: 'A folder or file with that name already exists' });
             folders.add(body.name);
             return json(201, { ok: true, path: body.name, folder: createReturnsFolder || `/workspace/${body.name}`, folders: [...folders].map((name) => ({ name, path: name })) });
         }
@@ -115,15 +127,30 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
     async function mcp(principal, agent, tool, args = {}) {
         explorerCalls.push({ principal, agent, tool, args: structuredClone(args) });
         if (tool === 'list_allowed_directories') return explorerListFails ? { failed: true, value: undefined, response: { status: 503 }, error: 'unavailable' } : explorerOk(`Allowed directories:\n${explorerRoot}`);
-        if (tool === 'list_directory') return explorerOk(args.path === explorerRoot ? [...folders].map((name) => `[DIR] ${name}`).join('\n') : '');
+        if (tool === 'list_directory') return explorerOk(args.path === explorerRoot ? [...[...folders].map((name) => `[DIR] ${name}`), ...[...files].map((name) => `[FILE] ${name}`), ...[...symlinks.keys()].map((name) => `[LINK] ${name}`)].join('\n') : '');
+        if (tool === 'get_file_info') {
+            // Explorer stats after realpath, so a symlink to a directory reports a directory.
+            const name = args.path.startsWith('/workspace/') ? args.path.slice('/workspace/'.length) : '';
+            const real = symlinks.get(name) ?? name;
+            if (folders.has(real)) return { failed: false, value: { path: args.path, isFile: false, isDirectory: true }, response: { status: 200 } };
+            if (files.has(real)) return { failed: false, value: { path: args.path, isFile: true, isDirectory: false }, response: { status: 200 } };
+            return { failed: true, value: undefined, response: { status: 500 }, error: 'ENOENT' };
+        }
         if (tool === 'delete_directory') {
             if (deleteFails) return { failed: true, value: undefined, response: { status: 500 }, error: 'delete refused' };
-            if (args.path.startsWith('/workspace/')) folders.delete(args.path.slice('/workspace/'.length));
+            if (args.path.startsWith('/workspace/')) {
+                // fs.rm after realpath: a symlink deletes its target, a regular entry deletes itself.
+                const name = args.path.slice('/workspace/'.length);
+                const real = symlinks.get(name) ?? name;
+                folders.delete(real); files.delete(real); symlinks.delete(name);
+            }
             return explorerOk(`Successfully deleted directory ${args.path}`);
         }
         throw new Error(`unexpected Explorer tool ${tool}`);
     }
-    return { handle, mcp, schedules, workflows, requests, started, folders, explorerCalls };
+    // The run-owned child is replaced by a symlink to a sibling directory between the create and the cleanup.
+    function swapForSymlink(name, sibling) { folders.delete(name); folders.add(sibling); symlinks.set(name, sibling); }
+    return { handle, mcp, schedules, workflows, requests, started, folders, files, symlinks, explorerCalls, swapForSymlink };
 }
 
 async function runWorld(options = {}) {
@@ -335,11 +362,46 @@ test('NEGATIVE: a failed Explorer delete is a recorded cleanup FAILURE and the f
     assert.ok(run.world.folders.has(CHILD), 'the undeleted folder is left in place for the operator');
 });
 
-test('NEGATIVE: a create that answers a different path fails the check, and the guarded cleanup still removes only the expected child', async () => {
+test('NEGATIVE: a create that answers a different path fails the check, and cleanup refuses to delete what it cannot prove it created', async () => {
     const run = await runWorld({ createReturnsFolder: '/elsewhere/authz-mk1-0a1b2c3d-folder' });
     assert.deepEqual([...run.failed.keys()], [FOLDER_CHECK]);
     assert.match(run.failed.get(FOLDER_CHECK), /root plus the child name/);
+    await runOwnedCleanup(run.ctx, run.cleanups.map((entry) => entry.fn), { closeStreams() {} });
+    assert.deepEqual(run.ctx.report.cleanup.map((entry) => entry.status).sort(), ['FAIL', 'PASS']);
+    assert.match(run.ctx.report.cleanup.find((entry) => entry.status === 'FAIL').error, /not run-owned/);
+    assert.equal(run.world.explorerCalls.some((call) => call.tool === 'delete_directory'), false, 'nothing is deleted without a 201 for the exact path');
+});
+
+test('NEGATIVE: a run-owned child swapped for a symlink to a sibling is not deleted, and the cleanup failure is recorded', async () => {
+    const run = await runWorld();
+    assert.ok(run.passed.includes(FOLDER_CHECK));
+    run.world.swapForSymlink(CHILD, 'precious-sibling');
+    await runOwnedCleanup(run.ctx, run.cleanups.map((entry) => entry.fn), { closeStreams() {} });
+    assert.deepEqual(run.ctx.report.cleanup.map((entry) => entry.status).sort(), ['FAIL', 'PASS']);
+    assert.match(run.ctx.report.cleanup.find((entry) => entry.status === 'FAIL').error, /no longer an ordinary directory/);
+    assert.equal(run.world.explorerCalls.some((call) => call.tool === 'delete_directory'), false, 'delete_directory is never called on a swapped path');
+    assert.ok(run.world.folders.has('precious-sibling'), 'the sibling the symlink points at survives');
+});
+
+test('NEGATIVE: a pre-existing entry with the run-owned name (directory, file or symlink) fails the check, is never created over or deleted, and cleanup reports it as not run-owned', async () => {
+    for (const type of ['dir', 'file', 'symlink']) {
+        const run = await runWorld({ preexisting: { name: CHILD, type, target: 'precious-sibling' } });
+        assert.deepEqual([...run.failed.keys()], [FOLDER_CHECK], type);
+        assert.match(run.failed.get(FOLDER_CHECK), /already exists/, type);
+        assert.equal(run.world.requests.some((entry) => entry.path.endsWith('/schedule-folders') && entry.body?.name === CHILD), false, `${type}: no create request`);
+        await runOwnedCleanup(run.ctx, run.cleanups.map((entry) => entry.fn), { closeStreams() {} });
+        assert.deepEqual(run.ctx.report.cleanup.map((entry) => entry.status).sort(), ['FAIL', 'PASS'], type);
+        assert.match(run.ctx.report.cleanup.find((entry) => entry.status === 'FAIL').error, /not run-owned/, type);
+        assert.equal(run.world.explorerCalls.some((call) => call.tool === 'delete_directory'), false, `${type}: nothing deleted`);
+        const stillThere = type === 'dir' ? run.world.folders.has(CHILD) : type === 'file' ? run.world.files.has(CHILD) : run.world.symlinks.has(CHILD);
+        assert.ok(stillThere, `${type}: the pre-existing entry is untouched`);
+    }
+});
+
+test('the normal cleanup inspects before it deletes and checks absence afterwards under any entry type', async () => {
+    const run = await runWorld();
     await cleanAll(run);
-    assert.equal(run.world.folders.size, 0);
-    assert.deepEqual(run.world.explorerCalls.filter((call) => call.tool === 'delete_directory').map((call) => call.args.path), [`/workspace/${CHILD}`]);
+    const tools = run.world.explorerCalls.map((call) => call.tool);
+    assert.ok(tools.indexOf('get_file_info') > -1 && tools.indexOf('get_file_info') < tools.indexOf('delete_directory'), 'Explorer inspects the path before deleting it');
+    assert.ok(tools.lastIndexOf('list_directory') > tools.indexOf('delete_directory'), 'Explorer is listed again after the delete');
 });

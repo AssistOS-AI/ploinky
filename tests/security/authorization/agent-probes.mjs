@@ -1029,34 +1029,59 @@ export async function runRoboflowProbes(ctx, { mcp = createResourceMcp(ctx) } = 
     const normalizeRoot = (value) => path.posix.normalize(String(value)).replace(/(.)\/+$/, '$1');
     const folderBody = () => ({ body: { name: 'authorization/probe' } });
     await denyAdminRoute(P['schedule-folders.create'], folderBody);
+    // Deletion safety. Explorer delete_directory realpaths its argument and removes it recursively, so a path that has
+    // been swapped for a symlink would delete the link target. The run therefore deletes only a directory it provably
+    // created: (1) before the create, no entry of any type with that name exists, seen by RoboTeam (path read, which
+    // lstat-rejects symlinks and non-directories) and by Explorer (listing under any [TYPE] prefix); (2) cleanup deletes only
+    // when the create answered 201 for exactly root + name; (3) immediately before deleting, RoboTeam must still report an
+    // ordinary directory at that exact path and Explorer must report a directory; (4) afterwards the name is absent in both.
+    // A TOCTOU window remains between the last pre-delete read and the delete (the file tools offer no atomic
+    // lstat-and-remove, and nothing else should write under a run-prefixed name during the run); it is accepted and documented.
+    const explorerNames = (rawText) => String(rawText || '').split('\n').map((line) => line.replace(/^\[[A-Za-z_-]+\]\s*/, '').trim()).filter(Boolean);
     await adminControl(P['schedule-folders.create'], async () => {
         assert.ok(state.root, 'The RoboTeam workspace root is unavailable');
         assert.ok(state.explorerRoot, state.explorerRootError || 'The Explorer allowed root is unavailable');
         assert.equal(normalizeRoot(state.root), normalizeRoot(state.explorerRoot),
             'ROOT_INCOMPATIBLE: the RoboTeam schedule-folder root differs from Explorer\'s first allowed root; nothing was created');
+        const root = normalizeRoot(state.root);
         const child = owned('folder');
-        const childPath = path.posix.join(normalizeRoot(state.root), child);
-        // Armed before the create. Guarded: only the exact run-owned child directly under the root is ever removed.
+        const childPath = path.posix.join(root, child);
+        const owner = { created: false, existedBefore: false };
+        const childRead = () => ctx.request('admin', { method: 'GET', path: `${ROBOFLOW_BASE}/schedule-folders?path=${encodeURIComponent(child)}` });
+        const explorerListing = async (label) => explorerNames(assertAllowed(await mcp('admin', 'explorer', 'list_directory', { path: root }), label).rawText);
+        // Armed before anything can create it; it deletes only what this run created.
         ctx.cleanup(async () => {
-            assert.equal(path.posix.dirname(childPath), normalizeRoot(state.root), 'Folder cleanup must act directly under the root');
-            assert.equal(path.posix.basename(childPath), child, 'Folder cleanup must act on the exact run-owned child');
             await ctx.guard();
+            if (!owner.created) {
+                // Nothing of this run to remove. If the name exists anyway it was not created here: leave it and report it.
+                const read = await childRead();
+                assert.equal(read.status, 404, `The folder ${child} exists but is not run-owned (not created by this run); it was left untouched`);
+                assert.equal((await explorerListing('Explorer root listing')).includes(child), false, `${child} is visible to Explorer but is not run-owned; it was left untouched`);
+                return;
+            }
+            const before = await childRead();
+            assert.equal(before.status, 200, `The run-owned folder is no longer an ordinary directory (HTTP ${before.status}); it was not deleted`);
+            assert.equal(before.json?.folder, childPath, 'RoboTeam reports a different location for the run-owned folder; it was not deleted');
+            const info = assertAllowed(await mcp('admin', 'explorer', 'get_file_info', { path: childPath }), 'Explorer inspection before folder cleanup');
+            assert.equal(info.isDirectory, true, 'Explorer does not report the run-owned folder as a directory; it was not deleted');
             assertAllowed(await mcp('admin', 'explorer', 'delete_directory', { path: childPath }), 'run-owned schedule folder cleanup');
-            const listing = await call('admin', P['schedule-folders.list'], {});
-            assert.equal(listing.status, 200, 'The folder listing must answer after cleanup');
-            assert.equal((listing.json?.folders || []).some((item) => item.name === child), false, 'The run-owned folder is still listed by RoboTeam after cleanup');
-            const explorer = assertAllowed(await mcp('admin', 'explorer', 'list_directory', { path: normalizeRoot(state.root) }), 'Explorer root listing after folder cleanup');
-            assert.equal(String(explorer.rawText || '').split('\n').some((line) => line.replace(/^\[DIR\]\s*/, '').trim() === child), false, 'The run-owned folder is still visible to Explorer after cleanup');
+            const after = await childRead();
+            assert.equal(after.status, 404, 'The run-owned folder is still present in RoboTeam after cleanup');
+            assert.equal((await explorerListing('Explorer root listing after folder cleanup')).includes(child), false, 'The run-owned folder is still visible to Explorer after cleanup');
         });
+        const existing = await childRead();
+        owner.existedBefore = existing.status !== 404;
+        assert.equal(existing.status, 404, `A folder named ${child} already exists (HTTP ${existing.status}); nothing was created`);
+        assert.equal((await explorerListing('Explorer root listing before the create')).includes(child), false, `An entry named ${child} already exists for Explorer; nothing was created`);
         const response = await call('admin', P['schedule-folders.create'], { body: { name: child } });
+        owner.created = response.status === 201 && response.json?.ok === true && response.json.folder === childPath && response.json.path === child;
         assert.equal(response.status, 201);
         assert.equal(response.json?.ok, true);
         assert.equal(response.json.path, child, 'The create answer names the child relative to the root');
         assert.equal(response.json.folder, childPath, 'The create answer is the root plus the child name');
         const listing = await call('admin', P['schedule-folders.list'], {});
         assert.equal((listing.json?.folders || []).some((item) => item.name === child), true, 'RoboTeam lists the created child');
-        const explorer = assertAllowed(await mcp('admin', 'explorer', 'list_directory', { path: normalizeRoot(state.root) }), 'Explorer root listing');
-        assert.equal(String(explorer.rawText || '').split('\n').some((line) => line.replace(/^\[DIR\]\s*/, '').trim() === child), true, 'Explorer sees the same created child');
+        assert.equal((await explorerListing('Explorer root listing')).includes(child), true, 'Explorer sees the same created child');
     });
 
     // ---- workflow validation and generation (no persistence, no model work) ---------------------
