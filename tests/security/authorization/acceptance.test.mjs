@@ -1044,7 +1044,7 @@ test('Router workspace-write matrix: all 68 checks are mandatory, counted once a
         assert.ok(['admin', 'userA'].includes(positive.actor), 'the positive is an entitled actor');
     }
     assert.equal(denials.filter(r => r.operation === 'sink-upload').every(r => r.positiveControl === 'router:workspace-upload-owner-positive:admin'), true);
-    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 612, offline: 10 });
+    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 722, offline: 10 });
 });
 
 test('Router workspace-write matrix: no row can be satisfied as an expected gap, and an unavailable denial rejects twice', () => {
