@@ -974,6 +974,10 @@ const cloudflaredRouterIntegration = createCloudflaredRouterIntegration({
 });
 
 server.on('upgrade', async (req, socket, head) => {
+    // An upgraded socket has no 'error' listener until a downstream handler
+    // attaches one, so a client reset during the access check would be
+    // uncaught. This only absorbs the event; teardown stays with the paths below.
+    socket.on('error', () => {});
     try {
         const exactHost = normalizeExactHost(req.headers.host);
         if (!exactHost || !String(req.url || '').startsWith('/')) {
