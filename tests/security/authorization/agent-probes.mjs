@@ -1059,11 +1059,13 @@ export async function runRoboflowProbes(ctx, { mcp = createResourceMcp(ctx) } = 
                 assert.equal((await explorerListing('Explorer root listing')).includes(child), false, `${child} is visible to Explorer but is not run-owned; it was left untouched`);
                 return;
             }
+            // Explorer stats after realpath, so it cannot see a symlink; it goes first, and the lstat-rejecting RoboTeam read is the
+            // last step before the delete.
+            const info = assertAllowed(await mcp('admin', 'explorer', 'get_file_info', { path: childPath }), 'Explorer inspection before folder cleanup');
+            assert.equal(info.isDirectory, true, 'Explorer does not report the run-owned folder as a directory; it was not deleted');
             const before = await childRead();
             assert.equal(before.status, 200, `The run-owned folder is no longer an ordinary directory (HTTP ${before.status}); it was not deleted`);
             assert.equal(before.json?.folder, childPath, 'RoboTeam reports a different location for the run-owned folder; it was not deleted');
-            const info = assertAllowed(await mcp('admin', 'explorer', 'get_file_info', { path: childPath }), 'Explorer inspection before folder cleanup');
-            assert.equal(info.isDirectory, true, 'Explorer does not report the run-owned folder as a directory; it was not deleted');
             assertAllowed(await mcp('admin', 'explorer', 'delete_directory', { path: childPath }), 'run-owned schedule folder cleanup');
             const after = await childRead();
             assert.equal(after.status, 404, 'The run-owned folder is still present in RoboTeam after cleanup');
@@ -1226,6 +1228,152 @@ export async function runRoboflowProbes(ctx, { mcp = createResourceMcp(ctx) } = 
     ]) ctx.recordGap(id, reason, { kind: 'declared-limitation' });
 }
 
+// ---------------------------------------------------------------------------------------------
+// RoboTeam family gate (decision D14, AchillesCLI roboTeamAgent/server/http-server.mjs at 4943549a; the table and
+// reach answers are in the combined D13+D14 SPEC, "Harness additions"). Every gated path of the 3001 family refuses a
+// signed user without the Explorer entitlement with exactly this 403, before any role or route logic.
+// selfRegistered must receive it exactly; anonymous needs an authorization denial (Router 401); userA, userB and
+// admin must reach the route's documented answer. /status is exempt from the gate (the Router readiness path).
+// No request may start work even if the gate fails open: every robot is absent, and bodies fail before dispatch.
+// Before the block, an admin listing must show no robot with the absent id or name; a collision aborts the block,
+// fails every check and sends no probe request.
+export const ROBOTEAM_ENTITLEMENT_REFUSAL = Object.freeze({ status: 403, error: 'Explorer access permission is required to use RoboTeam' });
+export const ROBOTEAM_BASE = '/base-agent-additional-server/roboTeamAgent/3001';
+export const ROBOTEAM_GAPS = Object.freeze({
+    websocketLive: 'agent.roboteam.session.websocket.live',
+});
+const ROBOTEAM_SOURCE = 'AchillesCLI/roboTeamAgent/server/http-server.mjs';
+const RT_ZERO_UUID = '00000000-0000-4000-8000-000000000000';
+const RT_ZERO_UUID_2 = '00000000-0000-4000-8000-000000000001';
+const notFound = (error = 'robot not found') => Object.freeze({ kind: 'json-error', status: 404, error });
+const roboteamProbe = (name, method, route, reachAnswer, lines, extra = {}) => Object.freeze({ name, method, path: route, reach: reachAnswer, source: `${ROBOTEAM_SOURCE}:${lines}`, ...extra });
+const controlBody = (operation, more = {}) => ({ robotName: ':absent', operation, ...more });
+/**
+ * The 17 probes. ':absent' in a path or body is replaced by the run-owned absent robot name. `inventory` is the
+ * agent-inventory.mjs row id each probe contacts (all of them also match the roboTeamAgent wildcard row in coverage.mjs).
+ */
+export const roboteamProbes = Object.freeze([
+    roboteamProbe('page.root', 'GET', '/', Object.freeze({ kind: 'html', status: 200, includes: '<base href=' }), '465'),
+    roboteamProbe('config', 'GET', '/config.js', Object.freeze({ kind: 'text-prefix', status: 200, prefix: 'globalThis.ROBOTEAM_CONFIG=' }), '466-470'),
+    roboteamProbe('asset.styles', 'GET', '/styles.css', Object.freeze({ kind: 'css', status: 200 }), '472'),
+    roboteamProbe('page.flows', 'GET', '/flows', Object.freeze({ kind: 'html', status: 200 }), '259-262'),
+    roboteamProbe('run.get', 'GET', '/api/robots/:absent/run', notFound(), '675-681'),
+    roboteamProbe('run.start', 'POST', '/api/robots/:absent/run', notFound(), '682-686', { body: { mode: 'browser' } }),
+    roboteamProbe('run.stop', 'DELETE', '/api/robots/:absent/run', notFound(), '687-692'),
+    roboteamProbe('logs', 'GET', '/api/robots/:absent/logs', notFound(), '700-705'),
+    roboteamProbe('session.http', 'GET', '/api/robots/:absent/session/', notFound(), '457-464'),
+    roboteamProbe('control.start-simple-task', 'POST', '/api/control', notFound(), '606-611', { body: controlBody('start-simple-task', { task: 'authorization probe, never run' }) }),
+    roboteamProbe('control.open-desktop', 'POST', '/api/control', notFound(), '606-611', { body: controlBody('open-desktop') }),
+    roboteamProbe('control.message-task', 'POST', '/api/control', notFound(), '606-611', { body: controlBody('message-task', { prompt: 'probe' }) }),
+    roboteamProbe('control.robot-delete', 'POST', '/api/control', notFound(), '606-614', { body: controlBody('robot-delete') }),
+    // Ordinary users reach the administrator refusal before any create; the administrator is not probed (it would create a robot).
+    roboteamProbe('robots.create', 'POST', '/api/robots', Object.freeze({ kind: 'json-error', status: 403, error: 'administrator role is required' }), '550-552', { body: { name: '' }, adminProbed: false }),
+    roboteamProbe('summary.session', 'GET', `/api/summary?session=${RT_ZERO_UUID}`, notFound('Summary source not found'), '486-488'),
+    roboteamProbe('webchat.logs', 'GET', `/api/webchat/logs/${RT_ZERO_UUID}/${RT_ZERO_UUID_2}`, Object.freeze({ kind: 'text', status: 404, text: 'log not found' }), '516-519'),
+    roboteamProbe('status.exempt', 'GET', '/status', Object.freeze({ kind: 'status-ok', status: 200 }), '443-445', { exempt: true }),
+]);
+/** Read routes of the family that are not probed live (unit-covered only). */
+export const ROBOTEAM_UNPROBED = Object.freeze([
+    'GET /api/required-skills :494-498 (may prepare DocumentationSkills over the network)',
+    'GET, PATCH /api/robots/:id/conversations/:sid/skills :503-512 (404 shape for an absent robot not pinned)',
+    'GET /summary and /webchat-logs/:s/:m and /conversation-skills* pages :485, :500-502, :514-515',
+    'GET /robots/:id/logs page :694-699',
+    'administrator robot routes: POST /api/robots/:id/terminal, GET /api/robots/:id/models, GET/PATCH /api/robots/:id/coding-agents, POST/DELETE/PATCH /api/robots/:id/skillsets :535-605',
+    'WebSocket upgrade /api/robots/:id/session/* (see ROBOTEAM_GAPS.websocketLive)',
+]);
+const roboteamActors = Object.freeze(['anonymous', 'selfRegistered', 'userA', 'userB']);
+export const roboteamCheckId = (entry, actor) => `agent.roboteam.${entry.name}.${actor}`;
+/** Every mandatory check the RoboTeam runner records, with its positive control. */
+export function roboteamCheckDefinitions() {
+    const source = 'tests/security/authorization/agent-probes.mjs runRoboteamProbes';
+    const out = [];
+    for (const entry of roboteamProbes) {
+        // robots.create has no administrator probe; the existing administrator robot listing is its control.
+        const control = entry.adminProbed === false ? 'agent.robot.list.admin' : roboteamCheckId(entry, 'admin');
+        if (entry.adminProbed !== false) out.push({ id: control, kind: 'live', boundary: 'agents', source, positiveControlAnyOf: null });
+        for (const actor of roboteamActors) out.push({ id: roboteamCheckId(entry, actor), kind: 'live', boundary: 'agents', source, positiveControlAnyOf: entry.exempt && actor === 'anonymous' ? null : [control] });
+    }
+    return out;
+}
+/** RoboTeam's entitlement refusal for the family (D14), exactly: no CSRF, origin, login or administrator refusal may stand in for it. */
+export function assertRoboteamEntitlementRefusal(response) {
+    assert.equal(response.status, ROBOTEAM_ENTITLEMENT_REFUSAL.status, `Expected RoboTeam's family entitlement refusal; got ${response.status}`);
+    assert.equal(response.json?.ok, false, 'The entitlement refusal must be an explicit failure');
+    assert.equal(response.json?.error, ROBOTEAM_ENTITLEMENT_REFUSAL.error, 'The refusal must be RoboTeam\'s Explorer entitlement refusal for the family');
+}
+/** The route was reached and answered as documented, without starting work. */
+export function assertRoboteamReach(entry, response) {
+    const want = entry.reach;
+    assert.equal(response.status, want.status, `${entry.name}: expected the documented ${want.status} answer; got ${response.status}`);
+    const type = String(response.headers?.['content-type'] || '').toLowerCase();
+    switch (want.kind) {
+        case 'json-error':
+            assert.equal(response.json?.ok, false, `${entry.name}: the answer must be an explicit failure`);
+            assert.equal(response.json?.error, want.error, `${entry.name}: the answer must be the route's exact error`);
+            break;
+        case 'html':
+            assert.match(type, /^text\/html/, `${entry.name}: expected text/html`);
+            if (want.includes) assert.ok(String(response.text || '').includes(want.includes), `${entry.name}: the page lacks ${want.includes}`);
+            break;
+        case 'css': assert.match(type, /^text\/css/, `${entry.name}: expected text/css`); break;
+        case 'text-prefix': assert.ok(String(response.text || '').startsWith(want.prefix), `${entry.name}: expected the body to start with ${want.prefix}`); break;
+        case 'text':
+            assert.match(type, /^text\/plain/, `${entry.name}: expected text/plain`);
+            assert.equal(String(response.text || '').trim(), want.text, `${entry.name}: expected the exact text answer`);
+            break;
+        case 'status-ok':
+            assert.equal(response.json?.ok, true);
+            assert.equal(response.json?.service, 'RoboTeamAgent');
+            break;
+        default: assert.fail(`unknown reach kind ${want.kind}`);
+    }
+}
+/** The absent robot id and name: run-owned, lowercase [a-z0-9-], at most 64 characters (the robot id pattern). */
+export const roboteamAbsentName = (prefix) => `${String(prefix).toLowerCase().replace(/[^a-z0-9-]/g, '-')}-absent`.slice(0, 64);
+
+export async function runRoboteamProbes(ctx) {
+    const recorded = new Set();
+    const absent = roboteamAbsentName(ctx.prefix);
+    const fill = (value) => typeof value === 'string' ? value.replaceAll(':absent', absent)
+        : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, fill(item)])) : value;
+    const failAll = async (reason) => { for (const definition of roboteamCheckDefinitions()) if (!recorded.has(definition.id)) { recorded.add(definition.id); await ctx.check(definition.id, async () => assert.fail(reason)); } };
+    // Fixture-collision rule (fail closed): the absent robot must not exist, and that must be provable.
+    let collision = '';
+    try {
+        const listing = await ctx.request('admin', { method: 'GET', path: `${ROBOTEAM_BASE}/api/robots` });
+        if (listing.status !== 200 || listing.json?.ok !== true || !Array.isArray(listing.json.robots)) collision = `the administrator robot listing is unavailable (HTTP ${listing.status}), so the absent fixture cannot be proven absent`;
+        else if (listing.json.robots.some((robot) => robot?.id === absent || robot?.name === absent)) collision = `fixture collision: a robot named ${absent} already exists`;
+    } catch (error) { collision = `the administrator robot listing failed: ${String(error?.message || error).slice(0, 160)}`; }
+    if (collision) await failAll(`${collision}; the RoboTeam family block was aborted and no probe request was sent`);
+    else {
+        for (const entry of roboteamProbes) {
+            const request = () => ({ method: entry.method, path: `${ROBOTEAM_BASE}${fill(entry.path)}`, ...(entry.body === undefined ? {} : { body: fill(entry.body) }) });
+            const send = async (actor) => { await ctx.guard(); return ctx.request(actor, request()); };
+            if (entry.adminProbed !== false) { recorded.add(roboteamCheckId(entry, 'admin')); await ctx.check(roboteamCheckId(entry, 'admin'), async () => assertRoboteamReach(entry, await send('admin'))); }
+            for (const actor of roboteamActors) {
+                recorded.add(roboteamCheckId(entry, actor));
+                await ctx.check(roboteamCheckId(entry, actor), async () => {
+                    const response = await send(actor);
+                    if (entry.exempt) {
+                        if (actor !== 'anonymous') return assertRoboteamReach(entry, response);
+                        // Row 1607 (/status) expects anonymous allow, the manifest's /3001/* access is authenticated, and the
+                        // Router decides first. Which of the two answers is observed is recorded, not assumed.
+                        const ok = response.status === 200 && response.json?.ok === true && response.json?.service === 'RoboTeamAgent';
+                        ctx.report.roboteamAnonymousStatus = { status: response.status, answer: ok ? 'agent-status-ok' : 'other' };
+                        if (ok) return;
+                        return assertDenied(response);
+                    }
+                    if (actor === 'anonymous') return assertDenied(response);
+                    if (actor === 'selfRegistered') return assertRoboteamEntitlementRefusal(response);
+                    return assertRoboteamReach(entry, response);
+                });
+            }
+        }
+        await failAll('Check was not reached');
+    }
+    ctx.recordGap(ROBOTEAM_GAPS.websocketLive, 'The Router converts a target\'s non-101 WebSocket answer into a proxy failure and records only an error code (executeWebSocketPlan.js:263-265, recordProxyOutcome.js:42), so a live refusal on /api/robots/:id/session/* is indistinguishable from a 404 or 409, and a positive would need a running robot desktop (real work). Unit coverage only; never counted as coverage.', { kind: 'declared-limitation' });
+}
+
 export async function runAgentProbes(ctx) {
     const mcp = createAgentSessions(ctx);
     await ctx.check('agent.registry.reconciliation', async () => {
@@ -1245,6 +1393,7 @@ export async function runAgentProbes(ctx) {
         });
     }
     await runRoboflowProbes(ctx);
+    await runRoboteamProbes(ctx);
     await discoverAgentMcp(ctx, mcp);
     if ((ctx.guestAgents || []).some((g) => g.agent === 'webAssist')) await webAssistGuestProbes(ctx, mcp);
     const roomFixture = await createRoomListingFixture(ctx, mcp);

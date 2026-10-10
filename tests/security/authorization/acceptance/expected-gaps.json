@@ -1717,7 +1717,7 @@
       "id": "agent.roboflow.schedules.run-now.admin-positive",
       "category": "external-inference-provider-git",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:1226",
+      "source": "tests/security/authorization/agent-probes.mjs:1228",
       "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). An administrator POST /api/roboflow/schedules/:id/run-now on a real schedule starts a real workflow (AchillesCLI roboTeamAgent/server/http-server.mjs:319-324, workflow-scheduler.mjs runNow), which is robot and model work the local-only target does not permit. The denials target an absent schedule identifier and depend on the administrator reach control (404 Cron job not found), which proves the administrator passes the gate without launching anything.",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:*:/base-agent-additional-server/roboTeamAgent/3001/*:manifest-policy-family"
@@ -1732,7 +1732,7 @@
       "id": "agent.roboflow.generation.admin-positive",
       "category": "external-inference-provider-git",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:1226",
+      "source": "tests/security/authorization/agent-probes.mjs:1228",
       "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). An administrator POST /api/roboflow/generate, POST /api/roboflow/generations or DELETE /api/roboflow/generations/:id with a real description or generation starts robot and model work (http-server.mjs:283-305, roboflow-service.mjs generateWorkflow and startGeneration). The denials send no description and depend on the administrator reach controls (400 before any robot or model call; 404 for an absent generation).",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:*:/base-agent-additional-server/roboTeamAgent/3001/*:manifest-policy-family"
@@ -1747,7 +1747,7 @@
       "id": "agent.roboflow.flows.start.positive",
       "category": "external-inference-provider-git",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:1226",
+      "source": "tests/security/authorization/agent-probes.mjs:1228",
       "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). POST /api/roboflow/flows starts a real workflow for any workspace user (http-server.mjs:360-364, no handler role gate). The probes name a workflow type that cannot exist, so a handler that is reached answers 404 workflow not found before any dispatch.",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:*:/base-agent-additional-server/roboTeamAgent/3001/*:manifest-policy-family"
@@ -1762,7 +1762,7 @@
       "id": "agent.roboflow.flows.run-mutations.positive",
       "category": "external-inference-provider-git",
       "presence": "required",
-      "source": "tests/security/authorization/agent-probes.mjs:1226",
+      "source": "tests/security/authorization/agent-probes.mjs:1228",
       "reason": "Unconditional declared limitation recorded by runRoboflowProbes (cited line). Human-input answer, pause, terminate, resume and the instance pause, message and resume operations act on a real running workflow (http-server.mjs:372-408, no handler role gate) and the run owns no workflow to act on. The probes use identifiers that cannot exist, so a reached handler answers 404 workflow run not found.",
       "affectedObligations": [
         "agent-inventory/AchillesCLI/roboTeamAgent:*:/base-agent-additional-server/roboTeamAgent/3001/*:manifest-policy-family"
@@ -1772,6 +1772,21 @@
         "kind": "declared-limitation"
       },
       "reviewedBy": "code-reviewer-xhigh B1+B2 review, 2026-10-10: accepted under D4b's rationale: explicit unrun limitation; never counted as coverage (needs a real running workflow, no no-op fixture); D4b decided"
+    },
+    {
+      "id": "agent.roboteam.session.websocket.live",
+      "category": "static-unsupported-protocol",
+      "presence": "required",
+      "source": "tests/security/authorization/agent-probes.mjs:1374",
+      "reason": "Unconditional declared limitation recorded by runRoboteamProbes (cited line). The Router converts a target's non-101 answer to a WebSocket upgrade into a proxy failure and records only an errorCode (executeWebSocketPlan.js:263-265, recordProxyOutcome.js:42), so a live RoboTeam refusal of GET /api/robots/:id/session/* with Upgrade is indistinguishable from a 404 or 409, and a positive would need a running robot desktop (real work). The upgrade refusal is covered by unit tests only and is never counted as coverage; the HTTP denial checks of the family stay strict.",
+      "affectedObligations": [
+        "agent-inventory/AchillesCLI/roboTeamAgent:GET:/base-agent-additional-server/roboTeamAgent/3001/api/robots/:robotId/session/*:websocket"
+      ],
+      "outsideChangedBehavior": "RoboTeam agent-internal WebSocket handling is outside the U3 template, U6 WebChat and U7 marketplace admission changes.",
+      "evidence": {
+        "kind": "declared-limitation"
+      },
+      "reviewedBy": "pending: code-reviewer-xhigh review of B2 round 4 (combined D13+D14 SPEC r2, QR1); category chosen by elimination, to be confirmed by the reviewer"
     }
   ]
 }

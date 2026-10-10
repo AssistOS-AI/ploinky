@@ -24,7 +24,7 @@ const ACTORS = ['anonymous', 'selfRegistered', 'userA', 'userB'];
  */
 function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRegisteredRefusal = ENTITLEMENT, everyoneReaches = false, usersCannotListSchedules = false, adminCreateFails = false, routerRefusesUsers = false,
     explorerRoot = '/workspace', explorerListFails = false, deleteFails = false, createReturnsFolder = null, preexisting = null } = {}) {
-    const schedules = [], workflows = [], requests = [], folders = new Set(), files = new Set(), symlinks = new Map(), explorerCalls = [];
+    const schedules = [], workflows = [], requests = [], folders = new Set(), files = new Set(), symlinks = new Map(), explorerCalls = [], events = [];
     // A pre-existing entry named like the run-owned child: a directory, a file or a symlink (to the named sibling).
     if (preexisting?.type === 'dir') folders.add(preexisting.name);
     if (preexisting?.type === 'file') files.add(preexisting.name);
@@ -45,6 +45,7 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
         if (method === 'GET' && route === '/schedule-folders' && query.startsWith('path=')) {
             // ScheduleFolders.directory: lstat each segment; absent 404, symlink or non-directory 400, ordinary directory 200.
             const refused = refuse('schedule-folders.list'); if (refused) return refused;
+            events.push('roboteam:path-read');
             const name = decodeURIComponent(query.slice(5));
             if (symlinks.has(name) || files.has(name)) return json(400, { ok: false, error: 'Choose an ordinary workspace folder' });
             if (!folders.has(name)) return json(404, { ok: false, error: 'Folder not found' });
@@ -126,6 +127,7 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
     const explorerOk = (rawText) => ({ failed: false, value: { rawText }, response: { status: 200 } });
     async function mcp(principal, agent, tool, args = {}) {
         explorerCalls.push({ principal, agent, tool, args: structuredClone(args) });
+        events.push(`explorer:${tool}`);
         if (tool === 'list_allowed_directories') return explorerListFails ? { failed: true, value: undefined, response: { status: 503 }, error: 'unavailable' } : explorerOk(`Allowed directories:\n${explorerRoot}`);
         if (tool === 'list_directory') return explorerOk(args.path === explorerRoot ? [...[...folders].map((name) => `[DIR] ${name}`), ...[...files].map((name) => `[FILE] ${name}`), ...[...symlinks.keys()].map((name) => `[LINK] ${name}`)].join('\n') : '');
         if (tool === 'get_file_info') {
@@ -150,7 +152,7 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
     }
     // The run-owned child is replaced by a symlink to a sibling directory between the create and the cleanup.
     function swapForSymlink(name, sibling) { folders.delete(name); folders.add(sibling); symlinks.set(name, sibling); }
-    return { handle, mcp, schedules, workflows, requests, started, folders, files, symlinks, explorerCalls, swapForSymlink };
+    return { handle, mcp, schedules, workflows, requests, started, folders, files, symlinks, explorerCalls, events, swapForSymlink };
 }
 
 async function runWorld(options = {}) {
@@ -404,4 +406,15 @@ test('the normal cleanup inspects before it deletes and checks absence afterward
     const tools = run.world.explorerCalls.map((call) => call.tool);
     assert.ok(tools.indexOf('get_file_info') > -1 && tools.indexOf('get_file_info') < tools.indexOf('delete_directory'), 'Explorer inspects the path before deleting it');
     assert.ok(tools.lastIndexOf('list_directory') > tools.indexOf('delete_directory'), 'Explorer is listed again after the delete');
+});
+
+test('the lstat-rejecting RoboTeam read is the last step before delete_directory', async () => {
+    const run = await runWorld();
+    run.world.events.length = 0;
+    await cleanAll(run);
+    const events = run.world.events;
+    const del = events.indexOf('explorer:delete_directory');
+    assert.ok(del > 1);
+    assert.equal(events[del - 1], 'roboteam:path-read', events.join(' > '));
+    assert.ok(events.indexOf('explorer:get_file_info') < events.indexOf('roboteam:path-read', events.indexOf('explorer:get_file_info')), 'Explorer inspection comes first');
 });
