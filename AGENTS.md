@@ -1,5 +1,94 @@
-# Pointer
+# Ploinky Repository Contract
 
-The canonical instructions for this repository live in `CLAUDE.md` in this directory.
+These instructions govern the complete Ploinky repository. This file is the canonical Ploinky instruction source for every coding agent; do not add a `CLAUDE.md`.
 
-Read [CLAUDE.md](./CLAUDE.md). This pointer intentionally contains no duplicate policy so the Ploinky invariants and mandatory cross-repository acceptance gate cannot drift between instruction files.
+## Source of truth
+
+Treat executable code and tests as the only source of truth for current Ploinky behavior. Historical DS/specification files and generated HTML may provide background, but do not use them to determine, justify, or change current behavior, and do not update them as part of behavior work.
+
+## Documentation structure
+
+Use `docs/index.html` for the documentation map, `docs/wiki.html` for canonical terminology and `docs/specsLoader.html?spec=matrix.md` for the specification set. Documentation corrections must follow executable source and tests and must not change runtime behavior to satisfy historical prose.
+
+Ploinky retains its externally referenced sequence: `DS001-vision.md`, `DS002-coding-style.md`, `DS003-workspace-and-repository-model.md` and `DS004-main-behavior.md`. Preserve these identifiers and use DS002 for coding style. Re-evaluate the main behavior from source before changing DS004. Ordinary DS files require exactly `title` and `summary` frontmatter, with the filename stem as title, and only `Introduction` and `Core Content` as their top-level content sections. Preserve rationale and limitations within Core Content. Do not add a `Conclusion` section. Keep prose unwrapped and maintain the shared header, wiki links and index map together.
+
+## Non-negotiable runtime and security invariants
+
+1. Keep Ploinky generic. Core routing, lifecycle code, and WebChat must not hardcode optional agent identifiers, model/provider tags, or agent-owned tool names.
+2. Resolve one exact workspace identity per Box. A Box must never discover, adopt, mutate, or report another workspace's state.
+3. Preserve the outer Box network boundary: publish only the public Router TCP surface targeting in-Box `8080` and one wildcard LiveKit UDP surface targeting the in-Box listener on `7882`; the physical-host UDP port may be selected independently. The Router TCP surface stays loopback-only unless the user explicitly runs `ploinky bind`, which may publish it on the IPv4 wildcard or on one IPv4 address assigned to the host while unknown `Host` headers remain rejected. Do not add a third publication, expose agent/Soul/port `7000` services directly, or expose the Router's private `8081` surface outside the Box.
+4. Preserve the rootless, unprivileged runtime. Enforce the expected immutable image identity, read-only source mounts, and an init/reaper. Do not use privileged mode, SUID/setuid, file capabilities, or relaxed confinement to make a deployment pass.
+   - GPU access: nested-agent admission accepts one GPU device, the CDI device `ploinky.local/gpu=all`, only for the agents the Box's GPU wiring names and only while that wiring is active; other devices, `--gpus`, host IPC and security options stay rejected. From it, such an agent's container gets only `--device ploinky.local/gpu=all`, plus, for a manifest-declared agent, the `PLOINKY_GPU_STATUS` and `PLOINKY_GPU_REASON` environment variables. An agent that declares `containerSecurity.gpu` but is not named starts without the GPU device; an operator-path request in `llmRuntime.runtimePolicy.devices` is refused instead.
+   - The wiring, computed each time the host prepares the Box and again after a `start`, `restart` or `update` has run, names the agents whose manifest declares `containerSecurity.gpu: true` in an installed repo or a workspace checkout, plus the agents the operator grants with `ploinky gpu grant --agent REPO/AGENT`, minus the agents the operator denies with `ploinky gpu revoke --agent REPO/AGENT`; `ploinky gpu revoke` without `--agent` withdraws every grant and hides every manifest declaration. Any installed repo's manifest can therefore take the GPU, and those manifests are workspace files that agents with workspace access can write; the operator's decision is recorded on the host, outside the workspace, in `~/.ploinky-box/gpu-grants`, and is the override.
+   - To the Box, active GPU wiring adds only explicit `--device` flags for the discovered NVIDIA device nodes, read-only binds of the driver libraries, `nvidia-smi`, a hookless CDI spec and a grant marker, and one label. It adds no privileges, capabilities, security options, publications or network changes, and never widens invariant 3. With hardware limits enabled, both fingerprinted NVIDIA MPS binaries may also be bound read-only into the Box. Share clients receive only the explicitly writable private MPS pipe bind; they never receive the tool binaries or the MPS state directory.
+   - GPU access is not the only device path in a Box. Independently of it, agents that declare `containerSecurity.nestedPodman` get `--cap-add SYS_ADMIN`, `--cap-add NET_ADMIN`, `--device /dev/fuse`, `--device /dev/net/tun`, `--security-opt label=disable` and the nested-Podman seccomp profile.
+   - When hardware limits are enabled, the permitted host lifecycle operations ensure bounded, idempotent preparation before graph work in every created, restarted or restored Box generation, including bind, GPU grant/revoke and internal GPU reapplication. The fixed preparation runs as the Box's user-namespace root, moves Box-root tasks into /ploinky/core, enables available delegated resource controllers and delegates only /ploinky to Box uid 1000. It reads no workspace input, starts no subprocess and imports only Node built-ins. It adds no privileged mode, capabilities, SUID, host-root access or publications.
+   - A lifecycle transaction may succeed with a reported degraded graph after hardware refusal. Blocked dependency propagation follows blocking edges and explicit no-wait waits; optional no-wait children remain contained. Full readiness is never claimed for a refused or blocked required runtime.
+5. The host `ploinky` process owns the outer Box. The in-Box `ploinky-local` process owns nested agents and must never recursively create another Box.
+6. Serialize workspace mutations with the workspace lock. Revalidate immutable identity immediately before mutation, bound rollback, and declare readiness only when the complete manifest graph is ready or has reached its declared no-wait terminal state and every required external health check passes.
+7. Routing fails closed. Apply the same authenticated route policy, caller ACL, exact active generation/lease checks, and replay protection to HTTP, SSE, and WebSocket traffic.
+8. Confine credentials. Never inject reusable agent credentials into host or `none` runtimes. Relay/channel credentials must be fresh, generation-bound, delivered only through the private confined channel, and absent from logs, persisted state, and test artifacts.
+9. A release-candidate deployment must use the exact pushed commit of Ploinky's current branch. Every other deployed repository must use its recorded remote default branch or, when the deployment selects a candidate branch with `--branch <branch>`, that same-named branch where the repository has it, each at its recorded exact pushed commit. A repository without the selected branch stays on its default branch; falling back to any other non-default branch is forbidden.
+10. Preserve the versionless semantic Box identity. Do not turn schema or runtime revisions into incrementing public Box names.
+
+## On-demand cross-repository release gate
+
+Do not automatically deploy Explorer or run the Playwright E2E gates after each Ploinky change. Run this cross-repository gate only when the user explicitly requests the deployment or E2E validation in the current task. Normal scoped unit, integration, and static verification still applies to every change.
+
+When the user requests this gate, all steps below are mandatory against the exact pushed candidate revisions. Do not infer an E2E request from a code change, a prior task, or the existence of this procedure.
+
+### 1. Pin the candidate
+
+Commit and push the Ploinky candidate first. Record its current branch, exact pushed commit, and configured upstream. For every other participating or deployed repository, resolve and record the remote symbolic `HEAD`, its default branch, the branch the deployment will use (its default branch, or the `--branch` candidate branch where that repository has it), that branch's exact pushed commit, and the configured upstream used by the fixture. When the candidate spans several repositories, push the same-named candidate branch in each of them before deploying. Also record the expected immutable Box image identity and the release manifest used by the Copilot gate. Do not test uncommitted source and do not silently mix branch heads from different candidate generations.
+
+### 2. Recreate the dedicated local fixture
+
+Use only `~/work/testExplorerFresh`. Positively identify that exact path and the Box, containers, networks, and volumes owned by its previous test deployment. Remove the previous deployment and its test-owned files and volumes, then recreate the directory as a genuinely fresh workspace. Never delete or reuse resources belonging to another workspace or environment; ambiguous ownership or non-test data is a blocker.
+
+Do not reuse a prior Box, generation, repository checkout, volume, release manifest, browser profile, or E2E artifact directory. Preserve evidence outside tracked source directories.
+
+### 3. Deploy Explorer with the canonical command
+
+The deployment command is literal, in one of two forms:
+
+```sh
+cd ~/work/testExplorerFresh
+ploinky start explorer
+```
+
+or, when the candidate uses a same-named branch across repositories:
+
+```sh
+cd ~/work/testExplorerFresh
+ploinky start explorer --branch <candidate-branch>
+```
+
+`--branch <candidate-branch>` is the only permitted option, and it must name the pushed candidate branch recorded in step 1. Repositories that do not have that branch stay on their default branch through the default fallback, which Ploinky logs. Do not add any other arguments or flags, including `--branch-fallback`, `--repo-branch`, or `--reset-repos`. Checkout updates and candidate pinning remain separate preparation steps. Do not substitute a manual compose/podman launch or an already-running deployment.
+
+Before testing, prove all of the following:
+
+1. The entire declared Explorer graph is ready, including required external health checks.
+2. Ploinky is clean, tracks the pushed current branch, and is at its recorded candidate commit. Every other deployed repository is clean, tracks its recorded upstream (`origin/<default-branch>`, or `origin/<candidate-branch>` for a repository on the `--branch` candidate branch), and is at its recorded commit.
+3. The running Box has the expected immutable image identity and fresh generation.
+4. The network publications and runtime privileges still satisfy the invariants above.
+
+Any fallback other than a repository without the `--branch` candidate branch staying on its default branch, and any detached/mixed revision, stale generation, unclean checkout, missing agent, or readiness exception, invalidates the deployment.
+
+### 4. Run the four separate headless Playwright gates
+
+Run the authoritative suite from `AssistOSExplorer/tests/smoke` against the fresh local origin (normally `http://localhost:8080`: a default deployment's local sign-in redirects `127.0.0.1:8080` to that canonical origin, so set both `SMOKE_BASE_URL` and `SMOKE_BOX_BASE_URL` to it, per `AssistOSExplorer/tests/smoke/README.md`). Use a new `SMOKE_RUN_ID` and artifact directory for each gate, Chromium headless mode, `--workers=1`, and `--retries=0`.
+
+| Gate | Required test and proof |
+| --- | --- |
+| Confidential document in OnlyOffice | Run `specs/50-onlyoffice-dpu.spec.mjs` with `SMOKE_ONLYOFFICE=1`, filtered to `Explorer-created Confidential document saves through callback, drains, and reopens after targeted restart`. Create a `.doc` or `.docx` under `/Confidential/My Space`, edit it in OnlyOffice, prove the save/callback completed, reopen it, and prove the marker persisted. Either extension satisfies this gate. |
+| Copilot | Run `specs/05-copilot-folder-launch.spec.mjs` with `SMOKE_RELEASE_MANIFEST` and exact Box/image/repository pins. It must pass the release-bundle verifier and prove the approved folder-launch flow against the current generation. |
+| WebMeet | Run `specs/30-webmeet-room-chat.spec.mjs` filtered to `two Explorer accounts can join one room and exchange chat`, with `SMOKE_WEBMEET_HEADLESS=1`, `SMOKE_WEBMEET_MEDIA=1`, and the strict media timeout. Prove both accounts, chat/DataChannel exchange, ICE/RTP media, and cleanup. |
+| WebMeet public room | Run `specs/30-webmeet-room-chat.spec.mjs` filtered to `standalone loader serves the authenticated dashboard and a guest invitation`, with the same `SMOKE_RELEASE_MANIFEST` and exact Box/image/repository pins and the primary administrator sign-in inputs; it needs no secondary account, `SMOKE_WEBMEET_*` flag or media. Prove that anyone with the URL of a public room can join that room: a guest in a fresh cookie-less, never-signed-in browser context opens exactly the public room URL published by the WebMeet UI, joins under a unique name, appears in the owner's participant list, and exchanges chat with the owner in both directions. Also prove that the URL of a team room is refused: the visitor sees the "not available as a public room" denial, WebMeet reports `Public room not found.`, and no name field or chat input appears. Both rooms must be deleted. |
+
+Each command must discover exactly one intended test and finish `1 passed`, with zero skips, retries, ignored browser/page errors, or softened assertions. The only acknowledged browser error is the OnlyOffice gate's recovered browser CSRF refresh, approved by the product owner: after an edge generation change, exactly one `browser_csrf_invalid` 403 for an operation, followed in the same document by a successful proof refresh to a different generation and a 2xx retry of the same request, with exactly that one console error. Its complete rules are in `AssistOSExplorer/tests/smoke/README.md` ("OnlyOffice recovered browser CSRF refresh"); every other console or page error, a repeated or differently bodied 403, and a failed, missing or cross-document refresh or retry still fail the gate. A command that reports no matching tests, a skipped test, or only setup success has failed the gate.
+
+### 5. Failure and evidence policy
+
+Save the candidate commit map, image identity, generation, deployment/readiness proof, Playwright output, traces, screenshots, and cleanup result. Do not store credentials in evidence.
+
+If a requested deployment or gate fails, do not waive, retry around, or narrow the invariant. Preserve the failed attempt's evidence, diagnose and fix the root cause, commit and push a new candidate, delete the failed fixture, redeploy from scratch, and rerun all four gates. Continue this fresh-generation cycle autonomously until every required gate passes or progress is genuinely blocked by unavailable external state, ambiguous resource ownership, or information only the user can provide. Passing results from an earlier generation or revision cannot be carried forward.

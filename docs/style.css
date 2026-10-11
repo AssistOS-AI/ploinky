@@ -990,7 +990,7 @@ body[data-page="cli-reference"] .sidebar {
 }
 
 .worker-hero h1 {
-  max-width: 760px;
+  max-width: none;
   margin: 1rem 0 1.25rem;
   font-size: clamp(3rem, 5vw, 4rem);
   line-height: 0.98;
@@ -1008,7 +1008,7 @@ body[data-page="cli-reference"] .sidebar {
 }
 
 .worker-hero__lead {
-  max-width: 680px;
+  max-width: none;
   margin: 0;
   color: #c8ddd6;
   font-size: clamp(1.05rem, 1.6vw, 1.28rem);
@@ -1302,11 +1302,11 @@ body[data-page="cli-reference"] .sidebar {
 }
 
 .worker-cta h2 {
-  max-width: 800px;
+  max-width: none;
 }
 
 .worker-cta p {
-  max-width: 770px;
+  max-width: none;
   color: #c8ddd6;
   font-size: 1.08rem;
   text-align: justify;
@@ -1384,3 +1384,9 @@ body[data-page="cli-reference"] .sidebar {
     transition: none;
   }
 }
+
+.documentation-map { overflow-x: auto; }
+.documentation-map table { width: 100%; border-collapse: separate; border-spacing: 0.75rem; }
+.documentation-map th, .documentation-map td { border: 0; text-align: left; vertical-align: top; padding: 0.5rem; }
+.documentation-map td span { display: block; margin-top: 0.4rem; }
+.documentation-map a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }

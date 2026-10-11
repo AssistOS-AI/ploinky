@@ -31,7 +31,7 @@ The operator initiates this behavior by running the public `ploinky` command fro
 
 `ploinky start <staticAgent> [port]` must prepare required repositories, resolve the static agent and its recursive manifest dependencies, admit the complete runtime graph, and start blocking dependency waves in topological order. The first core start must identify a static agent and persist its Router configuration; later starts may reuse that configuration. Startup must publish no agent target until the inactive generation, profile inputs, host hooks, startup configuration providers, runtime identities, and required readiness checks have been completed. A declared no-wait dependency may finish asynchronously only through its bounded run-specific status path.
 
-`ploinky cli <agentName> <params>` must resolve the enabled record or enable the named agent globally when needed, ensure that its runtime is ready, and execute the manifest's `cli` command. Arguments beginning with `--sso-` must not be appended to the agent command. Ploinky must convert `--sso-name=value` to an `SSO_NAME=value` environment assignment and must pass all remaining arguments to the manifest command. `ploinky cli` without an agent must open the managed Box shell in `/workspace`.
+`ploinky cli <agentName> <params>` must resolve the enabled record or enable the named agent globally when needed, ensure that its runtime is ready, and execute the manifest's `cli` command. Arguments beginning with `--sso-` must not be appended to the agent command. Ploinky must convert `--sso-name=value` to an `SSO_NAME=value` environment assignment and must pass all remaining arguments to the manifest command. `ploinky cli` without an agent must open the managed Box shell at the host-selected absolute workspace root.
 
 | Variable | Required value |
 | --- | --- |
@@ -42,7 +42,7 @@ The observable result must be one ready workspace whose agent commands and Route
 
 ### Container mounts
 
-The operator receives a workspace whose host files remain visible to the Box and to admitted agent runtimes. Ploinky must create the outer Box with the Ploinky checkout mounted read-only at `/opt/ploinky`, the selected workspace mounted read-write at `/workspace`, the workspace dependency cache mounted at `/opt/ploinky/node_modules`, and the nested image cache mounted at `/home/podman/.local/share/ploinky-images`. The Box must use a fresh `/tmp` tmpfs and must not create or depend on outer named volumes.
+The operator receives a workspace whose host files remain visible to the Box and to admitted agent runtimes. Ploinky must create the outer Box with the Ploinky checkout mounted read-only at `/opt/ploinky`, the selected workspace mounted read-write at its original host absolute path, the workspace dependency cache mounted at `/opt/ploinky/node_modules`, and the nested image cache mounted at `/home/podman/.local/share/ploinky-images`. The Box must use a fresh `/tmp` tmpfs and must not create or depend on outer named volumes.
 
 Before starting a Docker or Podman agent, Ploinky must build the complete mount set from the agent registry mode, active profile, prepared dependency cache, manifest, and runtime resources. The exact runtime may stage source trees to satisfy nested Podman semantics, but the paths visible to the agent must retain the following contract.
 
@@ -101,7 +101,7 @@ Operators must be able to control the outer Box and the in-Box workspace without
 | Public `ploinky destroy` | Remove the exact owned outer Box and preserve the workspace and `.ploinky/box` caches. |
 | Public `ploinky destroy --delete-cache` | Remove the exact owned outer Box and then delete only `.ploinky/box/dependencies` and `.ploinky/box/images`. |
 
-The outer Box must publish exactly one loopback Router TCP mapping to in-Box `8080/tcp` and one wildcard media UDP mapping to in-Box `7882/udp`. A lifecycle action must not expose an agent listener, the private Router listener, or a third publication. A failed transactional Box replacement must restore the prior validated Box or report failure without adopting ambiguous state.
+The outer Box must publish exactly one Router TCP mapping to in-Box `8080/tcp` and one wildcard media UDP mapping to in-Box `7882/udp`. Router TCP must remain loopback-only unless the operator explicitly selects an admitted IPv4 host binding through `ploinky bind`; unknown Host headers must remain rejected. A lifecycle action must not expose an agent listener, the private Router listener, or a third publication. A failed transactional Box replacement must restore the prior validated Box or report failure without adopting ambiguous state.
 
 ### Manifest profiles
 

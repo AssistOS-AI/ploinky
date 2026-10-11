@@ -293,7 +293,7 @@ p {
 }
 
 .chapter-header p {
-    max-width: 76ch;
+    max-width: none;
     margin-top: 16px;
     font-size: 1.05rem;
 }
