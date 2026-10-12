@@ -15,6 +15,18 @@ function execute(tree) {
     return parseMachineRenderReport(result.stdout);
 }
 
+test('query: captured ploinky-gpu report matches the libkrun tree and is accepted only on darwin', (t) => {
+    const text = fs.readFileSync(new URL('./fixtures/render-query/venus-machine-query.txt', import.meta.url), 'utf8');
+    const report = parseMachineRenderReport(text);
+    assert.equal(report.kernel, '7.1.3-200.fc44.aarch64');
+    assert.equal(report.nodes.length, 1);
+    const tree = makeTree(t, 'krun');
+    assert.deepEqual(report.nodes, execute(tree).nodes);
+    assert.deepEqual(report.nodes[0].children, [{ name: 'virtio3', driver: 'virtio_gpu', device: '0x0010' }]);
+    assert.equal(classifyRenderFacts(report.nodes[0], { platform: 'darwin' }).accepted, true);
+    assert.match(classifyRenderFacts(report.nodes[0], { platform: 'linux' }).reason, /granted only inside/);
+});
+
 test('query: MACHINE_RENDER_QUERY run by /bin/sh on fixture trees gives the facts the Linux collector gives', (t) => {
     for (const [kind, options] of [['qa', {}], ['krun', {}], ['amd', {}], ['amd', { link: true, mode: 0o120777 }],
         ['amd', { sysDev: '226:129' }], ['amd', { transport: null }], ['empty', {}]]) {

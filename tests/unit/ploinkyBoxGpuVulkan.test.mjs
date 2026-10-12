@@ -121,7 +121,7 @@ const IDENTITY = { instance: 'ploinky-box-golden-0123456789ab', pathHash: '01234
 const BASE_REASON = 'The NVIDIA kernel module is not loaded (/proc/driver/nvidia/version: ENOENT)';
 const wire = (discovery, more = {}) => buildGpuWiring({ identity: IDENTITY, grant: GRANT, discovery, homeDirectory: '/home/golden', ...more });
 const linux = (tree) => ({ ...tree, platform: 'linux', procVersionPath: `${tree.root}/proc/driver/nvidia/version` });
-const REPORT = 'kernel 6.8.0\nnode renderD128 21b6 e2 80 226:128 virtio-mmio - - rw\nchild renderD128 virtio10 virtio_gpu 0x0010\nend\n';
+const REPORT = fs.readFileSync(new URL('./fixtures/render-query/venus-machine-query.txt', import.meta.url), 'utf8');
 
 function machineRunner({ connections, machines, inspected, report = REPORT, failureAt = null } = {}) {
     const calls = [];
@@ -381,7 +381,7 @@ test('darwin: identical runner output selects the same machine as inspectSelecte
     const selected = inspectSelectedMachine({ runner: fixture.runner, platform: 'darwin', env: {} });
     const discovered = discoverVulkanRenderNode(fixture.options);
     assert.equal(selected.machineName, 'ploinky-gpu');
-    assert.equal(discovered.driverVersion, `virtio_gpu ${selected.machineName} 6.8.0`);
+    assert.equal(discovered.driverVersion, `virtio_gpu ${selected.machineName} 7.1.3-200.fc44.aarch64`);
     assert.deepEqual(fixture.calls.slice(0, 3), fixture.calls.slice(3, 6));
 });
 

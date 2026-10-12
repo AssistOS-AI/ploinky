@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // QA ancestry and permissions were captured read-only on 2026-10-12.
-// libkrun and AMD trees are synthetic until hardware capture is available.
+// The libkrun tree models the 2026-10-12 ploinky-gpu capture; AMD remains synthetic.
 export function makeTree(t, kind = 'amd', overrides = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'render-query-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -20,7 +20,7 @@ export function makeTree(t, kind = 'amd', overrides = {}) {
             transport = kind === 'qa' ? 'virtio-pci' : kind === 'krun' ? 'virtio-mmio' : 'amdgpu',
             vendor = kind === 'qa' ? '0x1af4' : kind === 'krun' ? null : '0x1002',
             vramBytes = ['qa', 'krun'].includes(kind) ? null : '8589934592',
-            children = ['qa', 'krun'].includes(kind) ? [{ name: 'virtio10', driver: 'virtio_gpu', device: '0x0010' }] : [],
+            children = ['qa', 'krun'].includes(kind) ? [{ name: kind === 'krun' ? 'virtio3' : 'virtio10', driver: 'virtio_gpu', device: '0x0010' }] : [],
             stat = true, link = false } = options;
         const device = `${root}/sys/devices/${name}`;
         fs.mkdirSync(device, { recursive: true });
