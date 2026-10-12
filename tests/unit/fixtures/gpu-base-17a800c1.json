@@ -1,0 +1,197 @@
+{
+  "x64": {
+    "fingerprint": "42333fc7805b15b2dedda80c604f01a2d7776bed0f00c2dbb74913d31b360abe",
+    "state": "active",
+    "reason": null,
+    "vendor": "nvidia",
+    "agents": [
+      "local-llms/local-llm"
+    ],
+    "denied": [],
+    "workspaceDenied": false,
+    "driverVersion": "595.91.07",
+    "devices": [
+      "/dev/nvidia0",
+      "/dev/nvidiactl",
+      "/dev/nvidia-uvm"
+    ],
+    "mounts": [
+      {
+        "source": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/42333fc7805b15b2dedda80c604f01a2d7776bed0f00c2dbb74913d31b360abe/box.json",
+        "destination": "/etc/cdi/ploinky-gpu.json"
+      },
+      {
+        "source": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/42333fc7805b15b2dedda80c604f01a2d7776bed0f00c2dbb74913d31b360abe/marker.json",
+        "destination": "/etc/ploinky-box-gpu-grant.json"
+      },
+      {
+        "source": "/usr/bin/nvidia-smi",
+        "destination": "/usr/local/nvidia/bin/nvidia-smi"
+      },
+      {
+        "source": "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libcuda.so.1"
+      },
+      {
+        "source": "/usr/lib/x86_64-linux-gnu/libnvidia-gpucomp.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libnvidia-gpucomp.so.595.91.07"
+      },
+      {
+        "source": "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libnvidia-ml.so.1"
+      },
+      {
+        "source": "/usr/lib/x86_64-linux-gnu/libnvidia-nvvm.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libnvidia-nvvm.so.4"
+      },
+      {
+        "source": "/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libnvidia-ptxjitcompiler.so.1"
+      }
+    ],
+    "files": [
+      {
+        "path": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/42333fc7805b15b2dedda80c604f01a2d7776bed0f00c2dbb74913d31b360abe/box.json",
+        "content": "{\n  \"cdiVersion\": \"0.6.0\",\n  \"kind\": \"ploinky.local/gpu\",\n  \"devices\": [\n    {\n      \"name\": \"all\",\n      \"containerEdits\": {\n        \"deviceNodes\": [\n          {\n            \"path\": \"/dev/nvidia0\"\n          },\n          {\n            \"path\": \"/dev/nvidiactl\"\n          },\n          {\n            \"path\": \"/dev/nvidia-uvm\"\n          }\n        ]\n      }\n    }\n  ],\n  \"containerEdits\": {\n    \"mounts\": [\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libcuda.so.1\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libcuda.so.1\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libnvidia-ptxjitcompiler.so.1\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libnvidia-ptxjitcompiler.so.1\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libnvidia-ml.so.1\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libnvidia-ml.so.1\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libnvidia-nvvm.so.4\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libnvidia-nvvm.so.4\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libnvidia-gpucomp.so.595.91.07\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libnvidia-gpucomp.so.595.91.07\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/bin/nvidia-smi\",\n        \"containerPath\": \"/usr/local/nvidia/bin/nvidia-smi\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      }\n    ]\n  }\n}\n"
+      },
+      {
+        "path": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/42333fc7805b15b2dedda80c604f01a2d7776bed0f00c2dbb74913d31b360abe/marker.json",
+        "content": "{\n  \"version\": 1,\n  \"kind\": \"ploinky-box-gpu-grant\",\n  \"instance\": \"ploinky-box-golden-0123456789ab\",\n  \"pathHash\": \"0123456789ab\",\n  \"workspaceRoot\": \"/workspace/golden\",\n  \"vendor\": \"nvidia\",\n  \"agents\": [\n    \"local-llms/local-llm\"\n  ],\n  \"state\": \"active\",\n  \"reason\": null,\n  \"fingerprint\": \"42333fc7805b15b2dedda80c604f01a2d7776bed0f00c2dbb74913d31b360abe\",\n  \"cdiDevice\": \"ploinky.local/gpu=all\",\n  \"specSha256\": \"27f88a24b7710376370a18e53fa209e047da25dc4728de57d5a31d2906c80b01\"\n}\n"
+      }
+    ]
+  },
+  "arm64": {
+    "fingerprint": "7d09f81e816590f6436e41b2e300e1abb6fa521b8d70a8408bbd8df9f52d3674",
+    "state": "active",
+    "reason": null,
+    "vendor": "nvidia",
+    "agents": [
+      "local-llms/local-llm"
+    ],
+    "denied": [],
+    "workspaceDenied": false,
+    "driverVersion": "595.91.07",
+    "devices": [
+      "/dev/nvidia0",
+      "/dev/nvidiactl",
+      "/dev/nvidia-uvm"
+    ],
+    "mounts": [
+      {
+        "source": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/7d09f81e816590f6436e41b2e300e1abb6fa521b8d70a8408bbd8df9f52d3674/box.json",
+        "destination": "/etc/cdi/ploinky-gpu.json"
+      },
+      {
+        "source": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/7d09f81e816590f6436e41b2e300e1abb6fa521b8d70a8408bbd8df9f52d3674/marker.json",
+        "destination": "/etc/ploinky-box-gpu-grant.json"
+      },
+      {
+        "source": "/usr/bin/nvidia-smi",
+        "destination": "/usr/local/nvidia/bin/nvidia-smi"
+      },
+      {
+        "source": "/usr/lib/aarch64-linux-gnu/libcuda.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libcuda.so.1"
+      },
+      {
+        "source": "/usr/lib/aarch64-linux-gnu/libnvidia-gpucomp.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libnvidia-gpucomp.so.595.91.07"
+      },
+      {
+        "source": "/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libnvidia-ml.so.1"
+      },
+      {
+        "source": "/usr/lib/aarch64-linux-gnu/libnvidia-nvvm.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libnvidia-nvvm.so.4"
+      },
+      {
+        "source": "/usr/lib/aarch64-linux-gnu/libnvidia-ptxjitcompiler.so.595.91.07",
+        "destination": "/usr/local/nvidia/lib64/libnvidia-ptxjitcompiler.so.1"
+      }
+    ],
+    "files": [
+      {
+        "path": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/7d09f81e816590f6436e41b2e300e1abb6fa521b8d70a8408bbd8df9f52d3674/box.json",
+        "content": "{\n  \"cdiVersion\": \"0.6.0\",\n  \"kind\": \"ploinky.local/gpu\",\n  \"devices\": [\n    {\n      \"name\": \"all\",\n      \"containerEdits\": {\n        \"deviceNodes\": [\n          {\n            \"path\": \"/dev/nvidia0\"\n          },\n          {\n            \"path\": \"/dev/nvidiactl\"\n          },\n          {\n            \"path\": \"/dev/nvidia-uvm\"\n          }\n        ]\n      }\n    }\n  ],\n  \"containerEdits\": {\n    \"mounts\": [\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libcuda.so.1\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libcuda.so.1\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libnvidia-ptxjitcompiler.so.1\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libnvidia-ptxjitcompiler.so.1\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libnvidia-ml.so.1\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libnvidia-ml.so.1\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libnvidia-nvvm.so.4\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libnvidia-nvvm.so.4\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/lib64/libnvidia-gpucomp.so.595.91.07\",\n        \"containerPath\": \"/usr/local/nvidia/lib64/libnvidia-gpucomp.so.595.91.07\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      },\n      {\n        \"hostPath\": \"/usr/local/nvidia/bin/nvidia-smi\",\n        \"containerPath\": \"/usr/local/nvidia/bin/nvidia-smi\",\n        \"options\": [\n          \"ro\",\n          \"nosuid\",\n          \"nodev\",\n          \"bind\"\n        ]\n      }\n    ]\n  }\n}\n"
+      },
+      {
+        "path": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/7d09f81e816590f6436e41b2e300e1abb6fa521b8d70a8408bbd8df9f52d3674/marker.json",
+        "content": "{\n  \"version\": 1,\n  \"kind\": \"ploinky-box-gpu-grant\",\n  \"instance\": \"ploinky-box-golden-0123456789ab\",\n  \"pathHash\": \"0123456789ab\",\n  \"workspaceRoot\": \"/workspace/golden\",\n  \"vendor\": \"nvidia\",\n  \"agents\": [\n    \"local-llms/local-llm\"\n  ],\n  \"state\": \"active\",\n  \"reason\": null,\n  \"fingerprint\": \"7d09f81e816590f6436e41b2e300e1abb6fa521b8d70a8408bbd8df9f52d3674\",\n  \"cdiDevice\": \"ploinky.local/gpu=all\",\n  \"specSha256\": \"27f88a24b7710376370a18e53fa209e047da25dc4728de57d5a31d2906c80b01\"\n}\n"
+      }
+    ]
+  },
+  "The NVIDIA kernel module is not loaded (/proc/driver/nvidia/version: ENOENT)": {
+    "fingerprint": "1bd638a55697c6558b88ca5bc68fa8316f451b4e795face13a319594fa7f09e3",
+    "state": "stale",
+    "reason": "The NVIDIA kernel module is not loaded (/proc/driver/nvidia/version: ENOENT)",
+    "vendor": "nvidia",
+    "agents": [
+      "local-llms/local-llm"
+    ],
+    "denied": [],
+    "workspaceDenied": false,
+    "driverVersion": null,
+    "devices": [],
+    "mounts": [
+      {
+        "source": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/1bd638a55697c6558b88ca5bc68fa8316f451b4e795face13a319594fa7f09e3/marker.json",
+        "destination": "/etc/ploinky-box-gpu-grant.json"
+      }
+    ],
+    "files": [
+      {
+        "path": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/1bd638a55697c6558b88ca5bc68fa8316f451b4e795face13a319594fa7f09e3/marker.json",
+        "content": "{\n  \"version\": 1,\n  \"kind\": \"ploinky-box-gpu-grant\",\n  \"instance\": \"ploinky-box-golden-0123456789ab\",\n  \"pathHash\": \"0123456789ab\",\n  \"workspaceRoot\": \"/workspace/golden\",\n  \"vendor\": \"nvidia\",\n  \"agents\": [\n    \"local-llms/local-llm\"\n  ],\n  \"state\": \"stale\",\n  \"reason\": \"The NVIDIA kernel module is not loaded (/proc/driver/nvidia/version: ENOENT)\",\n  \"fingerprint\": \"1bd638a55697c6558b88ca5bc68fa8316f451b4e795face13a319594fa7f09e3\",\n  \"cdiDevice\": null,\n  \"specSha256\": null\n}\n"
+      }
+    ]
+  },
+  "NVIDIA device node /dev/nvidia0 is missing (ENOENT); rootless Ploinky cannot create device nodes": {
+    "fingerprint": "9e62643c7c7cc2543ba960f1daaa0fb5598a3419555bfe297bd60371e1718611",
+    "state": "stale",
+    "reason": "NVIDIA device node /dev/nvidia0 is missing (ENOENT); rootless Ploinky cannot create device nodes",
+    "vendor": "nvidia",
+    "agents": [
+      "local-llms/local-llm"
+    ],
+    "denied": [],
+    "workspaceDenied": false,
+    "driverVersion": null,
+    "devices": [],
+    "mounts": [
+      {
+        "source": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/9e62643c7c7cc2543ba960f1daaa0fb5598a3419555bfe297bd60371e1718611/marker.json",
+        "destination": "/etc/ploinky-box-gpu-grant.json"
+      }
+    ],
+    "files": [
+      {
+        "path": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/9e62643c7c7cc2543ba960f1daaa0fb5598a3419555bfe297bd60371e1718611/marker.json",
+        "content": "{\n  \"version\": 1,\n  \"kind\": \"ploinky-box-gpu-grant\",\n  \"instance\": \"ploinky-box-golden-0123456789ab\",\n  \"pathHash\": \"0123456789ab\",\n  \"workspaceRoot\": \"/workspace/golden\",\n  \"vendor\": \"nvidia\",\n  \"agents\": [\n    \"local-llms/local-llm\"\n  ],\n  \"state\": \"stale\",\n  \"reason\": \"NVIDIA device node /dev/nvidia0 is missing (ENOENT); rootless Ploinky cannot create device nodes\",\n  \"fingerprint\": \"9e62643c7c7cc2543ba960f1daaa0fb5598a3419555bfe297bd60371e1718611\",\n  \"cdiDevice\": null,\n  \"specSha256\": null\n}\n"
+      }
+    ]
+  },
+  "revoked": {
+    "fingerprint": "16c32aebb1ff8e7607e8a656c94ce0634595eefe85b230d99eee3e2a82ee7b2f",
+    "state": "revoked",
+    "reason": null,
+    "vendor": "nvidia",
+    "agents": [],
+    "denied": [],
+    "workspaceDenied": true,
+    "driverVersion": null,
+    "devices": [],
+    "mounts": [
+      {
+        "source": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/16c32aebb1ff8e7607e8a656c94ce0634595eefe85b230d99eee3e2a82ee7b2f/marker.json",
+        "destination": "/etc/ploinky-box-gpu-grant.json"
+      }
+    ],
+    "files": [
+      {
+        "path": "/home/golden/.ploinky-box/gpu-grants/ploinky-box-golden-0123456789ab/16c32aebb1ff8e7607e8a656c94ce0634595eefe85b230d99eee3e2a82ee7b2f/marker.json",
+        "content": "{\n  \"version\": 1,\n  \"kind\": \"ploinky-box-gpu-grant\",\n  \"instance\": \"ploinky-box-golden-0123456789ab\",\n  \"pathHash\": \"0123456789ab\",\n  \"workspaceRoot\": \"/workspace/golden\",\n  \"vendor\": \"nvidia\",\n  \"agents\": [],\n  \"state\": \"revoked\",\n  \"reason\": null,\n  \"fingerprint\": \"16c32aebb1ff8e7607e8a656c94ce0634595eefe85b230d99eee3e2a82ee7b2f\",\n  \"cdiDevice\": null,\n  \"specSha256\": null,\n  \"workspaceDenied\": true\n}\n"
+      }
+    ]
+  }
+}

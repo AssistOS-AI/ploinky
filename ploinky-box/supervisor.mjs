@@ -68,6 +68,7 @@ import {
     declaredGpuAgents,
     defaultGpuVendor,
     discoverGpu,
+    vulkanFallbackOf,
     effectiveGpuAccess,
     enabledCdiRequestingAgents,
     normalizeGpuAgentSelectors,
@@ -375,7 +376,7 @@ export function createBoxSupervisor({
     captureCoreStartArgv = captureConfiguredCoreStartArgv,
     routerBindingStore = createRouterBindingStore(),
     updateHostState = updateHostStateForLockManager(lockManager),
-    gpuGrantStore = createGpuGrantStore(),
+    gpuGrantStore = createGpuGrantStore({ engineRunner: runner }),
     hardwareGateStore = createHardwareGateStore(),
     // Bounded, idempotent preparation of each created/restored/restarted
     // gate-on generation before graph work (plan U5/U11, §7).
@@ -386,7 +387,7 @@ export function createBoxSupervisor({
         repositoryRoot,
         writableSources: [identity.workspaceRoot, ...Object.values(identity.dataPaths || {})],
     }),
-    discoverGpuDevices = discoverGpu,
+    discoverGpuDevices = (vendor) => discoverGpu(vendor, { engineRunner: runner }),
     // MPS tool discovery for gate-on GPU wiring; the GPU module's default.
     discoverGpuMpsTools = undefined,
     scanGpuAgents = declaredGpuAgents,
@@ -3275,12 +3276,14 @@ export function createBoxSupervisor({
             host = Object.freeze({
                 available: true,
                 vendor: discovered.vendor,
+                ...(discovered.vendor === 'vulkan' ? { driver: discovered.driver } : {}),
                 driverVersion: discovered.driverVersion,
                 devices: discovered.devices.map((device) => device.path),
                 libraries: discovered.libraries.map((library) => library.soname),
             });
         } catch (error) {
-            host = Object.freeze({ available: false, reason: error.message });
+            host = Object.freeze({ available: false, reason: error.message,
+                ...(vulkanFallbackOf(error) ? { vulkanReason: vulkanFallbackOf(error) } : {}) });
         }
         const declared = scanGpuAgents(identity.workspaceRoot);
         const access = effectiveGpuAccess(saved, declared);
@@ -3767,9 +3770,12 @@ export function formatGpuGrantStatus(status) {
             ? [`Manifest GPU declarations: ${status.access.declared.join(', ')}`]
             : []),
         status.host.available
-            ? `Host GPU: ${status.host.vendor} driver ${status.host.driverVersion}; devices ${status.host.devices.join(', ')}; `
+            ? status.host.vendor === 'vulkan'
+                ? `Host GPU: vulkan render node ${status.host.devices.join(', ')} (${status.host.driver}; ${status.host.driverVersion})`
+                : `Host GPU: ${status.host.vendor} driver ${status.host.driverVersion}; devices ${status.host.devices.join(', ')}; `
                 + `libraries ${status.host.libraries.join(', ')}`
             : `Host GPU: unavailable (${status.host.reason})`,
+        ...(status.host.vulkanReason ? [`Vulkan render node: ${status.host.vulkanReason}`] : []),
         `Box: ${status.box}${status.boxProblem
             ? `; GPU wiring is invalid (${status.boxProblem})`
             : status.box === 'absent' ? '' : `; GPU wiring ${describeWiring(status.boxGpu)}`}`,

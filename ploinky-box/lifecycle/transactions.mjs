@@ -375,7 +375,8 @@ export async function reconcileBoxContainer({
         retireStartLock: seams.retireStartLock || retireQuiescentBoxWorkspaceStartLock,
         retireEdgePreparation: seams.retireEdgePreparation || retireQuiescentBoxEdgePreparation,
         materializeGpu: seams.materializeGpu || ((selectedIdentity, wiring, selectedLock) => {
-            if (wiring) createGpuGrantStore().materialize(selectedIdentity, wiring, selectedLock);
+            if (wiring) createGpuGrantStore({ engineRunner: runner, platform, renderOptions: { env } })
+                .materialize(selectedIdentity, wiring, selectedLock);
         }),
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),

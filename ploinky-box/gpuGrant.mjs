@@ -33,6 +33,7 @@ import {
     GPU_GRANT_STATE_DIRECTORY,
 } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
+import { discoverVulkanRenderNode, nvidiaAbsent, revalidateRenderNode, RENDER_DEVICE_PATH_RE } from './gpuVulkan.mjs';
 import { assertRouterBindingStateConfined } from './routerBinding.mjs';
 import { discoverMpsTools, validateMpsTools, revalidateMpsTools, MPS_TOOL_PATHS } from './lib/mpsTools.mjs';
 import {
@@ -399,9 +400,23 @@ export function discoverNvidiaGpu({
     });
 }
 
+const VULKAN_FALLBACK = new WeakMap();
+
+export function vulkanFallbackOf(error) {
+    return VULKAN_FALLBACK.get(error) ?? null;
+}
+
 export function discoverGpu(vendor, options = {}) {
-    if (normalizeGpuVendor(vendor) === 'nvidia') return discoverNvidiaGpu(options);
-    throw grantError(`Unsupported GPU vendor ${vendor}`);
+    normalizeGpuVendor(vendor);
+    try { return discoverNvidiaGpu(options); }
+    catch (error) {
+        if (error.code !== 'PLOINKY_BOX_GPU_DISCOVERY_FAILED' || !nvidiaAbsent(options)) throw error;
+        try { return discoverVulkanRenderNode(options); }
+        catch (vulkanError) {
+            VULKAN_FALLBACK.set(error, singleLine(vulkanError?.message || vulkanError, 400));
+            throw error;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +452,7 @@ export function renderBoxCdiSpec(discovery) {
                 deviceNodes: discovery.devices.map((device) => ({ path: device.path })),
             },
         }],
-        containerEdits: {
+        ...(discovery.libraries.length || discovery.tools.length ? { containerEdits: {
             mounts: [
                 ...discovery.libraries.map((library) => path.posix.join(BOX_GPU_LIBRARY_DIRECTORY, library.soname)),
                 ...discovery.tools.map((tool) => path.posix.join(BOX_GPU_BIN_DIRECTORY, tool.name)),
@@ -446,7 +461,7 @@ export function renderBoxCdiSpec(discovery) {
                 containerPath: inBoxPath,
                 options: ['ro', 'nosuid', 'nodev', 'bind'],
             })),
-        },
+        } } : {}),
     }, null, 2)}\n`;
 }
 
@@ -493,6 +508,7 @@ export function buildGpuWiring({
         ...(workspaceDenied ? { workspaceDenied: true } : {}),
     };
     const state = revoked ? 'revoked' : discovery ? 'active' : 'stale';
+    const wiringVendor = discovery?.vendor === 'vulkan' ? 'vulkan' : normalizedGrant.vendor;
     if (mps) { validateMpsTools(mps); if (!discovery) throw grantError('MPS tools require active GPU wiring'); }
     const reason = discovery || revoked ? null : singleLine(failure?.message || failure);
     // Why the host's MPS tools were not wired although the gate asked for them: kept in the marker (bounded, one
@@ -506,7 +522,7 @@ export function buildGpuWiring({
         instance: identity.instance,
         pathHash: identity.pathHash,
         workspaceRoot: identity.workspaceRoot,
-        vendor: normalizedGrant.vendor,
+        vendor: wiringVendor,
         agents: normalizedGrant.agents,
         state,
         reason,
@@ -525,7 +541,7 @@ export function buildGpuWiring({
         instance: identity.instance,
         pathHash: identity.pathHash,
         workspaceRoot: identity.workspaceRoot,
-        vendor: normalizedGrant.vendor,
+        vendor: wiringVendor,
         agents: normalizedGrant.agents,
         state,
         reason,
@@ -557,7 +573,7 @@ export function buildGpuWiring({
         fingerprint,
         state,
         reason,
-        vendor: normalizedGrant.vendor,
+        vendor: wiringVendor,
         agents: normalizedGrant.agents,
         denied: deniedAgents,
         workspaceDenied: workspaceDenied === true,
@@ -621,7 +637,9 @@ export function resolveDesiredGpuWiring(identity, decision, declared = [], {
         }
         let mps = null;
         let mpsFailure = null;
-        if (mpsEnabled) {
+        if (mpsEnabled && discovery.vendor === 'vulkan') {
+            mpsFailure = "GPU shares need NVIDIA MPS; this Box's GPU is a Vulkan render node";
+        } else if (mpsEnabled) {
             try { mps = discoverMps(); validateMpsTools(mps); }
             catch (error) { mps = null; mpsFailure = String(error?.message || error || 'MPS tool discovery failed'); }
         }
@@ -812,7 +830,11 @@ export function observeContainerGpuWiring(containerHandle, { homeDirectory = os.
     if (!Object.hasOwn(labels, BOX_LABELS.gpuGrant)) return null;
     const recordedDevices = repeatedOptionValues(runtime.createCommand, '--device') || [];
     const extraDevices = recordedDevices
-        .filter((device) => !BOX_BASE_DEVICES.includes(device) && /^\/dev\/nvidia[a-z0-9-]*$/.test(device));
+        .filter((device) => !BOX_BASE_DEVICES.includes(device)
+            && (/^\/dev\/nvidia[a-z0-9-]*$/.test(device) || RENDER_DEVICE_PATH_RE.test(device)));
+    if (extraDevices.filter((device) => RENDER_DEVICE_PATH_RE.test(device)).length > 1) {
+        throw wiringObservationError('Owned Box GPU wiring has more than one render device');
+    }
     const gpuMounts = (Array.isArray(runtime.mounts) ? runtime.mounts : [])
         .filter((mount) => isGpuMountDestination(String(mount.destination || '')));
     const fingerprint = String(labels[BOX_LABELS.gpuGrant]);
@@ -922,6 +944,9 @@ function writePrivateFileAtomically(fsApi, directory, target, content, beforeRen
 export function createGpuGrantStore({
     homeDirectory = os.homedir(),
     fsApi = fs,
+    platform = process.platform,
+    engineRunner,
+    renderOptions = {},
 } = {}) {
     const stateRoot = stateRootFor(homeDirectory);
     const directory = gpuGrantDirectory(homeDirectory);
@@ -1084,6 +1109,11 @@ export function createGpuGrantStore({
             if (!stat.isFile()) throw changed(mount.source, 'is not a regular file');
         }
         for (const device of wiring.devices) {
+            if (RENDER_DEVICE_PATH_RE.test(device)) {
+                try { revalidateRenderNode(device, { fsApi, platform, ...renderOptions, engineRunner }); }
+                catch (error) { throw changed(device, error.message); }
+                continue;
+            }
             let stat;
             try {
                 stat = fsApi.statSync(device);

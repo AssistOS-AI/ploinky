@@ -60,6 +60,58 @@ import {
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
+import { discoverVulkanRenderNode } from '../../ploinky-box/gpuVulkan.mjs';
+import { makeTree } from './fixtures/render-query/make-trees.mjs';
+
+test('contract: container device set accepts the render-node wiring', (t) => {
+    const state = boxFixture(t);
+    const tree = makeTree(t);
+    const discovery = discoverVulkanRenderNode({ ...tree, platform: 'linux' });
+    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery });
+    const handle = containerHandle(state, { gpu: wiring });
+    assert.doesNotThrow(() => validateContainerConfiguration(handle, desiredFor(state, wiring)));
+    assert.doesNotThrow(() => validateContainerConfiguration(handle, desiredFor(state, undefined)));
+    handle.runtime.createCommand.push('--device', '/dev/dri/card0');
+    assert.throws(() => validateContainerConfiguration(handle, desiredFor(state, wiring)), /device set is incompatible/);
+});
+
+test('kept Vulkan wiring uses the lifecycle engine runner and refuses changed permission before mutation', async (t) => {
+    const state = boxFixture(t);
+    useTempHome(t, state.root);
+    let mode = '21b6';
+    const calls = [];
+    const query = (command, args, options) => {
+        calls.push({ command, args, options });
+        const name = 'fixture-krun';
+        const value = args[0] === 'system' ? [{ Name: name, Default: true, IsMachine: true }]
+            : args[1] === 'list' ? [{ Name: name, VMType: 'libkrun', Running: true }]
+                : args[1] === 'inspect' ? [{ Name: name, Rootful: false }]
+                    : `kernel 6.8\nnode renderD128 ${mode} e2 80 226:128 virtio-mmio - - rw\nchild renderD128 virtio0 virtio_gpu 0x0010\nend\n`;
+        return { ok: true, status: 0, stdout: typeof value === 'string' ? value : JSON.stringify(value) };
+    };
+    const discovery = discoverVulkanRenderNode({ platform: 'darwin', env: {}, engineRunner: { query } });
+    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery });
+    createGpuGrantStore().materialize(state.identity, wiring, state.lock);
+    const old = containerHandle(state, { gpu: wiring });
+    const h = harness(state, { initial: old });
+    h.runner.query = query;
+    const { materializeGpu: _fake, ...seams } = h.seams;
+    calls.length = 0;
+    const options = { ...reconcileArguments(state, h, old, { explicitPort: 8091 }), platform: 'darwin', env: {} };
+    const result = await reconcileBoxContainer(options, seams);
+    result.finalize();
+    assert.equal(result.action, 'replaced');
+    assert.equal(result.gpu.fingerprint, wiring.fingerprint);
+    assert.equal(calls.length, 4);
+    const unchanged = harness(state, { initial: old });
+    unchanged.runner.query = query;
+    const { materializeGpu: _next, ...nextSeams } = unchanged.seams;
+    mode = '21b0';
+    await assert.rejects(() => reconcileBoxContainer({
+        ...reconcileArguments(state, unchanged, old, { explicitPort: 8092 }), platform: 'darwin', env: {},
+    }, nextSeams), /group-only/);
+    assert.equal(unchanged.calls.some((call) => ['stop', 'rm', 'create'].includes(call[3])), false);
+});
 
 const DRIVER = '595.91.07';
 // Each fixture host names its architecture, so discovery never depends on the
