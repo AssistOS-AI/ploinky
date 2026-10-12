@@ -1220,6 +1220,18 @@ export function buildRequiredCaseManifest() {
             'LL.ollama-pinned-over-cap', 'LL.ollama-auto-free', 'LL.gpu-minimal-env-all-adapters', 'LL.cpu-no-mps-env',
             'LL.partial-mps-refused', 'LL.unified-share-refused', 'LL.gpu-unlimited-golden',
         ]),
+        ...leaves(P, 'p4', unit('hardwareLimitsLiveModel.test.mjs'), [
+            'MODEL.manifest-profile-pins-and-old-mode-separation',
+            'MODEL.cpu-canonical-provision-inference-cleanup-with-ordinary-source',
+            'MODEL.failure-cancellation-stop-destroy-and-oversized-never-pass',
+            'MODEL.apple-and-nvidia-cohorts-and-foreign-compute-guard',
+            'MODEL.backend-model-image-offload-and-safe-process-facts',
+            'MODEL.source-mount-hash-device-and-workspace-reuse-refused',
+            'MODEL.apple-guard-thresholds-unreadable-and-cancellation',
+            'MODEL.apple-selected-machine-and-connection-fail-closed',
+            'MODEL.cleanup-artifacts-and-exact-action-bindings',
+            'MODEL.process-observer-never-emits-secret-arguments-or-environment',
+        ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveLlm.test.mjs'), [
             'L3LOAD.the-vllm-model-load-is-thirty-minutes-and-the-block-is-the-runner-maximum-and-the-summary-renders-both',
             'L3LOAD.a-load-within-the-deadline-continues-and-records-each-phase-transition-and-the-total-wait',
@@ -1809,7 +1821,7 @@ export function validateRunManifest(value) {
         if (!/^sha256:[0-9a-f]{64}$/.test(value[key])) fail(`${label}.${key}`, 'invalid digest');
     }
     if (!['mac-cpu', 'mac-adversarial', 'mac-explorer', 'apparatus-cpu', 'apparatus-core', 'apparatus-authority', 'apparatus-availability', 'apparatus-router-controls', 'apparatus-store', 'apparatus-mps', 'apparatus-local-llm',
-        'apparatus-vllm'].includes(value.block)) {
+        'apparatus-vllm', 'mac-model-venus', 'apparatus-model-nvidia', 'apparatus-model-cpu'].includes(value.block)) {
         fail(`${label}.block`, 'unknown block');
     }
     if (!['proposed', 'running', 'cleanup-required', 'complete'].includes(value.state)) fail(`${label}.state`, 'invalid state');

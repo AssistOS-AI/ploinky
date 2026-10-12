@@ -30,8 +30,10 @@ import { validateGpuProfile } from './liveGpuCommands.mjs';
 import { createLlmCases, llmCleanupProof } from './liveLlmCases.mjs';
 import { validateLlmProfile } from './liveLlmCommands.mjs';
 import { gpuCleanupProof, isGpuProcessRecord, isToleratedRecord } from './liveGpuGate.mjs';
+import { MODEL_PROFILES, createModelCases, validateModelProfile } from './liveModelCases.mjs';
 
 export const LIVE_CASES = Object.freeze({
+    ...Object.fromEntries(Object.values(MODEL_PROFILES).map(spec => [spec.block, [spec.case]])),
     'mac-cpu': ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C4', 'LIVE-C5', 'LIVE-C6', 'LIVE-C7'],
     'mac-adversarial': ['LIVE-S1', 'LIVE-S2'],
     'mac-explorer': ['LIVE-X0', 'LIVE-X1'],
@@ -64,7 +66,7 @@ export const LIVE_ACTIONS = Object.freeze(['provision', 'live', 'cleanup']);
 export function validateProfile(run, { partial = false } = {}) {
     validateRunManifest(run);
     const profile = run.target.execution;
-    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu', 'llm']);
+    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu', 'llm', 'model']);
     if (profile.fixtures !== undefined) {
         keys(profile.fixtures, [], 'fixtures', ['cpu', 'gpu', 'llm', 'availability', 'store']);
         for (const name of ['cpu', 'gpu', 'llm', 'availability', 'store']) {
@@ -113,8 +115,16 @@ export function validateProfile(run, { partial = false } = {}) {
     const gpuCases = profile.cases.some(id => id.startsWith('LIVE-P'));
     const llmCases = profile.cases.some(id => id.startsWith('LIVE-L'));
     if (llmCases !== (profile.llm !== undefined)) throw new Error('The local-llm pins and the selected cases disagree');
-    if (gpuCases || llmCases || profile.gpu !== undefined) validateGpuProfile(profile);
-    if (llmCases) validateLlmProfile(profile);
+    const modelBlock = Object.values(MODEL_PROFILES).some(spec => spec.block === run.block);
+    if (modelBlock !== (profile.model !== undefined)) throw new Error('Model block and profile disagree');
+    if (modelBlock) {
+        validateModelProfile(profile, run.block);
+        if (JSON.stringify(run.target.cases) !== JSON.stringify(profile.cases)) throw new Error('Model target and execution cases disagree');
+    }
+    else {
+        if (gpuCases || llmCases || profile.gpu !== undefined) validateGpuProfile(profile);
+        if (llmCases) validateLlmProfile(profile);
+    }
     if (!partial) {
         if (profile.cases.includes('LIVE-C2') && (profile.agents.length !== 3 || roles.size !== 3)) throw new Error('C2 requires three distinct owned agents');
         if (gpuCases && !['probe', 'peer', 'cpu'].every(role => roles.has(role))) throw new Error('The GPU cases require the owned probe, peer and cpu agents');
@@ -563,10 +573,10 @@ export function createLiveAdapter(profile, {
     }
     // The GPU cases of an apparatus-mps run (liveGpuCases.mjs), built over this
     // adapter's own journaled commands.
-    const gpuContext = { profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, processProvider, env, signal, host: hostProc, timings: gpuTimings };
+    const gpuContext = { profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, processProvider, env, signal, cleanupSignal, host: hostProc, timings: gpuTimings };
     const gpu = profile.gpu && !profile.llm ? createGpuCases(gpuContext) : null;
     // The local-llm and vLLM cases (liveLlmCases.mjs) build on the same kit and cleanup hooks.
-    const llm = profile.llm ? createLlmCases(gpuContext) : null;
+    const llm = profile.model ? createModelCases(gpuContext) : profile.llm ? createLlmCases(gpuContext) : null;
     // The availability cases (LIVE-C3 and LIVE-C3V) of their own fixtures.
     const availability = profile.fixtures?.availability ? createAvailabilityCases({ profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, ...availabilitySeams }) : null;
     // The store case (LIVE-C5): the host and the in-Box writers of the policy store, its lock and its barrier.
@@ -590,6 +600,7 @@ export function createLiveAdapter(profile, {
         }
         await runOwnedCleanup({ run, profile, persist, processProvider, signal: cleanupSignal, artifacts, artifactPath, proofAction: 'live' });
         if (hooks) await hooks.afterCleanup();
+        if (profile.model && run.cleanup.failures.length) throw new Error('Model cleanup has recorded failures');
     }
     return { cpuCase, coreCase, swapCase, helperCase, cleanup, inspectBox, gpu, llm, availability, store };
 }
@@ -680,7 +691,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     if (run.cleanup.state !== 'not-started') { report.limitations.push('Cleanup has already started for this run; provision a new one'); return report; }
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
     if (problem) { report.limitations.push(problem); return report; }
-    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C3V', 'LIVE-C5', 'LIVE-C6', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3'].includes(id))) {
+    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C3V', 'LIVE-C5', 'LIVE-C6', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3', 'LIVE-L4', 'LIVE-L5', 'LIVE-L6'].includes(id))) {
         report.limitations.push('Selected cases have no implemented live executor'); return report;
     }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return report; }
@@ -703,7 +714,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
                 ...(adapter.availability ? { 'LIVE-C3': adapter.availability.liveC3, 'LIVE-C3V': adapter.availability.liveC3V } : {}),
                 ...(adapter.store ? { 'LIVE-C5': adapter.store.liveC5 } : {}),
                 ...(adapter.gpu ? { 'LIVE-P1': adapter.gpu.liveP1, 'LIVE-P2': adapter.gpu.liveP2, 'LIVE-P3': adapter.gpu.liveP3, 'LIVE-P4': adapter.gpu.liveP4 } : {}),
-                ...(adapter.llm ? { 'LIVE-L1': adapter.llm.liveL1, 'LIVE-L2': adapter.llm.liveL2, 'LIVE-L3': adapter.llm.liveL3 } : {}),
+                ...(adapter.llm ? profile.model ? { [profile.cases[0]]: adapter.llm.liveModel } : { 'LIVE-L1': adapter.llm.liveL1, 'LIVE-L2': adapter.llm.liveL2, 'LIVE-L3': adapter.llm.liveL3 } : {}),
             };
             for (const id of selected) {
                 activeCase = id;

@@ -214,6 +214,31 @@ for(const name of fs.readdirSync('/proc').filter((n)=>/^[1-9][0-9]*$/.test(n)).s
 }
 process.stdout.write(JSON.stringify({processes:out}));`;
 
+// Fixed allowlist projection: never emit the full command line, API key, or
+// environment. Unreadable process facts fail closed, including permissions.
+export const MODEL_PROCESS_FACTS = String.raw`
+const fs=require('node:fs'),crypto=require('node:crypto');
+const expected=process.argv[1];
+if(!['/opt/llama.cpp/llama-server','/opt/llama.cpp-vulkan/llama-server'].includes(expected))throw Error('Invalid executable');
+const hash=(file)=>{const h=crypto.createHash('sha256'),fd=fs.openSync(file,'r'),b=Buffer.alloc(1048576);try{for(;;){const n=fs.readSync(fd,b,0,b.length,null);if(!n)break;h.update(b.subarray(0,n));}}finally{fs.closeSync(fd);}return h.digest('hex');};
+const out=[],names=fs.readdirSync('/proc').filter(n=>/^[1-9][0-9]*$/.test(n));
+if(names.length>4096)throw Error('Process bound exceeded');
+const devices=(directory,pattern)=>{try{const names=fs.readdirSync(directory);if(names.length>4096)throw Error('Device observation bound exceeded');return names.filter(name=>pattern.test(name)).map(name=>directory+'/'+name);}catch(e){if(e.code==='ENOENT')return [];throw e;}};
+const gpuNodes=[...devices('/dev',/^nvidia/),...devices('/dev/dri',/^(?:renderD|card)/)];
+for(const name of names){try{
+ const exe=fs.readlinkSync('/proc/'+name+'/exe');if(!exe.endsWith('/llama-server'))continue;
+ const args=fs.readFileSync('/proc/'+name+'/cmdline','utf8').split('\0');
+ const env=fs.readFileSync('/proc/'+name+'/environ','utf8').split('\0');
+ const values=(flag)=>args.flatMap((arg,i)=>arg===flag?[args[i+1]]:[]);
+ const value=(key)=>{const rows=env.filter(x=>x.startsWith(key+'='));if(rows.length>1||rows.some(x=>x.length>512))throw Error('Invalid selected environment field');return rows.length?rows[0].slice(key.length+1):null;};
+ const pick={};for(const flag of ['--device','--n-gpu-layers','-ngl','--fit']){const rows=values(flag);if(rows.length>1||rows.some(x=>typeof x!=='string'||x.length>128))throw Error('Invalid safe argument');pick[flag]=rows[0]??null;}
+ const stat=fs.readFileSync('/proc/'+name+'/stat','utf8');const fields=stat.slice(stat.lastIndexOf(')')+2).split(' ');
+ out.push({pid:Number(name),start:fields[19],exe,sha256:hash('/proc/'+name+'/exe'),args:pick,gpuNodes,
+ cudaVisible:value('CUDA_VISIBLE_DEVICES'),icd:value('VK_DRIVER_FILES'),layers:value('VK_LOADER_LAYERS_DISABLE'),
+ mps:env.some(x=>/^CUDA_MPS_|^PLOINKY_MPS_/.test(x)),nvidiaLibrary:(value('LD_LIBRARY_PATH')||'').split(':').some(x=>/nvidia|cuda/i.test(x))});
+}catch(e){if(!['ENOENT','ESRCH'].includes(e.code))throw e;}}
+if(out.length>4)throw Error('Runner bound exceeded');process.stdout.write(JSON.stringify({processes:out}));`;
+
 // The digests of the image files that identify the runner: llama.cpp's server, the image's source
 // contract and its runner lock. A fixed list, read-only, streamed.
 export const LLM_IMAGE_FILES = Object.freeze(['/opt/llama.cpp/llama-server', '/opt/local-llm/source.contract', '/opt/local-llm/runners.lock.json']);

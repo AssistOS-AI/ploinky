@@ -186,6 +186,12 @@ export function c5RequiredArtifacts({ profile, action, remoteReport, fetched = n
 
 // What a run must have left for its PASS to be certified: the proof each action ends with.
 export function requiredArtifacts({ profile, action, remoteReport, fetched = null }) {
+    if (profile?.model) {
+        if (action === 'provision') return ['box-inspect', 'box-contract', ...(profile.gpu ? ['gpu-initial-gate'] : []), ...(profile.model.profile === 'apple' ? ['model-apple-machine'] : [])];
+        if (action === 'live') return [`model-${profile.cases[0].toLowerCase()}`, 'llm-cleanup-proof', ...(remoteReport?.verdict === 'PASS' ? ['model-stop-proof'] : []), ...(profile.gpu ? ['gpu-final-observation'] : []), ...(profile.model.profile === 'apple' ? ['model-a15-host-guard'] : [])];
+        if (action === 'cleanup') return ['llm-cleanup-proof', `model-${profile.cases[0].toLowerCase()}`, ...(profile.gpu ? ['gpu-final-observation'] : [])];
+        return [];
+    }
     if (!profile?.gpu) return profile?.cases?.includes('LIVE-C5') ? c5RequiredArtifacts({ profile, action, remoteReport, fetched }) : [];
     // A failed or blocked MPS case that ran left its failure evidence (the daemon's state and logs, the Router and
     // Watchdog tails, the Apply response) before the Box was destroyed; a missing item is reported with the run.
@@ -198,14 +204,24 @@ export function requiredArtifacts({ profile, action, remoteReport, fetched = nul
     return [];
 }
 
+export function modelInferenceProofProblem(bytes, { runId, caseId, requirePass = false }) {
+    let proof;
+    try { proof = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch { return 'model inference proof is not JSON'; }
+    if (proof?.schema !== 1 || proof.runId !== runId || proof.case !== caseId) return 'model inference proof identity mismatch';
+    if (!['pass', 'fail'].includes(proof.status) || requirePass && proof.status !== 'pass') return 'model inference proof is not a terminal result';
+    if (proof.status === 'pass' && (typeof proof.answer?.text !== 'string' || !proof.answer.text.trim() || !Number.isFinite(proof.answer.generationTokensPerSecond) || proof.answer.generationTokensPerSecond <= 0
+        || !proof.agent?.id || !proof.source?.stagedTreeDigest || !Array.isArray(proof.processes) || proof.processes.length !== 1)) return 'model inference proof lacks runtime evidence';
+    return null;
+}
+
 // Why a fetched `llm-cleanup-proof` does not certify THIS cleanup, or null: it must be this run's, written by a cleanup
 // action (not by the live run), and list nothing remaining.
-export function llmCleanupProofProblem(bytes, { runId }) {
+export function llmCleanupProofProblem(bytes, { runId, action = 'cleanup' }) {
     let proof;
     try { proof = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch { return 'the LLM cleanup proof is not JSON'; }
     if (!proof || typeof proof !== 'object' || proof.schema !== 1) return 'the LLM cleanup proof has an unknown shape';
     if (proof.runId !== runId) return 'the LLM cleanup proof belongs to another run';
-    if (proof.action !== 'cleanup') return `the LLM cleanup proof was written by the ${String(proof.action).slice(0, 20)} action, not by this cleanup`;
+    if (proof.action !== action) return `the LLM cleanup proof was written by the ${String(proof.action).slice(0, 20)} action, not by this ${action}`;
     if (!Number.isSafeInteger(proof.at) || proof.at <= 0) return 'the LLM cleanup proof has no time';
     if (!Array.isArray(proof.remaining) || proof.remaining.length) return 'the LLM cleanup proof lists model data that remains';
     return null;
@@ -358,10 +374,18 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         // The side artifacts, with digest proof, before anything can be removed.
         const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport, fetched }) });
         // A cleanup's LLM proof must be this action's own, for this run, with nothing remaining.
-        const proofEntry = action === 'cleanup' ? artifacts.fetched.find(entry => entry.name === 'llm-cleanup-proof') : null;
+        const proofEntry = action === 'cleanup' || profile.model && action === 'live' ? artifacts.fetched.find(entry => entry.name === 'llm-cleanup-proof') : null;
         if (proofEntry) {
-            const problem = llmCleanupProofProblem(fs.readFileSync(path.join(runDirectory, proofEntry.file)), { runId: run.runId });
+            const problem = llmCleanupProofProblem(fs.readFileSync(path.join(runDirectory, proofEntry.file)), { runId: run.runId, action });
             if (problem) { artifacts.failures.push({ name: 'llm-cleanup-proof', reason: problem }); artifacts.complete = false; }
+        }
+        if (profile.model && ['live', 'cleanup'].includes(action)) {
+            const name = `model-${profile.cases[0].toLowerCase()}`;
+            const entry = artifacts.fetched.find(item => item.name === name);
+            if (entry) {
+                const problem = modelInferenceProofProblem(fs.readFileSync(path.join(runDirectory, entry.file)), { runId: run.runId, caseId: profile.cases[0], requirePass: action === 'live' && remoteReport.verdict === 'PASS' });
+                if (problem) { artifacts.failures.push({ name, reason: problem }); artifacts.complete = false; }
+            }
         }
         const c5Entry = action === 'cleanup' && profile.cases?.includes('LIVE-C5') && !profile.gpu ? artifacts.fetched.find(entry => entry.name === C5_CLEANUP_PROOF) : null;
         if (c5Entry) {
