@@ -148,6 +148,7 @@ const RETRYABLE_CLIENT_OPERATION_ERRORS = new Set([
     'WEBTTY_USER_QUOTA',
     'WEBTTY_SESSION_QUOTA',
     'WEBTTY_CREATION_RATE',
+    'WEBTTY_VIEWER_QUOTA',
     'WEBTTY_INPUT_RATE',
     'WEBTTY_IPC_BACKPRESSURE',
     'WEBTTY_AGENT_IPC_BACKPRESSURE',
@@ -166,17 +167,19 @@ function mapOperationError(res, error) {
         sendError(res, 401, 'authentication_required');
     } else if (code === 'WEBTTY_ADMIN_REQUIRED') {
         sendError(res, 403, 'administrator_required');
+    } else if (code === 'WEBTTY_OWNER_REQUIRED') {
+        sendError(res, 403, 'owner_required');
     } else if (RETRYABLE_CLIENT_OPERATION_ERRORS.has(code)) {
         sendError(res, 429, code.toLowerCase(), { 'Retry-After': '5' });
     } else if (code === 'WEBTTY_LAUNCH_NOT_FOUND') {
         sendError(res, 404, 'terminal_launch_unavailable');
-    } else if (code === 'WEBTTY_SESSION_NOT_FOUND') {
+    } else if (code === 'WEBTTY_SESSION_NOT_FOUND' || code === 'WEBTTY_ATTACH_NOT_FOUND') {
         sendError(res, 404, 'not_found');
     } else if (STALE_TARGET_ERRORS.has(code)) {
         sendError(res, 409, 'terminal_target_stale');
     } else if (code === 'WEBTTY_UNAVAILABLE' || code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') {
         sendError(res, 503, 'webtty_unavailable', { 'Retry-After': '5' });
-    } else if (code === 'WEBTTY_GENERATION_CHANGED') {
+    } else if (code === 'WEBTTY_GENERATION_CHANGED' || code === 'EDGE_GENERATION_INACTIVE') {
         sendError(res, 503, 'edge_generation_changed');
     } else {
         sendError(res, 503, 'terminal_runtime_failure');
@@ -193,11 +196,48 @@ export async function handleWebtty(req, res, parsedUrl, {
     if (!requireAvailable(manager, res)) return true;
     const method = String(req.method || 'GET').toUpperCase();
 
+    if (pathname === '/webtty/live-sessions' && method === 'GET') {
+        try { sendJson(res, 200, { ok: true, version: 1, sessions: await manager.listSessions({ req, routePlan }) }); }
+        catch (error) { mapOperationError(res, error); }
+        return true;
+    }
+
+    const attachTokenPath = pathname.match(/^\/webtty\/live-sessions\/([A-Za-z0-9_-]{32})\/attach-tokens$/);
+    if ((attachTokenPath || pathname === '/webtty/attachments') && method === 'POST') {
+        if (!verifyMutationBeforeBody(req, res, routePlan)) return true;
+        let body;
+        try { body = await readJsonBody(req, 1024); }
+        catch (error) {
+            sendError(res, error.code === 'UNSUPPORTED_MEDIA_TYPE' ? 415 : error.code === 'BODY_TOO_LARGE' ? 413 : 400, error.code.toLowerCase());
+            return true;
+        }
+        if (parsedUrl.search || (attachTokenPath ? !exactBodyKeys(body, [])
+            : !exactBodyKeys(body, ['attach', 'cols', 'rows'])
+                || typeof body.attach !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(body.attach)
+                || !validateDimensions(body.cols, body.rows))) {
+            sendError(res, 400, 'invalid_attachment_request');
+            return true;
+        }
+        if (!commitMutation(routePlan, res)) return true;
+        try {
+            if (attachTokenPath) {
+                sendJson(res, 201, { ok: true, ...await manager.createAttachToken({ req, routePlan, id: attachTokenPath[1] }) });
+            } else {
+                const session = await manager.attach({ req, routePlan, ...body });
+                sendJson(res, 200, { ok: true, session });
+            }
+        } catch (error) { mapOperationError(res, error); }
+        return true;
+    }
+
     if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {
         const body = await fs.promises.readFile(path.join(WEBTTY_ROOT, 'webtty.html'));
         if (req.destroyed || res.destroyed) return true;
         res.writeHead(200, {
             ...SECURITY_HEADERS,
+            'X-Frame-Options': 'SAMEORIGIN',
+            'Content-Security-Policy': SECURITY_HEADERS['Content-Security-Policy']
+                .replace("frame-ancestors 'none'", "frame-ancestors 'self'"),
             'Content-Type': 'text/html; charset=utf-8',
             'Content-Length': body.length,
         });
@@ -305,7 +345,10 @@ export async function handleWebtty(req, res, parsedUrl, {
 
     if (selected.operation === 'stream' && method === 'GET') {
         let session;
-        try { session = await manager.validateOwnership(req, routePlan, selected.id); }
+        try {
+            session = await manager.authorize(req, routePlan, selected.id, 'watch');
+            if (session) manager.assertViewerQuota(session);
+        }
         catch (error) { mapOperationError(res, error); return true; }
         if (!session) { sendError(res, 404, 'not_found'); return true; }
         res.writeHead(200, {
@@ -316,7 +359,7 @@ export async function handleWebtty(req, res, parsedUrl, {
         });
         let attached = false;
         try {
-            attached = manager.attachStream(session, req, res, req.headers?.['last-event-id']);
+            attached = manager.attachStream(session, req, res, req.headers?.['last-event-id'], routePlan);
         } catch (_) { }
         if (!attached && !res.writableEnded && !res.destroyed) {
             try { res.end(); } catch (_) { }
@@ -339,7 +382,7 @@ export async function handleWebtty(req, res, parsedUrl, {
             return true;
         }
         let session;
-        try { session = await manager.validateOwnership(req, routePlan, selected.id); }
+        try { session = await manager.authorize(req, routePlan, selected.id, 'input'); }
         catch (error) { mapOperationError(res, error); return true; }
         if (!session) { sendError(res, 404, 'not_found'); return true; }
         if (!commitMutation(routePlan, res)) return true;
@@ -361,7 +404,7 @@ export async function handleWebtty(req, res, parsedUrl, {
             return true;
         }
         let session;
-        try { session = await manager.validateOwnership(req, routePlan, selected.id); }
+        try { session = await manager.authorize(req, routePlan, selected.id, 'resize'); }
         catch (error) { mapOperationError(res, error); return true; }
         if (!session) { sendError(res, 404, 'not_found'); return true; }
         if (!commitMutation(routePlan, res)) return true;
@@ -374,7 +417,7 @@ export async function handleWebtty(req, res, parsedUrl, {
         if (!verifyMutationBeforeBody(req, res, routePlan)) return true;
         if (!commitMutation(routePlan, res)) return true;
         let closed;
-        try { closed = await manager.closeOwned(req, routePlan, selected.id); }
+        try { closed = await manager.closeAuthorized(req, routePlan, selected.id); }
         catch (error) { mapOperationError(res, error); return true; }
         if (!closed) { sendError(res, 404, 'not_found'); return true; }
         sendJson(res, 200, { ok: true });

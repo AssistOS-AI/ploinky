@@ -11,6 +11,7 @@ import { ANY_GUEST_SET_COOKIE } from '../helpers/guestCookies.mjs';
 import { guestCookieNameForRouteKey } from '../../cli/server/auth/guestCookieNames.js';
 
 import { dispatchAgentStartupRequest } from '../../cli/server/agentStartupDispatch.js';
+import { onAuthenticatedRequestDecision } from '../../cli/server/auth/authenticatedRequestEvents.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1565,6 +1566,8 @@ test('an authenticated route enforces its manifest capability against the live S
         routerAccess: { requiredCapability: 'explorer.access' },
     };
     const decision = { access: 'authenticated', routeKey: 'explorer', source: 'policy' };
+    const decisions = [];
+    t.after(onAuthenticatedRequestDecision(event => decisions.push(event)));
 
     const deniedReq = makeRequest({
         method: 'GET',
@@ -1582,6 +1585,19 @@ test('an authenticated route enforces its manifest capability against the live S
     assert.equal(denied.ok, false);
     assert.equal(deniedRes.statusCode, 403);
     assert.equal(JSON.parse(deniedRes.body).error, 'required_capability_missing');
+    assert.equal(decisions.length, 1, 'fresh full roles publish before capability denial');
+    assert.deepEqual(decisions[0].roles, ['user']);
+    assert.equal(decisions[0].userId, 'sso:member');
+
+    routePlan.snapshot.manifests.explorer.routerAccess.capabilityDeniedRedirect = '/additional-access/';
+    const navigationReq = makeRequest({ url: '/explorer/index.html', cookie: 'ploinky_sso=sso-capability-session', accept: 'text/html' });
+    const navigationRes = new MockResponse();
+    const redirected = await authHandlers.ensureHttpRouteAccess(navigationReq, navigationRes,
+        new URL(navigationReq.url, 'http://localhost'), decision, { routePlan });
+    assert.equal(redirected.ok, false);
+    assert.equal(navigationRes.statusCode, 302);
+    assert.equal(navigationRes.getHeader('location'), '/additional-access/');
+    assert.equal(decisions.length, 2, 'fresh full roles publish before capability redirect');
 
     capabilities = ['explorer.access'];
     const allowedReq = makeRequest({
@@ -1599,6 +1615,7 @@ test('an authenticated route enforces its manifest capability against the live S
     );
     assert.equal(allowed.ok, true);
     assert.deepEqual(allowedReq.user.capabilities, ['explorer.access']);
+    assert.equal(decisions.length, 3);
 });
 
 test('authenticated route key with guest auth falls back to static route auth instead of minting guest', async (t) => {

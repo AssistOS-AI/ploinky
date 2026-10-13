@@ -105,6 +105,57 @@ function resolver(root, inspectContainer, options = {}) {
     });
 }
 
+test('running-agent checks preserve inspection classification and never resolve directory or translate mounts', async (t) => {
+    const { root, selected } = fixture(t);
+    const plan = routePlan({ [CONTAINER_NAME]: agentRecord() });
+    let raw = inspected([bind(root, '/code')]);
+    let failure = '';
+    const targets = resolver(root, async () => {
+        if (failure) throw Object.assign(new Error(), { code: failure });
+        return raw;
+    });
+    const discovery = await targets.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    const target = discovery.targets[1];
+    fs.renameSync(selected, `${selected}-renamed`);
+    targets.directoryResolver = () => { assert.fail('running shell must not resolve cwd'); };
+    assert.equal(await targets.revalidateRunningAgent({ routePlan: plan, target }), target);
+    for (const code of ['WEBTTY_TARGET_INSPECT_FAILED', 'WEBTTY_TARGET_INSPECT_ABORTED', 'WEBTTY_TARGET_IDENTITY_STALE']) {
+        failure = code;
+        await assert.rejects(targets.revalidateRunningAgent({ routePlan: plan, target }), { code });
+    }
+    failure = '';
+    for (const changed of [
+        { ...raw, Id: 'b'.repeat(64) },
+        { ...raw, Config: { ...raw.Config, User: '2000:2000' } },
+        { ...raw, Config: { ...raw.Config, Labels: { ...raw.Config.Labels, [NETWORK_LABELS.workspace]: 'foreign' } } },
+    ]) {
+        const previous = raw;
+        raw = changed;
+        await assert.rejects(targets.revalidateRunningAgent({ routePlan: plan, target }), { code: 'WEBTTY_TARGET_IDENTITY_STALE' });
+        raw = previous;
+    }
+    const replacement = routePlan({ [CONTAINER_NAME]: agentRecord({ containerId: 'b'.repeat(64) }) });
+    await assert.rejects(targets.revalidateRunningAgent({ routePlan: replacement, target }), { code: 'WEBTTY_TARGET_IDENTITY_STALE' });
+});
+
+test('launch and running-agent revalidation preserve a generation flip after successful inspection', async (t) => {
+    const { root } = fixture(t);
+    let current = true;
+    let flip = false;
+    const plan = routePlan({ [CONTAINER_NAME]: agentRecord() }, () => current);
+    const targets = resolver(root, async () => {
+        if (flip) current = false;
+        return inspected([bind(root, '/code')]);
+    });
+    const discovery = await targets.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    flip = true;
+    for (const method of ['revalidate', 'revalidateRunningAgent']) {
+        current = true;
+        await assert.rejects(targets[method]({ routePlan: plan, target: discovery.targets[1] }),
+            { code: 'WEBTTY_TARGET_GENERATION_STALE' });
+    }
+});
+
 test('exact inspect uses only runtime plus immutable id and immediately redacts unrelated data', async () => {
     const calls = [];
     const raw = inspected([]);

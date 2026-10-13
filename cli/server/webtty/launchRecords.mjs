@@ -5,6 +5,8 @@ export const WEBTTY_LAUNCH_LIMITS = Object.freeze({
     maxBatchesPerAuthSession: 3,
     maxLaunchRecords: 512,
     ttlMs: 5 * 60_000,
+    attachTtlMs: 60_000,
+    maxAttachRecords: 512,
 });
 
 const SAFE_TARGET_KEYS = Object.freeze(['kind', 'label', 'detail', 'access', 'cwdDisplay']);
@@ -29,7 +31,7 @@ function exactText(value) {
 }
 
 function exactOwner(owner) {
-    const userId = exactText(owner?.userId);
+    const userId = typeof owner?.userId === 'string' ? owner.userId : '';
     const sessionFingerprint = exactText(owner?.sessionFingerprint);
     if (!userId || !sessionFingerprint) throw launchError('WEBTTY_LAUNCH_OWNER_INVALID');
     return Object.freeze({ userId, sessionFingerprint });
@@ -115,12 +117,44 @@ export class WebttyLaunchRecordStore {
         this.limits = Object.freeze({ ...WEBTTY_LAUNCH_LIMITS, ...limits });
         this.batches = new Map();
         this.launches = new Map();
+        this.attachments = new Map();
     }
 
     cleanupExpired(now = this.now()) {
         for (const batch of [...this.batches.values()]) {
             if (batch.expiresAt <= now) this.removeBatch(batch);
         }
+        for (const [id, record] of this.attachments) {
+            if (record.expiresAt <= now) this.attachments.delete(id);
+        }
+    }
+
+    createAttachment({ owner, routeBinding, sessionId } = {}) {
+        this.cleanupExpired();
+        if (this.attachments.size >= this.limits.maxAttachRecords) throw launchError('WEBTTY_LAUNCH_QUOTA');
+        if (!/^[A-Za-z0-9_-]{32}$/.test(sessionId)) throw launchError('WEBTTY_SESSION_NOT_FOUND');
+        const record = Object.freeze({
+            id: this.mintUniqueId(this.attachments, this.launches, this.batches),
+            owner: exactOwner(owner),
+            routeBinding: exactRouteBinding(routeBinding),
+            sessionId,
+            expiresAt: this.now() + this.limits.attachTtlMs,
+        });
+        this.attachments.set(record.id, record);
+        return Object.freeze({ attach: record.id, expiresAt: record.expiresAt });
+    }
+
+    consumeAttachment({ attach, owner, routeBinding } = {}) {
+        this.cleanupExpired();
+        const record = this.attachments.get(exactText(attach));
+        try {
+            if (!record || !ownerMatches(record.owner, exactOwner(owner))
+                || !routeMatches(record.routeBinding, exactRouteBinding(routeBinding))) {
+                throw launchError('WEBTTY_ATTACH_NOT_FOUND');
+            }
+        } catch (_) { throw launchError('WEBTTY_ATTACH_NOT_FOUND'); }
+        this.attachments.delete(record.id);
+        return record;
     }
 
     removeBatch(batch) {
@@ -269,6 +303,9 @@ export class WebttyLaunchRecordStore {
         for (const batch of [...this.batches.values()]) {
             if (batch.owner.sessionFingerprint === fingerprint && this.removeBatch(batch)) removed += 1;
         }
+        for (const [id, record] of this.attachments) {
+            if (record.owner.sessionFingerprint === fingerprint) this.attachments.delete(id);
+        }
         return removed;
     }
 
@@ -283,6 +320,9 @@ export class WebttyLaunchRecordStore {
         for (const batch of [...this.batches.values()]) {
             if (routeMatches(batch.routeBinding, routeBinding) && this.removeBatch(batch)) removed += 1;
         }
+        for (const [id, record] of this.attachments) {
+            if (routeMatches(record.routeBinding, routeBinding)) this.attachments.delete(id);
+        }
         return removed;
     }
 
@@ -295,13 +335,17 @@ export class WebttyLaunchRecordStore {
                 && !routeMatches(batch.routeBinding, current)
                 && this.removeBatch(batch)) removed += 1;
         }
+        for (const [id, record] of this.attachments) {
+            if (record.routeBinding.host === current.host && record.routeBinding.hostRouteKey === current.hostRouteKey
+                && !routeMatches(record.routeBinding, current)) this.attachments.delete(id);
+        }
         return removed;
     }
 
     hasAuthSession(sessionFingerprint) {
         this.cleanupExpired();
         const fingerprint = exactText(sessionFingerprint);
-        return Boolean(fingerprint && [...this.batches.values()].some(
+        return Boolean(fingerprint && [...this.batches.values(), ...this.attachments.values()].some(
             (batch) => batch.owner.sessionFingerprint === fingerprint,
         ));
     }

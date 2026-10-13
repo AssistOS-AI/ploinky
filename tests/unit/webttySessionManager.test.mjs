@@ -1,10 +1,15 @@
+import '../helpers/isolatedWorkspaceRoot.mjs';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { buildShellEnvironment } from '../../core-services/webtty/environment.mjs';
 import { WebttySessionManager } from '../../cli/server/webtty/sessionManager.mjs';
-import { terminalTargetRouteBinding } from '../../cli/server/webtty/terminalTargetResolver.mjs';
+import { TerminalTargetResolver, terminalTargetRouteBinding } from '../../cli/server/webtty/terminalTargetResolver.mjs';
+import { mintSessionJwt } from '../../cli/server/auth/localService.js';
+import { sessionTokenService } from '../../cli/server/authHandlers/shared.js';
+import { createBrowserSessionLease, validateBrowserSessionLease } from '../../cli/server/webtty/authLease.mjs';
+import { onAuthenticatedRequestDecision, publishAuthenticatedRequestDecision } from '../../cli/server/auth/authenticatedRequestEvents.mjs';
 
 // The Router's workspace root is the host-selected path mounted at itself.
 const WORKSPACE_ROOT = '/home/user/work space/proiect';
@@ -64,6 +69,30 @@ function lease(name, userId = 'local:admin') {
         sessionFingerprint: `fingerprint-${name}`,
         userId,
     };
+}
+
+function streamResponse() {
+    return Object.assign(new EventEmitter(), {
+        body: '', writableEnded: false, destroyed: false, writableLength: 0,
+        write(value) { this.body += value; return true; },
+        end() { this.writableEnded = true; },
+    });
+}
+
+async function createAgentSession(manager, req = {}) {
+    const plan = routePlan();
+    const selectedLease = req.lease || LEASE;
+    const discovery = manager.launchStore.createDiscovery({
+        owner: { userId: selectedLease.userId, sessionFingerprint: selectedLease.sessionFingerprint },
+        routeBinding: terminalTargetRouteBinding(plan), targets: terminalTargets(),
+    });
+    const created = await manager.create({ req, routePlan: plan, launch: discovery.targets[1].launch });
+    return manager.sessions.get(created.id);
+}
+
+async function settleTarget(session) {
+    await session.targetValidation?.promise;
+    await new Promise(resolve => setImmediate(resolve));
 }
 
 function terminalTargets(relativePath = 'Projects') {
@@ -271,11 +300,13 @@ async function createManager(t, options = {}) {
         auth: options.auth || authAdapter(),
         recordStore: options.recordStore || recordStore(),
         workerFactory: options.workerFactory || (() => new FakeWorker()),
-        agentWorkerFactory: options.agentWorkerFactory,
+        agentWorkerFactory: options.agentWorkerFactory || (() => new FakeWorker()),
         launchStore: options.launchStore,
         targetResolver: options.targetResolver,
         agentProviderAvailable: options.agentProviderAvailable,
         audit: options.audit,
+        now: options.now,
+        capturePlan: options.capturePlan,
     });
     await manager.initialize();
     installBoxLaunchTestHelper(manager);
@@ -382,7 +413,7 @@ test('agent startup rejection auditing preserves exact failure, worker cleanup, 
                 assert.equal(store.calls.recovered, failAt === 3 ? 0 : 1);
                 assert.equal(manager.activeCount(), 0);
                 assert.deepEqual([...manager.userCounts], []);
-                assert.deepEqual([...manager.authCounts], []);
+                assert.deepEqual([...manager.ownerIndex], []);
                 assert.deepEqual([...manager.agentStartLocks], []);
                 assert.deepEqual(manager.availability(), { ok: true });
             });
@@ -404,7 +435,7 @@ test('create-time authentication loss fails before quota reservation or worker a
     assert.equal(workerAllocations, 0);
     assert.equal(manager.activeCount(), 0);
     assert.deepEqual([...manager.userCounts], []);
-    assert.deepEqual([...manager.authCounts], []);
+    assert.deepEqual([...manager.ownerIndex], []);
 });
 
 test('throwing worker factory rolls back reserved quotas exactly once', async (t) => {
@@ -417,7 +448,7 @@ test('throwing worker factory rolls back reserved quotas exactly once', async (t
     );
     assert.equal(manager.activeCount(), 0);
     assert.deepEqual([...manager.userCounts], []);
-    assert.deepEqual([...manager.authCounts], []);
+    assert.deepEqual([...manager.ownerIndex], []);
 });
 
 test('throwing auth invalidation subscription rolls back admission before session registration', async (t) => {
@@ -436,7 +467,7 @@ test('throwing auth invalidation subscription rolls back admission before sessio
     assert.equal(workerAllocations, 1);
     assert.equal(manager.activeCount(), 0);
     assert.deepEqual([...manager.userCounts], []);
-    assert.deepEqual([...manager.authCounts], []);
+    assert.deepEqual([...manager.ownerIndex], []);
 });
 
 test('synchronous auth invalidation rejects discovery and session admission without leaving authority', async (t) => {
@@ -481,7 +512,7 @@ test('synchronous auth invalidation rejects discovery and session admission with
     assert.equal(allocations, 1);
     assert.equal(manager.activeCount(), 0);
     assert.deepEqual([...manager.userCounts], []);
-    assert.deepEqual([...manager.authCounts], []);
+    assert.deepEqual([...manager.ownerIndex], []);
     assert.equal(unsubscribes, 2);
 });
 
@@ -522,7 +553,7 @@ test('auth invalidation during asynchronous startup waits for cleanup and remove
     assert.equal(worker.closed, 1);
     assert.equal(store.calls.removed, 1);
     assert.deepEqual([...manager.userCounts], []);
-    assert.deepEqual([...manager.authCounts], []);
+    assert.deepEqual([...manager.ownerIndex], []);
 });
 
 test('externally cancelled create does not reject before its post-startup cleanup finishes', async (t) => {
@@ -562,19 +593,15 @@ test('externally cancelled create does not reject before its post-startup cleanu
     assert.equal(store.calls.removed, 1);
 });
 
-test('per-auth-session, per-user, global, and creation-rate quotas fail before extra workers', async (t) => {
-    await t.test('auth, user, and global quotas', async (t2) => {
+test('principal, global, and creation-rate quotas fail before extra workers', async (t) => {
+    await t.test('multiple logins share principal quota and global quota', async (t2) => {
         let allocations = 0;
         const manager = await createManager(t2, {
             auth: requestAuthAdapter(),
-            limits: { global: 2, perUser: 2, perAuthSession: 1, createsPerWindow: 10 },
+            limits: { global: 2, perUser: 2, createsPerWindow: 10 },
             workerFactory: () => { allocations += 1; return new FakeWorker(); },
         });
         await manager.create({ req: { lease: lease('a') }, routePlan: routePlan(), cwdRelative: '' });
-        await assert.rejects(
-            manager.create({ req: { lease: lease('a') }, routePlan: routePlan(), cwdRelative: '' }),
-            { code: 'WEBTTY_SESSION_QUOTA' },
-        );
         await manager.create({ req: { lease: lease('b') }, routePlan: routePlan(), cwdRelative: '' });
         await assert.rejects(
             manager.create({ req: { lease: lease('c', 'local:other-admin') }, routePlan: routePlan(), cwdRelative: '' }),
@@ -658,7 +685,7 @@ test('detached-stream timeout is armed only after worker readiness is durable', 
     await creation;
 });
 
-test('browser stream close reclaims the terminal within the bounded reconnect grace', async (t) => {
+test('browser stream close detaches without reclaiming the terminal', async (t) => {
     const store = recordStore();
     const worker = new FakeWorker();
     const manager = await createManager(t, {
@@ -681,11 +708,15 @@ test('browser stream close reclaims the terminal within the bounded reconnect gr
     request.emit('close');
     await new Promise((resolve) => setTimeout(resolve, 40));
 
-    assert.equal(manager.activeCount(), 0);
+    assert.equal(manager.activeCount(), 1);
+    assert.equal(session.viewers.size, 0);
+    assert.equal(worker.closed, 0);
+    assert.equal(store.calls.removed, 0);
+    await manager.closeSession(session, 'test_cleanup');
     assert.equal(worker.closed, 1);
     assert.equal(store.calls.removed, 1);
     assert.deepEqual([...manager.userCounts], []);
-    assert.deepEqual([...manager.authCounts], []);
+    assert.deepEqual([...manager.ownerIndex], []);
 });
 
 test('router shutdown joins cleanup that already removed its session from the live map', async (t) => {
@@ -725,14 +756,15 @@ test('throwing auth unsubscribe cannot bypass worker cleanup or quota release', 
         req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24,
     });
     const session = manager.sessions.get(created.id);
-    session.unsubscribeAuth = () => { throw new Error('unsubscribe broke'); };
+    manager.attachStream(session, new EventEmitter(), streamResponse());
+    session.viewers.values().next().value.unsubscribeAuth = () => { throw new Error('unsubscribe broke'); };
     assert.equal(await manager.closeSession(session, 'test'), true);
     assert.equal(worker.closed, 1);
     assert.equal(store.calls.removed, 1);
     assert.equal(session.closed, true);
     assert.equal(session.released, true);
     assert.deepEqual([...manager.userCounts], []);
-    assert.deepEqual([...manager.authCounts], []);
+    assert.deepEqual([...manager.ownerIndex], []);
 });
 
 test('already-closed and throwing SSE attachments preserve bounded detach cleanup', async (t) => {
@@ -1069,7 +1101,7 @@ test('reclamation auditing cannot throw, reject, or delay failed cleanup and quo
             assert.deepEqual(manager.availability(), { ok: false, category: 'terminal_reclamation_check_failed' });
             assert.equal(manager.activeCount(), 0);
             assert.equal(manager.userCounts.size, 0);
-            assert.equal(manager.authCounts.size, 0);
+            assert.equal(manager.ownerIndex.size, 0);
             assert.equal(store.calls.removed, 0);
         });
     }
@@ -1213,7 +1245,7 @@ test('output sequence, replay gap, and SSE high-water limits fail closed', async
         await new Promise((resolve) => setImmediate(resolve));
         assert.equal(manager.activeCount(), 0);
     });
-    await t.test('replay gap reset', async (t2) => {
+    await t.test('old cursor resyncs and replays retained output', async (t2) => {
         const worker = new FakeWorker();
         const manager = await createManager(t2, {
             workerFactory: () => worker,
@@ -1232,15 +1264,17 @@ test('output sequence, replay gap, and SSE high-water limits fail closed', async
             write(value) { this.body += value; return true; },
             end() { this.writableEnded = true; },
         };
-        assert.equal(manager.attachStream(session, new EventEmitter(), response, '0'), false);
-        assert.match(response.body, /event: reset/);
-        assert.equal(response.writableEnded, true);
+        assert.equal(manager.attachStream(session, new EventEmitter(), response, '0'), true);
+        assert.match(response.body, /event: resync/);
+        assert.match(response.body, /id: 2/);
+        assert.match(response.body, /id: 3/);
+        assert.equal(response.writableEnded, false);
     });
     await t.test('SSE high water', async (t2) => {
         const worker = new FakeWorker();
         const manager = await createManager(t2, {
             workerFactory: () => worker,
-            limits: { sseWritableBytes: 16 },
+            limits: { viewerQueueBytes: 16 },
         });
         const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
         const session = manager.sessions.get(created.id);
@@ -1255,11 +1289,13 @@ test('output sequence, replay gap, and SSE high-water limits fail closed', async
         manager.attachStream(session, request, response);
         worker.emit('output', { sequence: 1, data: 'this output exceeds the writable bound' });
         await new Promise((resolve) => setImmediate(resolve));
-        assert.equal(manager.activeCount(), 0);
+        assert.equal(manager.activeCount(), 1);
+        assert.equal(session.viewers.size, 0);
+        assert.equal(worker.closed, 0);
     });
 });
 
-test('ownership binds auth login, user, host route, generation, and supports same-owner DELETE replay', async (t) => {
+test('ownership binds principal and host route; any administrator can stop and replay DELETE', async (t) => {
     const manager = await createManager(t, {
         auth: requestAuthAdapter(),
         workerFactory: () => new FakeWorker(),
@@ -1269,20 +1305,21 @@ test('ownership binds auth login, user, host route, generation, and supports sam
     const ownerPlan = routePlan();
     const created = await manager.create({ req: ownerRequest, routePlan: ownerPlan, cwdRelative: '' });
 
-    assert.equal(await manager.validateOwnership({ lease: lease('other-login') }, ownerPlan, created.id), null);
-    assert.equal(await manager.validateOwnership({ lease: lease('owner', 'local:other') }, ownerPlan, created.id), null);
+    assert.ok(await manager.validateOwnership({ lease: lease('other-login') }, ownerPlan, created.id));
+    await assert.rejects(manager.validateOwnership({ lease: lease('owner', 'local:other') }, ownerPlan, created.id),
+        { code: 'WEBTTY_OWNER_REQUIRED' });
     const otherHost = routePlan();
     otherHost.host = 'other.example.test';
     otherHost.hostSelection.host = 'other.example.test';
     assert.equal(await manager.validateOwnership(ownerRequest, otherHost, created.id), null);
     const otherGeneration = routePlan();
     otherGeneration.lease.id = 'generation-b';
-    assert.equal(await manager.validateOwnership(ownerRequest, otherGeneration, created.id), null);
+    assert.ok(await manager.validateOwnership(ownerRequest, otherGeneration, created.id));
     assert.ok(await manager.validateOwnership(ownerRequest, ownerPlan, created.id));
 
     assert.equal(await manager.closeOwned(ownerRequest, ownerPlan, created.id), true);
     assert.equal(await manager.closeOwned(ownerRequest, ownerPlan, created.id), true);
-    assert.equal(await manager.closeOwned({ lease: lease('other-login') }, ownerPlan, created.id), false);
+    assert.equal(await manager.closeOwned({ lease: lease('other-login') }, ownerPlan, created.id), true);
 });
 
 test('ownership rejects a route replaced during asynchronous authentication validation', async (t) => {
@@ -1316,9 +1353,9 @@ test('ownership rejects a route replaced during asynchronous authentication vali
     current = false;
     releaseValidation();
 
-    assert.equal(await ownership, null);
-    assert.equal(worker.closed, 1);
-    assert.equal(manager.activeCount(), 0);
+    await assert.rejects(ownership, { code: 'WEBTTY_GENERATION_CHANGED' });
+    assert.equal(worker.closed, 0);
+    assert.equal(manager.activeCount(), 1);
 });
 
 test('periodic SSO administrator demotion closes the terminal and releases ownership', async (t) => {
@@ -1334,7 +1371,8 @@ test('periodic SSO administrator demotion closes the terminal and releases owner
         recordStore: store,
         workerFactory: () => worker,
     });
-    await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24 });
+    const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24 });
+    manager.attachStream(manager.sessions.get(created.id), new EventEmitter(), streamResponse());
     administrator = false;
     await manager.validateLiveSessions();
 
@@ -1357,7 +1395,7 @@ test('startup failure releases each quota and preserves ambiguous pty-starting e
     );
     assert.equal(manager.activeCount(), 0);
     assert.deepEqual([...manager.userCounts], []);
-    assert.deepEqual([...manager.authCounts], []);
+    assert.deepEqual([...manager.ownerIndex], []);
     assert.equal(store.calls.removed, 0);
     assert.deepEqual(manager.availability(), { ok: false, category: 'terminal_cleanup_unproven' });
 });
@@ -1959,4 +1997,824 @@ test('the session manager requires an explicit clean workspace root', () => {
             workerFactory: () => new FakeWorker(),
         }), { code: 'WEBTTY_CWD_INVALID' });
     }
+});
+
+test('multiple viewers share ordered output and only the owner can write or resize', async (t) => {
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { auth: requestAuthAdapter(), workerFactory: () => worker });
+    const plan = routePlan();
+    const owner = { lease: lease('owner') };
+    const watcher = { lease: lease('watcher', 'other-admin') };
+    const created = await manager.create({ req: owner, routePlan: plan, cwdRelative: '' });
+    const session = manager.sessions.get(created.id);
+    const responses = [streamResponse(), streamResponse()];
+    const requests = [Object.assign(new EventEmitter(), owner), Object.assign(new EventEmitter(), watcher)];
+    requests.forEach((req, index) => manager.attachStream(session, req, responses[index]));
+    worker.emit('output', { sequence: 1, data: 'shared' });
+    responses.forEach(res => assert.match(res.body, /id: 1\nevent: output/));
+    for (const need of ['input', 'resize']) {
+        await assert.rejects(manager.authorize(watcher, plan, created.id, need), { code: 'WEBTTY_OWNER_REQUIRED' });
+    }
+    const secondOwner = await manager.authorize({ lease: lease('other-device') }, plan, created.id, 'input');
+    await Promise.all([manager.input(secondOwner, 'first'), manager.input(session, 'second')]);
+    assert.deepEqual(worker.inputs, ['first', 'second']);
+    assert.equal(await manager.closeAuthorized(watcher, plan, created.id), true);
+    assert.equal(await manager.closeAuthorized(watcher, plan, created.id), true);
+    assert.equal(manager.viewerCount, 0);
+});
+
+test('a near-1 MiB replay is paced across drains and remains ahead of live output', async (t) => {
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { workerFactory: () => worker });
+    const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const session = manager.sessions.get(created.id);
+    for (let sequence = 1; sequence <= 63; sequence += 1) worker.emit('output', { sequence, data: 'x'.repeat(16_000) });
+    const response = streamResponse();
+    response.write = function write(value) {
+        this.body += value;
+        this.writableLength += Buffer.byteLength(value);
+        return this.writableLength < 32_000;
+    };
+    assert.equal(manager.attachStream(session, new EventEmitter(), response), true);
+    const viewer = session.viewers.values().next().value;
+    assert.ok(viewer.queuedBytes > 900_000);
+    worker.emit('output', { sequence: 64, data: 'live' });
+    let drains = 0;
+    while (viewer.waitingDrain || viewer.queue.length) {
+        assert.ok(++drains < 100);
+        response.writableLength = 0;
+        response.emit('drain');
+    }
+    assert.equal((response.body.match(/event: output/g) || []).length, 64);
+    assert.ok(response.body.indexOf('id: 63\n') < response.body.indexOf('id: 64\n'));
+    assert.doesNotMatch(response.body, /slow_viewer/);
+    assert.equal(worker.closed, 0);
+});
+
+test('never-draining viewer detaches at 30 seconds while another viewer and worker survive', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { workerFactory: () => worker });
+    const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const session = manager.sessions.get(created.id);
+    const slow = streamResponse();
+    slow.write = function write(value) { this.body += value; return false; };
+    const fast = streamResponse();
+    manager.attachStream(session, new EventEmitter(), slow);
+    manager.attachStream(session, new EventEmitter(), fast);
+    worker.emit('output', { sequence: 1, data: 'still live' });
+    t.mock.timers.tick(29_999);
+    assert.equal(session.viewers.size, 2);
+    t.mock.timers.tick(1);
+    assert.equal(session.viewers.size, 1);
+    assert.match(slow.body, /slow_viewer/);
+    assert.match(fast.body, /still live/);
+    assert.equal(worker.closed, 0);
+});
+
+test('byte and event rollover allow fresh replay, old-cursor resync and reject malformed/future cursors', async (t) => {
+    for (const limits of [{ outputReplayBytes: 130 }, { outputReplayEvents: 2 }]) {
+        const worker = new FakeWorker();
+        const manager = await createManager(t, { workerFactory: () => worker, limits });
+        const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+        const session = manager.sessions.get(created.id);
+        for (let sequence = 1; sequence <= 3; sequence += 1) worker.emit('output', { sequence, data: 'x'.repeat(25) });
+        for (const [cursor, event] of [['', 'replay-truncated'], ['0', 'resync']]) {
+            const response = streamResponse();
+            const request = new EventEmitter();
+            assert.equal(manager.attachStream(session, request, response, cursor), true);
+            assert.ok(response.body.indexOf(`event: ${event}`) < response.body.indexOf('event: output'));
+            assert.match(response.body, /id: 3/);
+            request.emit('close');
+        }
+        for (const cursor of ['4', 'nope', '1e0', '-1']) {
+            const response = streamResponse();
+            assert.equal(manager.attachStream(session, new EventEmitter(), response, cursor), false);
+            assert.match(response.body, /event: reset/);
+        }
+    }
+});
+
+test('logout detaches just its viewer; detached shells are not auth checked; owner demotion closes all owner shells', async (t) => {
+    const listeners = new Map();
+    let checks = 0;
+    const manager = await createManager(t, {
+        auth: { ...requestAuthAdapter(),
+            validateLease: async () => { checks += 1; return { ok: true }; },
+            subscribeInvalidation: (value, listener) => {
+                listeners.set(value.sessionFingerprint, listener);
+                return () => listeners.delete(value.sessionFingerprint);
+            },
+        },
+    });
+    const plan = routePlan();
+    const owner = { lease: lease('owner') };
+    const a = await manager.create({ req: owner, routePlan: plan, cwdRelative: '' });
+    const b = await manager.create({ req: owner, routePlan: plan, cwdRelative: '' });
+    const session = manager.sessions.get(a.id);
+    const response = streamResponse();
+    manager.attachStream(session, Object.assign(new EventEmitter(), owner), response);
+    listeners.get(owner.lease.sessionFingerprint)('logout');
+    assert.match(response.body, /auth_logout/);
+    assert.equal(session.viewers.size, 0);
+    const previousChecks = checks;
+    await manager.validateLiveSessions();
+    assert.equal(checks, previousChecks);
+    assert.equal(manager.activeCount(), 2);
+    manager.attachStream(session, Object.assign(new EventEmitter(), owner), streamResponse());
+    listeners.get(owner.lease.sessionFingerprint)('administrator_revoked');
+    await Promise.allSettled([...manager.inFlightCloses]);
+    assert.equal(manager.sessions.has(a.id), false);
+    assert.equal(manager.sessions.has(b.id), false);
+    assert.equal(manager.ownerIndex.size, 0);
+});
+
+test('production principal quota spans logins and viewer quotas release reusable slots', async (t) => {
+    let allocations = 0;
+    const manager = await createManager(t, {
+        auth: requestAuthAdapter(),
+        workerFactory: () => { allocations += 1; return new FakeWorker(); },
+    });
+    const plan = routePlan();
+    const sessions = [];
+    const requests = [];
+    for (let index = 0; index < 8; index += 1) {
+        const req = { lease: lease(index % 2 ? 'a' : 'b') };
+        const created = await manager.create({ req, routePlan: plan, cwdRelative: '' });
+        const session = manager.sessions.get(created.id);
+        sessions.push(session);
+        for (let viewer = 0; viewer < 8; viewer += 1) {
+            const request = Object.assign(new EventEmitter(), req);
+            requests.push(request);
+            manager.attachStream(session, request, streamResponse());
+        }
+    }
+    assert.equal(manager.viewerCount, 64);
+    await assert.rejects(manager.create({ req: { lease: lease('c') }, routePlan: plan, cwdRelative: '' }),
+        { code: 'WEBTTY_USER_QUOTA' });
+    assert.equal(allocations, 8);
+    assert.throws(() => manager.attachStream(sessions[0], Object.assign(new EventEmitter(), { lease: lease('a') }), streamResponse()),
+        { code: 'WEBTTY_VIEWER_QUOTA' });
+    const other = await manager.create({ req: { lease: lease('other', 'other-admin') }, routePlan: plan, cwdRelative: '' });
+    assert.throws(() => manager.attachStream(manager.sessions.get(other.id), Object.assign(new EventEmitter(), { lease: lease('a') }), streamResponse()),
+        { code: 'WEBTTY_VIEWER_QUOTA' });
+    requests[0].emit('close');
+    assert.equal(manager.viewerCount, 63);
+    assert.equal(manager.attachStream(manager.sessions.get(other.id), Object.assign(new EventEmitter(), { lease: lease('a') }), streamResponse()), true);
+    assert.equal(manager.viewerCount, 64);
+});
+
+test('production idle and absolute bounds and never-attached grace remain exact', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let now = 1_000;
+    const manager = await createManager(t, { now: () => now, limits: { streamDetachGraceMs: 15_000 } });
+    const orphan = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    t.mock.timers.tick(14_999);
+    assert.equal(manager.sessions.has(orphan.id), true);
+    t.mock.timers.tick(1);
+    await Promise.allSettled([...manager.inFlightCloses]);
+    assert.equal(manager.tombstones.get(orphan.id).row.exitReason, 'stream_never_attached');
+    const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const session = manager.sessions.get(created.id);
+    const request = new EventEmitter();
+    manager.attachStream(session, request, streamResponse());
+    request.emit('close');
+    now += 60_000;
+    await manager.validateLiveSessions();
+    assert.equal(manager.sessions.has(created.id), true);
+    now = session.createdAt + 24 * 60 * 60_000 - 1;
+    await manager.validateLiveSessions();
+    assert.equal(manager.sessions.has(created.id), true);
+    now += 1;
+    await manager.validateLiveSessions();
+    assert.equal(session.closeReason, 'idle_timeout');
+    const absolute = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const longSession = manager.sessions.get(absolute.id);
+    now = longSession.createdAt + 7 * 24 * 60 * 60_000;
+    manager.touch(longSession);
+    await manager.validateLiveSessions();
+    assert.equal(longSession.closeReason, 'absolute_timeout');
+});
+
+test('list projection, cross-login attach, watcher dimensions and single-use session-bound tokens', async (t) => {
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { auth: requestAuthAdapter(), workerFactory: () => worker });
+    const plan = routePlan();
+    const owner = { lease: lease('owner'), user: { displayName: '\n😀'.repeat(100) } };
+    const watcher = { lease: lease('watcher', 'other-admin') };
+    const created = await manager.create({ req: owner, routePlan: plan, cwdRelative: 'Projects' });
+    const rows = await manager.listSessions({ req: watcher, routePlan: plan });
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].isOwner, false);
+    assert.equal(rows[0].capabilities.input, false);
+    assert.equal(rows[0].status, 'detached');
+    assert.ok(Buffer.byteLength(rows[0].ownerLabel) <= 128);
+    assert.doesNotMatch(rows[0].ownerLabel, /[\u0000-\u001f\u007f]/);
+    assert.doesNotMatch(JSON.stringify(rows), /principal|containerId|sessionFingerprint|translatedCwd|pid/i);
+    const token = await manager.createAttachToken({ req: watcher, routePlan: plan, id: created.id });
+    await assert.rejects(manager.attach({ req: { lease: lease('other-device', 'other-admin') }, routePlan: plan,
+        attach: token.attach, cols: 90, rows: 30 }), { code: 'WEBTTY_ATTACH_NOT_FOUND' });
+    const view = await manager.attach({ req: watcher, routePlan: plan, attach: token.attach, cols: 90, rows: 30 });
+    assert.equal(view.role, 'watcher');
+    assert.equal(view.cols, 80);
+    assert.deepEqual(worker.resizes, []);
+    await assert.rejects(manager.attach({ req: watcher, routePlan: plan, attach: token.attach, cols: 90, rows: 30 }),
+        { code: 'WEBTTY_ATTACH_NOT_FOUND' });
+    const newLogin = { lease: lease('new-login') };
+    const ownToken = await manager.createAttachToken({ req: newLogin, routePlan: plan, id: created.id });
+    const ownView = await manager.attach({ req: newLogin, routePlan: plan, attach: ownToken.attach, cols: 100, rows: 35 });
+    assert.equal(ownView.role, 'owner');
+    assert.deepEqual(worker.resizes, [[100, 35]]);
+    const killedToken = await manager.createAttachToken({ req: newLogin, routePlan: plan, id: created.id });
+    await manager.closeAuthorized(watcher, plan, created.id);
+    await assert.rejects(manager.attach({ req: newLogin, routePlan: plan, attach: killedToken.attach, cols: 80, rows: 24 }),
+        { code: 'WEBTTY_SESSION_NOT_FOUND' });
+    assert.equal((await manager.listSessions({ req: newLogin, routePlan: plan }))[0].status, 'exited');
+    await assert.rejects(manager.createAttachToken({ req: owner, routePlan: plan, id: 'z'.repeat(32) }),
+        { code: 'WEBTTY_SESSION_NOT_FOUND' });
+    assert.equal(await manager.authorize(owner, plan, 'z'.repeat(32)), null);
+    assert.equal(await manager.closeAuthorized(owner, plan, 'z'.repeat(32)), false);
+});
+
+test('Kill during asynchronous attach authorization refuses attachment and never resizes the worker', async (t) => {
+    let release;
+    let entered;
+    let blocked = false;
+    const barrier = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { workerFactory: () => worker,
+        auth: { ...requestAuthAdapter(), validateLease: async () => {
+            if (blocked) { entered(); await barrier; }
+            return { ok: true };
+        } },
+    });
+    const req = { lease: lease('owner') };
+    const plan = routePlan();
+    const created = await manager.create({ req, routePlan: plan, cwdRelative: '' });
+    const token = await manager.createAttachToken({ req, routePlan: plan, id: created.id });
+    blocked = true;
+    const attachment = manager.attach({ req, routePlan: plan, attach: token.attach, cols: 90, rows: 30 });
+    await started;
+    await manager.closeSession(created.id, 'requested');
+    release();
+    await assert.rejects(attachment, { code: 'WEBTTY_SESSION_NOT_FOUND' });
+    assert.deepEqual(worker.resizes, []);
+});
+
+test('generation lease ends only its viewer, then a current stream delta-replays and accepts owner input', async (t) => {
+    let current = true;
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { workerFactory: () => worker });
+    const oldPlan = routePlan();
+    oldPlan.lease.isCurrent = oldPlan.lease.commit = () => current;
+    const created = await manager.create({ req: {}, routePlan: oldPlan, cwdRelative: '' });
+    const session = manager.sessions.get(created.id);
+    const oldResponse = streamResponse();
+    manager.attachStream(session, new EventEmitter(), oldResponse, '', oldPlan);
+    worker.emit('output', { sequence: 1, data: 'one' });
+    current = false;
+    await manager.validateLiveSessions();
+    assert.equal(oldResponse.writableEnded, true);
+    assert.match(oldResponse.body, /retry: 1000/);
+    assert.doesNotMatch(oldResponse.body, /event: detached/);
+    assert.equal(manager.activeCount(), 1);
+    await assert.rejects(manager.authorize({}, oldPlan, created.id, 'input'), { code: 'WEBTTY_GENERATION_CHANGED' });
+    assert.equal(worker.closed, 0);
+    worker.emit('output', { sequence: 2, data: 'two' });
+    const newPlan = routePlan();
+    newPlan.lease.id = 'generation-b';
+    assert.ok(await manager.authorize({}, newPlan, created.id, 'input'));
+    const nextResponse = streamResponse();
+    manager.attachStream(session, new EventEmitter(), nextResponse, '1', newPlan);
+    assert.doesNotMatch(nextResponse.body, /id: 1\n/);
+    assert.match(nextResponse.body, /id: 2\n/);
+});
+
+test('Box shell tick never resolves its directory again, including after a rename', async (t) => {
+    let resolutions = 0;
+    const manager = await createManager(t, { targetResolver: {
+        async revalidate({ target }) { resolutions += 1; return target; },
+        async revalidateRunningAgent() { assert.fail('Box must not enter agent validation'); },
+    } });
+    const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    manager.targetResolver.revalidate = () => { throw new Error('directory renamed'); };
+    const before = resolutions;
+    await manager.validateLiveSessions();
+    assert.equal(manager.sessions.has(created.id), true);
+    assert.equal(resolutions, before);
+});
+
+test('agent generation changes during deferred inspection recapture; proven identity replacement closes', async (t) => {
+    let plan = routePlan();
+    let release;
+    let attempts = 0;
+    const manager = await createManager(t, { agentProviderAvailable: true, capturePlan: () => plan,
+        targetResolver: {
+            async revalidate({ target }) { return target; },
+            async revalidateRunningAgent({ routePlan: admitted }) {
+                attempts += 1;
+                if (attempts === 1) {
+                    await new Promise(resolve => { release = resolve; });
+                    assert.notEqual(admitted, plan);
+                    throw Object.assign(new Error(), { code: 'WEBTTY_TARGET_GENERATION_STALE' });
+                }
+            },
+        },
+    });
+    const session = await createAgentSession(manager);
+    await manager.validateLiveSessions();
+    plan = routePlan();
+    release();
+    await settleTarget(session);
+    assert.equal(attempts, 2);
+    assert.equal(manager.activeCount(), 1);
+    manager.targetResolver.revalidateRunningAgent = async () => {
+        throw Object.assign(new Error(), { code: 'WEBTTY_TARGET_IDENTITY_STALE' });
+    };
+    await manager.validateLiveSessions();
+    await settleTarget(session);
+    assert.equal(session.closeReason, 'target_identity_changed');
+});
+
+test('transient inspect failures, deadline aborts and inactive/churning generations are undecided for 120 seconds', async (t) => {
+    for (const code of ['WEBTTY_TARGET_INSPECT_FAILED', 'WEBTTY_TARGET_INSPECT_ABORTED',
+        'EDGE_GENERATION_INACTIVE', 'WEBTTY_TARGET_GENERATION_STALE']) {
+        let now = 1_000;
+        let attempts = 0;
+        const manager = await createManager(t, { now: () => now, agentProviderAvailable: true,
+            capturePlan: () => {
+                if (code === 'EDGE_GENERATION_INACTIVE') throw Object.assign(new Error(), { code });
+                return routePlan();
+            },
+            targetResolver: {
+                async revalidate({ target }) { return target; },
+                async revalidateRunningAgent() { attempts += 1; throw Object.assign(new Error(), { code }); },
+            },
+        });
+        const session = await createAgentSession(manager);
+        await manager.validateLiveSessions();
+        await settleTarget(session);
+        if (code === 'WEBTTY_TARGET_GENERATION_STALE') assert.equal(attempts, 3);
+        assert.equal(session.targetUndecidedSince, 1_000);
+        now += 100_000;
+        await manager.validateLiveSessions();
+        await settleTarget(session);
+        assert.equal(manager.sessions.has(session.id), true, code);
+        assert.equal(manager.providerAvailability().agentAvailable, true, code);
+        now += 21_000;
+        await manager.validateLiveSessions();
+        assert.equal(session.closeReason, 'target_unverifiable', code);
+        assert.equal(manager.providerAvailability().agentAvailable, true, code);
+    }
+});
+
+test('24 saturated agent validations stay bounded, enforce deadlines and keep viewer checks running every tick', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let now = 1_000;
+    let active = 0;
+    let maximum = 0;
+    let completed = 0;
+    const targetResolver = new TerminalTargetResolver({
+        workspaceRoot: WORKSPACE_ROOT,
+        inspectContainer: (_runtime, _id, { signal }) => new Promise((resolve, reject) => {
+            active += 1;
+            maximum = Math.max(maximum, active);
+            const onAbort = () => {
+                clearTimeout(timer);
+                active -= 1;
+                reject(Object.assign(new Error(), { code: 'WEBTTY_TARGET_INSPECT_ABORTED' }));
+            };
+            const timer = setTimeout(() => {
+                signal.removeEventListener('abort', onAbort);
+                active -= 1;
+                completed += 1;
+                resolve();
+            }, 2_000);
+            signal.addEventListener('abort', onAbort, { once: true });
+        }),
+    });
+    targetResolver.revalidate = async ({ target }) => target;
+    targetResolver.revalidateRunningAgent = ({ target, signal }) =>
+        targetResolver.inspectWithGate(target.runtime, target.containerId, { signal });
+    const manager = await createManager(t, { targetResolver, now: () => now, agentProviderAvailable: true,
+        limits: { createsPerWindow: 100, perUser: 24 }, capturePlan: routePlan });
+    const sessions = [];
+    for (let index = 0; index < 24; index += 1) sessions.push(await createAgentSession(manager));
+    for (let tick = 0; tick < 10; tick += 1) {
+        const responses = [];
+        for (const session of sessions) {
+            if (!manager.sessions.has(session.id)) continue;
+            const response = streamResponse();
+            const admitted = routePlan();
+            admitted.lease.isCurrent = () => false;
+            manager.attachStream(session, new EventEmitter(), response, '', admitted);
+            responses.push(response);
+        }
+        await manager.validateLiveSessions();
+        responses.forEach(response => assert.equal(response.writableEnded, true));
+        assert.ok(sessions.filter(session => session.targetValidation).length <= 24);
+        for (let second = 0; second < 5; second += 1) {
+            now += 1_000;
+            t.mock.timers.tick(1_000);
+            await new Promise(resolve => setImmediate(resolve));
+        }
+        assert.ok(targetResolver.inspectionGate.queue.length <= 24);
+    }
+    assert.ok(maximum <= 4);
+    assert.ok(completed > 0);
+    assert.ok(sessions.some(session => Number.isFinite(session.targetUndecidedSince)));
+    assert.equal(manager.activeCount(), 24);
+});
+
+test('deadline ignores late results and synchronous cutoff closes by the following tick', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let now = 1_000;
+    let resolveLate;
+    let calls = 0;
+    const manager = await createManager(t, { now: () => now, agentProviderAvailable: true, capturePlan: routePlan,
+        targetResolver: {
+            async revalidate({ target }) { return target; },
+            revalidateRunningAgent() { calls += 1; return new Promise(resolve => { resolveLate = resolve; }); },
+        },
+    });
+    const session = await createAgentSession(manager);
+    const request = new EventEmitter();
+    manager.attachStream(session, request, streamResponse());
+    request.emit('close');
+    await manager.validateLiveSessions();
+    now += 10_000;
+    t.mock.timers.tick(10_000);
+    assert.equal(session.targetUndecidedSince, 11_000);
+    for (let tick = 0; tick < 10; tick += 1) await manager.validateLiveSessions();
+    assert.equal(calls, 1);
+    resolveLate();
+    await settleTarget(session);
+    assert.equal(session.targetUndecidedSince, 11_000);
+    now += 125_000;
+    await manager.validateLiveSessions();
+    assert.equal(session.closeReason, 'target_unverifiable');
+});
+
+test('viewer subscription rollback and a failed later attach preserve the correct shell lifetime', async (t) => {
+    let rejectSubscription = false;
+    const manager = await createManager(t, { auth: {
+        ...authAdapter(),
+        subscribeInvalidation: () => {
+            if (rejectSubscription) throw new Error('viewer subscription refused');
+            return () => {};
+        },
+    } });
+    const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const session = manager.sessions.get(created.id);
+    rejectSubscription = true;
+    assert.throws(() => manager.attachStream(session, new EventEmitter(), streamResponse()), /subscription refused/);
+    assert.equal(session.everAttached, false);
+    assert.ok(session.detachTimer);
+    assert.equal(manager.viewerCount, 0);
+    rejectSubscription = false;
+    const req = new EventEmitter();
+    manager.attachStream(session, req, streamResponse());
+    req.emit('close');
+    const broken = streamResponse();
+    broken.write = () => { throw new Error('connection gone'); };
+    assert.equal(manager.attachStream(session, new EventEmitter(), broken), false);
+    assert.equal(session.everAttached, true);
+    assert.equal(session.detachTimer, null);
+    assert.equal(manager.activeCount(), 1);
+    assert.equal(manager.viewerCount, 0);
+});
+
+test('queue overflow removes only the slow viewer; 70-second detached provider outage preserves shells', async (t) => {
+    let now = 1_000;
+    let unavailable = false;
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { now: () => now, workerFactory: () => worker,
+        auth: authAdapter({ validate: async () => unavailable ? { ok: false, reason: 'provider_unavailable' } : { ok: true } }),
+    });
+    const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const session = manager.sessions.get(created.id);
+    const slow = streamResponse();
+    slow.write = function write(value) { this.body += value; return false; };
+    const fast = streamResponse();
+    const fastReq = new EventEmitter();
+    manager.attachStream(session, new EventEmitter(), slow);
+    manager.attachStream(session, fastReq, fast);
+    for (let sequence = 1; sequence <= 90; sequence += 1) worker.emit('output', { sequence, data: 'x'.repeat(16_000) });
+    assert.match(slow.body, /slow_viewer/);
+    assert.equal(session.viewers.size, 1);
+    assert.equal((fast.body.match(/event: output/g) || []).length, 90);
+    fastReq.emit('close');
+    unavailable = true;
+    now += 70_000;
+    await manager.validateLiveSessions();
+    assert.equal(manager.activeCount(), 1);
+    assert.equal(worker.closed, 0);
+});
+
+test('per-viewer provider outage resets on a decided result and detaches only at the 60-second bound', async (t) => {
+    let now = 1_000;
+    let unavailable = false;
+    const manager = await createManager(t, { now: () => now,
+        auth: authAdapter({ validate: async () => unavailable ? { ok: false, reason: 'provider_unavailable' } : { ok: true } }),
+    });
+    const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const session = manager.sessions.get(created.id);
+    const response = streamResponse();
+    manager.attachStream(session, new EventEmitter(), response);
+    unavailable = true;
+    await manager.validateLiveSessions();
+    now += 59_999;
+    await manager.validateLiveSessions();
+    assert.equal(session.viewers.size, 1);
+    unavailable = false;
+    await manager.validateLiveSessions();
+    unavailable = true;
+    now += 1;
+    await manager.validateLiveSessions();
+    now += 60_000;
+    await manager.validateLiveSessions();
+    assert.equal(session.viewers.size, 0);
+    assert.match(response.body, /auth_provider_unavailable/);
+    assert.equal(manager.activeCount(), 1);
+});
+
+test('owner admission time only moves forward across devices', async (t) => {
+    const manager = await createManager(t, { auth: requestAuthAdapter() });
+    const plan = routePlan();
+    const req = { lease: { ...lease('new'), createdAt: 5000 } };
+    const created = await manager.create({ req, routePlan: plan, cwdRelative: '' });
+    const session = manager.sessions.get(created.id);
+    await manager.authorize({ lease: { ...lease('old'), createdAt: 1000 } }, plan, created.id, 'input');
+    manager.attachStream(session, Object.assign(new EventEmitter(), { lease: { ...lease('old'), createdAt: 1000 } }), streamResponse());
+    assert.equal(session.owner.adminAdmittedAt, 5000);
+    await manager.authorize({ lease: { ...lease('newer'), createdAt: 6000 } }, plan, created.id, 'input');
+    assert.equal(session.owner.adminAdmittedAt, 6000);
+});
+
+test('fresh non-admin decisions close every owner shell only when strictly newer and isolate identities', async (t) => {
+    const workers = [];
+    const manager = await createManager(t, { auth: requestAuthAdapter(),
+        workerFactory: () => { const worker = new FakeWorker(); workers.push(worker); return worker; },
+    });
+    const plan = routePlan();
+    const owner = { lease: { ...lease('owner'), createdAt: 5000 } };
+    const a = await manager.create({ req: owner, routePlan: plan, cwdRelative: '' });
+    const b = await manager.create({ req: owner, routePlan: plan, cwdRelative: '' });
+    const other = await manager.create({ req: { lease: lease('other', 'other-admin') }, routePlan: plan, cwdRelative: '' });
+    const otherMode = await manager.create({ req: { lease: { ...lease('sso'), mode: 'sso' } }, routePlan: plan, cwdRelative: '' });
+    const decision = { authMode: 'local', userId: owner.lease.userId, roles: ['user'], decidedAt: 6000 };
+    for (const invalid of [
+        { ...decision, decidedAt: 1000 }, { ...decision, decidedAt: 5000 }, { ...decision, decidedAt: NaN },
+        { ...decision, roles: [' Admin '] }, { ...decision, roles: ['guest'] }, { ...decision, roles: null },
+        { ...decision, authMode: 'none' }, { ...decision, userId: 'unknown' },
+    ]) manager.observeAuthenticatedRequest(invalid);
+    assert.equal(manager.activeCount(), 4);
+    manager.observeAuthenticatedRequest(decision);
+    manager.observeAuthenticatedRequest(decision);
+    assert.equal(manager.sessions.has(a.id), false);
+    assert.equal(manager.sessions.has(b.id), false);
+    assert.equal(manager.sessions.has(other.id), true);
+    assert.equal(manager.sessions.has(otherMode.id), true);
+    await Promise.allSettled([...manager.inFlightCloses]);
+    assert.equal(workers[0].closed, 1);
+    assert.equal(workers[1].closed, 1);
+    assert.equal(workers[2].closed, 0);
+    assert.equal(workers[3].closed, 0);
+    assert.equal(manager.tombstones.get(a.id).row.exitReason, 'owner_admin_revoked');
+    await manager.closeAll();
+    assert.doesNotThrow(() => manager.observeAuthenticatedRequest(new Proxy({}, { get() { throw new Error('must return immediately'); } })));
+});
+
+test('owner demotion during creation cancels synchronously and joins durable cleanup', async (t) => {
+    let release;
+    let enter;
+    const started = new Promise(resolve => { enter = resolve; });
+    const barrier = new Promise(resolve => { release = resolve; });
+    const store = recordStore();
+    const createRecord = store.create.bind(store);
+    store.create = async (value) => { enter(); await barrier; return createRecord(value); };
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { recordStore: store, workerFactory: () => worker });
+    const creating = manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const rejected = assert.rejects(creating, { code: 'WEBTTY_AUTH_INVALID' });
+    await started;
+    manager.observeAuthenticatedRequest({ authMode: LEASE.mode, userId: LEASE.userId, roles: [], decidedAt: 1000 });
+    const session = [...manager.sessions.values()][0];
+    assert.equal(session.startupCancellation, 'owner_admin_revoked');
+    release();
+    await rejected;
+    await Promise.allSettled([...manager.inFlightCloses]);
+    assert.equal(manager.activeCount(), 0);
+    assert.equal(manager.ownerIndex.size, 0);
+    assert.equal(worker.closed, 1);
+    assert.equal(store.calls.removed, 1);
+});
+
+test('demotion racing input authorization, attachment and explicit Kill never writes after close', async (t) => {
+    for (const operation of ['input', 'attach']) {
+        let blocked = false;
+        let release;
+        let enter;
+        const barrier = new Promise(resolve => { release = resolve; });
+        const started = new Promise(resolve => { enter = resolve; });
+        const worker = new FakeWorker();
+        const manager = await createManager(t, { workerFactory: () => worker, auth: {
+            ...authAdapter(), validateLease: async () => {
+                if (blocked) { enter(); await barrier; }
+                return { ok: true };
+            },
+        } });
+        const plan = routePlan();
+        const created = await manager.create({ req: {}, routePlan: plan, cwdRelative: '' });
+        const token = await manager.createAttachToken({ req: {}, routePlan: plan, id: created.id });
+        blocked = true;
+        const pending = operation === 'input'
+            ? manager.authorize({}, plan, created.id, 'input').then(session => manager.input(session, 'forbidden'))
+            : manager.attach({ req: {}, routePlan: plan, attach: token.attach, cols: 100, rows: 30 });
+        const rejected = assert.rejects(pending, { code: 'WEBTTY_SESSION_NOT_FOUND' });
+        await started;
+        manager.observeAuthenticatedRequest({ authMode: LEASE.mode, userId: LEASE.userId, roles: [], decidedAt: 1000 });
+        await manager.closeSession(created.id, 'requested');
+        release();
+        await rejected;
+        await Promise.allSettled([...manager.inFlightCloses]);
+        assert.deepEqual(worker.inputs, []);
+        assert.deepEqual(worker.resizes, []);
+        assert.equal(worker.closed, 1);
+    }
+});
+
+test('real signed local demotion cancels creation during its first auth or target await before worker allocation', async (t) => {
+    for (const phase of ['auth', 'target']) {
+        await t.test(phase, async (subtest) => {
+            let now = Date.now();
+            subtest.mock.method(Date, 'now', () => now);
+            const sessionId = mintSessionJwt({ id: 'local:admin', roles: ['admin'] }, 1, { channel: 'cli' });
+            const session = await sessionTokenService.getUserSession(sessionId);
+            const req = { authMode: 'local', sessionId, session, user: session.user };
+            req.lease = createBrowserSessionLease(req);
+            let release;
+            let enter;
+            const started = new Promise(resolve => { enter = resolve; });
+            const barrier = new Promise(resolve => { release = resolve; });
+            let blocked = false;
+            let allocations = 0;
+            const manager = await createManager(subtest, {
+                auth: { validateLease: async (value, options) => {
+                    if (phase === 'auth' && !blocked) { blocked = true; enter(); await barrier; }
+                    return validateBrowserSessionLease(value, options);
+                }, createLease: createBrowserSessionLease },
+                workerFactory: () => { allocations += 1; return new FakeWorker(); },
+            });
+            if (phase === 'target') manager.targetResolver.revalidate = async ({ target }) => {
+                if (!blocked) { blocked = true; enter(); await barrier; }
+                return target;
+            };
+            const stop = onAuthenticatedRequestDecision(decision => manager.observeAuthenticatedRequest(decision));
+            subtest.after(stop);
+            const creating = manager.create({ req, routePlan: routePlan(), cwdRelative: '' });
+            const rejected = assert.rejects(creating, { code: 'WEBTTY_AUTH_INVALID' });
+            await started;
+            assert.equal(manager.pendingCreations.size, 1);
+            assert.equal(manager.ownerIndex.size, 1);
+            assert.equal(manager.userCounts.size, 0);
+            assert.equal(allocations, 0);
+            now += 2000;
+            const demotedId = mintSessionJwt({ id: 'local:admin', roles: [] }, 1, { channel: 'cli' });
+            const demoted = await sessionTokenService.getUserSession(demotedId);
+            const decisionRequest = { authMode: 'local', sessionId: demotedId, session: demoted, user: demoted.user };
+            assert.equal(publishAuthenticatedRequestDecision(decisionRequest), true);
+            assert.equal(publishAuthenticatedRequestDecision(decisionRequest), true);
+            assert.equal((await validateBrowserSessionLease(req.lease)).ok, true, 'older signed administrator token remains cryptographically valid');
+            release();
+            await rejected;
+            assert.equal(manager.pendingCreations.size, 0);
+            assert.equal(manager.ownerIndex.size, 0);
+            assert.equal(manager.userCounts.size, 0);
+            assert.equal(manager.activeCount(), 0);
+            assert.equal(allocations, 0);
+        });
+    }
+});
+
+test('pending creation ignores older/equal or foreign decisions and transfers its owner index without a gap', async (t) => {
+    let release;
+    let enter;
+    const started = new Promise(resolve => { enter = resolve; });
+    const barrier = new Promise(resolve => { release = resolve; });
+    const manager = await createManager(t, { auth: requestAuthAdapter() });
+    let blocked = false;
+    manager.targetResolver.revalidate = async ({ target }) => {
+        if (!blocked) { blocked = true; enter(); await barrier; }
+        return target;
+    };
+    const req = { lease: { ...lease('owner'), createdAt: 5000 } };
+    const creating = manager.create({ req, routePlan: routePlan(), cwdRelative: '' });
+    await started;
+    const pending = [...manager.pendingCreations.values()][0];
+    for (const decision of [
+        { authMode: 'local', userId: req.lease.userId, roles: [], decidedAt: 1000 },
+        { authMode: 'local', userId: req.lease.userId, roles: [], decidedAt: 5000 },
+        { authMode: 'local', userId: 'foreign', roles: [], decidedAt: 6000 },
+        { authMode: 'sso', userId: req.lease.userId, roles: [], decidedAt: 6000 },
+    ]) manager.observeAuthenticatedRequest(decision);
+    assert.equal(pending.cancellation, '');
+    release();
+    const created = await creating;
+    assert.equal(created.id, pending.id);
+    assert.equal(manager.pendingCreations.size, 0);
+    assert.deepEqual([...manager.ownerIndex.get(pending.owner.principal)], [created.id]);
+    await manager.closeSession(created.id);
+    assert.equal(manager.ownerIndex.size, 0);
+});
+
+test('pre-registration auth, target, quota, factory and shutdown failures remove pending owner membership', async (t) => {
+    for (const phase of ['auth', 'target', 'quota', 'factory', 'shutdown']) {
+        await t.test(phase, async (subtest) => {
+            let release;
+            let enter;
+            const started = new Promise(resolve => { enter = resolve; });
+            const barrier = new Promise(resolve => { release = resolve; });
+            const manager = await createManager(subtest, {
+                auth: authAdapter({ validate: async () => phase === 'auth'
+                    ? { ok: false, reason: 'missing_or_expired' } : { ok: true } }),
+                limits: phase === 'quota' ? { global: 0 } : {},
+                workerFactory: () => {
+                    if (phase === 'factory') throw new Error('factory failed');
+                    return new FakeWorker();
+                },
+            });
+            manager.targetResolver.revalidate = async ({ target }) => {
+                if (phase === 'target') throw new Error('target failed');
+                if (phase === 'shutdown') { enter(); await barrier; }
+                return target;
+            };
+            const creating = manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+            const rejected = assert.rejects(creating);
+            if (phase === 'shutdown') {
+                await started;
+                await manager.closeAll();
+                assert.equal([...manager.pendingCreations.values()][0].cancellation, 'router_shutdown');
+                release();
+            }
+            await rejected;
+            assert.equal(manager.pendingCreations.size, 0);
+            assert.equal(manager.ownerIndex.size, 0);
+            assert.equal(manager.userCounts.size, 0);
+            assert.equal(manager.activeCount(), 0);
+        });
+    }
+});
+
+test('post-discovery decided demotion closes detached siblings; provider outage never revokes ownership', async (t) => {
+    for (const reason of ['administrator_revoked', 'provider_unavailable']) {
+        let refused = false;
+        const manager = await createManager(t, {
+            auth: authAdapter({ validate: async () => refused ? { ok: false, reason } : { ok: true } }),
+        });
+        const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+        const session = manager.sessions.get(created.id);
+        const request = new EventEmitter();
+        manager.attachStream(session, request, streamResponse());
+        request.emit('close');
+        manager.targetResolver.discover = async () => {
+            refused = true;
+            return { targets: terminalTargets(), agentTargetsAvailable: true };
+        };
+        await assert.rejects(manager.discoverTargets({ req: {}, routePlan: routePlan(), directory: '' }),
+            { code: reason === 'administrator_revoked' ? 'WEBTTY_ADMIN_REQUIRED' : 'WEBTTY_UNAVAILABLE' });
+        await Promise.allSettled([...manager.inFlightCloses]);
+        assert.equal(manager.activeCount(), reason === 'administrator_revoked' ? 0 : 1);
+        assert.equal(session.worker.closed, reason === 'administrator_revoked' ? 1 : 0);
+    }
+});
+
+test('decided startup demotion reclaims the new shell and detached siblings without awaiting its own startup barrier', async (t) => {
+    let demoted = false;
+    const workers = [];
+    const manager = await createManager(t, {
+        auth: authAdapter({ validate: async () => demoted ? { ok: false, reason: 'administrator_revoked' } : { ok: true } }),
+        workerFactory: () => {
+            const worker = new FakeWorker();
+            if (workers.length) {
+                const start = worker.start.bind(worker);
+                worker.start = async fields => { const result = await start(fields); demoted = true; return result; };
+            }
+            workers.push(worker);
+            return worker;
+        },
+    });
+    const first = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const session = manager.sessions.get(first.id);
+    const request = new EventEmitter();
+    manager.attachStream(session, request, streamResponse());
+    request.emit('close');
+    await assert.rejects(manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' }), { code: 'WEBTTY_ADMIN_REQUIRED' });
+    await Promise.allSettled([...manager.inFlightCloses]);
+    assert.equal(manager.activeCount(), 0);
+    assert.equal(manager.pendingCreations.size, 0);
+    assert.equal(manager.ownerIndex.size, 0);
+    assert.equal(manager.userCounts.size, 0);
+    assert.deepEqual(workers.map(worker => worker.closed), [1, 1]);
 });

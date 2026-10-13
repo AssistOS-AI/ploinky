@@ -110,6 +110,8 @@ import { createCloudflaredRouterIntegration } from '../../ploinky-box/cloudflare
 import { requestAgentCard } from './agentCardFanout.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { WebttySessionManager } from './webtty/sessionManager.mjs';
+import { captureEdgeRoutingLease } from '../sandbox/edgeGeneration.js';
+import { onAuthenticatedRequestDecision } from './auth/authenticatedRequestEvents.mjs';
 import { buildAgentWorkerEnvironment } from './webtty/agentWorkerEnvironment.mjs';
 import {
     probeNestedPodmanRuntime,
@@ -178,9 +180,16 @@ const webttyProviderLocality = resolveWebttyProviderLocality({
 const webttySessionManager = new WebttySessionManager({
     workspaceRoot: PLOINKY_WORKSPACE_ROOT,
     agentProviderAvailable: webttyProviderLocality.agentAvailable,
+    capturePlan: () => {
+        const lease = captureEdgeRoutingLease();
+        return { snapshot: lease.snapshot, lease };
+    },
     audit: (event, value) => appendLog(event, value),
 });
 const webttyRecovery = await webttySessionManager.initialize();
+const stopObservingAuthenticatedRequests = onAuthenticatedRequestDecision(
+    decision => webttySessionManager.observeAuthenticatedRequest(decision),
+);
 appendLog('webtty_provider_locality', {
     surfaceAvailable: webttySessionManager.availability().ok,
     agentAvailable: webttySessionManager.providerAvailability().agentAvailable,
@@ -1092,6 +1101,7 @@ const lifecycle = setupProcessLifecycle(
     {
         beforeClose: [async () => {
             hardwareAvailabilityLatcher.stop();
+            stopObservingAuthenticatedRequests();
             await webttySessionManager.closeAll();
             runtimeRelayManager.close();
             await cloudflaredRouterIntegration.stop();

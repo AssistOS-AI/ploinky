@@ -4,6 +4,7 @@
  * A row is an inventory obligation, not a claim that a live test passed.
  */
 import fs from 'node:fs';
+import { buildLiveSessionsRouterInventory } from './router-live-sessions-inventory.mjs';
 import { hasRouterSourceReference, normalizeRouterInventory, resolveRouterSourceReference, assertRouterInventoryObligations } from './router-source-references.mjs';
 
 const access = {
@@ -134,13 +135,17 @@ add('unix-authority-read', 'GET', '/authority-attestations/:nonce', 'cli/server/
 
 export const routerInventoryBaseline = Object.freeze(normalizeRouterInventory(rows).map(row => Object.freeze(row)));
 const sourceFiles = new Map();
-export const routerInventory = Object.freeze(routerInventoryBaseline.map(row => {
+export const routerInventoryHistorical = Object.freeze(routerInventoryBaseline.map(row => {
   if (!hasRouterSourceReference(row)) return row;
   const [file] = row.source.split(':');
   if (!sourceFiles.has(file)) sourceFiles.set(file, fs.readFileSync(new URL(`../../../${file}`, import.meta.url)));
   return Object.freeze(resolveRouterSourceReference(row, sourceFiles.get(file)));
 }));
-assertRouterInventoryObligations(routerInventory);
+assertRouterInventoryObligations(routerInventoryHistorical);
+export const routerInventory = buildLiveSessionsRouterInventory(
+  routerInventoryHistorical,
+  fs.readFileSync(new URL('../../../cli/server/handlers/webtty.js', import.meta.url)),
+);
 
 export const routerAuthorizationOrder = Object.freeze([
   'Exact Host + origin-form request target; select public/managed interface and immutable edge snapshot.',

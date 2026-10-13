@@ -16,6 +16,26 @@ const ROUTE = Object.freeze({
 });
 const OTHER_ROUTE = Object.freeze({ ...ROUTE, activationId: 'activation-b' });
 
+test('attach tokens expire at 60 seconds, are single use and bind login, route and session', () => {
+    let now = 1000;
+    const records = new WebttyLaunchRecordStore({ now: () => now });
+    const sessionId = 's'.repeat(32);
+    const token = records.createAttachment({ owner: OWNER, routeBinding: ROUTE, sessionId });
+    assert.match(token.attach, /^[A-Za-z0-9_-]{32}$/);
+    assert.equal(token.expiresAt, 61_000);
+    for (const wrong of [{ owner: OTHER_OWNER, routeBinding: ROUTE }, { owner: OWNER, routeBinding: OTHER_ROUTE }]) {
+        assert.throws(() => records.consumeAttachment({ attach: token.attach, ...wrong }), { code: 'WEBTTY_ATTACH_NOT_FOUND' });
+    }
+    now = 60_999;
+    assert.equal(records.consumeAttachment({ attach: token.attach, owner: OWNER, routeBinding: ROUTE }).sessionId, sessionId);
+    assert.throws(() => records.consumeAttachment({ attach: token.attach, owner: OWNER, routeBinding: ROUTE }),
+        { code: 'WEBTTY_ATTACH_NOT_FOUND' });
+    const expired = records.createAttachment({ owner: OWNER, routeBinding: ROUTE, sessionId });
+    now += 60_000;
+    assert.throws(() => records.consumeAttachment({ attach: expired.attach, owner: OWNER, routeBinding: ROUTE }),
+        { code: 'WEBTTY_ATTACH_NOT_FOUND' });
+});
+
 function randomSource() {
     let sequence = 0;
     return (bytes) => {

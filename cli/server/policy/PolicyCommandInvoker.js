@@ -1,6 +1,7 @@
 import { parseCookies, readJsonBody } from '../handlers/common.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { Caller } from './Caller.js';
+import { publishAuthenticatedRequestDecision } from '../auth/authenticatedRequestEvents.mjs';
 import {
     AUTHENTICATION_UNAVAILABLE_MESSAGE,
     authenticationUnavailableHeaders,
@@ -47,9 +48,11 @@ export class PolicyCommandInvoker {
         }
         const cookies = parseCookies(req);
         let cookie = cookies.get(LOCAL_AUTH_COOKIE_NAME) || '';
+        let authMode = 'local';
         let session = cookie ? this._getSession(cookie) : null;
         if (!session?.user || !this._allowLocalSession(session, routePlan)) {
             cookie = cookies.get('ploinky_sso') || '';
+            authMode = 'sso';
             try {
                 session = cookie ? await this._getProviderSession(cookie) : null;
             } catch (error) {
@@ -67,13 +70,15 @@ export class PolicyCommandInvoker {
             return true;
         }
         const user = session.user;
+        req.user = user;
+        req.session = session;
+        req.sessionId = cookie;
+        req.authMode = authMode;
+        publishAuthenticatedRequestDecision(req);
         if (!this._isAdminUser(user)) {
             sendJson(res, 403, { ok: false, error: { code: 'ADMIN_REQUIRED', message: 'A real administrator session is required.' } });
             return true;
         }
-        req.user = user;
-        req.session = session;
-        req.sessionId = cookie;
         let body = {};
         try {
             body = await readJsonBody(req);

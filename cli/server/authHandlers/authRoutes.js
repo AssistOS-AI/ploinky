@@ -1,6 +1,7 @@
 import { getSession as getLocalSession, isAdminUser, verifySessionJwt, revokeSession as revokeLocalSession } from '../auth/localService.js';
 import { revokeSessionIds } from '../auth/sessionRevocations.js';
 import { isSsoProviderUnavailable } from '../auth/ssoAdmission.js';
+import { publishAuthenticatedRequestDecision } from '../auth/authenticatedRequestEvents.mjs';
 import { canonicalControlOrigin, mintAdminCsrfToken } from '../adminControlSecurity.js';
 import {
     BROWSER_CSRF_COOKIE_NAME,
@@ -585,6 +586,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 session,
             } = tokenSession;
             setAuthenticatedRequest(req, { session, sessionId, mode: sessionMode });
+            publishAuthenticatedRequestDecision(req);
             if (method === 'POST') {
                 let body = {};
                 try {

@@ -95,10 +95,149 @@ function request({ method = 'POST', url = '/webtty/sessions', body, routePlan, c
 function manager(overrides = {}) {
     return {
         availability: () => ({ ok: true }),
+        assertViewerQuota() {},
         async create() { return { id: 'terminal-abcdefghijklmnop', cwd: '.', cols: 80, rows: 24 }; },
         ...overrides,
     };
 }
+
+test('Live Sessions routes enforce administrator admission and exact body-only attach payloads', async () => {
+    for (const url of ['/webtty/live-sessions', '/webtty/attachments', `/webtty/live-sessions/${'a'.repeat(32)}/attach-tokens`]) {
+        const res = new MockResponse();
+        await handleWebtty({ method: 'GET', user: { id: 'user', roles: ['user'] } }, res, new URL(url, 'https://app.example.test'),
+            { manager: manager(), routePlan: plan() });
+        assert.equal(res.statusCode, 403);
+        assert.equal(JSON.parse(res.body).error, 'administrator_required');
+    }
+    for (const [url, body] of [
+        ['/webtty/attachments?attach=x', {}],
+        ['/webtty/attachments', { attach: 'a'.repeat(31), cols: 80, rows: 24 }],
+        ['/webtty/attachments', { attach: 'a'.repeat(33), cols: 80, rows: 24 }],
+        ['/webtty/attachments', { attach: 'a'.repeat(32), cols: 1, rows: 24 }],
+        ['/webtty/attachments', { attach: 'a'.repeat(32), cols: 80, rows: 0 }],
+        [`/webtty/live-sessions/${'a'.repeat(32)}/attach-tokens`, { extra: true }],
+    ]) {
+        const routePlan = plan();
+        const { req } = request({ routePlan, url, body });
+        const res = new MockResponse();
+        await handleWebtty(req, res, new URL(url, 'https://app.example.test'), { manager: manager(), routePlan });
+        assert.equal(res.statusCode, 400, url);
+    }
+});
+
+test('attach mutations reject wrong/missing Origin, invalid proof and foreign-session cookie before reading body', async () => {
+    for (const url of ['/webtty/attachments', `/webtty/live-sessions/${'a'.repeat(32)}/attach-tokens`]) {
+        for (const mode of ['wrong-origin', 'no-origin', 'invalid-proof', 'foreign-cookie']) {
+            const routePlan = plan();
+            const input = request({ routePlan, url, body: {} });
+            if (mode === 'wrong-origin') input.req.headers.origin = 'https://foreign.example.test';
+            if (mode === 'no-origin') delete input.req.headers.origin;
+            if (mode === 'invalid-proof') input.req.headers['x-ploinky-browser-csrf-token'] = 'invalid';
+            if (mode === 'foreign-cookie') {
+                const foreign = request({ routePlan, url });
+                foreign.req.session = { _jwtPayload: { sid: 'other-session' } };
+                const token = mintBrowserCsrfToken({ req: foreign.req, routePlan,
+                    authContext: foreign.req.edgeAuthContext, sessionId: foreign.req.sessionId });
+                delete input.req.headers['x-ploinky-browser-csrf-token'];
+                input.req.headers.cookie = `ploinky_browser_csrf=${token}`;
+            }
+            const res = new MockResponse();
+            await handleWebtty(input.req, res, new URL(url, 'https://app.example.test'), { manager: manager(), routePlan });
+            assert.equal(res.statusCode, 403, mode);
+            assert.equal(input.wasConsumed(), false, mode);
+        }
+    }
+});
+
+test('watcher input is forbidden, watcher Kill succeeds, and stream quota returns JSON 429', async () => {
+    for (const [method, suffix, status, overrides] of [
+        ['POST', '/input', 403, { authorize: async () => { throw Object.assign(new Error(), { code: 'WEBTTY_OWNER_REQUIRED' }); } }],
+        ['DELETE', '', 200, { closeAuthorized: async () => true }],
+        ['GET', '/stream', 429, { authorize: async () => ({}), assertViewerQuota() { throw Object.assign(new Error(), { code: 'WEBTTY_VIEWER_QUOTA' }); } }],
+        ['GET', '/stream', 503, { authorize: async () => { throw Object.assign(new Error(), { code: 'EDGE_GENERATION_INACTIVE' }); } }],
+    ]) {
+        const routePlan = plan();
+        const url = `/webtty/sessions/${'a'.repeat(32)}${suffix}`;
+        const { req } = request({ routePlan, url, method, body: { data: 'x' } });
+        const res = new MockResponse();
+        await handleWebtty(req, res, new URL(url, 'https://app.example.test'), { manager: manager(overrides), routePlan });
+        assert.equal(res.statusCode, status);
+        assert.match(res.headers['Content-Type'], /application\/json/);
+        if (status === 403) assert.equal(JSON.parse(res.body).error, 'owner_required');
+    }
+});
+
+test('a fresh manager lists no sessions and rejects stale streams after router restart', async () => {
+    const { WebttySessionManager } = await import('../../cli/server/webtty/sessionManager.mjs');
+    const live = new WebttySessionManager({ workspaceRoot: '/private/tmp/ls-p1',
+        auth: { createLease: () => ({ mode: 'local', userId: 'admin' }), validateLease: async () => ({ ok: true }) },
+    });
+    live.ready = true;
+    for (const url of ['/webtty/live-sessions', `/webtty/sessions/${'a'.repeat(32)}/stream`]) {
+        const routePlan = plan();
+        const { req } = request({ routePlan, url, method: 'GET' });
+        const res = new MockResponse();
+        await handleWebtty(req, res, new URL(url, 'https://app.example.test'), { manager: live, routePlan });
+        assert.equal(res.statusCode, url.endsWith('/stream') ? 404 : 200);
+        if (res.statusCode === 200) assert.deepEqual(JSON.parse(res.body), { ok: true, version: 1, sessions: [] });
+    }
+});
+
+test('real handler and manager reject a foreign-login attach token and token reuse with 404', async (t) => {
+    const { WebttySessionManager } = await import('../../cli/server/webtty/sessionManager.mjs');
+    const { createBrowserSessionLease } = await import('../../cli/server/webtty/authLease.mjs');
+    const live = new WebttySessionManager({
+        workspaceRoot: '/private/tmp/ls-p1',
+        auth: { validateLease: async () => ({ ok: true }) },
+    });
+    live.ready = true;
+    const routePlan = plan();
+    const id = 'a'.repeat(32);
+    let resizes = 0;
+    const { req: original } = request({ routePlan });
+    const ownerLease = createBrowserSessionLease(original);
+    const session = {
+        id, routerEpoch: live.routerEpoch, owner: { principal: ownerLease.principal, adminAdmittedAt: 0 },
+        binding: { host: routePlan.host, hostRouteKey: routePlan.hostSelection.record.routeKey },
+        viewers: new Map(), cwdRelative: 'Projects', cols: 80, rows: 24,
+        target: { kind: 'box', label: 'Ploinky Box', detail: 'Workspace runtime', access: 'rw', cwdDisplay: '/workspace/Projects' },
+        worker: { resize: async () => { resizes += 1; } },
+    };
+    live.sessions.set(id, session);
+    t.after(() => {
+        live.sessions.clear();
+        for (const unsubscribe of live.launchAuthSubscriptions.values()) unsubscribe();
+        live.launchAuthSubscriptions.clear();
+    });
+    async function call(url, body, login = 'sess-stable') {
+        const { req } = request({ routePlan, url, body, csrf: false });
+        req.sessionId = `jwt-${login}`;
+        req.session = { _jwtPayload: { sid: login } };
+        req.headers['x-ploinky-browser-csrf-token'] = mintBrowserCsrfToken({
+            req, routePlan, authContext: req.edgeAuthContext, sessionId: req.sessionId,
+        });
+        const res = new MockResponse();
+        await handleWebtty(req, res, new URL(url, 'https://app.example.test'), { manager: live, routePlan });
+        return { status: res.statusCode, body: JSON.parse(res.body) };
+    }
+    const minted = await call(`/webtty/live-sessions/${id}/attach-tokens`, {});
+    assert.equal(minted.status, 201);
+    assert.match(minted.body.attach, /^[A-Za-z0-9_-]{32}$/);
+    const payload = { attach: minted.body.attach, cols: 100, rows: 30 };
+    const foreign = await call('/webtty/attachments', payload, 'different-login');
+    assert.deepEqual(foreign, { status: 404, body: { ok: false, error: 'not_found' } });
+    assert.equal(resizes, 0);
+    const accepted = await call('/webtty/attachments', payload);
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.body.session.id, id);
+    assert.equal(accepted.body.session.role, 'owner');
+    assert.equal(resizes, 1);
+    const replay = await call('/webtty/attachments', payload);
+    assert.deepEqual(replay, { status: 404, body: { ok: false, error: 'not_found' } });
+    assert.equal(resizes, 1);
+    assert.equal(live.launchStore.attachments.size, 0);
+    assert.equal(live.launchAuthSubscriptions.size, 0);
+});
 
 test('the entire unauthenticated WebTTY surface is response-oriented instead of redirect-oriented', async () => {
     for (const pathname of ['/webtty', '/webtty/', '/webtty/assets/webtty-bootstrap.js', '/webtty/assets/xterm.js', '/webtty/sessions/id/stream']) {
@@ -369,14 +508,14 @@ test('availability, ownership, and close internals cannot escape the HTTP error 
             },
         }],
         ['GET', '/webtty/sessions/terminal-abcdefghijklmnop/stream', {
-            async validateOwnership() {
+            async authorize() {
                 const error = new Error('private ownership detail');
                 error.code = 'WEBTTY_AUTH_SUBSCRIPTION_INVALID';
                 throw error;
             },
         }],
         ['DELETE', '/webtty/sessions/terminal-abcdefghijklmnop', {
-            async closeOwned() {
+            async closeAuthorized() {
                 const error = new Error('private cleanup detail');
                 error.code = 'WEBTTY_RECOVERY_STATE_INVALID';
                 throw error;
@@ -415,7 +554,7 @@ test('a stream rejected after ownership validation is ended instead of leaked', 
         {
             routePlan,
             manager: manager({
-                async validateOwnership() { return { id: 'terminal-abcdefghijklmnop' }; },
+                async authorize() { return { id: 'terminal-abcdefghijklmnop' }; },
                 attachStream() { return false; },
             }),
         },
@@ -488,7 +627,7 @@ test('page, asset, and stream GETs never allocate and assets use a fixed allowli
     const routePlan = plan();
     const service = manager({
         async create() { allocations += 1; },
-        async validateOwnership() { ownershipChecks += 1; return null; },
+        async authorize() { ownershipChecks += 1; return null; },
     });
     for (const pathname of ['/webtty', '/webtty/', '/webtty/assets/webtty-bootstrap.js', '/webtty/assets/xterm.js']) {
         const req = {
@@ -563,7 +702,7 @@ test('worker IPC backpressure is exposed as a retryable 429', async () => {
         const res = new MockResponse();
         await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
             manager: manager({
-                async validateOwnership() { return { id: 'terminal-abcdefghijklmnop' }; },
+                async authorize() { return { id: 'terminal-abcdefghijklmnop' }; },
                 async input() {
                     const error = new Error('worker IPC high-water limit exceeded');
                     error.code = code;
@@ -575,5 +714,30 @@ test('worker IPC backpressure is exposed as a retryable 429', async () => {
         assert.equal(res.statusCode, 429, code);
         assert.equal(res.headers['Retry-After'], '5', code);
         assert.equal(JSON.parse(res.body).error, code.toLowerCase(), code);
+    }
+});
+
+test('only real HTML responses allow same-origin framing; assets, JSON and SSE remain unframeable', async () => {
+    const routePlan = plan();
+    for (const [url, type, frame] of [
+        ['/webtty/', 'text/html', 'SAMEORIGIN'],
+        ['/webtty/assets/webtty.js', 'application/javascript', 'DENY'],
+        ['/webtty/live-sessions', 'application/json', 'DENY'],
+        [`/webtty/sessions/${'a'.repeat(32)}/stream`, 'text/event-stream', 'DENY'],
+    ]) {
+        const { req } = request({ method: 'GET', url, routePlan });
+        const res = new MockResponse();
+        await handleWebtty(req, res, new URL(url, 'https://app.example.test'), {
+            routePlan,
+            manager: manager({
+                listSessions: async () => [],
+                authorize: async () => ({}),
+                attachStream(session, request, response) { response.write(': connected\n\n'); response.end(); return true; },
+            }),
+        });
+        assert.equal(res.statusCode, 200, url);
+        assert.ok(res.headers['Content-Type'].startsWith(type), url);
+        assert.equal(res.headers['X-Frame-Options'], frame, url);
+        assert.ok(res.headers['Content-Security-Policy'].includes(`frame-ancestors '${frame === 'SAMEORIGIN' ? 'self' : 'none'}'`), url);
     }
 });

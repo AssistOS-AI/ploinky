@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { publishAuthenticatedRequestDecision } from '../auth/authenticatedRequestEvents.mjs';
 import path from 'path';
 
 import { PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from '../../utils/config.js';
@@ -957,6 +958,7 @@ function capabilityDenialRedirectTarget(req, parsedUrl, manifest) {
 }
 
 function finalizeAuthenticatedRequest(req, res, parsedUrl, authContext, options, session) {
+    publishAuthenticatedRequestDecision(req);
     const routes = readRouting(options).routes || {};
     const capabilityRouteKeys = [...new Set([
         String(authContext?.capabilityOwnerRouteKey || authContext?.routeKey || '').trim(),

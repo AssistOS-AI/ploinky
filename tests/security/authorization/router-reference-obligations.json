@@ -2068,6 +2068,123 @@
     "cli/server/RoutingServer.js": {
       "baseline": "d79de70162e698f12723a2dacc2327f3a62b8a066a77de6c3d433356ef9da93c",
       "blobs": {
+        "d336f2281752d95be3245607838fa0bf9370a694153d66c95667698044925dd9": {
+          "root.get": {
+            "line": 791,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "root-index.get": {
+            "line": 791,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "health.get": {
+            "line": 664,
+            "anchor": null,
+            "statement": "if (pathname === '/health') {"
+          },
+          "agent-card.get": {
+            "line": 751,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-card-slash.get": {
+            "line": 751,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "mcp-browser-client.get": {
+            "line": 486,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 486,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 752,
+            "anchor": null,
+            "statement": "} else if (agentName && isActiveAgentRootPlan(routePlan)) {"
+          },
+          "agent-mcp.post": {
+            "line": 761,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.get": {
+            "line": 761,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.delete": {
+            "line": 761,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-task-status.get": {
+            "line": 624,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-status-alias.get": {
+            "line": 624,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-cancel.post": {
+            "line": 565,
+            "anchor": null,
+            "statement": "} else if (isDelegatedAgentTaskCancelRoute) {"
+          },
+          "agent-openai.post": {
+            "line": 768,
+            "anchor": null,
+            "statement": "return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath, {"
+          },
+          "agent-root-websocket.get": {
+            "line": 1051,
+            "anchor": null,
+            "statement": "const handled = await handleAgentRootUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 1013,
+            "anchor": null,
+            "statement": "if (routePlan.kind === 'agent-port') {"
+          },
+          "internal-agent-control.*": {
+            "line": 501,
+            "anchor": null,
+            "statement": "if (hasInternalAgentSegment(pathname)) {"
+          },
+          "reserved--metrics.*": {
+            "line": 803,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--health-internal.*": {
+            "line": 803,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin.*": {
+            "line": 803,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin-*.*": {
+            "line": 803,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "unix-health.get": {
+            "line": 964,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          }
+        },
         "d79de70162e698f12723a2dacc2327f3a62b8a066a77de6c3d433356ef9da93c": {
           "root.get": {
             "line": 771,
@@ -2425,6 +2542,38 @@
     "cli/server/authHandlers/marketplaceRoutes.js": {
       "baseline": "b6a1ed207ecfdeef15b97994e9bf6fd3039c98f197f3126b5086a6282fa5d01d",
       "blobs": {
+        "b7e95f5361b0e602e200f5870f38324f729a2c4ee35b33850b042ee99ab9af2b": {
+          "marketplace-repos-read.get": {
+            "line": 812,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 782,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 884,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 884,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 910,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 912,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
+        },
         "b6a1ed207ecfdeef15b97994e9bf6fd3039c98f197f3126b5086a6282fa5d01d": {
           "marketplace-repos-read.get": {
             "line": 625,
@@ -2933,6 +3082,58 @@
     "cli/server/handlers/webtty.js": {
       "baseline": "3058bf7aefe36011af1f3909f8ca6dba6d914a1341854e2ee34b3dfa989d7bc8",
       "blobs": {
+        "a857a64e177ea41d199c719e92caecbc2ad9cd47cf91b3db11430c7cfee1ee31": {
+          "webtty-ui.get": {
+            "line": 233,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-ui-slash.get": {
+            "line": 233,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-assets.get": {
+            "line": 248,
+            "anchor": "pathname.startsWith('/webtty/assets/')",
+            "statement": "if (pathname.startsWith('/webtty/assets/') && method === 'GET') {"
+          },
+          "webtty-discover.post": {
+            "line": 267,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/target-discoveries' && method === 'POST') {"
+          },
+          "webtty-discovery-delete.delete": {
+            "line": 293,
+            "anchor": null,
+            "statement": "if (selectedDiscovery && method === 'DELETE') {"
+          },
+          "webtty-create.post": {
+            "line": 310,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/sessions' && method === 'POST') {"
+          },
+          "webtty-stream.get": {
+            "line": 346,
+            "anchor": null,
+            "statement": "if (selected.operation === 'stream' && method === 'GET') {"
+          },
+          "webtty-input.post": {
+            "line": 370,
+            "anchor": null,
+            "statement": "if (selected.operation === 'input' && method === 'POST') {"
+          },
+          "webtty-resize.post": {
+            "line": 394,
+            "anchor": null,
+            "statement": "if (selected.operation === 'resize' && method === 'POST') {"
+          },
+          "webtty-delete.delete": {
+            "line": 416,
+            "anchor": null,
+            "statement": "if (!selected.operation && method === 'DELETE') {"
+          }
+        },
         "3058bf7aefe36011af1f3909f8ca6dba6d914a1341854e2ee34b3dfa989d7bc8": {
           "webtty-ui.get": {
             "line": 196,

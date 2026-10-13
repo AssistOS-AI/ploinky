@@ -5,7 +5,7 @@ import fsPromises from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { routerInventory, routerInventoryBaseline } from './router-inventory.mjs';
+import { routerInventoryHistorical as routerInventory, routerInventoryBaseline } from './router-inventory.mjs';
 import { resolveRouterSourceReference, assertRouterInventoryObligations, assertRouterReferenceMaps } from './router-source-references.mjs';
 import { inspectMarketplaceAuthorization, routerProbes, runRouterProbes, validateRouterAllowedResponse, validateRouterPrincipal } from './router-probes.mjs';
 import { assertNoWorkspaceDisclosure, markerCommand, runWebchatUploadDenialProof, runWorkspaceWriteMatrix, terminalFixtureNames, workspaceWriteCheckDefinitions, workspaceWriteMatrix, workspaceWriteRequest } from './stream-probes.mjs';

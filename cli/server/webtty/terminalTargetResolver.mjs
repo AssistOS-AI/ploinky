@@ -659,8 +659,33 @@ export class TerminalTargetResolver {
             routeSnapshot(routePlan);
             return Object.freeze({ ...target, directory });
         } catch (error) {
-            if (error?.code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') throw error;
+            if (['WEBTTY_TARGET_PROVIDER_UNAVAILABLE', 'WEBTTY_TARGET_GENERATION_STALE'].includes(error?.code)) throw error;
             throw targetError('WEBTTY_TARGET_STALE');
         }
+    }
+
+    async revalidateRunningAgent({ routePlan, target, signal, agentProviderAvailable = true } = {}) {
+        const snapshot = routeSnapshot(routePlan);
+        if (!agentProviderAvailable) throw targetError('WEBTTY_TARGET_PROVIDER_UNAVAILABLE');
+        const candidate = exactCandidate(target?.containerName, snapshot.agents?.[target?.containerName], this.supportedRuntimes);
+        if (!candidate || !sameAgentIdentity(target, candidate) || this.isTargetQuarantined(candidate)) {
+            throw targetError('WEBTTY_TARGET_IDENTITY_STALE');
+        }
+        const workspaceHash = exactText(this.workspaceIdentity()?.hash);
+        if (!workspaceHash) throw targetError('WEBTTY_TARGET_PROVIDER_UNAVAILABLE');
+        // Preserve inspection failures: only a completed ownership/identity
+        // comparison proves replacement. No cwd or mount translation runs here.
+        const raw = await this.inspectWithGate(candidate.runtime, candidate.containerId, {
+            signal, timeoutMs: this.limits.inspectTimeoutMs, maxOutputBytes: this.limits.inspectOutputBytes,
+        });
+        routeSnapshot(routePlan);
+        let inspected;
+        try { inspected = assertOwnedInspection(candidate, raw, workspaceHash); }
+        catch (error) {
+            if (error?.code === 'WEBTTY_TARGET_INSPECT_INVALID') throw error;
+            throw targetError('WEBTTY_TARGET_IDENTITY_STALE');
+        }
+        if (inspected.user !== target.targetUser) throw targetError('WEBTTY_TARGET_IDENTITY_STALE');
+        return target;
     }
 }

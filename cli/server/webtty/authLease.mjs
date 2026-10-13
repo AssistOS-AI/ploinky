@@ -15,11 +15,15 @@ function fingerprint(mode, value) {
         .digest('base64url');
 }
 
+export function browserPrincipal(mode, userId) {
+    return crypto.createHash('sha256').update(`${mode}\0${userId}`).digest('hex');
+}
+
 export function createBrowserSessionLease(req) {
     const mode = String(req?.authMode || '').trim();
     const sessionId = String(req?.sessionId || '').trim();
     const sessionBindingId = resolveSessionBindingId(req, sessionId);
-    const userId = String(req?.user?.id || '').trim();
+    const userId = String(req?.user?.id || '');
     if (!['local', 'sso'].includes(mode) || !sessionId || !sessionBindingId || !userId) {
         const error = new Error('an authenticated browser session is required');
         error.code = 'WEBTTY_AUTH_SESSION_REQUIRED';
@@ -37,7 +41,8 @@ export function createBrowserSessionLease(req) {
         sessionBindingId,
         sessionFingerprint: fingerprint(mode, sessionBindingId),
         userId,
-        createdAt: Date.now(),
+        principal: browserPrincipal(mode, userId),
+        createdAt: mode === 'local' ? Number(req?.session?.createdAt) || 0 : Date.now(),
     });
 }
 

@@ -1,4 +1,5 @@
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
+import { publishAuthenticatedRequestDecision } from '../auth/authenticatedRequestEvents.mjs';
 import {
     mintBrowserCsrfToken,
     verifyBrowserMutationRequest,
@@ -215,15 +216,17 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
         sendUserAdminError(res, 'authentication_required');
         return true;
     }
+    req.user = session.user;
+    req.session = session;
+    req.sessionId = sessionId;
+    req.authMode = 'sso';
+    publishAuthenticatedRequestDecision(req);
     const isAdmin = Array.isArray(session.user?.capabilities)
         && session.user.capabilities.includes('admin.users.manage');
     if (!isAdmin) {
         sendUserAdminError(res, 'admin_required');
         return true;
     }
-    req.user = session.user;
-    req.session = session;
-    req.sessionId = sessionId;
     const publicAuthContext = publicUserAdminAuthContext(routePlan, route, authContext);
     if (['POST', 'PATCH', 'DELETE'].includes(method)) {
         const publicCsrfToken = publicAuthContext
