@@ -187,8 +187,12 @@ export function c5RequiredArtifacts({ profile, action, remoteReport, fetched = n
 // What a run must have left for its PASS to be certified: the proof each action ends with.
 export function requiredArtifacts({ profile, action, remoteReport, fetched = null, dispatchHistory = null }) {
     if (profile?.model) {
-        if (action === 'provision') return ['box-inspect', 'box-contract', ...(profile.gpu ? ['gpu-initial-gate'] : []), ...(profile.model.profile === 'apple' ? ['model-apple-machine'] : [])];
-        if (action === 'live') return [`model-${profile.cases[0].toLowerCase()}`, 'llm-cleanup-proof', ...(remoteReport?.verdict === 'PASS' ? ['model-stop-proof', 'model-container-mounts', 'model-source-binding-before', 'model-container-mounts-after', 'model-source-binding-after'] : []), ...(profile.gpu ? ['gpu-final-observation'] : []), ...(profile.model.profile === 'apple' ? ['model-a15-host-guard'] : [])];
+        if (profile.model.measurement && action === 'live') return [
+            ...profile.cases.map(id => `${id.startsWith('LIVE-M') ? 'measurement' : 'model'}-${id.toLowerCase()}`),
+            'llm-cleanup-proof', 'model-stop-proof', 'model-a15-host-guard',
+        ];
+        if (action === 'provision') return ['box-inspect', 'box-contract', ...(profile.gpu ? ['gpu-initial-gate'] : []), ...(['apple', 'apple-cpu'].includes(profile.model.profile) ? ['model-apple-machine'] : [])];
+        if (action === 'live') return [`model-${profile.cases[0].toLowerCase()}`, 'llm-cleanup-proof', ...(remoteReport?.verdict === 'PASS' ? ['model-stop-proof', 'model-container-mounts', 'model-source-binding-before', 'model-container-mounts-after', 'model-source-binding-after'] : []), ...(profile.gpu ? ['gpu-final-observation'] : []), ...(['apple', 'apple-cpu'].includes(profile.model.profile) ? ['model-a15-host-guard'] : [])];
         if (action === 'cleanup') return ['llm-cleanup-proof', ...(modelProvisionOnlyCleanupProven({ fetched, dispatchHistory }) ? [] : [`model-${profile.cases[0].toLowerCase()}`]), ...(profile.gpu ? ['gpu-final-observation'] : [])];
         return [];
     }

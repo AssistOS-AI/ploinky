@@ -12,12 +12,16 @@ import { llmCleanupProof } from './liveLlmCases.mjs';
 import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs';
 import { requireTransport } from './liveProcess.mjs';
 import { cgroupWithin, createHostProc, processesWithin } from './liveGpuHost.mjs';
-import { createModelHostGuard, observeAppleMachine, parseModelHostSample } from './liveModelHostGuard.mjs';
+import { createModelHostGuard, observeAppleMachine, parseModelHostSample, assertModelGrantInventory, modelGrantInventory } from './liveModelHostGuard.mjs';
 import { MODEL_SOURCE_VIEW, modelMountFacts, modelSourceLayout, observeModelStage } from './liveModelSource.mjs';
 import { APPLE_DEVICE_INSPECT, assertAppleDeviceArguments, observeAppleDevices } from './liveModelDevices.mjs';
+import { normalizeMeasurement, measurementCases, measurementParams, MEASUREMENT_DEADLINES } from './liveModelMeasurements.mjs';
+import { createMeasurementExecutor, MEASUREMENT_RUNNER, MEASUREMENT_GROUP } from './liveModelMeasurementCommands.mjs';
+import { performance } from 'node:perf_hooks';
 
 export const MODEL_PROFILES = Object.freeze({
     apple: { block: 'mac-model-venus', case: 'LIVE-L6', platform: 'darwin', backend: 'venus', runner: 'llama.cpp-vulkan', executable: '/opt/llama.cpp-vulkan/llama-server' },
+    'apple-cpu': { block: 'mac-model-cpu', case: 'LIVE-L7', platform: 'darwin', backend: 'cpu', runner: 'llama.cpp', executable: '/opt/llama.cpp/llama-server' },
     nvidia: { block: 'apparatus-model-nvidia', case: 'LIVE-L4', platform: 'linux', backend: 'dedicated', runner: 'llama.cpp', executable: '/opt/llama.cpp/llama-server' },
     cpu: { block: 'apparatus-model-cpu', case: 'LIVE-L5', platform: 'linux', backend: 'cpu', runner: 'llama.cpp', executable: '/opt/llama.cpp/llama-server' },
 });
@@ -58,6 +62,14 @@ export function modelPlan(run) {
     const nested = [...core, 'podman', '--cgroup-manager=cgroupfs'];
     const command = (id, argv, deadlineMs = 30000) => ({ id, binary: profile.engine.path, argv, deadlineMs });
     const tool = (name, args) => command(`model-${name}`, [...core, 'node', '-e', '<LLM_TOOL_CALL>', ...llmToolWords(name, args, { model: LLM_MODELS.small, agent: LLM_AGENT })], 290000);
+    if (profile.model.measurement) return [
+        { id: 'measurement-configuration', action: JSON.stringify({ cases: profile.cases, configuration: profile.model.measurement,
+            params: measurementParams(profile.model.measurement), deadlines: MEASUREMENT_DEADLINES }) },
+        { id: 'measurement-preflight', action: 'Revalidate exact Apple engine, machine, source, Box, agent, CPU withdrawal or Venus device proof; observe host guard throughout the measurement and Stop.' },
+        { id: 'measurement-acquisition', action: 'Routed explicit-parameter Run, ready status, Stop, verified idle/group absence, fixed read-only controller-cache artifact hash.' },
+        { id: 'measurement-execute', action: 'Execute only the frozen scenario with one warm-up and three sequential prompts, two concurrent prompts, or one cancellation interception as selected. Baseline includes its separate functional case and fresh/reload timings. Keep individual hashed artifacts and apply fixed deadlines.' },
+        { id: 'measurement-stop', action: 'Routed Stop through idle and independently observed runner-group absence within 60000 ms, then owned canonical cleanup. Final certification requires the external settlement and restoration index.' },
+    ];
     return [
         command('model-box-contract', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<BOX_ID>']),
         command('model-agent-source', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<AGENT_ID>']),
@@ -84,28 +96,31 @@ export function modelPlan(run) {
 }
 
 export function validateModelPins(model, block) {
-    keys(model, ['profile', 'imageConfigDigest', 'imageParentDigest', 'cibRevision', 'executable'], 'model pins', ['apple']);
+    keys(model, ['profile', 'imageConfigDigest', 'imageParentDigest', 'cibRevision', 'executable'], 'model pins', ['apple', 'measurement']);
     const spec = MODEL_PROFILES[model.profile];
     check(spec && spec.block === block, 'Model profile and block disagree');
     check(HASH.test(model.imageConfigDigest) && HASH.test(model.imageParentDigest) && /^[a-f0-9]{40}$/.test(model.cibRevision), 'Invalid immutable model image pins');
     keys(model.executable, ['path', 'sha256', 'version'], 'model executable');
     check(model.executable.path === spec.executable && /^[a-f0-9]{64}$/.test(model.executable.sha256) && model.executable.version === 'b11159', 'Invalid pinned model executable');
-    if (model.profile === 'apple') {
-        keys(model.apple, ['machine', 'connection', 'uri', 'provider', 'renderNode'], 'Apple pins');
+    if (spec.platform === 'darwin') {
+        keys(model.apple, ['machine', 'connection', 'uri', 'provider', ...(model.profile === 'apple' ? ['renderNode'] : [])], 'Apple pins');
         check(model.apple.provider === 'libkrun' && /^[A-Za-z0-9_.-]{1,80}$/.test(model.apple.machine)
             && /^[A-Za-z0-9_.-]{1,100}$/.test(model.apple.connection) && /^ssh:\/\/[^\s\0]{1,250}$/.test(model.apple.uri)
-            && /^\/dev\/dri\/renderD\d+$/.test(model.apple.renderNode), 'Invalid Apple machine pins');
+            && (model.profile !== 'apple' || /^\/dev\/dri\/renderD\d+$/.test(model.apple.renderNode)), 'Invalid Apple machine pins');
     } else check(model.apple === undefined, 'Only Apple profile has machine pins');
+    if (model.measurement !== undefined) normalizeMeasurement(model.measurement, null, model.profile);
     return spec;
 }
 
 export function validateModelProfile(profile, block) {
     const spec = validateModelPins(profile.model, block);
-    check(profile.host.platform === spec.platform && profile.cases.join(',') === spec.case, 'Model platform or case mismatch');
+    const config = profile.model.measurement;
+    check(profile.host.platform === spec.platform && profile.cases.join(',') === (config ? measurementCases(profile.model.profile, config).join(',') : spec.case), 'Model platform or case mismatch');
     keys(profile.llm, ['image', 'revision', 'models'], 'model local-llm');
     check(IMAGE_REF.test(profile.llm.image) && profile.llm.image === profile.provision.image
         && profile.llm.revision === profile.provision.llm.revision, 'Model source/image pins disagree');
-    validateLlmModelPins(profile.llm.models);
+    validateLlmModelPins(profile.llm.models, { measurement: Boolean(config) });
+    if (config) normalizeMeasurement(config, profile.llm.models, profile.model.profile);
     check(profile.provision.ordinarySource === true && profile.fixtures.llm.ref === LLM_REF, 'Model requires ordinary staged source');
     check(profile.provision.llm.sourcePath === `${profile.source.root}/.hwl-local-llms/local-llm`, 'Model frozen source path mismatch');
     if (profile.model.profile === 'nvidia') {
@@ -117,17 +132,17 @@ export function validateModelProfile(profile, block) {
             && /^\/[A-Za-z0-9/_.-]+$/.test(gpu.smi.path)
             && HASH.test(gpu.smi.digest) && profile.provision.gpu?.uuid === gpu.uuid, 'Invalid ordinary NVIDIA pins');
     } else check(profile.gpu === undefined, 'CPU/Apple model must not carry NVIDIA pins');
-    check(profile.model.profile === 'cpu' ? profile.provision.gpu === undefined : profile.provision.gpu?.grantAgents?.join(',') === LLM_REF, 'Model GPU grant mismatch');
+    check(spec.backend === 'cpu' ? profile.provision.gpu === undefined : profile.provision.gpu?.grantAgents?.join(',') === LLM_REF, 'Model GPU grant mismatch');
     return spec;
 }
 
 export function assertModelObservation({ spec, model, pins, status, answer, processes, imageId }) {
     check(imageId.replace(/^sha256:/, '') === model.imageConfigDigest.slice(7), 'Model image config digest mismatch');
     check(status.profile === spec.backend && status.phase === 'ready' && status.deployment?.profile === spec.backend
-        && status.deployment.modelId === LLM_MODELS.small && status.deployment.runnerId === spec.runner, 'Wrong model, runner, or backend');
+        && status.deployment.modelId === pins.id && status.deployment.runnerId === spec.runner, 'Wrong model, runner, or backend');
     const artifact = status.deployment.artifact;
     check(artifact && ['repo', 'file', 'commit', 'size', 'sha256'].every(key => artifact[key] === pins[key]), 'Model artifact digest mismatch');
-    check(typeof answer.text === 'string' && answer.text.trim().length > 0 && answer.modelId === LLM_MODELS.small && answer.runnerId === spec.runner
+    check(typeof answer.text === 'string' && answer.text.trim().length > 0 && answer.modelId === pins.id && answer.runnerId === spec.runner
         && Number.isFinite(answer.generationTokensPerSecond) && answer.generationTokensPerSecond > 0, 'Empty or unmeasured model response');
     check(Array.isArray(processes) && processes.length === 1, 'Expected one observed model process');
     const proc = processes[0];
@@ -135,7 +150,7 @@ export function assertModelObservation({ spec, model, pins, status, answer, proc
     keys(proc.args, ['--device', '--n-gpu-layers', '-ngl', '--fit'], 'safe model arguments');
     check(proc.exe === model.executable.path && proc.sha256 === model.executable.sha256 && proc.mps === false && typeof proc.nvidiaLibrary === 'boolean' && /^[0-9]+$/.test(proc.start)
         && Number.isInteger(proc.pid) && proc.pid > 0, 'Wrong executable or MPS environment');
-    if (model.profile === 'cpu') {
+    if (spec.backend === 'cpu') {
         check(proc.args?.['--device'] === 'none' && proc.args['--n-gpu-layers'] === '0' && proc.args['--fit'] === 'off'
             && proc.args['-ngl'] === null && proc.cudaVisible === '' && !proc.nvidiaLibrary && proc.icd === null
             && Array.isArray(proc.gpuNodes) && proc.gpuNodes.length === 0, 'CPU runner has GPU launch facts');
@@ -159,7 +174,7 @@ export function assertModelContainer(value, { profile, role }) {
         modelSourceLayout(profile, value);
     }
     check(!value.labels?.[BOX_LABELS.hardwareLimits] || value.labels[BOX_LABELS.hardwareLimits] === 'off', 'Model Box budgets must be off');
-    if (profile.model.profile === 'cpu') {
+    if (MODEL_PROFILES[profile.model.profile].backend === 'cpu') {
         const allowed = role === 'box' ? ['/dev/fuse', '/dev/net/tun'] : [];
         check(Array.isArray(value.devices) && value.devices.every(device => allowed.includes(device?.PathOnHost) && device.PathInContainer === device.PathOnHost)
             && !value.mounts.some(mount => /nvidia|cuda|\/dev\/dri|cdi/i.test(`${mount.Source} ${mount.Destination}`)), 'CPU container has GPU/CDI devices or mounts');
@@ -200,7 +215,7 @@ export function createModelCases(ctx) {
     const write = (name, value) => { const problem = safeArtifact(name, value); if (problem) throw new Error(`Mandatory model artifact unavailable: ${problem}`); };
     let gpu; let apple; let launched = false; let toolAgent;
     const host = ctx.host || createHostProc();
-    const routeBinding = async (name, abort, cleanup) => {
+    const routeBinding = async (name, abort, cleanup, label = name.replaceAll('_', '-'), deadlineMs = 30000) => {
         const expected = { routeKey: LLM_AGENT, ref: LLM_REF, container: fixtureContainerName(profile.workspace.path, LLM_AGENT, LLM_REPOSITORY), containerId: toolAgent?.id };
         const proof = { schema: 1, runId: run.runId, tool: name, expected, matches: false };
         try {
@@ -213,20 +228,26 @@ export function createModelCases(ctx) {
             };
             const route = read('routing.json').routes?.[LLM_AGENT];
             const record = read('agents.json')[expected.container];
-            const current = checkedJson(await engine('model-tool-agent', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, toolAgent.id], { abort, cleanup, journal: false }));
+            const current = checkedJson(await engine('model-tool-agent', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, toolAgent.id], { abort, cleanup, journal: false, deadlineMs }));
             proof.route = { present: Boolean(route), repoMatches: route?.repo === LLM_REPOSITORY, agentMatches: route?.agent === LLM_AGENT,
                 containerMatches: route?.container === expected.container, active: Boolean(route) && !route.disabled && !route.draining };
             proof.containerMatches = sameContainer(current, toolAgent) && current.name === expected.container && record?.containerId === current.id;
             proof.matches = Object.values(proof.route).every(Boolean) && proof.containerMatches;
         } catch { proof.problem = 'Model route identity observation unavailable'; }
-        write(`model-tool-binding-${name.replaceAll('_', '-')}`, proof);
+        write(`model-tool-binding-${label}`, proof);
         check(proof.matches, 'Model Router route identity mismatch');
         return expected;
     };
-    const tool = async (name, args, abort, cleanup = false) => {
-        const expected = await routeBinding(name, abort, cleanup);
-        const result = await command(`model-${name}`, profile.engine.path, [...core, 'node', '-e', LLM_TOOL_CALL, ...llmToolWords(name, args, { model: LLM_MODELS.small, agent: LLM_AGENT })],
-            { deadlineMs: 290000, maxBytes: 65536, abort, cleanup, tolerate: true, tolerateCancel: true, journal: !['local_llm_status', 'local_llm_overview'].includes(name) });
+    const tool = async (name, args, abort, cleanup = false, measurement = null) => {
+        if (name === 'local_llm_run') launched = true;
+        const label = measurement?.label || name.replaceAll('_', '-');
+        const end = performance.now() + (measurement?.deadlineMs || 290000);
+        const budget = () => { const left = Math.floor(end - performance.now()); check(left > 0, 'Routed tool deadline expired'); return left; };
+        if (measurement && spec.platform === 'darwin') await observeAppleMachine({ profile, engine: (kind, argv, opts) => engine(kind, argv, { ...opts, abort, cleanup, deadlineMs: Math.min(30000, budget()) }) });
+        const expected = await routeBinding(name, abort, cleanup, label, Math.min(30000, budget()));
+        const result = await command(`model-${name}`, profile.engine.path, [...core, 'node', '-e', LLM_TOOL_CALL, ...llmToolWords(name, args,
+            { model: measurement?.model || LLM_MODELS.small, agent: LLM_AGENT, ...(measurement ? { budgetMs: budget() } : {}) })],
+            { deadlineMs: budget(), maxBytes: 65536, abort, cleanup, tolerate: true, tolerateCancel: true, journal: !['local_llm_status', 'local_llm_overview'].includes(name) });
         // Parse only for the safe diagnostic projection. No incomplete or
         // nonzero transport result becomes trusted tool evidence.
         let parsed = null; let transportFailure = null;
@@ -242,7 +263,7 @@ export function createModelCases(ctx) {
             || (doc.ok === true || doc.agent !== undefined) && doc.agent !== expected.routeKey;
         const admission = doc.error?.details?.admission;
         const errorText = typeof doc.error?.message === 'string' ? doc.error.message.slice(0, 600) : '';
-        write(`model-tool-reply-${name.replaceAll('_', '-')}`, { schema: 1, runId: run.runId, tool: name, expected,
+        write(`model-tool-reply-${label}`, { schema: 1, runId: run.runId, tool: name, expected,
             observed: { agent: doc.agent === expected.routeKey ? expected.routeKey : null, agentDigest: digest(JSON.stringify(doc.agent ?? null)) },
             ok: !transportFailure && doc.ok === true, replyParsed: parsed !== null,
             transport: { status: Number.isInteger(result?.status) ? result.status : null, timedOut: Boolean(result?.timedOut),
@@ -257,9 +278,10 @@ export function createModelCases(ctx) {
         if (transportFailure) throw transportFailure;
         check(parsed, 'Model Router returned an invalid bounded reply');
         check(!identityMismatch, 'Model Router reply identity mismatch');
-        check(doc.ok === true, 'Model Router tool refused the request');
-        await routeBinding(name, abort, cleanup);
+        if (doc.ok !== true) throw Object.assign(new Error('Model Router tool refused the request'), { code: doc.error?.code });
+        await routeBinding(name, abort, cleanup, `${label}${measurement ? '-after' : ''}`, Math.min(30000, budget()));
         if (name === 'local_llm_status') {
+            if (measurement) return doc.result;
             const { phase, profile: backend, deployment, runnerReport } = doc.result;
             return { phase, profile: backend, deployment, runnerReport };
         }
@@ -275,18 +297,21 @@ export function createModelCases(ctx) {
             check(sameContainer(boxFacts, box), 'Apple Box identity changed');
             devices = await appleDevices(boxFacts, agent, 'before');
         }
-        write('model-container-mounts', { schema: 1, runId: run.runId, box: modelMountFacts(boxFacts), agent: modelMountFacts(agent) });
+        write('model-container-mounts', { schema: 1, runId: run.runId, box: { ...modelMountFacts(boxFacts), devices: boxFacts.devices }, agent: { ...modelMountFacts(agent), devices: agent.devices } });
         assertModelContainer(boxFacts, { profile, role: 'box' });
         assertModelContainer(agent, { profile, role: 'agent' });
         toolAgent = agent;
         const source = assertModelSource(profile);
         source.binding = await sourceBinding(agent, boxFacts, source.stagedTreeDigest, 'before');
-        if (profile.model.profile === 'apple') {
+        if (spec.platform === 'darwin') {
             const machine = await observeAppleMachine({ profile, engine });
             write('model-apple-machine', machine);
             apple = createModelHostGuard({ intervalMs: timings.monitorMs, write: value => write('model-a15-host-guard', value), sample: async () => {
-                await observeAppleMachine({ profile, engine });
-                const sample = async (binary, args) => (await command('model-host-sample', binary, args, { deadlineMs: 10000, maxBytes: 65536, journal: false })).stdout;
+                const end = performance.now() + 10000;
+                const abort = AbortSignal.any([AbortSignal.timeout(10000), ...(signal ? [signal] : [])]);
+                const budget = () => { const left = Math.floor(end - performance.now()); check(left > 0, 'Host sample deadline expired'); return left; };
+                await observeAppleMachine({ profile, engine: (kind, argv, opts) => engine(kind, argv, { ...opts, abort, deadlineMs: budget() }) });
+                const sample = async (binary, args) => (await command('model-host-sample', binary, args, { abort, deadlineMs: budget(), maxBytes: 65536, journal: false })).stdout;
                 return parseModelHostSample({ memoryLevel: await sample('/usr/sbin/sysctl', ['-n', 'kern.memorystatus_level']), pressure: await sample('/usr/sbin/sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']), swap: await sample('/usr/sbin/sysctl', ['-n', 'vm.swapusage']), processes: await sample('/bin/ps', ['-axo', 'pid=,rss=,comm=']) });
             } });
             await apple.check();
@@ -360,7 +385,8 @@ export function createModelCases(ctx) {
             await monitor(async abort => {
                 if (gpu) await gpu.check('model-before-run');
                 launched = true;
-                await tool('local_llm_run', { requestId: `model-${run.runId}`, modelId: LLM_MODELS.small, runnerId: spec.runner, params: {}, replace: false }, abort);
+                await tool('local_llm_run', { requestId: `model-${run.runId}`, modelId: LLM_MODELS.small, runnerId: spec.runner,
+                    params: profile.model.measurement ? measurementParams(profile.model.measurement) : {}, replace: false }, abort);
                 const end = Date.now() + run.deadlines.modelLoadMs;
                 for (;;) {
                     check(!signal?.aborted && !abort?.aborted, 'Model load cancelled');
@@ -397,14 +423,69 @@ export function createModelCases(ctx) {
     }
     async function beforeCleanup() {
         if (!launched) return;
+        if (profile.model.measurement) {
+            const began = performance.now(); const abort = AbortSignal.timeout(60000);
+            const budget = () => { const left = Math.floor(60000 - (performance.now() - began)); check(left > 0, 'Cleanup Stop deadline expired'); return left; };
+            const observed = checkedJson(await engine('measurement-cleanup-processes', [...nested, 'container', 'exec', toolAgent.id, 'node', '-e', MODEL_PROCESS_FACTS, profile.model.executable.path], { abort, cleanup: true, deadlineMs: budget() }));
+            const groups = [];
+            for (const process of observed.processes) {
+                check(process.sha256 === profile.model.executable.sha256, 'Cleanup runner executable differs');
+                const group = checkedJson(await engine('measurement-cleanup-group', [...nested, 'container', 'exec', toolAgent.id, 'node', '-e', MEASUREMENT_RUNNER, String(process.pid)], { abort, cleanup: true, deadlineMs: budget() }));
+                check(group.start === process.start, 'Cleanup runner identity changed'); groups.push(group);
+            }
+            await tool('local_llm_stop', {}, abort, true, { label: 'measurement-cleanup-stop', deadlineMs: budget() });
+            for (;;) {
+                const state = await tool('local_llm_status', {}, abort, true, { label: 'measurement-cleanup-status', deadlineMs: budget() });
+                const absent = [];
+                for (const group of groups) absent.push(checkedJson(await engine('measurement-cleanup-absence', [...nested, 'container', 'exec', toolAgent.id, 'node', '-e', MEASUREMENT_GROUP, JSON.stringify(group)], { abort, cleanup: true, deadlineMs: budget() })).groupAbsent === true);
+                if (state.phase === 'idle' && absent.every(Boolean)) {
+                    write('model-stop-proof', { runId: run.runId, phase: state.phase, groupAbsent: true, elapsedMs: performance.now() - began }); return;
+                }
+                await delay(Math.min(1000, budget()), undefined, { signal: abort });
+            }
+        }
         await tool('local_llm_stop', {}, null, true);
         const status = await tool('local_llm_status', {}, null, true);
         check(!['ready', 'starting', 'loading', 'downloading', 'stopping'].includes(status.phase), 'Model stop did not settle');
         write('model-stop-proof', { runId: run.runId, phase: status.phase });
     }
     async function afterCleanup() {
+        assertModelGrantInventory(run, profile);
+        if (profile.model.profile === 'apple-cpu') write('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.host.home) });
         if (profile.gpu) await gpuCleanupProof({ run, profile, processProvider, signal: ctx.cleanupSignal, hostProc: host, artifacts: write });
         llmCleanupProof({ workspace: profile.workspace.path, runId: run.runId, action: 'live', write });
     }
-    return { liveModel, beforeCleanup, afterCleanup };
+    const liveMeasurement = profile.model.measurement ? createMeasurementExecutor({ run, profile, spec, tool, prepare, write, signal,
+        monitor: work => apple.monitor(work),
+        observe: async (kind, program, args, abort, deadlineMs) => {
+            await observeAppleMachine({ profile, engine: (id, argv, opts) => engine(id, argv, { ...opts, abort, deadlineMs }) });
+            return checkedJson(await engine(`measurement-${kind}`, [...nested, 'container', 'exec', toolAgent.id, 'node', '-e', program, ...args], { abort, deadlineMs, maxBytes: 65536, journal: false }));
+        },
+        processes: async (abort, deadlineMs) => checkedJson(await engine('measurement-processes', [...nested, 'container', 'exec', toolAgent.id, 'node', '-e', MODEL_PROCESS_FACTS, profile.model.executable.path], { abort, deadlineMs, maxBytes: 16384, journal: false })).processes,
+        sourceProof: async abort => {
+            const source = assertModelSource(profile);
+            const box = checkedJson(await engine('measurement-box', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, profile.box.id], { abort, journal: false }));
+            const agent = checkedJson(await engine('measurement-agent', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, toolAgent.id], { abort, journal: false }));
+            if (profile.model.profile === 'apple') await appleDevices(box, agent, 'measurement', abort);
+            assertModelContainer(box, { profile, role: 'box' }); assertModelContainer(agent, { profile, role: 'agent' });
+            return { ...source, binding: await sourceBinding(agent, box, source.stagedTreeDigest, 'measurement', abort) };
+        },
+        hostProof: async (abort, deadlineMs) => {
+            const end = performance.now() + deadlineMs;
+            abort = AbortSignal.any([abort, AbortSignal.timeout(deadlineMs)]);
+            const budget = () => { const left = Math.floor(end - performance.now()); check(left > 0, 'Host identity deadline expired'); return left; };
+            await apple.check();
+            const machine = await observeAppleMachine({ profile, engine: (id, argv, opts) => engine(id, argv, { ...opts, abort, deadlineMs: budget() }) });
+            const read = async (binary, argv) => (await command('measurement-host-identity', binary, argv, { abort, deadlineMs: budget(), maxBytes: 16384, journal: false })).stdout.trim();
+            const chip = await read('/usr/sbin/sysctl', ['-n', 'machdep.cpu.brand_string']);
+            const ramBytes = Number(await read('/usr/sbin/sysctl', ['-n', 'hw.memsize']));
+            const osVersion = await read('/usr/bin/sw_vers', ['-productVersion']);
+            const inspect = checkedJson(await engine('measurement-vm', ['machine', 'inspect', profile.model.apple.machine], { abort, deadlineMs: budget(), journal: false }));
+            const resources = inspect[0]?.Resources;
+            check(chip && Number.isSafeInteger(ramBytes) && ramBytes > 0 && resources?.CPUs > 0 && resources?.Memory > 0, 'Host/VM identity unavailable');
+            return { host: { chip, ramBytes, osVersion }, vm: { ...machine, cpus: resources.CPUs, ramBytes: resources.Memory * 1048576 }, guard: apple.snapshot() };
+        },
+        assertBackend: (status, answer, processes, pins) => assertModelObservation({ spec, model: profile.model, pins, status, answer, processes, imageId: toolAgent.image }),
+    }) : null;
+    return { liveModel, liveMeasurement, beforeCleanup, afterCleanup };
 }

@@ -1536,5 +1536,12 @@ test('OWNER.selection-is-after-authorization-and-rejects-default-cpu-and-injecte
         await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live' }), /Invalid private ownership path/);
         await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', processProvider: f.provider }), /exclusive provider/);
         await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', remoteLocal: f.run.runId }), /local Apple action/);
+        f.run.block = 'mac-model-cpu'; f.profile.model = { profile: 'apple-cpu' };
+        const cpuBytes = Buffer.from(JSON.stringify(f.run)); fs.writeFileSync(runPath, cpuBytes);
+        fs.writeFileSync(authorizationPath, JSON.stringify({ ...authorization, manifestDigest: hash(cpuBytes), targetDigest: jsonDigest(f.run.target) }));
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live' }), /Invalid private ownership path/);
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', processProvider: f.provider }), /exclusive provider/);
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', remoteLocal: f.run.runId }), /local Apple action/);
+        assert.equal(f.calls.length, 0);
     } finally { if (previous === undefined) delete process.env[PROCESS_OWNER_ENV]; else process.env[PROCESS_OWNER_ENV] = previous; }
 });
