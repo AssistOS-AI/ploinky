@@ -186,7 +186,7 @@ export function validateMeasurementReceipt(receipt, { run, runId, caseId, profil
         && sourceBefore.binding?.treeDigest === sourceBefore.stagedTreeDigest && sourceBefore.binding?.dependency?.generationId
         && sourceBefore.binding?.provider?.sourceIdHash, 'Changed or incomplete source binding');
     const sourceBinding = sourceBefore.binding;
-    keys(sourceBinding, ['stage', 'dependency', 'provider', 'treeDigest', 'files'], 'measurement source binding');
+    keys(sourceBinding, ['code', 'dependency', 'provider', 'treeDigest', 'files'], 'measurement source binding');
     keys(sourceBinding.dependency, ['objectId', 'generationId', 'inputKey', 'nodeModulesPath', 'treeDigest', 'packageSha256'], 'measurement dependency identity');
     keys(sourceBinding.provider, ['mode', 'path', 'sourceIdHash', 'supplyingImageId', 'boxId'], 'measurement provider identity');
     const supplier = `sha256:${execution.box.image.replace(/^sha256:/, '')}`;
@@ -198,7 +198,7 @@ export function validateMeasurementReceipt(receipt, { run, runId, caseId, profil
         && /^[a-f0-9-]{36}$/.test(dep.objectId) && Number.isSafeInteger(sourceBinding.files) && sourceBinding.files > 0
         && dep.nodeModulesPath === `${execution.workspace.path}/.ploinky/deps/store/objects/${dep.objectId}/payload/node_modules`
         && sourceBefore.path === `${execution.workspace.path}/local-llms/local-llm`
-        && sourceBinding.stage.startsWith(`${execution.workspace.path}/.ploinky/container-runtime/`), 'Source dependency escaped frozen workspace');
+        && sourceBinding.code === sourceBefore.path, 'Source dependency escaped frozen workspace');
     for (const phase of ['host', 'host-after']) {
         const host = required('cohort', phase);
         check(equal(host.host, receipt.identity.host) && equal(host.vm, receipt.identity.vm)

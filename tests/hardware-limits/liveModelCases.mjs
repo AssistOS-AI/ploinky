@@ -13,7 +13,7 @@ import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs'
 import { requireTransport } from './liveProcess.mjs';
 import { cgroupWithin, createHostProc, processesWithin } from './liveGpuHost.mjs';
 import { createModelHostGuard, observeAppleMachine, parseModelHostSample, assertModelGrantInventory, modelGrantInventory } from './liveModelHostGuard.mjs';
-import { MODEL_SOURCE_VIEW, modelMountFacts, modelSourceLayout, observeModelStage } from './liveModelSource.mjs';
+import { MODEL_CODE_MOUNT_POINT, MODEL_SOURCE_VIEW, assertModelMountPoint, modelMountFacts, modelSourceLayout, observeModelStage } from './liveModelSource.mjs';
 import { APPLE_DEVICE_INSPECT, assertAppleDeviceArguments, observeAppleDevices, AMD_DEVICE_INSPECT, assertAmdDeviceArguments, observeAmdDevices } from './liveModelDevices.mjs';
 import { normalizeMeasurement, measurementCases, measurementParams, MEASUREMENT_DEADLINES } from './liveModelMeasurements.mjs';
 import { createMeasurementExecutor, MEASUREMENT_RUNNER, MEASUREMENT_GROUP } from './liveModelMeasurementCommands.mjs';
@@ -97,7 +97,7 @@ export function modelPlan(run) {
         command('model-box-contract', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<BOX_ID>']),
         command('model-agent-source', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<AGENT_ID>']),
         command('model-source-view', [...nested, 'container', 'exec', '<AGENT_ID>', 'node', '-e', '<MODEL_SOURCE_VIEW>', '<PINNED_SOURCE_AND_DEPENDENCY_PATHS>']),
-        { id: 'model-source', action: `Rehash ${profile.provision.workspace.path}/local-llms/local-llm against ${profile.provision.llm.treeDigest}, allowing only the recorded manifest.container rewrite` },
+        { id: 'model-source', action: `Rehash ${profile.provision.workspace.path}/local-llms/local-llm against ${profile.provision.llm.treeDigest}, allowing only the recorded manifest.container rewrite and Ploinky's empty node_modules mount point; /code must be the read-only bind of that exact source with the admitted dependency generation read-only at /code/node_modules` },
         ...(profile.model.profile === 'apple' ? [
             command('model-apple-box-devices', ['container', 'inspect', '--format', APPLE_DEVICE_INSPECT, '<BOX_ID>']),
             command('model-apple-agent-devices', [...nested, 'container', 'inspect', '--format', APPLE_DEVICE_INSPECT, '<AGENT_ID>']),
@@ -227,9 +227,13 @@ export function assertModelContainer(value, { profile, role }) {
 
 // Verify staged bytes without reading the managed-repository fallback. The
 // manifest is the sole deliberate change; compare every other source byte.
+// The only extra entry is Ploinky's /code/node_modules mount point at the top
+// level, which must be an empty directory: it adds no digest row and can hide
+// nothing behind the dependency mount.
 export function assertModelSource(profile) {
     const original = profile.provision.llm;
     check(liveSourceDigest(original.sourcePath) === original.treeDigest, 'Frozen model source changed');
+    check(!fs.readdirSync(original.sourcePath).includes(MODEL_CODE_MOUNT_POINT), 'Frozen model source contains an unreviewed code substitution');
     if (isApuModel(profile.model)) {
         const expected = prepareApuModel(profile.model, JSON.parse(fs.readFileSync(path.join(original.sourcePath, 'catalog', 'models.json'))));
         check(JSON.stringify(expected) === JSON.stringify(profile.model), 'APU derivation differs from frozen catalog');
@@ -238,7 +242,8 @@ export function assertModelSource(profile) {
     const visit = (from, to) => {
         check(fs.lstatSync(to).isDirectory() && !fs.lstatSync(to).isSymbolicLink(), 'Model source directory changed');
         const names = fs.readdirSync(from).sort();
-        check(JSON.stringify(names) === JSON.stringify(fs.readdirSync(to).sort()), 'Model source entries changed');
+        const expected = to === target ? [...names, MODEL_CODE_MOUNT_POINT].sort() : names;
+        check(JSON.stringify(expected) === JSON.stringify(fs.readdirSync(to).sort()), 'Model source entries changed');
         for (const name of names) {
             const a = path.join(from, name); const b = path.join(to, name); const stat = fs.lstatSync(a);
             if (stat.isDirectory()) visit(a, b);
@@ -249,6 +254,8 @@ export function assertModelSource(profile) {
             }
         }
     };
+    check(fs.realpathSync(target) === target, 'Model source directory changed');
+    assertModelMountPoint(target);
     visit(original.sourcePath, target);
     return { path: target, originalTreeDigest: original.treeDigest, stagedTreeDigest: liveSourceDigest(target), manifest: original.manifest };
 }
@@ -433,7 +440,8 @@ export function createModelCases(ctx) {
         const view = checkedJson(await engine('model-source-view', [...nested, 'container', 'exec', agent.id, 'node', '-e', MODEL_SOURCE_VIEW, JSON.stringify(stage.view)], { abort, maxBytes: 1048576 }));
         write(name, { runId: run.runId, ...stage, namespace: view });
         check(view.complete === true && view.treeDigest === expectedTreeDigest, 'Model namespace code does not resolve to the pinned source bytes');
-        return { stage: stage.layout.stage, dependency: stage.dependency, provider: stage.provider, treeDigest: view.treeDigest, files: view.files.length };
+        check(stage.layout.code === path.join(profile.provision.workspace.path, 'local-llms', 'local-llm') && stage.layout.code === stage.view.source, 'Model /code differs from the provisioned source');
+        return { code: stage.layout.code, dependency: stage.dependency, provider: stage.provider, treeDigest: view.treeDigest, files: view.files.length };
     }
     async function liveModel() {
         const evidence = { schema: 1, runId: run.runId, case: spec.case, profile: profile.model.profile, status: 'running' };
@@ -476,7 +484,7 @@ export function createModelCases(ctx) {
                 assertModelContainer(after, { profile, role: 'agent' });
                 assertModelContainer(boxAfter, { profile, role: 'box' });
                 const afterBinding = await sourceBinding(after, boxAfter, evidence.source.stagedTreeDigest, 'after', abort);
-                check(afterBinding.stage === evidence.source.binding.stage && afterBinding.dependency.generationId === evidence.source.binding.dependency.generationId, 'Model source stage or dependency changed during inference');
+                check(afterBinding.code === evidence.source.binding.code && afterBinding.dependency.generationId === evidence.source.binding.dependency.generationId, 'Model source binding or dependency changed during inference');
             });
             evidence.status = 'pass';
             return evidence;

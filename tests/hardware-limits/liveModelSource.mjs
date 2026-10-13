@@ -1,5 +1,7 @@
-// Read-only proof of Podman's linked /code stage. Source bytes and the
-// dependency substitution remain bound to the exact owned runtime.
+// Read-only proof of the model agent's /code view. Ploinky binds the owned
+// agent source directly at /code and the admitted dependency generation over
+// the empty mount point it creates at <source>/node_modules (ensureCodeMountPoint).
+// Source bytes and the dependency substitution stay bound to the exact owned runtime.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -8,7 +10,6 @@ import { canonicalDigest } from '../../cli/utils/dependencies/store/canonical.mj
 import { hashInstalledTree } from '../../cli/utils/dependencies/store/treeHash.mjs';
 import { buildResolutionManifest, readHiddenLock } from '../../cli/utils/dependencies/store/resolution.mjs';
 import { boxMcpSdkCacheProblem } from '../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
-import { runtimeSegment } from '../../cli/utils/runtime/runtimeStaging.js';
 import { agentLibContractFromContainer } from '../../ploinky-box/contract/agentlib.mjs';
 
 const check = (ok, reason) => { if (!ok) throw new Error(reason); };
@@ -17,6 +18,11 @@ const under = (value, root) => value === root || value.startsWith(`${root}/`);
 const managed = value => /(?:^|\/)\.ploinky\/repos(?:\/|$)/.test(String(value));
 const sameImage = (left, right) => String(left).replace(/^sha256:/, '') === String(right).replace(/^sha256:/, '');
 const providerPath = '/opt/ploinky-agentlib';
+// The only /code descendant mount of the pinned model agent: its admitted
+// dependency generation, over a mount point that must stay an empty directory
+// in the source so it can hide nothing and adds no row to the source digest.
+export const MODEL_CODE_MOUNT_POINT = 'node_modules';
+const dependencyTarget = `/code/${MODEL_CODE_MOUNT_POINT}`;
 
 function validateMounts(mounts) {
     check(Array.isArray(mounts) && mounts.length <= 128 && mounts.every(mount => mount && ['Source', 'Destination'].every(key =>
@@ -29,18 +35,30 @@ export function modelSourceLayout(profile, agent) {
     const workspace = profile.workspace.path;
     const source = path.join(workspace, 'local-llms', 'local-llm');
     const name = fixtureContainerName(workspace, 'local-llm', 'local-llms');
-    const root = path.join(workspace, '.ploinky', 'container-runtime', runtimeSegment(name));
     const code = agent.mounts.filter(mount => mount.Destination === '/code');
-    check(code.length === 1 && code[0].Type === 'bind' && code[0].RW === false
-        && path.dirname(code[0].Source || '') === root && /^code-[1-9][0-9]*-[1-9][0-9]*$/.test(path.basename(code[0].Source)), 'Model /code is not the exact owned read-only staging bind');
+    check(code.length === 1 && code[0].Type === 'bind' && code[0].RW === false && code[0].Source === source, 'Model /code is not the exact owned read-only source bind');
     const self = agent.mounts.filter(mount => mount.Destination === source);
     check(self.length === 1 && self[0].Type === 'bind' && self[0].Source === source && self[0].RW === false, 'Model ordinary source lacks its exact read-only self-bind');
-    check(!agent.mounts.some(mount => mount.Destination.startsWith('/code/') || mount.Destination.startsWith(`${source}/`)
-        || under(mount.Destination, code[0].Source)), 'Model source has an unexpected descendant mount');
+    const objects = path.join(workspace, '.ploinky', 'deps', 'store', 'objects');
+    const modules = agent.mounts.filter(mount => mount.Destination === dependencyTarget);
+    check(modules.length === 1 && modules[0].Type === 'bind' && modules[0].RW === false && modules[0].Source.startsWith(`${objects}/`),
+        'Model /code/node_modules is not one read-only owned dependency bind');
+    check(!agent.mounts.some(mount => mount.Destination !== dependencyTarget && mount.Destination.startsWith('/code/')
+        || mount.Destination.startsWith(`${source}/`)), 'Model source has an unexpected descendant mount');
     const provider = agent.mounts.filter(mount => mount.Destination === providerPath);
     check(provider.length === 1 && provider[0].Type === 'bind' && provider[0].Source === providerPath && provider[0].RW === false
         && !agent.mounts.some(mount => mount.Destination.startsWith(`${providerPath}/`)), 'Model provider lacks its exact read-only self-bind or has a descendant overlay');
-    return { workspace, source, name, root, stage: code[0].Source };
+    return { workspace, source, name, code: code[0].Source, dependencyMount: modules[0].Source };
+}
+
+// The ploinky-created mount point: a real, canonical, empty directory. Any
+// content in it would be hidden in the agent by the dependency mount.
+export function assertModelMountPoint(source, io = fs) {
+    const point = path.join(source, MODEL_CODE_MOUNT_POINT);
+    const stat = io.lstatSync(point);
+    check(stat.isDirectory() && !stat.isSymbolicLink() && io.realpathSync(point) === point && io.readdirSync(point).length === 0,
+        'Model /code/node_modules mount point is not an empty directory');
+    return point;
 }
 
 export const modelMountFacts = value => ({ id: value.id, image: value.image, created: value.created, mountCount: value.mounts?.length ?? null,
@@ -136,7 +154,7 @@ function readDependencyObject(dep, layout, profile, agent, io) {
 }
 
 export function observeModelStage(profile, agent, { box, write = () => {} } = {}) {
-    const facts = { schema: 1, agent: modelMountFacts(agent), box: box ? modelMountFacts(box) : null, links: [] };
+    const facts = { schema: 1, agent: modelMountFacts(agent), box: box ? modelMountFacts(box) : null };
     const save = () => write(structuredClone(facts));
     save();
     try {
@@ -144,28 +162,31 @@ export function observeModelStage(profile, agent, { box, write = () => {} } = {}
         facts.provider = modelProvider(profile, box); save();
         const io = boundedFs();
         facts.layout = layout; save();
-        canonicalDirectory(layout.stage, layout.workspace, io);
         canonicalDirectory(layout.source, layout.workspace, io);
-        const stageNames = io.readdirSync(layout.stage).sort();
-        facts.stageEntryCount = stageNames.length;
-        facts.stageEntries = stageNames.slice(0, 256).map(name => {
-            const file = path.join(layout.stage, name); const stat = io.lstatSync(file);
-            return { name, symbolic: stat.isSymbolicLink(), targetDigest: stat.isSymbolicLink() ? sha(io.readlinkSync(file)) : null };
-        });
+        const names = io.readdirSync(layout.source).sort();
+        facts.codeEntryCount = names.length; facts.codeEntries = names.slice(0, 256);
+        const point = path.join(layout.source, MODEL_CODE_MOUNT_POINT);
+        let pointStat = null;
+        try { pointStat = io.lstatSync(point); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        facts.mountPoint = { name: MODEL_CODE_MOUNT_POINT, present: Boolean(pointStat), directory: Boolean(pointStat?.isDirectory()),
+            symbolic: Boolean(pointStat?.isSymbolicLink()), entryCount: pointStat?.isDirectory() && !pointStat.isSymbolicLink() ? io.readdirSync(point).length : null };
         save();
-        check(stageNames.length <= 256, 'Model staging observation exceeds its entry bound');
+        check(names.length <= 256 && names.includes(MODEL_CODE_MOUNT_POINT) && !names.includes('.git'), 'Model source entry bound or code substitution changed');
+        assertModelMountPoint(layout.source, io);
         const recordFile = path.join(layout.workspace, '.ploinky', 'agents.json');
         check(io.lstatSync(recordFile).size <= 4 * 1024 * 1024, 'Owned runtime record exceeds its bound');
         let record;
         try { record = JSON.parse(io.readFileSync(recordFile, 'utf8'))[layout.name]; }
         catch { throw new Error('Owned runtime record is unreadable'); }
-        check(record?.containerId === agent.id && record.runtime === 'podman' && record.profile === 'default', 'Staged source runtime record names another container or profile');
+        check(record?.containerId === agent.id && record.runtime === 'podman' && record.profile === 'default', 'Model source runtime record names another container or profile');
         const binds = record.config?.binds;
         const recorded = target => Array.isArray(binds) ? binds.filter(bind => bind.target === target) : [];
-        for (const [target, source] of [['/code', layout.stage], [layout.source, layout.source]]) {
+        for (const [target, source] of [['/code', layout.source], [layout.source, layout.source]]) {
             const matches = recorded(target);
             check(matches.length === 1 && matches[0].source === source && matches[0].ro === true, 'Recorded source binding differs from the runtime mount');
         }
+        check(!binds.some(bind => typeof bind.target === 'string' && bind.target !== dependencyTarget
+            && (bind.target.startsWith('/code/') || bind.target.startsWith(`${layout.source}/`))), 'Recorded source has an unexpected descendant binding');
         const providerBinds = recorded(providerPath);
         check(providerBinds.length === 1 && providerBinds[0].source === providerPath && providerBinds[0].ro === true
             && !binds.some(bind => typeof bind.target === 'string' && bind.target.startsWith(`${providerPath}/`)), 'Recorded model provider differs from the runtime mount');
@@ -177,6 +198,9 @@ export function observeModelStage(profile, agent, { box, write = () => {} } = {}
         const dependency = path.join(payload, 'node_modules');
         check(dep.payloadPath === payload && dep.nodeModulesPath === dependency, 'Model dependency payload path differs from its owned object');
         canonicalDirectory(dependency, layout.workspace, io);
+        check(layout.dependencyMount === dependency, 'Model /code/node_modules is not the admitted dependency generation');
+        const modules = recorded(dependencyTarget);
+        check(modules.length === 1 && modules[0].source === dependency && modules[0].ro === true, 'Recorded /code/node_modules differs from the admitted dependency');
         const mounted = agent.mounts.filter(mount => mount.Destination === dependency);
         check(mounted.length === 1 && mounted[0].Type === 'bind' && mounted[0].Source === dependency && mounted[0].RW === false
             && !agent.mounts.some(mount => mount.Destination.startsWith(`${dependency}/`)), 'Model dependencies lack their exact read-only self-bind');
@@ -200,19 +224,6 @@ export function observeModelStage(profile, agent, { box, write = () => {} } = {}
             check(mounts.length === 1 && mounts[0].Type === 'bind' && mounts[0].Source === source && mounts[0].RW === !readOnly, 'Declared model volume differs from its runtime bind');
             facts.volumes.push({ source, target, readOnly });
         }
-        const names = io.readdirSync(layout.source).sort();
-        check(!names.includes('node_modules') && !names.includes('.git'), 'Pinned model source contains an unreviewed code substitution');
-        check(JSON.stringify(io.readdirSync(layout.stage).sort()) === JSON.stringify([...names, 'node_modules'].sort()), 'Model staging entries differ from the pinned source and admitted dependency');
-        for (const name of [...names, 'node_modules']) {
-            const file = path.join(layout.stage, name);
-            const expected = name === 'node_modules' ? dependency : path.join(layout.source, name);
-            const stat = io.lstatSync(file);
-            const target = stat.isSymbolicLink() ? io.readlinkSync(file) : null;
-            facts.links.push({ name, symbolic: stat.isSymbolicLink(), targetMatches: target === expected, targetDigest: target === null ? null : sha(target) }); save();
-            check(stat.isSymbolicLink() && target === expected, 'Model stage entry does not point to its pinned origin');
-            // Only resolve after the literal link has matched an allowed origin.
-            check(io.realpathSync(file) === expected, 'Model stage entry resolves away from its pinned origin');
-        }
         facts.complete = true; save();
         return { ...facts, view: { source: layout.source, dependency } };
     } catch (error) {
@@ -222,31 +233,40 @@ export function observeModelStage(profile, agent, { box, write = () => {} } = {}
 }
 
 // Also run inside the actual agent namespace. No environment, record contents
-// or source bodies leave the process: only selected link facts and hashes.
+// or source bodies leave the process: only selected entry facts and hashes.
+// /code is a bind of the source, so its identity is proved by the engine's
+// mount table and here by the same device and inode as the source self-bind;
+// the bytes read through /code must hash to the provisioned tree.
 export function observeModelCodeView({ source, dependency, codeRoot = '/code' }, io = fs) {
-    const facts = { schema: 1, links: [], files: [], complete: false };
+    const facts = { schema: 1, files: [], complete: false };
     const hash = value => crypto.createHash('sha256').update(value).digest('hex');
     const assert = (ok, reason) => { if (!ok) throw new Error(reason); };
     const allowed = value => typeof value === 'string' && path.isAbsolute(value) && path.normalize(value) === value && !/(?:^|\/)\.ploinky\/repos(?:\/|$)/.test(value);
+    const sameNode = (left, right) => { const a = io.statSync(left); const b = io.statSync(right); return a.dev === b.dev && a.ino === b.ino; };
+    const plainDirectory = value => { const stat = io.lstatSync(value); return stat.isDirectory() && !stat.isSymbolicLink() && io.realpathSync(value) === value; };
+    const mountPoint = 'node_modules';
     let count = 0; let bytes = 0;
     try {
         assert(allowed(source) && allowed(dependency) && allowed(codeRoot), 'Invalid model namespace source paths');
-        assert(io.realpathSync(source) === source && io.lstatSync(codeRoot).isDirectory() && !io.lstatSync(codeRoot).isSymbolicLink(), 'Model namespace roots changed');
+        assert(io.realpathSync(source) === source && io.realpathSync(dependency) === dependency && plainDirectory(codeRoot), 'Model namespace roots changed');
         const names = io.readdirSync(source).sort();
-        assert(!names.includes('node_modules') && !names.includes('.git') && names.length <= 256, 'Model namespace source entry bound or substitution changed');
+        assert(names.includes(mountPoint) && !names.includes('.git') && names.length <= 256, 'Model namespace source entry bound or substitution changed');
         const codeNames = io.readdirSync(codeRoot).sort();
         facts.entryCount = codeNames.length; facts.entryNames = codeNames.slice(0, 256);
-        assert(JSON.stringify(codeNames) === JSON.stringify([...names, 'node_modules'].sort()), 'Model namespace staging entries changed');
-        for (const name of [...names, 'node_modules']) {
-            const file = path.join(codeRoot, name);
-            const expected = name === 'node_modules' ? dependency : path.join(source, name);
-            const stat = io.lstatSync(file); const target = stat.isSymbolicLink() ? io.readlinkSync(file) : null;
-            facts.links.push({ name, symbolic: stat.isSymbolicLink(), targetMatches: target === expected, targetDigest: target === null ? null : hash(target) });
-            assert(stat.isSymbolicLink() && target === expected, 'Model namespace link has an unpinned origin');
-            assert(io.realpathSync(file) === expected, 'Model namespace link resolves to another origin');
-        }
+        assert(JSON.stringify(codeNames) === JSON.stringify(names), 'Model namespace /code entries differ from the pinned source');
+        const point = path.join(source, mountPoint);
+        const pointStat = io.lstatSync(point);
+        facts.mountPoint = { name: mountPoint, directory: pointStat.isDirectory(), symbolic: pointStat.isSymbolicLink(),
+            entryCount: pointStat.isDirectory() && !pointStat.isSymbolicLink() ? io.readdirSync(point).length : null };
+        assert(facts.mountPoint.entryCount === 0 && io.realpathSync(point) === point, 'Model namespace mount point is not an empty directory');
+        const modules = path.join(codeRoot, mountPoint);
+        assert(plainDirectory(modules), 'Model namespace dependency mount is not a directory');
+        const dependencyNames = io.readdirSync(dependency).sort();
+        assert(dependencyNames.length <= 4096 && JSON.stringify(io.readdirSync(modules).sort()) === JSON.stringify(dependencyNames), 'Model namespace dependency mount differs from the admitted generation');
+        facts.identity = { code: sameNode(codeRoot, source), dependency: sameNode(modules, dependency) };
+        assert(facts.identity.code && facts.identity.dependency, 'Model namespace /code or dependency mount is another directory');
         const provider = '/opt/ploinky-agentlib';
-        const providerLink = path.join(codeRoot, 'node_modules', 'achillesAgentLib');
+        const providerLink = path.join(modules, 'achillesAgentLib');
         const linkStat = io.lstatSync(providerLink);
         const target = linkStat.isSymbolicLink() ? io.readlinkSync(providerLink) : null;
         facts.provider = { path: provider, symbolic: linkStat.isSymbolicLink(), targetMatches: target === provider };
@@ -258,12 +278,14 @@ export function observeModelCodeView({ source, dependency, codeRoot = '/code' },
         const rows = [];
         const walk = (directory, relative = '') => {
             for (const name of io.readdirSync(directory).sort()) {
+                // The dependency mount is proved above; its mount point is empty.
+                if (!relative && name === mountPoint) continue;
                 assert(++count <= 4096, 'Model namespace source entry bound exceeded');
                 const rel = relative ? `${relative}/${name}` : name;
-                const original = path.join(source, rel); const file = path.join(codeRoot, rel);
-                const stat = io.lstatSync(original);
-                assert(!stat.isSymbolicLink() && io.realpathSync(file) === original, 'Model namespace source resolution changed');
-                if (stat.isDirectory()) walk(original, rel);
+                const file = path.join(codeRoot, rel);
+                const stat = io.lstatSync(file);
+                assert(!stat.isSymbolicLink(), 'Model namespace source has a symbolic link');
+                if (stat.isDirectory()) walk(file, rel);
                 else {
                     assert(stat.isFile(), 'Model namespace source entry has an invalid type');
                     bytes += stat.size; assert(bytes <= 64 * 1024 * 1024, 'Model namespace source byte bound exceeded');
@@ -273,7 +295,7 @@ export function observeModelCodeView({ source, dependency, codeRoot = '/code' },
                 }
             }
         };
-        walk(source);
+        walk(codeRoot);
         facts.treeDigest = `sha256:${hash(rows.join('\n'))}`; facts.bytes = bytes; facts.complete = true;
     } catch (error) { facts.problem = String(error?.message || error).slice(0, 300); }
     return facts;

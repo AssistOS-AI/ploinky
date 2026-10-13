@@ -238,14 +238,15 @@ export function modelProvisionOnlyCleanupProven({ fetched, dispatchHistory }) {
     return true;
 }
 
-export function modelInferenceProofProblem(bytes, { runId, caseId, requirePass = false }) {
+export function modelInferenceProofProblem(bytes, { runId, caseId, workspace, requirePass = false }) {
     let proof;
     try { proof = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch { return 'model inference proof is not JSON'; }
     if (proof?.schema !== 1 || proof.runId !== runId || proof.case !== caseId) return 'model inference proof identity mismatch';
     if (!['pass', 'fail'].includes(proof.status) || requirePass && proof.status !== 'pass') return 'model inference proof is not a terminal result';
     if (proof.status === 'pass' && (typeof proof.answer?.text !== 'string' || !proof.answer.text.trim() || !Number.isFinite(proof.answer.generationTokensPerSecond) || proof.answer.generationTokensPerSecond <= 0
         || !proof.agent?.id || !HASH.test(proof.source?.stagedTreeDigest || '') || !Array.isArray(proof.processes) || proof.processes.length !== 1
-        || typeof proof.source?.binding?.stage !== 'string' || !/^\/.*\/code-[1-9][0-9]*-[1-9][0-9]*$/.test(proof.source.binding.stage)
+        || typeof workspace !== 'string' || !workspace.startsWith('/') || proof.source?.path !== `${workspace}/local-llms/local-llm`
+        || proof.source.binding?.code !== proof.source.path
         || proof.source.binding.treeDigest !== proof.source.stagedTreeDigest || !/^[a-f0-9]{64}$/.test(proof.source.binding.dependency?.generationId || '')
         || proof.source.binding.provider?.mode !== 'image' || proof.source.binding.provider.path !== '/opt/ploinky-agentlib'
         || !/^[a-f0-9]{64}$/.test(proof.source.binding.provider.sourceIdHash || '')
@@ -438,7 +439,7 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
             const name = `model-${profile.cases[0].toLowerCase()}`;
             const entry = artifacts.fetched.find(item => item.name === name);
             if (entry) {
-                const problem = modelInferenceProofProblem(fs.readFileSync(path.join(runDirectory, entry.file)), { runId: run.runId, caseId: profile.cases[0], requirePass: action === 'live' && remoteReport.verdict === 'PASS' });
+                const problem = modelInferenceProofProblem(fs.readFileSync(path.join(runDirectory, entry.file)), { runId: run.runId, caseId: profile.cases[0], workspace: profile.provision.workspace.path, requirePass: action === 'live' && remoteReport.verdict === 'PASS' });
                 if (problem) { artifacts.failures.push({ name, reason: problem }); artifacts.complete = false; }
             }
             }
@@ -567,6 +568,26 @@ export function apuFetchedProofProblem({ run, fetched, remoteReport, action, rea
             if (idle.runId !== run.runId) throw new Error('AMD idle history belongs to another run');
             validateApuIdleProof(idle, { requireUntripped: action === 'cleanup' || remoteReport.verdict === 'PASS',
                 requireFinal: true, runId: run.runId, profile, allocationRecords });
+            // In the live action one cumulative gate wrote every case snapshot and
+            // the final history: each case receipt's history is an exact prefix of
+            // the final one. The cleanup action's final history comes from its own
+            // fresh gate, which never carries a case context.
+            if (action === 'cleanup' && idle.history.some(receipt => receipt.context !== null)) throw new Error('AMD cleanup idle history carries a case context');
+            let covered = 0;
+            for (const proof of action === 'live' ? receipts.values() : []) {
+                if (proof?.gpuGate === undefined) continue;
+                const history = proof.gpuGate?.history;
+                if (!Array.isArray(history) || history.length > idle.history.length || jsonDigest(proof.gpuGate.baseline) !== jsonDigest(idle.baseline)
+                    || history.some((receipt, index) => jsonDigest(receipt) !== jsonDigest(idle.history[index]))) throw new Error('AMD case idle history is not a prefix of the final idle history');
+                covered = Math.max(covered, history.length);
+            }
+            // A blocked check belongs to a nonpassing case, or (with no case
+            // context) to the final cleanup window after every case snapshot.
+            for (const [index, receipt] of idle.history.entries()) {
+                if (receipt.state === 'complete') continue;
+                const owner = receipt.context?.case;
+                if (owner ? !receipts.has(owner) || receipts.get(owner)?.status === 'pass' : index < covered) throw new Error('AMD blocked idle check belongs to a passing case');
+            }
         }
         const outcomes = action === 'live' ? remoteReport.cases : fetched.operations.filter(op => op.kind === 'apu-case-result')
             .map(op => ({ id: op.case, result: op.status }));

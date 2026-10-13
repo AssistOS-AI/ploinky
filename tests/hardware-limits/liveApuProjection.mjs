@@ -52,7 +52,7 @@ export function projectApuEvidence(input, sinceSeq = 0, projected = false) {
     });
     const d = input?.deployment;
     const report = input?.runnerReport;
-    const phase = value => ['idle', 'starting', 'ready', 'stopping', 'error', 'downloading', 'paused'].includes(value) ? value : null;
+    const phase = value => ['idle', 'starting', 'ready', 'stopping', 'error', 'downloading', 'copying', 'verifying', 'paused'].includes(value) ? value : null;
     return { phase: phase(input?.phase), profile: ['apu', 'cpu'].includes(input?.profile) ? input.profile : null,
         deployment: d ? { id: id(d.id), requestId: id(d.requestId), logSeqStart: int(d.logSeqStart), modelId: id(d.modelId), runnerId: id(d.runnerId),
             profile: ['apu', 'cpu'].includes(d.profile) ? d.profile : null, phase: phase(d.phase), params: params(d.params),

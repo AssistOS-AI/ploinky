@@ -33,7 +33,7 @@ function world(scenario = 'baseline-v1', modelProfile = 'apple', cohort = 1) {
         args: cpu ? { '--device': 'none', '--n-gpu-layers': '0', '--fit': 'off' } : { '--device': 'Vulkan0' },
         icd: cpu ? null : '/opt/local-llm/vulkan/icd.d/virtio_icd.json', layers: cpu ? null : '~all~', cudaVisible: cpu ? '' : null, gpuNodes: [], mps: false, nvidiaLibrary: false });
     const source = { path: '/offline/workspace/local-llms/local-llm', originalTreeDigest: 'sha256:' + 'a'.repeat(64), manifest: { originalDigest: 'sha256:' + 'b'.repeat(64), rewrittenDigest: 'sha256:' + 'c'.repeat(64) },
-        stagedTreeDigest: 'sha256:' + 'e'.repeat(64), binding: { stage: '/offline/workspace/.ploinky/container-runtime/code', files: 1, treeDigest: 'sha256:' + 'e'.repeat(64),
+        stagedTreeDigest: 'sha256:' + 'e'.repeat(64), binding: { code: '/offline/workspace/local-llms/local-llm', files: 1, treeDigest: 'sha256:' + 'e'.repeat(64),
             dependency: { objectId: '11111111-2222-4333-8444-555555555555', generationId: 'f'.repeat(64), inputKey: 'a'.repeat(64), treeDigest: 'b'.repeat(64), packageSha256: 'c'.repeat(64),
                 nodeModulesPath: '/offline/workspace/.ploinky/deps/store/objects/11111111-2222-4333-8444-555555555555/payload/node_modules' },
             provider: { mode: 'image', path: '/opt/ploinky-agentlib', supplyingImageId: 'sha256:' + '4'.repeat(64), boxId: '3'.repeat(64),
@@ -155,6 +155,27 @@ test('MEASURE.source-receipt-must-match-complete-hashed-dependency-and-provider'
         const bytes = Buffer.from(JSON.stringify(doc)); w.artifacts.set(entry.name, bytes); entry.sha256 = hash(bytes);
     }
     assert.throws(() => w.validate(changed), /source|binding|identity/i);
+});
+
+test('MEASURE.source-binding-code-must-be-the-provisioned-source-bind', async () => {
+    const w = world(); const original = await w.executor('LIVE-M1');
+    assert.equal(w.validate(copy(original)).status, 'pass');
+    // Consistent edits of the receipt and every hashed source artifact: the old
+    // staged /code tree, another workspace and the old field name are refused.
+    for (const [label, mutate] of [
+        ['old staged tree', source => { source.binding.code = '/offline/workspace/.ploinky/container-runtime/local-llm/code-1-1'; }],
+        ['other workspace', source => { source.binding.code = '/offline/other/local-llms/local-llm'; }],
+        ['dependency as code', source => { source.binding.code = source.binding.dependency.nodeModulesPath; }],
+        ['old field name', source => { source.binding.stage = source.binding.code; delete source.binding.code; }],
+    ]) {
+        const saved = new Map(w.artifacts); const changed = copy(original); mutate(changed.identity.source);
+        for (const entry of changed.artifacts.filter(value => value.type === 'source')) {
+            const doc = JSON.parse(w.artifacts.get(entry.name)); mutate(doc.value);
+            const bytes = Buffer.from(JSON.stringify(doc)); w.artifacts.set(entry.name, bytes); entry.sha256 = hash(bytes);
+        }
+        assert.throws(() => w.validate(changed), /escaped frozen workspace|source binding/, label);
+        for (const [key, value] of saved) w.artifacts.set(key, value);
+    }
 });
 
 test('MEASURE.health-and-generation-cancellation-reject-unobserved-or-successful-races', async () => {

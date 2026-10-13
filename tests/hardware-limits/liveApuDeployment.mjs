@@ -5,21 +5,29 @@ const check = (value, message) => { if (!value) throw new Error(message); };
 const identity = ['controllerInstanceId', 'deploymentId', 'requestId', 'pid', 'command', 'launchSeq', 'logSeqStart', 'startedMonotonicMs'];
 const requestFor = (runId, caseId) => `apu-${runId}-${caseId.slice(5).toLowerCase()}`;
 
-// Admission/download/starting/error observations bind the requested deployment
+// The local-llm controller's weight-transfer phases (TRANSFER_PHASES in
+// src/controller/deployments.mjs). For controller-fetched GGUF weights they
+// all precede the runner launch: a Run clears the APU launch record, and
+// launchRunner sets it only after the transfer and the pre-load recheck.
+export const APU_TRANSFER_PHASES = Object.freeze(['downloading', 'copying', 'verifying']);
+const LAUNCH_PHASES = Object.freeze(['starting', 'ready', 'stopping', 'idle', 'paused', 'error']);
+
+// Admission/transfer/starting/error observations bind the requested deployment
 // without imposing the functional case's ready state or inference answer.
 export function validateApuDeployment(state, { profile, requestId, launch = null, requireLaunch = false }) {
     const deployment = state?.deployment; const pins = profile.llm.models.small;
     const backend = profile.model.profile === 'amd-apu-cpu' ? 'cpu' : 'apu';
     const runner = backend === 'cpu' ? 'llama.cpp' : 'llama.cpp-vulkan';
+    const observed = state?.apuObservation;
+    const launchObserved = Boolean(requireLaunch || observed || launch);
     check(state?.profile === backend && deployment?.profile === backend
         && /^[A-Za-z0-9_.-]{1,128}$/.test(deployment.id || '') && deployment.requestId === requestId
         && deployment.modelId === pins.id && deployment.runnerId === runner
-        && ['downloading', 'starting', 'ready', 'stopping', 'idle', 'paused', 'error'].includes(state.phase)
+        && (LAUNCH_PHASES.includes(state.phase) || APU_TRANSFER_PHASES.includes(state.phase) && !launchObserved)
         && deployment.phase === state.phase && jsonDigest(deployment.params) === jsonDigest(APU_PARAMS)
         && ['repo', 'file', 'commit', 'size', 'sha256'].every(key => deployment.artifact?.[key] === pins[key]),
     'APU launched deployment model, artifact or parameters differ');
-    const observed = state.apuObservation;
-    if (requireLaunch || observed || launch) {
+    if (launchObserved) {
         check(backend === 'apu' && observed && /^[A-Za-z0-9_.-]{1,128}$/.test(observed.controllerInstanceId || '')
             && observed.deploymentId === deployment.id && observed.requestId === requestId
             && observed.command === profile.model.executable.path && Number.isSafeInteger(observed.pid) && observed.pid > 0

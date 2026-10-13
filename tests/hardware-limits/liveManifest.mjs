@@ -30,6 +30,13 @@ import { MODEL_PROFILES, modelPlan, validateModelPins } from './liveModelCases.m
 import { normalizeMeasurement, measurementCases, MEASUREMENT_DEADLINES, MEASUREMENT_SCENARIOS, MEASUREMENT_MODEL } from './liveModelMeasurements.mjs';
 import { isApuModel, prepareApuModel } from './liveApuPins.mjs';
 
+// The deadlines recorded in a block's manifest. Only the two Linux ordinary-model blocks have the longer provision start.
+export function blockDeadlines(block, execution = {}) {
+    const spec = CONCRETE_BLOCKS[block];
+    if (!spec) throw new Error(`Unknown hardware-limits block ${block}`);
+    return { ...(execution.model?.measurement ? { ...DEADLINES, ...MEASUREMENT_DEADLINES } : LINUX_MODEL_START_BLOCKS.includes(block) ? LINUX_MODEL_DEADLINES
+        : spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : spec.store ? STORE_DEADLINES : spec.availability ? AVAILABILITY_DEADLINES : DEADLINES) };
+}
 export const CONCRETE_BLOCKS = Object.freeze({
     ...Object.fromEntries(Object.entries(MODEL_PROFILES).map(([model, spec]) => [spec.block, { platform: spec.platform, remote: spec.platform === 'linux', cases: spec.cases || [spec.case], llm: true, model, gpu: model === 'nvidia' }])),
     'mac-cpu': { platform: 'darwin', remote: false, cases: ['LIVE-C1', 'LIVE-C2'] },
@@ -116,6 +123,15 @@ export const GPU_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 24 * 60 * 10
 // for the block, cleanup and margin), and the install and the load are bounded inside them. An install or a load that does not fit
 // is BLOCKED with the progress it made, never an indefinite poll.
 export const LLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES });
+// The Linux ordinary-model blocks (LIVE-L4 NVIDIA, LIVE-L5 CPU) start a cold Box in a fresh workspace: the host Box image and the
+// nested local-llm image are pulled during the provision start. The local-llm image alone has a 2,453,102,477-byte layer, about
+// 23 minutes at the 1.76 MB/s single-connection Docker Hub rate measured on the apparatus, so the start has 60 minutes. The block,
+// which is also the remote action bound (min(18,000,000, block + cleanup + 30 s) = 4,830,000 ms), is 75 minutes: the 60-minute
+// start plus 15 minutes for the provision's other bounded steps (engine identity, inventories and inspects at 30 s each, the GPU
+// grant or withdrawal, the GPU query) and its failure-path owned cleanup (destroy 5 minutes). The block deadline is also the live
+// action's ceiling for these two blocks; every live, load, stop and cleanup bound inside it is unchanged.
+export const LINUX_MODEL_DEADLINES = Object.freeze({ ...LLM_DEADLINES, startMs: 60 * 60 * 1000, blockMs: 75 * 60 * 1000 });
+const LINUX_MODEL_START_BLOCKS = Object.freeze(['apparatus-model-nvidia', 'apparatus-model-cpu']);
 // The availability blocks restart the whole graph up to three times and poll for it to settle after each.
 export const AVAILABILITY_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 60 * 60 * 1000 });
 // The store block waits for the product's own 10 s lock wait several times, stops the Box once, restarts it with the gate on, runs the two actual
@@ -332,7 +348,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         schema: 1, runId, configDigest, casesDigest, block, target, state: 'proposed',
         workspace: { proposedParent: parent, proposedPath: workspacePath, instance: identity.instance, pathHash: identity.pathHash },
         ports: { tcp: ports.tcp, udp: ports.udp },
-        deadlines: { ...(execution.model?.measurement ? { ...DEADLINES, ...MEASUREMENT_DEADLINES } : spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : spec.store ? STORE_DEADLINES : spec.availability ? AVAILABILITY_DEADLINES : DEADLINES) },
+        deadlines: blockDeadlines(block, execution),
         images: [
             { role: 'fixture-agent', ref: image, source: spec.llm ? 'operator pins (local-llm image)' : 'AssistOSExplorer explorer/manifest.json line 2' },
             { role: 'box', ref: pins.boxImage, source: 'operator pins' },
@@ -742,7 +758,7 @@ export function renderSummary(run, manifestPath) {
         `| Fixture image | \`${plan.image}\` |`,
         ...plan.agents.map(agent => (agent.hardwareLimits ? `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | hardwareLimits memory ${agent.hardwareLimits.memory}, cpus ${agent.hardwareLimits.cpus}, pids ${agent.hardwareLimits.pidsLimit}, readiness none |` : agent.role === 'llm' ? `| Agent ${LLM_REF} | ${profile.model ? 'ordinary committed source, immutable image rewrite, budgets and MPS off' : "the local-llm candidate's own manifest, which declares no limits; the administrator's Apply sets them"} |`
             : `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | declares no hardware limits of its own (readiness none); the stored override the live case saves through the administrator route is its only request |`)),
-        `| Deadlines | core ${run.deadlines.coreMs} ms, start ${run.deadlines.startMs} ms, destroy ${run.deadlines.destroyMs} ms, cleanup ${run.deadlines.cleanupMs} ms${remote ? `, staging ${run.deadlines.stagingMs} ms` : ''} |`,
+        `| Deadlines | core ${run.deadlines.coreMs} ms, start ${run.deadlines.startMs} ms, destroy ${run.deadlines.destroyMs} ms, cleanup ${run.deadlines.cleanupMs} ms${remote ? `, staging ${run.deadlines.stagingMs} ms` : ''}${LINUX_MODEL_START_BLOCKS.includes(run.block) ? `; block ${run.deadlines.blockMs} ms (the remote action bound is ${Math.min(18_000_000, run.deadlines.blockMs + run.deadlines.cleanupMs + 30000)} ms): the cold provision start pulls the host Box image and the nested local-llm image (a 2,453,102,477-byte layer, about 23 minutes at the measured 1.76 MB/s)` : ''} |`,
         '',
         '## Commands',
         '',

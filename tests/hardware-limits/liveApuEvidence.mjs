@@ -188,7 +188,8 @@ export function validateApuReceipt(proof, { runId, block, profile, caseId, repor
         && `sha256:${String(proof.agent.image).replace(/^sha256:/, '')}` === model.imageConfigDigest
         && proof.box?.id === profile.box?.id && proof.box?.image === profile.box?.image
         && proof.source.originalTreeDigest === profile.provision.llm.treeDigest && HASH.test(proof.source.stagedTreeDigest || '')
-        && binding?.treeDigest === proof.source.stagedTreeDigest && /^\/.*\/code-[1-9][0-9]*-[1-9][0-9]*$/.test(binding?.stage || '')
+        && binding?.treeDigest === proof.source.stagedTreeDigest && proof.source.path === `${profile.provision.workspace.path}/local-llms/local-llm`
+        && binding.code === proof.source.path
         && /^[a-f0-9]{64}$/.test(binding?.dependency?.generationId || '') && binding.provider?.mode === 'image'
         && binding.provider.path === '/opt/ploinky-agentlib' && /^[a-f0-9]{64}$/.test(binding.provider.sourceIdHash || '')
         && binding.provider.boxId === profile.box.id && binding.provider.supplyingImageId === `sha256:${profile.box.image.replace(/^sha256:/, '')}`
