@@ -28,7 +28,7 @@ import { fakeEngineInfo, ok, worldState } from '../hardware-limits/fakeLiveEngin
 import { createGpuWorld } from '../hardware-limits/fakeLiveGpu.mjs';
 import { createGpuGate, gpuQueryArgv, isToleratedRecord } from '../hardware-limits/liveGpuGate.mjs';
 import { parseGpuInventory, parseGpuMemory } from '../hardware-limits/liveGpu.mjs';
-import { createHostProc } from '../hardware-limits/liveGpuHost.mjs';
+import { createHostProc, processesWithin } from '../hardware-limits/liveGpuHost.mjs';
 import { createGpuCases, compactEvidence } from '../hardware-limits/liveGpuCases.mjs';
 import {
     ADMIN_REQUEST, GPU_GRANT_FACTS, MPS_FAILURE_EVIDENCE, MPS_KILL_OWNED_DAEMON, MPS_OBSERVE, assertMpsControlCommand, classifyMpsReply, controlHelperExecArgv, controlHelperRunArgv, parseProbeResult, probeBoundMiB, probeExecArgv,
@@ -152,6 +152,99 @@ function scriptedGate({ replies, procs = new Map(), prefix = '/box', expectedMem
 const smiOk = xml => ok(xml);
 const proc = (cgroup, extra = {}) => ({ startIdentity: '10', ppid: 1, cgroup, nspid: [1], uid: { real: 1000, effective: 1000, saved: 1000, fs: 1000 }, ...extra });
 const blockedWith = (reason) => error => error.code === 'LIVE_PREREQUISITE_MISSING' && error.gate?.reason === reason;
+
+test('G1.ordinary-host-namespace-and-discovery-refuse-unreadable-malformed-and-overflow', () => {
+    let namespace = 'pid:[4026533317]';
+    const host = createHostProc({ fsApi: { readlinkSync: () => namespace, readdirSync: () => Array(4097).fill('child') } });
+    assert.equal(host.pidNamespace(249565), namespace);
+    for (const pid of [0, -1, '42', NaN, 1.5, Number.MAX_SAFE_INTEGER + 1]) assert.throws(() => host.pidNamespace(pid), /Invalid host PID/);
+    for (const value of ['pid:[0]', 'pid:[]', 'pid:[-1]', 'mnt:[123]', 'pid:[1]\n']) {
+        namespace = value; assert.throws(() => host.pidNamespace(42), /namespace/);
+    }
+    for (const code of ['ENOENT', 'ESRCH', 'EACCES']) {
+        const absent = createHostProc({ fsApi: { readlinkSync() { throw Object.assign(new Error(code), { code }); } } });
+        if (code === 'EACCES') assert.throws(() => absent.pidNamespace(42), /EACCES/);
+        else assert.equal(absent.pidNamespace(42), null);
+    }
+    assert.throws(() => host.cgroupDirectories('/box'), /bound/);
+    const fake = { observe: pid => ({ hostPid: pid, cgroup: '/box' }), cgroupProcs: () => [], cgroupDirectories: () => [] };
+    assert.deepEqual(processesWithin(fake, '/box'), []);
+    assert.throws(() => processesWithin({ ...fake, cgroupProcs: () => Array(4097).fill(1) }, '/box'), /bound/);
+    assert.throws(() => processesWithin({ ...fake, cgroupProcs: () => [0] }, '/box'), /Invalid host PID/);
+    assert.throws(() => processesWithin({ ...fake, cgroupDirectories: () => ['child'] }, '/box'), /bound/);
+    assert.throws(() => processesWithin({ ...fake, cgroupDirectories: dir => dir === '/box' ? Array.from({ length: 128 }, (_, i) => `c${i}`) : [] }, '/box'), /bound/);
+    assert.throws(() => processesWithin({ ...fake, cgroupDirectories: () => ['..'] }, '/box'), /Invalid/);
+    assert.throws(() => processesWithin({ ...fake, cgroupDirectories: () => null }, '/box'), /unavailable/);
+});
+
+test('G1.ordinary-client-registration-rechecks-identity-and-is-idempotent', () => {
+    const expected = { hostPid: 42, bootId: 'boot-1', startIdentity: '1234', cgroup: '/box', nspid: [42, 10, 2], pidNamespace: 'pid:[123]' };
+    let current = structuredClone(expected); let namespace = expected.pidNamespace; const registered = [];
+    const host = { bootId: () => 'boot-1', observe: () => structuredClone(current), pidNamespace: () => namespace };
+    const gate = createGpuGate({ query: async () => smiOk(smiXml()), uuid: UUID, host, boxPrefix: '/box', onRegister: row => registered.push(row) });
+    gate.registerClient(42, expected); gate.registerClient(42, expected);
+    assert.equal(registered.length, 1);
+    for (const change of [{ bootId: 'other' }, { hostPid: 43 }, { startIdentity: '1235' }, { cgroup: '/box/other' }, { nspid: [42, 20, 2] }]) {
+        current = { ...expected, ...change };
+        assert.throws(() => gate.registerClient(42, expected), /identity changed/);
+        assert.throws(() => gate.registerClient(42, { ...current, pidNamespace: namespace }), /cannot replace/);
+    }
+    current = structuredClone(expected); namespace = 'pid:[456]';
+    assert.throws(() => gate.registerClient(42, expected), /identity changed/);
+    assert.throws(() => gate.registerClient(42, { ...expected, pidNamespace: namespace }), /cannot replace/);
+    assert.equal(registered.length, 1);
+    let reads = 0;
+    const racing = { ...host, pidNamespace: () => expected.pidNamespace,
+        observe: () => ({ ...expected, startIdentity: ++reads === 1 ? '1234' : 'reused' }) };
+    const raceGate = createGpuGate({ query: async () => smiOk(smiXml()), uuid: UUID, host: racing, boxPrefix: '/box' });
+    assert.throws(() => raceGate.registerClient(42, expected), /identity changed/);
+    assert.deepEqual(raceGate.summary().registered, []);
+});
+
+test('G1.ordinary-preclassification-proof-runs-on-final-inventory-and-cannot-be-reused', async () => {
+    const expected = { hostPid: 42, bootId: 'boot-1', startIdentity: '1234', cgroup: '/box', nspid: [42, 10, 2], pidNamespace: 'pid:[123]' };
+    const host = { bootId: () => 'boot-1', observe: pid => pid === 42 ? { ...expected } : null, pidNamespace: () => expected.pidNamespace };
+    let queries = 0; let proofs = 0; let prove = true;
+    const gate = createGpuGate({ uuid: UUID, host, boxPrefix: '/box', sleep: async () => {},
+        query: async () => smiOk(smiXml({ rows: ++queries === 1 ? '' : queries === 2 ? row(99) : row(42) })),
+        beforeClassify: async inventory => {
+            proofs += 1; assert.deepEqual(inventory.processes.map(row => row.pid), [42]);
+            if (prove) gate.registerClient(42, expected);
+        } });
+    await gate.initial(); assert.equal(proofs, 0);
+    assert.deepEqual((await gate.check('first')).owned, [42]);
+    assert.equal(queries, 3); assert.equal(proofs, 1);
+    prove = false;
+    await assert.rejects(gate.check('empty fresh proof'), blockedWith('gpu_busy'));
+    assert.equal(proofs, 2);
+    const failed = createGpuGate({ uuid: UUID, host, boxPrefix: '/box', query: async () => smiOk(smiXml()),
+        beforeClassify: async () => { throw new Error('unreadable facts'); } });
+    await failed.initial();
+    await assert.rejects(failed.check('denied'), blockedWith('owned_provenance_unproved'));
+    await assert.rejects(failed.check('latched'), blockedWith('owned_provenance_unproved'));
+});
+
+test('G1.ordinary-monitor-and-explicit-checks-serialize-their-fresh-proofs', async () => {
+    let active = 0; let maximum = 0; let queries = 0; let checks = 0; let explicit;
+    let finishTask;
+    const task = new Promise(resolve => { finishTask = resolve; });
+    const host = { bootId: () => 'boot-1', observe: () => null };
+    const gate = createGpuGate({ uuid: UUID, host, boxPrefix: '/box', intervalMs: 1,
+        query: async () => { queries += 1; return smiOk(smiXml()); },
+        beforeClassify: async () => {
+            active += 1; maximum = Math.max(active, maximum);
+            if (!explicit) explicit = gate.check('explicit-overlap');
+            await new Promise(resolve => setTimeout(resolve, 5));
+            active -= 1; checks += 1;
+            if (checks === 2) finishTask();
+        } });
+    await gate.initial();
+    await gate.monitor(() => task);
+    await explicit;
+    assert.equal(maximum, 1); assert.ok(checks >= 2); assert.equal(queries, checks + 1);
+    assert.ok(gate.history.some(row => row.label === 'monitor'));
+    assert.ok(gate.history.some(row => row.label === 'explicit-overlap'));
+});
 
 test('G1.gate-initial-idle-records-uuid-mode-and-memory', async () => {
     const { gate } = scriptedGate({ replies: [smiOk(smiXml())] });

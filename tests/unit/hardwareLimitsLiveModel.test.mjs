@@ -7,6 +7,8 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import vm from 'node:vm';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { agentLibLabels, normalizeBoxAgentLib } from '../../ploinky-box/contract/agentlib.mjs';
 import { imageSourceIdentity } from '../../agentlib/contract.mjs';
@@ -14,8 +16,8 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { buildConcreteManifest, validatePins, CONCRETE_BLOCKS, renderSummary } from '../hardware-limits/liveManifest.mjs';
 import { validateProfile, executeLiveRun, executeCleanupRun, validateAuthorization } from '../hardware-limits/liveHarness.mjs';
 import { provisionRun, fixtureContainerName } from '../hardware-limits/liveFixture.mjs';
-import { engineIdentityDigest, digest, jsonDigest, liveSourceDigest, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
-import { MODEL_PROFILES, assertModelObservation, assertModelContainer, assertModelSource, validateModelPins } from '../hardware-limits/liveModelCases.mjs';
+import { artifactPathFor, engineIdentityDigest, digest, jsonDigest, liveSourceDigest, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
+import { MODEL_PROFILES, assertModelObservation, assertModelContainer, assertModelSource, validateModelPins, ordinaryGpuAnchor } from '../hardware-limits/liveModelCases.mjs';
 import { MODEL_SOURCE_VIEW, modelSourceLayout, observeModelStage, observeModelCodeView } from '../hardware-limits/liveModelSource.mjs';
 import { ensurePodmanStagedCodeDir } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { canonicalDigest } from '../../cli/utils/dependencies/store/canonical.mjs';
@@ -90,6 +92,9 @@ function stageModelFixture(profile, agent) {
         config: { binds: mounts.map(mount => ({ source: mount.Source, target: mount.Destination, ro: !mount.RW })) },
         dependencies: { schema: 1, mode: 'store', family: 'container', imageId: CONFIG, runtimeKey: contract.runtime.key, inputKey, generationId, objectId, payloadPath: payload, nodeModulesPath: dependency },
     } }));
+    fs.writeFileSync(path.join(workspace, '.ploinky', 'routing.json'), JSON.stringify({ routes: {
+        'local-llm': { repo: 'local-llms', agent: 'local-llm', container: agent.name, hostPort: 12345 },
+    } }));
     return { stage, dependency, objectRoot };
 }
 function modelPin(profile) {
@@ -145,12 +150,27 @@ function world(t, profile = 'cpu', fault = {}) {
     const controllerFiles = Array.from({ length: 90 }, (_, index) => `controller.${index}`);
     const cgroupChildren = { [prefix]: ['engine'], [`${prefix}/engine`]: ['agents'], [`${prefix}/engine/agents`]: [`libpod-${'2'.repeat(64)}`] };
     const bootId = '11111111-2222-4333-8444-555555555555';
+    // The budget-off host capture had [244954, 1] for the Box and
+    // [249565, 3190, 1] for its agent init, in the same Box cgroup.
+    let factsReads = 0; let reused = false; let loadingChecks = 0;
     const hostProc = { bootId: () => bootId, uid: () => process.getuid(),
-        observe: pid => pid === 100 && box || pid === 200 && running ? { hostPid: pid, ppid: 1, startIdentity: '1234', bootId, cgroup: pid === 100 ? prefix : leaf, nspid: pid === 100 ? [100] : [200, 42], uid: { effective: process.getuid() } } : null,
-        cgroupDirectories: directory => fault.controllerHeavy
+        pidNamespace(pid) {
+            if (fault.namespaceDenied) throw new Error('namespace read denied');
+            return pid === 244954 || fault.unrelatedBox && pid === 200 ? 'pid:[4026533239]'
+                : fault.siblingNamespace && pid === 200 ? 'pid:[4026533481]' : 'pid:[4026533317]';
+        },
+        observe(pid) {
+            if (!(pid === 244954 && box || pid === 249565 && agent || pid === 200 && running)) return null;
+            return { hostPid: pid, ppid: 1, startIdentity: pid === 244954 ? '13787279' : pid === 249565 ? '13812476' : reused ? '9999' : '1234',
+                bootId, cgroup: pid === 244954 || fault.sharedCgroup ? prefix : leaf,
+                nspid: pid === 244954 ? [244954, 1] : pid === 249565 ? [249565, 3190, 1] : [200, 3380, 42], uid: { effective: process.getuid() } };
+        },
+        cgroupDirectories: directory => fault.sharedCgroup ? [] : fault.controllerHeavy
             ? Object.hasOwn(cgroupChildren, directory) ? [...controllerFiles, ...cgroupChildren[directory]] : []
             : directory === prefix ? [`libpod-${'2'.repeat(64)}`] : [],
-        cgroupProcs: directory => directory === leaf ? running ? [200] : [] : fault.controllerHeavy && [`${prefix}/engine`, `${prefix}/engine/agents`].includes(directory) ? [] : null };
+        cgroupProcs: directory => directory === prefix ? [244954, ...(fault.sharedCgroup ? [249565, ...(running ? [200] : [])] : [])]
+            : !fault.sharedCgroup && directory === leaf ? [249565, ...(running ? [200] : [])]
+                : fault.controllerHeavy && [`${prefix}/engine`, `${prefix}/engine/agents`].includes(directory) ? [] : null };
     const provider = async (binary, args, options) => {
         calls.push({ binary, args, env: options.env });
         assert.ok(!args.some(arg => String(arg).includes('/.ploinky/repos/')), 'No managed source operation');
@@ -160,16 +180,17 @@ function world(t, profile = 'cpu', fault = {}) {
         if (args[0] === 'machine') return ok(JSON.stringify(args[1] === 'list' ? [{ Name: 'owned-test', VMType: 'libkrun', Running: true }] : [{ Name: 'owned-test', State: 'running', Rootful: false }]));
         if (args[0] === 'system') return ok(JSON.stringify([{ Name: 'owned-test', URI: pins.model.apple.uri, Default: true }]));
         if (args.includes('-q') && args.includes('-x')) {
+            if (running && fault.loading) loadingChecks += 1;
             const rows = running ? [{ pid: 200, type: 'C' }, ...(fault.foreign ? [{ pid: 999, type: 'C' }] : [])] : fault.foreignBefore ? [{ pid: 999, type: 'C' }] : [];
             return ok(`<nvidia_smi_log><gpu id="0"><uuid>GPU-12345678</uuid><compute_mode>Default</compute_mode><fb_memory_usage><total>6144 MiB</total><used>100 MiB</used><free>6044 MiB</free></fb_memory_usage><processes>${rows.map(row => `<process_info><pid>${row.pid}</pid><type>${row.type}</type></process_info>`).join('')}</processes></gpu></nvidia_smi_log>`);
         }
         if (binary === node && args.includes('start')) {
             assert.equal(options.env.PLOINKY_BOX_HARDWARE_LIMITS, 'off');
             const identity = buildWorkspaceIdentity(options.cwd);
-            box = { id: '1'.repeat(64), created: '2026-10-12T00:00:00Z', image: 'f'.repeat(64), imageName: pins.boxImage, running: true, pid: 100,
+            box = { id: '1'.repeat(64), created: '2026-10-12T00:00:00Z', image: 'f'.repeat(64), imageName: pins.boxImage, running: true, pid: 244954,
                 labels: { [BOX_LABELS.pathHash]: identity.pathHash, [BOX_LABELS.role]: 'box', [BOX_LABELS.imageRef]: pins.boxImage,
                     ...agentLibLabels(imageProvider('f'.repeat(64))) }, mounts: [{ Type: 'bind', Source: options.cwd, Destination: options.cwd, RW: true }], devices: ['/dev/fuse', '/dev/net/tun'].map(name => ({ PathOnHost: name, PathInContainer: name })) };
-            agent = { id: '2'.repeat(64), name: fixtureContainerName(options.cwd, 'local-llm', 'local-llms'), created: box.created, image: CONFIG.slice(7), imageName: IMAGE, running: true, labels: {}, devices: [], mounts: [{ Source: path.join(options.cwd, 'local-llms', 'local-llm'), Destination: '/code', RW: false }] };
+            agent = { id: '2'.repeat(64), pid: 3190, name: fixtureContainerName(options.cwd, 'local-llm', 'local-llms'), created: box.created, image: CONFIG.slice(7), imageName: IMAGE, running: true, labels: {}, devices: [], mounts: [{ Source: path.join(options.cwd, 'local-llms', 'local-llm'), Destination: '/code', RW: false }] };
             stageModelFixture({ ...run.target.execution, box }, agent);
             if (profile === 'apple') { agent.devices = [{ PathOnHost: '/dev/dri/renderD128', PathInContainer: '/dev/dri/renderD128' }]; box.devices.push(...agent.devices); }
             return ok();
@@ -182,18 +203,28 @@ function world(t, profile = 'cpu', fault = {}) {
         if (args[0] === 'info') return ok(JSON.stringify(fakeEngineInfo(HOST)));
         if (args.includes(LLM_TOOL_CALL)) {
             const at = args.indexOf(LLM_TOOL_CALL); const tool = args[at + 1];
+            assert.equal(JSON.parse(args[at + 3]).agent, 'local-llm', 'ordinary calls pin the exact advertised route before dispatch');
+            if (fault.toolReply) return ok(fault.toolStdout ?? JSON.stringify(fault.toolReply), fault.toolTransport);
             if (tool === 'local_llm_test_prompt' && fault.providerOverlayAfter) {
                 box.mounts.push({ Type: 'bind', Source: '/foreign', Destination: '/opt/ploinky-agentlib/main.mjs', RW: true });
             }
             if (tool === 'local_llm_run') running = true;
+            if (tool === 'local_llm_test_prompt') fault.afterPrompt?.(value);
             if (tool === 'local_llm_stop') { if (fault.stop) return fail('injected stop failure'); running = false; }
             if (tool === 'local_llm_status' && fault.cancelLoad && running) return ok('', { cancelled: true, status: null });
             let result = tool === 'local_llm_overview' ? { profile: value.spec.backend, hardware: { gpu: { name: 'offline GPU', driverVersion: '595.1' } }, runners: [{ id: value.spec.runner, installed: true, version: 'b11159' }] }
                 : tool === 'local_llm_status' ? running ? clone(value.status) : { phase: 'idle' }
                     : tool === 'local_llm_test_prompt' ? { ...value.answer, ...(fault.empty ? { text: '' } : {}) } : {};
-            return ok(JSON.stringify({ ok: true, agent: fault.agent ? 'foreign/agent' : 'local-llms/local-llm', result }));
+            if (tool === 'local_llm_status' && running && fault.loading && loadingChecks < (fault.loadingChecks || 1)) result = { phase: 'loading' };
+            return ok(JSON.stringify({ ok: true, agent: fault.agent ? 'foreign-agent' : 'local-llm', result }));
         }
-        if (args.includes(MODEL_PROCESS_FACTS)) return ok(JSON.stringify({ processes: value.processes }), fault.oversized ? { truncated: true } : {});
+        if (args.includes(MODEL_PROCESS_FACTS)) {
+            factsReads += 1;
+            if (running && fault.reuseDuringFacts) reused = true;
+            if (running && fault.replaceInit) agent.pid += 1;
+            if (running && fault.factsDenied) return fail('process read denied');
+            return ok(JSON.stringify({ processes: running ? value.processes : [] }), fault.oversized ? { truncated: true } : {});
+        }
         if (args.includes(MODEL_SOURCE_VIEW)) {
             const stage = agent.mounts.find(mount => mount.Destination === '/code').Source;
             const io = modelNamespaceFs(stage, providerRoot);
@@ -213,15 +244,196 @@ function world(t, profile = 'cpu', fault = {}) {
         throw new Error(`Unexpected offline command: ${args[0]}`);
     };
     const options = () => ({ run, processProvider: provider, hostIdentity: pins.host, hostProc, remoteArrival: profile !== 'apple', artifacts: (name, data) => {
+        artifactPathFor(path.join(evidence, 'run_codex.json'), name);
         if (fault.proof && name === 'llm-cleanup-proof') throw new Error('injected proof write failure');
         artifacts.set(name, clone(data));
     }, persist: () => {} });
-    return { root, source, pins, run, calls, artifacts, provider, options, value, agent: () => agent, box: () => box,
+    return { root, source, pins, run, calls, artifacts, provider, options, value, hostProc, factsReads: () => factsReads, agent: () => agent, box: () => box,
         namespace: () => modelNamespaceFs(agent.mounts.find(mount => mount.Destination === '/code').Source, providerRoot),
         provision: () => provisionRun({ ...options(), validateProfile, portProbe: async () => ({ tcp: true, udp: true }) }),
-        live: () => executeLiveRun({ ...options(), gpuTimings: { pollMs: 1 } }),
+        live: () => executeLiveRun({ ...options(), gpuTimings: { pollMs: 1, ...(fault.loading ? { monitorMs: 1 } : {}) } }),
         cleanup: () => executeCleanupRun(options()) };
 }
+
+test('MODEL.ordinary-NVIDIA-shared-Box-cgroup-registers-only-runner', async t => {
+    const w = world(t, 'nvidia', { sharedCgroup: true });
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const result = await w.live();
+    assert.equal(result.verdict, 'PASS', JSON.stringify(result));
+    assert.deepEqual(w.run.ownedProcesses.filter(row => row.kind === 'gpu-process').map(row => row.hostPid), [200]);
+    assert.ok(w.factsReads() >= 4, 'every noninitial classification collected new safe facts');
+});
+
+test('MODEL.ordinary-NVIDIA-loading-registers-runner-and-refuses-foreign-compute', async t => {
+    for (const foreign of [false, true]) {
+        const w = world(t, 'nvidia', { sharedCgroup: true, loading: true, foreign });
+        assert.equal((await w.provision()).verdict, 'PASS');
+        const result = await w.live();
+        assert.equal(result.verdict === 'PASS', !foreign, JSON.stringify(result));
+        const firstFacts = w.calls.findIndex(call => call.args.includes(MODEL_PROCESS_FACTS));
+        const prompt = w.calls.findIndex(call => call.args.includes('local_llm_test_prompt'));
+        assert.ok(firstFacts >= 0 && (prompt === -1 || firstFacts < prompt));
+        if (foreign) assert.equal(prompt, -1, 'foreign loading activity prevented inference');
+    }
+});
+
+test('MODEL.ordinary-NVIDIA-fresh-identity-and-executable-proofs-fail-closed', async t => {
+    const scenarios = [
+        ['sibling namespace with identical inner PID/start', { siblingNamespace: true }],
+        ['unrelated Box process', { unrelatedBox: true }],
+        ['PID reused while safe process facts are read', { reuseDuringFacts: true }],
+        ['agent init replaced during facts', { replaceInit: true }],
+        ['namespace read denied', { namespaceDenied: true }],
+        ['process facts read denied', { factsDenied: true }],
+        ['missing facts after registration', { afterPrompt: value => { value.processes = []; } }],
+        ['wrong executable after registration', { afterPrompt: value => { value.processes[0].exe = '/foreign/llama-server'; } }],
+        ['wrong hash after registration', { afterPrompt: value => { value.processes[0].sha256 = '0'.repeat(64); } }],
+        ['different inner PID after registration', { afterPrompt: value => { value.processes[0].pid = 43; } }],
+        ['zero inner PID', {}, value => { value.processes[0].pid = 0; }],
+        ['wrong executable', {}, value => { value.processes[0].exe = '/foreign/llama-server'; }],
+        ['wrong hash', {}, value => { value.processes[0].sha256 = '0'.repeat(64); }],
+    ];
+    for (const [label, fault, mutate] of scenarios) {
+        const w = world(t, 'nvidia', { sharedCgroup: true, ...fault });
+        mutate?.(w.value);
+        assert.equal((await w.provision()).verdict, 'PASS', label);
+        const result = await w.live();
+        assert.notEqual(result.verdict, 'PASS', label);
+        assert.match(w.artifacts.get('model-live-l4').reason, fault.factsDenied ? /Live command failed/ : /GPU|namespace/, label);
+        if (!fault.afterPrompt) assert.equal(w.run.ownedProcesses.filter(row => row.kind === 'gpu-process').length, 0, label);
+        assert.ok(!w.calls.some(call => call.args.includes('kill')), label);
+    }
+});
+
+test('MODEL.ordinary-NVIDIA-init-mapping-is-unique-and-pinned-to-Box-namespace-position', async t => {
+    const w = world(t, 'nvidia', { sharedCgroup: true });
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const anchor = ordinaryGpuAnchor(w.hostProc, w.box(), w.agent());
+    assert.deepEqual(anchor.agentProcess.nspid, [249565, 3190, 1]);
+    assert.equal(anchor.agentProcess.pidNamespace, 'pid:[4026533317]');
+    assert.equal(anchor.boxProcess.cgroup, anchor.agentProcess.cgroup);
+    for (const pid of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        assert.throws(() => ordinaryGpuAnchor(w.hostProc, w.box(), { ...w.agent(), pid }), /init PID/);
+    }
+    const duplicate = { ...w.hostProc, cgroupProcs: () => [244954, 249565, 999],
+        observe: pid => pid === 999 ? { ...w.hostProc.observe(249565), hostPid: 999, nspid: [999, 3190, 1] } : w.hostProc.observe(pid) };
+    assert.throws(() => ordinaryGpuAnchor(duplicate, w.box(), w.agent()), /ambiguous/);
+    const wrongPosition = { ...w.hostProc, observe: pid => pid === 249565 ? { ...w.hostProc.observe(pid), nspid: [249565, 777, 3190, 1] } : w.hostProc.observe(pid) };
+    assert.throws(() => ordinaryGpuAnchor(wrongPosition, w.box(), w.agent()), /absent/);
+    const sameNamespace = { ...w.hostProc, pidNamespace: () => 'pid:[4026533239]' };
+    assert.throws(() => ordinaryGpuAnchor(sameNamespace, w.box(), w.agent()), /namespace/);
+});
+
+test('MODEL.Router-short-key-stays-bound-to-qualified-route-and-container', async t => {
+    for (const mutate of [
+        route => { route.repo = 'foreign'; }, route => { route.agent = 'foreign'; },
+        route => { route.container = 'foreign'; }, route => { route.disabled = true; }, route => { route.draining = true; },
+    ]) {
+        const w = world(t); assert.equal((await w.provision()).verdict, 'PASS');
+        const file = path.join(w.run.target.execution.workspace.path, '.ploinky', 'routing.json');
+        const document = JSON.parse(fs.readFileSync(file)); mutate(document.routes['local-llm']); fs.writeFileSync(file, JSON.stringify(document));
+        assert.notEqual((await w.live()).verdict, 'PASS');
+        assert.equal(w.artifacts.get('model-tool-binding-local-llm-overview').matches, false);
+        assert.ok(!w.calls.some(call => call.args.includes(LLM_TOOL_CALL)), 'wrong route refused before tool dispatch');
+    }
+    const w = world(t); assert.equal((await w.provision()).verdict, 'PASS');
+    const file = path.join(w.run.target.execution.workspace.path, '.ploinky', 'agents.json');
+    const records = JSON.parse(fs.readFileSync(file)); records[w.agent().name].containerId = '0'.repeat(64); fs.writeFileSync(file, JSON.stringify(records));
+    assert.notEqual((await w.live()).verdict, 'PASS');
+    assert.ok(!w.calls.some(call => call.args.includes(LLM_TOOL_CALL)));
+});
+
+test('MODEL.Router-reply-evidence-distinguishes-refusal-and-identity-without-secrets', async t => {
+    for (const [toolReply, outcome] of [
+        [{ ok: true, agent: 'foreign-agent', result: { token: 'must-not-be-emitted' } }, 'identity-mismatch'],
+        [{ ok: false, agent: 'local-llm', error: { code: 'admission_insufficient_now', message: 'must-not-be-emitted ECONNRESET HTTP 503',
+            details: { admission: { status: 'insufficient-now', reason: 'must-not-be-emitted', estimate: { ramBytes: 1234, token: 'must-not-be-emitted' } } } } }, 'tool-refusal'],
+        [{ ok: false, error: { code: 'transport', message: 'ETIMEDOUT must-not-be-emitted' } }, 'tool-refusal'],
+        [{ ok: false, error: { code: 'agent_identity_mismatch', message: 'must-not-be-emitted' } }, 'identity-mismatch'],
+    ]) {
+        const w = world(t, 'cpu', { toolReply }); assert.equal((await w.provision()).verdict, 'PASS');
+        assert.notEqual((await w.live()).verdict, 'PASS');
+        const evidence = w.artifacts.get('model-tool-reply-local-llm-overview');
+        assert.equal(evidence.outcome, outcome);
+        assert.equal(evidence.expected.ref, 'local-llms/local-llm');
+        assert.equal(evidence.expected.containerId, '2'.repeat(64));
+        assert.equal(JSON.stringify(evidence).includes('must-not-be-emitted'), false);
+        if (toolReply.error?.code === 'admission_insufficient_now') {
+            assert.equal(evidence.error.code, 'admission_insufficient_now'); assert.equal(evidence.error.errno, 'ECONNRESET');
+            assert.equal(evidence.error.httpStatus, '503'); assert.equal(evidence.error.admission.estimate.ramBytes, 1234);
+        }
+    }
+});
+
+test('MODEL.Router-helper-opt-in-refuses-wrong-sole-agent-before-dispatch', t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'model-route-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const auth = path.join(root, 'auth.mjs'); const client = path.join(root, 'client.mjs'); const dispatched = path.join(root, 'dispatched');
+    fs.writeFileSync(auth, 'export const mintSessionJwt=()=>"must-not-be-emitted";');
+    const program = LLM_TOOL_CALL.replace('/opt/ploinky/cli/server/auth/localService.js', pathToFileURL(auth).href)
+        .replace('/opt/ploinky/Agent/client/MCPBrowserClient.js', pathToFileURL(client).href);
+    for (const agent of ['local-llm', 'foreign-agent', 'local-llms/local-llm']) {
+        fs.writeFileSync(client, `import fs from 'node:fs'; export const createAgentClient=()=>({
+            listTools:async()=>[{name:'local_llm_stop',annotations:{router:{agent:${JSON.stringify(agent)}}}}],
+            callTool:async()=>{fs.writeFileSync(${JSON.stringify(dispatched)},'called');return {json:{}};},close:async()=>{}});`);
+        const result = spawnSync(process.execPath, ['-e', program, 'local_llm_stop', '{}', '{"agent":"local-llm"}'], { encoding: 'utf8', timeout: 10000 });
+        assert.equal(result.status, 0, result.stderr);
+        const doc = JSON.parse(result.stdout);
+        assert.equal(doc.ok, agent === 'local-llm');
+        assert.equal(fs.existsSync(dispatched), agent === 'local-llm');
+        assert.ok(!result.stdout.includes('must-not-be-emitted'));
+        if (agent === 'local-llm') fs.unlinkSync(dispatched);
+        else assert.equal(doc.error.code, 'agent_identity_mismatch');
+    }
+    fs.writeFileSync(client, 'export const createAgentClient=()=>({listTools:async()=>{throw new Error("ECONNREFUSED");},close:async()=>{}});');
+    const refused = spawnSync(process.execPath, ['-e', program, 'local_llm_stop', '{}', '{"agent":"local-llm"}'], { encoding: 'utf8', timeout: 10000 });
+    assert.equal(refused.status, 3);
+    assert.equal(JSON.parse(refused.stdout).error.code, 'transport');
+    assert.ok(!fs.existsSync(dispatched));
+});
+
+test('MODEL.Router-artifacts-follow-the-real-writer-contract', async t => {
+    const w = world(t); assert.equal((await w.provision()).verdict, 'PASS');
+    const report = await w.live();
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report));
+    assert.ok(w.artifacts.has('model-tool-reply-local-llm-overview'));
+});
+
+test('MODEL.repeated-observations-exceed-512-without-consuming-mutation-journal', async t => {
+    const w = world(t, 'nvidia', { sharedCgroup: true, loading: true, loadingChecks: 110 });
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const result = await w.live();
+    assert.equal(result.verdict, 'PASS', JSON.stringify(result));
+    assert.ok(w.factsReads() >= 110);
+    assert.ok(w.calls.filter(call => call.args.includes('inspect') || call.args.includes(MODEL_PROCESS_FACTS)).length > 512);
+    assert.ok(w.run.operations.length < 128, w.run.operations.length);
+    for (const kind of ['model-tool-agent', 'model-gpu-box', 'model-gpu-agent']) assert.ok(!w.run.operations.some(row => row.kind === kind), kind);
+    for (const kind of ['model-local_llm_run', 'model-local_llm_test_prompt', 'model-local_llm_stop']) assert.ok(w.run.operations.some(row => row.kind === kind), kind);
+});
+
+test('MODEL.Router-transport-failures-save-bounded-diagnostics-before-refusal', async t => {
+    for (const transport of [{ status: 3 }, { status: null, timedOut: true }, { truncated: true }, { cancelled: true }, { settlementForced: true }]) {
+        const toolReply = { ok: false, error: { code: 'transport', message: 'ECONNREFUSED HTTP 503 must-not-be-emitted' } };
+        const w = world(t, 'cpu', { toolReply, toolTransport: transport });
+        assert.equal((await w.provision()).verdict, 'PASS');
+        assert.notEqual((await w.live()).verdict, 'PASS');
+        const evidence = w.artifacts.get('model-tool-reply-local-llm-overview');
+        assert.ok(evidence, JSON.stringify(transport));
+        assert.equal(evidence.outcome, 'transport-failure');
+        assert.equal(evidence.error.code, 'transport'); assert.equal(evidence.error.errno, 'ECONNREFUSED');
+        assert.equal(evidence.error.httpStatus, '503');
+        assert.equal(evidence.transport.status, transport.status === undefined ? 0 : transport.status);
+        assert.equal(JSON.stringify(evidence).includes('must-not-be-emitted'), false);
+    }
+    for (const toolStdout of ['{"ok":', 'x'.repeat(65537)]) {
+        const w = world(t, 'cpu', { toolReply: {}, toolStdout, toolTransport: { truncated: true } });
+        assert.equal((await w.provision()).verdict, 'PASS');
+        assert.notEqual((await w.live()).verdict, 'PASS');
+        const evidence = w.artifacts.get('model-tool-reply-local-llm-overview');
+        assert.equal(evidence.outcome, 'transport-failure'); assert.equal(evidence.replyParsed, false);
+        assert.equal(evidence.transport.truncated, true);
+    }
+});
 
 test('MODEL.manifest-profile-pins-and-old-mode-separation', t => {
     for (const profile of Object.keys(MODEL_PROFILES)) {

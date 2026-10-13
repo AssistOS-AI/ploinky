@@ -139,6 +139,7 @@ const fail=(message,code)=>{out({ok:false,error:{code:code||'invalid',message:St
 const [tool,argsText,viewText]=process.argv.slice(1);
 if(!Object.hasOwn(ALLOWED,tool))fail('Unsupported tool');
 let args,view;try{args=JSON.parse(argsText||'{}');view=JSON.parse(viewText||'{}');}catch{fail('Invalid JSON');}
+if(view.agent!==undefined&&view.agent!=='local-llm')fail('Invalid expected model route');
 if(!args||typeof args!=='object'||Array.isArray(args)||Buffer.byteLength(argsText||'')>4096||Object.keys(args).some((k)=>!ALLOWED[tool].includes(k)))fail('Invalid arguments');
 const id=/^[a-z0-9][a-z0-9._-]{0,127}$/;
 if(tool==='local_llm_run'&&(!/^[A-Za-z0-9_-]{8,64}$/.test(args.requestId)||!id.test(args.modelId)||!id.test(args.runnerId)||(args.replace!==undefined&&typeof args.replace!=='boolean')||(args.params!==undefined&&(!args.params||typeof args.params!=='object'||Array.isArray(args.params)))))fail('Invalid run request');
@@ -167,6 +168,7 @@ const project=(name,result)=>{
  try{
   const tools=await client.listTools();
   const agents=[...new Set(tools.filter((t)=>t&&t.name===tool).map((t)=>(t.annotations&&t.annotations.router&&t.annotations.router.agent)||t.agent).filter(Boolean))];
+  if(view.agent!==undefined&&(agents.length!==1||agents[0]!==view.agent)){out({ok:false,error:{code:'agent_identity_mismatch',message:'The advertised model route differs from the pinned route'}});return;}
   if(agents.length!==1)fail('The tool '+tool+' is offered by '+agents.length+' agents','agent_not_found');
   let timer;const reply=await Promise.race([client.callTool(tool,args,{agent:agents[0]}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('timeout')),285000);})]).finally(()=>clearTimeout(timer));
   const text=reply&&Array.isArray(reply.content)?(reply.content.find((c)=>c&&c.type==='text')||{}).text:undefined;
@@ -187,6 +189,7 @@ export function llmToolWords(tool, args = {}, view = {}) {
     const argsText = JSON.stringify(args); const viewText = JSON.stringify(view);
     if (Buffer.byteLength(argsText) > 4096 || Buffer.byteLength(viewText) > 1024) throw new Error('local-llm tool arguments exceed their bound');
     if (view.model !== undefined && !LLM_MODEL_ID.test(view.model)) throw new Error('Invalid local-llm model view');
+    if (view.agent !== undefined && view.agent !== LLM_AGENT) throw new Error('Invalid expected model route');
     return [tool, argsText, viewText];
 }
 

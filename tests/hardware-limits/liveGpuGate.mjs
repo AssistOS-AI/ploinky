@@ -65,16 +65,20 @@ function classify(message) {
 // records what the rule allows and reports each record through `onTolerate`.
 export function createGpuGate({
     query, uuid, host, boxPrefix, expectedMemoryMiB = null, intervalMs = 2000, retryMs = 100, onRegister = () => {},
-    tolerated = [], recordTolerated = false, onTolerate = () => {},
+    tolerated = [], recordTolerated = false, onTolerate = () => {}, beforeClassify = null,
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), now = Date.now,
 } = {}) {
     if (typeof query !== 'function' || !/^GPU-[a-fA-F0-9-]{8,64}$/.test(String(uuid)) || !host || typeof boxPrefix !== 'string' || !boxPrefix.startsWith('/')) {
         throw new Error('The GPU gate needs its query, device UUID, host observer and Box cgroup prefix');
     }
     if (!Array.isArray(tolerated) || tolerated.length > GPU_TOLERATED_MAX || !tolerated.every(isToleratedRecord)) throw new Error('The tolerated display processes of the run are invalid');
+    if (beforeClassify !== null && typeof beforeClassify !== 'function') throw new Error('Invalid GPU preclassification callback');
     const toleratedSet = new Map(tolerated.map(record => [record.hostPid, record]));
     const vanishedEver = new Set();
     const registry = new Map();
+    const identities = new Map();
+    let freshClients = new Set();
+    let checkTail = Promise.resolve();
     const daemons = new Set();
     const leaves = new Set();
     const history = [];
@@ -90,10 +94,32 @@ export function createGpuGate({
     const tuple = (role, observed) => ({ role, hostPid: observed.hostPid, bootId: observed.bootId, startIdentity: observed.startIdentity });
     // Registration verifies on the spot: the process is observed now, its
     // cgroup is beneath the exact Box and the role's own placement holds.
-    function register(hostPid, role) {
+    const identityMatches = (observed, expected) => observed && expected
+        && ['hostPid', 'bootId', 'startIdentity', 'cgroup'].every(key => observed[key] === expected[key])
+        && JSON.stringify(observed.nspid) === JSON.stringify(expected.nspid);
+    function observeExpected(hostPid, expected) {
         const observed = host.observe(hostPid);
+        const namespace = host.pidNamespace(hostPid);
+        const after = host.observe(hostPid);
+        if (!expected.pidNamespace || namespace !== expected.pidNamespace || !identityMatches(observed, expected) || !identityMatches(after, expected)) {
+            throw gpuBlocked('owned_provenance_unproved', { hostPid, message: 'the registered process identity changed' });
+        }
+        return after;
+    }
+    function register(hostPid, role, expected = null) {
+        const observed = expected ? observeExpected(hostPid, expected) : host.observe(hostPid);
         if (!observed || !cgroupWithin(observed.cgroup, boxPrefix)) throw gpuBlocked('owned_provenance_unproved', { hostPid, role, message: 'the process is not provably beneath the exact Box' });
         const record = tuple(role, observed);
+        const previous = registry.get(hostPid);
+        if (previous && ['role', 'hostPid', 'bootId', 'startIdentity'].some(key => previous[key] !== record[key])) {
+            throw gpuBlocked('owned_provenance_unproved', { hostPid, message: 'a changed identity cannot replace a registered process' });
+        }
+        if (identities.has(hostPid) && (!expected || !identityMatches(expected, identities.get(hostPid))
+            || expected.pidNamespace !== identities.get(hostPid).pidNamespace)) {
+            throw gpuBlocked('owned_provenance_unproved', { hostPid, message: 'a changed identity cannot replace a registered client' });
+        }
+        if (expected) { identities.set(hostPid, structuredClone(expected)); freshClients.add(hostPid); }
+        if (previous) return previous;
         registry.set(hostPid, record);
         // The registration is durable: the owner persists it into the run manifest
         // with its full tuple, so a resumed cleanup can prove the process is gone.
@@ -134,7 +160,7 @@ export function createGpuGate({
         // gate may exclude. Never a name or a UID rule.
         registerDaemon(hostPid) { const record = register(hostPid, 'mps-server'); daemons.add(hostPid); return record; },
         registerServer(hostPid) { return register(hostPid, 'mps-server'); },
-        registerClient(hostPid) { return register(hostPid, 'mps-client'); },
+        registerClient(hostPid, expectedIdentity = null) { return register(hostPid, 'mps-client', expectedIdentity); },
         registerLeaf(leaf) {
             if (typeof leaf !== 'string' || !cgroupWithin(leaf, boxPrefix) || leaf === boxPrefix) throw new Error('An owned leaf must be beneath the exact Box cgroup');
             leaves.add(leaf);
@@ -161,7 +187,18 @@ export function createGpuGate({
         },
         // Before every later GPU operation: query again; exclude only owned,
         // freshly verified PIDs.
-        async check(label, { minFreeMiB = 0 } = {}) {
+        check(label, options = {}) {
+            // Keep each fresh proof with its own final inventory, even when a
+            // monitor tick overlaps an explicit check during loading.
+            if (!beforeClassify) return gate.classifyInventory(label, options);
+            const pending = checkTail.then(() => gate.classifyInventory(label, options)).catch(error => {
+                tripped = error;
+                throw error;
+            });
+            checkTail = pending.catch(() => {});
+            return pending;
+        },
+        async classifyInventory(label, { minFreeMiB = 0 } = {}) {
             if (tripped) throw tripped;
             // A process the inventory listed may exit before the host can be asked
             // about it (the MPS server leaves a moment after its last client). Such
@@ -173,8 +210,17 @@ export function createGpuGate({
                 query_ = await guarded(label);
             }
             const { result, inventory, memory } = query_;
+            if (beforeClassify) {
+                freshClients = new Set();
+                try { await beforeClassify(inventory); }
+                catch (error) {
+                    tripped = gpuBlocked('owned_provenance_unproved', { label, message: error.message });
+                    throw tripped;
+                }
+            }
             const owned = [];
             for (const { pid } of inventory.processes) {
+                if (beforeClassify && identities.has(pid) && !freshClients.has(pid)) continue;
                 const record = registry.get(pid) || discover(pid);
                 if (record) owned.push(record);
             }
@@ -186,7 +232,8 @@ export function createGpuGate({
                     // `owned` holds only PIDs the inventory lists, so a dead
                     // registered process never blocks, and a listed PID whose
                     // tuple changed (a reused PID) does.
-                    observe: pid => host.observe(pid), bootId, boxCgroupPrefix: boxPrefix, tolerate: toleration('subset'),
+                    observe: pid => identities.has(pid) ? observeExpected(pid, identities.get(pid)) : host.observe(pid),
+                    bootId, boxCgroupPrefix: boxPrefix, tolerate: toleration('subset'),
                 });
             } catch (error) {
                 const reason = classify(error.message);

@@ -6,11 +6,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { AGENT_INSPECT, HASH, IMAGE_REF, checkedJson, digest, keys, liveSourceDigest } from './liveCommon.mjs';
 import { fixtureContainerName, rewriteLlmManifest } from './liveFixture.mjs';
-import { LLM_MODELS, LLM_REF } from './liveLlmNames.mjs';
+import { LLM_AGENT, LLM_MODELS, LLM_REF, LLM_REPOSITORY } from './liveLlmNames.mjs';
 import { LLM_TOOL_CALL, MODEL_PROCESS_FACTS, llmToolWords, validateLlmModelPins } from './liveLlmCommands.mjs';
 import { llmCleanupProof } from './liveLlmCases.mjs';
 import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs';
-import { createHostProc } from './liveGpuHost.mjs';
+import { requireTransport } from './liveProcess.mjs';
+import { cgroupWithin, createHostProc, processesWithin } from './liveGpuHost.mjs';
 import { createModelHostGuard, observeAppleMachine, parseModelHostSample } from './liveModelHostGuard.mjs';
 import { MODEL_SOURCE_VIEW, modelMountFacts, modelSourceLayout, observeModelStage } from './liveModelSource.mjs';
 
@@ -20,6 +21,34 @@ export const MODEL_PROFILES = Object.freeze({
     cpu: { block: 'apparatus-model-cpu', case: 'LIVE-L5', platform: 'linux', backend: 'cpu', runner: 'llama.cpp', executable: '/opt/llama.cpp/llama-server' },
 });
 const check = (condition, message) => { if (!condition) throw new Error(message); };
+const sameProcess = (a, b) => a && b && ['hostPid', 'bootId', 'startIdentity', 'cgroup', 'pidNamespace'].every(key => a[key] === b[key])
+    && JSON.stringify(a.nspid) === JSON.stringify(b.nspid);
+const sameContainer = (a, b) => a && b && a.running === true && b.running === true
+    && ['id', 'image', 'created', 'pid'].every(key => a[key] === b[key]);
+
+function namespaceProcess(host, pid) {
+    const before = host.observe(pid); const pidNamespace = host.pidNamespace(pid); const after = host.observe(pid);
+    check(pidNamespace && sameProcess(before, after), 'Ordinary GPU process namespace or identity unavailable');
+    return { ...after, pidNamespace };
+}
+
+export function ordinaryGpuAnchor(host, box, agent) {
+    check(Number.isSafeInteger(agent.pid) && agent.pid > 0, 'Ordinary GPU agent init PID unavailable');
+    const boxProcess = namespaceProcess(host, box.pid);
+    const prefix = boxProcess.cgroup?.match(new RegExp(`^(.*\\/libpod-${box.id}(?:\\.scope)?(?:\\/container)?)(?:\\/.*)?$`))?.[1];
+    check(/^[a-f0-9]{64}$/.test(box.id) && prefix && boxProcess.nspid?.[0] === box.pid
+        && boxProcess.nspid.at(-1) === 1 && boxProcess.nspid.every(pid => Number.isSafeInteger(pid) && pid > 0), 'Ordinary GPU Box ancestry unavailable');
+    const index = boxProcess.nspid.length - 1;
+    const matches = processesWithin(host, prefix).filter(value => value.nspid?.length === index + 2
+        && value.nspid[0] === value.hostPid && value.nspid[index] === agent.pid && value.nspid.at(-1) === 1);
+    check(matches.length === 1, 'Ordinary GPU agent init mapping is absent or ambiguous');
+    const agentProcess = namespaceProcess(host, matches[0].hostPid);
+    check(sameProcess({ ...matches[0], pidNamespace: agentProcess.pidNamespace }, agentProcess)
+        && agentProcess.bootId === boxProcess.bootId && agentProcess.pidNamespace !== boxProcess.pidNamespace
+        && cgroupWithin(agentProcess.cgroup, prefix), 'Ordinary GPU agent namespace unavailable');
+    check(sameProcess(namespaceProcess(host, box.pid), boxProcess), 'Ordinary GPU Box init changed');
+    return { prefix, boxProcess, agentProcess };
+}
 
 export function modelPlan(run) {
     const profile = run.target.execution;
@@ -27,7 +56,7 @@ export function modelPlan(run) {
     const core = ['container', 'exec', '--user', 'podman', '<BOX_ID>'];
     const nested = [...core, 'podman', '--cgroup-manager=cgroupfs'];
     const command = (id, argv, deadlineMs = 30000) => ({ id, binary: profile.engine.path, argv, deadlineMs });
-    const tool = (name, args) => command(`model-${name}`, [...core, 'node', '-e', '<LLM_TOOL_CALL>', ...llmToolWords(name, args, { model: LLM_MODELS.small })], 290000);
+    const tool = (name, args) => command(`model-${name}`, [...core, 'node', '-e', '<LLM_TOOL_CALL>', ...llmToolWords(name, args, { model: LLM_MODELS.small, agent: LLM_AGENT })], 290000);
     return [
         command('model-box-contract', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<BOX_ID>']),
         command('model-agent-source', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<AGENT_ID>']),
@@ -165,13 +194,67 @@ export function createModelCases(ctx) {
     const spec = MODEL_PROFILES[profile.model.profile];
     const timings = { pollMs: 3000, monitorMs: 2000, ...ctx.timings };
     const write = (name, value) => { const problem = safeArtifact(name, value); if (problem) throw new Error(`Mandatory model artifact unavailable: ${problem}`); };
-    let gpu; let apple; let launched = false;
+    let gpu; let apple; let launched = false; let toolAgent;
     const host = ctx.host || createHostProc();
+    const routeBinding = async (name, abort, cleanup) => {
+        const expected = { routeKey: LLM_AGENT, ref: LLM_REF, container: fixtureContainerName(profile.workspace.path, LLM_AGENT, LLM_REPOSITORY), containerId: toolAgent?.id };
+        const proof = { schema: 1, runId: run.runId, tool: name, expected, matches: false };
+        try {
+            const read = file => {
+                const target = path.join(profile.workspace.path, '.ploinky', file);
+                check(fs.lstatSync(target).isFile() && fs.statSync(target).size <= 4 * 1024 * 1024, 'Model route record unavailable');
+                const bytes = fs.readFileSync(target);
+                check(bytes.length <= 4 * 1024 * 1024, 'Model route record exceeds bound');
+                return JSON.parse(bytes);
+            };
+            const route = read('routing.json').routes?.[LLM_AGENT];
+            const record = read('agents.json')[expected.container];
+            const current = checkedJson(await engine('model-tool-agent', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, toolAgent.id], { abort, cleanup, journal: false }));
+            proof.route = { present: Boolean(route), repoMatches: route?.repo === LLM_REPOSITORY, agentMatches: route?.agent === LLM_AGENT,
+                containerMatches: route?.container === expected.container, active: Boolean(route) && !route.disabled && !route.draining };
+            proof.containerMatches = sameContainer(current, toolAgent) && current.name === expected.container && record?.containerId === current.id;
+            proof.matches = Object.values(proof.route).every(Boolean) && proof.containerMatches;
+        } catch { proof.problem = 'Model route identity observation unavailable'; }
+        write(`model-tool-binding-${name.replaceAll('_', '-')}`, proof);
+        check(proof.matches, 'Model Router route identity mismatch');
+        return expected;
+    };
     const tool = async (name, args, abort, cleanup = false) => {
-        const result = await command(`model-${name}`, profile.engine.path, [...core, 'node', '-e', LLM_TOOL_CALL, ...llmToolWords(name, args, { model: LLM_MODELS.small })],
-            { deadlineMs: 290000, maxBytes: 65536, abort, cleanup, journal: !['local_llm_status', 'local_llm_overview'].includes(name) });
-        const doc = checkedJson(result);
-        check(doc.ok === true && doc.agent === LLM_REF, 'Model Router MCP reply failed or names another agent');
+        const expected = await routeBinding(name, abort, cleanup);
+        const result = await command(`model-${name}`, profile.engine.path, [...core, 'node', '-e', LLM_TOOL_CALL, ...llmToolWords(name, args, { model: LLM_MODELS.small, agent: LLM_AGENT })],
+            { deadlineMs: 290000, maxBytes: 65536, abort, cleanup, tolerate: true, tolerateCancel: true, journal: !['local_llm_status', 'local_llm_overview'].includes(name) });
+        // Parse only for the safe diagnostic projection. No incomplete or
+        // nonzero transport result becomes trusted tool evidence.
+        let parsed = null; let transportFailure = null;
+        try { requireTransport(result); } catch (error) { transportFailure = error; }
+        try {
+            if (typeof result?.stdout === 'string' && Buffer.byteLength(result.stdout) <= 65536) {
+                const value = JSON.parse(result.stdout);
+                if (value && typeof value === 'object' && !Array.isArray(value)) parsed = value;
+            }
+        } catch { /* Malformed output remains a failed reply, with status-only evidence. */ }
+        const doc = parsed || {};
+        const identityMismatch = doc.error?.code === 'agent_identity_mismatch'
+            || (doc.ok === true || doc.agent !== undefined) && doc.agent !== expected.routeKey;
+        const admission = doc.error?.details?.admission;
+        const errorText = typeof doc.error?.message === 'string' ? doc.error.message.slice(0, 600) : '';
+        write(`model-tool-reply-${name.replaceAll('_', '-')}`, { schema: 1, runId: run.runId, tool: name, expected,
+            observed: { agent: doc.agent === expected.routeKey ? expected.routeKey : null, agentDigest: digest(JSON.stringify(doc.agent ?? null)) },
+            ok: !transportFailure && doc.ok === true, replyParsed: parsed !== null,
+            transport: { status: Number.isInteger(result?.status) ? result.status : null, timedOut: Boolean(result?.timedOut),
+                truncated: Boolean(result?.truncated), cancelled: Boolean(result?.cancelled), settlementForced: Boolean(result?.settlementForced) },
+            outcome: transportFailure ? 'transport-failure' : identityMismatch ? 'identity-mismatch' : doc.ok === false ? 'tool-refusal' : doc.ok === true ? 'success' : 'invalid-reply',
+            error: { code: typeof doc.error?.code === 'string' && /^(?:admission_[a-z_]+|runner_[a-z_]+|invalid_[a-z_]+|busy|licence_required|tool_error|transport|agent_not_found|agent_identity_mismatch)$/.test(doc.error.code) ? doc.error.code.slice(0, 80) : null,
+                errno: (/\b(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|EACCES|ENOENT)\b/.exec(errorText) || [])[0] || null,
+                httpStatus: (/\bHTTP (?:status )?([45][0-9]{2})\b/i.exec(errorText) || [])[1] || null,
+                admission: admission ? { status: ['ok', 'incompatible', 'insufficient-now', 'insufficient'].includes(admission.status) ? admission.status : null,
+                    reasonCode: typeof admission.reasonCode === 'string' && /^(?:admission_|runner_|vllm_|model_)[a-z_]{1,60}$/.test(admission.reasonCode) ? admission.reasonCode : null,
+                    estimate: Object.fromEntries(['gpuBytes', 'ramBytes', 'gpuMemoryUtilization', 'weightsBytes', 'kvBytes'].filter(key => Number.isFinite(admission.estimate?.[key])).map(key => [key, admission.estimate[key]])) } : null } });
+        if (transportFailure) throw transportFailure;
+        check(parsed, 'Model Router returned an invalid bounded reply');
+        check(!identityMismatch, 'Model Router reply identity mismatch');
+        check(doc.ok === true, 'Model Router tool refused the request');
+        await routeBinding(name, abort, cleanup);
         if (name === 'local_llm_status') {
             const { phase, profile: backend, deployment, runnerReport } = doc.result;
             return { phase, profile: backend, deployment, runnerReport };
@@ -186,6 +269,7 @@ export function createModelCases(ctx) {
         write('model-container-mounts', { schema: 1, runId: run.runId, box: modelMountFacts(boxFacts), agent: modelMountFacts(agent) });
         assertModelContainer(boxFacts, { profile, role: 'box' });
         assertModelContainer(agent, { profile, role: 'agent' });
+        toolAgent = agent;
         const source = assertModelSource(profile);
         source.binding = await sourceBinding(agent, boxFacts, source.stagedTreeDigest, 'before');
         if (profile.model.profile === 'apple') {
@@ -199,30 +283,43 @@ export function createModelCases(ctx) {
             await apple.check();
         }
         if (profile.gpu) {
-            const observed = host.observe(box.pid);
-            const prefix = observed?.cgroup?.match(new RegExp(`^(.*\\/libpod-${box.id}(?:\\.scope)?(?:\\/container)?)(?:\\/.*)?$`))?.[1];
-            check(prefix, 'Ordinary GPU Box ancestry unavailable');
-            gpu = createGpuGate({ query: () => processProvider(profile.gpu.smi.path, gpuQueryArgv(profile.gpu.uuid), { cwd: profile.host.home, env: { PATH: '/usr/bin:/bin', HOME: profile.host.home }, deadlineMs: 30000, maxBytes: 1048576, signal }),
-                host, uuid: profile.gpu.uuid, expectedMemoryMiB: profile.gpu.memoryMiB, boxPrefix: prefix, tolerated: run.toleratedProcesses || [], intervalMs: timings.monitorMs,
-                onRegister: record => { run.ownedProcesses.push({ kind: 'gpu-process', ...record }); persist(); } });
-            // Register only the exact agent leaf. Foreign processes remain fatal.
-            const leaves = [];
-            let visited = 0;
-            const findLeaf = (directory, depth) => {
-                check(++visited <= 128 && depth <= 8, 'Ordinary GPU ancestry observation exceeded its bound');
-                for (const name of new Set(host.cgroupDirectories(directory) || [])) {
-                    check(/^[A-Za-z0-9_.:@-]+$/.test(name), 'Invalid observed cgroup directory');
-                    const child = `${directory}/${name}`;
-                    // The host observer returns readdir entries, including controller
-                    // files. Only a readable cgroup directory consumes the walk bound.
-                    if (host.cgroupProcs(child) === null) continue;
-                    if (name === `libpod-${agent.id}` || name === `libpod-${agent.id}.scope`) leaves.push(child);
-                    else findLeaf(child, depth + 1);
+            check(sameContainer(boxFacts, box), 'Ordinary GPU Box identity changed');
+            const anchor = ordinaryGpuAnchor(host, boxFacts, agent);
+            const revalidate = async () => {
+                const currentBox = checkedJson(await engine('model-gpu-box', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, box.id], { journal: false }));
+                const currentAgent = checkedJson(await engine('model-gpu-agent', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, agent.id], { journal: false }));
+                check(sameContainer(currentBox, boxFacts) && sameContainer(currentAgent, agent), 'Ordinary GPU container identity changed');
+                check(sameProcess(namespaceProcess(host, box.pid), anchor.boxProcess)
+                    && sameProcess(namespaceProcess(host, anchor.agentProcess.hostPid), anchor.agentProcess), 'Ordinary GPU init identity changed');
+            };
+            const beforeClassify = async inventory => {
+                await revalidate();
+                const candidates = inventory.processes.map(({ pid }) => {
+                    const observed = host.observe(pid);
+                    return observed && cgroupWithin(observed.cgroup, anchor.prefix) ? namespaceProcess(host, pid) : null;
+                }).filter(Boolean);
+                const facts = checkedJson(await engine('model-process-facts', [...nested, 'container', 'exec', agent.id, 'node', '-e', MODEL_PROCESS_FACTS, profile.model.executable.path], { maxBytes: 16384, journal: false }));
+                check(Array.isArray(facts.processes) && facts.processes.length <= 4, 'Ordinary GPU runner facts unavailable');
+                await revalidate();
+                for (const observed of candidates) {
+                    const matches = facts.processes.filter(inner => Number.isSafeInteger(inner.pid) && inner.pid > 0
+                        && typeof inner.start === 'string' && /^[0-9]+$/.test(inner.start)
+                        && inner.exe === profile.model.executable.path && inner.sha256 === profile.model.executable.sha256 && inner.mps === false
+                        && observed.nspid?.length === anchor.agentProcess.nspid.length && observed.nspid.at(-1) === inner.pid
+                        && observed.startIdentity === inner.start && observed.bootId === anchor.agentProcess.bootId
+                        && observed.pidNamespace === anchor.agentProcess.pidNamespace);
+                    check(matches.length <= 1, 'Ordinary GPU runner mapping is ambiguous');
+                    if (matches.length === 1) {
+                        check(candidates.filter(value => value.pidNamespace === observed.pidNamespace
+                            && value.nspid.at(-1) === observed.nspid.at(-1) && value.startIdentity === observed.startIdentity).length === 1,
+                        'Ordinary GPU runner host mapping is ambiguous');
+                        gpu.registerClient(observed.hostPid, observed);
+                    }
                 }
             };
-            findLeaf(prefix, 0);
-            check(leaves.length === 1 && host.cgroupProcs(leaves[0]) !== null, 'Ordinary GPU agent ancestry unavailable');
-            gpu.registerLeaf(leaves[0]);
+            gpu = createGpuGate({ query: () => processProvider(profile.gpu.smi.path, gpuQueryArgv(profile.gpu.uuid), { cwd: profile.host.home, env: { PATH: '/usr/bin:/bin', HOME: profile.host.home }, deadlineMs: 30000, maxBytes: 1048576, signal }),
+                host, uuid: profile.gpu.uuid, expectedMemoryMiB: profile.gpu.memoryMiB, boxPrefix: anchor.prefix, tolerated: run.toleratedProcesses || [], intervalMs: timings.monitorMs, beforeClassify,
+                onRegister: record => { run.ownedProcesses.push({ kind: 'gpu-process', ...record }); persist(); } });
             await gpu.initial();
         }
         return { box: { id: box.id, image: box.image }, agent: { id: agent.id, image: agent.image, created: agent.created }, source };
