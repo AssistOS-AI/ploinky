@@ -7,6 +7,7 @@ import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { cpuMaxMatches, cpuQuotaMatches, nanoCpusMatches } from '../../cli/sandbox/hardwareLimits/cpuQuota.mjs';
 import { EXIT, validateRunManifest, writePrivateJson } from './fixtures.mjs';
 import { runBoundedProcess, requireTransport } from './liveProcess.mjs';
+import { createOwnershipClient, PROCESS_OWNER_ENV } from './liveProcessOwnership.mjs';
 import { assertRemoteArrival } from './liveRemote.mjs';
 import {
     HASH, HOST_RECORD_DIRECTORIES, ID, INSPECT, MAX_NESTED_LISTED, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, absolute, artifactPathFor, assertWorkspace,
@@ -754,6 +755,13 @@ export async function runLiveCommand({
     if (!authorizationPath) throw new Error('APPROVAL REQUIRED: provide the binding record for separate execution-time approval of this exact target/action');
     const { value: authorization, bytes: authorizationBytes } = readPrivateJson(authorizationPath, 4096);
     validateAuthorization(run, bytes, authorization, action);
+    let ownershipClient;
+    if (Object.hasOwn(process.env, PROCESS_OWNER_ENV)) {
+        if (run.block !== 'mac-model-venus' || run.target.execution?.model?.profile !== 'apple'
+            || run.target.ssh || remoteLocal !== null || processProvider) throw Error('Process ownership requires the local Apple action and exclusive provider');
+        ownershipClient = await createOwnershipClient({ descriptorPath: process.env[PROCESS_OWNER_ENV], runPath, runId: run.runId, action });
+        processProvider = ownershipClient.processProvider;
+    }
     if (remoteLocal !== null) {
         if (remoteLocal !== run.runId) throw new Error('Remote invocation run identity mismatch');
         if (expectedManifestDigest !== digest(bytes)) throw new Error('Remote manifest bytes do not match authorized local input');
@@ -774,5 +782,8 @@ export async function runLiveCommand({
                 : await executeLiveRun({ run, action, ...local });
         writePrivateJson(path.join(path.dirname(runPath), `report_${action}.json`), report);
         return report;
-    } finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); process.removeListener('SIGHUP', abort); }
+    } finally {
+        await ownershipClient?.close();
+        process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); process.removeListener('SIGHUP', abort);
+    }
 }

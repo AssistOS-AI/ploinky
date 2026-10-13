@@ -4,6 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import net from 'node:net';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { createOwnershipBroker, createOwnershipClient, inspectOwnershipEvidence, PROCESS_OWNER_ENV } from '../hardware-limits/liveProcessOwnership.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { runBoundedProcess } from '../hardware-limits/liveProcess.mjs';
@@ -1269,4 +1273,268 @@ test('R7.identity-check-stays-strict-for-a-running-agent-with-another-creation-t
     const { c1 } = await agentLoss(t, {}, (records) => { records.get('1'.repeat(64)).created = '2026-10-01T09:09:09Z'; });
     assert.equal(c1.result, 'fail');
     assert.equal(c1.row.reason, 'Agent identity changed');
+});
+
+// Offline real-process ownership checks. No engine, VM, model, or live target.
+async function ownershipFixture(t, action = 'live') {
+    const root = fs.realpathSync(fs.mkdtempSync('/tmp/hwo-test-'));
+    const binding = { runPath: path.join(root, 'run.json'), runId: crypto.randomBytes(16).toString('hex'), action };
+    const broker = await createOwnershipBroker({ binding, evidenceDirectory: root });
+    const client = await createOwnershipClient({ ...binding, descriptorPath: broker.descriptorPath });
+    t.after(async () => {
+        await client.close(); await broker.close();
+        fs.rmSync(path.dirname(broker.descriptorPath), { recursive: true, force: true });
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+    return { root, binding, broker, client };
+}
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function waitUntil(predicate, timeout = 3000) {
+    const end = Date.now() + timeout;
+    while (!predicate()) { if (Date.now() >= end) throw Error('Condition did not become true'); await delay(10); }
+}
+function ownershipFrame(value) {
+    const body = Buffer.from(JSON.stringify(value)), header = Buffer.alloc(4);
+    header.writeUInt32BE(body.length); return Buffer.concat([header, body]);
+}
+async function rawOwnership(descriptorPath, mutate = value => value) {
+    const descriptor = JSON.parse(fs.readFileSync(descriptorPath));
+    return new Promise(resolve => {
+        const socket = net.createConnection(descriptor.socketPath), chunks = [];
+        socket.on('error', () => {}); socket.on('data', chunk => chunks.push(chunk));
+        socket.on('close', () => resolve(Buffer.concat(chunks)));
+        socket.on('connect', () => {
+            const message = mutate({ type: 'run', requestId: crypto.randomBytes(16).toString('hex'),
+                epoch: descriptor.epoch, capability: descriptor.capability, binding: descriptor.binding,
+                binary: process.execPath, args: ['-e', 'process.exit(0)'],
+                options: { cwd: '/tmp', env: {}, deadlineMs: 1000, maxBytes: 1024, stdinPath: null } });
+            socket.write(Buffer.isBuffer(message) ? message : ownershipFrame(message));
+        });
+    });
+}
+test('OWNER.direct-broker-exit-signal-stdin-output-timeout-parity', async t => {
+    const f = await ownershipFixture(t);
+    const input = path.join(f.root, 'stdin'); fs.writeFileSync(input, 'private input\n', { mode: 0o600 });
+    for (const [script, extra] of [
+        ['process.stdout.write("out"); process.stderr.write("err"); process.exit(7)', {}],
+        ['process.kill(process.pid,"SIGUSR2")', {}],
+        ['process.stdin.pipe(process.stdout)', { stdinPath: input }],
+        ['process.stdout.write("x".repeat(3000));setInterval(()=>{},1000)', { maxBytes: 256 }],
+        ['process.on("SIGTERM",()=>{});setInterval(()=>{},1000)', { deadlineMs: 200 }],
+    ]) {
+        const options = { cwd: f.root, deadlineMs: 3000, maxBytes: 4096, ...extra };
+        const direct = await runBoundedProcess(process.execPath, ['-e', script], options);
+        const owned = await f.client.processProvider(process.execPath, ['-e', script], options);
+        for (const key of ['status', 'stdout', 'stderr', 'timedOut', 'truncated', 'cancelled', 'errorCode', 'settlementForced'])
+            assert.deepEqual(owned[key], direct[key], key);
+        if (!owned.truncated) assert.equal(owned.signal, direct.signal);
+    }
+    const receipt = await f.broker.settle(); assert.equal(receipt.settled, true);
+    assert.equal(receipt.requests.length, 5);
+    for (const record of receipt.requests) assert.ok(record.releasedAt <= record.endedAt && record.workerIdentity && record.state === 'terminal');
+});
+test('OWNER.early-target-exit-retains-custody-until-descendants-end', async t => {
+    const f = await ownershipFixture(t);
+    const script = "require('child_process').spawn(process.execPath,['-e',\"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)\"],{stdio:'ignore'});process.exit(0)";
+    const result = await f.client.processProvider(process.execPath, ['-e', script], { cwd: f.root });
+    assert.equal(result.status, 0); assert.equal(result.errorCode, null); assert.equal(result.settlementForced, false);
+    const receipt = await f.broker.settle(); assert.equal(receipt.settled, true); assert.deepEqual(receipt.unresolved, []);
+    assert.equal((await inspectOwnershipEvidence({ evidenceDirectory: f.root, binding: f.binding })).settled, true);
+});
+test('OWNER.spawn-errors-retain-canonical-failed-transport', async t => {
+    const f = await ownershipFixture(t), binary = path.join(f.root, 'missing-binary');
+    const direct = await runBoundedProcess(binary, [], { cwd: f.root });
+    const owned = await f.client.processProvider(binary, [], { cwd: f.root });
+    assert.deepEqual(owned, direct);
+});
+test('OWNER.connection-cap-refuses-excess-before-spawn', async t => {
+    const f = await ownershipFixture(t), descriptor = JSON.parse(fs.readFileSync(f.broker.descriptorPath)), sockets = [];
+    try {
+        for (let i = 0; i < 64; i++) await new Promise(resolve => {
+            const socket = net.createConnection(descriptor.socketPath); sockets.push(socket);
+            socket.on('error', () => {}); socket.once('connect', resolve);
+        });
+        assert.equal((await rawOwnership(f.broker.descriptorPath)).length, 0);
+        assert.equal((await f.broker.settle()).requests.length, 0);
+    } finally { for (const socket of sockets) socket.destroy(); }
+});
+test('OWNER.truncated-and-malformed-replies-fail-closed', async t => {
+    const f = await ownershipFixture(t), descriptor = JSON.parse(fs.readFileSync(f.broker.descriptorPath));
+    const socketPath = path.join(path.dirname(f.broker.descriptorPath), 'fake');
+    const fakeDescriptor = path.join(path.dirname(f.broker.descriptorPath), 'fake.json');
+    fs.writeFileSync(fakeDescriptor, JSON.stringify({ ...descriptor, socketPath }), { mode: 0o600 });
+    for (const reply of [Buffer.from([0, 0, 0, 100, 123]), ownershipFrame({ type: 'result', requestId: 'wrong', result: {} }),
+        ...[null, [], ['result'], true, false, 0, 42, 'result'].map(ownershipFrame)]) {
+        const server = net.createServer(socket => { socket.on('data', () => socket.end(reply)); });
+        await new Promise(resolve => server.listen(socketPath, resolve));
+        const client = await createOwnershipClient({ ...f.binding, descriptorPath: fakeDescriptor });
+        const result = await client.processProvider(process.execPath, ['-e', 'process.exit(0)'], { cwd: f.root });
+        assert.ok(result.errorCode); await client.close(); await new Promise(resolve => server.close(resolve));
+    }
+    assert.equal((await f.broker.settle()).requests.length, 0);
+});
+test('OWNER.nonobject-and-malformed-frames-refuse-without-crash-or-buffered-launch', async t => {
+    const f = await ownershipFixture(t), marker = path.join(f.root, 'must-not-launch');
+    const malformed = Buffer.from([0, 0, 0, 3, 123, 63, 125]);
+    for (const prefix of [...[null, [], ['run'], true, false, 0, 42, 'run', {}].map(ownershipFrame), malformed]) {
+        const response = await rawOwnership(f.broker.descriptorPath, message => Buffer.concat([prefix, ownershipFrame({ ...message,
+            args: ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)},'bad')`],
+        })]));
+        assert.equal(response.length, 0); assert.equal(fs.existsSync(marker), false);
+    }
+    // Bad peers do not kill the broker or disable a subsequent valid request.
+    const valid = await f.client.processProvider(process.execPath, ['-e', 'process.stdout.write("alive")'], { cwd: f.root });
+    assert.equal(valid.status, 0); assert.equal(valid.stdout, 'alive');
+    const receipt = await f.broker.settle(); assert.equal(receipt.settled, true); assert.equal(receipt.requests.length, 1);
+});
+test('OWNER.owner-death-during-registration-leaves-target-unopened', async t => {
+    const root = fs.realpathSync(fs.mkdtempSync('/tmp/hwo-unopened-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const binding = { runPath: path.join(root, 'run.json'), runId: 'c'.repeat(32), action: 'live' };
+    const modulePath = new URL('../hardware-limits/liveProcessOwnership.mjs', import.meta.url).href;
+    const registered = path.join(root, 'registered'), marker = path.join(root, 'started');
+    const owner = spawn(process.execPath, ['--input-type=module', '-e', `import fs from 'node:fs';import {createOwnershipBroker} from ${JSON.stringify(modulePath)};
+        const b=await createOwnershipBroker(${JSON.stringify({ binding, evidenceDirectory: root })});process.send({descriptorPath:b.descriptorPath});
+        const rename=fs.renameSync;fs.renameSync=(from,to)=>{rename(from,to);if(to.endsWith('ownership-registry.json')&&JSON.parse(fs.readFileSync(to)).requests.some(r=>r.state==='gated')){fs.writeFileSync(${JSON.stringify(registered)},'yes');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10000);}};`],
+        { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    t.after(() => { try { owner.kill('SIGKILL'); } catch {} });
+    const { descriptorPath } = await new Promise(resolve => owner.once('message', resolve));
+    const client = await createOwnershipClient({ ...binding, descriptorPath });
+    const pending = client.processProvider(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)},'bad')`], { cwd: root });
+    await waitUntil(() => fs.existsSync(registered)); owner.kill('SIGKILL'); assert.ok((await pending).errorCode);
+    await delay(500); assert.equal(fs.existsSync(marker), false);
+    const receipt = await inspectOwnershipEvidence({ evidenceDirectory: root, binding }); assert.equal(receipt.settled, true);
+    assert.equal(receipt.requests[0].state, 'gated'); await client.close();
+    fs.rmSync(path.dirname(descriptorPath), { recursive: true, force: true });
+});
+test('OWNER.abort-closes-admission-fresh-epoch-and-private-environment', async t => {
+    const f = await ownershipFixture(t), sentinel = path.join(f.root, 'started');
+    const controller = new AbortController();
+    const pending = f.client.processProvider(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(sentinel)},'yes');process.on('SIGTERM',()=>{});setInterval(()=>{},1000)`],
+        { cwd: f.root, signal: controller.signal, deadlineMs: 5000 });
+    await waitUntil(() => fs.existsSync(sentinel));
+    assert.equal(f.broker.closeAdmission('deadline').activeRequests, 1); controller.abort();
+    f.broker.closeAdmission('second-reason');
+    assert.equal((await pending).cancelled, true);
+    const marker = path.join(f.root, 'late');
+    const late = await f.client.processProvider(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)},'bad')`], { cwd: f.root });
+    assert.ok(late.errorCode); assert.equal(fs.existsSync(marker), false);
+    const receipt = await f.broker.settle(); assert.equal(receipt.reason, 'deadline'); assert.equal(receipt.settled, true);
+    assert.equal((await f.broker.settle()).settled, true);
+    const cleanup = await ownershipFixture(t, 'cleanup');
+    const result = await cleanup.client.processProvider(process.execPath, ['-e', `console.log(process.env.${PROCESS_OWNER_ENV} ?? 'absent');console.log(process.env.PRIVATE_TEST)`],
+        { cwd: cleanup.root, env: { [PROCESS_OWNER_ENV]: 'secret-descriptor', PRIVATE_TEST: 'private-value' } });
+    assert.equal(result.stdout, 'absent\nprivate-value\n');
+    await cleanup.broker.settle();
+    const evidence = fs.readFileSync(path.join(cleanup.root, 'ownership-registry.json'), 'utf8');
+    for (const secret of ['secret-descriptor', 'private-value', 'PRIVATE_TEST', 'capability']) assert.equal(evidence.includes(secret), false);
+});
+test('OWNER.descriptor-binding-permissions-and-protocol-bounds-refuse-before-target', async t => {
+    const f = await ownershipFixture(t);
+    for (const descriptorPath of ['', 'relative', path.join(f.root, 'missing')])
+        await assert.rejects(createOwnershipClient({ ...f.binding, descriptorPath }));
+    const link = path.join(f.root, 'link'); fs.symlinkSync(f.broker.descriptorPath, link);
+    await assert.rejects(createOwnershipClient({ ...f.binding, descriptorPath: link }));
+    const oversize = path.join(f.root, 'oversize'); fs.writeFileSync(oversize, 'x'.repeat(65537), { mode: 0o600 });
+    await assert.rejects(createOwnershipClient({ ...f.binding, descriptorPath: oversize }));
+    await assert.rejects(createOwnershipClient({ ...f.binding, action: 'cleanup', descriptorPath: f.broker.descriptorPath }));
+    for (const mutate of [
+        value => ({ ...value, epoch: '0'.repeat(32) }), value => ({ ...value, capability: '0'.repeat(64) }),
+        value => ({ ...value, binding: { ...value.binding, runId: '0'.repeat(32) } }),
+        value => ({ ...value, binding: { ...value.binding, action: 'cleanup' } }),
+        value => ({ ...value, options: { ...value.options, deadlineMs: 0 } }),
+        value => ({ ...value, requestId: [value.requestId] }),
+        () => { const buffer = Buffer.alloc(4); buffer.writeUInt32BE(8 * 1024 * 1024 + 1); return buffer; },
+    ]) assert.equal((await rawOwnership(f.broker.descriptorPath, mutate)).length, 0);
+    assert.equal((await f.broker.settle()).requests.length, 0);
+});
+test('OWNER.replay-and-concurrent-close-never-launch-late-target', async t => {
+    const f = await ownershipFixture(t), id = 'a'.repeat(32), marker = path.join(f.root, 'count');
+    const request = value => ({ ...value, requestId: id, args: ['-e', `require('fs').appendFileSync(${JSON.stringify(marker)},'x')`] });
+    assert.ok((await rawOwnership(f.broker.descriptorPath, request)).length > 0);
+    assert.equal((await rawOwnership(f.broker.descriptorPath, request)).length, 0);
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'x');
+    const late = path.join(f.root, 'late');
+    const commands = [1, 2].map(() => f.client.processProvider(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(late)},'bad')`], { cwd: f.root }));
+    f.broker.closeAdmission('race');
+    for (const result of await Promise.all(commands)) assert.ok(result.errorCode || result.cancelled);
+    assert.equal(fs.existsSync(late), false); assert.equal((await f.broker.settle()).settled, true);
+});
+test('OWNER.registration-persistence-failure-does-not-release-worker', async t => {
+    const f = await ownershipFixture(t), marker = path.join(f.root, 'must-not-start');
+    const original = fs.fsyncSync; let count = 0;
+    fs.fsyncSync = fd => { if (++count === 1) throw Error('offline persistence failure'); return original(fd); };
+    try {
+        const result = await f.client.processProvider(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)},'bad')`], { cwd: f.root });
+        assert.ok(result.cancelled || result.errorCode); assert.equal(fs.existsSync(marker), false);
+    } finally { fs.fsyncSync = original; }
+    const receipt = await f.broker.settle(); assert.equal(receipt.settled, false); assert.equal(receipt.persistenceFailed, true);
+});
+test('OWNER.queued-release-is-revoked-before-worker-continues', async t => {
+    const root = fs.realpathSync(fs.mkdtempSync('/tmp/hwo-gate-')), identity = crypto.randomBytes(16).toString('hex');
+    const gate = path.join(root, 'gate'), marker = path.join(root, 'started');
+    const worker = fileURLToPath(new URL('../hardware-limits/liveProcessOwnedWorker.mjs', import.meta.url));
+    const child = spawn(process.execPath, [worker, identity, gate], { detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    t.after(() => {
+        if (child.exitCode === null && child.signalCode === null) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+    await new Promise(resolve => child.once('message', resolve));
+    process.kill(child.pid, 'SIGSTOP');
+    fs.writeFileSync(gate, identity, { mode: 0o600 });
+    child.send({ type: 'release', identity, binary: process.execPath, args: ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)},'bad')`], cwd: root, env: {} });
+    fs.unlinkSync(gate);
+    process.kill(child.pid, 'SIGCONT');
+    await new Promise(resolve => child.once('close', resolve));
+    assert.equal(fs.existsSync(marker), false);
+});
+test('OWNER.client-disconnect-terminates-resistant-descendant-and-preserves-sentinel', async t => {
+    const f = await ownershipFixture(t), marker = path.join(f.root, 'started');
+    const sentinel = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+    t.after(() => { try { process.kill(-sentinel.pid, 'SIGKILL'); } catch {} });
+    const script = `const {spawn}=require('child_process');spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'});require('fs').writeFileSync(${JSON.stringify(marker)},'started');process.on('SIGTERM',()=>{});setInterval(()=>{},1000)`;
+    const pending = f.client.processProvider(process.execPath, ['-e', script], { cwd: f.root, deadlineMs: 5000 });
+    await waitUntil(() => fs.existsSync(marker)); await f.client.close(); assert.ok((await pending).errorCode);
+    const receipt = await f.broker.settle(); assert.equal(receipt.settled, true); assert.doesNotThrow(() => process.kill(sentinel.pid, 0));
+    assert.equal((await inspectOwnershipEvidence({ evidenceDirectory: f.root, binding: f.binding })).settled, true);
+});
+test('OWNER.owner-death-after-release-kills-group-within-disconnect-bound', async t => {
+    const root = fs.realpathSync(fs.mkdtempSync('/tmp/hwo-death-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const binding = { runPath: path.join(root, 'run.json'), runId: 'b'.repeat(32), action: 'live' };
+    const modulePath = new URL('../hardware-limits/liveProcessOwnership.mjs', import.meta.url).href;
+    const owner = spawn(process.execPath, ['--input-type=module', '-e', `import {createOwnershipBroker} from ${JSON.stringify(modulePath)};const b=await createOwnershipBroker(${JSON.stringify({ binding, evidenceDirectory: root })});process.send({descriptorPath:b.descriptorPath});`],
+        { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    t.after(() => { try { owner.kill('SIGKILL'); } catch {} });
+    const { descriptorPath } = await new Promise(resolve => owner.once('message', resolve));
+    const client = await createOwnershipClient({ ...binding, descriptorPath });
+    const marker = path.join(root, 'started');
+    const pending = client.processProvider(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)},'yes');process.on('SIGTERM',()=>{});setInterval(()=>{},1000)`], { cwd: root, deadlineMs: 5000 });
+    await waitUntil(() => fs.existsSync(marker));
+    const killedAt = Date.now(); owner.kill('SIGKILL'); assert.ok((await pending).errorCode);
+    let receipt;
+    do { receipt = await inspectOwnershipEvidence({ evidenceDirectory: root, binding }); if (!receipt.settled) await delay(20); }
+    while (!receipt.settled && Date.now() - killedAt < 1100);
+    assert.equal(receipt.settled, true); assert.ok(Date.now() - killedAt < 1100, '750 ms + 350 ms scheduling allowance');
+    assert.equal(receipt.recovered, true); await client.close();
+    fs.rmSync(path.dirname(descriptorPath), { recursive: true, force: true });
+});
+test('OWNER.selection-is-after-authorization-and-rejects-default-cpu-and-injected-provider', async t => {
+    const f = fixture(t), runPath = path.join(f.root, 'run.json'), authorizationPath = path.join(f.root, 'auth.json');
+    const bytes = Buffer.from(JSON.stringify(f.run)); fs.writeFileSync(runPath, bytes, { mode: 0o600 });
+    const authorization = { schema: 1, runId: f.run.runId, manifestDigest: hash(bytes), targetDigest: jsonDigest(f.run.target), action: 'live' };
+    fs.writeFileSync(authorizationPath, JSON.stringify(authorization), { mode: 0o600 });
+    const previous = process.env[PROCESS_OWNER_ENV]; process.env[PROCESS_OWNER_ENV] = '';
+    try {
+        await assert.rejects(runLiveCommand({ runPath, action: 'live' }), /APPROVAL REQUIRED/);
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', processProvider: f.provider }), /local Apple action/);
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live' }), /local Apple action/);
+        assert.equal(f.calls.length, 0);
+        f.run.block = 'mac-model-venus'; f.profile.model = { profile: 'apple' };
+        const appleBytes = Buffer.from(JSON.stringify(f.run)); fs.writeFileSync(runPath, appleBytes);
+        fs.writeFileSync(authorizationPath, JSON.stringify({ ...authorization, manifestDigest: hash(appleBytes), targetDigest: jsonDigest(f.run.target) }));
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live' }), /Invalid private ownership path/);
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', processProvider: f.provider }), /exclusive provider/);
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', remoteLocal: f.run.runId }), /local Apple action/);
+    } finally { if (previous === undefined) delete process.env[PROCESS_OWNER_ENV]; else process.env[PROCESS_OWNER_ENV] = previous; }
 });
