@@ -12,11 +12,10 @@ import {
     buildPodmanStagedTargetMounts,
     codeRelativeMountPath,
     collectManifestVolumeEntries,
-    ensurePodmanStagedCodeDir,
+    ensureCodeMountPoint,
     ensurePodmanStagedAgentLibDir,
     ensureManifestVolumeHostPath,
     manifestVolumeMountSuffix,
-    mergeNodeOptions,
     podmanManifestVolumeMountSuffix,
     podmanMountSuffix,
     resolveReusablePodmanStagedMounts,
@@ -41,8 +40,7 @@ test('link-install stages Agent links without occupying the agent code linked di
     // the Box, and in the agent container.
     const linkText = fs.readlinkSync(path.join(staged, 'linked/Library'));
     assert.equal(path.posix.resolve('/Agent/linked', linkText), source);
-    const stagedCode = ensurePodmanStagedCodeDir('test', code, deps, new Map(), { runtimeRoot });
-    assert.equal(fs.readFileSync(path.join(stagedCode, 'linked/keep.txt'), 'utf8'), 'agent-owned');
+    assert.equal(fs.readFileSync(path.join(code, 'linked/keep.txt'), 'utf8'), 'agent-owned');
     assert.equal(fs.existsSync(path.join(code, 'linked/Library')), false);
     const mounts = buildPodmanStagedTargetMounts({ agentCodePath: code, nodeModulesDir: deps, linkedRepositories, codeReadOnly: true });
     assert.deepEqual(mounts.find(m => m.source === source), { source, target: source, ro: false });
@@ -94,59 +92,38 @@ test('codeRelativeMountPath recognizes mounts below /code only', () => {
     assert.equal(codeRelativeMountPath('/code'), null);
 });
 
-test('ensurePodmanStagedCodeDir stages source tree with dependency and /code volume symlinks', () => {
+test('ensureCodeMountPoint creates empty mount points in the agent source and refuses mismatched entries', () => {
     const root = tempDir();
     try {
         const agentCodePath = path.join(root, 'agent');
-        const cacheNodeModules = path.join(root, 'cache', 'node_modules');
-        const runtimeConfig = path.join(root, 'generated', 'runtime.json');
-        const topLevelConfig = path.join(root, 'generated', 'top.txt');
-        fs.mkdirSync(path.join(agentCodePath, 'config'), { recursive: true });
-        fs.mkdirSync(cacheNodeModules, { recursive: true });
-        fs.mkdirSync(path.dirname(runtimeConfig), { recursive: true });
-        fs.writeFileSync(path.join(agentCodePath, 'package.json'), '{"type":"module"}\n');
-        fs.writeFileSync(path.join(agentCodePath, 'config', 'default.json'), '{}\n');
-        fs.writeFileSync(path.join(agentCodePath, 'top.txt'), 'source\n');
-        fs.writeFileSync(runtimeConfig, '{"generated":true}\n');
-        fs.writeFileSync(topLevelConfig, 'generated\n');
-
-        const stagedCodePath = ensurePodmanStagedCodeDir('demo', agentCodePath, cacheNodeModules, new Map([
-            ['config/runtime.json', runtimeConfig],
-            ['top.txt', topLevelConfig],
-        ]), { runtimeRoot: path.join(root, 'runtime') });
-
-        assert.equal(fs.realpathSync(path.join(stagedCodePath, 'package.json')), fs.realpathSync(path.join(agentCodePath, 'package.json')));
-        assert.equal(fs.realpathSync(path.join(stagedCodePath, 'node_modules')), fs.realpathSync(cacheNodeModules));
-        assert.equal(fs.realpathSync(path.join(stagedCodePath, 'config', 'default.json')), fs.realpathSync(path.join(agentCodePath, 'config', 'default.json')));
-        assert.equal(fs.realpathSync(path.join(stagedCodePath, 'config', 'runtime.json')), fs.realpathSync(runtimeConfig));
-        assert.equal(fs.realpathSync(path.join(stagedCodePath, 'top.txt')), fs.realpathSync(topLevelConfig));
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});
-
-test('ensurePodmanStagedCodeDir rejects manifest overrides below /code/node_modules', () => {
-    const root = tempDir();
-    try {
-        const agentCodePath = path.join(root, 'agent');
-        const cacheNodeModules = path.join(root, 'cache', 'node_modules');
-        const replacement = path.join(root, 'replacement');
         fs.mkdirSync(agentCodePath, { recursive: true });
-        fs.mkdirSync(cacheNodeModules, { recursive: true });
-        fs.mkdirSync(replacement, { recursive: true });
+        fs.writeFileSync(path.join(agentCodePath, 'top.txt'), 'source\n');
 
-        assert.throws(
-            () => ensurePodmanStagedCodeDir('demo', agentCodePath, cacheNodeModules, new Map([
-                ['node_modules/minimatch', replacement],
-            ]), { runtimeRoot: path.join(root, 'runtime') }),
-            /reserved \/code\/node_modules/,
-        );
+        ensureCodeMountPoint(agentCodePath, 'node_modules');
+        ensureCodeMountPoint(agentCodePath, 'config/runtime.json', { file: true });
+        assert.deepEqual(fs.readdirSync(path.join(agentCodePath, 'node_modules')), []);
+        assert.equal(fs.readFileSync(path.join(agentCodePath, 'config', 'runtime.json'), 'utf8'), '');
+        // Existing mount points are reused, never rewritten.
+        ensureCodeMountPoint(agentCodePath, 'top.txt', { file: true });
+        assert.equal(fs.readFileSync(path.join(agentCodePath, 'top.txt'), 'utf8'), 'source\n');
+
+        fs.symlinkSync(root, path.join(agentCodePath, 'skills'), 'dir');
+        assert.throws(() => ensureCodeMountPoint(agentCodePath, 'skills'), /is not a directory/);
+        assert.throws(() => ensureCodeMountPoint(agentCodePath, 'top.txt'), /is not a directory/);
+        assert.throws(() => ensureCodeMountPoint(agentCodePath, '../escape'), /invalid \/code mount point/);
+        assert.throws(() => ensureCodeMountPoint(agentCodePath, 'missing', { adoptOnly: true }), /mount point/);
+        assert.equal(fs.existsSync(path.join(agentCodePath, 'missing')), false);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
 });
 
-test('resolveReusablePodmanStagedMounts preserves exact managed Agent and code directories', () => {
+test('podman agents run without symlink-preserving NODE_OPTIONS', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /preserve-symlinks/);
+});
+
+test('resolveReusablePodmanStagedMounts preserves the exact managed Agent directory', () => {
     const root = tempDir();
     try {
         const runtimeRoot = path.join(root, 'container-runtime', 'demo');
@@ -162,7 +139,7 @@ test('resolveReusablePodmanStagedMounts preserves exact managed Agent and code d
                     { source: codeSource, target: '/code', ro: false },
                 ],
             },
-        }, runtimeRoot), { agentLibMountPath: agentSource, codeMountPath: codeSource });
+        }, runtimeRoot), { agentLibMountPath: agentSource });
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -343,13 +320,6 @@ test('pruneStaleRuntimeEntries returns empty list when runtimeRoot is missing', 
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
-});
-
-test('mergeNodeOptions appends podman symlink flags without duplicating existing options', () => {
-    assert.equal(
-        mergeNodeOptions('--trace-warnings --preserve-symlinks', ['--preserve-symlinks', '--preserve-symlinks-main']),
-        '--trace-warnings --preserve-symlinks --preserve-symlinks-main',
-    );
 });
 
 test('podmanMountSuffix places z before ro for absolute self-mount targets', () => {
