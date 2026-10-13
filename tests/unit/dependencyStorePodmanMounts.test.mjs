@@ -10,7 +10,7 @@ import {
     buildPersistentAgentRunArgs,
     buildPodmanStagedTargetMounts,
     ensurePodmanStagedAgentLibDir,
-    ensurePodmanStagedCodeDir,
+    ensureCodeMountPoint,
     podmanMountSuffix,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { buildAgentInstallPlan } from '../../cli/utils/dependencies/store/installContract.mjs';
@@ -148,8 +148,9 @@ for (const layout of LAYOUTS) for (const stateRoot of [false, true]) {
         const healthProbeHostDir = path.join(workspace, '.ploinky', 'run', 'health-probes', agentName);
         for (const dir of [agentCodePath, sharedDir, agentHomeDir, healthProbeHostDir]) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(agentCodePath, 'index.js'), 'export default 1;\n');
+        ensureCodeMountPoint(agentCodePath, 'node_modules');
 
-        // Same sequence as the Podman start path: staged Agent and code trees,
+        // Same sequence as the Podman start path: the staged Agent tree, /code bound directly,
         // the persistent run arguments, staged target mounts, then controller guards.
         const nodeModulesDir = own.built.nodeModulesPath;
         const runtimeRoot = path.join(workspace, '.ploinky', 'container-runtime', containerName);
@@ -159,9 +160,9 @@ for (const layout of LAYOUTS) for (const stateRoot of [false, true]) {
             envHash: 'depstore-podman-test',
             containerWorkdir: layout.workdir,
             agentLibMountPath: ensurePodmanStagedAgentLibDir(agentName, nodeModulesDir, { runtimeRoot, linkedRepositories: [] }),
-            codeMountPath: ensurePodmanStagedCodeDir(agentName, agentCodePath, nodeModulesDir, new Map(), { runtimeRoot }),
+            codeMountPath: agentCodePath,
             codeMountMode: ':z,ro',
-            useNestedDependencyMounts: false,
+            stagedAgentLib: true,
             preparedNodeModulesDir: nodeModulesDir,
             sharedDir,
             healthProbeHostDir,
