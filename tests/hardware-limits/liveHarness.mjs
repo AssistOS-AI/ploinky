@@ -149,7 +149,7 @@ export function validateProfile(run, { partial = false } = {}) {
     } else {
         if (profile.box) validateC5BoxReceipts(run, profile);
         else if (run.ownedBoxes.length > 1) throw new Error('Only one immutable owned Box is supported');
-        keys(run.preInventory, [], 'before inventory', ['containers']);
+        keys(run.preInventory, [], 'before inventory', ['containers', 'gpuGrants']);
     }
     if (run.preInventory.containers !== undefined && (!Array.isArray(run.preInventory.containers) || run.preInventory.containers.length > 256
         || run.preInventory.containers.some(value => !ID.test(value.id) || !bounded(value.created, 128) || !bounded(value.image, 128)))) throw new Error('Invalid before inventory');

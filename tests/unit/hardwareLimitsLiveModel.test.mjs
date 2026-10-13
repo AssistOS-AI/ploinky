@@ -540,6 +540,64 @@ test('MODEL.apple-cpu-preserves-unrelated-grant-records-and-detects-changes', as
     assert.notEqual((await changed.live()).verdict, 'PASS');
 });
 
+test('MODEL.completed-live-run-allows-repeated-standalone-cleanup', async t => {
+    for (const profile of ['apple-cpu', 'cpu', 'apple', 'nvidia']) {
+        const w = world(t, profile);
+        assert.equal((await w.provision()).verdict, 'PASS');
+        if (profile === 'apple-cpu') assert.deepEqual(w.run.preInventory, { containers: [], gpuGrants: [] });
+        assert.equal((await w.live()).verdict, 'PASS');
+        assert.equal(w.run.cleanup.state, 'complete');
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            w.artifacts.delete('llm-cleanup-proof'); w.artifacts.delete('model-grants-after');
+            const result = await w.cleanup();
+            assert.equal(result.verdict, 'PASS', JSON.stringify(result));
+            assert.equal(result.exitCode, 0); assert.equal(result.cleanup.state, 'complete');
+            assert.deepEqual(result.cleanup.failures, []);
+            const proof = w.artifacts.get('llm-cleanup-proof');
+            assert.equal(proof.action, 'cleanup'); assert.equal(proof.runId, w.run.runId);
+            assert.deepEqual(proof.remaining, []);
+            if (profile === 'apple-cpu') assert.deepEqual(w.artifacts.get('model-grants-after'), { runId: w.run.runId, entries: [] });
+        }
+    }
+});
+
+test('MODEL.apple-cpu-standalone-cleanup-retains-complete-grant-and-ownership-checks', async t => {
+    const w = world(t, 'apple-cpu');
+    const grants = path.join(w.pins.host.home, '.ploinky-box', 'gpu-grants');
+    const directory = path.join(grants, 'unrelated'); fs.mkdirSync(directory, { recursive: true });
+    const sentinel = path.join(directory, 'grant.json'); const bytes = '{"grant":"unrelated"}'; fs.writeFileSync(sentinel, bytes);
+    assert.equal((await w.provision()).verdict, 'PASS');
+    assert.equal((await w.live()).verdict, 'PASS');
+    const cleanup = run => executeCleanupRun({ ...w.options(), run });
+    const result = await w.cleanup(); assert.equal(result.verdict, 'PASS', JSON.stringify(result));
+    assert.deepEqual(w.artifacts.get('model-grants-after').entries, w.run.preInventory.gpuGrants);
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), bytes);
+    for (const mutate of [
+        run => { delete run.preInventory.gpuGrants; },
+        run => { run.preInventory.gpuGrants = null; },
+        run => { run.preInventory.gpuGrants.pop(); },
+        run => { run.preInventory.gpuGrants[1].sha256 = '0'.repeat(64); },
+        run => { run.preInventory.gpuGrants[1].path = '../foreign.json'; },
+    ]) {
+        const bad = clone(w.run); mutate(bad);
+        const failed = await cleanup(bad); assert.equal(failed.verdict, 'FAIL');
+        assert.ok(failed.cleanup.failures.includes('Unrelated GPU grant inventory changed'));
+    }
+    for (const mutate of [
+        run => { run.preInventory.unexpected = []; },
+        run => { run.preInventory.containers = [{ id: 'short', created: 'now', image: 'image' }]; },
+        run => { run.ownedPaths.push({ path: grants }); },
+    ]) {
+        const bad = clone(w.run); mutate(bad); const before = w.calls.length;
+        assert.equal((await cleanup(bad)).verdict, 'BLOCKED');
+        assert.equal(w.calls.length, before, 'invalid inventory or ownership must refuse before commands');
+    }
+    fs.writeFileSync(sentinel, 'changed');
+    const changed = await cleanup(clone(w.run)); assert.equal(changed.verdict, 'FAIL');
+    assert.ok(changed.cleanup.failures.includes('Unrelated GPU grant inventory changed'));
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'changed');
+});
+
 test('MODEL.measurement-manifest-through-canonical-cohort-retains-receipts', async t => {
     for (const profile of ['apple', 'apple-cpu']) {
         const w = world(t, profile, { measurement: 'baseline-v1' });
