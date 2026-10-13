@@ -37,6 +37,7 @@ import {
     waitForAgentReady,
 } from '../server/utils/agentReadiness.js';
 import { InMemoryPolicyStateStore } from '../server/policy/InMemoryPolicyStateStore.js';
+import { FileSystemPolicyStateStore } from '../server/policy/FileSystemPolicyStateStore.js';
 import { McpToolPolicy } from '../server/policy/McpToolPolicy.js';
 import { PolicyStateRepository } from '../server/policy/PolicyStateRepository.js';
 import {
@@ -742,7 +743,7 @@ export function prepareAgentEnableBatch(requests, {
                     'router-security',
                     'policy-state.json',
                 );
-                fs.writeFileSync(policyFile, JSON.stringify(policy, null, 2));
+                new FileSystemPolicyStateStore({ file: () => policyFile, coordinate: false }).write(policy);
                 preparedGeneration = prepareEdgeRoutingGeneration({ reason, applyLockCapability });
             } else if (effectiveAvailabilityMode === 'additive') {
                 retireNoWaitMarkers(supersededNoWaitRecords);
