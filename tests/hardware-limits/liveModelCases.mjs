@@ -12,6 +12,7 @@ import { llmCleanupProof } from './liveLlmCases.mjs';
 import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs';
 import { createHostProc } from './liveGpuHost.mjs';
 import { createModelHostGuard, observeAppleMachine, parseModelHostSample } from './liveModelHostGuard.mjs';
+import { MODEL_SOURCE_VIEW, modelMountFacts, modelSourceLayout, observeModelStage } from './liveModelSource.mjs';
 
 export const MODEL_PROFILES = Object.freeze({
     apple: { block: 'mac-model-venus', case: 'LIVE-L6', platform: 'darwin', backend: 'venus', runner: 'llama.cpp-vulkan', executable: '/opt/llama.cpp-vulkan/llama-server' },
@@ -30,6 +31,7 @@ export function modelPlan(run) {
     return [
         command('model-box-contract', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<BOX_ID>']),
         command('model-agent-source', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<AGENT_ID>']),
+        command('model-source-view', [...nested, 'container', 'exec', '<AGENT_ID>', 'node', '-e', '<MODEL_SOURCE_VIEW>', '<PINNED_SOURCE_AND_DEPENDENCY_PATHS>']),
         { id: 'model-source', action: `Rehash ${profile.provision.workspace.path}/local-llms/local-llm against ${profile.provision.llm.treeDigest}, allowing only the recorded manifest.container rewrite` },
         ...(profile.model.profile === 'apple' ? [
             command('model-machine-list', ['machine', 'list', '--format', 'json']),
@@ -120,9 +122,7 @@ export function assertModelContainer(value, { profile, role }) {
         const owned = profile.agents.find(agent => agent.role === 'llm');
         check(owned && value.id === owned.id && value.created === owned.created && value.image === owned.image
             && value.imageName === profile.llm.image && value.running === true, 'Model agent identity changed');
-        const mounts = value.mounts.filter(mount => mount.Destination === '/code');
-        check(mounts.length === 1 && mounts[0].Source === path.join(profile.workspace.path, 'local-llms', 'local-llm')
-            && mounts[0].RW === false, 'Model /code is not the exact read-only ordinary source');
+        modelSourceLayout(profile, value);
     }
     check(!value.labels?.[BOX_LABELS.hardwareLimits] || value.labels[BOX_LABELS.hardwareLimits] === 'off', 'Model Box budgets must be off');
     if (profile.model.profile === 'cpu') {
@@ -183,9 +183,11 @@ export function createModelCases(ctx) {
         const agentName = fixtureContainerName(profile.workspace.path, 'local-llm', 'local-llms');
         const boxFacts = checkedJson(await engine('model-box', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, box.id]));
         const agent = checkedJson(await engine('model-agent', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, agentName]));
+        write('model-container-mounts', { schema: 1, runId: run.runId, box: modelMountFacts(boxFacts), agent: modelMountFacts(agent) });
         assertModelContainer(boxFacts, { profile, role: 'box' });
         assertModelContainer(agent, { profile, role: 'agent' });
         const source = assertModelSource(profile);
+        source.binding = await sourceBinding(agent, boxFacts, source.stagedTreeDigest, 'before');
         if (profile.model.profile === 'apple') {
             const machine = await observeAppleMachine({ profile, engine });
             write('model-apple-machine', machine);
@@ -225,6 +227,14 @@ export function createModelCases(ctx) {
         }
         return { box: { id: box.id, image: box.image }, agent: { id: agent.id, image: agent.image, created: agent.created }, source };
     }
+    async function sourceBinding(agent, box, expectedTreeDigest, label, abort = null) {
+        const name = `model-source-binding-${label}`;
+        const stage = observeModelStage(profile, agent, { box, write: facts => write(name, { runId: run.runId, ...facts }) });
+        const view = checkedJson(await engine('model-source-view', [...nested, 'container', 'exec', agent.id, 'node', '-e', MODEL_SOURCE_VIEW, JSON.stringify(stage.view)], { abort, maxBytes: 1048576 }));
+        write(name, { runId: run.runId, ...stage, namespace: view });
+        check(view.complete === true && view.treeDigest === expectedTreeDigest, 'Model namespace code does not resolve to the pinned source bytes');
+        return { stage: stage.layout.stage, dependency: stage.dependency, provider: stage.provider, treeDigest: view.treeDigest, files: view.files.length };
+    }
     async function liveModel() {
         const evidence = { schema: 1, runId: run.runId, case: spec.case, profile: profile.model.profile, status: 'running' };
         try {
@@ -254,6 +264,13 @@ export function createModelCases(ctx) {
                 if (gpu) await gpu.check('model-after-prompt');
                 assertModelObservation({ spec, model: profile.model, pins: profile.llm.models.small, status: evidence.deployment, answer: evidence.answer, processes: facts.processes, imageId: agent.image });
                 check(assertModelSource(profile).stagedTreeDigest === evidence.source.stagedTreeDigest, 'Staged model source changed during inference');
+                const after = checkedJson(await engine('model-agent-after', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, agent.id], { abort }));
+                const boxAfter = checkedJson(await engine('model-box-after', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, profile.box.id], { abort }));
+                write('model-container-mounts-after', { schema: 1, runId: run.runId, box: modelMountFacts(boxAfter), agent: modelMountFacts(after) });
+                assertModelContainer(after, { profile, role: 'agent' });
+                assertModelContainer(boxAfter, { profile, role: 'box' });
+                const afterBinding = await sourceBinding(after, boxAfter, evidence.source.stagedTreeDigest, 'after', abort);
+                check(afterBinding.stage === evidence.source.binding.stage && afterBinding.dependency.generationId === evidence.source.binding.dependency.generationId, 'Model source stage or dependency changed during inference');
             });
             evidence.status = 'pass';
             return evidence;

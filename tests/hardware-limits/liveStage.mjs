@@ -185,11 +185,11 @@ export function c5RequiredArtifacts({ profile, action, remoteReport, fetched = n
 }
 
 // What a run must have left for its PASS to be certified: the proof each action ends with.
-export function requiredArtifacts({ profile, action, remoteReport, fetched = null }) {
+export function requiredArtifacts({ profile, action, remoteReport, fetched = null, dispatchHistory = null }) {
     if (profile?.model) {
         if (action === 'provision') return ['box-inspect', 'box-contract', ...(profile.gpu ? ['gpu-initial-gate'] : []), ...(profile.model.profile === 'apple' ? ['model-apple-machine'] : [])];
-        if (action === 'live') return [`model-${profile.cases[0].toLowerCase()}`, 'llm-cleanup-proof', ...(remoteReport?.verdict === 'PASS' ? ['model-stop-proof'] : []), ...(profile.gpu ? ['gpu-final-observation'] : []), ...(profile.model.profile === 'apple' ? ['model-a15-host-guard'] : [])];
-        if (action === 'cleanup') return ['llm-cleanup-proof', `model-${profile.cases[0].toLowerCase()}`, ...(profile.gpu ? ['gpu-final-observation'] : [])];
+        if (action === 'live') return [`model-${profile.cases[0].toLowerCase()}`, 'llm-cleanup-proof', ...(remoteReport?.verdict === 'PASS' ? ['model-stop-proof', 'model-container-mounts', 'model-source-binding-before', 'model-container-mounts-after', 'model-source-binding-after'] : []), ...(profile.gpu ? ['gpu-final-observation'] : []), ...(profile.model.profile === 'apple' ? ['model-a15-host-guard'] : [])];
+        if (action === 'cleanup') return ['llm-cleanup-proof', ...(modelProvisionOnlyCleanupProven({ fetched, dispatchHistory }) ? [] : [`model-${profile.cases[0].toLowerCase()}`]), ...(profile.gpu ? ['gpu-final-observation'] : [])];
         return [];
     }
     if (!profile?.gpu) return profile?.cases?.includes('LIVE-C5') ? c5RequiredArtifacts({ profile, action, remoteReport, fetched }) : [];
@@ -204,13 +204,40 @@ export function requiredArtifacts({ profile, action, remoteReport, fetched = nul
     return [];
 }
 
+// Absence of an inference artifact is never proof that live was not attempted.
+// The caller's persisted dispatch intent precedes the remote command, including
+// cancellation or failed transport. Only a complete, bound non-live history
+// may certify cleanup of a cohort that was provisioned but never tested.
+export function modelProvisionOnlyCleanupProven({ fetched, dispatchHistory }) {
+    if (!fetched || !RUN_ID.test(fetched.runId || '') || dispatchHistory?.schema !== 1 || dispatchHistory.runId !== fetched.runId
+        || dispatchHistory.rootIntent !== true || dispatchHistory.staged !== true
+        || !['dev', 'ino', 'uid'].every(key => typeof dispatchHistory.identity?.[key] === 'string' && /^[0-9]+$/.test(dispatchHistory.identity[key]))
+        || typeof fetched.target?.stage?.root !== 'string' || dispatchHistory.root !== fetched.target.stage.root
+        || !Array.isArray(fetched.operations) || fetched.operations.some(op => !op || typeof op.kind !== 'string')) return false;
+    const liveKinds = new Set(['model-box', 'model-agent', 'model-source-view', 'model-agent-after', 'model-box-after']);
+    if (fetched.operations.some(op => liveKinds.has(op.kind) || op.kind.startsWith('model-local_llm_'))) return false;
+    const history = dispatchHistory.dispatches;
+    if (!Array.isArray(history) || history.length < 2 || history.length > 1024
+        || history.some(entry => !entry || !['provision', 'cleanup'].includes(entry.action)
+            || !['intent', 'returned', 'incomplete'].includes(entry.state) || !HASH.test(entry.manifestDigest || ''))
+        || history[0].action !== 'provision' || history.at(-1).action !== 'cleanup' || history.at(-1).state !== 'returned') return false;
+    return true;
+}
+
 export function modelInferenceProofProblem(bytes, { runId, caseId, requirePass = false }) {
     let proof;
     try { proof = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch { return 'model inference proof is not JSON'; }
     if (proof?.schema !== 1 || proof.runId !== runId || proof.case !== caseId) return 'model inference proof identity mismatch';
     if (!['pass', 'fail'].includes(proof.status) || requirePass && proof.status !== 'pass') return 'model inference proof is not a terminal result';
     if (proof.status === 'pass' && (typeof proof.answer?.text !== 'string' || !proof.answer.text.trim() || !Number.isFinite(proof.answer.generationTokensPerSecond) || proof.answer.generationTokensPerSecond <= 0
-        || !proof.agent?.id || !proof.source?.stagedTreeDigest || !Array.isArray(proof.processes) || proof.processes.length !== 1)) return 'model inference proof lacks runtime evidence';
+        || !proof.agent?.id || !HASH.test(proof.source?.stagedTreeDigest || '') || !Array.isArray(proof.processes) || proof.processes.length !== 1
+        || typeof proof.source?.binding?.stage !== 'string' || !/^\/.*\/code-[1-9][0-9]*-[1-9][0-9]*$/.test(proof.source.binding.stage)
+        || proof.source.binding.treeDigest !== proof.source.stagedTreeDigest || !/^[a-f0-9]{64}$/.test(proof.source.binding.dependency?.generationId || '')
+        || proof.source.binding.provider?.mode !== 'image' || proof.source.binding.provider.path !== '/opt/ploinky-agentlib'
+        || !/^[a-f0-9]{64}$/.test(proof.source.binding.provider.sourceIdHash || '')
+        || proof.source.binding.provider.boxId !== proof.box?.id || !HASH.test(proof.source.binding.provider.supplyingImageId || '')
+        || proof.source.binding.provider.supplyingImageId !== `sha256:${String(proof.box?.image).replace(/^sha256:/, '')}`
+        || !Number.isInteger(proof.source.binding.files) || proof.source.binding.files < 1)) return 'model inference proof lacks runtime evidence';
     return null;
 }
 
@@ -372,7 +399,9 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         if (jsonDigest(JSON.parse(reportText)) !== jsonDigest(remoteReport)) throw new Error('Fetched remote report differs from the dispatched result');
         writePrivateBytes(path.join(runDirectory, `report_${action}_remote_${suffix}.json`), Buffer.from(reportText, 'utf8'));
         // The side artifacts, with digest proof, before anything can be removed.
-        const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport, fetched }) });
+        const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport, fetched,
+            dispatchHistory: { schema: journal.schema, runId: journal.runId, root: journal.root, rootIntent: journal.rootIntent,
+                staged: journal.staged, identity: journal.identity, dispatches: journal.dispatches } }) });
         // A cleanup's LLM proof must be this action's own, for this run, with nothing remaining.
         const proofEntry = action === 'cleanup' || profile.model && action === 'live' ? artifacts.fetched.find(entry => entry.name === 'llm-cleanup-proof') : null;
         if (proofEntry) {

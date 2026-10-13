@@ -8,15 +8,23 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import vm from 'node:vm';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
+import { agentLibLabels, normalizeBoxAgentLib } from '../../ploinky-box/contract/agentlib.mjs';
+import { imageSourceIdentity } from '../../agentlib/contract.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { buildConcreteManifest, validatePins, CONCRETE_BLOCKS, renderSummary } from '../hardware-limits/liveManifest.mjs';
 import { validateProfile, executeLiveRun, executeCleanupRun, validateAuthorization } from '../hardware-limits/liveHarness.mjs';
 import { provisionRun, fixtureContainerName } from '../hardware-limits/liveFixture.mjs';
 import { engineIdentityDigest, digest, jsonDigest, liveSourceDigest, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
 import { MODEL_PROFILES, assertModelObservation, assertModelContainer, assertModelSource, validateModelPins } from '../hardware-limits/liveModelCases.mjs';
+import { MODEL_SOURCE_VIEW, modelSourceLayout, observeModelStage, observeModelCodeView } from '../hardware-limits/liveModelSource.mjs';
+import { ensurePodmanStagedCodeDir } from '../../cli/sandbox/docker/agentServiceManager.js';
+import { canonicalDigest } from '../../cli/utils/dependencies/store/canonical.mjs';
+import { hashInstalledTree } from '../../cli/utils/dependencies/store/treeHash.mjs';
+import { buildResolutionManifest } from '../../cli/utils/dependencies/store/resolution.mjs';
+import { generationIdFor } from '../../cli/utils/dependencies/store/objectStore.mjs';
 import { assertModelHostSample, parseModelHostSample, createModelHostGuard, observeAppleMachine } from '../hardware-limits/liveModelHostGuard.mjs';
 import { MODEL_PROCESS_FACTS, LLM_TOOL_CALL } from '../hardware-limits/liveLlmCommands.mjs';
-import { requiredArtifacts, llmCleanupProofProblem, modelInferenceProofProblem, judgeArtifacts, writeUstar } from '../hardware-limits/liveStage.mjs';
+import { requiredArtifacts, llmCleanupProofProblem, modelInferenceProofProblem, modelProvisionOnlyCleanupProven, judgeArtifacts, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { fakeEngineInfo, evaluateTemplate, inspectModel, ok } from '../hardware-limits/fakeLiveEngine.mjs';
 import { validateRunManifest } from '../hardware-limits/fixtures.mjs';
 
@@ -26,6 +34,64 @@ const CONFIG = `sha256:${'b'.repeat(64)}`;
 const SMALL = { id: 'qwen2.5-0.5b-instruct-q4_k_m', repo: 'Qwen/Qwen2.5-0.5B-Instruct-GGUF', file: 'qwen2.5-0.5b-instruct-q4_k_m.gguf', commit: 'c'.repeat(40), size: 500, sha256: 'd'.repeat(64) };
 const HOST = { arch: 'test', os: 'linux', hostname: 'offline', id: 'model-engine' };
 const clone = value => structuredClone(value);
+const imageProvider = image => normalizeBoxAgentLib({ mode: 'image', sourceDir: '/opt/ploinky-agentlib', sourceRelativePath: 'image',
+    sourceId: imageSourceIdentity(`sha256:${String(image).replace(/^sha256:/, '')}`) });
+
+function modelNamespaceFs(stage, providerRoot) {
+    const provider = '/opt/ploinky-agentlib';
+    return new Proxy(fs, { get(target, key) {
+        if (typeof target[key] !== 'function') return target[key];
+        return (file, ...rest) => {
+            const mapped = typeof file === 'string' && (file === '/code' || file.startsWith('/code/')) ? stage + file.slice(5) : file;
+            if (key === 'realpathSync' && mapped === path.join(stage, 'node_modules', 'achillesAgentLib')) {
+                if (fs.readlinkSync(mapped) !== provider) return fs.realpathSync(mapped);
+                fs.statSync(providerRoot); return provider;
+            }
+            if (mapped === provider) return key === 'realpathSync' ? (fs.realpathSync(providerRoot), provider) : target[key](providerRoot, ...rest);
+            return target[key](mapped, ...rest);
+        };
+    } });
+}
+
+function stageModelFixture(profile, agent) {
+    const workspace = profile.workspace.path;
+    const source = path.join(workspace, 'local-llms', 'local-llm');
+    const objectId = crypto.randomUUID();
+    const objectRoot = path.join(workspace, '.ploinky', 'deps', 'store', 'objects', objectId);
+    const payload = path.join(objectRoot, 'payload');
+    const dependency = path.join(payload, 'node_modules');
+    fs.mkdirSync(dependency, { recursive: true });
+    fs.symlinkSync('/opt/ploinky-agentlib', path.join(dependency, 'achillesAgentLib'));
+    const contract = { kind: 'agent', runtime: { family: 'container', key: 'container-linux-x64-glibc-node24' }, toolchain: { kind: 'container', engine: 'podman', imageId: CONFIG },
+        providers: { mcpSdk: null, agentLib: { library: 'achillesAgentLib', mode: 'image', supplyingImageId: profile.box?.image || 'f'.repeat(64),
+            sourceIdHash: imageProvider(profile.box?.image || 'f'.repeat(64)).sourceIdHash, linkTarget: '/opt/ploinky-agentlib', installTarget: '/opt/ploinky-agentlib' } },
+        agent: { packageSource: { selection: 'root', relativePath: 'local-llms/local-llm/package.json', sha256: hex(fs.readFileSync(path.join(source, 'package.json'))) } } };
+    const inputKey = canonicalDigest(contract);
+    const tree = hashInstalledTree(payload, { approvedExternalTargets: ['/opt/ploinky-agentlib'] });
+    const resolution = buildResolutionManifest(null, { installer: null });
+    const generationId = generationIdFor(inputKey, resolution.hash, tree.hash);
+    const manifest = { format: 'ploinky-deps-cache', version: 1, owner: 'ploinky-deps-store', workspaceId: hex(workspace), objectId, inputKey, generationId,
+        contract, payloadPath: payload, tree, resolution: { hash: resolution.hash, installer: null }, approvedExternalTargets: ['/opt/ploinky-agentlib'] };
+    const manifestBytes = JSON.stringify(manifest);
+    fs.writeFileSync(path.join(objectRoot, 'manifest.json'), manifestBytes);
+    fs.writeFileSync(path.join(objectRoot, 'complete.json'), JSON.stringify({ format: manifest.format, version: 1, objectId, generationId, manifestSha256: hex(manifestBytes) }));
+    const runtimeRoot = path.join(workspace, '.ploinky', 'container-runtime', agent.name);
+    const stage = ensurePodmanStagedCodeDir('local-llm', source, dependency, new Map(), { runtimeRoot });
+    const mounts = [
+        { Type: 'bind', Source: stage, Destination: '/code', RW: false },
+        { Type: 'bind', Source: source, Destination: source, RW: false },
+        { Type: 'bind', Source: dependency, Destination: dependency, RW: false },
+        { Type: 'bind', Source: path.join(workspace, '.data', 'local-llm'), Destination: '/data', RW: true },
+        { Type: 'bind', Source: '/opt/ploinky-agentlib', Destination: '/opt/ploinky-agentlib', RW: false },
+    ];
+    agent.mounts = mounts;
+    fs.writeFileSync(path.join(workspace, '.ploinky', 'agents.json'), JSON.stringify({ [agent.name]: {
+        containerId: agent.id, runtime: 'podman', profile: 'default', auth: { privateSentinel: 'must-not-be-emitted' },
+        config: { binds: mounts.map(mount => ({ source: mount.Source, target: mount.Destination, ro: !mount.RW })) },
+        dependencies: { schema: 1, mode: 'store', family: 'container', imageId: CONFIG, runtimeKey: contract.runtime.key, inputKey, generationId, objectId, payloadPath: payload, nodeModulesPath: dependency },
+    } }));
+    return { stage, dependency, objectRoot };
+}
 function modelPin(profile) {
     return { profile, imageConfigDigest: CONFIG, imageParentDigest: `sha256:${'c'.repeat(64)}`, cibRevision: 'd'.repeat(40),
         executable: { path: MODEL_PROFILES[profile].executable, sha256: 'e'.repeat(64), version: 'b11159' },
@@ -44,13 +110,15 @@ function world(t, profile = 'cpu', fault = {}) {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const dir = name => { const target = path.join(root, name); fs.mkdirSync(target, { recursive: true }); return target; };
     const home = dir('h'); const source = dir('s'); const bin = dir('b'); const evidence = dir('e');
+    const providerRoot = dir('image-provider');
     const node = fs.realpathSync(process.execPath); const engine = path.join(bin, 'podman'); const ssh = path.join(bin, 'ssh'); const knownHosts = path.join(bin, 'known_hosts');
     for (const file of [engine, ssh, knownHosts]) fs.writeFileSync(file, 'offline fake\n');
     fs.mkdirSync(path.join(source, 'ploinky-box', 'bin'), { recursive: true });
     fs.writeFileSync(path.join(source, 'ploinky-box', 'bin', 'ploinky-box.mjs'), '// offline candidate\n');
     const local = path.join(source, '.hwl-local-llms', 'local-llm');
     fs.mkdirSync(path.join(local, 'catalog'), { recursive: true });
-    fs.writeFileSync(path.join(local, 'manifest.json'), JSON.stringify({ container: 'image:tag', agent: 'exec node /code/main.mjs', containerSecurity: { gpu: true } }));
+    fs.writeFileSync(path.join(local, 'manifest.json'), JSON.stringify({ container: 'image:tag', agent: 'exec node /code/main.mjs', containerSecurity: { gpu: true }, volumes: { '.data/local-llm': '/data' } }));
+    fs.writeFileSync(path.join(local, 'package.json'), JSON.stringify({ name: 'local-llm', type: 'module' }));
     fs.writeFileSync(path.join(local, 'main.mjs'), '// offline agent\n');
     fs.writeFileSync(path.join(local, 'catalog', 'models.json'), JSON.stringify({ models: [
         { id: SMALL.id, sources: { gguf: { ...SMALL } } },
@@ -99,8 +167,10 @@ function world(t, profile = 'cpu', fault = {}) {
             assert.equal(options.env.PLOINKY_BOX_HARDWARE_LIMITS, 'off');
             const identity = buildWorkspaceIdentity(options.cwd);
             box = { id: '1'.repeat(64), created: '2026-10-12T00:00:00Z', image: 'f'.repeat(64), imageName: pins.boxImage, running: true, pid: 100,
-                labels: { [BOX_LABELS.pathHash]: identity.pathHash, [BOX_LABELS.role]: 'box', [BOX_LABELS.imageRef]: pins.boxImage }, mounts: [{ Source: options.cwd, Destination: options.cwd, RW: true }], devices: ['/dev/fuse', '/dev/net/tun'].map(name => ({ PathOnHost: name, PathInContainer: name })) };
+                labels: { [BOX_LABELS.pathHash]: identity.pathHash, [BOX_LABELS.role]: 'box', [BOX_LABELS.imageRef]: pins.boxImage,
+                    ...agentLibLabels(imageProvider('f'.repeat(64))) }, mounts: [{ Type: 'bind', Source: options.cwd, Destination: options.cwd, RW: true }], devices: ['/dev/fuse', '/dev/net/tun'].map(name => ({ PathOnHost: name, PathInContainer: name })) };
             agent = { id: '2'.repeat(64), name: fixtureContainerName(options.cwd, 'local-llm', 'local-llms'), created: box.created, image: CONFIG.slice(7), imageName: IMAGE, running: true, labels: {}, devices: [], mounts: [{ Source: path.join(options.cwd, 'local-llms', 'local-llm'), Destination: '/code', RW: false }] };
+            stageModelFixture({ ...run.target.execution, box }, agent);
             if (profile === 'apple') { agent.devices = [{ PathOnHost: '/dev/dri/renderD128', PathInContainer: '/dev/dri/renderD128' }]; box.devices.push(...agent.devices); }
             return ok();
         }
@@ -112,6 +182,9 @@ function world(t, profile = 'cpu', fault = {}) {
         if (args[0] === 'info') return ok(JSON.stringify(fakeEngineInfo(HOST)));
         if (args.includes(LLM_TOOL_CALL)) {
             const at = args.indexOf(LLM_TOOL_CALL); const tool = args[at + 1];
+            if (tool === 'local_llm_test_prompt' && fault.providerOverlayAfter) {
+                box.mounts.push({ Type: 'bind', Source: '/foreign', Destination: '/opt/ploinky-agentlib/main.mjs', RW: true });
+            }
             if (tool === 'local_llm_run') running = true;
             if (tool === 'local_llm_stop') { if (fault.stop) return fail('injected stop failure'); running = false; }
             if (tool === 'local_llm_status' && fault.cancelLoad && running) return ok('', { cancelled: true, status: null });
@@ -121,6 +194,14 @@ function world(t, profile = 'cpu', fault = {}) {
             return ok(JSON.stringify({ ok: true, agent: fault.agent ? 'foreign/agent' : 'local-llms/local-llm', result }));
         }
         if (args.includes(MODEL_PROCESS_FACTS)) return ok(JSON.stringify({ processes: value.processes }), fault.oversized ? { truncated: true } : {});
+        if (args.includes(MODEL_SOURCE_VIEW)) {
+            const stage = agent.mounts.find(mount => mount.Destination === '/code').Source;
+            const io = modelNamespaceFs(stage, providerRoot);
+            let output = '';
+            vm.runInNewContext(MODEL_SOURCE_VIEW, { require: name => name === 'node:fs' ? io : name === 'node:path' ? path : crypto, Buffer,
+                process: { argv: ['node', args.at(-1)], stdout: { write: text => { output += text; } } } });
+            return ok(output);
+        }
         if (args.includes('inspect')) {
             const wanted = args.at(-1);
             const record = wanted === box?.id ? box : wanted === agent?.id || wanted === agent?.name ? agent : null;
@@ -135,7 +216,8 @@ function world(t, profile = 'cpu', fault = {}) {
         if (fault.proof && name === 'llm-cleanup-proof') throw new Error('injected proof write failure');
         artifacts.set(name, clone(data));
     }, persist: () => {} });
-    return { root, source, pins, run, calls, artifacts, provider, options, value,
+    return { root, source, pins, run, calls, artifacts, provider, options, value, agent: () => agent, box: () => box,
+        namespace: () => modelNamespaceFs(agent.mounts.find(mount => mount.Destination === '/code').Source, providerRoot),
         provision: () => provisionRun({ ...options(), validateProfile, portProbe: async () => ({ tcp: true, udp: true }) }),
         live: () => executeLiveRun({ ...options(), gpuTimings: { pollMs: 1 } }),
         cleanup: () => executeCleanupRun(options()) };
@@ -170,6 +252,15 @@ test('MODEL.cpu-canonical-provision-inference-cleanup-with-ordinary-source', asy
     const live = await w.live(); assert.equal(live.verdict, 'PASS', JSON.stringify(live));
     assert.deepEqual(live.cases.map(row => [row.id, row.result]), [['LIVE-L5', 'pass']]);
     assert.equal(w.artifacts.get('model-live-l5').status, 'pass');
+    const proof = w.artifacts.get('model-live-l5');
+    assert.equal(modelInferenceProofProblem(JSON.stringify(proof), { runId: w.run.runId, caseId: 'LIVE-L5', requirePass: true }), null);
+    for (const mutate of [p => { delete p.source.binding.provider; }, p => { p.source.binding.provider.boxId = '0'.repeat(64); },
+        p => { p.source.binding.provider.supplyingImageId = `sha256:${'0'.repeat(64)}`; }]) {
+        const bad = clone(proof); mutate(bad);
+        assert.match(modelInferenceProofProblem(JSON.stringify(bad), { runId: w.run.runId, caseId: 'LIVE-L5', requirePass: true }), /lacks runtime evidence/);
+    }
+    delete proof.source.binding;
+    assert.match(modelInferenceProofProblem(JSON.stringify(proof), { runId: w.run.runId, caseId: 'LIVE-L5', requirePass: true }), /lacks runtime evidence/);
     assert.deepEqual(w.artifacts.get('llm-cleanup-proof').remaining, []);
     assert.equal(fs.existsSync(profile.workspace.path), false);
     const repeated = await w.live(); assert.notEqual(repeated.verdict, 'PASS');
@@ -225,16 +316,122 @@ test('MODEL.backend-model-image-offload-and-safe-process-facts', () => {
 
 test('MODEL.source-mount-hash-device-and-workspace-reuse-refused', async t => {
     const w = world(t); assert.equal((await w.provision()).verdict, 'PASS'); const profile = w.run.target.execution;
-    const agent = { ...profile.agents[0], imageName: IMAGE, running: true, devices: [], mounts: [{ Source: path.join(profile.workspace.path, 'local-llms', 'local-llm'), Destination: '/code', RW: false }] };
+    const agent = clone(w.agent());
     assertModelContainer(agent, { profile, role: 'agent' });
+    const captured = [];
+    const binding = observeModelStage(profile, agent, { box: w.box(), write: value => captured.push(value) });
+    assert.equal(binding.complete, true);
+    assert.ok(!JSON.stringify(captured).includes('must-not-be-emitted'));
+    const layout = modelSourceLayout(profile, agent);
+    const view = observeModelCodeView({ ...binding.view, codeRoot: layout.stage }, w.namespace());
+    assert.equal(view.complete, true);
+    assert.equal(view.treeDigest, assertModelSource(profile).stagedTreeDigest);
     const baseDevices = ['/dev/fuse', '/dev/net/tun'].map(name => ({ PathOnHost: name, PathInContainer: name }));
     assert.doesNotThrow(() => assertModelContainer({ mounts: [], devices: baseDevices }, { profile, role: 'box' }));
     assert.throws(() => assertModelContainer({ mounts: [], devices: [...baseDevices, { PathOnHost: '/dev/dri/renderD128', PathInContainer: '/dev/dri/renderD128' }] }, { profile, role: 'box' }));
-    for (const mutate of [v => { v.mounts = []; }, v => { v.mounts[0].Source += '/wrong'; }, v => { v.mounts[0].RW = true; }, v => { v.devices = [{ PathOnHost: '/dev/nvidia0' }]; }, v => { v.id = 'a'.repeat(64); }]) { const bad = clone(agent); mutate(bad); assert.throws(() => assertModelContainer(bad, { profile, role: 'agent' })); }
+    for (const mutate of [v => { v.mounts = []; }, v => { v.mounts[0].Source += '/wrong'; }, v => { v.mounts[0].RW = true; }, v => { v.devices = [{ PathOnHost: '/dev/nvidia0' }]; }, v => { v.id = 'a'.repeat(64); },
+        v => { v.mounts[1].RW = true; }, v => { v.mounts.splice(1, 1); }, v => { v.mounts.push({ Type: 'bind', Source: '/wrong', Destination: '/code/main.mjs', RW: false }); }]) {
+        const bad = clone(agent); mutate(bad); assert.throws(() => assertModelContainer(bad, { profile, role: 'agent' }));
+    }
+    for (const mutate of [v => { v.mounts[2].RW = true; }, v => { v.mounts[2].Source += '/wrong'; }, v => { v.mounts[3].Source += '/wrong'; }]) {
+        const bad = clone(agent); mutate(bad); const failures = [];
+        assert.throws(() => observeModelStage(profile, bad, { box: w.box(), write: value => failures.push(value) }));
+        assert.equal(failures.at(-1).complete, false);
+        assert.ok(failures[0].agent.mounts.length > 0);
+    }
+    const mainLink = path.join(layout.stage, 'main.mjs');
+    const expectedMain = path.join(layout.source, 'main.mjs');
+    const impostor = path.join(w.root, 'same-bytes.mjs'); fs.copyFileSync(expectedMain, impostor);
+    for (const target of [impostor, path.join(profile.workspace.path, '.ploinky', 'repos', 'foreign', 'main.mjs')]) {
+        fs.unlinkSync(mainLink); fs.symlinkSync(target, mainLink);
+        const failures = [];
+        assert.throws(() => observeModelStage(profile, agent, { box: w.box(), write: value => failures.push(value) }), /pinned origin/);
+        assert.equal(failures.at(-1).complete, false); assert.equal(failures.at(-1).links.find(link => link.name === 'main.mjs').targetMatches, false);
+        assert.equal(observeModelCodeView({ ...binding.view, codeRoot: layout.stage }, w.namespace()).complete, false);
+    }
+    fs.unlinkSync(mainLink); fs.copyFileSync(expectedMain, mainLink);
+    assert.throws(() => observeModelStage(profile, agent, { box: w.box() }), /pinned origin/);
+    fs.unlinkSync(mainLink); fs.symlinkSync(expectedMain, mainLink);
+    const extra = path.join(layout.stage, 'injected.mjs'); fs.symlinkSync(expectedMain, extra);
+    assert.throws(() => observeModelStage(profile, agent, { box: w.box() }), /entries differ/); fs.unlinkSync(extra);
+    const recordFile = path.join(profile.workspace.path, '.ploinky', 'agents.json');
+    const records = JSON.parse(fs.readFileSync(recordFile));
+    const badRecord = clone(records); badRecord[layout.name].dependencies.generationId = '0'.repeat(64);
+    fs.writeFileSync(recordFile, JSON.stringify(badRecord));
+    assert.throws(() => observeModelStage(profile, agent, { box: w.box() }), /integrity check/); fs.writeFileSync(recordFile, JSON.stringify(records));
+    fs.writeFileSync(recordFile, 'must-not-be-emitted');
+    const unreadable = [];
+    assert.throws(() => observeModelStage(profile, agent, { box: w.box(), write: value => unreadable.push(value) }), /record is unreadable/);
+    assert.ok(!JSON.stringify(unreadable).includes('must-not-be-emitted')); fs.writeFileSync(recordFile, JSON.stringify(records));
     fs.appendFileSync(path.join(profile.workspace.path, 'local-llms', 'local-llm', 'main.mjs'), 'changed');
     assert.throws(() => assertModelSource(profile), /bytes changed/);
+    assert.notEqual(observeModelCodeView({ ...binding.view, codeRoot: layout.stage }, w.namespace()).treeDigest, view.treeDigest);
     assert.notEqual((await w.provision()).verdict, 'PASS');
     assert.ok(workspaceSocketProblem('/tmp/' + 'x'.repeat(200)));
+});
+
+test('MODEL.external-provider-mount-chain-is-required', async t => {
+    const changedDuringInference = world(t, 'cpu', { providerOverlayAfter: true });
+    assert.equal((await changedDuringInference.provision()).verdict, 'PASS');
+    const failed = await changedDuringInference.live();
+    assert.notEqual(failed.verdict, 'PASS');
+    assert.match(changedDuringInference.artifacts.get('model-live-l5').reason, /provider image/);
+    assert.equal(failed.cleanup.state, 'failed');
+    assert.equal(fs.existsSync(changedDuringInference.run.target.execution.workspace.path), true);
+    const w = world(t); assert.equal((await w.provision()).verdict, 'PASS');
+    const profile = w.run.target.execution; const agent = w.agent();
+    const observed = observeModelStage(profile, agent, { box: w.box() });
+    assert.equal(observed.complete, true);
+    for (const mutate of [
+        mounts => mounts.filter(mount => mount.Destination !== '/opt/ploinky-agentlib'),
+        mounts => mounts.map(mount => mount.Destination === '/opt/ploinky-agentlib' ? { ...mount, Source: '/foreign', RW: true } : mount),
+        mounts => mounts.map(mount => mount.Destination === '/opt/ploinky-agentlib' ? { ...mount, RW: true } : mount),
+        mounts => mounts.map(mount => mount.Destination === '/opt/ploinky-agentlib' ? { ...mount, Source: '/foreign' } : mount),
+        mounts => [...mounts, mounts.find(mount => mount.Destination === '/opt/ploinky-agentlib')],
+        mounts => [...mounts, { Type: 'bind', Source: '/foreign', Destination: '/opt/ploinky-agentlib/main.mjs', RW: true }],
+    ]) {
+        const bad = { ...agent, mounts: mutate(clone(agent.mounts)) };
+        assert.throws(() => observeModelStage(profile, bad, { box: w.box() }), /provider/);
+    }
+    for (const destination of ['/', '/opt', '/opt/ploinky-agentlib', '/opt/ploinky-agentlib/main.mjs']) {
+        for (const writable of [true, false]) {
+            const box = clone(w.box()); box.mounts.push({ Type: 'bind', Source: '/foreign', Destination: destination, RW: writable });
+            const evidence = [];
+            assert.throws(() => observeModelStage(profile, agent, { box, write: facts => evidence.push(facts) }), /provider image/);
+            assert.equal(evidence.at(-1).complete, false); assert.equal(evidence[0].box.mounts.at(-1).Destination, destination);
+        }
+    }
+    for (const mutate of [box => { box.labels = {}; }, box => { box.id = '0'.repeat(64); }, box => { box.image = '0'.repeat(64); },
+        box => { box.created += 'changed'; }, box => { box.running = false; },
+        box => { Object.assign(box.labels, agentLibLabels(imageProvider('0'.repeat(64)))); }]) {
+        const box = clone(w.box()); mutate(box);
+        assert.throws(() => observeModelStage(profile, agent, { box }));
+    }
+    assert.throws(() => observeModelStage(profile, agent), /provider Box/);
+    const file = path.join(profile.workspace.path, '.ploinky', 'agents.json');
+    const records = JSON.parse(fs.readFileSync(file));
+    for (const change of [
+        binds => binds.filter(bind => bind.target !== '/opt/ploinky-agentlib'),
+        binds => binds.map(bind => bind.target === '/opt/ploinky-agentlib' ? { ...bind, ro: false } : bind),
+        binds => binds.map(bind => bind.target === '/opt/ploinky-agentlib' ? { ...bind, source: '/foreign' } : bind),
+        binds => [...binds, { source: '/foreign', target: '/opt/ploinky-agentlib/main.mjs', ro: true }],
+    ]) {
+        const changed = clone(records); changed[agent.name].config.binds = change(changed[agent.name].config.binds);
+        fs.writeFileSync(file, JSON.stringify(changed));
+        assert.throws(() => observeModelStage(profile, agent, { box: w.box() }), /Recorded model provider/);
+    }
+    fs.writeFileSync(file, JSON.stringify(records));
+    const input = { ...observed.view, codeRoot: observed.layout.stage };
+    assert.equal(observeModelCodeView(input, w.namespace()).provider.resolved, true);
+    const absent = new Proxy(w.namespace(), { get(target, key) {
+        if (typeof target[key] !== 'function') return target[key];
+        return (name, ...args) => { if (name === '/opt/ploinky-agentlib') throw new Error('provider absent'); return target[key](name, ...args); };
+    } });
+    assert.equal(observeModelCodeView(input, absent).complete, false);
+    const link = path.join(observed.view.dependency, 'achillesAgentLib');
+    fs.unlinkSync(link); fs.symlinkSync('/foreign', link);
+    assert.match(observeModelCodeView(input, w.namespace()).problem, /provider link/);
+    assert.throws(() => observeModelStage(profile, agent, { box: w.box() }));
 });
 
 test('MODEL.apple-guard-thresholds-unreadable-and-cancellation', async () => {
@@ -259,7 +456,7 @@ test('MODEL.apple-selected-machine-and-connection-fail-closed', async () => {
     profile.engine.identityDigest = digest('changed'); await assert.rejects(observe(documents), /engine identity changed/);
 });
 
-test('MODEL.cleanup-artifacts-and-exact-action-bindings', t => {
+test('MODEL.cleanup-artifacts-and-exact-action-bindings', async t => {
     for (const profile of ['cpu', 'nvidia', 'apple']) {
         const w = world(t, profile); const execution = w.run.target.execution;
         assert.ok(requiredArtifacts({ profile: execution, action: 'live' }).includes(`model-${execution.cases[0].toLowerCase()}`));
@@ -274,6 +471,33 @@ test('MODEL.cleanup-artifacts-and-exact-action-bindings', t => {
         assert.match(modelInferenceProofProblem('{}', { runId: w.run.runId, caseId: execution.cases[0] }), /identity mismatch/);
         const report = judgeArtifacts({ verdict: 'PASS', exitCode: 0, limitations: [] }, { complete: false, missingRequired: [`model-${execution.cases[0].toLowerCase()}`], failures: [] });
         assert.equal(report.verdict, 'BLOCKED');
+    }
+    const w = world(t);
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const cleanup = await w.cleanup(); assert.equal(cleanup.verdict, 'PASS');
+    assert.equal(w.artifacts.has('model-live-l5'), false);
+    const dispatchHistory = { schema: 1, runId: w.run.runId, root: w.run.target.stage.root, rootIntent: true, staged: true, identity: { dev: '1', ino: '2', uid: '1000' },
+        dispatches: [{ action: 'provision', state: 'returned', manifestDigest: digest('provision') }, { action: 'cleanup', state: 'returned', manifestDigest: digest('cleanup') }] };
+    const context = { profile: w.run.target.execution, action: 'cleanup', remoteReport: cleanup, fetched: w.run, dispatchHistory };
+    assert.equal(modelProvisionOnlyCleanupProven(context), true);
+    for (const state of ['intent', 'incomplete']) {
+        const interrupted = clone(dispatchHistory); interrupted.dispatches[0].state = state;
+        assert.equal(modelProvisionOnlyCleanupProven({ ...context, dispatchHistory: interrupted }), true);
+    }
+    assert.deepEqual(requiredArtifacts(context), ['llm-cleanup-proof']);
+    assert.equal(judgeArtifacts(cleanup, { complete: true, missingRequired: [], failures: [] }).verdict, 'PASS');
+    for (const state of ['intent', 'incomplete', 'returned']) {
+        const attempted = clone(dispatchHistory); attempted.dispatches.splice(1, 0, { action: 'live', state, manifestDigest: digest('live') });
+        assert.ok(requiredArtifacts({ ...context, dispatchHistory: attempted }).includes('model-live-l5'));
+        assert.equal(judgeArtifacts(cleanup, { complete: false, missingRequired: ['model-live-l5'], failures: [] }).verdict, 'BLOCKED');
+    }
+    for (const mutate of [h => { h.schema = 99; }, h => { h.staged = false; }, h => { h.identity = null; }, h => { h.runId = '0'.repeat(32); }, h => { h.root += '/foreign'; }, h => { h.dispatches = []; }, h => { delete h.dispatches[0].manifestDigest; }, h => { h.dispatches[0].state = 'unknown'; }, h => { h.dispatches[0].action = 'unknown'; }, h => { h.dispatches.pop(); }]) {
+        const bad = clone(dispatchHistory); mutate(bad); assert.ok(requiredArtifacts({ ...context, dispatchHistory: bad }).includes('model-live-l5'));
+    }
+    assert.ok(requiredArtifacts({ ...context, dispatchHistory: null }).includes('model-live-l5'));
+    for (const kind of ['model-box', 'model-box-after', 'model-local_llm_run']) {
+        const contradiction = clone(w.run); contradiction.operations.push({ kind });
+        assert.ok(requiredArtifacts({ ...context, fetched: contradiction }).includes('model-live-l5'));
     }
 });
 
