@@ -219,12 +219,15 @@ export function discoverVulkanRenderNode(options = {}) {
     } else throw discoveryError('no /dev/dri render node');
     const accepted = [];
     const reasons = [];
+    const considered = [];
     for (const facts of nodes) {
         const result = classifyRenderFacts(facts, { platform });
-        if (!result.accepted) reasons.push(result.reason);
-        else if (platform === 'linux' && !/^[0-9]+$/.test(result.node.vramBytes ?? '')) {
-            reasons.push(`${facts.name} VRAM size is unreadable`);
-        } else accepted.push(result.node);
+        const reason = !result.accepted ? result.reason
+            : platform === 'linux' && !/^[0-9]+$/.test(result.node.vramBytes ?? '')
+                ? `${facts.name} VRAM size is unreadable` : null;
+        considered.push({ name: facts.name, reason });
+        if (reason) reasons.push(reason);
+        else accepted.push(result.node);
     }
     if (!accepted.length) throw discoveryError(reasons.join('; ') || 'no /dev/dri render node');
     if (platform === 'linux') {
@@ -240,6 +243,13 @@ export function discoverVulkanRenderNode(options = {}) {
     });
     const node = accepted[0];
     return Object.freeze({ vendor: 'vulkan', driver: node.driver, driverVersion,
+        considered: Object.freeze(considered.map((entry) => Object.freeze({
+            name: entry.name,
+            selected: entry.name === node.name,
+            reason: entry.name === node.name ? null : entry.reason
+                || `${entry.name} not selected; ${node.name} was preferred by `
+                    + (platform === 'linux' ? 'VRAM size, then render-node minor' : 'render-node minor'),
+        }))),
         devices: Object.freeze([Object.freeze({ path: node.path, major: 226, minor: node.minor })]),
         libraries: Object.freeze([]), tools: Object.freeze([]) });
 }

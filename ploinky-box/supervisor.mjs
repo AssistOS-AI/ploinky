@@ -3276,7 +3276,10 @@ export function createBoxSupervisor({
             host = Object.freeze({
                 available: true,
                 vendor: discovered.vendor,
-                ...(discovered.vendor === 'vulkan' ? { driver: discovered.driver } : {}),
+                ...(discovered.vendor === 'vulkan' ? {
+                    driver: discovered.driver,
+                    renderNodes: discovered.considered,
+                } : {}),
                 driverVersion: discovered.driverVersion,
                 devices: discovered.devices.map((device) => device.path),
                 libraries: discovered.libraries.map((library) => library.soname),
@@ -3776,6 +3779,8 @@ export function formatGpuGrantStatus(status) {
                 + `libraries ${status.host.libraries.join(', ')}`
             : `Host GPU: unavailable (${status.host.reason})`,
         ...(status.host.vulkanReason ? [`Vulkan render node: ${status.host.vulkanReason}`] : []),
+        ...(status.host.renderNodes?.length > 1 ? [`Other render nodes: ${status.host.renderNodes
+            .filter((node) => !node.selected).map((node) => node.reason).join('; ')}`] : []),
         `Box: ${status.box}${status.boxProblem
             ? `; GPU wiring is invalid (${status.boxProblem})`
             : status.box === 'absent' ? '' : `; GPU wiring ${describeWiring(status.boxGpu)}`}`,

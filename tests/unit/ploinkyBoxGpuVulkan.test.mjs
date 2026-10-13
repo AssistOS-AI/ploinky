@@ -232,6 +232,119 @@ test('two amdgpu nodes: only the larger VRAM node is granted; a tie picks the lo
     assert.equal(discoverVulkanRenderNode(linux(tree)).devices[0].minor, 129);
 });
 
+test('render-node diagnostics retain refused siblings and explain usable nodes not selected', (t) => {
+    const tree = makeTree(t);
+    tree.addNode({ name: 'renderD129', mode: 0o20660 });
+    tree.addNode({ name: 'renderD130', vramBytes: '4294967296' });
+    tree.addNode({ name: 'renderD131', vramBytes: null });
+    tree.addNode({ name: 'renderD132', transport: 'i915', vendor: '0x8086' });
+    const discovery = discoverVulkanRenderNode(linux(tree));
+    const denied = discovery.considered.find((node) => node.name === 'renderD129');
+    assert.deepEqual(discovery.devices, [{ path: '/dev/dri/renderD128', major: 226, minor: 128 }]);
+    assert.deepEqual(discovery.considered.find((node) => node.selected), {
+        name: 'renderD128', selected: true, reason: null,
+    });
+    assert.equal(denied.selected, false);
+    assert.match(denied.reason, /mode 0660 \(group-only\).*every local user can read and write/);
+    assert.match(denied.reason, /DRIVERS=="amdgpu".*MODE="0666"/);
+    assert.match(denied.reason, /every local user submit work to this GPU/);
+    assert.deepEqual(discovery.considered.find((node) => node.name === 'renderD130'), {
+        name: 'renderD130', selected: false,
+        reason: 'renderD130 not selected; renderD128 was preferred by VRAM size, then render-node minor',
+    });
+    assert.equal(discovery.considered.find((node) => node.name === 'renderD131').reason,
+        'renderD131 VRAM size is unreadable');
+    assert.match(discovery.considered.find((node) => node.name === 'renderD132').reason, /driver i915 is not supported/);
+    assert.equal(Object.isFrozen(discovery.considered), true);
+    assert.equal(discovery.considered.every(Object.isFrozen), true);
+});
+
+test('render-node diagnostics reach host status and preserve singleton grant bytes', (t) => {
+    const tree = makeTree(t);
+    fs.writeFileSync(`${tree.root}/proc/sys/kernel/osrelease`, '6.8.0-fixture');
+    const single = discoverVulkanRenderNode(linux(tree));
+    const singleWiring = wire(single);
+    // Captured from the base revision, with the fixture kernel fixed.
+    assert.equal(singleWiring.fingerprint, '4f34f8e4a655ef40d693f64403d3289533a08d6be44d00618ebb4cf906cf4da9');
+    assert.equal(singleWiring.files[0].content, `{
+  "cdiVersion": "0.6.0",
+  "kind": "ploinky.local/gpu",
+  "devices": [
+    {
+      "name": "all",
+      "containerEdits": {
+        "deviceNodes": [
+          {
+            "path": "/dev/dri/renderD128"
+          }
+        ]
+      }
+    }
+  ]
+}
+`);
+    assert.equal(singleWiring.files[1].content, `{
+  "version": 1,
+  "kind": "ploinky-box-gpu-grant",
+  "instance": "ploinky-box-golden-0123456789ab",
+  "pathHash": "0123456789ab",
+  "workspaceRoot": "/workspace/golden",
+  "vendor": "vulkan",
+  "agents": [
+    "local-llms/local-llm"
+  ],
+  "state": "active",
+  "reason": null,
+  "fingerprint": "4f34f8e4a655ef40d693f64403d3289533a08d6be44d00618ebb4cf906cf4da9",
+  "cdiDevice": "ploinky.local/gpu=all",
+  "specSha256": "512f1472724846281125974fa03ad2d0b23ef0024a007f117f9233658aa15afa"
+}
+`);
+    tree.addNode({ name: 'renderD129', mode: 0o20660 });
+    tree.addNode({ name: 'renderD130', vramBytes: '4294967296' });
+    const discovery = discoverVulkanRenderNode(linux(tree));
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => IDENTITY,
+        discover: () => ({ state: 'absent' }),
+        discoverGpuDevices: () => discovery,
+        gpuGrantStore: { read: () => GRANT, homeDirectory: '/home/golden' },
+        scanGpuAgents: () => [],
+        hardwareGateStore: { read: () => null },
+    });
+    const status = supervisor.inspectGpuGrant();
+    assert.deepEqual(status.host.renderNodes, discovery.considered);
+    assert.deepEqual(status.grant, GRANT);
+    assert.deepEqual(status.desired, singleWiring);
+    const text = formatGpuGrantStatus(status);
+    const line = text.split('\n').find((entry) => entry.startsWith('Other render nodes: '));
+    assert.equal(line, `Other render nodes: ${discovery.considered.filter((node) => !node.selected)
+        .map((node) => node.reason).join('; ')}`);
+    assert.equal(text.split('\n').filter((entry) => entry.startsWith('Other render nodes: ')).length, 1);
+    assert.match(line, /renderD129.*group-only.*DRIVERS=="amdgpu"/);
+    assert.match(line, /renderD130 not selected/);
+    assert.deepEqual(wire(discovery), singleWiring);
+});
+
+test('singleton Vulkan and NVIDIA status bytes remain equal to the base', (t) => {
+    const tree = makeTree(t);
+    fs.writeFileSync(`${tree.root}/proc/sys/kernel/osrelease`, '6.8.0-fixture');
+    const discovery = discoverVulkanRenderNode(linux(tree));
+    const base = { identity: IDENTITY, grant: null, box: 'absent' };
+    const status = formatGpuGrantStatus({ ...base, host: {
+        available: true, vendor: discovery.vendor, driver: discovery.driver,
+        driverVersion: discovery.driverVersion, devices: discovery.devices.map((device) => device.path),
+        libraries: [], renderNodes: discovery.considered,
+    } });
+    assert.equal(status, 'Workspace identity: ploinky-box-golden-0123456789ab\nGPU grant: none\n'
+        + 'Host GPU: vulkan render node /dev/dri/renderD128 (amdgpu; amdgpu 6.8.0-fixture)\nBox: absent\n');
+    assert.equal(formatGpuGrantStatus({ ...base, host: {
+        available: true, vendor: 'nvidia', driverVersion: DRIVER,
+        devices: ['/dev/nvidia0', '/dev/nvidiactl', '/dev/nvidia-uvm'], libraries: ['libcuda.so.1'],
+    } }), 'Workspace identity: ploinky-box-golden-0123456789ab\nGPU grant: none\n'
+        + 'Host GPU: nvidia driver 595.91.07; devices /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-uvm; '
+        + 'libraries libcuda.so.1\nBox: absent\n');
+});
+
 test('render node checks: renderD127, renderD0128, rdev mismatch, sysfs dev mismatch, symlink, non-char', (t) => {
     for (const [change, reason] of [[{ name: 'renderD127' }, /not a render node name/],
         [{ name: 'renderD0128' }, /not a render node name/], [{ minor: 129 }, /not a character device/],
