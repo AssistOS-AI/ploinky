@@ -5,12 +5,14 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import net from 'node:net';
-import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createOwnershipBroker, createOwnershipClient, inspectOwnershipEvidence, PROCESS_OWNER_ENV } from '../hardware-limits/liveProcessOwnership.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
-import { runBoundedProcess } from '../hardware-limits/liveProcess.mjs';
+import { runBoundedProcess, signalOwnedProcessGroup } from '../hardware-limits/liveProcess.mjs';
 import { dispatchRemoteRun, assertRemoteArrival } from '../hardware-limits/liveRemote.mjs';
 import vm from 'node:vm';
 import {
@@ -1312,6 +1314,143 @@ async function rawOwnership(descriptorPath, mutate = value => value) {
         });
     });
 }
+test('OWNER.terminal-SIGKILL-EPERM-requires-complete-bounded-group-proof', () => {
+    const calls = []; const denied = () => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); };
+    const query = stdout => (binary, args, options) => {
+        calls.push({ binary, args, options }); return { status: 0, signal: null, stdout, stderr: '' };
+    };
+    for (const snapshot of ['1 1 Ss\n42 42 Z\n43 42 Z+\n', '1 1 Ss\n44 44 S\n']) {
+        assert.deepEqual(signalOwnedProcessGroup(42, 'SIGKILL', { allowTerminalEperm: true, kill: denied, query: query(snapshot) }), { errorCode: null, terminal: true });
+    }
+    for (const call of calls) {
+        assert.equal(call.binary, '/bin/ps'); assert.deepEqual(call.args, ['-axo', 'pid=,pgid=,stat=']);
+        assert.ok(call.options.timeout > 0 && call.options.timeout <= 100);
+        assert.ok(call.options.maxBuffer > 0 && call.options.maxBuffer <= 8 * 1024 * 1024);
+        assert.deepEqual(call.options.env, { PATH: '/usr/bin:/bin', LC_ALL: 'C' });
+    }
+    for (const stdout of ['', '  ', '1 1 Ss\n43 42 S\n', '1 1 Ss\n42 42 Z\n43 42 R\n', '1 1 Ss\n43 42 ?\n',
+        '1 1 Ss\nmalformed\n', '1 1 Ss\n42 42 Z\ntruncated', '1 1 Ss\n0 42 Z\n', '1 1 Ss\n9007199254740992 42 Z\n', '1 1 Ss\n42 -1 Z\n']) {
+        assert.equal(signalOwnedProcessGroup(42, 'SIGKILL', { allowTerminalEperm: true, kill: denied, query: query(stdout) }).errorCode, 'EPERM');
+    }
+    for (const result of [{ status: 1 }, { signal: 'SIGTERM' }, { error: { code: 'ETIMEDOUT' } }, { error: { code: 'ENOBUFS' } }, { stdout: Buffer.from('1 1 S\n') }]) {
+        assert.equal(signalOwnedProcessGroup(42, 'SIGKILL', { allowTerminalEperm: true, kill: denied,
+            query: () => ({ status: 0, signal: null, stdout: '1 1 S\n', ...result }) }).errorCode, 'EPERM');
+    }
+    assert.equal(signalOwnedProcessGroup(42, 'SIGKILL', { allowTerminalEperm: true, kill: denied, query: () => { throw Error('unavailable'); } }).errorCode, 'EPERM');
+    for (const pgid of [0, -1, 1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN]) {
+        assert.throws(() => signalOwnedProcessGroup(pgid, 'SIGKILL', { kill: () => assert.fail('invalid signal'), query: () => assert.fail('invalid query') }), /Invalid owned/);
+    }
+    for (const signal of [0, 'SIGUSR2']) assert.throws(() => signalOwnedProcessGroup(42, signal), /Invalid owned/);
+    for (const [signal, allowTerminalEperm] of [['SIGTERM', true], ['SIGKILL', false]]) {
+        assert.equal(signalOwnedProcessGroup(42, signal, { allowTerminalEperm, kill: denied, query: () => assert.fail('ineligible query') }).errorCode, 'EPERM');
+    }
+    for (const code of ['ESRCH', 'EACCES']) {
+        assert.equal(signalOwnedProcessGroup(42, 'SIGKILL', { allowTerminalEperm: true,
+            kill: () => { throw Object.assign(Error('signal'), { code }); }, query: () => assert.fail('ineligible query') }).errorCode, code === 'ESRCH' ? null : code);
+    }
+    const signalled = [];
+    signalOwnedProcessGroup(42, 'SIGKILL', { allowTerminalEperm: true, kill: (...args) => { signalled.push(args); denied(); }, query: query('1 1 S\n43 42 Z\n') });
+    assert.deepEqual(signalled, [[-42, 'SIGKILL']]);
+});
+
+function terminalTransport({ termError, childError, groupError, queryResult, killErrors = true } = {}) {
+    const child = new EventEmitter(); child.pid = 424242; child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.unref = () => {};
+    const controller = new AbortController(); const calls = []; let observed = false; let queries = 0; let settled = 0;
+    const kill = (pid, signal) => {
+        calls.push([pid, signal]);
+        const code = signal === 0 ? groupError || (observed ? 'ESRCH' : null)
+            : signal === 'SIGTERM' ? termError : killErrors ? 'EPERM' : null;
+        if (code) throw Object.assign(Error('injected'), { code });
+    };
+    const result = runBoundedProcess(process.execPath, [], { cwd: '/tmp', deadlineMs: 3000, maxBytes: 1,
+        signal: controller.signal, spawnProcess: () => child }, { kill, query: () => {
+            queries += 1; observed = true;
+            return queryResult || { status: 0, signal: null, stdout: '1 1 Ss\n424242 424242 Z\n' };
+        } }).then(value => { settled += 1; return value; });
+    if (childError) child.emit('error', Object.assign(Error('child'), { code: childError }));
+    child.stdout.emit('data', Buffer.from('xx'));
+    return { child, controller, calls, result, queries: () => queries, settled: () => settled };
+}
+
+test('OWNER.terminal-proof-waits-for-close-and-never-resignals-on-repeated-stop', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    for (const closeBefore of [false, true]) {
+        const f = terminalTransport();
+        if (closeBefore) f.child.emit('close', 7, 'SIGKILL');
+        t.mock.timers.tick(250);
+        assert.equal(f.queries(), 1);
+        if (!closeBefore) {
+            await Promise.resolve(); assert.equal(f.settled(), 0, 'terminal observation must not synthesize close');
+            f.child.emit('close', 7, 'SIGKILL');
+        } else t.mock.timers.tick(10);
+        const result = await f.result;
+        assert.equal(result.status, 7); assert.equal(result.signal, 'SIGKILL'); assert.equal(result.errorCode, null);
+        assert.equal(result.truncated, true); assert.equal(result.settlementForced, false);
+        f.controller.abort(); f.child.stdout.emit('data', Buffer.from('xx')); t.mock.timers.tick(1000);
+        assert.deepEqual(f.calls.filter(call => call[1] !== 0), [[-424242, 'SIGTERM'], [-424242, 'SIGKILL']]);
+        assert.equal(f.queries(), 1); assert.equal(f.settled(), 1);
+    }
+});
+
+test('OWNER.terminal-proof-preserves-child-query-and-earlier-errors', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    for (const [options, errorCode] of [[{ termError: 'EACCES' }, 'EACCES'], [{ termError: 'EPERM' }, 'EPERM'],
+        [{ childError: 'EPERM' }, 'EPERM'], [{ groupError: 'EPERM' }, 'EPERM']]) {
+        const f = terminalTransport(options);
+        if (options.groupError) f.child.emit('close', null, 'SIGKILL');
+        t.mock.timers.tick(250);
+        if (!options.groupError) f.child.emit('close', null, 'SIGKILL');
+        else t.mock.timers.tick(500);
+        const result = await f.result;
+        assert.equal(result.errorCode, errorCode); assert.equal(result.truncated, true);
+        assert.equal(result.settlementForced, Boolean(options.groupError));
+        assert.equal(f.queries(), 1);
+    }
+});
+
+test('OWNER.forced-settlement-never-observes-and-terminal-proof-without-close-stays-forced', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    for (const options of [{}, { queryResult: { status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' }, stdout: '' } }]) {
+        const f = terminalTransport(options); t.mock.timers.tick(250);
+        assert.equal(f.queries(), 1);
+        f.controller.abort(); f.child.stdout.emit('data', Buffer.from('xx')); t.mock.timers.tick(500);
+        const result = await f.result;
+        assert.equal(result.settlementForced, true); assert.equal(result.cancelled, true); assert.equal(result.truncated, true);
+        assert.equal(result.errorCode, options.queryResult ? 'EPERM' : null);
+        assert.equal(f.queries(), 1, 'forced callback may not invoke the observer');
+        assert.equal(f.calls.filter(call => call[1] === 'SIGKILL').length, options.queryResult ? 2 : 1);
+        assert.equal(f.settled(), 1);
+    }
+});
+
+test('OWNER.terminal-observer-dependencies-cannot-be-injected-through-wire-options', async t => {
+    const f = await ownershipFixture(t);
+    const response = await rawOwnership(f.broker.descriptorPath, message => ({ ...message,
+        args: ['-e', 'process.stdout.write("x".repeat(3000));setInterval(()=>{},1000)'],
+        options: { ...message.options, deadlineMs: 3000, maxBytes: 256, kill: 'forged', query: 'forged', signalGroup: 'forged', allowTerminalEperm: true },
+    }));
+    let cursor = 0; const frames = [];
+    while (cursor < response.length) {
+        const length = response.readUInt32BE(cursor); cursor += 4;
+        frames.push(JSON.parse(response.subarray(cursor, cursor + length))); cursor += length;
+    }
+    const result = frames.find(frame => frame.type === 'result')?.result;
+    assert.equal(result?.truncated, true); assert.equal(result.errorCode, null); assert.equal(result.settlementForced, false);
+    const receipt = await f.broker.settle(); assert.equal(receipt.settled, true); assert.deepEqual(receipt.unresolved, []);
+});
+
+test('OWNER.terminal-observer-blocked-query-keeps-EPERM-within-bound', () => {
+    const began = performance.now(); let observation;
+    const result = signalOwnedProcessGroup(42, 'SIGKILL', { allowTerminalEperm: true,
+        kill: () => { throw Object.assign(Error('signal'), { code: 'EPERM' }); },
+        query: (_binary, _args, options) => {
+            observation = spawnSync(process.execPath, ['-e', 'setInterval(()=>{},1000)'], options); return observation;
+        },
+    });
+    assert.equal(observation.error?.code, 'ETIMEDOUT'); assert.equal(result.errorCode, 'EPERM'); assert.equal(result.terminal, false);
+    assert.ok(performance.now() - began < 1000, 'bounded query plus settlement margin');
+});
+
 test('OWNER.direct-broker-exit-signal-stdin-output-timeout-parity', async t => {
     const f = await ownershipFixture(t);
     const input = path.join(f.root, 'stdin'); fs.writeFileSync(input, 'private input\n', { mode: 0o600 });
@@ -1536,5 +1675,12 @@ test('OWNER.selection-is-after-authorization-and-rejects-default-cpu-and-injecte
         await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live' }), /Invalid private ownership path/);
         await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', processProvider: f.provider }), /exclusive provider/);
         await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', remoteLocal: f.run.runId }), /local Apple action/);
+        f.run.block = 'mac-model-cpu'; f.profile.model = { profile: 'apple-cpu' };
+        const cpuBytes = Buffer.from(JSON.stringify(f.run)); fs.writeFileSync(runPath, cpuBytes);
+        fs.writeFileSync(authorizationPath, JSON.stringify({ ...authorization, manifestDigest: hash(cpuBytes), targetDigest: jsonDigest(f.run.target) }));
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live' }), /Invalid private ownership path/);
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', processProvider: f.provider }), /exclusive provider/);
+        await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', remoteLocal: f.run.runId }), /local Apple action/);
+        assert.equal(f.calls.length, 0);
     } finally { if (previous === undefined) delete process.env[PROCESS_OWNER_ENV]; else process.env[PROCESS_OWNER_ENV] = previous; }
 });

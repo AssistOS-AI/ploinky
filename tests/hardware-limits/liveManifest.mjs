@@ -27,6 +27,7 @@ import { remoteRoot, remoteReportName } from './liveStage.mjs';
 import { DOCUMENT_SUFFIXES, GPU_TOLERATED_MAX, GPU_TOLERATED_MAX_MIB } from './fixtures.mjs';
 import { sshOptions } from './liveRemote.mjs';
 import { MODEL_PROFILES, modelPlan, validateModelPins } from './liveModelCases.mjs';
+import { normalizeMeasurement, measurementCases, MEASUREMENT_DEADLINES, MEASUREMENT_SCENARIOS, MEASUREMENT_MODEL } from './liveModelMeasurements.mjs';
 
 export const CONCRETE_BLOCKS = Object.freeze({
     ...Object.fromEntries(Object.entries(MODEL_PROFILES).map(([model, spec]) => [spec.block, { platform: spec.platform, remote: spec.platform === 'linux', cases: [spec.case], llm: true, model, gpu: model === 'nvidia' }])),
@@ -54,6 +55,11 @@ export const CONCRETE_BLOCKS = Object.freeze({
 // approver sees exactly what a PASS means. `row` names the spec line; `procedure` is what the runner does; `passes` the observable
 // artifact; `evidence` the files the case writes. The summary prints every selected case that has an entry.
 export const CASE_PASS_CONDITIONS = Object.freeze({
+    ...Object.fromEntries(Object.entries(MEASUREMENT_SCENARIOS).map(([scenario, id]) => [id, {
+        row: `Apple measurement ${scenario}`, procedure: 'Frozen canonical measurement through owned routed commands, with host guard and monotonic deadlines.',
+        passes: 'Every required load, prompt, source, model, memory and Stop receipt validates. Refused, blocked, incomplete and not-exercised are never pass.',
+        evidence: `measurement-${id.toLowerCase()} and all indexed artifacts; final settlement, cleanup and restoration remain mandatory.`,
+    }])),
     ...Object.fromEntries(Object.values(MODEL_PROFILES).map(spec => [spec.case, {
         row: `Optional local-llm ${spec.block}`,
         procedure: 'A fresh budget-off Box runs committed ordinary local-llm source through bounded Router MCP calls. CPU withdraws GPU access before startup. Apple revalidates the selected rootless libkrun machine and observes the bounded A15 host guard; the caller owns machine setup and restoration.',
@@ -216,18 +222,20 @@ export function proposedWorkspace(block, pins, runId) {
 // The pins of the local-llm candidate carried in the frozen payload (.hwl-local-llms/local-llm): its
 // tree digest, its manifest before and after the image is pinned, and the two models' catalog pins
 // the live cases compare the agent's own catalog with.
-export function describeLlmCandidate({ root, sourceRoot, revision, image }) {
+export function describeLlmCandidate({ root, sourceRoot, revision, image, measurement }) {
     const local = path.join(root, LLM_SOURCE_DIRECTORY, 'local-llm');
     const bytes = fs.readFileSync(path.join(local, 'manifest.json'));
     const catalog = JSON.parse(fs.readFileSync(path.join(local, 'catalog', 'models.json'), 'utf8'));
     const model = id => { const found = catalog.models.find(entry => entry.id === id); if (!found) throw new Error(`The local-llm catalog has no model ${id}`); return found; };
     const gguf = model(LLM_MODELS.small).sources.gguf;
     const hf = model(LLM_MODELS.awq).sources.hf;
+    const larger = measurement?.scenario === 'larger-model-v1' ? model(MEASUREMENT_MODEL).sources.gguf : null;
     const files = hf.files.map(file => ({ path: file.path, size: file.size, sha256: file.sha256 }));
     return {
         revision, sourcePath: `${sourceRoot}/${LLM_SOURCE_DIRECTORY}/local-llm`, treeDigest: liveSourceDigest(local),
         manifest: { originalContainer: JSON.parse(bytes).container, originalDigest: digest(bytes), rewrittenDigest: digest(rewriteLlmManifest(bytes, image)) },
         models: {
+            ...(larger ? { larger: { id: MEASUREMENT_MODEL, repo: larger.repo, file: larger.file, commit: larger.commit, size: larger.size, sha256: larger.sha256 } } : {}),
             small: { id: LLM_MODELS.small, repo: gguf.repo, file: gguf.file, commit: gguf.commit, size: gguf.size, sha256: gguf.sha256 },
             awq: { id: LLM_MODELS.awq, repo: hf.repo, commit: hf.commit, size: files.reduce((sum, file) => sum + file.size, 0), files },
         },
@@ -249,7 +257,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
     const agents = fixturePlan(spec.cases);
     // The local-llm candidate runs from its own immutable image, not the Explorer's fixture image.
     if (spec.llm) image = pins.llm.image;
-    const llmCandidate = spec.llm ? describeLlmCandidate({ root: candidate.root, sourceRoot, revision: candidate.llm.revision, image }) : null;
+    const llmCandidate = spec.llm ? describeLlmCandidate({ root: candidate.root, sourceRoot, revision: candidate.llm.revision, image, measurement: pins.model?.measurement }) : null;
     const execution = {
         protocol: 'owned-fixture-v1',
         host: { ...pins.host },
@@ -270,11 +278,15 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
     if (spec.model) {
         const { models, ...plan } = llmCandidate;
         execution.model = structuredClone(pins.model);
+        if (pins.model.measurement !== undefined) {
+            execution.model.measurement = normalizeMeasurement(pins.model.measurement, models, spec.model);
+            execution.cases = measurementCases(spec.model, execution.model.measurement);
+        }
         execution.provision.ordinarySource = true;
         execution.provision.llm = plan;
         execution.llm = { image, revision: plan.revision, models };
         if (spec.model === 'nvidia') execution.gpu = { ...pins.gpu };
-        if (spec.model !== 'cpu') execution.provision.gpu = { uuid: spec.model === 'nvidia' ? pins.gpu.uuid : null, grantAgents: [LLM_REF] };
+        if (!['cpu', 'apple-cpu'].includes(spec.model)) execution.provision.gpu = { uuid: spec.model === 'nvidia' ? pins.gpu.uuid : null, grantAgents: [LLM_REF] };
     } else if (spec.llm) {
         const { models, ...plan } = llmCandidate;
         execution.gpu = { ...pins.gpu };
@@ -299,7 +311,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         engine: { binary: pins.engine.path, kind: 'podman', identity: pins.engine.identityDigest },
         ssh: remote ? { alias: pins.ssh.alias, expectedAddress: pins.ssh.address, expectedHostKeyAlias: pins.ssh.hostKeyAlias } : null,
         note: 'Proposal only. Each action (provision, live, cleanup) needs its own separate execution-time authorization binding over the exact manifest bytes; no file grants permission.',
-        cases: [...spec.cases],
+        cases: [...execution.cases],
         unsupported,
         execution,
     };
@@ -316,7 +328,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         schema: 1, runId, configDigest, casesDigest, block, target, state: 'proposed',
         workspace: { proposedParent: parent, proposedPath: workspacePath, instance: identity.instance, pathHash: identity.pathHash },
         ports: { tcp: ports.tcp, udp: ports.udp },
-        deadlines: { ...(spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : spec.store ? STORE_DEADLINES : spec.availability ? AVAILABILITY_DEADLINES : DEADLINES) },
+        deadlines: { ...(execution.model?.measurement ? { ...DEADLINES, ...MEASUREMENT_DEADLINES } : spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : spec.store ? STORE_DEADLINES : spec.availability ? AVAILABILITY_DEADLINES : DEADLINES) },
         images: [
             { role: 'fixture-agent', ref: image, source: spec.llm ? 'operator pins (local-llm image)' : 'AssistOSExplorer explorer/manifest.json line 2' },
             { role: 'box', ref: pins.boxImage, source: 'operator pins' },
@@ -362,7 +374,7 @@ export function plannedCommands(run) {
             { id: 'gpu-grant', binary: node, argv: [profile.candidate.path, 'gpu', 'grant', ...plan.gpu.grantAgents.flatMap(ref => ['--agent', ref])], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs,
                 note: 'The supported product path: records the grant under ~/.ploinky-box/gpu-grants and discovers the host driver. No Box exists yet, so the next start applies it.' },
         ] : []),
-        ...(profile.model?.profile === 'cpu' ? [{ id: 'gpu-withdraw', binary: node, argv: [profile.candidate.path, 'gpu', 'revoke'], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs }] : []),
+        ...(['cpu', 'apple-cpu'].includes(profile.model?.profile) ? [{ id: 'gpu-withdraw', binary: node, argv: [profile.candidate.path, 'gpu', 'revoke'], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs }] : []),
         { id: 'fixture-start', binary: node, argv: startArgs(profile, run.ports), cwd: workspace, env, deadlineMs: run.deadlines.startMs,
             note: profile.model ? 'Production start creates a budget-off Box after the explicit GPU grant or withdrawal.' : 'Production start creates the gate-on Box and runs its bounded root preparation before graph work; this is the declared provisioning step that may change cgroup state.' },
         { id: 'box-inventory', binary: engine, argv: ps, deadlineMs: run.deadlines.coreMs },

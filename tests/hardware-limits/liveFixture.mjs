@@ -26,7 +26,7 @@ import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs'
 import { LLM_AGENT, LLM_REF, LLM_REPOSITORY } from './liveLlmNames.mjs';
 import { C3_AGENTS, C3V_AGENTS } from './liveAvailabilityCommands.mjs';
 import { C5_AGENTS } from './liveStoreCommands.mjs';
-import { observeAppleMachine } from './liveModelHostGuard.mjs';
+import { observeAppleMachine, modelGrantInventory } from './liveModelHostGuard.mjs';
 
 export const FIXTURE_REPOSITORY = 'hwlfixture';
 export const FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '64m', cpus: '0.5', pidsLimit: 64 });
@@ -49,7 +49,7 @@ export function fixturePlan(cases) {
     if (cases.includes('LIVE-C3V')) return C3V_AGENTS.map(name => ({ name, role: name, hardwareLimits: null }));
     // LIVE-C5: the one managed-network agent whose stored override the host and the in-Box writers contend for.
     if (cases.includes('LIVE-C5')) return C5_AGENTS.map(name => ({ name, role: name, hardwareLimits: null }));
-    if (cases.some(id => String(id).startsWith('LIVE-L'))) {
+    if (cases.some(id => /^LIVE-[LM]/.test(id))) {
         return [{ name: LLM_AGENT, role: 'llm', repository: LLM_REPOSITORY, hardwareLimits: null }];
     }
     if (cases.some(id => String(id).startsWith('LIVE-P'))) {
@@ -260,7 +260,7 @@ export async function provisionRun({
         let engineIdentity;
         try { engineIdentity = await observeEngineIdentity((kind, argv) => engine(kind, argv)); } catch (error) { throw error?.code === 'ENGINE_IDENTITY_INCOMPLETE' ? blocked(error.message) : error; }
         if (engineIdentity !== profile.engine.identityDigest) throw blocked('Engine service identity changed');
-        if (profile.model?.profile === 'apple') artifacts('model-apple-machine', await observeAppleMachine({ profile, engine }));
+        if (['apple', 'apple-cpu'].includes(profile.model?.profile)) artifacts('model-apple-machine', await observeAppleMachine({ profile, engine }));
         // No host record may already exist for this fresh instance.
         const instance = run.workspace.instance;
         const existing = hostRecordPaths(profile.host.home, instance).filter(target => { try { fs.lstatSync(target); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } });
@@ -320,7 +320,8 @@ export async function provisionRun({
                 || value.mounts?.some(mount => mount.Source === workspace.path || String(mount.Source).startsWith(`${workspace.path}/`))) throw blocked('An existing container already claims the new workspace');
             containers.push({ id: value.id, created: value.created, image: value.image });
         }
-        run.preInventory = { containers }; persist();
+        run.preInventory = { containers, ...(profile.model?.profile === 'apple-cpu' ? { gpuGrants: modelGrantInventory(profile.host.home) } : {}) }; persist();
+        if (profile.model?.profile === 'apple-cpu') artifacts('model-grants-before', { runId: run.runId, entries: run.preInventory.gpuGrants });
 
         // 4. The fixture agents, only inside the new workspace.
         const fixtureOp = intent('fixture-write');
@@ -363,7 +364,7 @@ export async function provisionRun({
             } catch (error) { throw blocked(`The GPU grant did not complete: ${String(error.message).slice(0, 300)}`); }
             finally { recordHostRecords(run, profile, instance); persist(); }
         }
-        if (profile.model?.profile === 'cpu') {
+        if (['cpu', 'apple-cpu'].includes(profile.model?.profile)) {
             try {
                 await journaled('gpu-withdraw', profile.node.path, [profile.candidate.path, 'gpu', 'revoke'],
                     { cwd: workspace.path, env, deadlineMs: run.deadlines.coreMs || 30000, capture: 'gpu-withdraw' });

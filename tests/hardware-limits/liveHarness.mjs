@@ -32,9 +32,11 @@ import { createLlmCases, llmCleanupProof } from './liveLlmCases.mjs';
 import { validateLlmProfile } from './liveLlmCommands.mjs';
 import { gpuCleanupProof, isGpuProcessRecord, isToleratedRecord } from './liveGpuGate.mjs';
 import { MODEL_PROFILES, createModelCases, validateModelProfile } from './liveModelCases.mjs';
+import { MEASUREMENT_SCENARIOS, MEASUREMENT_DEADLINES } from './liveModelMeasurements.mjs';
+import { assertModelGrantInventory, modelGrantInventory } from './liveModelHostGuard.mjs';
 
 export const LIVE_CASES = Object.freeze({
-    ...Object.fromEntries(Object.values(MODEL_PROFILES).map(spec => [spec.block, [spec.case]])),
+    ...Object.fromEntries(Object.values(MODEL_PROFILES).map(spec => [spec.block, [spec.case, ...(spec.platform === 'darwin' ? Object.values(MEASUREMENT_SCENARIOS) : [])]])),
     'mac-cpu': ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C4', 'LIVE-C5', 'LIVE-C6', 'LIVE-C7'],
     'mac-adversarial': ['LIVE-S1', 'LIVE-S2'],
     'mac-explorer': ['LIVE-X0', 'LIVE-X1'],
@@ -114,12 +116,13 @@ export function validateProfile(run, { partial = false } = {}) {
         || new Set(profile.cases).size !== profile.cases.length
         || profile.cases.some(id => !LIVE_CASES[run.block].includes(id))) throw new Error('Invalid case selection');
     const gpuCases = profile.cases.some(id => id.startsWith('LIVE-P'));
-    const llmCases = profile.cases.some(id => id.startsWith('LIVE-L'));
+    const llmCases = profile.cases.some(id => /^LIVE-[LM]/.test(id));
     if (llmCases !== (profile.llm !== undefined)) throw new Error('The local-llm pins and the selected cases disagree');
     const modelBlock = Object.values(MODEL_PROFILES).some(spec => spec.block === run.block);
     if (modelBlock !== (profile.model !== undefined)) throw new Error('Model block and profile disagree');
     if (modelBlock) {
         validateModelProfile(profile, run.block);
+        if (profile.model.measurement && Object.entries(MEASUREMENT_DEADLINES).some(([key, value]) => run.deadlines[key] !== value)) throw new Error('Measurement deadlines changed');
         if (JSON.stringify(run.target.cases) !== JSON.stringify(profile.cases)) throw new Error('Model target and execution cases disagree');
     }
     else {
@@ -139,14 +142,14 @@ export function validateProfile(run, { partial = false } = {}) {
         // proved through the product's own durable records (liveBoxTransitionCustody.mjs).
         if (run.ownedBoxes.filter(box => box.id === profile.box.id).length !== 1) throw new Error('Only one immutable owned Box is supported');
         validateC5BoxReceipts(run, profile);
-        keys(run.preInventory, ['containers'], 'before inventory');
+        keys(run.preInventory, ['containers'], 'before inventory', ['gpuGrants']);
         if (!run.ownedBoxes.some(box => box.id === profile.box.id && box.created === profile.box.created)) throw new Error('Missing Box receipt');
         if (!run.operations.some(op => op.id === 'fixture-created' && op.state === 'observed'
             && op.resourceIds?.includes(profile.box.id))) throw new Error('Missing durable fixture creation receipt');
     } else {
         if (profile.box) validateC5BoxReceipts(run, profile);
         else if (run.ownedBoxes.length > 1) throw new Error('Only one immutable owned Box is supported');
-        keys(run.preInventory, [], 'before inventory', ['containers']);
+        keys(run.preInventory, [], 'before inventory', ['containers', 'gpuGrants']);
     }
     if (run.preInventory.containers !== undefined && (!Array.isArray(run.preInventory.containers) || run.preInventory.containers.length > 256
         || run.preInventory.containers.some(value => !ID.test(value.id) || !bounded(value.created, 128) || !bounded(value.image, 128)))) throw new Error('Invalid before inventory');
@@ -269,7 +272,8 @@ export function createLiveAdapter(profile, {
             if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
             run.operations.push(op); persist();
         }
-        const callSignal = cleanup ? cleanupSignal : (abort ? (signal ? AbortSignal.any([signal, abort]) : abort) : signal);
+        const scopeSignal = cleanup ? cleanupSignal : signal;
+        const callSignal = abort ? (scopeSignal ? AbortSignal.any([scopeSignal, abort]) : abort) : scopeSignal;
         const result = await processProvider(binary, args, { cwd: profile.workspace.path, env: gate === null ? env : { ...env, PLOINKY_BOX_HARDWARE_LIMITS: gate }, deadlineMs, maxBytes, signal: callSignal });
         if (op) {
             op.state = 'observed';
@@ -636,7 +640,7 @@ function pinProblem(run, profile, hostIdentity, remoteArrival) {
 // Standalone cleanup resumes from the manifest alone, including after an
 // interrupted provisioning that never recorded a Box or workspace receipt.
 export async function executeCleanupRun({ run, persist = () => {}, processProvider = runBoundedProcess, signal, remoteArrival = false, hostIdentity = defaultHostIdentity(), hostProc, artifacts = () => {}, artifactPath = null } = {}) {
-    const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Cleanup only' }));
+    const cases = (run.target.execution?.model ? run.target.execution.cases : LIVE_CASES[run.block]).map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Cleanup only' }));
     const report = { schema: 1, runId: run.runId, action: 'cleanup', verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
     // The foreign-workspace guard speaks first, over whatever the manifest names, before the profile is even validated.
     const foreign = foreignWorkspaceProblem(foreignGuardInput(run, run.target?.execution));
@@ -668,6 +672,8 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
             if (!workspacePath) throw new Error('The cleanup cannot prove the model data gone: no workspace path is recorded');
             llmCleanupProof({ workspace: workspacePath, runId: run.runId, action: 'cleanup', write: artifacts });
         }
+        assertModelGrantInventory(run, profile);
+        if (profile.model?.profile === 'apple-cpu') artifacts('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.host.home) });
         run.cleanup.state = 'complete'; run.state = 'complete';
     } catch (error) { run.cleanup.state = 'failed'; run.cleanup.failures.push(error.message); }
     finally { clearTimeout(timer); }
@@ -683,7 +689,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
 } = {}) {
     if (action === 'cleanup') return executeCleanupRun({ run, persist, processProvider, signal, remoteArrival, hostIdentity, hostProc, artifacts, artifactPath });
     const selected = run.target.execution?.cases || LIVE_CASES[run.block];
-    const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Not selected or no completed enforcement evidence' }));
+    const cases = (run.target.execution?.model ? selected : LIVE_CASES[run.block]).map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Not selected or no completed enforcement evidence' }));
     const report = { schema: 1, runId: run.runId, action, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
     const foreign = foreignWorkspaceProblem(foreignGuardInput(run, run.target?.execution));
     if (foreign) { report.limitations.push(foreign); return report; }
@@ -692,7 +698,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     if (run.cleanup.state !== 'not-started') { report.limitations.push('Cleanup has already started for this run; provision a new one'); return report; }
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
     if (problem) { report.limitations.push(problem); return report; }
-    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C3V', 'LIVE-C5', 'LIVE-C6', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3', 'LIVE-L4', 'LIVE-L5', 'LIVE-L6'].includes(id))) {
+    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C3V', 'LIVE-C5', 'LIVE-C6', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3', 'LIVE-L4', 'LIVE-L5', 'LIVE-L6', 'LIVE-L7', ...Object.values(MEASUREMENT_SCENARIOS)].includes(id))) {
         report.limitations.push('Selected cases have no implemented live executor'); return report;
     }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return report; }
@@ -715,7 +721,9 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
                 ...(adapter.availability ? { 'LIVE-C3': adapter.availability.liveC3, 'LIVE-C3V': adapter.availability.liveC3V } : {}),
                 ...(adapter.store ? { 'LIVE-C5': adapter.store.liveC5 } : {}),
                 ...(adapter.gpu ? { 'LIVE-P1': adapter.gpu.liveP1, 'LIVE-P2': adapter.gpu.liveP2, 'LIVE-P3': adapter.gpu.liveP3, 'LIVE-P4': adapter.gpu.liveP4 } : {}),
-                ...(adapter.llm ? profile.model ? { [profile.cases[0]]: adapter.llm.liveModel } : { 'LIVE-L1': adapter.llm.liveL1, 'LIVE-L2': adapter.llm.liveL2, 'LIVE-L3': adapter.llm.liveL3 } : {}),
+                ...(adapter.llm ? profile.model ? { [MODEL_PROFILES[profile.model.profile].case]: adapter.llm.liveModel,
+                    ...Object.fromEntries(Object.values(MEASUREMENT_SCENARIOS).map(id => [id, () => adapter.llm.liveMeasurement(id)])) }
+                    : { 'LIVE-L1': adapter.llm.liveL1, 'LIVE-L2': adapter.llm.liveL2, 'LIVE-L3': adapter.llm.liveL3 } : {}),
             };
             for (const id of selected) {
                 activeCase = id;
@@ -757,7 +765,7 @@ export async function runLiveCommand({
     validateAuthorization(run, bytes, authorization, action);
     let ownershipClient;
     if (Object.hasOwn(process.env, PROCESS_OWNER_ENV)) {
-        if (run.block !== 'mac-model-venus' || run.target.execution?.model?.profile !== 'apple'
+        if (!['mac-model-venus/apple', 'mac-model-cpu/apple-cpu'].includes(`${run.block}/${run.target.execution?.model?.profile}`)
             || run.target.ssh || remoteLocal !== null || processProvider) throw Error('Process ownership requires the local Apple action and exclusive provider');
         ownershipClient = await createOwnershipClient({ descriptorPath: process.env[PROCESS_OWNER_ENV], runPath, runId: run.runId, action });
         processProvider = ownershipClient.processProvider;

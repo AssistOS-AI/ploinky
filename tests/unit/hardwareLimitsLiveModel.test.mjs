@@ -14,10 +14,12 @@ import { agentLibLabels, normalizeBoxAgentLib } from '../../ploinky-box/contract
 import { imageSourceIdentity } from '../../agentlib/contract.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { buildConcreteManifest, validatePins, CONCRETE_BLOCKS, renderSummary } from '../hardware-limits/liveManifest.mjs';
-import { validateProfile, executeLiveRun, executeCleanupRun, validateAuthorization } from '../hardware-limits/liveHarness.mjs';
+import { validateProfile, executeLiveRun, executeCleanupRun, validateAuthorization, runLiveCommand } from '../hardware-limits/liveHarness.mjs';
 import { provisionRun, fixtureContainerName } from '../hardware-limits/liveFixture.mjs';
 import { artifactPathFor, engineIdentityDigest, digest, jsonDigest, liveSourceDigest, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
 import { MODEL_PROFILES, assertModelObservation, assertModelContainer, assertModelSource, validateModelPins, ordinaryGpuAnchor } from '../hardware-limits/liveModelCases.mjs';
+import { MEASUREMENT_WEIGHTS, MEASUREMENT_MEMORY, MEASUREMENT_RUNNER, MEASUREMENT_GROUP } from '../hardware-limits/liveModelMeasurementCommands.mjs';
+import { validateMeasurementReceipt } from '../hardware-limits/liveModelMeasurements.mjs';
 import { MODEL_SOURCE_VIEW, modelSourceLayout, observeModelStage, observeModelCodeView } from '../hardware-limits/liveModelSource.mjs';
 import { ensurePodmanStagedCodeDir } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { canonicalDigest } from '../../cli/utils/dependencies/store/canonical.mjs';
@@ -29,7 +31,7 @@ import { MODEL_PROCESS_FACTS, LLM_TOOL_CALL } from '../hardware-limits/liveLlmCo
 import { APPLE_DEVICE_INSPECT, APPLE_RENDER_FACTS } from '../hardware-limits/liveModelDevices.mjs';
 import { requiredArtifacts, llmCleanupProofProblem, modelInferenceProofProblem, modelProvisionOnlyCleanupProven, judgeArtifacts, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { fakeEngineInfo, evaluateTemplate, inspectModel, ok } from '../hardware-limits/fakeLiveEngine.mjs';
-import { validateRunManifest } from '../hardware-limits/fixtures.mjs';
+import { validateRunManifest, writePrivateJson } from '../hardware-limits/fixtures.mjs';
 
 const hex = value => crypto.createHash('sha256').update(value).digest('hex');
 const IMAGE = `docker.io/assistos/local-llm@sha256:${'a'.repeat(64)}`;
@@ -101,10 +103,11 @@ function stageModelFixture(profile, agent) {
 function modelPin(profile) {
     return { profile, imageConfigDigest: CONFIG, imageParentDigest: `sha256:${'c'.repeat(64)}`, cibRevision: 'd'.repeat(40),
         executable: { path: MODEL_PROFILES[profile].executable, sha256: 'e'.repeat(64), version: 'b11159' },
-        ...(profile === 'apple' ? { apple: { machine: 'owned-test', connection: 'owned-test', uri: 'ssh://user@localhost:1234/run/user/501/podman/podman.sock', provider: 'libkrun', renderNode: '/dev/dri/renderD128' } } : {}) };
+        ...(['apple', 'apple-cpu'].includes(profile) ? { apple: { machine: 'owned-test', connection: 'owned-test', uri: 'ssh://user@localhost:1234/run/user/501/podman/podman.sock', provider: 'libkrun', ...(profile === 'apple' ? { renderNode: '/dev/dri/renderD128' } : {}) } } : {}) };
 }
 function observation(profile = 'cpu') {
     const model = modelPin(profile); const spec = MODEL_PROFILES[profile];
+    if (profile === 'apple-cpu') return { ...observation('cpu'), model, spec };
     return { spec, model, pins: SMALL, imageId: CONFIG,
         status: { phase: 'ready', profile: spec.backend, deployment: { phase: 'ready', profile: spec.backend, modelId: SMALL.id, runnerId: spec.runner, artifact: { ...SMALL } }, runnerReport: { device: profile === 'cpu' ? 'CPU' : `${profile === 'apple' ? 'Vulkan0' : 'CUDA0'} (offline GPU)`, offloaded: { layers: profile === 'cpu' ? 0 : 24 } } },
         answer: { text: 'Blue.', modelId: SMALL.id, runnerId: spec.runner, generationTokensPerSecond: 4 },
@@ -132,9 +135,10 @@ function world(t, profile = 'cpu', fault = {}) {
     ] }));
     const pins = { schema: 1, host: { hostname: 'offline', platform: MODEL_PROFILES[profile].platform, home }, node: { path: node, digest: digest(fs.readFileSync(node)) },
         engine: { path: engine, digest: digest(fs.readFileSync(engine)), identityDigest: engineIdentityDigest(fakeEngineInfo(HOST)) }, boxImage: `docker.io/assistos/box@sha256:${'f'.repeat(64)}`, llm: { image: IMAGE }, model: modelPin(profile),
-        ...(profile === 'apple' ? { workspaceParentRoot: root } : { ssh: { alias: 'ubuntu-codex', sshBinary: ssh, address: '192.168.1.63', hostKeyAlias: '192.168.1.63', user: 'offline', knownHosts, identityFile: null } }),
+        ...(['apple', 'apple-cpu'].includes(profile) ? { workspaceParentRoot: root } : { ssh: { alias: 'ubuntu-codex', sshBinary: ssh, address: '192.168.1.63', hostKeyAlias: '192.168.1.63', user: 'offline', knownHosts, identityFile: null } }),
         ...(profile === 'nvidia' ? { gpu: { uuid: 'GPU-12345678', name: 'offline GPU', driverVersion: '595.1', memoryMiB: 6144, smi: { path: engine, digest: digest(fs.readFileSync(engine)) } } } : {}) };
     const runId = crypto.randomBytes(16).toString('hex');
+    if (fault.measurement) pins.model.measurement = { schema: 1, comparisonId: 'a'.repeat(32), cohort: 1, scenario: fault.measurement };
     const candidate = { root: source, digest: liveSourceDigest(source), revision: 'a'.repeat(40), llm: { revision: 'b'.repeat(40) } };
     const payload = path.join(evidence, 'candidate.tar'); candidate.payload = { path: payload, ...writeUstar(source, payload) };
     const run = buildConcreteManifest({ block: MODEL_PROFILES[profile].block, runId, configDigest: digest('config'), casesDigest: digest('cases'), documentSuffix: 'codex', pins, candidate, image: IMAGE, ports: { tcp: 23456, udp: 34567 }, unsupported: {} });
@@ -143,7 +147,7 @@ function world(t, profile = 'cpu', fault = {}) {
         fs.writeFileSync(path.join(run.target.stage.root, '.ploinky-hwl-owner'), runId);
         fs.cpSync(source, path.join(run.target.stage.root, 'source'), { recursive: true });
     }
-    const artifacts = new Map(); const calls = []; let box = null; let agent = null; let running = false;
+    const artifacts = new Map(); const calls = []; let box = null; let agent = null; let running = false; let runnerEpoch = 0;
     const value = observation(profile);
     const fail = text => ok('', { status: 1, stderr: text });
     const prefix = `/user.slice/libpod-${'1'.repeat(64)}.scope`;
@@ -173,12 +177,13 @@ function world(t, profile = 'cpu', fault = {}) {
             : !fault.sharedCgroup && directory === leaf ? [249565, ...(running ? [200] : [])]
                 : fault.controllerHeavy && [`${prefix}/engine`, `${prefix}/engine/agents`].includes(directory) ? [] : null };
     const provider = async (binary, args, options) => {
-        calls.push({ binary, args, env: options.env });
+        calls.push({ binary, args, env: options.env, cancelled: Boolean(options.signal?.aborted) });
         assert.ok(!args.some(arg => String(arg).includes('/.ploinky/repos/')), 'No managed source operation');
         if (options.signal?.aborted) return ok('', { status: null, cancelled: true });
-        if (binary === '/usr/sbin/sysctl') return ok(args.at(-1) === 'vm.swapusage' ? 'used = 0.00M' : args.at(-1) === 'kern.memorystatus_level' ? '50' : '1');
+        if (binary === '/usr/sbin/sysctl') return ok(args.at(-1) === 'machdep.cpu.brand_string' ? 'Offline Apple' : args.at(-1) === 'hw.memsize' ? String(16 * 2 ** 30) : args.at(-1) === 'vm.swapusage' ? 'used = 0.00M' : args.at(-1) === 'kern.memorystatus_level' ? '50' : '1');
+        if (binary === '/usr/bin/sw_vers') return ok('offline');
         if (binary === '/bin/ps') return ok('123 1024000 /opt/bin/krunkit\n');
-        if (args[0] === 'machine') return ok(JSON.stringify(args[1] === 'list' ? [{ Name: 'owned-test', VMType: 'libkrun', Running: true }] : [{ Name: 'owned-test', State: 'running', Rootful: false }]));
+        if (args[0] === 'machine') return ok(JSON.stringify(args[1] === 'list' ? [{ Name: 'owned-test', VMType: 'libkrun', Running: true }] : [{ Name: 'owned-test', State: 'running', Rootful: false, Resources: { CPUs: 4, Memory: 6144 } }]));
         if (args[0] === 'system') return ok(JSON.stringify([{ Name: 'owned-test', URI: pins.model.apple.uri, Default: true }]));
         if (args.includes('-q') && args.includes('-x')) {
             if (running && fault.loading) loadingChecks += 1;
@@ -209,13 +214,29 @@ function world(t, profile = 'cpu', fault = {}) {
             if (tool === 'local_llm_test_prompt' && fault.providerOverlayAfter) {
                 box.mounts.push({ Type: 'bind', Source: '/foreign', Destination: '/opt/ploinky-agentlib/main.mjs', RW: true });
             }
-            if (tool === 'local_llm_run') running = true;
+            if (tool === 'local_llm_run') {
+                running = true;
+                if (fault.measurement) {
+                    runnerEpoch++; value.processes[0].start = String(1234 + runnerEpoch);
+                    value.status.deployment.params = JSON.parse(args[at + 2]).params;
+                    value.status.context = { totalContext: value.status.deployment.params.ctxSize,
+                        perRequestContext: Math.floor(value.status.deployment.params.ctxSize / value.status.deployment.params.parallel),
+                        parallel: value.status.deployment.params.parallel, kvUnified: false };
+                    value.status.startupObservation = { controllerEpoch: 'offline-epoch', deploymentId: `deployment-${runnerEpoch}`, runnerIdentity: { runnerStartId: `runner-${runnerEpoch}`, pid: 42 },
+                        pageCachePreparation: { policy: 'existing-best-effort-per-file-drop', phase: 'complete', filesConsidered: 1, attempts: 1, reportedSuccesses: 1, reportedFailures: 0, skippedNonRegular: 0, observationErrors: 0 } };
+                }
+            }
             if (tool === 'local_llm_test_prompt') fault.afterPrompt?.(value);
             if (tool === 'local_llm_stop') { if (fault.stop) return fail('injected stop failure'); running = false; }
             if (tool === 'local_llm_status' && fault.cancelLoad && running) return ok('', { cancelled: true, status: null });
             let result = tool === 'local_llm_overview' ? { profile: value.spec.backend, hardware: { gpu: { name: 'offline GPU', driverVersion: '595.1' } }, runners: [{ id: value.spec.runner, installed: true, version: 'b11159' }] }
                 : tool === 'local_llm_status' ? running ? clone(value.status) : { phase: 'idle' }
                     : tool === 'local_llm_test_prompt' ? { ...value.answer, ...(fault.empty ? { text: '' } : {}) } : {};
+            if (fault.measurement) {
+                if (tool === 'local_llm_overview') result.preview = { admission: { status: 'ok' } };
+                if (tool === 'local_llm_run') result = { deployment: { params: value.status.deployment.params } };
+                if (tool === 'local_llm_test_prompt') result.completionTokens = 2;
+            }
             if (tool === 'local_llm_status' && running && fault.loading && loadingChecks < (fault.loadingChecks || 1)) result = { phase: 'loading' };
             return ok(JSON.stringify({ ok: true, agent: fault.agent ? 'foreign-agent' : 'local-llm', result }));
         }
@@ -226,6 +247,10 @@ function world(t, profile = 'cpu', fault = {}) {
             if (running && fault.factsDenied) return fail('process read denied');
             return ok(JSON.stringify({ processes: running ? value.processes : [] }), fault.oversized ? { truncated: true } : {});
         }
+        if (args.includes(MEASUREMENT_WEIGHTS)) return ok(JSON.stringify({ root: 'controller-gguf-cache', files: [{ file: SMALL.file, size: SMALL.size, sha256: SMALL.sha256 }], weightsReused: true, pageCacheState: 'unverified', shaderCachePolicy: 'unchanged-no-harness-purge' }));
+        if (args.includes(MEASUREMENT_MEMORY)) return ok(JSON.stringify({ vm: { totalBytes: 6 * 2 ** 30, availableBytes: 4 * 2 ** 30 }, cgroup: { 'memory.current': '1000', 'memory.peak': '2000', 'memory.max': 'max', 'memory.swap.current': '0', 'memory.events': 'oom_kill 0' }, peakKind: 'cumulative' }));
+        if (args.includes(MEASUREMENT_RUNNER)) return ok(JSON.stringify({ pid: 42, start: value.processes[0].start, pgid: 42, resolvedThreads: 4, shaderCacheIdentity: profile === 'apple' ? 'a'.repeat(64) : null, flags: { '--threads': '4' } }));
+        if (args.includes(MEASUREMENT_GROUP)) return ok(JSON.stringify({ ...JSON.parse(args.at(-1)), groupAbsent: !running }));
         if (args.includes(MODEL_SOURCE_VIEW)) {
             const stage = agent.mounts.find(mount => mount.Destination === '/code').Source;
             const io = modelNamespaceFs(stage, providerRoot);
@@ -255,7 +280,7 @@ function world(t, profile = 'cpu', fault = {}) {
         if (args.includes('ps')) return ok(box ? box.id + '\n' : '');
         throw new Error(`Unexpected offline command: ${args[0]}`);
     };
-    const options = () => ({ run, processProvider: provider, hostIdentity: pins.host, hostProc, remoteArrival: profile !== 'apple', artifacts: (name, data) => {
+    const options = () => ({ run, processProvider: provider, hostIdentity: pins.host, hostProc, signal: fault.liveAbort?.signal, remoteArrival: MODEL_PROFILES[profile].platform !== 'darwin', artifacts: (name, data) => {
         artifactPathFor(path.join(evidence, 'run_codex.json'), name);
         if (fault.proof && name === 'llm-cleanup-proof') throw new Error('injected proof write failure');
         artifacts.set(name, clone(data));
@@ -451,8 +476,8 @@ test('MODEL.manifest-profile-pins-and-old-mode-separation', t => {
     for (const profile of Object.keys(MODEL_PROFILES)) {
         const w = world(t, profile);
         const localPins = clone(w.pins);
-        if (profile === 'apple') localPins.host = { hostname: os.hostname(), platform: process.platform, home: fs.realpathSync(os.homedir()) };
-        if (profile === 'apple' && process.platform !== 'darwin') assert.throws(() => validatePins(localPins, w.run.block), /Invalid pins/);
+        if (MODEL_PROFILES[profile].platform === 'darwin') localPins.host = { hostname: os.hostname(), platform: process.platform, home: fs.realpathSync(os.homedir()) };
+        if (MODEL_PROFILES[profile].platform === 'darwin' && process.platform !== 'darwin') assert.throws(() => validatePins(localPins, w.run.block), /Invalid pins/);
         else validatePins(localPins, w.run.block);
         validateProfile(w.run, { partial: true }); validateRunManifest(w.run);
         assert.equal(CONCRETE_BLOCKS[w.run.block].cases.length, 1);
@@ -488,6 +513,132 @@ test('MODEL.cpu-canonical-provision-inference-cleanup-with-ordinary-source', asy
     assert.deepEqual(w.artifacts.get('llm-cleanup-proof').remaining, []);
     assert.equal(fs.existsSync(profile.workspace.path), false);
     const repeated = await w.live(); assert.notEqual(repeated.verdict, 'PASS');
+});
+
+test('MODEL.apple-cpu-canonical-withdrawal-host-guard-and-cleanup', async t => {
+    const w = world(t, 'apple-cpu');
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const revoke = w.calls.findIndex(call => call.args.includes('revoke'));
+    const start = w.calls.findIndex(call => call.args.includes('start'));
+    assert.ok(revoke >= 0 && revoke < start);
+    const result = await w.live(); assert.equal(result.verdict, 'PASS', JSON.stringify(result));
+    assert.equal(w.artifacts.get('model-live-l7').status, 'pass');
+    assert.ok(w.artifacts.get('model-a15-host-guard').samples.length > 0);
+    assert.equal(w.calls.some(call => call.args.includes('grant')), false);
+});
+
+test('MODEL.apple-cpu-preserves-unrelated-grant-records-and-detects-changes', async t => {
+    const w = world(t, 'apple-cpu');
+    const directory = path.join(w.pins.host.home, '.ploinky-box', 'gpu-grants'); fs.mkdirSync(directory, { recursive: true });
+    const sentinel = path.join(directory, 'unrelated.json'); fs.writeFileSync(sentinel, '{"grant":"unrelated"}');
+    assert.equal((await w.provision()).verdict, 'PASS');
+    assert.equal((await w.live()).verdict, 'PASS');
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), '{"grant":"unrelated"}');
+    const changed = world(t, 'apple-cpu'); const grants = path.join(changed.pins.host.home, '.ploinky-box', 'gpu-grants');
+    fs.mkdirSync(grants, { recursive: true }); fs.writeFileSync(path.join(grants, 'other.json'), 'original');
+    assert.equal((await changed.provision()).verdict, 'PASS'); fs.writeFileSync(path.join(grants, 'other.json'), 'changed');
+    assert.notEqual((await changed.live()).verdict, 'PASS');
+});
+
+test('MODEL.completed-live-run-allows-repeated-standalone-cleanup', async t => {
+    for (const profile of ['apple-cpu', 'cpu', 'apple', 'nvidia']) {
+        const w = world(t, profile);
+        assert.equal((await w.provision()).verdict, 'PASS');
+        if (profile === 'apple-cpu') assert.deepEqual(w.run.preInventory, { containers: [], gpuGrants: [] });
+        assert.equal((await w.live()).verdict, 'PASS');
+        assert.equal(w.run.cleanup.state, 'complete');
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            w.artifacts.delete('llm-cleanup-proof'); w.artifacts.delete('model-grants-after');
+            const result = await w.cleanup();
+            assert.equal(result.verdict, 'PASS', JSON.stringify(result));
+            assert.equal(result.exitCode, 0); assert.equal(result.cleanup.state, 'complete');
+            assert.deepEqual(result.cleanup.failures, []);
+            const proof = w.artifacts.get('llm-cleanup-proof');
+            assert.equal(proof.action, 'cleanup'); assert.equal(proof.runId, w.run.runId);
+            assert.deepEqual(proof.remaining, []);
+            if (profile === 'apple-cpu') assert.deepEqual(w.artifacts.get('model-grants-after'), { runId: w.run.runId, entries: [] });
+        }
+    }
+});
+
+test('MODEL.apple-cpu-standalone-cleanup-retains-complete-grant-and-ownership-checks', async t => {
+    const w = world(t, 'apple-cpu');
+    const grants = path.join(w.pins.host.home, '.ploinky-box', 'gpu-grants');
+    const directory = path.join(grants, 'unrelated'); fs.mkdirSync(directory, { recursive: true });
+    const sentinel = path.join(directory, 'grant.json'); const bytes = '{"grant":"unrelated"}'; fs.writeFileSync(sentinel, bytes);
+    assert.equal((await w.provision()).verdict, 'PASS');
+    assert.equal((await w.live()).verdict, 'PASS');
+    const cleanup = run => executeCleanupRun({ ...w.options(), run });
+    const result = await w.cleanup(); assert.equal(result.verdict, 'PASS', JSON.stringify(result));
+    assert.deepEqual(w.artifacts.get('model-grants-after').entries, w.run.preInventory.gpuGrants);
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), bytes);
+    for (const mutate of [
+        run => { delete run.preInventory.gpuGrants; },
+        run => { run.preInventory.gpuGrants = null; },
+        run => { run.preInventory.gpuGrants.pop(); },
+        run => { run.preInventory.gpuGrants[1].sha256 = '0'.repeat(64); },
+        run => { run.preInventory.gpuGrants[1].path = '../foreign.json'; },
+    ]) {
+        const bad = clone(w.run); mutate(bad);
+        const failed = await cleanup(bad); assert.equal(failed.verdict, 'FAIL');
+        assert.ok(failed.cleanup.failures.includes('Unrelated GPU grant inventory changed'));
+    }
+    for (const mutate of [
+        run => { run.preInventory.unexpected = []; },
+        run => { run.preInventory.containers = [{ id: 'short', created: 'now', image: 'image' }]; },
+        run => { run.ownedPaths.push({ path: grants }); },
+    ]) {
+        const bad = clone(w.run); mutate(bad); const before = w.calls.length;
+        assert.equal((await cleanup(bad)).verdict, 'BLOCKED');
+        assert.equal(w.calls.length, before, 'invalid inventory or ownership must refuse before commands');
+    }
+    fs.writeFileSync(sentinel, 'changed');
+    const changed = await cleanup(clone(w.run)); assert.equal(changed.verdict, 'FAIL');
+    assert.ok(changed.cleanup.failures.includes('Unrelated GPU grant inventory changed'));
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'changed');
+});
+
+test('MODEL.measurement-manifest-through-canonical-cohort-retains-receipts', async t => {
+    for (const profile of ['apple', 'apple-cpu']) {
+        const w = world(t, profile, { measurement: 'baseline-v1' });
+        validateProfile(w.run, { partial: true });
+        assert.equal((await w.provision()).verdict, 'PASS');
+        const result = await w.live(); assert.equal(result.verdict, 'PASS', JSON.stringify(result));
+        const receipt = w.artifacts.get('measurement-live-m1');
+        validateMeasurementReceipt(receipt, { run: w.run, runId: w.run.runId, caseId: 'LIVE-M1', profile,
+            configuration: w.run.target.execution.model.measurement, readArtifact: name => Buffer.from(JSON.stringify(w.artifacts.get(name), null, 2) + '\n') });
+        assert.equal(receipt.trials.length, 4); assert.equal(receipt.loads.length, 2);
+        assert.equal(w.artifacts.get('model-stop-proof').groupAbsent, true);
+    }
+});
+
+test('MODEL.measurement-runLiveCommand-consumes-frozen-authorized-manifest', async t => {
+    const w = world(t, 'apple-cpu', { measurement: 'baseline-v1' });
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const runPath = path.join(w.root, 'e', 'run_codex.json'); const authorizationPath = path.join(w.root, 'e', 'authorization.json');
+    writePrivateJson(runPath, w.run);
+    writePrivateJson(authorizationPath, { schema: 1, runId: w.run.runId, manifestDigest: digest(fs.readFileSync(runPath)), targetDigest: jsonDigest(w.run.target), action: 'live' });
+    const report = await runLiveCommand({ runPath, authorizationPath, action: 'live', processProvider: w.provider, hostIdentity: w.pins.host });
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report));
+    assert.equal(JSON.parse(fs.readFileSync(artifactPathFor(runPath, 'measurement-live-m1'))).status, 'pass');
+    const calls = w.calls.length;
+    await assert.rejects(runLiveCommand({ runPath, authorizationPath, action: 'live', processProvider: w.provider, hostIdentity: w.pins.host }), /binding|manifest|approval/i);
+    assert.equal(w.calls.length, calls);
+});
+
+test('MODEL.measurement-abort-dispatches-normal-Stop-under-fresh-cleanup-scope', async t => {
+    const liveAbort = new AbortController();
+    const w = world(t, 'apple', { measurement: 'longer-context-v1', liveAbort, afterPrompt: () => liveAbort.abort(Error('injected live abort')) });
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const report = await w.live();
+    assert.notEqual(report.verdict, 'PASS'); assert.equal(report.cleanup.state, 'complete', JSON.stringify(report.cleanup));
+    const promptIndex = w.calls.findIndex(call => call.args.includes(LLM_TOOL_CALL) && call.args[call.args.indexOf(LLM_TOOL_CALL) + 1] === 'local_llm_test_prompt');
+    const stopIndex = w.calls.findIndex((call, index) => index > promptIndex && call.args.includes(LLM_TOOL_CALL) && call.args[call.args.indexOf(LLM_TOOL_CALL) + 1] === 'local_llm_stop');
+    assert.ok(promptIndex >= 0 && stopIndex > promptIndex, 'Normal Stop dispatched after live cancellation');
+    assert.equal(w.calls[stopIndex].cancelled, false);
+    assert.ok(w.calls.some(call => call.args.includes('destroy') && !call.cancelled));
+    assert.equal(w.artifacts.get('model-stop-proof').groupAbsent, true);
+    assert.notEqual(w.artifacts.get('measurement-live-m2').status, 'pass');
 });
 
 test('MODEL.failure-cancellation-stop-destroy-and-oversized-never-pass', async t => {
@@ -560,9 +711,9 @@ test('MODEL.backend-model-image-offload-and-safe-process-facts', () => {
         for (const mutate of [o => { o.status.profile = 'wrong'; }, o => { o.status.deployment.modelId = 'wrong'; }, o => { o.status.deployment.artifact.sha256 = '0'.repeat(64); }, o => { o.imageId = '0'.repeat(64); }, o => { o.answer.text = ''; }, o => { o.answer.generationTokensPerSecond = 0; }, o => { o.processes[0].mps = true; }, o => { o.processes[0].sha256 = '0'.repeat(64); }]) {
             const bad = clone(good); mutate(bad); assert.throws(() => assertModelObservation(bad));
         }
-        if (profile !== 'cpu') for (const mutate of [o => { o.status.runnerReport.offloaded.layers = 0; }, o => { o.status.runnerReport.device = 'CPU'; }]) { const bad = clone(good); mutate(bad); assert.throws(() => assertModelObservation(bad)); }
+        if (MODEL_PROFILES[profile].backend !== 'cpu') for (const mutate of [o => { o.status.runnerReport.offloaded.layers = 0; }, o => { o.status.runnerReport.device = 'CPU'; }]) { const bad = clone(good); mutate(bad); assert.throws(() => assertModelObservation(bad)); }
         if (profile === 'apple') { const bad = clone(good); bad.processes[0].icd = '/wrong'; assert.throws(() => assertModelObservation(bad)); }
-        if (profile === 'cpu') for (const mutate of [o => { o.processes[0].cudaVisible = '0'; }, o => { o.processes[0].nvidiaLibrary = true; }, o => { o.processes[0].args['--fit'] = 'on'; }, o => { o.processes[0].args['--n-gpu-layers'] = '99'; }]) { const bad = clone(good); mutate(bad); assert.throws(() => assertModelObservation(bad)); }
+        if (MODEL_PROFILES[profile].backend === 'cpu') for (const mutate of [o => { o.processes[0].cudaVisible = '0'; }, o => { o.processes[0].nvidiaLibrary = true; }, o => { o.processes[0].args['--fit'] = 'on'; }, o => { o.processes[0].args['--n-gpu-layers'] = '99'; }]) { const bad = clone(good); mutate(bad); assert.throws(() => assertModelObservation(bad)); }
     }
 });
 

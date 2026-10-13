@@ -1,5 +1,7 @@
 # Dependencies for graph skill scope persistence
 
+The optional Apple CPU and measurement tests use Node.js built-ins and repository modules. They add no package or runtime dependency. Live execution uses the existing pinned Podman, Node.js, llama.cpp image and macOS observers through the owned process provider. Preparation checks executable and image pins before execution; it never installs a missing prerequisite. The fixed cache observer imports the staged local-llm downloader's path resolver and reads only the controller's `/data/models/gguf` tree. Offline tests use the existing engine-spawn guard and need `PLOINKY_AGENTLIB_DIR` to name the canonical AchillesAgentLib checkout.
+
 Host-path workspace mounts, path admission, diagnostics, and their tests use
 Node.js 22+ built-ins and repository-owned modules. They introduce no new
 packages, external source, or system tools. Native verification uses the
