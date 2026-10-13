@@ -14,6 +14,7 @@ import { requireTransport } from './liveProcess.mjs';
 import { cgroupWithin, createHostProc, processesWithin } from './liveGpuHost.mjs';
 import { createModelHostGuard, observeAppleMachine, parseModelHostSample } from './liveModelHostGuard.mjs';
 import { MODEL_SOURCE_VIEW, modelMountFacts, modelSourceLayout, observeModelStage } from './liveModelSource.mjs';
+import { APPLE_DEVICE_INSPECT, assertAppleDeviceArguments, observeAppleDevices } from './liveModelDevices.mjs';
 
 export const MODEL_PROFILES = Object.freeze({
     apple: { block: 'mac-model-venus', case: 'LIVE-L6', platform: 'darwin', backend: 'venus', runner: 'llama.cpp-vulkan', executable: '/opt/llama.cpp-vulkan/llama-server' },
@@ -63,6 +64,10 @@ export function modelPlan(run) {
         command('model-source-view', [...nested, 'container', 'exec', '<AGENT_ID>', 'node', '-e', '<MODEL_SOURCE_VIEW>', '<PINNED_SOURCE_AND_DEPENDENCY_PATHS>']),
         { id: 'model-source', action: `Rehash ${profile.provision.workspace.path}/local-llms/local-llm against ${profile.provision.llm.treeDigest}, allowing only the recorded manifest.container rewrite` },
         ...(profile.model.profile === 'apple' ? [
+            command('model-apple-box-devices', ['container', 'inspect', '--format', APPLE_DEVICE_INSPECT, '<BOX_ID>']),
+            command('model-apple-agent-devices', [...nested, 'container', 'inspect', '--format', APPLE_DEVICE_INSPECT, '<AGENT_ID>']),
+            command('model-apple-box-render', [...core, 'node', '-e', '<APPLE_RENDER_FACTS>', profile.model.apple.renderNode, 'box']),
+            command('model-apple-agent-render', [...nested, 'container', 'exec', '<AGENT_ID>', 'node', '-e', '<APPLE_RENDER_FACTS>', profile.model.apple.renderNode, 'agent']),
             command('model-machine-list', ['machine', 'list', '--format', 'json']),
             command('model-machine-inspect', ['machine', 'inspect', profile.model.apple.machine]),
             command('model-machine-connection', ['system', 'connection', 'list', '--format', 'json']),
@@ -160,8 +165,7 @@ export function assertModelContainer(value, { profile, role }) {
             && !value.mounts.some(mount => /nvidia|cuda|\/dev\/dri|cdi/i.test(`${mount.Source} ${mount.Destination}`)), 'CPU container has GPU/CDI devices or mounts');
     }
     if (profile.model.profile === 'apple') {
-        check(Array.isArray(value.devices) && value.devices.some(device => device.PathOnHost === profile.model.apple.renderNode
-            && device.PathInContainer === profile.model.apple.renderNode), 'Venus render device missing');
+        assertAppleDeviceArguments(value, { role, renderNode: profile.model.apple.renderNode });
     }
 }
 
@@ -266,6 +270,11 @@ export function createModelCases(ctx) {
         const agentName = fixtureContainerName(profile.workspace.path, 'local-llm', 'local-llms');
         const boxFacts = checkedJson(await engine('model-box', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, box.id]));
         const agent = checkedJson(await engine('model-agent', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, agentName]));
+        let devices;
+        if (profile.model.profile === 'apple') {
+            check(sameContainer(boxFacts, box), 'Apple Box identity changed');
+            devices = await appleDevices(boxFacts, agent, 'before');
+        }
         write('model-container-mounts', { schema: 1, runId: run.runId, box: modelMountFacts(boxFacts), agent: modelMountFacts(agent) });
         assertModelContainer(boxFacts, { profile, role: 'box' });
         assertModelContainer(agent, { profile, role: 'agent' });
@@ -322,7 +331,14 @@ export function createModelCases(ctx) {
                 onRegister: record => { run.ownedProcesses.push({ kind: 'gpu-process', ...record }); persist(); } });
             await gpu.initial();
         }
-        return { box: { id: box.id, image: box.image }, agent: { id: agent.id, image: agent.image, created: agent.created }, source };
+        return { box: { id: box.id, image: box.image }, agent: { id: agent.id, image: agent.image, created: agent.created }, source,
+            ...(devices ? { devices } : {}) };
+    }
+    async function appleDevices(box, agent, label, abort) {
+        const proof = await observeAppleDevices({ engine, core, nested, box, agent, renderNode: profile.model.apple.renderNode, abort });
+        box.recordedDevices = proof.box.recordedDevices; agent.recordedDevices = proof.agent.recordedDevices;
+        write(`model-apple-devices-${label}`, { schema: 1, runId: run.runId, ...proof });
+        return proof;
     }
     async function sourceBinding(agent, box, expectedTreeDigest, label, abort = null) {
         const name = `model-source-binding-${label}`;
@@ -363,6 +379,11 @@ export function createModelCases(ctx) {
                 check(assertModelSource(profile).stagedTreeDigest === evidence.source.stagedTreeDigest, 'Staged model source changed during inference');
                 const after = checkedJson(await engine('model-agent-after', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, agent.id], { abort }));
                 const boxAfter = checkedJson(await engine('model-box-after', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, profile.box.id], { abort }));
+                if (profile.model.profile === 'apple') {
+                    check(sameContainer(boxAfter, evidence.devices.box) && sameContainer(after, evidence.devices.agent), 'Apple container identity changed');
+                    const devices = await appleDevices(boxAfter, after, 'after', abort);
+                    check(devices.box.renderNodes[0].rdev === evidence.devices.box.renderNodes[0].rdev, 'Apple render device changed during inference');
+                }
                 write('model-container-mounts-after', { schema: 1, runId: run.runId, box: modelMountFacts(boxAfter), agent: modelMountFacts(after) });
                 assertModelContainer(after, { profile, role: 'agent' });
                 assertModelContainer(boxAfter, { profile, role: 'box' });

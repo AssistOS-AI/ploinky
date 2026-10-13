@@ -26,6 +26,7 @@ import { buildResolutionManifest } from '../../cli/utils/dependencies/store/reso
 import { generationIdFor } from '../../cli/utils/dependencies/store/objectStore.mjs';
 import { assertModelHostSample, parseModelHostSample, createModelHostGuard, observeAppleMachine } from '../hardware-limits/liveModelHostGuard.mjs';
 import { MODEL_PROCESS_FACTS, LLM_TOOL_CALL } from '../hardware-limits/liveLlmCommands.mjs';
+import { APPLE_DEVICE_INSPECT, APPLE_RENDER_FACTS } from '../hardware-limits/liveModelDevices.mjs';
 import { requiredArtifacts, llmCleanupProofProblem, modelInferenceProofProblem, modelProvisionOnlyCleanupProven, judgeArtifacts, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { fakeEngineInfo, evaluateTemplate, inspectModel, ok } from '../hardware-limits/fakeLiveEngine.mjs';
 import { validateRunManifest } from '../hardware-limits/fixtures.mjs';
@@ -192,7 +193,7 @@ function world(t, profile = 'cpu', fault = {}) {
                     ...agentLibLabels(imageProvider('f'.repeat(64))) }, mounts: [{ Type: 'bind', Source: options.cwd, Destination: options.cwd, RW: true }], devices: ['/dev/fuse', '/dev/net/tun'].map(name => ({ PathOnHost: name, PathInContainer: name })) };
             agent = { id: '2'.repeat(64), pid: 3190, name: fixtureContainerName(options.cwd, 'local-llm', 'local-llms'), created: box.created, image: CONFIG.slice(7), imageName: IMAGE, running: true, labels: {}, devices: [], mounts: [{ Source: path.join(options.cwd, 'local-llms', 'local-llm'), Destination: '/code', RW: false }] };
             stageModelFixture({ ...run.target.execution, box }, agent);
-            if (profile === 'apple') { agent.devices = [{ PathOnHost: '/dev/dri/renderD128', PathInContainer: '/dev/dri/renderD128' }]; box.devices.push(...agent.devices); }
+            if (profile === 'apple') { agent.devices = []; box.devices = []; }
             return ok();
         }
         if (binary === node && args.includes('destroy')) {
@@ -237,8 +238,19 @@ function world(t, profile = 'cpu', fault = {}) {
             const wanted = args.at(-1);
             const record = wanted === box?.id ? box : wanted === agent?.id || wanted === agent?.name ? agent : null;
             if (!record) return fail('no such container');
+            if (profile === 'apple' && args.includes(APPLE_DEVICE_INSPECT)) {
+                const value = { ...record, createCommand: ['podman', 'create', '--env', 'SECRET=must-not-be-emitted',
+                    ...(record === box ? ['/dev/fuse', '/dev/net/tun', '/dev/dri/renderD128'] : ['ploinky.local/gpu=all']).flatMap(device => ['--device', device])] };
+                fault.appleInspect?.(value); return ok(JSON.stringify(value));
+            }
             const rendered = evaluateTemplate(args[args.indexOf('--format') + 1], 'inspect', inspectModel(record));
             return typeof rendered === 'string' ? ok(rendered) : rendered;
+        }
+        if (profile === 'apple' && args.includes(APPLE_RENDER_FACTS)) {
+            const value = { renderNodes: [{ path: '/dev/dri/renderD128', character: true, symlink: false, rdev: 57984, mode: 8630,
+                uid: 65534, gid: 65534, read: true, write: true }],
+            cdi: args.at(-1) === 'box' ? { device: 'ploinky.local/gpu=all', deviceNodes: [{ path: '/dev/dri/renderD128' }] } : null };
+            fault.appleRender?.(value); return ok(JSON.stringify(value));
         }
         if (args.includes('ps')) return ok(box ? box.id + '\n' : '');
         throw new Error(`Unexpected offline command: ${args[0]}`);
@@ -485,6 +497,34 @@ test('MODEL.failure-cancellation-stop-destroy-and-oversized-never-pass', async t
         if (fault.destroy) { assert.equal(result.cleanup.state, 'failed'); assert.equal(fs.existsSync(w.run.target.execution.workspace.path), true); }
         else assert.equal(fs.existsSync(w.run.target.execution.workspace.path), false);
         assert.ok(w.artifacts.has('model-live-l5'));
+    }
+});
+
+test('MODEL.apple-device-proof-injected-cohort', async t => {
+    const w = world(t, 'apple');
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const result = await w.live(); assert.equal(result.verdict, 'PASS', JSON.stringify(result));
+    assert.deepEqual(result.cases.map(row => [row.id, row.result]), [['LIVE-L6', 'pass']]);
+    for (const name of ['model-apple-devices-before', 'model-apple-devices-after']) {
+        const proof = w.artifacts.get(name);
+        assert.deepEqual(proof.box.recordedDevices, ['/dev/fuse', '/dev/net/tun', '/dev/dri/renderD128']);
+        assert.deepEqual(proof.agent.recordedDevices, ['ploinky.local/gpu=all']);
+        assert.equal(proof.box.renderNodes[0].rdev, proof.agent.renderNodes[0].rdev);
+    }
+    assert.ok(!JSON.stringify([...w.artifacts]).includes('must-not-be-emitted'));
+});
+
+test('MODEL.apple-device-proof-refuses-before-tool-dispatch', async t => {
+    for (const fault of [{ appleInspect: value => { value.createCommand = []; } },
+        { appleInspect: value => { value.devices = null; } },
+        { appleRender: value => { value.renderNodes[0].write = false; } },
+        { appleRender: value => { value.renderNodes.push(value.renderNodes[0]); } },
+        { appleRender: value => { if (value.cdi) value.cdi.deviceNodes[0].path = '/dev/null'; } }]) {
+        const w = world(t, 'apple', fault);
+        assert.equal((await w.provision()).verdict, 'PASS');
+        assert.notEqual((await w.live()).verdict, 'PASS');
+        assert.ok(!w.calls.some(call => call.args.includes(LLM_TOOL_CALL)));
+        assert.ok(!JSON.stringify([...w.artifacts]).includes('must-not-be-emitted'));
     }
 });
 
