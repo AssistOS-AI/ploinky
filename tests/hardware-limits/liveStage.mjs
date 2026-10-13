@@ -13,6 +13,9 @@ import { EXIT, validateRunManifest } from './fixtures.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { assertLocalSshPins, dispatchRemoteRun, safePath, sshOptions, validateRemoteTarget } from './liveRemote.mjs';
 import { HASH, OWNER_MARKER, RUN_ID, artifactPathFor, c5CleanupProofName, digest, failureEvidenceNames, jsonDigest, keys } from './liveCommon.mjs';
+import { isApuModel } from './liveApuPins.mjs';
+import { validateApuReceipt, validateApuHostProof, validateApuIdleProof } from './liveApuEvidence.mjs';
+import { MODEL_PROFILES, assertModelContainer, assertModelObservation } from './liveModelCases.mjs';
 
 const WORD = /^[A-Za-z0-9_./:=,%+@-]+$/;
 export const REMOTE_PARENT = '.cache/ploinky-hwlimits';
@@ -187,6 +190,13 @@ export function c5RequiredArtifacts({ profile, action, remoteReport, fetched = n
 // What a run must have left for its PASS to be certified: the proof each action ends with.
 export function requiredArtifacts({ profile, action, remoteReport, fetched = null, dispatchHistory = null }) {
     if (profile?.model) {
+        if (isApuModel(profile.model)) {
+            const gpu = profile.model.profile !== 'amd-apu-cpu';
+            if (action === 'provision') return ['box-inspect', 'box-contract', 'linux-host-guard-baseline', ...(gpu ? ['amd-idle-gate-initial'] : [])];
+            if (['live', 'cleanup'].includes(action)) return ['llm-cleanup-proof', 'linux-host-guard', ...(gpu ? ['amd-idle-gate-final'] : []),
+                ...(action === 'cleanup' && modelProvisionOnlyCleanupProven({ fetched, dispatchHistory }) ? [] : profile.cases.map(id => `model-${id.toLowerCase()}`))];
+            return [];
+        }
         if (profile.model.measurement && action === 'live') return [
             ...profile.cases.map(id => `${id.startsWith('LIVE-M') ? 'measurement' : 'model'}-${id.toLowerCase()}`),
             'llm-cleanup-proof', 'model-stop-proof', 'model-a15-host-guard',
@@ -413,11 +423,24 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
             if (problem) { artifacts.failures.push({ name: 'llm-cleanup-proof', reason: problem }); artifacts.complete = false; }
         }
         if (profile.model && ['live', 'cleanup'].includes(action)) {
+            if (isApuModel(profile.model)) {
+                const exempt = action === 'cleanup' && modelProvisionOnlyCleanupProven({ fetched, dispatchHistory: journal });
+                if (!exempt) {
+                    const problem = apuFetchedProofProblem({ run, fetched, remoteReport, action,
+                        read: name => {
+                            const entries = artifacts.fetched.filter(item => item.name === name);
+                            if (entries.length !== 1) throw new Error('APU artifact is missing or duplicated');
+                            return fs.readFileSync(path.join(runDirectory, entries[0].file));
+                        } });
+                    if (problem) { artifacts.failures.push({ name: 'apu-case-receipts', reason: problem }); artifacts.complete = false; }
+                }
+            } else {
             const name = `model-${profile.cases[0].toLowerCase()}`;
             const entry = artifacts.fetched.find(item => item.name === name);
             if (entry) {
                 const problem = modelInferenceProofProblem(fs.readFileSync(path.join(runDirectory, entry.file)), { runId: run.runId, caseId: profile.cases[0], requirePass: action === 'live' && remoteReport.verdict === 'PASS' });
                 if (problem) { artifacts.failures.push({ name, reason: problem }); artifacts.complete = false; }
+            }
             }
         }
         const c5Entry = action === 'cleanup' && profile.cases?.includes('LIVE-C5') && !profile.gpu ? artifacts.fetched.find(entry => entry.name === C5_CLEANUP_PROOF) : null;
@@ -529,5 +552,43 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         if (after.status === 0 || !/No such file/.test(after.stderr)) throw new Error('Remote staging root remains after removal');
         journal.removal = 'complete'; save();
     }
+}
+
+export function apuFetchedProofProblem({ run, fetched, remoteReport, action, read }) {
+    try {
+        const profile = run.target.execution;
+        const receipts = new Map(profile.cases.map(caseId => [caseId, JSON.parse(Buffer.from(read(`model-${caseId.toLowerCase()}`)).toString('utf8'))]));
+        const allocationRecords = new Map([...receipts].map(([caseId, proof]) => [caseId, proof.bufferObservations || []]));
+        const host = JSON.parse(Buffer.from(read('linux-host-guard')).toString('utf8'));
+        if (host.runId !== run.runId) throw new Error('APU host history belongs to another run');
+        validateApuHostProof(host, profile.model, { requireUntripped: action === 'cleanup' || remoteReport.verdict === 'PASS' });
+        if (profile.model.profile !== 'amd-apu-cpu') {
+            const idle = JSON.parse(Buffer.from(read('amd-idle-gate-final')).toString('utf8'));
+            if (idle.runId !== run.runId) throw new Error('AMD idle history belongs to another run');
+            validateApuIdleProof(idle, { requireUntripped: action === 'cleanup' || remoteReport.verdict === 'PASS',
+                requireFinal: true, runId: run.runId, profile, allocationRecords });
+        }
+        const outcomes = action === 'live' ? remoteReport.cases : fetched.operations.filter(op => op.kind === 'apu-case-result')
+            .map(op => ({ id: op.case, result: op.status }));
+        if (!Array.isArray(outcomes) || outcomes.length !== profile.cases.length
+            || new Set(outcomes.map(entry => entry.id)).size !== outcomes.length
+            || outcomes.some(entry => !profile.cases.includes(entry.id))) throw new Error('APU report case inventory differs');
+        for (const caseId of profile.cases) {
+            const proof = receipts.get(caseId);
+            const records = fetched.operations.filter(op => op.kind === 'apu-case-result' && op.case === caseId);
+            if (records.length !== 1 || records[0].receiptDigest !== jsonDigest(proof) || records[0].status !== proof.status) throw new Error('APU receipt transfer/outcome binding differs');
+            const reportedStatus = outcomes.find(entry => entry.id === caseId).result;
+            if (action === 'live' && remoteReport.verdict === 'PASS' && reportedStatus !== 'pass') throw new Error('APU nonpassing case cannot certify live PASS');
+            validateApuReceipt(proof, { runId: run.runId, block: run.block, profile, caseId, reportedStatus,
+                functional: value => assertModelObservation({ spec: MODEL_PROFILES[profile.model.profile], model: profile.model,
+                    pins: profile.llm.models.small, status: value.deployment, answer: value.answer,
+                    processes: value.processes, imageId: value.agent.image }) });
+            if (proof.status === 'pass') {
+                assertModelContainer(proof.containers.box, { profile, role: 'box' });
+                assertModelContainer(proof.containers.agent, { profile, role: 'agent' });
+            }
+        }
+        return null;
+    } catch (error) { return String(error.message).slice(0, 400); }
 }
 

@@ -1838,7 +1838,8 @@ export function validateRunManifest(value) {
         if (!/^sha256:[0-9a-f]{64}$/.test(value[key])) fail(`${label}.${key}`, 'invalid digest');
     }
     if (!['mac-cpu', 'mac-adversarial', 'mac-explorer', 'apparatus-cpu', 'apparatus-core', 'apparatus-authority', 'apparatus-availability', 'apparatus-router-controls', 'apparatus-store', 'apparatus-mps', 'apparatus-local-llm',
-        'apparatus-vllm', 'mac-model-venus', 'mac-model-cpu', 'apparatus-model-nvidia', 'apparatus-model-cpu'].includes(value.block)) {
+        'apparatus-vllm', 'mac-model-venus', 'mac-model-cpu', 'apparatus-model-nvidia', 'apparatus-model-cpu',
+        'linux-model-amd-apu', 'linux-model-amd-apu-pressure', 'linux-model-amd-apu-cpu'].includes(value.block)) {
         fail(`${label}.block`, 'unknown block');
     }
     if (!['proposed', 'running', 'cleanup-required', 'complete'].includes(value.state)) fail(`${label}.state`, 'invalid state');

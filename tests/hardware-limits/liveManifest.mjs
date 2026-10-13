@@ -28,9 +28,10 @@ import { DOCUMENT_SUFFIXES, GPU_TOLERATED_MAX, GPU_TOLERATED_MAX_MIB } from './f
 import { sshOptions } from './liveRemote.mjs';
 import { MODEL_PROFILES, modelPlan, validateModelPins } from './liveModelCases.mjs';
 import { normalizeMeasurement, measurementCases, MEASUREMENT_DEADLINES, MEASUREMENT_SCENARIOS, MEASUREMENT_MODEL } from './liveModelMeasurements.mjs';
+import { isApuModel, prepareApuModel } from './liveApuPins.mjs';
 
 export const CONCRETE_BLOCKS = Object.freeze({
-    ...Object.fromEntries(Object.entries(MODEL_PROFILES).map(([model, spec]) => [spec.block, { platform: spec.platform, remote: spec.platform === 'linux', cases: [spec.case], llm: true, model, gpu: model === 'nvidia' }])),
+    ...Object.fromEntries(Object.entries(MODEL_PROFILES).map(([model, spec]) => [spec.block, { platform: spec.platform, remote: spec.platform === 'linux', cases: spec.cases || [spec.case], llm: true, model, gpu: model === 'nvidia' }])),
     'mac-cpu': { platform: 'darwin', remote: false, cases: ['LIVE-C1', 'LIVE-C2'] },
     'apparatus-cpu': { platform: 'linux', remote: true, cases: ['LIVE-A1'] },
     // C1 and C2 on native Linux (release plan C8b): the same owned CPU fixture and executors as mac-cpu, on the apparatus.
@@ -222,7 +223,7 @@ export function proposedWorkspace(block, pins, runId) {
 // The pins of the local-llm candidate carried in the frozen payload (.hwl-local-llms/local-llm): its
 // tree digest, its manifest before and after the image is pinned, and the two models' catalog pins
 // the live cases compare the agent's own catalog with.
-export function describeLlmCandidate({ root, sourceRoot, revision, image, measurement }) {
+export function describeLlmCandidate({ root, sourceRoot, revision, image, measurement, apuModel }) {
     const local = path.join(root, LLM_SOURCE_DIRECTORY, 'local-llm');
     const bytes = fs.readFileSync(path.join(local, 'manifest.json'));
     const catalog = JSON.parse(fs.readFileSync(path.join(local, 'catalog', 'models.json'), 'utf8'));
@@ -233,7 +234,7 @@ export function describeLlmCandidate({ root, sourceRoot, revision, image, measur
     const files = hf.files.map(file => ({ path: file.path, size: file.size, sha256: file.sha256 }));
     return {
         revision, sourcePath: `${sourceRoot}/${LLM_SOURCE_DIRECTORY}/local-llm`, treeDigest: liveSourceDigest(local),
-        manifest: { originalContainer: JSON.parse(bytes).container, originalDigest: digest(bytes), rewrittenDigest: digest(rewriteLlmManifest(bytes, image)) },
+        manifest: { originalContainer: JSON.parse(bytes).container, originalDigest: digest(bytes), rewrittenDigest: digest(rewriteLlmManifest(bytes, image, apuModel)) },
         models: {
             ...(larger ? { larger: { id: MEASUREMENT_MODEL, repo: larger.repo, file: larger.file, commit: larger.commit, size: larger.size, sha256: larger.sha256 } } : {}),
             small: { id: LLM_MODELS.small, repo: gguf.repo, file: gguf.file, commit: gguf.commit, size: gguf.size, sha256: gguf.sha256 },
@@ -257,7 +258,9 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
     const agents = fixturePlan(spec.cases);
     // The local-llm candidate runs from its own immutable image, not the Explorer's fixture image.
     if (spec.llm) image = pins.llm.image;
-    const llmCandidate = spec.llm ? describeLlmCandidate({ root: candidate.root, sourceRoot, revision: candidate.llm.revision, image, measurement: pins.model?.measurement }) : null;
+    const apuModel = isApuModel(pins.model) ? prepareApuModel(pins.model,
+        JSON.parse(fs.readFileSync(path.join(candidate.root, LLM_SOURCE_DIRECTORY, 'local-llm', 'catalog', 'models.json')))) : null;
+    const llmCandidate = spec.llm ? describeLlmCandidate({ root: candidate.root, sourceRoot, revision: candidate.llm.revision, image, measurement: pins.model?.measurement, apuModel }) : null;
     const execution = {
         protocol: 'owned-fixture-v1',
         host: { ...pins.host },
@@ -277,7 +280,8 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
     };
     if (spec.model) {
         const { models, ...plan } = llmCandidate;
-        execution.model = structuredClone(pins.model);
+        execution.model = apuModel || structuredClone(pins.model);
+        if (apuModel) execution.provision.apuModel = structuredClone(apuModel);
         if (pins.model.measurement !== undefined) {
             execution.model.measurement = normalizeMeasurement(pins.model.measurement, models, spec.model);
             execution.cases = measurementCases(spec.model, execution.model.measurement);
@@ -286,7 +290,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         execution.provision.llm = plan;
         execution.llm = { image, revision: plan.revision, models };
         if (spec.model === 'nvidia') execution.gpu = { ...pins.gpu };
-        if (!['cpu', 'apple-cpu'].includes(spec.model)) execution.provision.gpu = { uuid: spec.model === 'nvidia' ? pins.gpu.uuid : null, grantAgents: [LLM_REF] };
+        if (MODEL_PROFILES[spec.model].backend !== 'cpu') execution.provision.gpu = { uuid: spec.model === 'nvidia' ? pins.gpu.uuid : null, grantAgents: [LLM_REF] };
     } else if (spec.llm) {
         const { models, ...plan } = llmCandidate;
         execution.gpu = { ...pins.gpu };
@@ -374,7 +378,8 @@ export function plannedCommands(run) {
             { id: 'gpu-grant', binary: node, argv: [profile.candidate.path, 'gpu', 'grant', ...plan.gpu.grantAgents.flatMap(ref => ['--agent', ref])], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs,
                 note: 'The supported product path: records the grant under ~/.ploinky-box/gpu-grants and discovers the host driver. No Box exists yet, so the next start applies it.' },
         ] : []),
-        ...(['cpu', 'apple-cpu'].includes(profile.model?.profile) ? [{ id: 'gpu-withdraw', binary: node, argv: [profile.candidate.path, 'gpu', 'revoke'], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs }] : []),
+        ...(['cpu', 'apple-cpu', 'amd-apu-cpu'].includes(profile.model?.profile) ? [{ id: 'gpu-withdraw', binary: node, argv: [profile.candidate.path, 'gpu', 'revoke'], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs }] : []),
+        ...(isApuModel(profile.model) ? [{ id: 'apu-manifest-default', action: `Before first start, verify the exact manifest-default rewrite ${JSON.stringify(profile.model.env)} and its pinned digest; no post-start var operation is permitted.` }] : []),
         { id: 'fixture-start', binary: node, argv: startArgs(profile, run.ports), cwd: workspace, env, deadlineMs: run.deadlines.startMs,
             note: profile.model ? 'Production start creates a budget-off Box after the explicit GPU grant or withdrawal.' : 'Production start creates the gate-on Box and runs its bounded root preparation before graph work; this is the declared provisioning step that may change cgroup state.' },
         { id: 'box-inventory', binary: engine, argv: ps, deadlineMs: run.deadlines.coreMs },
@@ -749,7 +754,9 @@ export function renderSummary(run, manifestPath) {
         '| --- | --- |',
         ...commands,
         '',
-        ...(profile.model ? [`Model profile: ${profile.model.profile}. Hardware budgets and MPS are disabled. Pins: ${JSON.stringify(profile.model)}. Required case: ${profile.cases[0]}.`, 'Apple setup and restoration belong to the enclosing D10 operator envelope; this suite does not certify restoration.'] : profile.gpu ? gpuSummary(run) : []),
+        ...(profile.model ? [`Model profile: ${profile.model.profile}. Hardware budgets and MPS are disabled. Pins: ${JSON.stringify(profile.model)}. Required cases: ${profile.cases.join(', ')}.`,
+            isApuModel(profile.model) ? 'AMD profiles use the proven manifest-default delivery before first start. L12 is pending without reviewed generation binding. Functional observations do not qualify an APU.'
+                : 'Apple setup and restoration belong to the enclosing D10 operator envelope; this suite does not certify restoration.'] : profile.gpu ? gpuSummary(run) : []),
         ...(profile.fixtures?.availability ? availabilitySummary(run) : []),
         ...(profile.fixtures?.store ? storeSummary(run) : []),
         '## Cleanup',

@@ -14,12 +14,20 @@ import { requireTransport } from './liveProcess.mjs';
 import { cgroupWithin, createHostProc, processesWithin } from './liveGpuHost.mjs';
 import { createModelHostGuard, observeAppleMachine, parseModelHostSample, assertModelGrantInventory, modelGrantInventory } from './liveModelHostGuard.mjs';
 import { MODEL_SOURCE_VIEW, modelMountFacts, modelSourceLayout, observeModelStage } from './liveModelSource.mjs';
-import { APPLE_DEVICE_INSPECT, assertAppleDeviceArguments, observeAppleDevices } from './liveModelDevices.mjs';
+import { APPLE_DEVICE_INSPECT, assertAppleDeviceArguments, observeAppleDevices, AMD_DEVICE_INSPECT, assertAmdDeviceArguments, observeAmdDevices } from './liveModelDevices.mjs';
 import { normalizeMeasurement, measurementCases, measurementParams, MEASUREMENT_DEADLINES } from './liveModelMeasurements.mjs';
 import { createMeasurementExecutor, MEASUREMENT_RUNNER, MEASUREMENT_GROUP } from './liveModelMeasurementCommands.mjs';
 import { performance } from 'node:perf_hooks';
+import { APU_CASES, APU_PARAMS, isApuModel, validateApuPins, prepareApuModel } from './liveApuPins.mjs';
+import { projectApuEvidence } from './liveApuProjection.mjs';
+import { createApuCases } from './liveApuCases.mjs';
+import { APU_ENV_FACTS, APU_DISCOVERY } from './liveApuCommands.mjs';
 
 export const MODEL_PROFILES = Object.freeze({
+    ...Object.fromEntries(Object.entries(APU_CASES).map(([name, cases]) => [name, { block: `linux-model-${name}`, case: cases[0], cases,
+        platform: 'linux', backend: name === 'amd-apu-cpu' ? 'cpu' : 'apu', withdrawGpu: name === 'amd-apu-cpu',
+        runner: name === 'amd-apu-cpu' ? 'llama.cpp' : 'llama.cpp-vulkan',
+        executable: name === 'amd-apu-cpu' ? '/opt/llama.cpp/llama-server' : '/opt/llama.cpp-vulkan/llama-server' }])),
     apple: { block: 'mac-model-venus', case: 'LIVE-L6', platform: 'darwin', backend: 'venus', runner: 'llama.cpp-vulkan', executable: '/opt/llama.cpp-vulkan/llama-server' },
     'apple-cpu': { block: 'mac-model-cpu', case: 'LIVE-L7', platform: 'darwin', backend: 'cpu', runner: 'llama.cpp', executable: '/opt/llama.cpp/llama-server' },
     nvidia: { block: 'apparatus-model-nvidia', case: 'LIVE-L4', platform: 'linux', backend: 'dedicated', runner: 'llama.cpp', executable: '/opt/llama.cpp/llama-server' },
@@ -62,6 +70,21 @@ export function modelPlan(run) {
     const nested = [...core, 'podman', '--cgroup-manager=cgroupfs'];
     const command = (id, argv, deadlineMs = 30000) => ({ id, binary: profile.engine.path, argv, deadlineMs });
     const tool = (name, args) => command(`model-${name}`, [...core, 'node', '-e', '<LLM_TOOL_CALL>', ...llmToolWords(name, args, { model: LLM_MODELS.small, agent: LLM_AGENT })], 290000);
+    if (isApuModel(profile.model)) return [
+        command('model-box-contract', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<BOX_ID>']),
+        command('model-agent-source', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, '<AGENT_ID>']),
+        command('model-env', [...nested, 'container', 'exec', '<AGENT_ID>', 'node', '-e', APU_ENV_FACTS, JSON.stringify(profile.model.env)]),
+        ...(spec.backend === 'apu' ? [
+            command('model-amd-box-devices', ['container', 'inspect', '--format', AMD_DEVICE_INSPECT, '<BOX_ID>']),
+            command('model-amd-agent-devices', [...nested, 'container', 'inspect', '--format', AMD_DEVICE_INSPECT, '<AGENT_ID>']),
+            command('model-amd-discovery', [...nested, 'container', 'exec', '<AGENT_ID>', 'node', '-e', APU_DISCOVERY], 65000),
+        ] : []),
+        { id: 'linux-host-guard', action: 'Pinned host identity; MemAvailable, swap and PSI sampled every 2 seconds, 1800 samples maximum. AMD GPU operations also require the retained 60-second idle baseline and 5-second idle window.' },
+        ...profile.cases.map(caseId => ({ id: `model-${caseId.toLowerCase()}`, action: caseId === 'LIVE-L12'
+            ? 'Pending: missing reviewed APU generation binding; do not launch a prompt.'
+            : `Execute ${caseId} with its own idle/process absence, routed request, observations and receipt; explicit params ${JSON.stringify(APU_PARAMS)}. L9 uses the pinned refusal derivation; L10 the pinned runtime-only floor; L11 continuous current-launch tensor events and routed Stop.` })),
+        tool('local_llm_stop', {}),
+    ];
     if (profile.model.measurement) return [
         { id: 'measurement-configuration', action: JSON.stringify({ cases: profile.cases, configuration: profile.model.measurement,
             params: measurementParams(profile.model.measurement), deadlines: MEASUREMENT_DEADLINES }) },
@@ -96,9 +119,11 @@ export function modelPlan(run) {
 }
 
 export function validateModelPins(model, block) {
-    keys(model, ['profile', 'imageConfigDigest', 'imageParentDigest', 'cibRevision', 'executable'], 'model pins', ['apple', 'measurement']);
+    keys(model, ['profile', 'imageConfigDigest', 'imageParentDigest', 'cibRevision', 'executable'], 'model pins', ['apple', 'measurement', 'amd', 'env', 'envDelivery', 'guardFloorBytes', 'refusal']);
     const spec = MODEL_PROFILES[model.profile];
     check(spec && spec.block === block, 'Model profile and block disagree');
+    if (isApuModel(model)) validateApuPins(model, { prepared: model.envDelivery !== undefined });
+    else check(['amd', 'env', 'envDelivery', 'guardFloorBytes', 'refusal'].every(key => model[key] === undefined), 'Non-APU model has APU pins');
     check(HASH.test(model.imageConfigDigest) && HASH.test(model.imageParentDigest) && /^[a-f0-9]{40}$/.test(model.cibRevision), 'Invalid immutable model image pins');
     keys(model.executable, ['path', 'sha256', 'version'], 'model executable');
     check(model.executable.path === spec.executable && /^[a-f0-9]{64}$/.test(model.executable.sha256) && model.executable.version === 'b11159', 'Invalid pinned model executable');
@@ -115,7 +140,8 @@ export function validateModelPins(model, block) {
 export function validateModelProfile(profile, block) {
     const spec = validateModelPins(profile.model, block);
     const config = profile.model.measurement;
-    check(profile.host.platform === spec.platform && profile.cases.join(',') === (config ? measurementCases(profile.model.profile, config).join(',') : spec.case), 'Model platform or case mismatch');
+    check(profile.host.platform === spec.platform && profile.cases.join(',') === (config ? measurementCases(profile.model.profile, config).join(',') : (spec.cases || [spec.case]).join(',')), 'Model platform or case mismatch');
+    if (isApuModel(profile.model)) validateApuPins(profile.model, { prepared: true });
     keys(profile.llm, ['image', 'revision', 'models'], 'model local-llm');
     check(IMAGE_REF.test(profile.llm.image) && profile.llm.image === profile.provision.image
         && profile.llm.revision === profile.provision.llm.revision, 'Model source/image pins disagree');
@@ -157,10 +183,22 @@ export function assertModelObservation({ spec, model, pins, status, answer, proc
         check(!status.runnerReport?.device || /^CPU/.test(status.runnerReport.device), 'CPU runner reports a GPU');
         check(!status.runnerReport?.offloaded?.layers, 'CPU runner offloaded layers');
     } else {
-        check((model.profile === 'apple' ? /^Vulkan0(?: \([^\n]+\))?$/ : /^CUDA0(?: \([^\n]+\))?$/).test(status.runnerReport?.device || '')
+        check((model.profile === 'apple' || spec.backend === 'apu' ? /^Vulkan0(?: \([^\n]+\))?$/ : /^CUDA0(?: \([^\n]+\))?$/).test(status.runnerReport?.device || '')
             && Number.isInteger(status.runnerReport?.offloaded?.layers) && status.runnerReport.offloaded.layers > 0, 'GPU backend or positive offload missing');
         if (model.profile === 'apple') check(proc.args?.['--device'] === 'Vulkan0'
             && proc.icd === '/opt/local-llm/vulkan/icd.d/virtio_icd.json' && proc.layers === '~all~' && !proc.nvidiaLibrary, 'Wrong Venus ICD or process backend');
+        if (spec.backend === 'apu') {
+            const report = status.runnerReport;
+            check(proc.args?.['--device'] === 'Vulkan0' && proc.args['-ngl'] === '999' && proc.args['--fit'] === 'off'
+                && proc.icd === '/opt/local-llm/vulkan/icd.d/radeon_icd.json' && proc.layers === '~all~' && !proc.nvidiaLibrary,
+            'Wrong APU ICD or process backend');
+            check(report.offloaded.layers === report.offloaded.of && report.kvMiB > 0 && report.modelMiB > 0
+                && report.modelBufferDenominatorBytes === pins.size && Number.isFinite(report.modelBufferRatio)
+                && report.modelBufferRatio === report.modelMiB * 1048576 / pins.size
+                && (report.minModelBufferFraction === null || Number.isFinite(report.minModelBufferFraction)
+                    && report.modelBufferRatio >= report.minModelBufferFraction), 'APU placement proof unavailable');
+            check(JSON.stringify(status.deployment.params) === JSON.stringify(APU_PARAMS), 'APU effective parameters differ');
+        }
     }
 }
 
@@ -182,6 +220,9 @@ export function assertModelContainer(value, { profile, role }) {
     if (profile.model.profile === 'apple') {
         assertAppleDeviceArguments(value, { role, renderNode: profile.model.apple.renderNode });
     }
+    if (isApuModel(profile.model) && profile.model.profile !== 'amd-apu-cpu') {
+        assertAmdDeviceArguments(value, { role, renderNode: profile.model.amd.render.path });
+    }
 }
 
 // Verify staged bytes without reading the managed-repository fallback. The
@@ -189,6 +230,10 @@ export function assertModelContainer(value, { profile, role }) {
 export function assertModelSource(profile) {
     const original = profile.provision.llm;
     check(liveSourceDigest(original.sourcePath) === original.treeDigest, 'Frozen model source changed');
+    if (isApuModel(profile.model)) {
+        const expected = prepareApuModel(profile.model, JSON.parse(fs.readFileSync(path.join(original.sourcePath, 'catalog', 'models.json'))));
+        check(JSON.stringify(expected) === JSON.stringify(profile.model), 'APU derivation differs from frozen catalog');
+    }
     const target = path.join(profile.workspace.path, 'local-llms', 'local-llm');
     const visit = (from, to) => {
         check(fs.lstatSync(to).isDirectory() && !fs.lstatSync(to).isSymbolicLink(), 'Model source directory changed');
@@ -200,7 +245,7 @@ export function assertModelSource(profile) {
             else {
                 check(stat.isFile() && fs.lstatSync(b).isFile() && !fs.lstatSync(b).isSymbolicLink(), 'Model source file changed');
                 const bytes = fs.readFileSync(a);
-                check(digest(fs.readFileSync(b)) === digest(a === path.join(original.sourcePath, 'manifest.json') ? rewriteLlmManifest(bytes, profile.llm.image) : bytes), 'Staged model source bytes changed');
+                check(digest(fs.readFileSync(b)) === digest(a === path.join(original.sourcePath, 'manifest.json') ? rewriteLlmManifest(bytes, profile.llm.image, profile.model) : bytes), 'Staged model source bytes changed');
             }
         }
     };
@@ -246,7 +291,7 @@ export function createModelCases(ctx) {
         if (measurement && spec.platform === 'darwin') await observeAppleMachine({ profile, engine: (kind, argv, opts) => engine(kind, argv, { ...opts, abort, cleanup, deadlineMs: Math.min(30000, budget()) }) });
         const expected = await routeBinding(name, abort, cleanup, label, Math.min(30000, budget()));
         const result = await command(`model-${name}`, profile.engine.path, [...core, 'node', '-e', LLM_TOOL_CALL, ...llmToolWords(name, args,
-            { model: measurement?.model || LLM_MODELS.small, agent: LLM_AGENT, ...(measurement ? { budgetMs: budget() } : {}) })],
+            { model: measurement?.model || LLM_MODELS.small, agent: LLM_AGENT, ...(isApuModel(profile.model) ? { apu: true } : {}), ...(measurement ? { budgetMs: budget() } : {}) })],
             { deadlineMs: budget(), maxBytes: 65536, abort, cleanup, tolerate: true, tolerateCancel: true, journal: !['local_llm_status', 'local_llm_overview'].includes(name) });
         // Parse only for the safe diagnostic projection. No incomplete or
         // nonzero transport result becomes trusted tool evidence.
@@ -278,9 +323,19 @@ export function createModelCases(ctx) {
         if (transportFailure) throw transportFailure;
         check(parsed, 'Model Router returned an invalid bounded reply');
         check(!identityMismatch, 'Model Router reply identity mismatch');
-        if (doc.ok !== true) throw Object.assign(new Error('Model Router tool refused the request'), { code: doc.error?.code });
+        if (doc.ok !== true) {
+            if (measurement?.expectedRefusal === true && spec.backend === 'apu' && name === 'local_llm_run' && measurement.caseId === 'LIVE-L9') {
+                await routeBinding(name, abort, cleanup, `${label}-after`, Math.min(30000, budget()));
+                check(doc.agent === expected.routeKey && doc.ok === false && /^admission_(?:incompatible|insufficient_now)$/.test(doc.error?.code || ''), 'APU expected refusal unavailable');
+                return { status: ['incompatible', 'insufficient-now'].includes(admission?.status) ? admission.status : null,
+                    constraint: ['C1', 'C2'].includes(admission?.estimate?.constraint) ? admission.estimate.constraint : null,
+                    ...projectApuEvidence(doc.error.details) };
+            }
+            throw Object.assign(new Error('Model Router tool refused the request'), { code: doc.error?.code });
+        }
         await routeBinding(name, abort, cleanup, `${label}${measurement ? '-after' : ''}`, Math.min(30000, budget()));
         if (name === 'local_llm_status') {
+            if (isApuModel(profile.model)) return projectApuEvidence(doc.result, args.sinceSeq || 0, true);
             if (measurement) return doc.result;
             const { phase, profile: backend, deployment, runnerReport } = doc.result;
             return { phase, profile: backend, deployment, runnerReport };
@@ -296,6 +351,12 @@ export function createModelCases(ctx) {
         if (profile.model.profile === 'apple') {
             check(sameContainer(boxFacts, box), 'Apple Box identity changed');
             devices = await appleDevices(boxFacts, agent, 'before');
+        }
+        if (isApuModel(profile.model) && spec.backend === 'apu') {
+            check(sameContainer(boxFacts, box), 'AMD Box identity changed');
+            devices = await observeAmdDevices({ engine, core, nested, box: boxFacts, agent, renderNode: profile.model.amd.render.path });
+            boxFacts.recordedDevices = devices.box.recordedDevices; agent.recordedDevices = devices.agent.recordedDevices;
+            write('model-amd-devices-before', { schema: 1, runId: run.runId, ...devices });
         }
         write('model-container-mounts', { schema: 1, runId: run.runId, box: { ...modelMountFacts(boxFacts), devices: boxFacts.devices }, agent: { ...modelMountFacts(agent), devices: agent.devices } });
         assertModelContainer(boxFacts, { profile, role: 'box' });
@@ -357,6 +418,7 @@ export function createModelCases(ctx) {
             await gpu.initial();
         }
         return { box: { id: box.id, image: box.image }, agent: { id: agent.id, image: agent.image, created: agent.created }, source,
+            ...(isApuModel(profile.model) ? { containers: { box: boxFacts, agent } } : {}),
             ...(devices ? { devices } : {}) };
     }
     async function appleDevices(box, agent, label, abort) {
@@ -422,6 +484,7 @@ export function createModelCases(ctx) {
         finally { write(`model-${spec.case.toLowerCase()}`, evidence); }
     }
     async function beforeCleanup() {
+        if (apu) { if (launched) await apu.beforeCleanup(); return; }
         if (!launched) return;
         if (profile.model.measurement) {
             const began = performance.now(); const abort = AbortSignal.timeout(60000);
@@ -450,6 +513,7 @@ export function createModelCases(ctx) {
         write('model-stop-proof', { runId: run.runId, phase: status.phase });
     }
     async function afterCleanup() {
+        if (apu) await apu.afterCleanup();
         assertModelGrantInventory(run, profile);
         if (profile.model.profile === 'apple-cpu') write('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.host.home) });
         if (profile.gpu) await gpuCleanupProof({ run, profile, processProvider, signal: ctx.cleanupSignal, hostProc: host, artifacts: write });
@@ -487,5 +551,26 @@ export function createModelCases(ctx) {
         },
         assertBackend: (status, answer, processes, pins) => assertModelObservation({ spec, model: profile.model, pins, status, answer, processes, imageId: toolAgent.image }),
     }) : null;
-    return { liveModel, liveMeasurement, beforeCleanup, afterCleanup };
+    const apu = isApuModel(profile.model) ? createApuCases({ run, profile, spec, prepare, tool, write, signal, processProvider, persist, timings,
+        functional: proof => assertModelObservation({ spec, model: profile.model, pins: profile.llm.models.small,
+            status: proof.deployment, answer: proof.answer, processes: proof.processes, imageId: proof.agent.image }),
+        read: async (kind, program, args, abort, cleanup = false, deadlineMs = 30000) => checkedJson(await engine(`apu-${kind}`,
+            [...nested, 'container', 'exec', toolAgent.id, 'node', '-e', program, ...args], { abort, cleanup, deadlineMs, maxBytes: 65536, journal: false })),
+        processes: async (abort, cleanup = false, deadlineMs = 30000) => checkedJson(await engine('apu-processes',
+            [...nested, 'container', 'exec', toolAgent.id, 'node', '-e', MODEL_PROCESS_FACTS, profile.model.executable.path],
+            { abort, cleanup, deadlineMs, maxBytes: 16384, journal: false })).processes,
+        sourceAfter: async abort => {
+            const source = assertModelSource(profile);
+            const box = checkedJson(await engine('model-box-after', ['container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, profile.box.id], { abort, journal: false }));
+            const agent = checkedJson(await engine('model-agent-after', [...nested, 'container', 'inspect', '--format', MODEL_CONTAINER_INSPECT, toolAgent.id], { abort, journal: false }));
+            if (spec.backend === 'apu') {
+                const devices = await observeAmdDevices({ engine, core, nested, box, agent, renderNode: profile.model.amd.render.path, abort });
+                box.recordedDevices = devices.box.recordedDevices; agent.recordedDevices = devices.agent.recordedDevices;
+                write('model-amd-devices-after', { schema: 1, runId: run.runId, ...devices });
+            }
+            assertModelContainer(box, { profile, role: 'box' }); assertModelContainer(agent, { profile, role: 'agent' });
+            return { ...source, binding: await sourceBinding(agent, box, source.stagedTreeDigest, 'after', abort) };
+        },
+    }) : null;
+    return { liveModel, liveMeasurement, beforeCleanup, afterCleanup, apuCase: apu?.execute };
 }
