@@ -13,6 +13,7 @@ import { bounded, keys } from './liveCommon.mjs';
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
 import { cpuMaxMatches } from '../../cli/sandbox/hardwareLimits/cpuQuota.mjs';
 import { LLM_AGENT, LLM_MODELS, LLM_REF, LLM_REPOSITORY } from './liveLlmNames.mjs';
+import { projectApuEvidence } from './liveApuProjection.mjs';
 
 export { LLM_AGENT, LLM_MODELS, LLM_REF, LLM_REPOSITORY };
 export const GIB = 1024 * MIB;
@@ -133,6 +134,7 @@ export const LLM_REQUEST_ID = /^[A-Za-z0-9_-]{8,64}$/;
 // {ok:true, agent, result} or {ok:false, error:{code, message, details?}}. A refusal of the
 // tool (an MCP error, or a document with ok:false) is data, not an exception.
 export const LLM_TOOL_CALL = String.raw`
+const apuProject=${projectApuEvidence.toString()};
 const ALLOWED={local_llm_overview:['preview'],local_llm_status:['sinceSeq'],local_llm_run:['requestId','modelId','runnerId','params','replace'],local_llm_stop:[],local_llm_runner_install:['runnerId','acceptLicence'],local_llm_test_prompt:['prompt','maxTokens','observationId']};
 const out=(value)=>{let text=JSON.stringify(value);if(text.length>60000)text=JSON.stringify({ok:false,error:{code:'too_large',message:'The reply exceeds 60000 characters'}});process.stdout.write(text);};
 const fail=(message,code)=>{out({ok:false,error:{code:code||'invalid',message:String(message).slice(0,400)}});process.exit(3);};
@@ -140,6 +142,7 @@ const [tool,argsText,viewText]=process.argv.slice(1);
 if(!Object.hasOwn(ALLOWED,tool))fail('Unsupported tool');
 let args,view;try{args=JSON.parse(argsText||'{}');view=JSON.parse(viewText||'{}');}catch{fail('Invalid JSON');}
 if(view.agent!==undefined&&view.agent!=='local-llm')fail('Invalid expected model route');
+if(view.apu!==undefined&&view.apu!==true)fail('Invalid APU projection');
 if(view.budgetMs!==undefined&&(!Number.isInteger(view.budgetMs)||view.budgetMs<1||view.budgetMs>290000))fail('Invalid tool budget');
 if(!args||typeof args!=='object'||Array.isArray(args)||Buffer.byteLength(argsText||'')>4096||Object.keys(args).some((k)=>!ALLOWED[tool].includes(k)))fail('Invalid arguments');
 const id=/^[a-z0-9][a-z0-9._-]{0,127}$/;
@@ -155,6 +158,8 @@ const deployment=(d)=>d?{id:d.id,modelId:d.modelId,runnerId:d.runnerId,profile:d
 const startup=o=>o?{...pick(o,['controllerEpoch','deploymentId','loadingObserved','firstAcceptedHealthSequence','observationErrors']),runnerIdentity:pick(o.runnerIdentity,['runnerStartId','pid']),latestHealthObservation:pick(o.latestHealthObservation,['status','accepted','sequence','monotonicMs']),pageCachePreparation:pick(o.pageCachePreparation,['policy','phase','filesConsidered','attempts','reportedSuccesses','reportedFailures','skippedNonRegular','observationErrors'])}:null;
 const stop=o=>o?{...pick(o,['controllerEpoch','sequence','deploymentId','phaseAtStop','runnerRunning','firstAcceptedHealthSequence','monotonicMs']),runnerIdentity:pick(o.runnerIdentity,['runnerStartId','pid']),latestHealthObservation:pick(o.latestHealthObservation,['status','accepted','sequence','monotonicMs']),startupObservation:startup(o.startupObservation)}:null;
 const project=(name,result)=>{
+ if(view.apu&&name==='local_llm_status')return apuProject(result,args.sinceSeq||0);
+ if(view.apu&&['local_llm_run','local_llm_stop'].includes(name))return {settled:true};
  if(name==='local_llm_overview'){const hw=result.hardware||{};const models=Array.isArray(result.models)?result.models:[];const wanted=models.find((m)=>m&&m.id===view.model);
   return {profile:result.profile,limits:result.limits??null,
    hardware:{gpu:pick(hw.gpu,['available','name','driverVersion','totalBytes','usedBytes','freeBytes','memoryModel','state','reason','device']),memory:pick(hw.memory,['totalBytes','availableBytes']),cpus:hw.cpus??null,cgroupMemory:hw.cgroupMemory??null},
@@ -180,7 +185,7 @@ const project=(name,result)=>{
   const reply=await bounded(client.callTool(tool,args,{agent:agents[0]}));
   const text=reply&&Array.isArray(reply.content)?(reply.content.find((c)=>c&&c.type==='text')||{}).text:undefined;
   const refusal=(raw)=>{let doc=null;try{doc=JSON.parse(raw);}catch{doc=null;}
-   if(doc&&typeof doc==='object'&&typeof doc.error==='string')return {ok:false,agent:agents[0],error:{code:doc.error.slice(0,80),message:String(doc.message||doc.error).slice(0,600),details:doc.details&&doc.details.admission?{admission:admission(doc.details.admission)}:undefined}};
+   if(doc&&typeof doc==='object'&&typeof doc.error==='string')return {ok:false,agent:agents[0],error:{code:doc.error.slice(0,80),message:view.apu?'APU request refused':String(doc.message||doc.error).slice(0,600),details:doc.details&&doc.details.admission?{admission:view.apu?{status:doc.details.admission.status,estimate:{constraint:doc.details.admission.estimate?.constraint}}:admission(doc.details.admission),...(view.apu?apuProject(doc.details):{})}:undefined}};
    const message=String(raw||'The tool failed').replace(/^MCP error -?\d+:\s*/,'');const code=(/\b(admission_[a-z_]+|busy|runner_[a-z_]+|licence_required|invalid_[a-z_]+)\b/.exec(message)||[])[1]||'tool_error';
    return {ok:false,agent:agents[0],error:{code,message:message.slice(0,600)}};};
   if(reply&&reply.isError){out(refusal(text));return;}

@@ -32,6 +32,11 @@ import { APPLE_DEVICE_INSPECT, APPLE_RENDER_FACTS } from '../hardware-limits/liv
 import { requiredArtifacts, llmCleanupProofProblem, modelInferenceProofProblem, modelProvisionOnlyCleanupProven, judgeArtifacts, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { fakeEngineInfo, evaluateTemplate, inspectModel, ok } from '../hardware-limits/fakeLiveEngine.mjs';
 import { validateRunManifest, writePrivateJson } from '../hardware-limits/fixtures.mjs';
+import { fakeApuPin, fakeApuActivity, fakeApuProof } from '../hardware-limits/fakeApuEvidence.mjs';
+import { projectApuEvidence } from '../hardware-limits/liveApuProjection.mjs';
+import { LINUX_HOST_SAMPLE } from '../hardware-limits/liveLinuxHostGuard.mjs';
+import { APU_ENV_FACTS, APU_DISCOVERY } from '../hardware-limits/liveApuCommands.mjs';
+import { apuFetchedProofProblem } from '../hardware-limits/liveStage.mjs';
 
 const hex = value => crypto.createHash('sha256').update(value).digest('hex');
 const IMAGE = `docker.io/assistos/local-llm@sha256:${'a'.repeat(64)}`;
@@ -101,6 +106,7 @@ function stageModelFixture(profile, agent) {
     return { stage, dependency, objectRoot };
 }
 function modelPin(profile) {
+    if (profile.startsWith('amd-apu')) return fakeApuPin(profile);
     return { profile, imageConfigDigest: CONFIG, imageParentDigest: `sha256:${'c'.repeat(64)}`, cibRevision: 'd'.repeat(40),
         executable: { path: MODEL_PROFILES[profile].executable, sha256: 'e'.repeat(64), version: 'b11159' },
         ...(['apple', 'apple-cpu'].includes(profile) ? { apple: { machine: 'owned-test', connection: 'owned-test', uri: 'ssh://user@localhost:1234/run/user/501/podman/podman.sock', provider: 'libkrun', ...(profile === 'apple' ? { renderNode: '/dev/dri/renderD128' } : {}) } } : {}) };
@@ -108,6 +114,19 @@ function modelPin(profile) {
 function observation(profile = 'cpu') {
     const model = modelPin(profile); const spec = MODEL_PROFILES[profile];
     if (profile === 'apple-cpu') return { ...observation('cpu'), model, spec };
+    if (profile.startsWith('amd-apu')) {
+        const value = observation(profile === 'amd-apu-cpu' ? 'cpu' : 'apple');
+        value.spec = spec; value.model = model; value.status.profile = spec.backend; value.status.deployment.profile = spec.backend;
+        value.status.deployment.runnerId = spec.runner;
+        value.status.deployment.params = { ctxSize: 4096, parallel: 1 };
+        if (spec.backend === 'apu') {
+            value.status.runnerReport = { device: 'Vulkan0 (offline GPU)', offloaded: { layers: 25, of: 25 }, kvMiB: 4,
+                modelMiB: 1, modelBufferDenominatorBytes: SMALL.size, modelBufferRatio: 1048576 / SMALL.size, minModelBufferFraction: null };
+            Object.assign(value.processes[0], { icd: '/opt/local-llm/vulkan/icd.d/radeon_icd.json', gpuNodes: ['/dev/dri/renderD128'],
+                args: { '--device': 'Vulkan0', '--n-gpu-layers': null, '-ngl': '999', '--fit': 'off' } });
+        }
+        return value;
+    }
     return { spec, model, pins: SMALL, imageId: CONFIG,
         status: { phase: 'ready', profile: spec.backend, deployment: { phase: 'ready', profile: spec.backend, modelId: SMALL.id, runnerId: spec.runner, artifact: { ...SMALL } }, runnerReport: { device: profile === 'cpu' ? 'CPU' : `${profile === 'apple' ? 'Vulkan0' : 'CUDA0'} (offline GPU)`, offloaded: { layers: profile === 'cpu' ? 0 : 24 } } },
         answer: { text: 'Blue.', modelId: SMALL.id, runnerId: spec.runner, generationTokensPerSecond: 4 },
@@ -126,7 +145,8 @@ function world(t, profile = 'cpu', fault = {}) {
     fs.writeFileSync(path.join(source, 'ploinky-box', 'bin', 'ploinky-box.mjs'), '// offline candidate\n');
     const local = path.join(source, '.hwl-local-llms', 'local-llm');
     fs.mkdirSync(path.join(local, 'catalog'), { recursive: true });
-    fs.writeFileSync(path.join(local, 'manifest.json'), JSON.stringify({ container: 'image:tag', agent: 'exec node /code/main.mjs', containerSecurity: { gpu: true }, volumes: { '.data/local-llm': '/data' } }));
+    fs.writeFileSync(path.join(local, 'manifest.json'), JSON.stringify({ container: 'image:tag', agent: 'exec node /code/main.mjs', containerSecurity: { gpu: true }, volumes: { '.data/local-llm': '/data' },
+        ...(profile.startsWith('amd-apu') ? { profiles: { default: { env: { LOCAL_LLM_AMD_APU: { required: false }, LOCAL_LLM_APU_GUARD_FLOOR_BYTES: { required: false } } } } } : {}) }));
     fs.writeFileSync(path.join(local, 'package.json'), JSON.stringify({ name: 'local-llm', type: 'module' }));
     fs.writeFileSync(path.join(local, 'main.mjs'), '// offline agent\n');
     fs.writeFileSync(path.join(local, 'catalog', 'models.json'), JSON.stringify({ models: [
@@ -149,6 +169,8 @@ function world(t, profile = 'cpu', fault = {}) {
     }
     const artifacts = new Map(); const calls = []; let box = null; let agent = null; let running = false; let runnerEpoch = 0;
     const value = observation(profile);
+    let apuTime = 0; let apuSeq = 0; let apuLogs = []; let apuLaunch = null; let apuPhase = 'idle'; let apuReads = 0; let apuJobs = 0; let apuActivityMs = 0;
+    const apuHostTimings = { gate: { clock: () => ++apuTime, wait: async ms => { apuTime += ms; } } };
     const fail = text => ok('', { status: 1, stderr: text });
     const prefix = `/user.slice/libpod-${'1'.repeat(64)}.scope`;
     const leaf = `${prefix}/${fault.controllerHeavy ? 'engine/agents/' : ''}libpod-${'2'.repeat(64)}`;
@@ -180,6 +202,14 @@ function world(t, profile = 'cpu', fault = {}) {
         calls.push({ binary, args, env: options.env, cancelled: Boolean(options.signal?.aborted) });
         assert.ok(!args.some(arg => String(arg).includes('/.ploinky/repos/')), 'No managed source operation');
         if (options.signal?.aborted) return ok('', { status: null, cancelled: true });
+        if (args.includes(LINUX_HOST_SAMPLE)) {
+            const pin = pins.model.amd;
+            return ok(JSON.stringify({ identity: { pci: pin.pci, render: pin.render, kernel: pin.host.kernel, os: pin.host.os,
+                memTotalBytes: pin.host.memTotalBytes, memory: pin.memory }, totalBytes: pin.host.memTotalBytes, availableBytes: pin.host.availableBytes,
+                swapTotalBytes: 0, swapUsedBytes: 0, psiFull: 0, busyPercent: 0, vramUsedBytes: 100, gttUsedBytes: 100 }));
+        }
+        if (args.includes(APU_ENV_FACTS)) return ok(JSON.stringify({ switchMatched: profile !== 'amd-apu-cpu', floorMatched: profile === 'amd-apu-pressure', unexpectedSwitch: false, unexpectedFloor: false }));
+        if (args.includes(APU_DISCOVERY)) return ok(JSON.stringify({ vulkan: pins.model.amd.vulkan, devices: pins.model.amd.devices }));
         if (binary === '/usr/sbin/sysctl') return ok(args.at(-1) === 'machdep.cpu.brand_string' ? 'Offline Apple' : args.at(-1) === 'hw.memsize' ? String(16 * 2 ** 30) : args.at(-1) === 'vm.swapusage' ? 'used = 0.00M' : args.at(-1) === 'kern.memorystatus_level' ? '50' : '1');
         if (binary === '/usr/bin/sw_vers') return ok('offline');
         if (binary === '/bin/ps') return ok('123 1024000 /opt/bin/krunkit\n');
@@ -198,7 +228,7 @@ function world(t, profile = 'cpu', fault = {}) {
                     ...agentLibLabels(imageProvider('f'.repeat(64))) }, mounts: [{ Type: 'bind', Source: options.cwd, Destination: options.cwd, RW: true }], devices: ['/dev/fuse', '/dev/net/tun'].map(name => ({ PathOnHost: name, PathInContainer: name })) };
             agent = { id: '2'.repeat(64), pid: 3190, name: fixtureContainerName(options.cwd, 'local-llm', 'local-llms'), created: box.created, image: CONFIG.slice(7), imageName: IMAGE, running: true, labels: {}, devices: [], mounts: [{ Source: path.join(options.cwd, 'local-llms', 'local-llm'), Destination: '/code', RW: false }] };
             stageModelFixture({ ...run.target.execution, box }, agent);
-            if (profile === 'apple') { agent.devices = []; box.devices = []; }
+            if (profile === 'apple' || profile.startsWith('amd-apu') && profile !== 'amd-apu-cpu') { agent.devices = []; box.devices = []; }
             return ok();
         }
         if (binary === node && args.includes('destroy')) {
@@ -211,6 +241,42 @@ function world(t, profile = 'cpu', fault = {}) {
             const at = args.indexOf(LLM_TOOL_CALL); const tool = args[at + 1];
             assert.equal(JSON.parse(args[at + 3]).agent, 'local-llm', 'ordinary calls pin the exact advertised route before dispatch');
             if (fault.toolReply) return ok(fault.toolStdout ?? JSON.stringify(fault.toolReply), fault.toolTransport);
+            if (profile.startsWith('amd-apu')) {
+                const input = JSON.parse(args[at + 2]);
+                if (tool === 'local_llm_run') {
+                    const activity = () => ({ ...fakeApuActivity(++apuActivityMs), modelJobsStarted: apuJobs });
+                    if (input.requestId.endsWith('-l9')) {
+                        const selected = run.target.execution.model.refusal.selected;
+                        return ok(JSON.stringify({ ok: false, agent: 'local-llm', error: { code: `admission_${selected.status.replace('-', '_')}`,
+                            details: { admission: { status: selected.status, estimate: { constraint: selected.constraint } }, apuAttempt: {
+                                schema: 1, attemptId: 'attempt-01234567', controllerInstanceId: 'controller-01234567', requestId: input.requestId,
+                                modelId: input.modelId, runnerId: input.runnerId, params: input.params, boundary: 'initial-admission', before: activity(2), after: activity(3) } } } }));
+                    }
+                    running = true; apuJobs++; apuReads = 0;
+                    apuPhase = input.requestId.endsWith('-l11') || input.requestId.endsWith('-l10') ? 'starting' : 'ready';
+                    const logSeqStart = apuSeq;
+                    apuLogs.push({ seq: ++apuSeq, stream: 'controller', line: 'phase starting' });
+                    apuLogs.push({ seq: ++apuSeq, stream: 'controller', line: 'starting /opt/llama.cpp-vulkan/llama-server --api-key SECRET' });
+                    apuLaunch = { controllerInstanceId: 'controller-01234567', deploymentId: `deployment-${apuJobs}`, requestId: input.requestId,
+                        pid: 42, command: '/opt/llama.cpp-vulkan/llama-server', launchSeq: apuSeq, logSeqStart, startedMonotonicMs: 100, guardStop: null };
+                    apuLogs.push({ seq: ++apuSeq, stream: 'stderr', line: 'loading model tensors, this can take a while...' });
+                    Object.assign(value.status.deployment, { id: apuLaunch.deploymentId, requestId: input.requestId, logSeqStart, params: input.params });
+                }
+                if (tool === 'local_llm_stop') { running = false; apuPhase = 'idle'; apuLogs.push({ seq: ++apuSeq, stream: 'controller', line: 'phase idle' }); }
+                if (tool === 'local_llm_status') {
+                    if (profile === 'amd-apu-pressure' && running && ++apuReads >= 2) {
+                        running = false; apuPhase = 'error'; apuLogs.push({ seq: ++apuSeq, stream: 'controller', line: 'stopped: memory floor' });
+                        apuLaunch.guardStop = { kind: 'host-memory-floor', seq: apuSeq, floorBytes: run.target.execution.model.guardFloorBytes,
+                            availableBytes: pins.model.amd.host.availableBytes, killRequestedMonotonicMs: 600, settledMonotonicMs: 601, settlement: 'resolved', valid: true };
+                    }
+                    const raw = { ...clone(value.status), phase: apuPhase, deployment: apuLaunch ? { ...clone(value.status.deployment), phase: apuPhase } : null,
+                        logs: apuLogs.filter(row => row.seq > (input.sinceSeq || 0)).slice(-200), nextSeq: apuSeq,
+                        apuActivity: { ...fakeApuActivity(++apuActivityMs), modelJobsStarted: apuJobs, runnerRunning: running },
+                        apuObservation: apuLaunch ? { ...apuLaunch, running, firstSeq: 1, nextSeq: apuSeq } : null };
+                    fault.apuStatus?.(raw);
+                    return ok(JSON.stringify({ ok: true, agent: 'local-llm', result: projectApuEvidence(raw, input.sinceSeq || 0) }));
+                }
+            }
             if (tool === 'local_llm_test_prompt' && fault.providerOverlayAfter) {
                 box.mounts.push({ Type: 'bind', Source: '/foreign', Destination: '/opt/ploinky-agentlib/main.mjs', RW: true });
             }
@@ -263,7 +329,7 @@ function world(t, profile = 'cpu', fault = {}) {
             const wanted = args.at(-1);
             const record = wanted === box?.id ? box : wanted === agent?.id || wanted === agent?.name ? agent : null;
             if (!record) return fail('no such container');
-            if (profile === 'apple' && args.includes(APPLE_DEVICE_INSPECT)) {
+            if ((profile === 'apple' || profile.startsWith('amd-apu')) && args.includes(APPLE_DEVICE_INSPECT)) {
                 const value = { ...record, createCommand: ['podman', 'create', '--env', 'SECRET=must-not-be-emitted',
                     ...(record === box ? ['/dev/fuse', '/dev/net/tun', '/dev/dri/renderD128'] : ['ploinky.local/gpu=all']).flatMap(device => ['--device', device])] };
                 fault.appleInspect?.(value); return ok(JSON.stringify(value));
@@ -271,7 +337,7 @@ function world(t, profile = 'cpu', fault = {}) {
             const rendered = evaluateTemplate(args[args.indexOf('--format') + 1], 'inspect', inspectModel(record));
             return typeof rendered === 'string' ? ok(rendered) : rendered;
         }
-        if (profile === 'apple' && args.includes(APPLE_RENDER_FACTS)) {
+        if ((profile === 'apple' || profile.startsWith('amd-apu')) && args.includes(APPLE_RENDER_FACTS)) {
             const value = { renderNodes: [{ path: '/dev/dri/renderD128', character: true, symlink: false, rdev: 57984, mode: 8630,
                 uid: 65534, gid: 65534, read: true, write: true }],
             cdi: args.at(-1) === 'box' ? { device: 'ploinky.local/gpu=all', deviceNodes: [{ path: '/dev/dri/renderD128' }] } : null };
@@ -287,10 +353,154 @@ function world(t, profile = 'cpu', fault = {}) {
     }, persist: () => {} });
     return { root, source, pins, run, calls, artifacts, provider, options, value, hostProc, factsReads: () => factsReads, agent: () => agent, box: () => box,
         namespace: () => modelNamespaceFs(agent.mounts.find(mount => mount.Destination === '/code').Source, providerRoot),
-        provision: () => provisionRun({ ...options(), validateProfile, portProbe: async () => ({ tcp: true, udp: true }) }),
-        live: () => executeLiveRun({ ...options(), gpuTimings: { pollMs: 1, ...(fault.loading ? { monitorMs: 1 } : {}) } }),
+        provision: () => provisionRun({ ...options(), validateProfile, apuHostTimings, portProbe: async () => ({ tcp: true, udp: true }) }),
+        live: () => executeLiveRun({ ...options(), gpuTimings: { pollMs: 1, apuHost: apuHostTimings, ...(fault.loading ? { monitorMs: 1 } : {}) } }),
         cleanup: () => executeCleanupRun(options()) };
 }
+
+test('MODEL.APU canonical every-case dispatch keeps L12 pending with independent cleanup', async t => {
+    const w = world(t, 'amd-apu');
+    const provision = await w.provision(); assert.equal(provision.verdict, 'PASS', JSON.stringify(provision));
+    const report = await w.live();
+    assert.deepEqual(report.cases.map(entry => [entry.id, entry.result]), [['LIVE-L13', 'pass'], ['LIVE-L9', 'pass'], ['LIVE-L11', 'pass'], ['LIVE-L12', 'pending']], JSON.stringify(report));
+    assert.equal(report.verdict, 'BLOCKED'); assert.equal(report.cleanup.state, 'complete');
+    const read = name => JSON.stringify(w.artifacts.get(name));
+    assert.equal(apuFetchedProofProblem({ run: w.run, fetched: w.run, remoteReport: report, action: 'live', read }), null);
+    const changed = clone(report); changed.verdict = 'PASS';
+    assert.match(apuFetchedProofProblem({ run: w.run, fetched: w.run, remoteReport: changed, action: 'live', read }), /nonpassing/);
+    // Injected L12 validates its full remote receipt contract. The real executor
+    // above remains pending and never uses this synthetic generation proof.
+    const synthetic = clone(w.artifacts.get('model-live-l11'));
+    // Its idle evidence is the pending L12 receipt's own current-case gate history.
+    const pendingL12 = w.artifacts.get('model-live-l12');
+    for (const key of ['before', 'gpuGate', 'bufferObservations']) synthetic[key] = clone(pendingL12[key] ?? []);
+    const generation = fakeApuProof('LIVE-L12').proof;
+    for (const key of ['launch', 'process', 'stop', 'generation', 'requestSettlement', 'promptRequestId']) synthetic[key] = generation[key];
+    synthetic.case = 'LIVE-L12'; synthetic.requestId = `apu-${w.run.runId}-l12`; synthetic.launch.requestId = synthetic.requestId; synthetic.stop.requestId = synthetic.requestId;
+    synthetic.deployment = { ...synthetic.deployment, phase: 'ready', apuObservation: clone(synthetic.launch), deployment: {
+        ...synthetic.deployment.deployment, id: synthetic.launch.deploymentId, requestId: synthetic.requestId,
+        logSeqStart: synthetic.launch.logSeqStart, phase: 'ready' } };
+    delete synthetic.reason; synthetic.status = 'pass';
+    const syntheticFetched = clone(w.run);
+    Object.assign(syntheticFetched.operations.find(op => op.kind === 'apu-case-result' && op.case === 'LIVE-L12'), { status: 'pass', receiptDigest: jsonDigest(synthetic) });
+    const syntheticReport = clone(report); syntheticReport.verdict = 'PASS'; syntheticReport.cases[3].result = 'pass';
+    const syntheticRead = name => name === 'model-live-l12' ? JSON.stringify(synthetic) : read(name);
+    assert.equal(apuFetchedProofProblem({ run: w.run, fetched: syntheticFetched, remoteReport: syntheticReport, action: 'live', read: syntheticRead }), null);
+    for (const caseId of ['LIVE-L11', 'LIVE-L12']) for (const mutate of [p => delete p.deployment,
+        p => p.deployment.deployment.modelId = 'wrong-model', p => p.deployment.deployment.runnerId = 'wrong-runner',
+        p => p.deployment.deployment.artifact.sha256 = '0'.repeat(64), p => p.deployment.deployment.params.ctxSize = 512,
+        p => p.deployment.deployment.requestId = 'wrong-request', p => p.deployment.apuObservation.controllerInstanceId = 'wrong-epoch']) {
+        const proof = clone(caseId === 'LIVE-L12' ? synthetic : w.artifacts.get('model-live-l11')); mutate(proof);
+        const fetched = clone(syntheticFetched);
+        fetched.operations.find(op => op.kind === 'apu-case-result' && op.case === caseId).receiptDigest = jsonDigest(proof);
+        assert.match(apuFetchedProofProblem({ run: w.run, fetched, remoteReport: syntheticReport, action: 'live',
+            read: name => name === `model-${caseId.toLowerCase()}` ? JSON.stringify(proof) : syntheticRead(name) }) || '',
+        /APU launched deployment (model, artifact or parameters|identity) differ/, `${caseId}: ${mutate}`);
+    }
+    // Each case needs its own initial idle window, every positive allowance needs
+    // its recorded same-case buffer observation and the run ends in a final window.
+    const l12Started = Math.max(...synthetic.gpuGate.history.filter(receipt => receipt.context?.case === 'LIVE-L12').map(receipt => receipt.startedMonotonicMs));
+    for (const [name, mutate, expected] of [
+        ['model-live-l12', p => { p.before.monotonicMs = l12Started + 1; }, /AMD current-case initial idle window unavailable/],
+        ['model-live-l11', p => { p.bufferObservations = []; }, /AMD allocation allowance lacks its recorded case buffer observation/],
+        ['model-live-l11', p => { p.bufferObservations = p.bufferObservations.map(value => ({ ...value, buffers: { ...value.buffers, kvMiB: (value.buffers.kvMiB ?? 0) + 1 } })); },
+            /AMD allocation allowance lacks its recorded case buffer observation/],
+        ['amd-idle-gate-final', p => { p.history.at(-1).purpose = 'operation'; }, /AMD final five-second idle window unavailable/]]) {
+        const proof = JSON.parse(syntheticRead(name)); mutate(proof);
+        const fetched = clone(syntheticFetched);
+        const record = fetched.operations.find(op => op.kind === 'apu-case-result' && `model-${op.case.toLowerCase()}` === name);
+        if (record) record.receiptDigest = jsonDigest(proof);
+        assert.match(apuFetchedProofProblem({ run: w.run, fetched, remoteReport: syntheticReport, action: 'live',
+            read: other => other === name ? JSON.stringify(proof) : syntheticRead(other) }) || '', expected, `${name}: ${mutate}`);
+    }
+    for (const change of ['missing-last', 'wrong-last', 'duplicate', 'digest', 'status', 'host-baseline', 'host-threshold']) {
+        const proofs = new Map([...w.artifacts].map(([key, value]) => [key, clone(value)]));
+        const fetched = clone(w.run); const remote = clone(report);
+        if (change === 'missing-last') proofs.delete('model-live-l12');
+        if (change === 'wrong-last') proofs.get('model-live-l12').case = 'LIVE-L7';
+        if (change === 'duplicate') remote.cases[3] = clone(remote.cases[0]);
+        if (change === 'digest') fetched.operations.find(op => op.kind === 'apu-case-result').receiptDigest = `sha256:${'0'.repeat(64)}`;
+        if (change === 'status') remote.cases[0].result = 'pending';
+        if (change === 'host-baseline') delete proofs.get('linux-host-guard').baseline;
+        if (change === 'host-threshold') proofs.get('linux-host-guard').samples[0].availableBytes = 0;
+        assert.ok(apuFetchedProofProblem({ run: w.run, fetched, remoteReport: remote, action: 'live', read: name => JSON.stringify(proofs.get(name)) }), change);
+    }
+    const cleanup = await w.cleanup(); assert.equal(cleanup.verdict, 'PASS', JSON.stringify(cleanup));
+    assert.equal(apuFetchedProofProblem({ run: w.run, fetched: w.run, remoteReport: cleanup, action: 'cleanup', read }), null);
+    assert.equal(report.verdict, 'BLOCKED');
+});
+test('MODEL.APU prepare/provision refuses drift before any operation', async t => {
+    for (const mutate of [r => delete r.target.execution.model.env.LOCAL_LLM_AMD_APU,
+        r => r.target.execution.model.guardFloorBytes--, r => r.target.execution.model.guardFloorBytes = r.target.execution.model.amd.host.memTotalBytes,
+        r => r.target.plan.live = r.target.plan.live.filter(step => step.id !== 'model-amd-box-devices'),
+        r => r.target.plan.provision.push({ id: 'late-var', argv: ['var', 'LOCAL_LLM_AMD_APU', 'experimental'] })]) {
+        const w = world(t, 'amd-apu-pressure'); mutate(w.run);
+        assert.equal((await w.provision()).verdict, 'BLOCKED'); assert.equal(w.calls.length, 0); assert.equal(w.run.operations.length, 0);
+    }
+});
+for (const name of ['amd-apu-pressure', 'amd-apu-cpu']) test(`MODEL.APU ${name} provisions and certifies its case`, async t => {
+    const w = world(t, name); const provision = await w.provision(); assert.equal(provision.verdict, 'PASS', JSON.stringify(provision));
+    const report = await w.live(); assert.equal(report.verdict, 'PASS', JSON.stringify(report));
+    assert.equal(apuFetchedProofProblem({ run: w.run, fetched: w.run, remoteReport: report, action: 'live', read: key => JSON.stringify(w.artifacts.get(key)) }), null);
+});
+test('MODEL.APU reviewed idle and deployment corruptions cannot certify a PASS pressure cohort', async t => {
+    const w = world(t, 'amd-apu-pressure'); assert.equal((await w.provision()).verdict, 'PASS');
+    const report = await w.live(); assert.equal(report.verdict, 'PASS', JSON.stringify(report));
+    const final = artifacts => artifacts.get('amd-idle-gate-final');
+    const proof = artifacts => artifacts.get('model-live-l10');
+    const mutations = [a => final(a).history = [null], a => proof(a).gpuGate.history = [null],
+        a => final(a).history.at(-1).samples[0] = null,
+        a => final(a).history.at(-1).samples.forEach(row => row.busyPercent = 11),
+        a => final(a).history.at(-1).samples[0].gttUsedBytes += 536870913,
+        a => final(a).history.pop(), a => final(a).history.at(-1).state = 'pending',
+        a => final(a).history.at(-1).allocationAllowanceBytes = 1,
+        a => final(a).history.at(-1).idleMode = 'active',
+        a => final(a).history.at(-1).samples = final(a).history.at(-1).samples.slice(0, 1),
+        a => final(a).history.at(-1).samples[0].sequence = 1,
+        a => final(a).history.at(-1).samples[0].monotonicMs = -1,
+        a => final(a).history.at(-1).endedMonotonicMs = 0,
+        a => final(a).history.find(row => row.allocationAllowanceBytes > 0).allocationAllowanceBytes++,
+        a => final(a).history.find(row => row.allocationAllowanceBytes > 0).allocationEvidence.case = 'LIVE-L13',
+        a => final(a).history.find(row => row.allocationAllowanceBytes > 0).allocationEvidence.status.deployment.modelId = 'wrong-model',
+        a => delete proof(a).deployment,
+        a => proof(a).deployment.deployment.modelId = 'wrong-model', a => proof(a).deployment.deployment.runnerId = 'wrong-runner',
+        a => proof(a).deployment.deployment.artifact.sha256 = '0'.repeat(64), a => proof(a).deployment.deployment.params.parallel = 4,
+        a => proof(a).deployment.profile = 'cpu', a => proof(a).deployment.deployment.profile = 'cpu',
+        a => proof(a).deployment.deployment.id = 'wrong-deployment', a => proof(a).deployment.deployment.requestId = 'wrong-request',
+        a => proof(a).deployment.apuObservation.pid++, a => proof(a).deployment.apuObservation.startedMonotonicMs++,
+        a => proof(a).deployment.apuObservation.controllerInstanceId = 'wrong-controller'];
+    for (const mutate of mutations) {
+        const artifacts = new Map([...w.artifacts].map(([key, value]) => [key, clone(value)])); const fetched = clone(w.run);
+        mutate(artifacts);
+        fetched.operations.find(op => op.kind === 'apu-case-result').receiptDigest = jsonDigest(proof(artifacts));
+        assert.ok(apuFetchedProofProblem({ run: w.run, fetched, remoteReport: report, action: 'live', read: name => JSON.stringify(artifacts.get(name)) }), String(mutate));
+    }
+});
+test('MODEL.APU producers reject wrong launched deployment before case certification', async t => {
+    for (const [profile, suffix] of [['amd-apu-pressure', '-l10'], ['amd-apu', '-l11']]) {
+        const w = world(t, profile, { apuStatus: state => {
+            if (state.apuObservation?.requestId?.endsWith(suffix)) state.deployment.modelId = 'wrong-model';
+        } });
+        assert.equal((await w.provision()).verdict, 'PASS'); const report = await w.live();
+        const entry = report.cases.find(row => row.id.toLowerCase().endsWith(suffix));
+        assert.equal(entry.result, 'fail'); assert.match(entry.reason, /launched deployment/);
+    }
+});
+test('MODEL.APU earlier failure records every later receipt as pending', async t => {
+    const w = world(t, 'amd-apu', { empty: true }); assert.equal((await w.provision()).verdict, 'PASS');
+    const report = await w.live(); assert.equal(report.verdict, 'FAIL');
+    assert.deepEqual(report.cases.map(entry => entry.result), ['fail', 'pending', 'pending', 'pending']);
+    for (const entry of report.cases) assert.equal(w.artifacts.get(`model-${entry.id.toLowerCase()}`).status, entry.result);
+});
+test('MODEL.APU live prerequisite failure still binds every declared receipt', async t => {
+    const w = world(t, 'amd-apu'); assert.equal((await w.provision()).verdict, 'PASS');
+    const before = w.calls.length;
+    const report = await executeLiveRun({ ...w.options(), hostIdentity: { ...w.pins.host, hostname: 'other-host' } });
+    assert.equal(w.calls.length, before);
+    assert.deepEqual(report.cases.map(entry => entry.result), ['blocked', 'pending', 'pending', 'pending']);
+    for (const entry of report.cases) assert.equal(w.artifacts.get(`model-${entry.id.toLowerCase()}`).status, entry.result);
+    assert.equal(w.run.operations.filter(op => op.kind === 'apu-case-result').length, 4);
+});
 
 test('MODEL.ordinary-NVIDIA-shared-Box-cgroup-registers-only-runner', async t => {
     const w = world(t, 'nvidia', { sharedCgroup: true });
@@ -480,7 +690,7 @@ test('MODEL.manifest-profile-pins-and-old-mode-separation', t => {
         if (MODEL_PROFILES[profile].platform === 'darwin' && process.platform !== 'darwin') assert.throws(() => validatePins(localPins, w.run.block), /Invalid pins/);
         else validatePins(localPins, w.run.block);
         validateProfile(w.run, { partial: true }); validateRunManifest(w.run);
-        assert.equal(CONCRETE_BLOCKS[w.run.block].cases.length, 1);
+        assert.equal(CONCRETE_BLOCKS[w.run.block].cases.length, MODEL_PROFILES[profile].cases?.length || 1);
         assert.equal(w.run.target.execution.provision.ordinarySource, true);
         assert.match(renderSummary(w.run, '/tmp/run_codex.json'), /Hardware budgets and MPS are disabled/);
         for (const mutate of [m => { m.profile = ''; }, m => { m.profile = 'other'; }, m => { m.imageConfigDigest = ''; }, m => { m.executable.sha256 = 'bad'; }, m => { m.imageParentDigest = 'sha256:'; }]) {
@@ -713,6 +923,11 @@ test('MODEL.backend-model-image-offload-and-safe-process-facts', () => {
         }
         if (MODEL_PROFILES[profile].backend !== 'cpu') for (const mutate of [o => { o.status.runnerReport.offloaded.layers = 0; }, o => { o.status.runnerReport.device = 'CPU'; }]) { const bad = clone(good); mutate(bad); assert.throws(() => assertModelObservation(bad)); }
         if (profile === 'apple') { const bad = clone(good); bad.processes[0].icd = '/wrong'; assert.throws(() => assertModelObservation(bad)); }
+        if (MODEL_PROFILES[profile].backend === 'apu') for (const mutate of [o => o.status.runnerReport.kvMiB = null,
+            o => o.status.runnerReport.modelMiB = 0, o => o.status.runnerReport.offloaded.of = 26,
+            o => o.status.runnerReport.modelBufferRatio = 0, o => o.processes[0].icd = '/wrong', o => o.processes[0].args['-ngl'] = '0']) {
+            const bad = clone(good); mutate(bad); assert.throws(() => assertModelObservation(bad));
+        }
         if (MODEL_PROFILES[profile].backend === 'cpu') for (const mutate of [o => { o.processes[0].cudaVisible = '0'; }, o => { o.processes[0].nvidiaLibrary = true; }, o => { o.processes[0].args['--fit'] = 'on'; }, o => { o.processes[0].args['--n-gpu-layers'] = '99'; }]) { const bad = clone(good); mutate(bad); assert.throws(() => assertModelObservation(bad)); }
     }
 });

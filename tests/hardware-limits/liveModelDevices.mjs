@@ -89,7 +89,7 @@ export function assertAppleRenderFacts(facts, { renderNode, role }) {
         rdev: node.rdev, mode: node.mode, uid: node.uid, gid: node.gid };
 }
 
-export async function observeAppleDevices({ engine, core, nested, box, agent, renderNode, abort }) {
+export async function observeAppleDevices({ engine, core, nested, box, agent, renderNode, abort, family = 'apple' }) {
     const read = async (name, args) => {
         const result = await engine(name, args, { journal: false, maxBytes: 65536, deadlineMs: 30000, abort });
         requireTransport(result);
@@ -105,7 +105,7 @@ export async function observeAppleDevices({ engine, core, nested, box, agent, re
             && ['id', 'image', 'created', 'pid'].every(key => observed[key] === expected[key]), 'Apple container identity changed');
     };
     const inspect = async (role, expected) => {
-        const raw = await read(`model-apple-${role}-devices`, [...(role === 'box' ? [] : nested), 'container', 'inspect', '--format', APPLE_DEVICE_INSPECT, expected.id]);
+        const raw = await read(`model-${family}-${role}-devices`, [...(role === 'box' ? [] : nested), 'container', 'inspect', '--format', APPLE_DEVICE_INSPECT, expected.id]);
         const value = projectAppleDeviceInspect(raw);
         identity(value, expected);
         const devices = Array.isArray(expected.devices) ? expected.devices.map(device => ({ PathOnHost: device?.PathOnHost,
@@ -115,8 +115,8 @@ export async function observeAppleDevices({ engine, core, nested, box, agent, re
         return value;
     };
     const beforeBox = await inspect('box', box); const beforeAgent = await inspect('agent', agent);
-    const boxFacts = await read('model-apple-box-render', [...core, 'node', '-e', APPLE_RENDER_FACTS, renderNode, 'box']);
-    const agentFacts = await read('model-apple-agent-render', [...nested, 'container', 'exec', agent.id, 'node', '-e', APPLE_RENDER_FACTS, renderNode, 'agent']);
+    const boxFacts = await read(`model-${family}-box-render`, [...core, 'node', '-e', APPLE_RENDER_FACTS, renderNode, 'box']);
+    const agentFacts = await read(`model-${family}-agent-render`, [...nested, 'container', 'exec', agent.id, 'node', '-e', APPLE_RENDER_FACTS, renderNode, 'agent']);
     const boxNode = assertAppleRenderFacts(boxFacts, { role: 'box', renderNode });
     const agentNode = assertAppleRenderFacts(agentFacts, { role: 'agent', renderNode });
     check(boxNode.rdev === agentNode.rdev, 'Apple render device identity differs');
@@ -124,3 +124,7 @@ export async function observeAppleDevices({ engine, core, nested, box, agent, re
     return { box: { ...afterBox, renderNodes: [boxNode], cdi: { device: 'ploinky.local/gpu=all', deviceNodes: [{ path: renderNode }] } },
         agent: { ...afterAgent, renderNodes: [agentNode], cdi: null } };
 }
+
+export const AMD_DEVICE_INSPECT = APPLE_DEVICE_INSPECT;
+export const assertAmdDeviceArguments = assertAppleDeviceArguments;
+export const observeAmdDevices = options => observeAppleDevices({ ...options, family: 'amd' });

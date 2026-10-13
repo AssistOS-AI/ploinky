@@ -27,6 +27,8 @@ import { LLM_AGENT, LLM_REF, LLM_REPOSITORY } from './liveLlmNames.mjs';
 import { C3_AGENTS, C3V_AGENTS } from './liveAvailabilityCommands.mjs';
 import { C5_AGENTS } from './liveStoreCommands.mjs';
 import { observeAppleMachine, modelGrantInventory } from './liveModelHostGuard.mjs';
+import { isApuModel, validateApuPins, apuEnvironment } from './liveApuPins.mjs';
+import { createApuHostScope } from './liveApuHost.mjs';
 
 export const FIXTURE_REPOSITORY = 'hwlfixture';
 export const FIXTURE_HARDWARE_LIMITS = Object.freeze({ memory: '64m', cpus: '0.5', pidsLimit: 64 });
@@ -100,9 +102,17 @@ export function fixtureContainerName(workspace, agentName, repository = FIXTURE_
 
 // The local-llm candidate's manifest with its image pinned immutably: the candidate's own
 // bytes, one field replaced, serialized the same way every time so the digest is a pin.
-export function rewriteLlmManifest(bytes, image) {
+export function rewriteLlmManifest(bytes, image, model = null) {
     const manifest = JSON.parse(bytes);
     if (typeof manifest.container !== 'string' || !manifest.container) throw new Error('The local-llm manifest has no container image');
+    if (isApuModel(model)) {
+        validateApuPins(model, { prepared: true });
+        const env = manifest.profiles?.default?.env;
+        for (const [name, value] of Object.entries(apuEnvironment(model))) {
+            if (!env?.[name] || env[name].required !== false || env[name].default !== undefined || env[name].value !== undefined) throw new Error('APU manifest environment declaration differs');
+            env[name].default = value;
+        }
+    }
     return `${JSON.stringify({ ...manifest, container: image }, null, 2)}\n`;
 }
 
@@ -117,8 +127,12 @@ export function startArgs(profile, ports) {
 }
 
 export function validateProvisionPlan(value, run) {
-    keys(value, ['revision', 'repository', 'image', 'boxImage', 'agents', 'workspace'], 'provision plan', ['gpu', 'llm', 'ordinarySource']);
+    keys(value, ['revision', 'repository', 'image', 'boxImage', 'agents', 'workspace'], 'provision plan', ['gpu', 'llm', 'ordinarySource', 'apuModel']);
     const model = run?.target?.execution?.model;
+    if (isApuModel(model)) {
+        validateApuPins(model, { prepared: true });
+        if (jsonDigest(value.apuModel) !== jsonDigest(model)) throw new Error('APU provisioning pins differ');
+    } else if (value.apuModel !== undefined) throw new Error('Unexpected APU provisioning pins');
     if (value.ordinarySource !== undefined && (value.ordinarySource !== true || !model)) throw new Error('Ordinary source requires an optional model block');
     const llmFixture = value.llm !== undefined;
     if (!/^[a-f0-9]{40}$/.test(value.revision) || value.repository !== (llmFixture ? LLM_REPOSITORY : FIXTURE_REPOSITORY)
@@ -164,7 +178,7 @@ export function validateProvisionPlan(value, run) {
             || typeof value.llm.manifest.originalContainer !== 'string' || !value.llm.manifest.originalContainer) throw new Error('Invalid local-llm provision plan');
         if (value.gpu) {
             keys(value.gpu, ['uuid', 'grantAgents'], 'GPU provision plan');
-            if (!(model?.profile === 'apple' ? value.gpu.uuid === null : /^GPU-[a-fA-F0-9-]{8,64}$/.test(value.gpu.uuid)) || value.gpu.grantAgents?.join(',') !== LLM_REF) throw new Error('Invalid GPU provision plan');
+            if (!(model?.profile === 'apple' || isApuModel(model) ? value.gpu.uuid === null : /^GPU-[a-fA-F0-9-]{8,64}$/.test(value.gpu.uuid)) || value.gpu.grantAgents?.join(',') !== LLM_REF) throw new Error('Invalid GPU provision plan');
         }
     } else {
         // The GPU fixture is exactly probe (the root), peer and the unrelated cpu agent.
@@ -207,7 +221,7 @@ function provisionReport(run, verdict, limitations) {
 export async function provisionRun({
     run, persist = () => {}, processProvider = runBoundedProcess, signal, portProbe = probeLocalPorts, remoteArrival = false, artifacts = () => {},
     hostIdentity = { hostname: os.hostname(), platform: process.platform, home: fs.realpathSync(os.homedir()) },
-    validateProfile, hostProc,
+    validateProfile, hostProc, apuHostTimings,
 } = {}) {
     const limitations = [];
     let profile;
@@ -254,6 +268,7 @@ export async function provisionRun({
     const intent = (kind, extra = {}) => { const op = { id: `provision-${run.operations.length + 1}`, kind, state: 'intent', resourceIds: [], argvDigest: null, resultArtifact: null, ...extra }; run.operations.push(op); persist(); return op; };
     const observed = (op, extra = {}) => { Object.assign(op, { state: 'observed' }, extra); persist(); };
     let mutated = false;
+    let apuHost;
     try {
         run.state = 'running'; persist();
         // Engine identity, before any mutation.
@@ -261,6 +276,8 @@ export async function provisionRun({
         try { engineIdentity = await observeEngineIdentity((kind, argv) => engine(kind, argv)); } catch (error) { throw error?.code === 'ENGINE_IDENTITY_INCOMPLETE' ? blocked(error.message) : error; }
         if (engineIdentity !== profile.engine.identityDigest) throw blocked('Engine service identity changed');
         if (['apple', 'apple-cpu'].includes(profile.model?.profile)) artifacts('model-apple-machine', await observeAppleMachine({ profile, engine }));
+        if (isApuModel(profile.model)) apuHost = await createApuHostScope({ run, profile, processProvider, signal,
+            write: artifacts, persist, provision: true, timings: apuHostTimings });
         // No host record may already exist for this fresh instance.
         const instance = run.workspace.instance;
         const existing = hostRecordPaths(profile.host.home, instance).filter(target => { try { fs.lstatSync(target); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } });
@@ -320,7 +337,7 @@ export async function provisionRun({
                 || value.mounts?.some(mount => mount.Source === workspace.path || String(mount.Source).startsWith(`${workspace.path}/`))) throw blocked('An existing container already claims the new workspace');
             containers.push({ id: value.id, created: value.created, image: value.image });
         }
-        run.preInventory = { containers, ...(profile.model?.profile === 'apple-cpu' ? { gpuGrants: modelGrantInventory(profile.host.home) } : {}) }; persist();
+        run.preInventory = { ...run.preInventory, containers, ...(profile.model?.profile === 'apple-cpu' ? { gpuGrants: modelGrantInventory(profile.host.home) } : {}) }; persist();
         if (profile.model?.profile === 'apple-cpu') artifacts('model-grants-before', { runId: run.runId, entries: run.preInventory.gpuGrants });
 
         // 4. The fixture agents, only inside the new workspace.
@@ -364,7 +381,7 @@ export async function provisionRun({
             } catch (error) { throw blocked(`The GPU grant did not complete: ${String(error.message).slice(0, 300)}`); }
             finally { recordHostRecords(run, profile, instance); persist(); }
         }
-        if (['cpu', 'apple-cpu'].includes(profile.model?.profile)) {
+        if (['cpu', 'apple-cpu', 'amd-apu-cpu'].includes(profile.model?.profile)) {
             try {
                 await journaled('gpu-withdraw', profile.node.path, [profile.candidate.path, 'gpu', 'revoke'],
                     { cwd: workspace.path, env, deadlineMs: run.deadlines.coreMs || 30000, capture: 'gpu-withdraw' });
@@ -431,6 +448,7 @@ export async function provisionRun({
             persist();
         }
         validateProfile(run);
+        if (apuHost) await apuHost.host.check();
         return provisionReport(run, 'PASS', limitations);
     } catch (error) {
         limitations.push(error.message);
@@ -440,6 +458,7 @@ export async function provisionRun({
             await runOwnedCleanup({ run, profile, persist, processProvider, signal });
             // A GPU fixture is certified clean only after a successful final GPU observation.
             if (profile.gpu) await gpuCleanupProof({ run, profile, processProvider, signal, hostProc, artifacts });
+            if (apuHost) await apuHost.final();
             run.cleanup.state = 'complete'; run.state = 'complete';
         } catch (cleanupError) { run.cleanup.state = 'failed'; run.cleanup.failures.push(cleanupError.message); }
         persist();
@@ -504,7 +523,7 @@ function installLlmAgent({ plan, repository, workspacePath, files }) {
     const original = fs.readFileSync(manifestFile);
     if (digest(original) !== llm.manifest.originalDigest) throw blocked('The staged local-llm manifest differs from the digest pinned in the manifest');
     if (JSON.parse(original).container !== llm.manifest.originalContainer) throw blocked('The staged local-llm manifest names another image than the one pinned in the manifest');
-    const rewritten = rewriteLlmManifest(original, plan.image);
+    const rewritten = rewriteLlmManifest(original, plan.image, plan.apuModel);
     if (digest(rewritten) !== llm.manifest.rewrittenDigest) throw blocked('The rewritten local-llm manifest differs from the digest pinned in the manifest');
     fs.writeFileSync(manifestFile, rewritten, { mode: 0o644 });
     files[path.relative(workspacePath, target)] = llm.treeDigest;
