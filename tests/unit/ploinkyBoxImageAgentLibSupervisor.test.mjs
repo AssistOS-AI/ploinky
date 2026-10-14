@@ -6,6 +6,8 @@ import test from 'node:test';
 import {
     activeDescriptorPath, buildImageSelection, readActiveDescriptor, writeActiveDescriptor,
 } from '../../agentlib/source.mjs';
+import { createGpuGrantStore } from '../../ploinky-box/gpuGrant.mjs';
+import { createHardwareGateStore } from '../../ploinky-box/hardwareLimitsGate.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
@@ -20,6 +22,9 @@ function fixture(t, {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
     fs.mkdirSync(workspace);
+    // Destroy removes host operator records: keep them in a private home under the fixture.
+    const home = path.join(root, 'home');
+    fs.mkdirSync(home, { mode: 0o700 });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: false });
     const bundle = {
         packageName: 'ploinky-agent-lib', packageVersion: '1.2.3',
@@ -39,6 +44,8 @@ function fixture(t, {
     let lockNumber = 0;
     const supervisor = createBoxSupervisor({
         checkHostPrerequisites: () => {}, env, platform: 'darwin',
+        gpuGrantStore: createGpuGrantStore({ homeDirectory: home }),
+        hardwareGateStore: createHardwareGateStore({ homeDirectory: home }),
         ...(repositoryRoot ? { repositoryRoot } : {}),
         resolveIdentity: () => identity, launchCwd: workspace,
         discover: () => ownership,

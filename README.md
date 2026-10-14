@@ -291,8 +291,8 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
 | `ploinky update` / `ploinky update all [PATH]` | Update Ploinky (only when its checkout is inside the selected folder or the command is run from inside that checkout), AgentLib, registered and discovered repositories, and skills with verified fast-forward-only Git updates, then restart an already configured running workspace when every required input verified. `PATH` must be inside the workspace. Dirty, conflicted, diverged, detached, or operation-in-progress checkouts are preserved and reported as named skips; nothing is stashed, rebased, or reset. Dependency caches are not touched |
 | `ploinky update repos` / `ploinky update repo <name>` | Update only registered repositories (or one) under the same workspace transaction; activation is recorded as pending rather than restarting the whole graph — run `ploinky restart` when ready |
-| `ploinky destroy` | Without prompting, stop nested agents and remove the outer container; retain the host workspace and `.ploinky/box` |
-| `ploinky destroy --delete-cache` | Remove the outer container without prompting, then delete only `.ploinky/box/dependencies` and `.ploinky/box/images` |
+| `ploinky destroy` | Without prompting, stop nested agents and remove the outer container, then this workspace's GPU-grant and hardware-limits records in `~/.ploinky-box`; retain the host workspace, `.ploinky/box` and the saved Router binding |
+| `ploinky destroy --delete-cache` | Remove the outer container and those records without prompting, then delete only `.ploinky/box/dependencies` and `.ploinky/box/images` |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 Workspaces that have never enabled hardware limits retain the existing
@@ -328,7 +328,10 @@ pulling, cache preparation, restart, upgrade, or replacement. Ploinky does not
 migrate, clean, relabel, or adopt them: run `ploinky destroy` explicitly, then
 recreate the Box. Ordinary destroy retains `.ploinky/box`;
 `--delete-cache` performs an explicit storage reset of exactly those two cache
-directories without deleting any other workspace file.
+directories without deleting any other workspace file. Both forms remove this
+workspace's host GPU-grant and hardware-limits records once the Box is gone, so
+the next `ploinky start` at the same path begins from manifest defaults (see the
+state table below).
 
 Cross-repository release candidates record the AgentLib commit of the deployed
 checkout in the release manifest. Run the offline release-bundle verifier
@@ -362,6 +365,21 @@ State follows these stop/start and destroy boundaries:
 | Nested container records and writable layers | Box writable layer under `/home/podman/.local/share/containers/storage` | Yes | No |
 | Inner Podman named volumes | Under the same disposable graphroot | Yes | No |
 | Transient runtime metadata | Tmpfs path `/tmp/storage-run-1000` | No; `/tmp` is fresh each boot | No |
+| Saved Router binding | Host file `~/.ploinky-box/router-bindings/<box-instance>.json` | Yes | Yes |
+| GPU grant record (grants, denies, workspace revoke) and its generation files | Host `~/.ploinky-box/gpu-grants/<box-instance>.json` and `gpu-grants/<box-instance>/` | Yes | No; both destroy forms remove them after the Box is gone |
+| Hardware-limits gate, policy store, transition journals and markers | Host `~/.ploinky-box/hardware-limits/<box-instance>.json` and `hardware-limits/<box-instance>/` | Yes | No; both destroy forms remove them after the Box is gone |
+
+Destroy removes the two host record sets only after the outer Box is proven
+gone, and only the paths derived from this exact workspace identity; another
+workspace's records, the Router binding, host locks and update journals are
+never touched. A pending gate-on to gate-off transition is closed first, and a
+stale hardware-store lock is recovered under the usual proof that its holder is
+dead. If removal is refused (a live, ownerless or other-host store lock, an
+unreadable transition journal, or a record path that is not private Ploinky
+state), the Box stays removed, the records are kept, the command exits 1 with a
+message that says the records were kept and names the fix, and running
+`ploinky destroy` again finishes. `--delete-cache` still deletes the cache in
+that case and lists what it deleted.
 
 ## WebTTY terminal targets
 
@@ -456,10 +474,12 @@ container and fails closed on unreachable, split, or foreign state; there is no
 public `--name`, `--engine`, or `PLOINKY_BOX_ENGINE` override. Ordinary
 `destroy` removes only the selected outer container, preserving the host
 workspace, the nested image cache, and the Ploinky dependency cache for
-recreation. The explicit `destroy --delete-cache` form deletes exactly
-`.ploinky/box/dependencies` and `.ploinky/box/images` after the outer container
-is gone; it never removes the workspace, `.ploinky/data/master-key`, repositories,
-agents, routing state, or secrets.
+recreation; it then removes this workspace's GPU-grant and hardware-limits
+records from `~/.ploinky-box`. The explicit `destroy --delete-cache` form also
+deletes exactly `.ploinky/box/dependencies` and `.ploinky/box/images` after the
+outer container is gone; neither form removes the workspace,
+`.ploinky/data/master-key`, repositories, agents, the saved Router binding, or
+secrets.
 
 Every managed box has exactly two engine publications, independent of graph or
 workspace state: `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and
@@ -682,7 +702,8 @@ restart recovery. Administration remains a separate navigation tab.
 Hardware limits are off by default. Turn them on for a workspace with
 `PLOINKY_BOX_HARDWARE_LIMITS=on ploinky start` (or `restart`, `update`); the
 choice is saved on the host in `~/.ploinky-box/hardware-limits` and later
-commands reuse it. Only `start`, `restart` and `update` apply the variable.
+commands reuse it until `ploinky destroy` removes it with the stored limits.
+Only `start`, `restart` and `update` apply the variable.
 Turning the gate off while agents still have stored limits is refused with:
 
     N agents have stored hardware limits. Turn the gate on with PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart, or run ploinky limits clear --agent REPO/AGENT or ploinky limits clear --all on the host. No Box mutation was performed.
@@ -867,7 +888,10 @@ only if several are ever supported.
 The operator's grants, denies and workspace revoke are saved for this exact
 workspace as `~/.ploinky-box/gpu-grants/<box-instance>.json` with mode `0600`,
 outside the workspace because agents can write the workspace bind, and with the
-same confinement checks as Router bindings. `grant` first discovers the host GPU
+same confinement checks as Router bindings. They last until `ploinky destroy`,
+which removes them with the generation files: after a destroy, an operator
+revoke or deny no longer applies, and the next start gives the GPU to the
+manifest-declared agents again unless the revoke is repeated. `grant` first discovers the host GPU
 whenever an agent would get it, and refuses, naming the item, when a device node
 (`/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`) is missing or not readable
 and writable by this user, when a driver library (`libcuda.so.1`,
@@ -902,8 +926,9 @@ Without a Box, the record is saved for the next `ploinky start`.
 While a Box exists, `revoke` first reads the workspace agent registry, routes,
 and manifests. If an enabled agent that requests the GPU through
 `runtimePolicy.devices` would lose it, it refuses before changing the Box and
-names `ploinky disable agent REPO/AGENT`, or `ploinky destroy` followed by
-`ploinky gpu revoke`; a manifest-declared agent simply restarts without the
+names `ploinky disable agent REPO/AGENT`, or `ploinky destroy` (which removes
+the saved grant) followed by `ploinky gpu revoke`, which then saves the revoke
+for the next start; a manifest-declared agent simply restarts without the
 GPU. Agents can write those
 workspace files, so anything this check cannot read is skipped, and admission
 during the graph restart remains the authority. An agent without the GPU is

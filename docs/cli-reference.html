@@ -458,7 +458,7 @@ MCP ping succeeded.</code></pre>
                         <pre><code>shutdown</code></pre>
 
                         <h3>destroy</h3>
-                        <p>In the Ploinky REPL, <code>destroy</code> removes workspace runtimes and regenerated dependencies while leaving the outer Box and <code>.data/</code> homes in place. From a host terminal, <code>ploinky destroy</code> removes the exact managed outer Box and discards its nested runtime layer and inner volumes. Workspace files and persistent agent homes remain; regenerated dependency and image caches are removed only when the corresponding cache-deletion option selects them.</p>
+                        <p>In the Ploinky REPL, <code>destroy</code> removes workspace runtimes and regenerated dependencies while leaving the outer Box and <code>.data/</code> homes in place. From a host terminal, <code>ploinky destroy</code> removes the exact managed outer Box and discards its nested runtime layer and inner volumes, then removes this workspace's host GPU-grant and hardware-limits records from <code>~/.ploinky-box</code>, so the next start begins from manifest defaults. Workspace files, persistent agent homes and the saved Router binding remain; regenerated dependency and image caches are removed only when the corresponding cache-deletion option selects them.</p>
                         <pre><code>destroy</code></pre>
 
                         <h3>clean</h3>
