@@ -155,8 +155,10 @@ export function resolveEffectiveLimits({ declared = {}, override = null, envelop
 
 // The operator override as a runtime-policy layer (the final policy layer).
 // CPU must lie within the CURRENT envelope (plan §3 Bounds): a stored value
-// above it is refused at admission, never rendered. GPU shares are not part
-// of this release (P1), so a stored GPU entry is refused, never ignored (U4).
+// above it is refused at admission, never rendered. A stored GPU share is
+// resolved against the observed dedicated-memory GPU and the Box's MPS grant;
+// when it cannot be (no eligible GPU, no grant for this agent, unified or
+// unknown memory model), it is refused, never ignored (U4).
 export function resolveStoredGpuShare(policy, gpu, ref) {
     try {
         if (!gpu?.eligible || !gpu.grant?.agents?.includes(ref) || gpu.grant?.denied?.includes(ref)) throw new MpsError(gpu?.reason || 'This agent has no active, qualified Box GPU grant.');

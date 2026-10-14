@@ -47,4 +47,10 @@ Generation cancellation requires the authenticated controller Stop notification 
 
 The external adapter freezes an execution manifest before provisioning. After action settlement, independent cleanup, machine restoration and review it writes a separate final evidence index. A comparison needs two complete Venus/CPU pairs with matching host, VM, model, image, source, context and prompt identities. Different backend binaries, flags and resolved threads remain recorded experimental differences. A successful comparison is not a hardware-only speedup claim.
 
-Offline checks use Node's test runner with `--import ./tests/helpers/engineSpawnGuard.mjs` and the canonical `PLOINKY_AGENTLIB_DIR`. They make no hardware claim. Live execution still requires explicit target selection, preflight and sole machine ownership. The suite never creates an A10 completion marker.
+Offline checks use Node's test runner with `--import ./tests/helpers/engineSpawnGuard.mjs` and the canonical `PLOINKY_AGENTLIB_DIR`. The offline unit command for the hardware-limits MPS, store, route and unified-memory classifier tests is:
+
+```sh
+cd ploinky && PLOINKY_AGENTLIB_DIR=$HOME/work/gb10-agentlib node --test --import ./tests/helpers/agentlibTestContract.mjs --import ./tests/helpers/engineSpawnGuard.mjs tests/unit/hardwareLimitsMps.test.mjs tests/unit/hardwareLimitsMpsStatus.test.mjs tests/unit/hardwareLimitsStore.test.mjs tests/unit/hardwareLimitsLiveGpu.test.mjs tests/unit/hardwareLimitsRoutes.test.mjs tests/unit/hardwareLimitsUnified.test.mjs
+```
+
+They make no hardware claim. Live execution still requires explicit target selection, preflight and sole machine ownership. The suite never creates an A10 completion marker.

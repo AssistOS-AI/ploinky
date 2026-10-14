@@ -52,7 +52,10 @@ export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, obse
         // not an unverifiable fact: keep the model and name it was refused for.
         if (error?.memoryModel === 'unified' || error?.memoryModel === 'unknown') {
             return finish({ ...result, eligible: false, memoryModel: error.memoryModel, name: String(error.gpuName || '').slice(0, 256),
-                reason: `${unsupportedGpuMemoryModelReason(error.gpuName)} ${UNSUPPORTED_GPU_MEMORY_MODEL_FIX}`, code: 'gpu_sharing_unavailable' });
+                reason: `${unsupportedGpuMemoryModelReason(error.gpuName)} ${UNSUPPORTED_GPU_MEMORY_MODEL_FIX}`, code: 'gpu_sharing_unavailable',
+                // Unified only: say what the RAM limit does not cover. Dedicated and unknown payloads are unchanged.
+                ...(error.memoryModel === 'unified' ? { pciDeviceId: error.pciDeviceId ?? null, addressingMode: error.addressingMode ?? null,
+                    unifiedMemory: { ramLimitCoversGpuAllocations: false, gpuMemoryBound: 'admission-only', assurance: 'advisory' } } : {}) });
         }
         // The specific cause, bounded and one line, with the generic recovery step kept as the fix.
         const cause = oneLine(error?.message) || 'an unreadable fact';

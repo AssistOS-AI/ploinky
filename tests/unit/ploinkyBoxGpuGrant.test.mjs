@@ -2714,7 +2714,8 @@ test('P1X.restart-wires-mps-and-the-box-observes-the-gpu-with-the-loader-path', 
     const status = readMpsStatus({ workspaceRoot: box.identity.workspaceRoot, readGrant: () => grant, observeGpu: () => observeMpsGpu({ query }), readState: () => null });
     assert.equal(status.eligible, true, JSON.stringify({ reason: status.reason, code: status.code }));
     assert.equal(status.mode, 'mps-shared'); assert.equal(status.deviceUuid, 'GPU-11111111-2222-3333-4444-555555555555');
-    assert.equal(calls.length, 1); assert.equal(calls[0].command, '/usr/local/nvidia/bin/nvidia-smi');
+    // The main query, then the optional PCI-id/addressing-mode query (which the stub answers with a line that does not parse, so those facts stay null).
+    assert.equal(calls.length, 2); assert.equal(calls[0].command, '/usr/local/nvidia/bin/nvidia-smi'); assert.equal(calls[1].command, '/usr/local/nvidia/bin/nvidia-smi');
 });
 
 test('P1X.a-failing-observation-names-its-cause-instead-of-a-generic-refusal', async (t) => {

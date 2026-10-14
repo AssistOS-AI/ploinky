@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { buildGpuWiring, renderBoxCdiSpec, resolveDesiredGpuWiring, gpuWiringCreateArgs } from '../../ploinky-box/gpuGrant.mjs';
 import { discoverMpsTools, revalidateMpsTools, MPS_TOOL_PATHS } from '../../ploinky-box/lib/mpsTools.mjs';
-import { assertMpsImageEligibility, classifyGpuMemoryModel, parseMpsGpuObservation, prepareMpsImage, inspectMpsImage } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
+import { assertMpsImageEligibility, classifyGpuFacts, classifyGpuMemoryModel, parseMpsGpuObservation, prepareMpsImage, inspectMpsImage } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
 import { configureMpsDefaults, parseMpsMemoryReply, parseMpsSmReply, parseMpsServerList, runMpsControl, observeOwnedMpsDaemon, createMpsDaemonBackend, createMpsStateStore, recoverMpsDaemonIdentity, discoverOwnedMpsDaemon, cleanupMpsGeneration } from '../../cli/sandbox/hardwareLimits/mps.mjs';
 
 const discovery = { vendor: 'nvidia', driverVersion: '595.91.07', devices: [{ path: '/dev/nvidia0', major: 195, minor: 0 }], libraries: [{ soname: 'libcuda.so.1', source: '/usr/lib/libcuda.so.595.91.07', size: 100, mtimeMs: 1 }], tools: [{ name: 'nvidia-smi', source: '/usr/bin/nvidia-smi', size: 100, mtimeMs: 1 }] };
@@ -90,6 +90,8 @@ test('MP.immutable-image', () => {
 test('MP.gb10-numeric-memory', () => {
     assert.equal(classifyGpuMemoryModel('NVIDIA GB10'), 'unified');
     assert.throws(() => parseMpsGpuObservation(`0, ${gpuUuid}, NVIDIA GB10, 131072, 595.91.07`), /Unified/);
+    assert.equal(classifyGpuFacts({ name: 'NVIDIA GB10', pciDeviceId: null }), 'unified');
+    assert.equal(parseMpsGpuObservation(`0, ${gpuUuid}, NVIDIA GeForce RTX 4090, 24576, 595.91.07`, 'garbage').pciDeviceId, null);
     assert.equal(parseMpsGpuObservation(`0, ${gpuUuid}, NVIDIA GeForce RTX 4090, 24576, 595.91.07`).memoryModel, 'dedicated');
 });
 test('MP.unknown-model', () => {

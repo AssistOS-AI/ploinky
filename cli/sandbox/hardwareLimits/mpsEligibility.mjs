@@ -13,6 +13,27 @@ export function classifyGpuMemoryModel(name) {
     return 'unknown';
 }
 
+// The GB10 (DGX Spark) PCI device-id, as nvidia-smi prints pci.device_id (device id then vendor id). A match is a
+// qualified unified candidate regardless of the marketed name; every other GPU keeps the name-regex result.
+const UNIFIED_PCI_DEVICE_IDS = Object.freeze(['0X2E1210DE']);
+
+export function classifyGpuFacts({ name, pciDeviceId = null, addressingMode = null, memoryNumeric = null } = {}) {
+    void addressingMode; void memoryNumeric;
+    if (typeof pciDeviceId === 'string' && UNIFIED_PCI_DEVICE_IDS.includes(pciDeviceId.trim().toUpperCase())) return 'unified';
+    return classifyGpuMemoryModel(name);
+}
+
+// The optional second observation: exactly `pci.device_id, addressing_mode`. Anything else leaves both fields null.
+export function parseMpsDeviceFacts(text) {
+    const none = { pciDeviceId: null, addressingMode: null };
+    if (typeof text !== 'string') return none;
+    const lines = text.trim().split('\n');
+    if (lines.length !== 1) return none;
+    const fields = lines[0].split(',').map((value) => value.trim());
+    if (fields.length !== 2 || !/^0x[0-9a-f]{8}$/i.test(fields[0]) || !/^[A-Za-z0-9_\-[\]/ ]{1,32}$/.test(fields[1])) return none;
+    return { pciDeviceId: `0x${fields[0].slice(2).toUpperCase()}`, addressingMode: fields[1] };
+}
+
 // Plan §9.3: the unified/unknown memory-model refusal reason and fix.
 export function unsupportedGpuMemoryModelReason(name) {
     const text = String(name || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 256) || 'unknown';
@@ -20,24 +41,28 @@ export function unsupportedGpuMemoryModelReason(name) {
 }
 export const UNSUPPORTED_GPU_MEMORY_MODEL_FIX = 'Clear the GPU share. CPU/RAM controls remain separately available.';
 
-export function parseMpsGpuObservation(text) {
+export function parseMpsGpuObservation(text, deviceText) {
     const lines = String(text || '').trim().split('\n');
     if (lines.length !== 1) throw new MpsError('GPU index 0 must have one exact observation');
     const fields = lines[0].split(',').map((value) => value.trim());
     if (fields.length !== 5 || fields[0] !== '0') throw new MpsError('GPU identity or dedicated memory is unknown');
     // Classify the model before memory.total: a unified GPU (GB10) may not
     // report dedicated memory at all, and must still refuse as unified.
-    const memoryModel = classifyGpuMemoryModel(fields[2]);
+    // deviceText is the optional second query's output; undefined means it was not asked (facts stay as before).
+    const device = deviceText === undefined ? null : parseMpsDeviceFacts(deviceText);
+    const memoryModel = classifyGpuFacts({ name: fields[2], ...(device || {}), memoryNumeric: /^[1-9]\d*$/.test(fields[3]) ? Number(fields[3]) : null });
     if (memoryModel !== 'dedicated') {
         const error = new MpsError(memoryModel === 'unified' ? 'Unified GPUs cannot use configured MPS shares' : 'The GPU memory model is unknown');
         error.memoryModel = memoryModel;
         error.gpuName = fields[2];
+        error.pciDeviceId = device ? device.pciDeviceId : null;
+        error.addressingMode = device ? device.addressingMode : null;
         throw error;
     }
     if (!/^GPU-[a-f0-9-]{36}$/i.test(fields[1]) || !/^[1-9]\d*$/.test(fields[3]) || !/^\d+(?:\.\d+)+$/.test(fields[4])) throw new MpsError('GPU identity or dedicated memory is unknown');
     const memoryMiB = Number(fields[3]);
     if (!Number.isSafeInteger(memoryMiB) || !Number.isSafeInteger(memoryMiB * 1048576)) throw new MpsError('GPU dedicated memory is out of range');
-    return Object.freeze({ index: 0, uuid: fields[1], name: fields[2], memoryMiB, driverVersion: fields[4], memoryModel });
+    return Object.freeze({ index: 0, uuid: fields[1], name: fields[2], memoryMiB, driverVersion: fields[4], memoryModel, ...(device || {}) });
 }
 
 // The Box image has no loader path for the bound driver libraries (they sit under /usr/local/nvidia/lib64,
@@ -59,7 +84,13 @@ function observationFailure(result) {
 export function observeMpsGpu({ query = spawnSync } = {}) {
     const result = query('/usr/local/nvidia/bin/nvidia-smi', ['-i', '0', '--query-gpu=index,uuid,name,memory.total,driver_version', '--format=csv,noheader,nounits'], { encoding: 'utf8', timeout: 5000, maxBuffer: 8192, stdio: ['ignore', 'pipe', 'pipe'], env: { ...MPS_OBSERVATION_ENVIRONMENT } });
     if (result.status !== 0 || result.signal || result.error || Buffer.byteLength(String(result.stdout || '')) > 8192) throw new MpsError(`GPU observation failed or timed out${observationFailure(result)}`);
-    return parseMpsGpuObservation(result.stdout);
+    // Second, optional query: older drivers or a failing query lose only the PCI id and addressing mode.
+    let deviceText = null;
+    try {
+        const device = query('/usr/local/nvidia/bin/nvidia-smi', ['-i', '0', '--query-gpu=pci.device_id,addressing_mode', '--format=csv,noheader'], { encoding: 'utf8', timeout: 5000, maxBuffer: 8192, stdio: ['ignore', 'pipe', 'pipe'], env: { ...MPS_OBSERVATION_ENVIRONMENT } });
+        if (device && device.status === 0 && !device.signal && !device.error && Buffer.byteLength(String(device.stdout || '')) <= 8192) deviceText = String(device.stdout || '');
+    } catch (_) { deviceText = null; }
+    return parseMpsGpuObservation(result.stdout, deviceText);
 }
 
 export function assertMpsImageEligibility({ imageId, imageUser, networkMode }) {
