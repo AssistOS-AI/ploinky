@@ -643,7 +643,7 @@ export function downgradeRecoveryAdvice(journal) {
     if (journal?.phase === 'recovery-blocked') {
         const problem = journal.lastProblem?.message ? ` (${String(journal.lastProblem.message).slice(0, 512)})` : '';
         return `Recovery is blocked${problem}, and ploinky restart cannot complete it. Run ploinky destroy on the host `
-            + 'to remove this workspace\'s Box and close the transition (the saved gate and stored limits are kept), '
+            + 'to remove this workspace\'s Box and close the transition (this also removes the saved gate, stored limits and GPU decisions), '
             + 'then run ploinky start.';
     }
     return 'Run ploinky restart on the host to complete recovery.';

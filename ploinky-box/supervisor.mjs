@@ -3007,12 +3007,13 @@ export function createBoxSupervisor({
                 });
             }
             // Removing GPU access must not require starting agents first: without
-            // a Box, a revoke only clears the saved grant.
+            // a Box, a revoke only saves the decision for the next start.
             throw supervisorError(
                 verb === 'revoke'
                     ? 'ploinky gpu revoke replaces the Box and must restart and health-check the workspace graph, '
                         + 'and none is configured; either run `ploinky start AGENT` and revoke again, or remove the Box '
-                        + 'with `ploinky destroy` and run `ploinky gpu revoke` again, which then only clears the saved grant'
+                        + 'with `ploinky destroy` (which also removes the saved GPU grant) and run `ploinky gpu revoke` again, '
+                        + 'which then saves the revoke for the next start'
                     : `ploinky gpu ${verb} requires a configured workspace graph to restart and health-check; `
                         + 'run `ploinky start AGENT` first',
                 'PLOINKY_BOX_GPU_GRAPH_REQUIRED',
@@ -3414,14 +3415,177 @@ export function createBoxSupervisor({
 
     // An explicit destroy settles a pending downgrade only after the owned Box
     // is proven gone (removed here, or already absent): record
-    // aborted-by-destroy and remove its barrier. The saved gate and policy
-    // follow destroy's contract.
+    // aborted-by-destroy and remove its barrier. The journal is then removed
+    // with the rest of this workspace's hardware-limits state.
     function closePendingDowngradesAfterDestroy(identity) {
         try {
-            abortHardwareDowngradesForDestroy({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+            const aborted = abortHardwareDowngradesForDestroy({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+            return Object.freeze({ ok: true, aborted });
         } catch (error) {
-            stderr?.write?.(`[ploinky] A pending hardware transition could not be closed (${error.message}); its journal was kept for recovery.\n`);
+            return Object.freeze({ ok: false, error });
         }
+    }
+
+    // A refused record removal: the Box is gone, the records are kept (or,
+    // after a failure while deleting, partly kept) for a re-run of destroy.
+    // `step` is the operator's next action; null means a re-run cannot help.
+    function destroyRecordsError(identity, { reason, step, partial = false }) {
+        const outcome = partial ? 'were only partly removed' : 'were kept';
+        const next = step === null
+            ? ''
+            : ` ${step}, then run ploinky destroy again${partial ? ' to remove the rest' : ''}.`;
+        return supervisorError(
+            `Ploinky Box ${identity.instance} was removed, but its host operator records ${outcome}: `
+            + `${String(reason).trim().replace(/\.+$/, '')}.${next}`,
+            'PLOINKY_BOX_DESTROY_RECORDS_KEPT',
+        );
+    }
+
+    // The operator's next step for a refused record removal, by its cause.
+    function destroyRecordsRefusal(identity, error, { partial = false } = {}) {
+        const reason = error?.message || String(error);
+        if (error?.code === 'PLOINKY_BOX_ROUTER_BINDING_STATE_INVALID' || error?.code === 'identity_changed') {
+            return destroyRecordsError(identity, {
+                reason: `${reason.replace(/\.+$/, '')}. This workspace or one of its cache paths overlaps ~/.ploinky-box, so destroy never `
+                    + `deletes there. Remove ~/.ploinky-box/gpu-grants/${identity.instance}.json, ~/.ploinky-box/gpu-grants/${identity.instance}, `
+                    + `~/.ploinky-box/hardware-limits/${identity.instance}.json and ~/.ploinky-box/hardware-limits/${identity.instance} `
+                    + 'by hand once no Ploinky process uses them',
+                step: null,
+                partial,
+            });
+        }
+        const step = error?.code === 'store_busy'
+            ? 'Resolve that store lock as described'
+            : error?.code === 'PLOINKY_BOX_HARDWARE_STORE_BUSY'
+                ? 'Make sure no Ploinky process uses this workspace\'s hardware policy store and remove that lock directory'
+                : 'Inspect the named path and repair it, or move it out of ~/.ploinky-box once no Ploinky process uses it';
+        return destroyRecordsError(identity, { reason, step, partial });
+    }
+
+    /**
+     * Destroy removes this workspace's host operator records: the GPU grant
+     * record and generations, and the hardware-limits gate record and
+     * INSTANCE tree (store, journals, markers). It runs only after the Box is
+     * proven gone, and only on paths derived from the exact identity. The
+     * full preflight of both stores precedes the first deletion, decision
+     * records go before derived data, and a refusal keeps them for a re-run of
+     * ploinky destroy, which takes the absent path and finishes. Router
+     * bindings, locks and update journals are never touched.
+     *
+     * Returns the canonical paths that existed and were removed, in the order
+     * gpu-grants/INSTANCE.json, gpu-grants/INSTANCE, hardware-limits/INSTANCE.json,
+     * hardware-limits/INSTANCE.
+     */
+    function removeOperatorRecordsAfterDestroy(identity, lock, boxProvenGone) {
+        if (boxProvenGone !== true) {
+            throw destroyRecordsError(identity, {
+                reason: 'the Box was not proven absent',
+                step: 'Run ploinky status on the host',
+            });
+        }
+        // The Box was removed by its exact ID in this transaction, or the
+        // locked discovery found none: no Box writer can hold the store lock.
+        const provenAbsent = () => Object.freeze({ state: 'absent' });
+        const refuse = (error) => destroyRecordsRefusal(identity, error);
+        try {
+            // Confinement and structure first, then stale-lock recovery: the
+            // journal abort below needs the store lock.
+            hardwareGateStore.planInstanceTeardown(identity, lock, { inspectBox: provenAbsent });
+            gpuGrantStore.planTeardown(identity, lock);
+        } catch (error) {
+            throw refuse(error);
+        }
+        const transitions = createTransitionStore({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+        const closed = closePendingDowngradesAfterDestroy(identity);
+        if (!closed.ok) {
+            if (closed.error?.code === 'store_busy') throw refuse(closed.error);
+            throw destroyRecordsError(identity, {
+                reason: `a pending hardware transition in ${transitions.directory} could not be closed (${closed.error?.message || closed.error})`,
+                step: `Inspect it with ploinky limits status, and move a journal that cannot be read out of ${transitions.directory} `
+                    + 'once nothing needs it for recovery',
+            });
+        }
+        let pending;
+        try {
+            pending = transitions.listPending();
+        } catch (error) {
+            throw destroyRecordsError(identity, {
+                reason: `the hardware transition journals in ${transitions.directory} cannot be read (${error.message})`,
+                step: `Inspect them with ploinky limits status, and move a journal that cannot be read out of ${transitions.directory} `
+                    + 'once nothing needs it for recovery',
+            });
+        }
+        if (pending.length) {
+            throw destroyRecordsError(identity, {
+                reason: `the hardware transition ${pending[0].operationId} is still pending (phase ${pending[0].phase})`,
+                step: 'Inspect it with ploinky limits status',
+            });
+        }
+        let hardwarePlan;
+        let gpuPlan;
+        try {
+            hardwarePlan = hardwareGateStore.planInstanceTeardown(identity, lock);
+            gpuPlan = gpuGrantStore.planTeardown(identity, lock);
+        } catch (error) {
+            throw refuse(error);
+        }
+        try {
+            const hardwareRemoved = hardwareGateStore.removeInstanceState(hardwarePlan, lock);
+            const gpuRemoved = [];
+            if (gpuGrantStore.clear(identity, lock) || gpuPlan.recordPath) gpuRemoved.push(gpuGrantStore.pathFor(identity));
+            if (gpuPlan.instanceDir) {
+                gpuGrantStore.prune(identity, [], lock);
+                gpuRemoved.push(gpuPlan.instanceDir);
+            }
+            return Object.freeze([...gpuRemoved, ...hardwareRemoved]);
+        } catch (error) {
+            throw destroyRecordsRefusal(identity, error, { partial: true });
+        }
+    }
+
+    // Records first (their refusal is kept, not thrown yet), then the cache:
+    // an explicit --delete-cache runs whenever the Box is proven gone, even if
+    // the records were kept. The refusal is reported after it.
+    function finishDestroy(identity, lock, { boxProvenGone, deleteCache, container }) {
+        retireDestroyedMarkers({ identity, lock });
+        let removedRecords = Object.freeze([]);
+        let recordsError = null;
+        try {
+            removedRecords = removeOperatorRecordsAfterDestroy(identity, lock, boxProvenGone);
+        } catch (error) {
+            recordsError = error;
+        }
+        let deletedPaths = Object.freeze([]);
+        let deletedAgentLibPaths = Object.freeze([]);
+        try {
+            // Cache deletion is explicit and runs only after the outer Box is
+            // proven gone, so a failed stop or removal always retains the data.
+            if (deleteCache && boxProvenGone) deletedPaths = destroyBoxCache({ identity, lock });
+            // Workspace-owned managed AgentLib state may go with the cache, but
+            // only once the Box is proven absent. A user-owned local checkout is
+            // never touched: it is outside `.ploinky` entirely.
+            if (deleteCache && boxProvenGone && !container) deletedAgentLibPaths = destroyManagedAgentLib(identity.workspaceRoot);
+        } catch (cacheError) {
+            if (!recordsError) throw cacheError;
+            const combined = supervisorError(
+                `${recordsError.message} The cache data could not be deleted either: ${cacheError.message}`,
+                recordsError.code,
+            );
+            throw combined;
+        }
+        if (recordsError) {
+            if (!deleteCache) throw recordsError;
+            const deleted = [...deletedPaths, ...deletedAgentLibPaths];
+            const reported = supervisorError(
+                `${recordsError.message} The cache data was deleted: `
+                + `${deleted.length ? deleted.join(', ') : 'nothing remained to delete'}.`,
+                recordsError.code,
+            );
+            reported.deletedPaths = deletedPaths;
+            reported.deletedAgentLibPaths = deletedAgentLibPaths;
+            throw reported;
+        }
+        return { removedRecords, deletedPaths, deletedAgentLibPaths };
     }
 
     async function runDestroyTransaction(expectedContainerId, { deleteCache = false } = {}) {
@@ -3430,10 +3594,12 @@ export function createBoxSupervisor({
             if (!container && expectedContainerId) {
                 throw supervisorError('Box changed before destroy; nothing was removed');
             }
+            // Without a container, the locked discovery itself is the proof:
+            // only an absent or owned observation passes lockedMutation.
+            const absentProven = !container && ['absent', 'owned'].includes(ownership.state);
             if (!container && !deleteCache) {
-                retireDestroyedMarkers({ identity, lock });
-                closePendingDowngradesAfterDestroy(identity);
-                return Object.freeze({ identity, action: 'absent' });
+                const { removedRecords } = finishDestroy(identity, lock, { boxProvenGone: absentProven, deleteCache, container });
+                return Object.freeze({ identity, action: 'absent', removedRecords });
             }
             if (container && (!expectedContainerId || container.id !== expectedContainerId)) {
                 throw supervisorError('Box changed before destroy; nothing was removed');
@@ -3475,19 +3641,9 @@ export function createBoxSupervisor({
                 }
                 removeContainerById(ownership.engine, container.id, runner);
             }
-            retireDestroyedMarkers({ identity, lock });
-            closePendingDowngradesAfterDestroy(identity);
-            // Cache deletion is explicit and runs only after the outer Box is
-            // proven gone, so a failed stop or removal always retains the data.
-            const deletedPaths = deleteCache
-                ? destroyBoxCache({ identity, lock })
-                : Object.freeze([]);
-            // Workspace-owned managed AgentLib state may go with the cache, but
-            // only once the Box is proven absent. A user-owned local checkout is
-            // never touched: it is outside `.ploinky` entirely.
-            const deletedAgentLibPaths = deleteCache && !container
-                ? destroyManagedAgentLib(identity.workspaceRoot)
-                : Object.freeze([]);
+            const { removedRecords, deletedPaths, deletedAgentLibPaths } = finishDestroy(identity, lock, {
+                boxProvenGone: container ? true : absentProven, deleteCache, container,
+            });
             return Object.freeze({
                 identity,
                 action: container ? 'destroyed' : 'deleted-cache',
@@ -3495,6 +3651,7 @@ export function createBoxSupervisor({
                 deletedCache: deleteCache,
                 deletedPaths,
                 deletedAgentLibPaths,
+                removedRecords,
             });
         });
     }

@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../../ploinky-box/constants.mjs';
+import { createGpuGrantStore } from '../../ploinky-box/gpuGrant.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import {
@@ -848,6 +849,7 @@ function realSupervisor(state, { env = {}, events = [], ownership = owned(state.
         validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
         validateContainer: () => {},
         hardwareGateStore: state.gateStore,
+        gpuGrantStore: createGpuGrantStore({ homeDirectory: state.home }),
         prepareHardwareGeneration: async () => { events.push('prepare'); return { structurallyPrepared: true }; },
         stderr: { write: (text) => events.push(`stderr:${text.trim()}`) },
     });
@@ -1269,19 +1271,24 @@ test('G.recovery-blocked-advice', async (t) => {
         });
         assert.equal(events.includes('reconcile'), false, label);
     }
-    // The advised destroy closes the journal and removes its barrier, also
-    // with the Box already absent.
+    // The advised destroy closes the journal, also with the Box already
+    // absent, and then removes the journal with the gate and instance state.
     const state = fixture(t);
     state.gateStore.write(state.identity, true, lockFor(state.identity));
     const pending = await pendingDowngrade(state);
     const store = createTransitionStore({ identity: state.identity, homeDirectory: state.home });
     store.writeJournal({ ...pending, phase: 'recovery-blocked' });
+    const journalPath = path.join(store.directory, `${pending.operationId}.json`);
+    assert.ok(fs.existsSync(journalPath) && fs.existsSync(storePaths(state).barrierPath));
     const absent = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} };
-    await realSupervisor(state, { ownership: absent }).runDestroyTransaction(null);
-    assert.equal(store.readJournal(pending.operationId).phase, 'aborted-by-destroy');
+    const result = await realSupervisor(state, { ownership: absent }).runDestroyTransaction(null);
+    assert.equal(fs.existsSync(journalPath), false, 'the closed journal is gone with the tree');
     assert.deepEqual(store.listPending(), []);
     assert.equal(fs.existsSync(storePaths(state).barrierPath), false);
-    assert.equal(state.gateStore.read(state.identity).enabled, true, 'destroy keeps the saved gate');
+    assert.equal(state.gateStore.read(state.identity), null, 'the saved gate is gone');
+    const instanceDir = path.join(state.gateStore.root, state.identity.instance);
+    assert.equal(fs.existsSync(instanceDir), false, 'the instance state is gone');
+    assert.deepEqual(result.removedRecords, [state.gateStore.recordPath(state.identity), instanceDir]);
 });
 
 function storeLockOwnedBy(state, owner) {
@@ -1292,6 +1299,240 @@ function storeLockOwnedBy(state, owner) {
     })}\n`, { mode: 0o600 });
     return directory;
 }
+
+// ---------------------------------------------------------------------------
+// Destroy removes this workspace's hardware-limits records.
+
+// The complete instance state: the gate record (on), a store with an entry,
+// a transitions directory and one generation marker.
+function seedInstanceState(state) {
+    state.gateStore.write(state.identity, true, lockFor(state.identity));
+    const paths = storeWithEntry(state);
+    const instanceDir = path.join(state.gateStore.root, state.identity.instance);
+    fs.mkdirSync(path.join(instanceDir, 'transitions'), { mode: 0o700 });
+    fs.writeFileSync(path.join(instanceDir, 'transitions', `sha256-${'1'.repeat(64)}.json`), '{}\n', { mode: 0o600 });
+    const marker = path.join(instanceDir, 'f'.repeat(64), 'marker.json');
+    fs.mkdirSync(path.dirname(marker), { mode: 0o700 });
+    fs.writeFileSync(marker, '{}\n', { mode: 0o600 });
+    return { paths, instanceDir, record: state.gateStore.recordPath(state.identity), marker };
+}
+
+function teardownStore(state) {
+    const store = state.gateStore;
+    assert.equal(typeof store.planInstanceTeardown, 'function', 'the gate store has a destroy preflight');
+    assert.equal(typeof store.removeInstanceState, 'function', 'the gate store has a destroy removal');
+    return store;
+}
+
+test('G.destroy-teardown-plan-is-read-only-exact-and-ordered', (t) => {
+    const fresh = fixture(t);
+    const freshStore = teardownStore(fresh);
+    const plan = freshStore.planInstanceTeardown(fresh.identity, lockFor(fresh.identity));
+    assert.deepEqual([plan.recordPath, plan.instanceDir, plan.entries], [null, null, []]);
+    assert.equal(fs.existsSync(path.join(fresh.home, '.ploinky-box')), false, 'the preflight never creates state');
+    assert.throws(() => freshStore.planInstanceTeardown(fresh.identity, null), /requires the workspace mutation lock/);
+
+    const state = fixture(t);
+    const seeded = seedInstanceState(state);
+    const store = teardownStore(state);
+    const planned = store.planInstanceTeardown(state.identity, lockFor(state.identity));
+    assert.equal(planned.recordPath, seeded.record);
+    assert.equal(planned.instanceDir, seeded.instanceDir);
+    assert.deepEqual(planned.entries.map((entry) => entry.name), ['transitions', 'f'.repeat(64), 'store'],
+        'the journals go first and the store last');
+    for (const target of [seeded.record, seeded.paths.policyPath, seeded.marker]) assert.ok(fs.existsSync(target), target);
+    assert.deepEqual(store.removeInstanceState(planned, lockFor(state.identity)), [seeded.record, seeded.instanceDir]);
+    assert.equal(fs.existsSync(seeded.record), false);
+    assert.equal(fs.existsSync(seeded.instanceDir), false);
+    assert.equal(state.gateStore.read(state.identity), null);
+    // Idempotent: nothing remains to plan or remove.
+    const again = store.planInstanceTeardown(state.identity, lockFor(state.identity));
+    assert.deepEqual([again.recordPath, again.instanceDir], [null, null]);
+    assert.deepEqual(store.removeInstanceState(again, lockFor(state.identity)), []);
+});
+
+test('G.destroy-teardown-removes-half-deleted-empty-and-dangling-state', (t) => {
+    // A store a crash left with only limits.json: contents are never parsed.
+    const half = fixture(t);
+    const store = teardownStore(half);
+    const instanceDir = path.join(half.gateStore.root, half.identity.instance);
+    fs.mkdirSync(path.join(instanceDir, 'store'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(instanceDir, 'store', 'limits.json'), '{"half":', { mode: 0o600 });
+    store.removeInstanceState(store.planInstanceTeardown(half.identity, lockFor(half.identity)), lockFor(half.identity));
+    assert.equal(fs.existsSync(instanceDir), false);
+    // An empty INSTANCE directory.
+    const empty = fixture(t);
+    const emptyDir = path.join(empty.gateStore.root, empty.identity.instance);
+    fs.mkdirSync(emptyDir, { recursive: true, mode: 0o700 });
+    assert.deepEqual(empty.gateStore.removeInstanceState(empty.gateStore.planInstanceTeardown(empty.identity, lockFor(empty.identity)), lockFor(empty.identity)), [emptyDir]);
+    assert.equal(fs.existsSync(emptyDir), false);
+    // A dangling symlink record: only the link is unlinked.
+    const dangling = fixture(t);
+    fs.mkdirSync(dangling.gateStore.root, { recursive: true, mode: 0o700 });
+    const missing = path.join(dangling.root, 'missing-target');
+    fs.symlinkSync(missing, dangling.gateStore.recordPath(dangling.identity));
+    dangling.gateStore.removeInstanceState(dangling.gateStore.planInstanceTeardown(dangling.identity, lockFor(dangling.identity)), lockFor(dangling.identity));
+    assert.throws(() => fs.lstatSync(dangling.gateStore.recordPath(dangling.identity)), /ENOENT/);
+    assert.equal(fs.existsSync(missing), false);
+});
+
+test('G.destroy-teardown-store-lock-recovery-needs-proof-and-never-takes-a-live-lock', (t) => {
+    const absentBox = () => ({ state: 'absent' });
+    // A live holder is refused even with the Box absent; nothing changes.
+    const live = fixture(t);
+    const seeded = seedInstanceState(live);
+    const store = teardownStore(live);
+    const lockDir = storeLockOwnedBy(live, { pid: process.pid, hostname: os.hostname() });
+    assert.throws(() => store.planInstanceTeardown(live.identity, lockFor(live.identity), { inspectBox: absentBox }), (error) => {
+        assert.equal(error.code, 'store_busy');
+        assert.match(error.message, /that process is still running on this host/);
+        return true;
+    });
+    assert.ok(fs.existsSync(path.join(lockDir, 'owner.json')));
+    for (const target of [seeded.record, seeded.paths.policyPath, seeded.marker]) assert.ok(fs.existsSync(target), target);
+    // A dead holder: kept without a Box proof, recovered (quarantined in the tree) with it.
+    const dead = fixture(t);
+    const deadSeeded = seedInstanceState(dead);
+    const deadLock = storeLockOwnedBy(dead, { pid: spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid, hostname: os.hostname() });
+    assert.throws(() => dead.gateStore.planInstanceTeardown(dead.identity, lockFor(dead.identity)), (error) => error.code === 'PLOINKY_BOX_HARDWARE_STORE_BUSY');
+    assert.ok(fs.existsSync(deadLock));
+    const plan = dead.gateStore.planInstanceTeardown(dead.identity, lockFor(dead.identity), { inspectBox: absentBox });
+    assert.equal(fs.existsSync(deadLock), false);
+    assert.ok(fs.readdirSync(deadSeeded.paths.storeRoot).some((name) => name.startsWith('write.lock.stale-')));
+    dead.gateStore.removeInstanceState(plan, lockFor(dead.identity));
+    assert.equal(fs.existsSync(deadSeeded.instanceDir), false, 'the quarantined lock goes with the tree');
+});
+
+test('G.destroy-teardown-refuses-symlinked-foreign-and-unexpected-state', (t) => {
+    // INSTANCE as a symlink to an outside directory: refused, the target survives.
+    const linked = fixture(t);
+    const store = teardownStore(linked);
+    linked.gateStore.write(linked.identity, true, lockFor(linked.identity));
+    const outside = path.join(linked.root, 'outside');
+    fs.mkdirSync(path.join(outside, 'store'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(outside, 'store', 'keep'), 'outside data', { mode: 0o600 });
+    fs.symlinkSync(outside, path.join(linked.gateStore.root, linked.identity.instance));
+    assert.throws(() => store.planInstanceTeardown(linked.identity, lockFor(linked.identity)), /is not a real directory/);
+    assert.equal(fs.readFileSync(path.join(outside, 'store', 'keep'), 'utf8'), 'outside data');
+    assert.equal(linked.gateStore.read(linked.identity).enabled, true, 'the gate record is kept');
+    // An extra, a 65-hex, a file and a symlinked entry are each refused with nothing deleted.
+    for (const [label, name, make] of [
+        ['extra entry', 'evil', (target) => fs.mkdirSync(target, { mode: 0o700 })],
+        ['65-hex name', 'a'.repeat(65), (target) => fs.mkdirSync(target, { mode: 0o700 })],
+        ['file entry', 'b'.repeat(64), (target) => fs.writeFileSync(target, 'x', { mode: 0o600 })],
+        ['symlinked store', 'store', (target, state) => fs.symlinkSync(path.join(state.root, 'workspace'), target)],
+    ]) {
+        const state = fixture(t);
+        state.gateStore.write(state.identity, true, lockFor(state.identity));
+        const instanceDir = path.join(state.gateStore.root, state.identity.instance);
+        fs.mkdirSync(path.join(instanceDir, 'transitions'), { recursive: true, mode: 0o700 });
+        make(path.join(instanceDir, name), state);
+        assert.throws(() => state.gateStore.planInstanceTeardown(state.identity, lockFor(state.identity)),
+            (error) => error.code === 'PLOINKY_BOX_HARDWARE_STATE_INVALID' && error.message.includes(path.join(instanceDir, name)), label);
+        assert.ok(fs.existsSync(path.join(instanceDir, 'transitions')), label);
+        assert.equal(state.gateStore.read(state.identity).enabled, true, label);
+    }
+    // A directory where the gate record should be is refused.
+    const dirRecord = fixture(t);
+    fs.mkdirSync(dirRecord.gateStore.recordPath(dirRecord.identity), { recursive: true, mode: 0o700 });
+    assert.throws(() => dirRecord.gateStore.planInstanceTeardown(dirRecord.identity, lockFor(dirRecord.identity)), /non-regular hardware-limits gate path/);
+    // A symlink inside the store to an outside file: the tree goes, the outside file survives.
+    const inner = fixture(t);
+    const seeded = seedInstanceState(inner);
+    const outsideFile = path.join(inner.root, 'outside-file');
+    fs.writeFileSync(outsideFile, 'keep me', { mode: 0o600 });
+    fs.symlinkSync(outsideFile, path.join(seeded.paths.storeRoot, 'link'));
+    inner.gateStore.removeInstanceState(inner.gateStore.planInstanceTeardown(inner.identity, lockFor(inner.identity)), lockFor(inner.identity));
+    assert.equal(fs.existsSync(seeded.instanceDir), false);
+    assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'keep me');
+});
+
+// Destroy with a pending journal and a stale store lock: the journal abort
+// needs that lock, so the first destroy recovers it, closes the journal and
+// removes everything.
+for (const [label, owner] of [
+    ['dead host-domain holder', { domain: 'host' }],
+    ['box-domain holder', { domain: 'box' }],
+]) {
+    for (const boxPresent of [true, false]) {
+        test(`G.destroy-first-run-finishes-with-a-pending-journal-and-a-${label.replace(/ /g, '-')}${boxPresent ? '' : '-box-absent'}`, async (t) => {
+            const state = fixture(t);
+            state.gateStore.write(state.identity, true, lockFor(state.identity));
+            const pending = await pendingDowngrade(state);
+            const lockDir = storeLockOwnedBy(state, { pid: spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid, hostname: os.hostname(), ...owner });
+            const events = [];
+            const absent = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} };
+            const box = owned(state.identity, { running: false });
+            const started = Date.now();
+            const result = await realSupervisor(state, { events, ownership: boxPresent ? box : absent })
+                .runDestroyTransaction(boxPresent ? box.handles.container.id : null);
+            assert.ok(Date.now() - started < 5000, 'the stale lock was recovered, not waited out');
+            const instanceDir = path.join(state.gateStore.root, state.identity.instance);
+            assert.equal(fs.existsSync(lockDir), false);
+            assert.equal(fs.existsSync(instanceDir), false);
+            assert.equal(state.gateStore.read(state.identity), null);
+            assert.deepEqual(result.removedRecords, [state.gateStore.recordPath(state.identity), instanceDir]);
+            assert.equal(events.includes('run:container rm'), boxPresent);
+            assert.equal(events.some((event) => /could not be closed/.test(event)), false, `no duplicate warning: ${pending.operationId}`);
+        });
+    }
+}
+
+test('G.destroy-keeps-records-for-a-live-ownerless-or-foreign-store-lock-with-remediation', async (t) => {
+    const deadPid = spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid;
+    for (const [label, makeLock, remediation] of [
+        ['live pid', (state) => storeLockOwnedBy(state, { pid: process.pid, hostname: os.hostname() }), /Wait for that operation to finish and retry/],
+        ['foreign host', (state) => storeLockOwnedBy(state, { pid: deadPid, hostname: 'other-host.example' }), /Stop this workspace on every host that uses this store/],
+        ['ownerless', (state) => {
+            const directory = path.join(storePaths(state).storeRoot, 'write.lock');
+            fs.mkdirSync(directory, { mode: 0o700 });
+            return directory;
+        }, /an ownerless lock is never removed automatically.*then remove that directory and retry/],
+    ]) {
+        const state = fixture(t);
+        state.gateStore.write(state.identity, true, lockFor(state.identity));
+        const pending = await pendingDowngrade(state);
+        const lockDir = makeLock(state);
+        const events = [];
+        const box = owned(state.identity, { running: false });
+        await assert.rejects(realSupervisor(state, { events, ownership: box }).runDestroyTransaction(box.handles.container.id), (error) => {
+            assert.equal(error.code, 'PLOINKY_BOX_DESTROY_RECORDS_KEPT', label);
+            assert.match(error.message, new RegExp(`^Ploinky Box ${state.identity.instance} was removed, but its host operator records were kept: `), label);
+            assert.match(error.message, remediation, label);
+            assert.match(error.message, /Resolve that store lock as described, then run ploinky destroy again\.$/, label);
+            return true;
+        });
+        assert.ok(events.includes('run:container rm'), `${label}: the Box was removed first`);
+        assert.ok(fs.existsSync(lockDir), `${label}: the lock is kept`);
+        assert.equal(state.gateStore.read(state.identity).enabled, true, `${label}: the gate is kept`);
+        const journal = createTransitionStore({ identity: state.identity, homeDirectory: state.home }).readJournal(pending.operationId);
+        assert.notEqual(journal.phase, 'aborted-by-destroy', `${label}: the journal is untouched`);
+        assert.ok(fs.existsSync(storePaths(state).barrierPath), `${label}: the barrier is kept`);
+    }
+});
+
+test('G.destroy-keeps-records-for-an-unreadable-journal-and-names-it', async (t) => {
+    const state = fixture(t);
+    const seeded = seedInstanceState(state);
+    const journalPath = path.join(seeded.instanceDir, 'transitions', `${'7'.repeat(32)}.json`);
+    fs.writeFileSync(journalPath, '{"malformed', { mode: 0o600 });
+    const events = [];
+    const box = owned(state.identity, { running: false });
+    await assert.rejects(realSupervisor(state, { events, ownership: box }).runDestroyTransaction(box.handles.container.id), (error) => {
+        assert.equal(error.code, 'PLOINKY_BOX_DESTROY_RECORDS_KEPT');
+        assert.ok(error.message.includes(path.join(seeded.instanceDir, 'transitions')), error.message);
+        assert.match(error.message, /move a journal that cannot be read out of .* once nothing needs it for recovery, then run ploinky destroy again\.$/);
+        return true;
+    });
+    assert.ok(events.includes('run:container rm'), 'the Box was removed first');
+    for (const target of [seeded.record, seeded.paths.policyPath, seeded.marker, journalPath]) assert.ok(fs.existsSync(target), target);
+    // Once the operator moves the journal out, the re-run (absent path) finishes.
+    fs.renameSync(journalPath, path.join(state.root, 'moved-journal.json'));
+    const absent = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} };
+    const result = await realSupervisor(state, { ownership: absent }).runDestroyTransaction(null);
+    assert.equal(result.action, 'absent');
+    assert.equal(fs.existsSync(seeded.instanceDir), false);
+});
 
 test('G.stale-lock-never-stolen-messages', async (t) => {
     // K7: a lock owned by another host or by a live PID, or held while the
@@ -1407,7 +1648,7 @@ test('G.status-transition', async (t) => {
         if (phase === 'recovery-blocked') {
             assert.equal(lines[0], `Transition: gate-on to gate-off ${pending.operationId}, recovery-blocked; recovery Recovery is blocked `
                 + `(Box ${'9'.repeat(64)} is not owned by this transition), and ploinky restart cannot complete it. Run ploinky destroy `
-                + "on the host to remove this workspace's Box and close the transition (the saved gate and stored limits are kept), then run ploinky start.");
+                + "on the host to remove this workspace's Box and close the transition (this also removes the saved gate, stored limits and GPU decisions), then run ploinky start.");
             assert.equal(lines[0].includes(RESTART), false, 'recovery-blocked is never told to run ploinky restart');
         } else {
             assert.equal(lines[0], `Transition: gate-on to gate-off ${pending.operationId}, ${phase}; recovery ${RESTART}`);
