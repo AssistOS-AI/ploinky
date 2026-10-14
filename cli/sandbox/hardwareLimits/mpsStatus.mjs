@@ -1,9 +1,11 @@
 import { spawnSync } from 'node:child_process';
 import { readBoxGpuGrant } from '../../../ploinky-box/lib/gpuGrantMarker.mjs';
 import { createMpsStateStore, createMpsDaemonBackend } from './mps.mjs';
-import { MpsError, observeMpsGpu, inspectMpsImage, resolveMpsShare, unsupportedGpuMemoryModelReason, UNSUPPORTED_GPU_MEMORY_MODEL_FIX } from './mpsEligibility.mjs';
+import { MpsError, observeMpsGpu, inspectMpsImage, resolveMpsShare, unsupportedGpuMemoryModelReason, UNSUPPORTED_GPU_MEMORY_MODEL_FIX, UNIFIED_ALLOCATION_KINDS, unifiedShareQualification } from './mpsEligibility.mjs';
 
 const GENERIC_FIX = 'Inspect GPU wiring and MPS tools, then retry.';
+const MIB = 1048576;
+const ENVELOPE_UNKNOWN_FIX = 'Check the Box memory envelope with ploinky limits status, then retry.';
 const oneLine = (value, limit = 400) => String(value ?? '').replace(/[^\x20-\x7e]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
 
 // Why this Box's grant marker does not allow MPS, specifically: no marker, an invalid one, wiring that is not
@@ -17,8 +19,11 @@ export function mpsGrantProblem(grant) {
     return 'The GPU wiring carries no MPS tools: the Box was created without the hardware-limits gate, or the host has no MPS tools.';
 }
 
-/** Bounded observations only: never prepares an image or starts a daemon. */
-export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, observeGpu = observeMpsGpu,
+/**
+ * Bounded observations only: never prepares an image or starts a daemon. `envelope` is the Box resource envelope; it
+ * is the pool a share on the qualified unified GPU is a percentage of, and nothing else reads it.
+ */
+export function readMpsStatus({ workspaceRoot, envelope = null, readGrant = readBoxGpuGrant, observeGpu = observeMpsGpu,
     readState = () => createMpsStateStore().read(), backend = createMpsDaemonBackend() } = {}) {
     let internal = {};
     const finish = (value) => Object.defineProperties(value, { facts: { value: internal.facts }, grant: { value: internal.grant } });
@@ -28,7 +33,24 @@ export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, obse
         if (!grant.valid || grant.state !== 'active' || !grant.mps) throw new MpsError(`${mpsGrantProblem(grant)} Active GPU wiring and both host MPS tools are required.`);
         const gpu = observeGpu();
         internal = { facts: gpu, grant };
-        Object.assign(result, { eligible: true, mode: 'mps-shared', memoryModel: gpu.memoryModel, name: gpu.name, deviceUuid: gpu.uuid, driverVersion: gpu.driverVersion, deviceMemoryBytes: gpu.memoryMiB * 1048576, wiringFingerprint: grant.fingerprint });
+        const qualified = gpu.memoryModel === 'unified' && gpu.unifiedShareQualified === true ? unifiedShareQualification(gpu) : null;
+        if (qualified) {
+            // The qualified unified GPU: no dedicated memory (deviceMemoryBytes is null, never 0); a share is a
+            // percentage of the Box memory envelope. With an unknown envelope the GPU is not eligible, but the daemon
+            // below is still observed, because the container monitor and the reconcile verify read only that.
+            const poolMiB = Number.isSafeInteger(envelope?.memoryBytes) && envelope.memoryBytes > 0 ? Math.floor(envelope.memoryBytes / MIB) : 0;
+            Object.assign(result, { memoryModel: 'unified', name: gpu.name, deviceUuid: gpu.uuid, driverVersion: gpu.driverVersion, deviceMemoryBytes: null, wiringFingerprint: grant.fingerprint, pciDeviceId: gpu.pciDeviceId, addressingMode: gpu.addressingMode });
+            if (poolMiB > 0) {
+                Object.assign(result, { eligible: true, mode: 'mps-shared', shareBasis: { kind: 'unified-pool', bytes: poolMiB * MIB, source: 'box-envelope' },
+                    unifiedMemory: { ramLimitCoversGpuAllocations: false, gpuMemoryBound: 'mps-per-process', assurance: 'best-effort', enforcement: 'cooperative',
+                        qualification: { pciDeviceId: qualified.pciDeviceId, driverVersion: qualified.driverVersion, evidenceRun: qualified.evidenceRun }, allocationKinds: UNIFIED_ALLOCATION_KINDS } });
+            } else {
+                Object.assign(result, { reason: 'Box memory envelope unknown', fix: ENVELOPE_UNKNOWN_FIX, code: 'gpu_sharing_unavailable',
+                    unifiedMemory: { ramLimitCoversGpuAllocations: false, gpuMemoryBound: 'admission-only', assurance: 'advisory' } });
+            }
+        } else {
+            Object.assign(result, { eligible: true, mode: 'mps-shared', memoryModel: gpu.memoryModel, name: gpu.name, deviceUuid: gpu.uuid, driverVersion: gpu.driverVersion, deviceMemoryBytes: gpu.memoryMiB * 1048576, wiringFingerprint: grant.fingerprint });
+        }
         const state = readState();
         if (!state || (state.status === 'inactive' && !state.daemon && !state.pipeDirectory)) return finish({ ...result, daemonStatus: 'stopped' });
         const owned = backend.observe(state).state;
@@ -45,14 +67,18 @@ export function readMpsStatus({ workspaceRoot, readGrant = readBoxGpuGrant, obse
         }
         result.pendingClients = (Array.isArray(state.pendingClients) ? state.pendingClients : []).slice(0, 256).map(({ key, instanceId, enableGeneration }) => ({ key, instanceId, enableGeneration }));
         result.clientsPending = result.pendingClients.length > 0 || state.status === 'pending';
-        if (!verified) result.reason = 'MPS generation requires lifecycle recovery before clients can be ready.';
+        if (!verified && result.reason === undefined) result.reason = 'MPS generation requires lifecycle recovery before clients can be ready.';
         return finish(result);
     } catch (error) {
         // A unified or unknown memory model is a definite refusal (§9.3),
         // not an unverifiable fact: keep the model and name it was refused for.
         if (error?.memoryModel === 'unified' || error?.memoryModel === 'unknown') {
-            return finish({ ...result, eligible: false, memoryModel: error.memoryModel, name: String(error.gpuName || '').slice(0, 256),
-                reason: `${unsupportedGpuMemoryModelReason(error.gpuName)} ${UNSUPPORTED_GPU_MEMORY_MODEL_FIX}`, code: 'gpu_sharing_unavailable',
+            // hardwareSupport marks this definite refusal; the generic catch below never sets it (a transient failure is not 'unsupported').
+            // A qualified GB10 on another driver carries the driver sentence (unsupportedReason) instead of the name-based one.
+            const unsupportedReason = typeof error.unsupportedReason === 'string' ? error.unsupportedReason : unsupportedGpuMemoryModelReason(error.gpuName);
+            return finish({ ...result, eligible: false, memoryModel: error.memoryModel, hardwareSupport: 'unsupported', name: String(error.gpuName || '').slice(0, 256),
+                reason: `${unsupportedReason} ${UNSUPPORTED_GPU_MEMORY_MODEL_FIX}`, code: 'gpu_sharing_unavailable',
+                ...(typeof error.unsupportedReason === 'string' ? { unsupportedReason, driverVersion: error.driverVersion } : {}),
                 // Unified only: say what the RAM limit does not cover. Dedicated and unknown payloads are unchanged.
                 ...(error.memoryModel === 'unified' ? { pciDeviceId: error.pciDeviceId ?? null, addressingMode: error.addressingMode ?? null,
                     unifiedMemory: { ramLimitCoversGpuAllocations: false, gpuMemoryBound: 'admission-only', assurance: 'advisory' } } : {}) });
@@ -72,10 +98,13 @@ export function inspectPreparedMpsImage(image, { runtime = 'podman', query = spa
 
 export function inspectMpsTargetEligibility({ image, networkMode, agentRef, gpuShare, workspaceRoot, status },
     { inspectImage = inspectPreparedMpsImage, readGrant = readBoxGpuGrant, fsApi } = {}) {
-    if (!status?.eligible) throw new MpsError(status?.reason || 'GPU sharing is unavailable');
+    if (!status?.eligible) throw new MpsError(status?.reason || 'GPU sharing is unavailable', 'gpu_sharing_unavailable', { fix: status?.fix });
     const grant = readGrant({ workspaceRoot });
     if (!grant.valid || grant.state !== 'active' || !grant.agents?.includes(agentRef) || grant.fingerprint !== status.wiringFingerprint) throw new MpsError('This exact agent does not have current GPU access. Check host GPU grants and restart the Box.');
     const prepared = inspectMpsImage({ image, networkMode }, { inspectImage });
-    const share = resolveMpsShare(gpuShare, { memoryModel: status.memoryModel, memoryMiB: status.deviceMemoryBytes / 1048576, uuid: status.deviceUuid, driverVersion: status.driverVersion }, { grant, fsApi });
+    // The observed facts of the status itself (the runtime path uses the same ones), never a rebuilt object.
+    if (!status.facts) throw new MpsError('The observed GPU facts are unavailable. Retry the request.');
+    const poolMiB = status.shareBasis?.kind === 'unified-pool' ? status.shareBasis.bytes / MIB : undefined;
+    const share = resolveMpsShare(gpuShare, status.facts, { grant, fsApi, ...(poolMiB === undefined ? {} : { poolMiB }) });
     return { ...status, imageUserKnown: true, imageId: prepared.imageId, imageUser: prepared.imageUser, share };
 }

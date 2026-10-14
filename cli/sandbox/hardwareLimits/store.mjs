@@ -57,12 +57,14 @@ const BARRIER_KEYS = ['schema', 'operationId', 'instance', 'pathHash', 'storeId'
 const RESERVED_REF_PARTS = new Set(['__proto__', 'prototype', 'constructor']);
 
 export class HardwareStoreError extends Error {
-    constructor(message, { code = 'invalid_limits', status, field = null, committed = false, token = null } = {}) {
+    constructor(message, { code = 'invalid_limits', status, field = null, committed = false, token = null, fix } = {}) {
         super(message);
         this.name = 'HardwareStoreError';
         this.code = code;
         this.status = status ?? STATUS_BY_CODE[code] ?? 400;
         this.field = field;
+        // The remedy of the refusal, when its cause carried one (a transient GPU status failure).
+        if (typeof fix === 'string' && fix) this.fix = fix;
         if (committed) {
             this.committed = true;
             this.token = token;
@@ -635,17 +637,21 @@ export function validateAgentLimits({
     let gpuBytes = null;
     if (entry.gpu !== undefined) {
         const gpu = capabilities.gpu || { eligible: false, code: 'gpu_sharing_unavailable', reason: 'GPU sharing is not available in this Box.' };
-        if (gpu.memoryModel === 'unified' || gpu.memoryModel === 'unknown') {
-            fail(`GPU sharing is unsupported on this unified or unverified GPU memory model: ${gpu.name || 'unknown'}. Clear the GPU share. CPU/RAM controls remain separately available.`, { code: 'gpu_sharing_unavailable', field: 'gpu' });
+        // A status that is not eligible keeps its own reason, code and remedy (a transient failure is not a model refusal).
+        if (gpu.eligible !== true) fail(gpu.reason || 'GPU sharing is not available in this Box.', { code: gpu.code || 'gpu_sharing_unavailable', field: 'gpu', fix: gpu.fix });
+        // The model guard: an unsupported marker, or a unified/unknown memory model that is not the qualified unified pool.
+        if (gpu.hardwareSupport === 'unsupported' || (gpu.memoryModel !== 'dedicated' && gpu.shareBasis?.kind !== 'unified-pool')) {
+            fail(`${gpu.unsupportedReason ?? `GPU sharing is unsupported on this unified or unverified GPU memory model: ${gpu.name || 'unknown'}.`} Clear the GPU share. CPU/RAM controls remain separately available.`, { code: 'gpu_sharing_unavailable', field: 'gpu' });
         }
-        if (gpu.eligible !== true) fail(gpu.reason || 'GPU sharing is not available in this Box.', { code: gpu.code || 'gpu_sharing_unavailable', field: 'gpu' });
         if (gpu.imageUserKnown === false) {
             fail("The GPU image's immutable user is not available for validation. Prepare the image through the normal agent startup path, then save the share. No image was pulled by this settings request.", { code: 'image_preparation_required', field: 'gpu' });
         }
-        if (!Number.isSafeInteger(gpu.deviceMemoryBytes) || gpu.deviceMemoryBytes <= 0) {
-            fail('The GPU device memory is unknown.', { code: 'gpu_sharing_unavailable', field: 'gpu' });
+        // Dedicated: the device memory. Qualified unified: the Box memory envelope the status was built from.
+        const basisBytes = gpu.shareBasis?.kind === 'unified-pool' ? gpu.shareBasis.bytes : gpu.deviceMemoryBytes;
+        if (!Number.isSafeInteger(basisBytes) || basisBytes <= 0) {
+            fail(gpu.shareBasis?.kind === 'unified-pool' ? 'The GPU memory basis is unknown.' : 'The GPU device memory is unknown.', { code: 'gpu_sharing_unavailable', field: 'gpu' });
         }
-        gpuBytes = Math.floor((entry.gpu.vramPercent * gpu.deviceMemoryBytes) / 100 / MIB) * MIB;
+        gpuBytes = Math.floor((entry.gpu.vramPercent * basisBytes) / 100 / MIB) * MIB;
         if (gpuBytes < MIN_GPU_SHARE_BYTES) {
             fail(`vramPercent ${entry.gpu.vramPercent} resolves to ${gpuBytes / MIB} MiB, below the 512 MiB minimum`, { code: 'exceeds_envelope', field: 'gpu' });
         }

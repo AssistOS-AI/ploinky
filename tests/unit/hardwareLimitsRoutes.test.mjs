@@ -750,3 +750,82 @@ test('T2b.the-attempts-after-a-failed-reconcile-are-spaced-by-the-backoff', asyn
     assert.ok(attempts.length >= 2 && attempts.length <= 6, `attempts in one second: ${attempts.length}`);
     for (let index = 1; index < attempts.length; index += 1) assert.ok(attempts[index] - attempts[index - 1] >= 240, `attempt ${index} followed after ${attempts[index] - attempts[index - 1]} ms`);
 });
+
+// Phase 2 (P2-P): a GPU memory share on the qualified unified GPU through the real POST path.
+const { default: nodeCrypto } = await import('node:crypto');
+const { observeMpsGpu: observeGpuForRoutes } = await import('../../cli/sandbox/hardwareLimits/mpsEligibility.mjs');
+const { readMpsStatus: readStatusForRoutes, inspectMpsTargetEligibility: inspectForRoutes } = await import('../../cli/sandbox/hardwareLimits/mpsStatus.mjs');
+const { qualifyHardwareGpuTarget: qualifyForRoutes, HARDWARE_HELP: HELP_FOR_ROUTES } = await import('../../cli/server/authHandlers/hardwareLimitsRoutes.mjs');
+function unifiedGpuFixture(t, f, { driver = '580.178.04', envelopeBytes = 128450985984 } = {}) {
+    const toolBytes = Buffer.from('fake mps tool\n');
+    const sha256 = nodeCrypto.createHash('sha256').update(toolBytes).digest('hex');
+    const stat = { dev: 1, ino: 7, size: toolBytes.length, mtimeMs: 1000, ctimeMs: 1000, nlink: 1, isFile: () => true };
+    const fsApi = { realpathSync: (p) => p, openSync: () => 3, fstatSync: () => stat, accessSync: () => {}, readSync: (fd, buf, off, len) => { toolBytes.copy(buf, off, 0, len); return len; }, closeSync: () => {} };
+    const tool = (name) => ({ source: `/host/bin/${name}`, destination: `/usr/local/nvidia/bin/${name}`, dev: 1, ino: 7, size: toolBytes.length, mtimeMs: 1000, sha256 });
+    const grant = { valid: true, state: 'active', fingerprint: 'wiring', agents: ['demo/worker'], mps: { control: tool('nvidia-cuda-mps-control'), server: tool('nvidia-cuda-mps-server') } };
+    const uuid = 'GPU-12345678-1234-1234-1234-123456789012';
+    const query = (_command, args) => ({ status: 0, stderr: '', stdout: args.some((arg) => arg.includes('pci.device_id')) ? '0x2E1210DE, ATS\n' : `0, ${uuid}, NVIDIA GB10, [N/A], ${driver}\n` });
+    const gpu = readStatusForRoutes({ envelope: { memoryBytes: envelopeBytes }, readGrant: () => grant, observeGpu: () => observeGpuForRoutes({ query }), readState: () => null });
+    const manifestPath = path.join(f.root, 'unified-manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify({ container: 'prepared:image', start: 'sleep infinity' }));
+    const inspectImage = () => [{ Id: `sha256:${'a'.repeat(64)}`, Config: { User: '1000:1000' } }];
+    const qualify = (input, deps) => inspectForRoutes(input, { ...deps, readGrant: () => grant, fsApi });
+    return {
+        gpu,
+        dependencies: {
+            getContext: () => ({ ...f.getContext(), gpu }),
+            getInstalled: () => [{ ref: 'demo/worker', manifestPath }],
+            qualifyGpu: (agent, records, context, limits) => qualifyForRoutes(agent, records, context, limits, { inspectImage, qualify }),
+        },
+    };
+}
+
+test('R.unified-share-post (qualified GB10)', async (t) => {
+    const f = fixture(t);
+    const u = unifiedGpuFixture(t, f);
+    assert.equal(u.gpu.eligible, true);
+    // R6-4: out-of-range percentages are refused on the percentage check, as a typed 409, before any store write.
+    for (const vramPercent of [0, 101]) {
+        const before = readStoreSnapshot({ paths: f.paths, identity: f.identity });
+        const result = await request(f, { method: 'POST', body: setBody(f, { limits: { gpu: { smPercent: 50, vramPercent } } }), dependencies: u.dependencies });
+        assert.equal(result.status, 409, `vram ${vramPercent}`);
+        assert.equal(result.body.error, 'gpu_sharing_unavailable');
+        assert.match(result.body.message, /integers in 1\.\.100/);
+        const after = readStoreSnapshot({ paths: f.paths, identity: f.identity });
+        assert.deepEqual(after.token, before.token);
+        assert.equal(after.agents.size, 0);
+    }
+    // vram 25 is accepted: the store keeps schema v1's exact { smPercent, vramPercent } entry.
+    const accepted = await request(f, { method: 'POST', body: setBody(f, { limits: { gpu: { smPercent: 50, vramPercent: 25 } } }), dependencies: u.dependencies });
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+    const stored = readStoreSnapshot({ paths: f.paths, identity: f.identity });
+    assert.deepEqual(stored.agents.get('demo/worker'), { gpu: { smPercent: 50, vramPercent: 25 } });
+    const document = JSON.parse(fs.readFileSync(f.paths.policyPath, 'utf8'));
+    assert.equal(document.schema, 'ploinky.hardware-limits/v1');
+});
+
+test('R.unified-share-post refuses an unqualified driver and an unknown envelope with their own messages', async (t) => {
+    const f = fixture(t);
+    const driver = unifiedGpuFixture(t, f, { driver: '580.159.03' });
+    const refused = await request(f, { method: 'POST', body: setBody(f, { limits: { gpu: { smPercent: 50, vramPercent: 25 } } }), dependencies: driver.dependencies });
+    assert.equal(refused.status, 409);
+    assert.equal(refused.body.error, 'gpu_sharing_unavailable');
+    assert.match(refused.body.message, /^GPU sharing is not qualified on this GB10 driver: it is qualified only for NVIDIA driver 580\.178\.04, and this host runs 580\.159\.03\./);
+    const envelope = unifiedGpuFixture(t, f, { envelopeBytes: 0 });
+    const unknown = await request(f, { method: 'POST', body: setBody(f, { limits: { gpu: { smPercent: 50, vramPercent: 25 } } }), dependencies: envelope.dependencies });
+    assert.equal(unknown.status, 409);
+    assert.equal(unknown.body.message, 'Box memory envelope unknown');
+    assert.equal(unknown.body.fix, 'Check the Box memory envelope with ploinky limits status, then retry.');
+    assert.equal(readStoreSnapshot({ paths: f.paths, identity: f.identity }).agents.size, 0);
+});
+
+test('R.unified-share-get carries the cooperative per-kind payload and the appended help sentence', async (t) => {
+    const f = fixture(t);
+    const u = unifiedGpuFixture(t, f);
+    const result = await request(f, { dependencies: { getContext: u.dependencies.getContext } });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.gpu.deviceMemoryBytes, null);
+    assert.equal(result.body.gpu.unifiedMemory.enforcement, 'cooperative');
+    assert.deepEqual(result.body.gpu.unifiedMemory.allocationKinds.map((entry) => entry.kind), ['device', 'managed', 'pinned-host', 'pageable']);
+    assert.deepEqual(result.body.help.gpu, HELP_FOR_ROUTES.gpu);
+});

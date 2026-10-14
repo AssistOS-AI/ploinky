@@ -37,6 +37,7 @@ export const HARDWARE_HELP = Object.freeze({
         'A RAM cgroup limit does not cap dedicated GPU memory.',
         'Only the host operator may choose EXCLUSIVE_PROCESS. It affects other CUDA users and workspaces. Ploinky never changes compute mode.',
         'On unified-memory NVIDIA GPUs (GB10 / DGX Spark) a RAM limit does not cap the GPU device memory (cudaMalloc) an agent allocates, such as llama.cpp\'s model buffers; only the agent\'s own admission check keeps that memory within the budget, and an overrun takes memory from the whole host, which has no separate GPU memory. Managed, pinned-host and ATS allocations are charged to the RAM limit (measured on driver 580.178.04).',
+        'On the qualified GB10 (driver 580.178.04) a GPU memory share is a best-effort, per-CUDA-process MPS limit on cudaMalloc and managed memory, measured at a 1 GiB limit; managed memory also counts against the RAM limit, and pinned-host and ATS memory count only against the RAM limit.',
     ],
 });
 
@@ -51,15 +52,21 @@ export function hasHardwareBearer(req) {
 }
 
 
-function defaultContext({ refreshBackend = false } = {}) {
-    if (!isInsideBox()) fail('not_in_box', 'Hardware administration requires this workspace\'s Ploinky Box.', 409);
-    const marker = readBoxHardwareMarker();
-    const context = readBoxHardwareContext({ refreshBackend });
+// The route context: the Box hardware context plus the live GPU status (built from the Box envelope) and the store paths.
+// The collaborators are seams so the wiring is testable; the defaults are the production readers.
+export function readDefaultHardwareContext({ refreshBackend = false } = {}, {
+    inBox = isInsideBox, readMarker = readBoxHardwareMarker, readContext = readBoxHardwareContext, readMps = readMpsStatus, storePaths = hardwareStorePaths,
+} = {}) {
+    if (!inBox()) fail('not_in_box', 'Hardware administration requires this workspace\'s Ploinky Box.', 409);
+    const marker = readMarker();
+    const context = readContext({ refreshBackend });
     if (context.gate !== 'on') return { ...context, identity: null, paths: null };
     if (!marker.valid) fail('store_unreadable', 'The hardware wiring marker cannot be read safely.', 503);
     const identity = { instance: marker.marker.instance, pathHash: marker.marker.pathHash, workspaceRoot: marker.marker.workspaceRoot };
-    return { ...context, gpu: readMpsStatus({ workspaceRoot: identity.workspaceRoot }), identity, paths: hardwareStorePaths({ identity, context: 'box' }) };
+    return { ...context, gpu: readMps({ workspaceRoot: identity.workspaceRoot, envelope: context.envelope }), identity, paths: storePaths({ identity, context: 'box' }) };
 }
+
+function defaultContext(options) { return readDefaultHardwareContext(options); }
 
 function installedAgents() {
     return collectAgentsSummary({ includeInactive: true }).flatMap((repo) => (repo.agents || []).map((agent) => ({ ref: `${agent.repo}/${agent.name}`, manifestPath: agent.manifestPath })));
@@ -226,7 +233,7 @@ export function hardwareHttpError(error) {
     if (hardwareOutcome) return { status: hardwareOutcome.state === 'blocked' ? 424 : 422, body: { ok: false, error: hardwareOutcome.code, message: hardwareOutcome.state === 'blocked' ? hardwareOutcome.rootCause.reason : hardwareOutcome.reason, fix: hardwareOutcome.rootCause.fix, hardwareOutcome } };
     const allowed = new Set(['not_in_box', 'invalid_json', 'invalid_limits', 'unknown_action', 'unknown_agent', 'unknown_container', 'revision_conflict', 'identity_changed', 'identity_unrepresentable', 'store_busy', 'hardware_limits_transition', 'apply_in_progress', 'apply_timeout', 'hardware_cleanup_failed', 'apply_recovery_required', 'hardware_limits_off', 'controller_unavailable', 'gpu_sharing_unavailable', 'image_preparation_required', 'exceeds_envelope', 'store_unreadable', 'audit_pending']);
     const code = allowed.has(error?.code) ? error.code : 'store_unreadable';
-    return { status: Number.isInteger(error?.status) ? error.status : 503, body: { ok: false, error: code, message: allowed.has(error?.code) ? String(error.message).slice(0, 2048) : 'Hardware limits are unavailable. Inspect host hardware status.', ...(error?.committed === true ? { committed: true, token: error.token } : {}) } };
+    return { status: Number.isInteger(error?.status) ? error.status : 503, body: { ok: false, error: code, message: allowed.has(error?.code) ? String(error.message).slice(0, 2048) : 'Hardware limits are unavailable. Inspect host hardware status.', ...(code === 'gpu_sharing_unavailable' && typeof error?.fix === 'string' && error.fix ? { fix: error.fix.slice(0, 2048) } : {}), ...(error?.committed === true ? { committed: true, token: error.token } : {}) } };
 }
 
 function readBody(req) {

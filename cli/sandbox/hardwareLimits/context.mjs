@@ -48,6 +48,7 @@ export function readBoxHardwareContext({
     query = defaultQuery,
     now = () => Date.now(),
     refreshBackend = false,
+    readMps = readMpsStatus,
 } = {}) {
     const marker = readBoxHardwareMarker({ markerPath, fsApi });
     if (!marker.present) {
@@ -101,7 +102,7 @@ export function readBoxHardwareContext({
         storeDetail: snapshot.status === 'valid' ? '' : String(snapshot.diagnostic || ''),
         storeToken: snapshot.token || null,
         overrides: snapshot.agents,
-        ...([...snapshot.agents?.values() || []].some((entry) => entry.gpu) ? { gpu: readMpsStatus({ workspaceRoot: identity.workspaceRoot }) } : {}),
+        ...([...snapshot.agents?.values() || []].some((entry) => entry.gpu) ? { gpu: readMps({ workspaceRoot: identity.workspaceRoot, envelope: envelope.unreadable ? null : envelope }) } : {}),
         envelope: envelope.unreadable ? null : envelope,
         envelopeProblem: envelope.unreadable ? envelope.reason : null,
     };

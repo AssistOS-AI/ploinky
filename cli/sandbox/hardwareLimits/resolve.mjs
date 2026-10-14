@@ -16,12 +16,14 @@ export const LIMITS_HASH_LABEL = 'ploinky.limitshash';
 const SIZE_UNITS = { '': 1, b: 1, k: 1024, m: MIB, g: 1024 * MIB, t: 1024 * 1024 * MIB };
 
 export class LimitResolutionError extends Error {
-    constructor(message, { code = 'invalid_limits', field = null, status = 422 } = {}) {
+    constructor(message, { code = 'invalid_limits', field = null, status = 422, fix } = {}) {
         super(message);
         this.name = 'LimitResolutionError';
         this.code = code;
         this.field = field;
         this.status = status;
+        // The remedy of the cause, when the cause carried one (a transient GPU status failure).
+        if (typeof fix === 'string' && fix) this.fix = fix;
     }
 }
 
@@ -161,10 +163,13 @@ export function resolveEffectiveLimits({ declared = {}, override = null, envelop
 // unknown memory model), it is refused, never ignored (U4).
 export function resolveStoredGpuShare(policy, gpu, ref) {
     try {
-        if (!gpu?.eligible || !gpu.grant?.agents?.includes(ref) || gpu.grant?.denied?.includes(ref)) throw new MpsError(gpu?.reason || 'This agent has no active, qualified Box GPU grant.');
-        return resolveMpsShare(policy, gpu.facts, { grant: gpu.grant, ...(gpu.fsApi ? { fsApi: gpu.fsApi } : {}) });
+        // A status that is itself not eligible keeps its own remedy (fix); a missing or revoked grant has none.
+        if (!gpu?.eligible || !gpu.grant?.agents?.includes(ref) || gpu.grant?.denied?.includes(ref)) throw new MpsError(gpu?.reason || 'This agent has no active, qualified Box GPU grant.', 'gpu_sharing_unavailable', { fix: gpu && gpu.eligible === false ? gpu.fix : undefined });
+        // A share on the qualified unified GPU is a percentage of the pool the status was built from (the Box envelope).
+        const poolMiB = gpu.shareBasis?.kind === 'unified-pool' ? gpu.shareBasis.bytes / MIB : undefined;
+        return resolveMpsShare(policy, gpu.facts, { grant: gpu.grant, ...(gpu.fsApi ? { fsApi: gpu.fsApi } : {}), ...(poolMiB === undefined ? {} : { poolMiB }) });
     } catch (error) {
-        throw new LimitResolutionError(error.message, { code: 'gpu_sharing_unavailable', field: 'gpu', status: 409 });
+        throw new LimitResolutionError(error.message, { code: 'gpu_sharing_unavailable', field: 'gpu', status: 409, fix: error.fix });
     }
 }
 
@@ -219,13 +224,14 @@ export function resolveStoredOverride(entry, envelope, { ref = 'REPO/AGENT', gpu
         // Every stored field replaces its declared value, so the refusal lists
         // the stored values (never a manifest value the entry overrides).
         const requested = storedRequestedLimits(entry);
-        if (error.code === 'gpu_sharing_unavailable' && entry.gpu !== undefined && (gpu?.memoryModel === 'unified' || gpu?.memoryModel === 'unknown')) {
-            // Plan §9.3: the exact unified/unknown memory-model refusal.
+        if (error.code === 'gpu_sharing_unavailable' && entry.gpu !== undefined && gpu?.hardwareSupport === 'unsupported') {
+            // Plan §9.3: the exact unified/unknown memory-model refusal, or the driver refusal of a qualified GB10.
+            // Only the definite refusal carries the marker; a transient status failure keeps its own reason and fix.
             return Object.freeze({
                 policy: null,
                 problem: Object.freeze({
                     reasonCode: 'gpu_sharing_unavailable',
-                    reason: unsupportedGpuMemoryModelReason(gpu.name),
+                    reason: gpu.unsupportedReason ?? unsupportedGpuMemoryModelReason(gpu.name),
                     fix: UNSUPPORTED_GPU_MEMORY_MODEL_FIX,
                     requested,
                 }),
@@ -237,7 +243,7 @@ export function resolveStoredOverride(entry, envelope, { ref = 'REPO/AGENT', gpu
                 problem: Object.freeze({
                     reasonCode: 'gpu_sharing_unavailable',
                     reason: String(error.message).slice(0, 1024),
-                    fix: `Clear the GPU share in Settings, or run ploinky limits clear --agent ${ref} on the host `
+                    fix: error.fix ?? `Clear the GPU share in Settings, or run ploinky limits clear --agent ${ref} on the host `
                         + '(this also clears its CPU/RAM override). CPU/RAM controls remain separately available.',
                     requested,
                 }),

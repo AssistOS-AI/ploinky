@@ -3,7 +3,11 @@ import { managedImageUserNamespace } from '../routerAuthorityAttestation.js';
 import { revalidateMpsTools } from '../../../ploinky-box/lib/mpsTools.mjs';
 
 export class MpsError extends Error {
-    constructor(message, code = 'gpu_sharing_unavailable') { super(message); this.name = 'MpsError'; this.code = code; this.status = 409; }
+    // `fix` is the operator remedy of the refusal; it is carried only when it is a non-empty string.
+    constructor(message, code = 'gpu_sharing_unavailable', { fix } = {}) {
+        super(message); this.name = 'MpsError'; this.code = code; this.status = 409;
+        if (typeof fix === 'string' && fix) this.fix = fix;
+    }
 }
 
 export function classifyGpuMemoryModel(name) {
@@ -11,6 +15,46 @@ export function classifyGpuMemoryModel(name) {
     if (/\b(?:GB10|GH200|GB200|Grace\s+(?:Hopper|Blackwell)|Jetson|Tegra|Orin)\b/i.test(text)) return 'unified';
     if (/\b(?:GeForce\s+(?:RTX\s+[2345]\d{3}|GTX\s+\d{3,4})|(?:NVIDIA\s+)?RTX\s+(?:[2345]\d{3}|[AB]?\d{3,4}|PRO\s+\d{3,4})|(?:Tesla\s+)?[AVHT]\d{2,3}|L[24]\d[S]?|Quadro\s+[RP]\d{3,4}|B[12]00)\b/i.test(text)) return 'dedicated';
     return 'unknown';
+}
+
+// The one measured unified-memory point a GPU memory share is qualified for: PCI device-id plus the exact driver
+// (Phase 0 run gb10p-20261014151531-013eff5b). local-llm keeps its own table; both are pinned by the same literal vectors.
+export const UNIFIED_SHARE_QUALIFIED = Object.freeze([
+    Object.freeze({ pciDeviceId: '0x2E1210DE', driverVersion: '580.178.04', evidenceRun: 'gb10p-20261014151531-013eff5b' }),
+]);
+
+// What each allocation kind is charged to on the qualified tuple (Phase 0, Observed). The single source for the API
+// payload, the panel and the docs; published only when the tuple matches. `ramLimit`: the kernel RAM limit charges the
+// kind. `gpuShare`: the MPS pinned-memory limit caps it, per CUDA process.
+const kindEntry = (kind, apis, ramLimit, gpuShare) => Object.freeze({ kind, apis: Object.freeze(apis), ramLimit, gpuShare });
+export const UNIFIED_ALLOCATION_KINDS = Object.freeze([
+    kindEntry('device', ['cudaMalloc', 'cuMemAlloc'], false, true),
+    kindEntry('managed', ['cudaMallocManaged'], true, true),
+    kindEntry('pinned-host', ['cudaHostAlloc', 'cuMemHostAlloc'], true, false),
+    kindEntry('pageable', ['malloc'], true, false),
+]);
+
+const normalizedPci = (value) => (typeof value === 'string' && /^0x[0-9a-f]{8}$/i.test(value.trim()) ? `0x${value.trim().slice(2).toUpperCase()}` : null);
+
+/** The UNIFIED_SHARE_QUALIFIED entry for the exact PCI id (case-insensitive) and the exact driver (trimmed), or null. */
+export function unifiedShareQualification({ pciDeviceId = null, driverVersion = null } = {}) {
+    const pci = normalizedPci(pciDeviceId);
+    const driver = typeof driverVersion === 'string' ? driverVersion.trim() : null;
+    if (pci === null || driver === null) return null;
+    return UNIFIED_SHARE_QUALIFIED.find((entry) => entry.pciDeviceId === pci && entry.driverVersion === driver) ?? null;
+}
+
+/** True only for a tuple in UNIFIED_SHARE_QUALIFIED: the exact PCI id and the exact driver. */
+export function unifiedShareQualified(facts) {
+    return unifiedShareQualification(facts) !== null;
+}
+
+const QUALIFIED_PCI_IDS = Object.freeze(UNIFIED_SHARE_QUALIFIED.map((entry) => entry.pciDeviceId));
+const QUALIFIED_DRIVERS = UNIFIED_SHARE_QUALIFIED.map((entry) => entry.driverVersion).join(', ');
+
+// I3: the refusal for a qualified GB10 whose driver is not the qualified one. `driver` is bounded digits and dots.
+export function unqualifiedDriverReason(driver) {
+    return `GPU sharing is not qualified on this GB10 driver: it is qualified only for NVIDIA driver ${QUALIFIED_DRIVERS}, and this host runs ${driver}.`;
 }
 
 // The GB10 (DGX Spark) PCI device-id, as nvidia-smi prints pci.device_id (device id then vendor id). A match is a
@@ -51,6 +95,22 @@ export function parseMpsGpuObservation(text, deviceText) {
     // deviceText is the optional second query's output; undefined means it was not asked (facts stay as before).
     const device = deviceText === undefined ? null : parseMpsDeviceFacts(deviceText);
     const memoryModel = classifyGpuFacts({ name: fields[2], ...(device || {}), memoryNumeric: /^[1-9]\d*$/.test(fields[3]) ? Number(fields[3]) : null });
+    if (memoryModel === 'unified' && device && QUALIFIED_PCI_IDS.includes(device.pciDeviceId) && /^\d{1,9}(?:\.\d{1,9}){1,4}$/.test(fields[4])) {
+        // A PCI-identified GB10 with a well-formed driver: qualified for shares on the measured driver, a typed
+        // driver refusal on any other. memory.total may be [N/A] here, so it is not read.
+        if (!unifiedShareQualified({ pciDeviceId: device.pciDeviceId, driverVersion: fields[4] })) {
+            const error = new MpsError(unqualifiedDriverReason(fields[4]));
+            error.memoryModel = 'unified';
+            error.gpuName = fields[2];
+            error.pciDeviceId = device.pciDeviceId;
+            error.addressingMode = device.addressingMode;
+            error.driverVersion = fields[4];
+            error.unsupportedReason = error.message;
+            throw error;
+        }
+        if (!/^GPU-[a-f0-9-]{36}$/i.test(fields[1])) throw new MpsError('GPU identity or dedicated memory is unknown');
+        return Object.freeze({ index: 0, uuid: fields[1], name: fields[2], memoryMiB: null, driverVersion: fields[4], memoryModel, ...device, unifiedShareQualified: true });
+    }
     if (memoryModel !== 'dedicated') {
         const error = new MpsError(memoryModel === 'unified' ? 'Unified GPUs cannot use configured MPS shares' : 'The GPU memory model is unknown');
         error.memoryModel = memoryModel;
@@ -114,11 +174,18 @@ export function inspectMpsImage({ image, networkMode }, { inspectImage }) {
     return assertMpsImageEligibility({ imageId: record?.Id, imageUser: record?.Config?.User, networkMode });
 }
 
-export function resolveMpsShare(policy, gpu, { grant, fsApi } = {}) {
+export function resolveMpsShare(policy, gpu, { grant, fsApi, poolMiB } = {}) {
     if (!grant?.valid || grant.state !== 'active' || !grant.mps) throw new MpsError(grant?.mpsProblem || 'Both host MPS tools and active GPU access are required');
     revalidateMpsTools(grant.mps, { ...(fsApi ? { fsApi } : {}), mounted: true });
     const { smPercent, vramPercent } = policy || {};
     if (![smPercent, vramPercent].every((value) => Number.isInteger(value) && value >= 1 && value <= 100)) throw new MpsError('GPU share percentages must be integers in 1..100');
+    if (gpu?.memoryModel === 'unified' && gpu.unifiedShareQualified === true && unifiedShareQualified(gpu)) {
+        // The qualified unified GPU shares the Box memory envelope: the percentage applies to that pool.
+        if (!Number.isSafeInteger(poolMiB) || poolMiB <= 0) throw new MpsError('The GPU memory basis is unknown.');
+        const sharedMiB = Math.floor(vramPercent * poolMiB / 100);
+        if (sharedMiB < 512) throw new MpsError('The GPU memory share is below the 512 MiB minimum');
+        return Object.freeze({ smPercent, vramPercent, vramMiB: sharedMiB, memoryMiB: sharedMiB, memoryBytes: sharedMiB * 1048576, deviceUuid: gpu.uuid, driverVersion: gpu.driverVersion, wiringFingerprint: grant.fingerprint, basis: 'unified-pool' });
+    }
     if (gpu?.memoryModel !== 'dedicated' || !Number.isSafeInteger(gpu.memoryMiB) || gpu.memoryMiB <= 0) throw new MpsError('Dedicated GPU memory cannot be resolved');
     const memoryMiB = Math.floor(vramPercent * gpu.memoryMiB / 100);
     if (memoryMiB < 512) throw new MpsError('The GPU memory share is below the 512 MiB minimum');

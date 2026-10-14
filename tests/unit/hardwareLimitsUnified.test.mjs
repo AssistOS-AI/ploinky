@@ -1,15 +1,23 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
-import { classifyGpuFacts, classifyGpuMemoryModel, observeMpsGpu, parseMpsGpuObservation, resolveMpsShare } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
-import { readMpsStatus } from '../../cli/sandbox/hardwareLimits/mpsStatus.mjs';
+import { MpsError, UNIFIED_ALLOCATION_KINDS, UNIFIED_SHARE_QUALIFIED, classifyGpuFacts, classifyGpuMemoryModel, observeMpsGpu, parseMpsGpuObservation, resolveMpsShare, unifiedShareQualified } from '../../cli/sandbox/hardwareLimits/mpsEligibility.mjs';
+import { inspectMpsTargetEligibility, readMpsStatus } from '../../cli/sandbox/hardwareLimits/mpsStatus.mjs';
+import { mpsClientArgs, mpsClientEnvironment, mpsServerDefaultMemoryMiB, parseMpsMemoryReply } from '../../cli/sandbox/hardwareLimits/mps.mjs';
+import { isDeepStrictEqual } from 'node:util';
+import { planMpsTransition, resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
 import { limitsHash, resolveEffectiveLimits, resolveStoredOverride, resolveStoredGpuShare, AGENT_PLACEMENT } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
-import { HARDWARE_HELP } from '../../cli/server/authHandlers/hardwareLimitsRoutes.mjs';
-import { STORE_SCHEMA, validateStoreDocument, validateAgentEntry } from '../../cli/sandbox/hardwareLimits/store.mjs';
+import { HARDWARE_HELP, hardwareHttpError, qualifyHardwareGpuTarget } from '../../cli/server/authHandlers/hardwareLimitsRoutes.mjs';
+import { STORE_SCHEMA, validateStoreDocument, validateAgentEntry, validateAgentLimits } from '../../cli/sandbox/hardwareLimits/store.mjs';
 
 const UUID = 'GPU-12345678-1234-1234-1234-123456789012';
 const FIX = 'Clear the GPU share. CPU/RAM controls remain separately available.';
 const GB10_PCI = '0x2E1210DE';
+const Q10_SENTENCE = 'On the qualified GB10 (driver 580.178.04) a GPU memory share is a best-effort, per-CUDA-process MPS limit on cudaMalloc and managed memory, measured at a 1 GiB limit; managed memory also counts against the RAM limit, and pinned-host and ATS memory count only against the RAM limit.';
+const driverReason = (driver) => `GPU sharing is not qualified on this GB10 driver: it is qualified only for NVIDIA driver 580.178.04, and this host runs ${driver}.`;
 const Q2_SENTENCE = 'On unified-memory NVIDIA GPUs (GB10 / DGX Spark) a RAM limit does not cap the GPU device memory (cudaMalloc) an agent allocates, such as llama.cpp\'s model buffers; only the agent\'s own admission check keeps that memory within the budget, and an overrun takes memory from the whole host, which has no separate GPU memory. Managed, pinned-host and ATS allocations are charged to the RAM limit (measured on driver 580.178.04).';
 const line = (name, memory = '122570', driver = '580.95.05') => `0, ${UUID}, ${name}, ${memory}, ${driver}`;
 const grant = { valid: true, state: 'active', fingerprint: 'wiring', agents: ['demo/worker'], mps: { control: { source: '/private/tool' } } };
@@ -34,19 +42,30 @@ test('HU.gb10-by-pci', () => {
     assert.equal(status.memoryModel, 'unified');
     assert.equal(status.pciDeviceId, GB10_PCI);
     assert.equal(status.addressingMode, 'ATS');
-    assert.equal(status.reason, reasonFor('NVIDIA DGX Spark'));
+    // Driver 580.95.05 is not the qualified driver: the PCI-identified GB10 gets the driver refusal (I3), not the name text.
+    assert.equal(status.reason, `${driverReason('580.95.05')} ${FIX}`);
     assert.equal(status.code, 'gpu_sharing_unavailable');
+    // Without the PCI id the same name is a different story: unknown, with the unchanged name text.
+    const nameOnly = refusal(() => observeMpsGpu({ query: smi(ok(`${line('NVIDIA DGX Spark', '[N/A]')}\n`), { status: 1, stdout: '' }) }));
+    assert.equal(nameOnly.memoryModel, 'unknown'); assert.equal(nameOnly.reason, reasonFor('NVIDIA DGX Spark'));
     // The PCI id compares case-insensitively.
     assert.equal(classifyGpuFacts({ name: 'x', pciDeviceId: '0x2e1210de' }), 'unified');
 });
 
 test('HU.unified-disclosure-payload', () => {
-    const status = refusal(() => parseMpsGpuObservation(line('NVIDIA GB10'), `${GB10_PCI}, ATS\n`));
+    // A GB10 identified by name alone (no PCI id) keeps the unified text of the Phase 1 refusal.
+    const status = refusal(() => parseMpsGpuObservation(line('NVIDIA GB10')));
     assert.equal(status.memoryModel, 'unified');
     assert.deepEqual(status.unifiedMemory, { ramLimitCoversGpuAllocations: false, gpuMemoryBound: 'admission-only', assurance: 'advisory' });
     assert.equal(status.reason, reasonFor('NVIDIA GB10'));
+    // The PCI-identified GB10 on another driver carries the same disclosure, with the driver text.
+    const byPci = refusal(() => parseMpsGpuObservation(line('NVIDIA GB10'), `${GB10_PCI}, ATS\n`));
+    assert.deepEqual(byPci.unifiedMemory, status.unifiedMemory);
+    assert.equal(byPci.reason, `${driverReason('580.95.05')} ${FIX}`);
     assert.ok(HARDWARE_HELP.gpu.includes(Q2_SENTENCE));
-    assert.equal(HARDWARE_HELP.gpu[HARDWARE_HELP.gpu.length - 1], Q2_SENTENCE);
+    // Phase 2 appends one sentence after the Phase 1 sentence (it does not replace it).
+    assert.equal(HARDWARE_HELP.gpu[HARDWARE_HELP.gpu.length - 2], Q2_SENTENCE);
+    assert.equal(HARDWARE_HELP.gpu[HARDWARE_HELP.gpu.length - 1], Q10_SENTENCE);
     // Only the unified refusal carries the disclosure: unknown and dedicated payloads do not.
     const unknown = refusal(() => parseMpsGpuObservation(line('NVIDIA futuristic 123', '8192'), '0x12345678, Default\n'));
     assert.equal(unknown.memoryModel, 'unknown');
@@ -215,4 +234,350 @@ test('HU.schema-v1-behaviour', () => {
     assert.deepEqual(read.agents.get('demo/worker'), { cpus: 1, memoryPercent: 50, gpu: { smPercent: 25, vramPercent: 25 } });
     assert.equal(JSON.stringify(v1), before);
     assert.deepEqual(validateAgentEntry({ gpu: { smPercent: 25, vramPercent: 25 } }), { gpu: { smPercent: 25, vramPercent: 25 } });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Phase 2 (P2-P): GPU memory shares on the qualified unified GPU (GB10, PCI 0x2E1210DE, driver 580.178.04).
+// ---------------------------------------------------------------------------------------------------------------
+const MIB = 1048576;
+const QUALIFIED_DRIVER = '580.178.04';
+const ENVELOPE_BYTES = 128450985984;
+const qualifiedText = `${line('NVIDIA GB10', '[N/A]', QUALIFIED_DRIVER)}\n`;
+const qualifiedObserve = () => observeMpsGpu({ query: smi(ok(qualifiedText), ok(`${GB10_PCI}, ATS\n`)) });
+const qualifiedStatus = (envelope = { memoryBytes: ENVELOPE_BYTES, cpus: 20 }, extra = {}) => readMpsStatus({ readGrant: () => goldenGrant, observeGpu: qualifiedObserve, readState: () => null, envelope, ...extra });
+const qualifiedFacts = () => parseMpsGpuObservation(qualifiedText.trim(), `${GB10_PCI}, ATS\n`);
+const KINDS_LITERAL = [
+    { kind: 'device', apis: ['cudaMalloc', 'cuMemAlloc'], ramLimit: false, gpuShare: true },
+    { kind: 'managed', apis: ['cudaMallocManaged'], ramLimit: true, gpuShare: true },
+    { kind: 'pinned-host', apis: ['cudaHostAlloc', 'cuMemHostAlloc'], ramLimit: true, gpuShare: false },
+    { kind: 'pageable', apis: ['malloc'], ramLimit: true, gpuShare: false },
+];
+const deepFrozen = (value) => Object.isFrozen(value) && (typeof value !== 'object' || value === null || Object.values(value).every(deepFrozen));
+
+test('HU.qualified-observation', () => {
+    const facts = qualifiedFacts();
+    assert.equal(facts.memoryModel, 'unified');
+    assert.equal(facts.memoryMiB, null);
+    assert.equal(facts.unifiedShareQualified, true);
+    assert.equal(facts.pciDeviceId, GB10_PCI);
+    assert.equal(facts.driverVersion, QUALIFIED_DRIVER);
+    // Through the real two-query observation, the PCI id compares case-insensitively and the driver is trimmed.
+    const viaSmi = observeMpsGpu({ query: smi(ok(`0, ${UUID}, NVIDIA GB10, [N/A],  ${QUALIFIED_DRIVER} \n`), ok('0x2e1210de, ATS\n')) });
+    assert.equal(viaSmi.unifiedShareQualified, true);
+    // The name alone never qualifies: without the PCI id the GB10 is the unchanged unified refusal.
+    const nameOnly = refusal(() => parseMpsGpuObservation(qualifiedText.trim()));
+    assert.equal(nameOnly.reason, reasonFor('NVIDIA GB10')); assert.equal(nameOnly.hardwareSupport, 'unsupported');
+    // A malformed UUID on the qualified tuple is a typed refusal, never a share.
+    const badUuid = refusal(() => parseMpsGpuObservation('0, GPU-nope, NVIDIA GB10, [N/A], 580.178.04', `${GB10_PCI}, ATS\n`));
+    assert.match(badUuid.reason, /GPU identity or dedicated memory is unknown/);
+    assert.equal('unifiedShareQualified' in badUuid, false);
+});
+
+test('HU.unqualified-driver (A-P-11)', () => {
+    for (const driver of ['580.159.03', '580.95.05', '581.0.1', '580.178.040']) {
+        const status = refusal(() => parseMpsGpuObservation(line('NVIDIA GB10', '[N/A]', driver), `${GB10_PCI}, ATS\n`));
+        assert.equal(status.reason, `${driverReason(driver)} ${FIX}`, driver);
+        assert.equal(status.unsupportedReason, driverReason(driver));
+        assert.equal(status.code, 'gpu_sharing_unavailable');
+        assert.equal(status.hardwareSupport, 'unsupported');
+        assert.equal(status.memoryModel, 'unified');
+        assert.equal(status.driverVersion, driver);
+        assert.equal(status.pciDeviceId, GB10_PCI);
+        assert.deepEqual(status.unifiedMemory, { ramLimitCoversGpuAllocations: false, gpuMemoryBound: 'admission-only', assurance: 'advisory' });
+        assert.match(status.reason, /not qualified/);
+        // Admission (a stored share) and the store (a Save) refuse with the driver text.
+        const resolved = resolveStoredOverride({ gpu: { smPercent: 25, vramPercent: 25 } }, { cpus: 8, memoryBytes: 8 * 1024 ** 3 }, { ref: 'demo/worker', gpu: status });
+        assert.equal(resolved.problem.reason, driverReason(driver));
+        assert.equal(resolved.problem.fix, FIX);
+        assert.throws(() => validateAgentLimits({ agentRef: 'demo/worker', limits: { gpu: { smPercent: 25, vramPercent: 25 } }, installedRefs: new Set(['demo/worker']), capabilities: { gate: 'on', gpu: status } }),
+            (error) => error.code === 'gpu_sharing_unavailable' && error.message === `${driverReason(driver)} ${FIX}`);
+    }
+    // A malformed driver string is not echoed: the unchanged name-based refusal.
+    for (const driver of ['580.178.04-evil', '5801780', '580.178.04\u0007']) {
+        const status = refusal(() => parseMpsGpuObservation(`0, ${UUID}, NVIDIA GB10, [N/A], ${driver}`, `${GB10_PCI}, ATS\n`));
+        assert.equal(status.reason, reasonFor('NVIDIA GB10'), JSON.stringify(driver));
+    }
+    // Unified GPUs other than the qualified tuple keep their existing refusal text, qualified driver or not.
+    for (const [name, pci] of [['NVIDIA GH200 480GB', '0x233010DE'], ['NVIDIA Jetson AGX Orin', null], ['NVIDIA GB200', null], ['NVIDIA GB10', null]]) {
+        const status = refusal(() => parseMpsGpuObservation(line(name, '97871', QUALIFIED_DRIVER), pci ? `${pci}, ATS\n` : undefined));
+        assert.equal(status.reason, reasonFor(name), name);
+        assert.equal(status.hardwareSupport, 'unsupported', name);
+        assert.equal('unsupportedReason' in status, false, name);
+    }
+});
+
+test('HU.tuple-table (A-P-19)', () => {
+    assert.deepEqual(UNIFIED_SHARE_QUALIFIED, [{ pciDeviceId: '0x2E1210DE', driverVersion: '580.178.04', evidenceRun: 'gb10p-20261014151531-013eff5b' }]);
+    assert.ok(deepFrozen(UNIFIED_SHARE_QUALIFIED));
+    assert.deepEqual(UNIFIED_ALLOCATION_KINDS, KINDS_LITERAL);
+    assert.ok(deepFrozen(UNIFIED_ALLOCATION_KINDS));
+    for (const facts of [{ pciDeviceId: '0x2E1210DE', driverVersion: '580.178.04' }, { pciDeviceId: '0x2e1210de', driverVersion: ' 580.178.04 ' }]) assert.equal(unifiedShareQualified(facts), true, JSON.stringify(facts));
+    for (const facts of [
+        { pciDeviceId: '0x2E1210DE', driverVersion: '580.159.03' }, { pciDeviceId: '0x2E1210DE', driverVersion: '580.95.05' },
+        { pciDeviceId: '0x2E1210DE', driverVersion: '580.178.04.1' }, { pciDeviceId: '0x2E1210DE', driverVersion: '580' }, { pciDeviceId: '0x2E1210DE' },
+        { pciDeviceId: '0x233010DE', driverVersion: '580.178.04' }, { pciDeviceId: '0x252010DE', driverVersion: '580.178.04' }, { pciDeviceId: null, driverVersion: '580.178.04' }, {}, undefined,
+    ]) assert.equal(unifiedShareQualified(facts), false, JSON.stringify(facts));
+});
+
+test('HU.unified-eligible-payload (A-P-16)', () => {
+    const status = qualifiedStatus();
+    assert.equal(status.eligible, true); assert.equal(status.mode, 'mps-shared'); assert.equal(status.assurance, 'best-effort');
+    assert.equal(status.memoryModel, 'unified');
+    assert.equal(status.deviceMemoryBytes, null);
+    assert.deepEqual(status.shareBasis, { kind: 'unified-pool', bytes: 122500 * MIB, source: 'box-envelope' });
+    assert.equal(status.pciDeviceId, GB10_PCI); assert.equal(status.addressingMode, 'ATS'); assert.equal(status.driverVersion, QUALIFIED_DRIVER);
+    assert.deepEqual(status.unifiedMemory, {
+        ramLimitCoversGpuAllocations: false, gpuMemoryBound: 'mps-per-process', assurance: 'best-effort', enforcement: 'cooperative',
+        qualification: { pciDeviceId: GB10_PCI, driverVersion: QUALIFIED_DRIVER, evidenceRun: 'gb10p-20261014151531-013eff5b' }, allocationKinds: KINDS_LITERAL,
+    });
+    assert.equal('hardwareSupport' in status, false);
+    assert.equal(status.daemonStatus, 'stopped');
+    // The payload serializes (no private fields) and the private facts stay non-enumerable.
+    assert.equal(JSON.parse(JSON.stringify(status)).deviceMemoryBytes, null);
+    assert.deepEqual(Object.getOwnPropertyNames(status).filter((key) => !Object.keys(status).includes(key)), ['facts', 'grant']);
+    // The share basis follows the envelope, rounded down to whole MiB.
+    assert.equal(qualifiedStatus({ memoryBytes: 40 * 1024 * MIB + 12345 }).shareBasis.bytes, 40 * 1024 * MIB);
+    // A dedicated payload never carries unified keys (the A-P-6 goldens pin the rest).
+    const dedicated = readMpsStatus({ readGrant: () => goldenGrant, observeGpu: () => observeMpsGpu({ query: smi(ok(`${dedicatedLine}\n`), ok('0x252010DE, None\n')) }), readState: () => null, envelope: { memoryBytes: ENVELOPE_BYTES } });
+    for (const key of ['shareBasis', 'unifiedMemory', 'pciDeviceId', 'addressingMode', 'hardwareSupport']) assert.equal(key in dedicated, false, key);
+    assert.equal(dedicated.deviceMemoryBytes, 6144 * MIB);
+});
+
+test('HU.qualified-null-envelope (A-P-15b, daemon status survives)', () => {
+    for (const envelope of [null, {}, { memoryBytes: 0 }, { memoryBytes: 'x' }]) {
+        const status = qualifiedStatus(envelope);
+        assert.equal(status.eligible, false);
+        assert.equal(status.memoryModel, 'unified');
+        assert.equal(status.reason, 'Box memory envelope unknown');
+        assert.equal(status.fix, 'Check the Box memory envelope with ploinky limits status, then retry.');
+        assert.equal(status.code, 'gpu_sharing_unavailable');
+        assert.equal('hardwareSupport' in status, false);
+        assert.equal('shareBasis' in status, false);
+    }
+    // The container monitor and the reconcile verification call readMpsStatus() without an envelope and read only the
+    // daemon generation: it must still be observed on the qualified GPU.
+    const ready = { status: 'ready', daemonGeneration: 'daemon1', configurationGeneration: 'config1', serverDefault: { smPercent: 50, memoryMiB: 31744, shareMemoryMiB: 30625, deviceUuid: UUID, driverVersion: QUALIFIED_DRIVER, wiringFingerprint: 'wiring' } };
+    const backend = { observe: () => ({ state: 'owned' }), verify: () => true };
+    const noEnvelope = readMpsStatus({ readGrant: () => goldenGrant, observeGpu: qualifiedObserve, readState: () => ready, backend });
+    assert.equal(noEnvelope.eligible, false);
+    assert.equal(noEnvelope.daemonStatus, 'ready');
+    assert.equal(noEnvelope.mpsGeneration, 'daemon1:config1');
+    assert.equal(noEnvelope.reason, 'Box memory envelope unknown');
+    const withEnvelope = readMpsStatus({ readGrant: () => goldenGrant, observeGpu: qualifiedObserve, readState: () => ready, backend, envelope: { memoryBytes: ENVELOPE_BYTES } });
+    assert.equal(withEnvelope.mpsGeneration, 'daemon1:config1');
+    assert.equal(withEnvelope.serverDefault.shareMemoryMiB, 30625);
+});
+
+test('HU.unified-share-bytes (A-P-8, A-P-9, A-P-10, A-P-10b)', () => {
+    const status = qualifiedStatus();
+    const policy = { smPercent: 25, vramPercent: 25 };
+    const share = resolveMpsShare(policy, status.facts, { grant: status.grant, fsApi, poolMiB: status.shareBasis.bytes / MIB });
+    assert.equal(share.memoryMiB, 30625); assert.equal(share.memoryBytes, 30625 * MIB); assert.equal(share.vramMiB, 30625);
+    assert.equal(share.basis, 'unified-pool');
+    assert.equal(share.deviceUuid, UUID); assert.equal(share.driverVersion, QUALIFIED_DRIVER); assert.equal(share.wiringFingerprint, 'wiring');
+    // The store's Save-time bytes are the resolved share's bytes.
+    const saved = validateAgentLimits({ agentRef: 'demo/worker', limits: { gpu: policy }, installedRefs: new Set(['demo/worker']), capabilities: { gate: 'on', gpu: status }, envelope: { cpus: 8, memoryBytes: ENVELOPE_BYTES } });
+    assert.equal(saved.gpuBytes, share.memoryBytes);
+    const env = mpsClientEnvironment(share, `/run/ploinky/mps/pipe-${'a'.repeat(32)}`);
+    assert.equal(env.CUDA_MPS_PINNED_DEVICE_MEM_LIMIT, '0=30625M');
+    assert.equal(env.CUDA_MPS_ACTIVE_THREAD_PERCENTAGE, '25');
+    assert.deepEqual(Object.keys(env).sort(), ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT', 'CUDA_MPS_PIPE_DIRECTORY']);
+    // A-P-10: a 40 GiB envelope makes 1 % smaller than the 512 MiB minimum, both when resolving and when saving.
+    const small = qualifiedStatus({ memoryBytes: 40 * 1024 * MIB });
+    assert.throws(() => resolveMpsShare({ smPercent: 50, vramPercent: 1 }, small.facts, { grant: small.grant, fsApi, poolMiB: small.shareBasis.bytes / MIB }), (error) => error instanceof MpsError && /below the 512 MiB minimum/.test(error.message));
+    assert.throws(() => validateAgentLimits({ agentRef: 'demo/worker', limits: { gpu: { smPercent: 50, vramPercent: 1 } }, installedRefs: new Set(['demo/worker']), capabilities: { gate: 'on', gpu: small } }),
+        (error) => error.code === 'exceeds_envelope' && /below the 512 MiB minimum/.test(error.message));
+    // A-P-10b: on the real envelope 1 % is accepted (1225 MiB).
+    const one = resolveMpsShare({ smPercent: 50, vramPercent: 1 }, status.facts, { grant: status.grant, fsApi, poolMiB: status.shareBasis.bytes / MIB });
+    assert.equal(one.memoryBytes, 1225 * MIB);
+    assert.equal(validateAgentLimits({ agentRef: 'demo/worker', limits: { gpu: { smPercent: 50, vramPercent: 1 } }, installedRefs: new Set(['demo/worker']), capabilities: { gate: 'on', gpu: status } }).gpuBytes, 1225 * MIB);
+    // The pool must be a known positive integer.
+    for (const poolMiB of [undefined, 0, -1, 1.5, NaN]) assert.throws(() => resolveMpsShare(policy, status.facts, { grant: status.grant, fsApi, poolMiB }), { code: 'gpu_sharing_unavailable', message: 'The GPU memory basis is unknown.' });
+    // A-P-18: the daemon default of one 30625 MiB share is 30720 MiB, and its `30G` readback parses to that.
+    assert.equal(mpsServerDefaultMemoryMiB(30625), 30720);
+    assert.equal(resolveMpsServerDefault([{ share }]).memoryMiB, 30720);
+    assert.equal(parseMpsMemoryReply('30G'), 30720 * MIB);
+});
+
+test('HU.percent-check-precedes-the-model-branch (R6-4)', () => {
+    const status = qualifiedStatus();
+    const pool = status.shareBasis.bytes / MIB;
+    for (const vramPercent of [0, 101, 1.5, '25', null]) {
+        assert.throws(() => resolveMpsShare({ smPercent: 50, vramPercent }, status.facts, { grant: status.grant, fsApi, poolMiB: pool }),
+            (error) => error instanceof MpsError && error.code === 'gpu_sharing_unavailable' && error.status === 409 && /integers in 1\.\.100/.test(error.message), String(vramPercent));
+        // Even with an unknown pool the percentage message wins.
+        assert.throws(() => resolveMpsShare({ smPercent: 50, vramPercent }, status.facts, { grant: status.grant, fsApi }), /integers in 1\.\.100/);
+    }
+    // Unified GPUs without the qualification flag still cannot resolve a share.
+    assert.throws(() => resolveMpsShare({ smPercent: 50, vramPercent: 25 }, { ...status.facts, unifiedShareQualified: false }, { grant: status.grant, fsApi, poolMiB: pool }), /Dedicated GPU memory cannot be resolved/);
+    assert.throws(() => resolveMpsShare({ smPercent: 50, vramPercent: 25 }, { ...status.facts, driverVersion: '580.159.03' }, { grant: status.grant, fsApi, poolMiB: pool }), /Dedicated GPU memory cannot be resolved/);
+});
+
+test('HU.mps-error-fix (R6-1)', () => {
+    assert.equal('fix' in new MpsError('m'), false);
+    assert.equal('fix' in new MpsError('m', 'image_preparation_required'), false);
+    assert.equal('fix' in new MpsError('m', 'gpu_sharing_unavailable', {}), false);
+    assert.equal('fix' in new MpsError('m', 'gpu_sharing_unavailable', { fix: '' }), false);
+    assert.equal('fix' in new MpsError('m', 'gpu_sharing_unavailable', { fix: 7 }), false);
+    const error = new MpsError('m', undefined, { fix: 'do this' });
+    assert.equal(error.fix, 'do this'); assert.equal(error.code, 'gpu_sharing_unavailable'); assert.equal(error.status, 409);
+    const two = new MpsError('m');
+    assert.equal(two.code, 'gpu_sharing_unavailable'); assert.equal(two.status, 409); assert.equal(two.name, 'MpsError');
+});
+
+// The transient-failure statuses on a qualified GB10: observation succeeds, then daemon ownership fails (a), and the envelope is null (b).
+const ownershipFailure = () => qualifiedStatus(undefined, { readState: () => ({ status: 'ready', daemonGeneration: 'd', configurationGeneration: 'c', serverDefault: {} }), backend: { observe: () => { throw new Error('daemon ownership is unknown'); }, verify: () => true } });
+const GENERIC_FIX = 'Inspect GPU wiring and MPS tools, then retry.';
+const ENVELOPE_FIX = 'Check the Box memory envelope with ploinky limits status, then retry.';
+const ENVELOPE = { cpus: 8, memoryBytes: ENVELOPE_BYTES };
+
+test('HU.transient-not-unsupported (A-P-15)', () => {
+    const stored = { gpu: { smPercent: 25, vramPercent: 25 } };
+    const cases = [['ownership', ownershipFailure(), /^GPU sharing facts or daemon ownership could not be verified/, GENERIC_FIX], ['null envelope', qualifiedStatus(null), /^Box memory envelope unknown$/, ENVELOPE_FIX]];
+    for (const [label, status, reason, fix] of cases) {
+        assert.equal(status.eligible, false, label);
+        assert.equal(status.fix, fix, label);
+        assert.equal('hardwareSupport' in status, false, label);
+        // Admission: the status's own reason and remedy, never the §9.3 text or the "Clear the GPU share in Settings" fix.
+        const problem = resolveStoredOverride(stored, ENVELOPE, { ref: 'demo/worker', gpu: status }).problem;
+        assert.match(problem.reason, reason, label); assert.equal(problem.fix, fix, label);
+        assert.doesNotMatch(problem.reason, /unsupported on this unified/, label);
+        // The store (Save) path: the same reason, with the remedy carried on the error and in the HTTP body.
+        let caught;
+        try { validateAgentLimits({ agentRef: 'demo/worker', limits: stored, installedRefs: new Set(['demo/worker']), capabilities: { gate: 'on', gpu: status } }); } catch (error) { caught = error; }
+        assert.ok(caught, label);
+        assert.equal(caught.code, 'gpu_sharing_unavailable', label); assert.equal(caught.message, status.reason, label); assert.equal(caught.fix, fix, label);
+        assert.doesNotMatch(caught.message, /unsupported on this unified/, label);
+        const body = hardwareHttpError(caught).body;
+        assert.equal(body.error, 'gpu_sharing_unavailable'); assert.equal(body.message, status.reason); assert.equal(body.fix, fix);
+    }
+    // A missing grant has no status fix and keeps the "Clear the GPU share" remedy (as before).
+    const ready = qualifiedStatus();
+    const missing = resolveStoredOverride(stored, ENVELOPE, { ref: 'demo/other', gpu: ready }).problem;
+    assert.equal(missing.reason, 'This agent has no active, qualified Box GPU grant.');
+    assert.match(missing.fix, /^Clear the GPU share in Settings, or run ploinky limits clear --agent demo\/other on the host/);
+    // A definite refusal keeps the §9.3 pair.
+    const gh200 = refusal(() => parseMpsGpuObservation(line('NVIDIA GH200 480GB', '97871', QUALIFIED_DRIVER), '0x233010DE, ATS\n'));
+    const refused = resolveStoredOverride(stored, ENVELOPE, { ref: 'demo/worker', gpu: gh200 }).problem;
+    assert.equal(refused.reason, reasonFor('NVIDIA GH200 480GB').slice(0, -(FIX.length + 1))); assert.equal(refused.fix, FIX);
+    // A dedicated status failure after a successful observation now also keeps the status's own remedy.
+    const dedicatedFailure = readMpsStatus({ readGrant: () => goldenGrant, observeGpu: () => parseMpsGpuObservation(dedicatedLine), readState: () => ({ status: 'ready', daemonGeneration: 'd', configurationGeneration: 'c', serverDefault: {} }), backend: { observe: () => { throw new Error('boom'); } } });
+    const dedicatedProblem = resolveStoredOverride(stored, ENVELOPE, { ref: 'demo/worker', gpu: dedicatedFailure }).problem;
+    assert.equal(dedicatedProblem.fix, GENERIC_FIX);
+});
+
+test('HU.qualified-unified-failure-reasons (A-P-13)', () => {
+    const stored = { gpu: { smPercent: 25, vramPercent: 25 } };
+    const ok1 = qualifiedStatus();
+    const withFs = (status, api = fsApi) => ({ ...status, facts: status.facts, grant: status.grant, fsApi: api });
+    // The resolved share through resolveStoredOverride and the status pool.
+    const resolved = resolveStoredOverride(stored, ENVELOPE, { ref: 'demo/worker', gpu: withFs(ok1) });
+    assert.equal(resolved.problem, null);
+    assert.equal(resolved.gpu.memoryMiB, 30625); assert.equal(resolved.gpu.basis, 'unified-pool');
+    const sinks = [];
+    // (a) the agent is not in the grant.
+    sinks.push(['a', resolveStoredOverride(stored, ENVELOPE, { ref: 'demo/missing', gpu: withFs(ok1) }).problem, 'This agent has no active, qualified Box GPU grant.']);
+    // (b) the envelope shrinks until 25 percent is under the 512 MiB minimum.
+    const tiny = qualifiedStatus({ memoryBytes: 1024 * MIB });
+    sinks.push(['b', resolveStoredOverride(stored, ENVELOPE, { ref: 'demo/worker', gpu: withFs(tiny) }).problem, /below the 512 MiB minimum/]);
+    // (c) revalidating the MPS tools throws.
+    const throwingFs = { ...fsApi, realpathSync: () => { throw new Error('tool vanished'); } };
+    sinks.push(['c', resolveStoredOverride(stored, ENVELOPE, { ref: 'demo/worker', gpu: withFs(ok1, throwingFs) }).problem, /tool vanished|MPS/]);
+    for (const [label, problem, expected] of sinks) {
+        assert.ok(problem, label);
+        if (typeof expected === 'string') assert.equal(problem.reason, expected, label); else assert.match(problem.reason, expected, label);
+        assert.doesNotMatch(problem.reason, /^GPU sharing is unsupported on this unified/, label);
+        assert.notEqual(problem.fix, UNSUPPORTED_FIX_TEXT, label);
+    }
+});
+const UNSUPPORTED_FIX_TEXT = FIX;
+
+test('HU.save-path-qualified (A-P-14)', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-unified-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const manifestPath = path.join(root, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify({ container: 'prepared:image', start: 'sleep infinity' }));
+    const agent = { ref: 'demo/worker', manifestPath };
+    const inspectImage = () => [{ Id: `sha256:${'a'.repeat(64)}`, Config: { User: '1000:1000' } }];
+    // The real inspectMpsTargetEligibility, with the marker and the tool revalidation seams injected.
+    const qualify = (input, deps) => inspectMpsTargetEligibility(input, { ...deps, readGrant: () => goldenGrant, fsApi });
+    const save = (status, gpuShare) => qualifyHardwareGpuTarget(agent, [], { gpu: status, identity: { workspaceRoot: root } }, { gpu: gpuShare }, { inspectImage, qualify });
+    const accepted = save(qualifiedStatus(), { smPercent: 50, vramPercent: 25 });
+    assert.equal(accepted.share.memoryMiB, 30625); assert.equal(accepted.share.basis, 'unified-pool');
+    assert.equal(accepted.share.smPercent, 50);
+    assert.equal(accepted.imageId, `sha256:${'a'.repeat(64)}`);
+    // Out-of-range percentages refuse on the percentage check, as a typed 409, before any store write.
+    for (const vramPercent of [0, 101]) {
+        let caught;
+        try { save(qualifiedStatus(), { smPercent: 50, vramPercent }); } catch (error) { caught = error; }
+        assert.ok(caught, String(vramPercent));
+        const response = hardwareHttpError(caught);
+        assert.equal(response.status, 409); assert.equal(response.body.error, 'gpu_sharing_unavailable'); assert.match(response.body.message, /integers in 1\.\.100/);
+    }
+    // An unqualified driver is refused with the driver text (no image inspected).
+    const unqualified = refusal(() => parseMpsGpuObservation(line('NVIDIA GB10', '[N/A]', '580.159.03'), `${GB10_PCI}, ATS\n`));
+    let refused;
+    try { qualifyHardwareGpuTarget(agent, [], { gpu: unqualified, identity: { workspaceRoot: root } }, { gpu: { smPercent: 50, vramPercent: 25 } }, { inspectImage: () => assert.fail('a refused driver never inspects an image'), qualify }); } catch (error) { refused = error; }
+    assert.equal(hardwareHttpError(refused).body.error, 'gpu_sharing_unavailable');
+    assert.equal(hardwareHttpError(refused).body.message, `${driverReason('580.159.03')} ${FIX}`);
+    // A transient failure carries its fix through the HTTP body.
+    let transient;
+    try { save(qualifiedStatus(null), { smPercent: 50, vramPercent: 25 }); } catch (error) { transient = error; }
+    const transientBody = hardwareHttpError(transient).body;
+    assert.equal(transientBody.message, 'Box memory envelope unknown'); assert.equal(transientBody.fix, ENVELOPE_FIX);
+    // A status without its private facts is refused rather than rebuilt.
+    const stripped = { ...qualifiedStatus() };
+    assert.equal('facts' in stripped, false);
+    assert.throws(() => qualify({ image: 'prepared:image', networkMode: 'default', agentRef: 'demo/worker', gpuShare: { smPercent: 50, vramPercent: 25 }, workspaceRoot: root, status: stripped }, { inspectImage }), { code: 'gpu_sharing_unavailable', message: /facts are unavailable/ });
+    // The dedicated GPU through the same path: the share equals the frozen golden.
+    const dedicatedStatus = readMpsStatus({ readGrant: () => goldenGrant, observeGpu: () => parseMpsGpuObservation(dedicatedLine), readState: () => null, envelope: { memoryBytes: ENVELOPE_BYTES } });
+    const dedicated = save(dedicatedStatus, { smPercent: 25, vramPercent: 50 });
+    assert.equal(JSON.stringify(dedicated.share), GOLDEN_SHARE_JSON);
+    assert.equal('basis' in dedicated.share, false);
+});
+
+test('HU.store-model-guard (I1)', () => {
+    const base = { agentRef: 'demo/worker', installedRefs: new Set(['demo/worker']), envelope: ENVELOPE };
+    const save = (gpu, share = { smPercent: 50, vramPercent: 25 }) => validateAgentLimits({ ...base, limits: { gpu: share }, capabilities: { gate: 'on', gpu } });
+    const qualified = qualifiedStatus();
+    assert.equal(save(qualified).gpuBytes, 30625 * MIB);
+    // Unified or unknown without the unified-pool basis stays refused (the Phase 1 vectors), with the model text.
+    for (const gpu of [{ eligible: true, memoryModel: 'unified', name: 'NVIDIA GB10', deviceMemoryBytes: 128 * 1024 * MIB }, { eligible: true, memoryModel: 'unknown', deviceMemoryBytes: 8 * 1024 * MIB }, { eligible: true, name: 'x', deviceMemoryBytes: 8 * 1024 * MIB }]) {
+        assert.throws(() => save(gpu), (error) => error.code === 'gpu_sharing_unavailable' && /^GPU sharing is unsupported on this unified or unverified GPU memory model: /.test(error.message), JSON.stringify(gpu));
+    }
+    // An unsupported marker refuses even an otherwise eligible-looking status.
+    assert.throws(() => save({ ...qualified, hardwareSupport: 'unsupported' }), { code: 'gpu_sharing_unavailable' });
+    // A non-eligible status keeps its own message (the guard sits after the eligible check).
+    assert.throws(() => save({ eligible: false, memoryModel: 'unified', name: 'NVIDIA GB10', reason: 'its own reason', code: 'gpu_sharing_unavailable' }), { message: 'its own reason' });
+    // The unified basis must be a positive safe integer.
+    for (const bytes of [0, -1, 1.5, '1', null]) assert.throws(() => save({ ...qualified, shareBasis: { kind: 'unified-pool', bytes } }), { code: 'gpu_sharing_unavailable', message: 'The GPU memory basis is unknown.' });
+    // Dedicated is unchanged, including its message and rounding.
+    assert.throws(() => save({ eligible: true, memoryModel: 'dedicated', deviceMemoryBytes: null }), { message: 'The GPU device memory is unknown.' });
+    assert.equal(save({ eligible: true, memoryModel: 'dedicated', deviceMemoryBytes: 6144 * MIB + 5 }, { smPercent: 50, vramPercent: 50 }).gpuBytes, 3072 * MIB);
+});
+
+test('HU.help-coupling (A-P-17, ploinky half)', () => {
+    assert.equal(HARDWARE_HELP.gpu.filter((sentence) => sentence === Q10_SENTENCE).length, 1);
+    assert.equal(HARDWARE_HELP.gpu[HARDWARE_HELP.gpu.length - 1], Q10_SENTENCE);
+    // The Phase 1 sentence stays, unchanged, on every host.
+    assert.equal(HARDWARE_HELP.gpu[HARDWARE_HELP.gpu.length - 2], Q2_SENTENCE);
+    assert.ok(Object.isFrozen(HARDWARE_HELP));
+});
+
+test('HU.unified-share-survives-apply-and-launch (A-P-18b)', () => {
+    // The unified share carries one extra key (basis). Past Save it must survive the transition plan, a JSON round trip
+    // (the applied observation), the exact-share comparison and the client launch arguments unchanged.
+    const status = qualifiedStatus();
+    const share = resolveMpsShare({ smPercent: 25, vramPercent: 25 }, status.facts, { grant: status.grant, fsApi, poolMiB: status.shareBasis.bytes / MIB });
+    assert.deepEqual(Object.keys(share), ['smPercent', 'vramPercent', 'vramMiB', 'memoryMiB', 'memoryBytes', 'deviceUuid', 'driverVersion', 'wiringFingerprint', 'basis']);
+    const client = { key: 'demo/worker', ref: 'demo/worker', instanceId: 'instance', enableGeneration: 'generation', containerId: 'a'.repeat(64), share };
+    const plan = planMpsTransition({ desiredClients: [client], configuredPolicies: [{ share }], selectedKeys: ['demo/worker'] });
+    assert.ok(plan);
+    assert.equal(isDeepStrictEqual(JSON.parse(JSON.stringify(share)), share), true);
+    const serverDefault = resolveMpsServerDefault([{ share }]);
+    assert.deepEqual({ smPercent: serverDefault.smPercent, memoryMiB: serverDefault.memoryMiB, shareMemoryMiB: serverDefault.shareMemoryMiB }, { smPercent: 25, memoryMiB: 30720, shareMemoryMiB: 30625 });
+    const pipeDirectory = `/run/ploinky/mps/pipe-${'b'.repeat(32)}`;
+    const args = mpsClientArgs(share, { status: 'ready', daemonGeneration: 'daemon1', configurationGeneration: 'config1', pipeDirectory });
+    const envFlags = args.flatMap((value, index) => (args[index - 1] === '--env' ? [value] : []));
+    assert.deepEqual(envFlags, ['CUDA_MPS_PIPE_DIRECTORY=/run/ploinky-mps-pipe', 'CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=30625M']);
 });
