@@ -18,7 +18,7 @@ function lifecycleHelpLines(surface) {
         return [
             '  status [--verbose]             Show combined, read-only outer runtime and workspace status',
             '  stop                           Stop core services, then stop the outer runtime',
-            '  destroy [--delete-cache]       Remove the outer runtime without prompting; optionally delete .ploinky/box cache data',
+            '  destroy [--delete-cache]       Remove the outer runtime without prompting, then this workspace\'s GPU grants and hardware-limits records; optionally delete .ploinky/box cache data',
         ];
     }
     return [
@@ -707,10 +707,10 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 notes: 'This host-level command preserves the workspace-backed .ploinky/box cache data.',
             },
             destroy: {
-                description: 'Stop nested agents and remove the outer runtime, retaining the host workspace and its .ploinky/box dependency and image cache directories by default.',
+                description: 'Stop nested agents, remove the outer runtime and then this workspace\'s GPU grants and hardware-limits records, retaining the host workspace and its .ploinky/box dependency and image cache directories by default.',
                 syntax: 'destroy [--delete-cache]',
                 examples: ['destroy', 'destroy --delete-cache'],
-                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Both forms run without prompting. Without the flag, this host-level command retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so the MCP SDK copied from the Box image and reusable nested image content survive destroy and recreate. With --delete-cache, it removes the outer runtime and then deletes exactly those two directories; the workspace, .ploinky/data/master-key, repositories, agents, routing state, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds.',
+                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Both forms run without prompting. Without the flag, this host-level command retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so the MCP SDK copied from the Box image and reusable nested image content survive destroy and recreate. Once the outer runtime is gone, both forms also remove this workspace\'s GPU grants and hardware-limits records from ~/.ploinky-box (the saved GPU grant and revoke, the saved hardware-limits gate, stored limits and transition journals), so the next start begins from manifest defaults; router bindings are kept. With --delete-cache, it also deletes exactly those two cache directories; the workspace, .ploinky/data/master-key, repositories, agents, router bindings, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds.',
             },
         }
         : {

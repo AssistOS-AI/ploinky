@@ -36,7 +36,7 @@ function execEnvAssignments(args) {
 const WORKSPACE_ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ploinky box cli ăîș $(id);'-")));
 test.after(() => fs.rmSync(WORKSPACE_ROOT, { recursive: true, force: true }));
 
-function fakeSupervisor(events, { statusState = 'absent' } = {}) {
+function fakeSupervisor(events, { statusState = 'absent', removedRecords = null } = {}) {
     const identity = { instance: 'ploinky-box-workspace-123456789abc', workspaceRoot: WORKSPACE_ROOT };
     const prepared = {
         identity,
@@ -84,6 +84,7 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
                 deletedPaths: options?.deleteCache
                     ? [`${WORKSPACE_ROOT}/.ploinky/box/dependencies`, `${WORKSPACE_ROOT}/.ploinky/box/images`]
                     : [],
+                removedRecords: removedRecords ? [...removedRecords] : [],
             };
         },
         inspectBoxStatus: () => { events.push('status'); return status; },
@@ -1361,6 +1362,36 @@ test('destroy runs input-free marker recovery when the outer Box is already abse
         ['destroy', null, { deleteCache: false }]);
 });
 
+test('destroy prints the host operator records it removed, for both forms', async () => {
+    const records = [
+        '/home/user/.ploinky-box/gpu-grants/ploinky-box-workspace-123456789abc.json',
+        '/home/user/.ploinky-box/hardware-limits/ploinky-box-workspace-123456789abc',
+    ];
+    for (const [argv, statusState, removedRecords, expected] of [
+        [['destroy'], 'running-initialized', records, `host operator records removed: ${records.join(', ')}.`],
+        [['destroy'], 'absent', [], 'host operator records removed: none remained.'],
+        [['destroy', '--delete-cache'], 'absent', records, `host operator records removed: ${records.join(', ')}.`],
+    ]) {
+        const output = bufferStream();
+        const code = await runOuterCli(argv, {
+            env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
+            supervisor: fakeSupervisor([], { statusState, removedRecords }),
+        });
+        assert.equal(code, 0);
+        assert.match(output.value(), /^Ploinky Box ploinky-box-workspace-123456789abc was destroyed; host operator records removed:/m);
+        assert.ok(output.value().includes(expected), output.value());
+        assert.equal(/cache data was deleted/.test(output.value()), argv.includes('--delete-cache'));
+    }
+});
+
+test('a records-kept refusal after the Box is gone fails the command', async () => {
+    const refusal = Object.assign(new Error('Ploinky Box ploinky-box-workspace-123456789abc was removed, but its host operator records were kept: x. y, then run ploinky destroy again.'), { code: 'PLOINKY_BOX_DESTROY_RECORDS_KEPT' });
+    const supervisor = { ...fakeSupervisor([], { statusState: 'absent' }), runDestroyTransaction: async () => { throw refusal; } };
+    await assert.rejects(runOuterCli(['destroy'], {
+        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(), supervisor,
+    }), (error) => error === refusal);
+});
+
 test('public help documents non-interactive destroy and explicit cache deletion', async () => {
     const output = bufferStream();
     const code = await runOuterCli(['help'], {
@@ -1380,6 +1411,9 @@ test('public help documents non-interactive destroy and explicit cache deletion'
     assert.doesNotMatch(output.value(), /--delete-volumes/);
     assert.match(output.value(), /\.ploinky\/box/);
     assert.match(output.value(), /destroy\s+Remove the outer Box without prompting/);
+    assert.match(output.value(), /GPU grants and hardware-limits records/);
+    assert.match(output.value(), /until ploinky destroy removes it/);
+    assert.doesNotMatch(output.value(), /only clears the saved (grant)|saved gate and stored limits (are) kept/);
     assert.match(output.value(), /docker\.io\/assistos\/ploinky-box:latest/);
     assert.match(output.value(), /PLOINKY_BOX_IMAGE/);
 });
