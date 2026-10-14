@@ -222,7 +222,10 @@ export async function reconcileExactHardwareInstance(captured, {
             }
             const routeKey = captured.record.alias || captured.record.agentName;
             const route = loadRouting().routes?.[routeKey];
-            if (!isSandboxRuntime(plan.runtime) && route && !route.hardwareAvailability) {
+            // A start keeps a refused-drain predecessor of a hardware-refused node and marks its draining route
+            // unavailable; once admitted again, only its accepted targeted restart may replace it and clear both marks.
+            const acceptsDrainingRoute = Boolean(acceptedFailedDrain) && route?.draining === true;
+            if (!isSandboxRuntime(plan.runtime) && route && (!route.hardwareAvailability || acceptsDrainingRoute)) {
                 check();
                 phase = 'restart-preparation';
                 transition = await prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability,

@@ -69,6 +69,16 @@ test('the CLI restart hands the accepted predecessor to the targeted preparation
     assert.equal(calls.commit, 1);
 });
 
+test('an accepted restart may replace the kept predecessor of a draining route that a start marked hardware-unavailable', async () => {
+    const { run, calls } = await reconcileWith({ routes: { worker: {
+        container: 'exact', repo: 'demo', agent: 'worker', draining: true, hardwareAvailability: { state: 'unavailable' },
+    } } });
+    await run;
+    assert.deepEqual(calls.prepare[0].acceptedFailedDrain, accepted);
+    assert.deepEqual(calls.ensure[0].targetedRestart.acceptedFailedDrain, accepted);
+    assert.equal(calls.commit, 1, 'the targeted commit republishes the route without either mark');
+});
+
 test('an ordinary CLI restart carries no acceptance', async () => {
     const { run, calls } = await reconcileWith({ acceptedFailedDrain: null });
     await run;

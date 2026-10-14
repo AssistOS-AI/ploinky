@@ -2050,7 +2050,8 @@ function ensureGraphNodesEnabled(graph, reg, {
     // the identity always rotates and its unpublished runtime is removed.
     const superseded = supersededNoWaitRunFor(supersededNoWaitRuns, existing.key, existing.rec);
     // A refused or blocked instance keeps no authority: an existing runtime is
-    // revoked by identity rotation and removed through exact ownership checks.
+    // revoked by identity rotation and removed through exact ownership checks,
+    // unless it is the kept predecessor of a refused targeted drain (below).
     const hardwareUnavailable = unavailableNodeIds.has(node.id)
       && (runtimeReplacementOptions?.containerExistsImpl || dockerSvc.containerExists)(existing.key);
     let runtimeReason = '';
@@ -2111,19 +2112,39 @@ function ensureGraphNodesEnabled(graph, reg, {
     });
   }
 
-  const changedPlans = existingPlans
-    .filter((plan) => plan.executionChanged || plan.profileChanged || plan.runtimeReason)
-    .sort((left, right) => left.node.id.localeCompare(right.node.id));
-  const changedContainers = changedPlans.map((plan) => plan.existing.key);
   // Removing the predecessor of a refused targeted drain would let a later
-  // restart replace it without any acknowledgement. Refuse the whole graph
+  // restart replace it without any acknowledgement, so it is never rotated or
+  // removed here. A no-wait or hardware-refused node keeps that predecessor
+  // under its exact identity and stays unlaunched behind its draining route
+  // while the rest of the graph starts; any other node refuses the whole graph
   // while nothing has been logged, revoked, rotated or removed.
-  if (changedPlans.length) {
-    const currentRouting = loadRouting();
-    for (const plan of changedPlans) {
-      dockerSvc.assertAgentServiceNotDraining(plan.existing.key, { loadRouting: () => currentRouting });
+  const replacementCandidates = existingPlans
+    .filter((plan) => plan.executionChanged || plan.profileChanged || plan.runtimeReason);
+  const drainingRouting = replacementCandidates.length ? loadRouting() : null;
+  const retainedDrainingPlans = [];
+  for (const plan of replacementCandidates) {
+    try {
+      dockerSvc.assertAgentServiceNotDraining(plan.existing.key, { loadRouting: () => drainingRouting });
+    } catch (error) {
+      const containable = (deferredNodeIds.has(plan.node.id) || unavailableNodeIds.has(plan.node.id))
+        && !['noWaitRunSuperseded', 'mpsCohortTransition'].includes(plan.runtimeReason);
+      if (error?.code !== 'PLOINKY_AGENT_DRAINING' || !containable) throw error;
+      retainedDrainingPlans.push(plan);
     }
   }
+  for (const plan of retainedDrainingPlans) {
+    const deferred = graphReplacementLine(plan).replace(/^.*?: replacing its runtime /, '');
+    const agent = plan.existing.rec.alias || plan.existing.rec.agentName || plan.node.shortAgentName;
+    logLine(`[start] ${plan.node.id}: keeping its stopped runtime after a refused targeted drain instead of replacing it ${deferred}; `
+      + `it stays unavailable until 'ploinky restart ${agent} --accept-failed-drain <container-id>'`);
+    plan.executionChanged = false;
+    plan.profileChanged = false;
+    plan.runtimeReason = '';
+  }
+  const changedPlans = replacementCandidates
+    .filter((plan) => !retainedDrainingPlans.includes(plan))
+    .sort((left, right) => left.node.id.localeCompare(right.node.id));
+  const changedContainers = changedPlans.map((plan) => plan.existing.key);
   // Say why each runtime is replaced before anything is revoked or removed.
   for (const plan of changedPlans) logLine(graphReplacementLine(plan));
   // Every retained route must be target-less in the prelaunch generation,
