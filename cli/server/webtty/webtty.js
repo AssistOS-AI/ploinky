@@ -200,6 +200,8 @@
         if (!closed) resizeTimer = window.setTimeout(sendResize, RESIZE_FLUSH_MS);
     });
 
+    let shellExited = false;
+
     function disposeLocal() {
         closed = true;
         stopInput();
@@ -265,6 +267,7 @@
         });
         source.addEventListener('exit', (event) => {
             if (!current()) return;
+            shellExited = true;
             let reason = 'Terminal exited.';
             try { reason = `Terminal closed: ${JSON.parse(event.data).reason || 'exited'}.`; } catch (_) {}
             disposeLocal();
@@ -281,23 +284,44 @@
         });
     }
 
-    async function killSession({ keepalive = false } = {}) {
+    async function killSession({ keepalive = false, refreshProof = false } = {}) {
         if (!terminalSessionId || deletionStarted) return;
         deletionStarted = true;
-        disposeLocal();
+        if (!refreshProof) disposeLocal();
+        else killButton.disabled = true;
         try {
+            // A confirmed Kill refreshes the CSRF proof once, then sends exactly one DELETE.
+            if (refreshProof) await jsonRequest('/webtty/live-sessions');
             await jsonRequest(`/webtty/sessions/${encodeURIComponent(terminalSessionId)}`, {
                 method: 'DELETE', headers: mutationHeaders(), keepalive,
             });
+            disposeLocal();
             setStatus('Closed', 'error');
             showMessage('Terminal killed.');
         } catch (error) {
-            showMessage(`Kill could not be confirmed. ${error.message}`);
+            if (!refreshProof) {
+                showMessage(`Kill could not be confirmed. ${error.message}`);
+                return;
+            }
+            if (shellExited || error.status === 404) {
+                killButton.disabled = true;
+                showMessage('The terminal had already ended.');
+                return;
+            }
+            if (closed) {
+                // The view closed for another reason; the shell may still be running.
+                killButton.disabled = true;
+                showMessage('Kill could not be confirmed. Reopen this terminal from Live Sessions to check whether it is still running.');
+                return;
+            }
+            deletionStarted = false;
+            killButton.disabled = false;
+            showMessage(`Kill failed: ${error.message} The terminal is still running.`);
         }
     }
     killButton.addEventListener('click', () => {
         if (!closed && terminalSessionId && window.confirm('Kill this terminal and its running processes?')) {
-            void killSession();
+            void killSession({ refreshProof: true });
         }
     });
 

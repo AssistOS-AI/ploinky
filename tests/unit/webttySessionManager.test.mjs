@@ -2395,12 +2395,23 @@ test('24 saturated agent validations stay bounded, enforce deadlines and keep vi
         }),
     });
     targetResolver.revalidate = async ({ target }) => target;
-    targetResolver.revalidateRunningAgent = ({ target, signal }) =>
-        targetResolver.inspectWithGate(target.runtime, target.containerId, { signal });
+    const validationsInFlight = new Map();
+    const sessionByTarget = new Map();
+    targetResolver.revalidateRunningAgent = async ({ target, signal }) => {
+        const id = sessionByTarget.get(target);
+        validationsInFlight.set(id, (validationsInFlight.get(id) || 0) + 1);
+        try {
+            return await targetResolver.inspectWithGate(target.runtime, target.containerId, { signal });
+        } finally {
+            validationsInFlight.set(id, validationsInFlight.get(id) - 1);
+        }
+    };
     const manager = await createManager(t, { targetResolver, now: () => now, agentProviderAvailable: true,
         limits: { createsPerWindow: 100, perUser: 24 }, capturePlan: routePlan });
     const sessions = [];
     for (let index = 0; index < 24; index += 1) sessions.push(await createAgentSession(manager));
+    for (const session of sessions) sessionByTarget.set(session.target, session.id);
+    assert.equal(sessionByTarget.size, 24, 'each session must carry its own target object');
     for (let tick = 0; tick < 10; tick += 1) {
         const responses = [];
         for (const session of sessions) {
@@ -2413,7 +2424,9 @@ test('24 saturated agent validations stay bounded, enforce deadlines and keep vi
         }
         await manager.validateLiveSessions();
         responses.forEach(response => assert.equal(response.writableEnded, true));
-        assert.ok(sessions.filter(session => session.targetValidation).length <= 24);
+        for (const session of sessions) {
+            assert.ok(validationsInFlight.get(session.id) <= 1, `session ${session.id} has overlapping validations`);
+        }
         for (let second = 0; second < 5; second += 1) {
             now += 1_000;
             t.mock.timers.tick(1_000);
@@ -2425,6 +2438,53 @@ test('24 saturated agent validations stay bounded, enforce deadlines and keep vi
     assert.ok(completed > 0);
     assert.ok(sessions.some(session => Number.isFinite(session.targetUndecidedSince)));
     assert.equal(manager.activeCount(), 24);
+});
+
+test('agent validation start order rotates each tick behind a single inspection slot', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const count = 4;
+    const targetResolver = new TerminalTargetResolver({
+        workspaceRoot: WORKSPACE_ROOT,
+        limits: { concurrency: 1 },
+        inspectContainer: async () => { await new Promise(resolve => setImmediate(resolve)); },
+    });
+    assert.equal(targetResolver.inspectionGate.limit, 1);
+    targetResolver.revalidate = async ({ target }) => target;
+    const sessionByTarget = new Map();
+    const inFlight = new Map();
+    let tickStarts = [];
+    let overlap = 0;
+    targetResolver.revalidateRunningAgent = async ({ target, signal }) => {
+        const id = sessionByTarget.get(target);
+        tickStarts.push(id);
+        inFlight.set(id, (inFlight.get(id) || 0) + 1);
+        overlap = Math.max(overlap, inFlight.get(id));
+        try {
+            return await targetResolver.inspectWithGate(target.runtime, target.containerId, { signal });
+        } finally {
+            inFlight.set(id, inFlight.get(id) - 1);
+        }
+    };
+    const manager = await createManager(t, { targetResolver, now: () => 1_000, agentProviderAvailable: true,
+        limits: { createsPerWindow: 100, perUser: 24 }, capturePlan: routePlan });
+    const sessions = [];
+    for (let index = 0; index < count; index += 1) sessions.push(await createAgentSession(manager));
+    for (const session of sessions) sessionByTarget.set(session.target, session.id);
+    assert.equal(sessionByTarget.size, count);
+    const firsts = [];
+    for (let tick = 0; tick < count * 2; tick += 1) {
+        tickStarts = [];
+        await manager.validateLiveSessions();
+        assert.equal(tickStarts.length, count, 'every idle agent session is enqueued each tick');
+        firsts.push(tickStarts[0]);
+        await Promise.all(sessions.map(settleTarget));
+        assert.ok(sessions.every(session => !session.targetValidation));
+    }
+    for (let tick = 1; tick < firsts.length; tick += 1) {
+        assert.notEqual(firsts[tick], firsts[tick - 1], `first-enqueued session repeated on tick ${tick}`);
+    }
+    assert.equal(new Set(firsts.slice(0, count)).size, count, 'every session leads once per rotation');
+    assert.equal(overlap, 1, 'a session never has overlapping validations');
 });
 
 test('deadline ignores late results and synchronous cutoff closes by the following tick', async (t) => {

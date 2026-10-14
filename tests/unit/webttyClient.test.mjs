@@ -418,11 +418,131 @@ test('confirmed Kill sends exactly one DELETE and cancelled Kill sends none', as
     }
 });
 
+function refreshes(harness) {
+    return harness.requests.filter(({ url }) => url === '/webtty/live-sessions');
+}
+
+test('confirmed Kill refreshes proof once, sends one DELETE, and disposes only after it succeeds', async () => {
+    let releaseDelete;
+    const harness = createHarness({
+        requestHandler(url, options) {
+            if (options.method !== 'DELETE') return;
+            return new Promise((resolve) => { releaseDelete = () => resolve(response(200, { ok: true })); });
+        },
+    });
+    await flushTasks();
+    const kill = harness.elements.get('kill');
+    kill.disabled = false;
+    kill.click();
+    kill.click();
+    await flushTasks();
+    assert.equal(kill.disabled, true);
+    assert.ok(!harness.sources[0].closed, 'view must stay until the DELETE succeeds');
+    assert.equal(refreshes(harness).length, 1);
+    assert.equal(deletions(harness).length, 1);
+    const order = harness.requests.map(({ url, options }) => `${options.method || 'GET'} ${url}`);
+    assert.deepEqual(order.slice(-2), ['GET /webtty/live-sessions', 'DELETE /webtty/sessions/terminal-abcdefghijklmnop']);
+    releaseDelete();
+    await flushTasks();
+    assert.equal(harness.sources[0].closed, true);
+    assert.equal(harness.elements.get('message').textContent, 'Terminal killed.');
+    assert.equal(refreshes(harness).length, 1);
+    assert.equal(deletions(harness).length, 1);
+});
+
+test('refused Kill DELETE keeps the view, re-enables Kill, and never retries automatically', async () => {
+    const harness = createHarness({
+        requestHandler(url, options) {
+            if (options.method === 'DELETE') return response(403, { error: 'browser_csrf_invalid' });
+        },
+    });
+    await flushTasks();
+    const kill = harness.elements.get('kill');
+    kill.disabled = false;
+    kill.click();
+    await flushTasks();
+    assert.equal(deletions(harness).length, 1);
+    assert.equal(refreshes(harness).length, 1);
+    assert.ok(!harness.sources[0].closed);
+    assert.equal(kill.disabled, false);
+    assert.match(harness.elements.get('message').textContent, /^Kill failed: .*the terminal is still running\.$/i);
+    harness.sources[0].emit('output', { data: 'still live' });
+    assert.match(harness.terminal.output, /still live$/);
+    await flushTasks();
+    assert.equal(deletions(harness).length, 1, 'no automatic retry');
+});
+
+test('exit during a pending Kill DELETE answered 404 does not claim the terminal is still running', async () => {
+    let releaseDelete;
+    const harness = createHarness({
+        requestHandler(url, options) {
+            if (options.method !== 'DELETE') return;
+            return new Promise((resolve) => { releaseDelete = () => resolve(response(404, { error: 'not_found' })); });
+        },
+    });
+    await flushTasks();
+    const kill = harness.elements.get('kill');
+    kill.disabled = false;
+    kill.click();
+    await flushTasks();
+    harness.sources[0].emit('exit', { reason: 'exited' });
+    releaseDelete();
+    await flushTasks();
+    assert.equal(deletions(harness).length, 1);
+    assert.equal(kill.disabled, true);
+    const text = harness.elements.get('message').textContent;
+    assert.doesNotMatch(text, /still running/i);
+    assert.equal(text, 'The terminal had already ended.');
+    assert.equal(harness.elements.get('status').textContent, 'Closed');
+});
+
+test('detached during a pending Kill DELETE that then fails claims neither ended nor still running', async () => {
+    let releaseDelete;
+    const harness = createHarness({
+        requestHandler(url, options) {
+            if (options.method !== 'DELETE') return;
+            return new Promise((resolve) => { releaseDelete = () => resolve(response(503, {})); });
+        },
+    });
+    await flushTasks();
+    const kill = harness.elements.get('kill');
+    kill.disabled = false;
+    kill.click();
+    await flushTasks();
+    harness.sources[0].emit('detached');
+    releaseDelete();
+    await flushTasks();
+    assert.equal(deletions(harness).length, 1);
+    assert.equal(kill.disabled, true);
+    const text = harness.elements.get('message').textContent;
+    assert.doesNotMatch(text, /already ended|Kill failed|terminal is still running/i);
+    assert.match(text, /^Kill could not be confirmed\. Reopen this terminal from Live Sessions/);
+});
+
+test('failed proof refresh sends no DELETE and keeps the view', async () => {
+    const harness = createHarness({
+        requestHandler(url) {
+            if (url === '/webtty/live-sessions') return response(503, {});
+        },
+    });
+    await flushTasks();
+    const kill = harness.elements.get('kill');
+    kill.disabled = false;
+    kill.click();
+    await flushTasks();
+    assert.equal(refreshes(harness).length, 1);
+    assert.equal(deletions(harness).length, 0);
+    assert.ok(!harness.sources[0].closed);
+    assert.equal(kill.disabled, false);
+    assert.match(harness.elements.get('message').textContent, /^Kill failed: .*the terminal is still running\.$/i);
+});
+
 test('invalid created session rolls back exactly once; malformed attach never deletes', async () => {
     for (const kind of ['launch', 'attach']) {
         const harness = createHarness({ hash: `#${kind}=${'a'.repeat(32)}`, sessionOverride: { target: null } });
         await flushTasks();
         assert.equal(deletions(harness).length, kind === 'launch' ? 1 : 0);
+        assert.equal(refreshes(harness).length, 0, 'rollback never refreshes proof');
         assert.equal(harness.sources.length, 0);
         harness.windowListeners.get('pagehide')();
         await flushTasks();
