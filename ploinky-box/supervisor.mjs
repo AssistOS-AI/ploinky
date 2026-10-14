@@ -3488,10 +3488,12 @@ export function createBoxSupervisor({
         const provenAbsent = () => Object.freeze({ state: 'absent' });
         const refuse = (error) => destroyRecordsRefusal(identity, error);
         try {
-            // Confinement and structure first, then stale-lock recovery: the
-            // journal abort below needs the store lock.
-            hardwareGateStore.planInstanceTeardown(identity, lock, { inspectBox: provenAbsent });
+            // Both read-only preflights pass before anything changes; the only
+            // change before the journal abort is the stale-lock recovery
+            // (after the hardware structure checks), because that abort needs
+            // the store lock.
             gpuGrantStore.planTeardown(identity, lock);
+            hardwareGateStore.planInstanceTeardown(identity, lock, { inspectBox: provenAbsent });
         } catch (error) {
             throw refuse(error);
         }
