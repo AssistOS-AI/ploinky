@@ -13,6 +13,7 @@ import { bounded, keys } from './liveCommon.mjs';
 import { resolveMemoryPercent } from '../../cli/sandbox/hardwareLimits/resolve.mjs';
 import { cpuMaxMatches } from '../../cli/sandbox/hardwareLimits/cpuQuota.mjs';
 import { LLM_AGENT, LLM_MODELS, LLM_REF, LLM_REPOSITORY } from './liveLlmNames.mjs';
+import { projectApuEvidence } from './liveApuProjection.mjs';
 
 export { LLM_AGENT, LLM_MODELS, LLM_REF, LLM_REPOSITORY };
 export const GIB = 1024 * MIB;
@@ -133,23 +134,32 @@ export const LLM_REQUEST_ID = /^[A-Za-z0-9_-]{8,64}$/;
 // {ok:true, agent, result} or {ok:false, error:{code, message, details?}}. A refusal of the
 // tool (an MCP error, or a document with ok:false) is data, not an exception.
 export const LLM_TOOL_CALL = String.raw`
-const ALLOWED={local_llm_overview:['preview'],local_llm_status:['sinceSeq'],local_llm_run:['requestId','modelId','runnerId','params','replace'],local_llm_stop:[],local_llm_runner_install:['runnerId','acceptLicence'],local_llm_test_prompt:['prompt','maxTokens']};
+const apuProject=${projectApuEvidence.toString()};
+const ALLOWED={local_llm_overview:['preview'],local_llm_status:['sinceSeq'],local_llm_run:['requestId','modelId','runnerId','params','replace'],local_llm_stop:[],local_llm_runner_install:['runnerId','acceptLicence'],local_llm_test_prompt:['prompt','maxTokens','observationId']};
 const out=(value)=>{let text=JSON.stringify(value);if(text.length>60000)text=JSON.stringify({ok:false,error:{code:'too_large',message:'The reply exceeds 60000 characters'}});process.stdout.write(text);};
 const fail=(message,code)=>{out({ok:false,error:{code:code||'invalid',message:String(message).slice(0,400)}});process.exit(3);};
 const [tool,argsText,viewText]=process.argv.slice(1);
 if(!Object.hasOwn(ALLOWED,tool))fail('Unsupported tool');
 let args,view;try{args=JSON.parse(argsText||'{}');view=JSON.parse(viewText||'{}');}catch{fail('Invalid JSON');}
+if(view.agent!==undefined&&view.agent!=='local-llm')fail('Invalid expected model route');
+if(view.apu!==undefined&&view.apu!==true)fail('Invalid APU projection');
+if(view.budgetMs!==undefined&&(!Number.isInteger(view.budgetMs)||view.budgetMs<1||view.budgetMs>290000))fail('Invalid tool budget');
 if(!args||typeof args!=='object'||Array.isArray(args)||Buffer.byteLength(argsText||'')>4096||Object.keys(args).some((k)=>!ALLOWED[tool].includes(k)))fail('Invalid arguments');
 const id=/^[a-z0-9][a-z0-9._-]{0,127}$/;
 if(tool==='local_llm_run'&&(!/^[A-Za-z0-9_-]{8,64}$/.test(args.requestId)||!id.test(args.modelId)||!id.test(args.runnerId)||(args.replace!==undefined&&typeof args.replace!=='boolean')||(args.params!==undefined&&(!args.params||typeof args.params!=='object'||Array.isArray(args.params)))))fail('Invalid run request');
 if(tool==='local_llm_overview'&&args.preview!==undefined&&(!args.preview||!id.test(args.preview.modelId)||!id.test(args.preview.runnerId)||(args.preview.params!==undefined&&(typeof args.preview.params!=='object'||Array.isArray(args.preview.params)))))fail('Invalid preview request');
 if(tool==='local_llm_runner_install'&&(args.runnerId!=='vllm'||args.acceptLicence!==false))fail('Only vllm may be installed, and without a licence acceptance');
 if(tool==='local_llm_test_prompt'&&(typeof args.prompt!=='string'||args.prompt.length<1||args.prompt.length>200||!Number.isInteger(args.maxTokens)||args.maxTokens<1||args.maxTokens>512))fail('Invalid test prompt');
+if(args.observationId!==undefined&&!/^[A-Za-z0-9_-]{8,128}$/.test(args.observationId))fail('Invalid prompt observation');
 if(tool==='local_llm_status'&&args.sinceSeq!==undefined&&!Number.isInteger(args.sinceSeq))fail('Invalid status request');
 const pick=(o,keys)=>{if(!o||typeof o!=='object')return o??null;const r={};for(const k of keys)if(o[k]!==undefined)r[k]=o[k];return r;};
 const admission=(a)=>a?{status:a.status,reason:a.reason?String(a.reason).slice(0,400):null,reasonCode:a.reasonCode??null,estimate:pick(a.estimate,['gpuBytes','ramBytes','gpuMemoryUtilization','weightsBytes','kvBytes','basis'])}:null;
-const deployment=(d)=>d?{id:d.id,modelId:d.modelId,runnerId:d.runnerId,profile:d.profile,phase:d.phase,error:d.error?String(d.error).slice(0,400):null,pausedReason:d.pausedReason??null,admission:admission(d.admission),artifact:pick(d.artifact,['type','repo','file','revision','commit','size','sha256','quantization']),artifactFiles:Array.isArray(d.artifact&&d.artifact.files)?d.artifact.files.map((f)=>pick(f,['path','size','sha256'])).slice(0,64):undefined,runner:pick(d.runner,['pid','port','startedAt']),download:pick(d.download,['bytes','total','rate','etaSeconds']),createdAt:d.createdAt,updatedAt:d.updatedAt}:null;
+const deployment=(d)=>d?{id:d.id,modelId:d.modelId,runnerId:d.runnerId,profile:d.profile,phase:d.phase,params:pick(d.params,['ctxSize','parallel','loadMode','threads']),error:d.error?String(d.error).slice(0,400):null,pausedReason:d.pausedReason??null,admission:admission(d.admission),artifact:pick(d.artifact,['type','repo','file','revision','commit','size','sha256','quantization']),artifactFiles:Array.isArray(d.artifact&&d.artifact.files)?d.artifact.files.map((f)=>pick(f,['path','size','sha256'])).slice(0,64):undefined,runner:pick(d.runner,['pid','port','startedAt']),download:pick(d.download,['bytes','total','rate','etaSeconds']),createdAt:d.createdAt,updatedAt:d.updatedAt}:null;
+const startup=o=>o?{...pick(o,['controllerEpoch','deploymentId','loadingObserved','firstAcceptedHealthSequence','observationErrors']),runnerIdentity:pick(o.runnerIdentity,['runnerStartId','pid']),latestHealthObservation:pick(o.latestHealthObservation,['status','accepted','sequence','monotonicMs']),pageCachePreparation:pick(o.pageCachePreparation,['policy','phase','filesConsidered','attempts','reportedSuccesses','reportedFailures','skippedNonRegular','observationErrors'])}:null;
+const stop=o=>o?{...pick(o,['controllerEpoch','sequence','deploymentId','phaseAtStop','runnerRunning','firstAcceptedHealthSequence','monotonicMs']),runnerIdentity:pick(o.runnerIdentity,['runnerStartId','pid']),latestHealthObservation:pick(o.latestHealthObservation,['status','accepted','sequence','monotonicMs']),startupObservation:startup(o.startupObservation)}:null;
 const project=(name,result)=>{
+ if(view.apu&&name==='local_llm_status')return apuProject(result,args.sinceSeq||0);
+ if(view.apu&&['local_llm_run','local_llm_stop'].includes(name))return {settled:true};
  if(name==='local_llm_overview'){const hw=result.hardware||{};const models=Array.isArray(result.models)?result.models:[];const wanted=models.find((m)=>m&&m.id===view.model);
   return {profile:result.profile,limits:result.limits??null,
    hardware:{gpu:pick(hw.gpu,['available','name','driverVersion','totalBytes','usedBytes','freeBytes','memoryModel','state','reason','device']),memory:pick(hw.memory,['totalBytes','availableBytes']),cpus:hw.cpus??null,cgroupMemory:hw.cgroupMemory??null},
@@ -157,7 +167,8 @@ const project=(name,result)=>{
    model:wanted?{id:wanted.id,sources:wanted.sources,weights:Object.fromEntries(Object.entries(wanted.weights||{}).map(([k,w])=>[k,{size:w.size,download:w.download,bytesNeeded:w.acquisition&&w.acquisition.bytesNeeded,runners:w.runners}])),runners:Object.fromEntries(Object.entries(wanted.runners||{}).map(([k,r])=>[k,{format:r.format,size:r.size,params:r.params,admission:admission(r.admission)}]))}:null,
    deployment:deployment(result.deployment),
    preview:result.preview?{modelId:result.preview.modelId,runnerId:result.preview.runnerId,error:result.preview.error??null,params:result.preview.params??null,admission:admission(result.preview.admission)}:undefined,gatewayModel:result.gatewayModel};}
- if(name==='local_llm_status'){return {phase:result.phase,profile:result.profile??null,deployment:deployment(result.deployment),logs:(result.logs||[]).slice(-30).map((l)=>({seq:l.seq,text:String(l.line??l.text??l.message??'').slice(0,240)})),nextSeq:result.nextSeq,runnerReport:pick(result.runnerReport,['modelMiB','kvMiB','kvTokens','computeMiB','totalMiB','offloaded','device']),memoryGuard:result.memoryGuard??null};}
+ if(name==='local_llm_status'){return {phase:result.phase,profile:result.profile??null,deployment:deployment(result.deployment),context:pick(result.context,['totalContext','perRequestContext','parallel','kvUnified']),startupObservation:startup(result.startupObservation),stopObservation:stop(result.stopObservation),promptObservations:(result.promptObservations||[]).slice(0,64).map(o=>({...pick(o,['id','controllerEpoch','deploymentId','modelId','runnerId','phase','beginSequence','firstTokenSequence','firstTokenPresent','stopSequence','stopNotificationSequence','terminalSequence','monotonicMs','elapsedMs','outcome','errorCode']),runnerIdentity:pick(o.runnerIdentity,['runnerStartId','pid']),cancellation:pick(o.cancellation,['mechanism','stopSequence','notificationSequence'])})),logs:(result.logs||[]).slice(-30).map((l)=>({seq:l.seq,text:String(l.line??l.text??l.message??'').slice(0,240)})),nextSeq:result.nextSeq,runnerReport:pick(result.runnerReport,['modelMiB','kvMiB','kvTokens','computeMiB','totalMiB','offloaded','device']),memoryGuard:result.memoryGuard??null};}
+ if(name==='local_llm_stop')return {deployment:deployment(result.deployment),stopObservation:stop(result.stopObservation)};
  return result;};
 (async()=>{
  const {mintSessionJwt}=await import('/opt/ploinky/cli/server/auth/localService.js');
@@ -165,13 +176,16 @@ const project=(name,result)=>{
  const token=mintSessionJwt({id:'local:admin',username:'admin',name:'Local CLI',email:'',roles:['user','admin']},1,{channel:'cli'});
  const client=createAgentClient('http://127.0.0.1:8080/mcp',{requestHeaders:{cookie:'ploinky_jwt='+token}});
  try{
-  const tools=await client.listTools();
+  const end=performance.now()+(view.budgetMs||285000);let outerTimer;
+  const bounded=p=>Promise.race([p,new Promise((_,reject)=>{outerTimer=setTimeout(()=>reject(Error('timeout')),Math.max(1,end-performance.now()));})]).finally(()=>clearTimeout(outerTimer));
+  const tools=await bounded(client.listTools());
   const agents=[...new Set(tools.filter((t)=>t&&t.name===tool).map((t)=>(t.annotations&&t.annotations.router&&t.annotations.router.agent)||t.agent).filter(Boolean))];
+  if(view.agent!==undefined&&(agents.length!==1||agents[0]!==view.agent)){out({ok:false,error:{code:'agent_identity_mismatch',message:'The advertised model route differs from the pinned route'}});return;}
   if(agents.length!==1)fail('The tool '+tool+' is offered by '+agents.length+' agents','agent_not_found');
-  let timer;const reply=await Promise.race([client.callTool(tool,args,{agent:agents[0]}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('timeout')),285000);})]).finally(()=>clearTimeout(timer));
+  const reply=await bounded(client.callTool(tool,args,{agent:agents[0]}));
   const text=reply&&Array.isArray(reply.content)?(reply.content.find((c)=>c&&c.type==='text')||{}).text:undefined;
   const refusal=(raw)=>{let doc=null;try{doc=JSON.parse(raw);}catch{doc=null;}
-   if(doc&&typeof doc==='object'&&typeof doc.error==='string')return {ok:false,agent:agents[0],error:{code:doc.error.slice(0,80),message:String(doc.message||doc.error).slice(0,600),details:doc.details&&doc.details.admission?{admission:admission(doc.details.admission)}:undefined}};
+   if(doc&&typeof doc==='object'&&typeof doc.error==='string')return {ok:false,agent:agents[0],error:{code:doc.error.slice(0,80),message:view.apu?'APU request refused':String(doc.message||doc.error).slice(0,600),details:doc.details&&doc.details.admission?{admission:view.apu?{status:doc.details.admission.status,estimate:{constraint:doc.details.admission.estimate?.constraint}}:admission(doc.details.admission),...(view.apu?apuProject(doc.details):{})}:undefined}};
    const message=String(raw||'The tool failed').replace(/^MCP error -?\d+:\s*/,'');const code=(/\b(admission_[a-z_]+|busy|runner_[a-z_]+|licence_required|invalid_[a-z_]+)\b/.exec(message)||[])[1]||'tool_error';
    return {ok:false,agent:agents[0],error:{code,message:message.slice(0,600)}};};
   if(reply&&reply.isError){out(refusal(text));return;}
@@ -187,6 +201,7 @@ export function llmToolWords(tool, args = {}, view = {}) {
     const argsText = JSON.stringify(args); const viewText = JSON.stringify(view);
     if (Buffer.byteLength(argsText) > 4096 || Buffer.byteLength(viewText) > 1024) throw new Error('local-llm tool arguments exceed their bound');
     if (view.model !== undefined && !LLM_MODEL_ID.test(view.model)) throw new Error('Invalid local-llm model view');
+    if (view.agent !== undefined && view.agent !== LLM_AGENT) throw new Error('Invalid expected model route');
     return [tool, argsText, viewText];
 }
 
@@ -213,6 +228,31 @@ for(const name of fs.readdirSync('/proc').filter((n)=>/^[1-9][0-9]*$/.test(n)).s
  }catch(e){if(!['ENOENT','ESRCH','EACCES','EPERM'].includes(e.code))throw e;}
 }
 process.stdout.write(JSON.stringify({processes:out}));`;
+
+// Fixed allowlist projection: never emit the full command line, API key, or
+// environment. Unreadable process facts fail closed, including permissions.
+export const MODEL_PROCESS_FACTS = String.raw`
+const fs=require('node:fs'),crypto=require('node:crypto');
+const expected=process.argv[1];
+if(!['/opt/llama.cpp/llama-server','/opt/llama.cpp-vulkan/llama-server'].includes(expected))throw Error('Invalid executable');
+const hash=(file)=>{const h=crypto.createHash('sha256'),fd=fs.openSync(file,'r'),b=Buffer.alloc(1048576);try{for(;;){const n=fs.readSync(fd,b,0,b.length,null);if(!n)break;h.update(b.subarray(0,n));}}finally{fs.closeSync(fd);}return h.digest('hex');};
+const out=[],names=fs.readdirSync('/proc').filter(n=>/^[1-9][0-9]*$/.test(n));
+if(names.length>4096)throw Error('Process bound exceeded');
+const devices=(directory,pattern)=>{try{const names=fs.readdirSync(directory);if(names.length>4096)throw Error('Device observation bound exceeded');return names.filter(name=>pattern.test(name)).map(name=>directory+'/'+name);}catch(e){if(e.code==='ENOENT')return [];throw e;}};
+const gpuNodes=[...devices('/dev',/^nvidia/),...devices('/dev/dri',/^(?:renderD|card)/)];
+for(const name of names){try{
+ const exe=fs.readlinkSync('/proc/'+name+'/exe');if(!exe.endsWith('/llama-server'))continue;
+ const args=fs.readFileSync('/proc/'+name+'/cmdline','utf8').split('\0');
+ const env=fs.readFileSync('/proc/'+name+'/environ','utf8').split('\0');
+ const values=(flag)=>args.flatMap((arg,i)=>arg===flag?[args[i+1]]:[]);
+ const value=(key)=>{const rows=env.filter(x=>x.startsWith(key+'='));if(rows.length>1||rows.some(x=>x.length>512))throw Error('Invalid selected environment field');return rows.length?rows[0].slice(key.length+1):null;};
+ const pick={};for(const flag of ['--device','--n-gpu-layers','-ngl','--fit']){const rows=values(flag);if(rows.length>1||rows.some(x=>typeof x!=='string'||x.length>128))throw Error('Invalid safe argument');pick[flag]=rows[0]??null;}
+ const stat=fs.readFileSync('/proc/'+name+'/stat','utf8');const fields=stat.slice(stat.lastIndexOf(')')+2).split(' ');
+ out.push({pid:Number(name),start:fields[19],exe,sha256:hash('/proc/'+name+'/exe'),args:pick,gpuNodes,
+ cudaVisible:value('CUDA_VISIBLE_DEVICES'),icd:value('VK_DRIVER_FILES'),layers:value('VK_LOADER_LAYERS_DISABLE'),
+ mps:env.some(x=>/^CUDA_MPS_|^PLOINKY_MPS_/.test(x)),nvidiaLibrary:(value('LD_LIBRARY_PATH')||'').split(':').some(x=>/nvidia|cuda/i.test(x))});
+}catch(e){if(!['ENOENT','ESRCH'].includes(e.code))throw e;}}
+if(out.length>4)throw Error('Runner bound exceeded');process.stdout.write(JSON.stringify({processes:out}));`;
 
 // The digests of the image files that identify the runner: llama.cpp's server, the image's source
 // contract and its runner lock. A fixed list, read-only, streamed.
@@ -384,8 +424,14 @@ export function vllmToolWords(command, { pins = null, hostNvmlBytes = null } = {
 // Pins of an apparatus-local-llm / apparatus-vllm execution profile.
 
 const SHA256 = /^[0-9a-f]{64}$/;
-export function validateLlmModelPins(models) {
-    keys(models, ['small', 'awq'], 'local-llm model pins');
+export function validateLlmModelPins(models, { measurement = false } = {}) {
+    keys(models, ['small', 'awq'], 'local-llm model pins', measurement ? ['larger'] : []);
+    if (models.larger !== undefined) {
+        keys(models.larger, ['id', 'repo', 'file', 'commit', 'size', 'sha256'], 'larger GGUF pin');
+        if (models.larger.id !== 'qwen2.5-1.5b-instruct-q4_k_m' || !bounded(models.larger.repo, 200)
+            || !bounded(models.larger.file, 200) || !/^[a-f0-9]{40}$/.test(models.larger.commit)
+            || !SHA256.test(models.larger.sha256) || !Number.isSafeInteger(models.larger.size) || models.larger.size < 1) throw new Error('Invalid larger GGUF pin');
+    }
     keys(models.small, ['id', 'repo', 'file', 'commit', 'size', 'sha256'], 'GGUF model pin');
     keys(models.awq, ['id', 'repo', 'commit', 'size', 'files'], 'AWQ model pin');
     if (models.small.id !== LLM_MODELS.small || models.awq.id !== LLM_MODELS.awq) throw new Error('Unexpected model pins');

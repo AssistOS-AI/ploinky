@@ -7,6 +7,7 @@ import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { cpuMaxMatches, cpuQuotaMatches, nanoCpusMatches } from '../../cli/sandbox/hardwareLimits/cpuQuota.mjs';
 import { EXIT, validateRunManifest, writePrivateJson } from './fixtures.mjs';
 import { runBoundedProcess, requireTransport } from './liveProcess.mjs';
+import { createOwnershipClient, PROCESS_OWNER_ENV } from './liveProcessOwnership.mjs';
 import { assertRemoteArrival } from './liveRemote.mjs';
 import {
     HASH, HOST_RECORD_DIRECTORIES, ID, INSPECT, MAX_NESTED_LISTED, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, absolute, artifactPathFor, assertWorkspace,
@@ -30,8 +31,17 @@ import { validateGpuProfile } from './liveGpuCommands.mjs';
 import { createLlmCases, llmCleanupProof } from './liveLlmCases.mjs';
 import { validateLlmProfile } from './liveLlmCommands.mjs';
 import { gpuCleanupProof, isGpuProcessRecord, isToleratedRecord } from './liveGpuGate.mjs';
+import { MODEL_PROFILES, createModelCases, validateModelProfile } from './liveModelCases.mjs';
+import { MEASUREMENT_SCENARIOS, MEASUREMENT_DEADLINES } from './liveModelMeasurements.mjs';
+import { assertModelGrantInventory, modelGrantInventory } from './liveModelHostGuard.mjs';
+import { isApuModel } from './liveApuPins.mjs';
+import { APU_OUTCOMES } from './liveApuEvidence.mjs';
+import { createApuHostScope } from './liveApuHost.mjs';
+import { assertLinuxHostSample, assertLinuxIdentity } from './liveLinuxHostGuard.mjs';
+import { validateAmdBaseline } from './liveAmdGpuGate.mjs';
 
 export const LIVE_CASES = Object.freeze({
+    ...Object.fromEntries(Object.values(MODEL_PROFILES).map(spec => [spec.block, [...(spec.cases || [spec.case]), ...(spec.platform === 'darwin' ? Object.values(MEASUREMENT_SCENARIOS) : [])]])),
     'mac-cpu': ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C4', 'LIVE-C5', 'LIVE-C6', 'LIVE-C7'],
     'mac-adversarial': ['LIVE-S1', 'LIVE-S2'],
     'mac-explorer': ['LIVE-X0', 'LIVE-X1'],
@@ -64,7 +74,7 @@ export const LIVE_ACTIONS = Object.freeze(['provision', 'live', 'cleanup']);
 export function validateProfile(run, { partial = false } = {}) {
     validateRunManifest(run);
     const profile = run.target.execution;
-    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu', 'llm']);
+    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu', 'llm', 'model']);
     if (profile.fixtures !== undefined) {
         keys(profile.fixtures, [], 'fixtures', ['cpu', 'gpu', 'llm', 'availability', 'store']);
         for (const name of ['cpu', 'gpu', 'llm', 'availability', 'store']) {
@@ -111,10 +121,25 @@ export function validateProfile(run, { partial = false } = {}) {
         || new Set(profile.cases).size !== profile.cases.length
         || profile.cases.some(id => !LIVE_CASES[run.block].includes(id))) throw new Error('Invalid case selection');
     const gpuCases = profile.cases.some(id => id.startsWith('LIVE-P'));
-    const llmCases = profile.cases.some(id => id.startsWith('LIVE-L'));
+    const llmCases = profile.cases.some(id => /^LIVE-[LM]/.test(id));
     if (llmCases !== (profile.llm !== undefined)) throw new Error('The local-llm pins and the selected cases disagree');
-    if (gpuCases || llmCases || profile.gpu !== undefined) validateGpuProfile(profile);
-    if (llmCases) validateLlmProfile(profile);
+    const modelBlock = Object.values(MODEL_PROFILES).some(spec => spec.block === run.block);
+    if (modelBlock !== (profile.model !== undefined)) throw new Error('Model block and profile disagree');
+    if (modelBlock) {
+        validateModelProfile(profile, run.block);
+        if (isApuModel(profile.model)) {
+            const steps = run.target.plan?.live;
+            if (profile.model.profile !== 'amd-apu-cpu' && !['model-amd-box-devices', 'model-amd-agent-devices'].every(id =>
+                steps?.some(step => step.id === id && step.argv?.some(word => typeof word === 'string' && word.includes('createCommand'))))) throw new Error('AMD create-argument capture missing');
+            if (run.target.plan?.provision?.some(step => step.argv?.includes('var'))) throw new Error('APU fallback cannot use a var step');
+        }
+        if (profile.model.measurement && Object.entries(MEASUREMENT_DEADLINES).some(([key, value]) => run.deadlines[key] !== value)) throw new Error('Measurement deadlines changed');
+        if (JSON.stringify(run.target.cases) !== JSON.stringify(profile.cases)) throw new Error('Model target and execution cases disagree');
+    }
+    else {
+        if (gpuCases || llmCases || profile.gpu !== undefined) validateGpuProfile(profile);
+        if (llmCases) validateLlmProfile(profile);
+    }
     if (!partial) {
         if (profile.cases.includes('LIVE-C2') && (profile.agents.length !== 3 || roles.size !== 3)) throw new Error('C2 requires three distinct owned agents');
         if (gpuCases && !['probe', 'peer', 'cpu'].every(role => roles.has(role))) throw new Error('The GPU cases require the owned probe, peer and cpu agents');
@@ -128,17 +153,21 @@ export function validateProfile(run, { partial = false } = {}) {
         // proved through the product's own durable records (liveBoxTransitionCustody.mjs).
         if (run.ownedBoxes.filter(box => box.id === profile.box.id).length !== 1) throw new Error('Only one immutable owned Box is supported');
         validateC5BoxReceipts(run, profile);
-        keys(run.preInventory, ['containers'], 'before inventory');
+        keys(run.preInventory, ['containers'], 'before inventory', ['gpuGrants', ...(isApuModel(profile.model) ? ['apuHost', 'amdIdle'] : [])]);
         if (!run.ownedBoxes.some(box => box.id === profile.box.id && box.created === profile.box.created)) throw new Error('Missing Box receipt');
         if (!run.operations.some(op => op.id === 'fixture-created' && op.state === 'observed'
             && op.resourceIds?.includes(profile.box.id))) throw new Error('Missing durable fixture creation receipt');
     } else {
         if (profile.box) validateC5BoxReceipts(run, profile);
         else if (run.ownedBoxes.length > 1) throw new Error('Only one immutable owned Box is supported');
-        keys(run.preInventory, [], 'before inventory', ['containers']);
+        keys(run.preInventory, [], 'before inventory', ['containers', 'gpuGrants', ...(isApuModel(profile.model) ? ['apuHost', 'amdIdle'] : [])]);
     }
     if (run.preInventory.containers !== undefined && (!Array.isArray(run.preInventory.containers) || run.preInventory.containers.length > 256
         || run.preInventory.containers.some(value => !ID.test(value.id) || !bounded(value.created, 128) || !bounded(value.image, 128)))) throw new Error('Invalid before inventory');
+    if (isApuModel(profile.model) && run.preInventory.apuHost) {
+        assertLinuxIdentity(run.preInventory.apuHost, profile.model.amd); assertLinuxHostSample(run.preInventory.apuHost);
+        if (profile.model.profile !== 'amd-apu-cpu') validateAmdBaseline(run.preInventory.amdIdle);
+    }
     // The only recorded processes are the registered GPU processes of a GPU run,
     // each with its full tuple; cleanup never signals them and the final GPU observation
     // proves them gone.
@@ -258,7 +287,8 @@ export function createLiveAdapter(profile, {
             if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
             run.operations.push(op); persist();
         }
-        const callSignal = cleanup ? cleanupSignal : (abort ? (signal ? AbortSignal.any([signal, abort]) : abort) : signal);
+        const scopeSignal = cleanup ? cleanupSignal : signal;
+        const callSignal = abort ? (scopeSignal ? AbortSignal.any([scopeSignal, abort]) : abort) : scopeSignal;
         const result = await processProvider(binary, args, { cwd: profile.workspace.path, env: gate === null ? env : { ...env, PLOINKY_BOX_HARDWARE_LIMITS: gate }, deadlineMs, maxBytes, signal: callSignal });
         if (op) {
             op.state = 'observed';
@@ -563,10 +593,10 @@ export function createLiveAdapter(profile, {
     }
     // The GPU cases of an apparatus-mps run (liveGpuCases.mjs), built over this
     // adapter's own journaled commands.
-    const gpuContext = { profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, processProvider, env, signal, host: hostProc, timings: gpuTimings };
+    const gpuContext = { profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, processProvider, env, signal, cleanupSignal, host: hostProc, timings: gpuTimings };
     const gpu = profile.gpu && !profile.llm ? createGpuCases(gpuContext) : null;
     // The local-llm and vLLM cases (liveLlmCases.mjs) build on the same kit and cleanup hooks.
-    const llm = profile.llm ? createLlmCases(gpuContext) : null;
+    const llm = profile.model ? createModelCases(gpuContext) : profile.llm ? createLlmCases(gpuContext) : null;
     // The availability cases (LIVE-C3 and LIVE-C3V) of their own fixtures.
     const availability = profile.fixtures?.availability ? createAvailabilityCases({ profile, run, command, engine, core, nested, inspectBox, safeArtifact, persist, ...availabilitySeams }) : null;
     // The store case (LIVE-C5): the host and the in-Box writers of the policy store, its lock and its barrier.
@@ -590,6 +620,7 @@ export function createLiveAdapter(profile, {
         }
         await runOwnedCleanup({ run, profile, persist, processProvider, signal: cleanupSignal, artifacts, artifactPath, proofAction: 'live' });
         if (hooks) await hooks.afterCleanup();
+        if (profile.model && run.cleanup.failures.length) throw new Error('Model cleanup has recorded failures');
     }
     return { cpuCase, coreCase, swapCase, helperCase, cleanup, inspectBox, gpu, llm, availability, store };
 }
@@ -624,7 +655,7 @@ function pinProblem(run, profile, hostIdentity, remoteArrival) {
 // Standalone cleanup resumes from the manifest alone, including after an
 // interrupted provisioning that never recorded a Box or workspace receipt.
 export async function executeCleanupRun({ run, persist = () => {}, processProvider = runBoundedProcess, signal, remoteArrival = false, hostIdentity = defaultHostIdentity(), hostProc, artifacts = () => {}, artifactPath = null } = {}) {
-    const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Cleanup only' }));
+    const cases = (run.target.execution?.model ? run.target.execution.cases : LIVE_CASES[run.block]).map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Cleanup only' }));
     const report = { schema: 1, runId: run.runId, action: 'cleanup', verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
     // The foreign-workspace guard speaks first, over whatever the manifest names, before the profile is even validated.
     const foreign = foreignWorkspaceProblem(foreignGuardInput(run, run.target?.execution));
@@ -649,6 +680,10 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
         // as in the live run; the registered processes are the manifest's own records, so a
         // resumed run proves the same thing. Without it the cleanup stays failed and retryable.
         if (profile.gpu) await gpuCleanupProof({ run, profile, processProvider, signal: scope, hostProc, artifacts });
+        if (isApuModel(profile.model) && run.preInventory.apuHost) {
+            const host = await createApuHostScope({ run, profile, processProvider, signal: scope, write: artifacts });
+            await host.final();
+        }
         // An LLM block likewise: this action proves its model data is gone and writes the proof the stager demands of a
         // cleanup (the live run's own proof belongs to that action and is never accepted for this one).
         if (profile.llm) {
@@ -656,6 +691,8 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
             if (!workspacePath) throw new Error('The cleanup cannot prove the model data gone: no workspace path is recorded');
             llmCleanupProof({ workspace: workspacePath, runId: run.runId, action: 'cleanup', write: artifacts });
         }
+        assertModelGrantInventory(run, profile);
+        if (profile.model?.profile === 'apple-cpu') artifacts('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.host.home) });
         run.cleanup.state = 'complete'; run.state = 'complete';
     } catch (error) { run.cleanup.state = 'failed'; run.cleanup.failures.push(error.message); }
     finally { clearTimeout(timer); }
@@ -671,19 +708,40 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
 } = {}) {
     if (action === 'cleanup') return executeCleanupRun({ run, persist, processProvider, signal, remoteArrival, hostIdentity, hostProc, artifacts, artifactPath });
     const selected = run.target.execution?.cases || LIVE_CASES[run.block];
-    const cases = LIVE_CASES[run.block].map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Not selected or no completed enforcement evidence' }));
+    const cases = (run.target.execution?.model ? selected : LIVE_CASES[run.block]).map(id => ({ id, result: 'blocked', reason: UNSUPPORTED[id] || 'Not selected or no completed enforcement evidence' }));
     const report = { schema: 1, runId: run.runId, action, verdict: 'BLOCKED', exitCode: EXIT.BLOCKED, cases, cleanup: run.cleanup, limitations: [] };
+    const prevented = () => {
+        const model = run.target.execution?.model;
+        const expected = isApuModel(model) ? MODEL_PROFILES[model.profile].cases : null;
+        // A repeat live request may not replace already-bound outcome records.
+        if (expected && JSON.stringify(selected) === JSON.stringify(expected)
+            && !run.operations.some(op => op.kind === 'apu-case-result')) {
+            for (const [index, entry] of cases.entries()) {
+                entry.result = index === 0 ? 'blocked' : 'pending';
+                entry.reason = (index === 0 ? report.limitations.join('; ') : 'Earlier prerequisite prevented execution').slice(0, 400);
+                entry.evidence = { schema: 1, runId: run.runId, block: run.block, profile: model.profile,
+                    case: entry.id, status: entry.result, reason: entry.reason };
+                try {
+                    artifacts(`model-${entry.id.toLowerCase()}`, entry.evidence);
+                    run.operations.push({ id: `apu-result-${entry.id.toLowerCase()}`, kind: 'apu-case-result', state: 'observed',
+                        case: entry.id, status: entry.result, receiptDigest: jsonDigest(entry.evidence) });
+                } catch { report.limitations.push('Mandatory APU prevented-case receipt unavailable'); }
+            }
+            persist();
+        }
+        return report;
+    };
     const foreign = foreignWorkspaceProblem(foreignGuardInput(run, run.target?.execution));
-    if (foreign) { report.limitations.push(foreign); return report; }
+    if (foreign) { report.limitations.push(foreign); return prevented(); }
     let profile;
-    try { profile = validateExecutionProfile(run); } catch (error) { report.limitations.push(error.message); return report; }
-    if (run.cleanup.state !== 'not-started') { report.limitations.push('Cleanup has already started for this run; provision a new one'); return report; }
+    try { profile = validateExecutionProfile(run); } catch (error) { report.limitations.push(error.message); return prevented(); }
+    if (run.cleanup.state !== 'not-started') { report.limitations.push('Cleanup has already started for this run; provision a new one'); return prevented(); }
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
-    if (problem) { report.limitations.push(problem); return report; }
-    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C3V', 'LIVE-C5', 'LIVE-C6', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3'].includes(id))) {
-        report.limitations.push('Selected cases have no implemented live executor'); return report;
+    if (problem) { report.limitations.push(problem); return prevented(); }
+    if (!selected.some(id => ['LIVE-C1', 'LIVE-C2', 'LIVE-C3', 'LIVE-C3V', 'LIVE-C5', 'LIVE-C6', 'LIVE-A1', 'LIVE-P1', 'LIVE-P2', 'LIVE-P3', 'LIVE-P4', 'LIVE-L1', 'LIVE-L2', 'LIVE-L3', 'LIVE-L4', 'LIVE-L5', 'LIVE-L6', 'LIVE-L7', 'LIVE-L8', 'LIVE-L9', 'LIVE-L10', 'LIVE-L11', 'LIVE-L12', 'LIVE-L13', ...Object.values(MEASUREMENT_SCENARIOS)].includes(id))) {
+        report.limitations.push('Selected cases have no implemented live executor'); return prevented();
     }
-    if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return report; }
+    if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return prevented(); }
     assertWorkspace(profile);
     const blockController = new AbortController();
     const cleanupController = new AbortController();
@@ -703,13 +761,16 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
                 ...(adapter.availability ? { 'LIVE-C3': adapter.availability.liveC3, 'LIVE-C3V': adapter.availability.liveC3V } : {}),
                 ...(adapter.store ? { 'LIVE-C5': adapter.store.liveC5 } : {}),
                 ...(adapter.gpu ? { 'LIVE-P1': adapter.gpu.liveP1, 'LIVE-P2': adapter.gpu.liveP2, 'LIVE-P3': adapter.gpu.liveP3, 'LIVE-P4': adapter.gpu.liveP4 } : {}),
-                ...(adapter.llm ? { 'LIVE-L1': adapter.llm.liveL1, 'LIVE-L2': adapter.llm.liveL2, 'LIVE-L3': adapter.llm.liveL3 } : {}),
+                ...(adapter.llm ? profile.model ? { ...(isApuModel(profile.model) ? Object.fromEntries(profile.cases.map(id => [id, () => adapter.llm.apuCase(id)])) : { [MODEL_PROFILES[profile.model.profile].case]: adapter.llm.liveModel }),
+                    ...Object.fromEntries(Object.values(MEASUREMENT_SCENARIOS).map(id => [id, () => adapter.llm.liveMeasurement(id)])) }
+                    : { 'LIVE-L1': adapter.llm.liveL1, 'LIVE-L2': adapter.llm.liveL2, 'LIVE-L3': adapter.llm.liveL3 } : {}),
             };
             for (const id of selected) {
                 activeCase = id;
-                if (!executors[id]) continue;
+                if (!executors[id]) { if (isApuModel(profile.model)) throw new Error('APU case has no executor'); continue; }
                 const evidence = await executors[id]();
-                Object.assign(cases.find(value => value.id === id), { result: 'pass', reason: '', evidence });
+                if (isApuModel(profile.model) && !APU_OUTCOMES.includes(evidence?.status)) throw new Error('APU executor returned an unknown status');
+                Object.assign(cases.find(value => value.id === id), { result: isApuModel(profile.model) ? evidence.status : 'pass', reason: evidence?.reason || '', evidence });
             }
         }
     } catch (error) {
@@ -718,6 +779,22 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
         report.limitations.push(error.message);
     } finally {
         clearTimeout(blockTimer);
+        if (isApuModel(profile.model)) {
+            for (const entry of cases) {
+                if (!entry.evidence) {
+                    const active = entry.id === activeCase;
+                    entry.result = active && ['fail', 'blocked'].includes(entry.result) ? entry.result : 'pending';
+                    entry.reason = active ? entry.reason || 'Case execution did not produce a receipt' : 'Earlier case or prerequisite prevented execution';
+                    entry.evidence = { schema: 1, runId: run.runId, block: run.block, profile: profile.model.profile,
+                        case: entry.id, status: entry.result, reason: entry.reason };
+                }
+                try { artifacts(`model-${entry.id.toLowerCase()}`, entry.evidence); }
+                catch { entry.result = 'fail'; entry.reason = 'Mandatory APU case receipt unavailable'; }
+                run.operations.push({ id: `apu-result-${entry.id.toLowerCase()}`, kind: 'apu-case-result', state: 'observed',
+                    case: entry.id, status: entry.result, receiptDigest: jsonDigest(entry.evidence) });
+            }
+            persist();
+        }
         if (attempted || action === 'cleanup') {
             run.state = 'cleanup-required'; run.cleanup.state = 'running'; persist();
             const cleanupTimer = setTimeout(() => cleanupController.abort(), 5 * 60 * 1000);
@@ -743,6 +820,13 @@ export async function runLiveCommand({
     if (!authorizationPath) throw new Error('APPROVAL REQUIRED: provide the binding record for separate execution-time approval of this exact target/action');
     const { value: authorization, bytes: authorizationBytes } = readPrivateJson(authorizationPath, 4096);
     validateAuthorization(run, bytes, authorization, action);
+    let ownershipClient;
+    if (Object.hasOwn(process.env, PROCESS_OWNER_ENV)) {
+        if (!['mac-model-venus/apple', 'mac-model-cpu/apple-cpu'].includes(`${run.block}/${run.target.execution?.model?.profile}`)
+            || run.target.ssh || remoteLocal !== null || processProvider) throw Error('Process ownership requires the local Apple action and exclusive provider');
+        ownershipClient = await createOwnershipClient({ descriptorPath: process.env[PROCESS_OWNER_ENV], runPath, runId: run.runId, action });
+        processProvider = ownershipClient.processProvider;
+    }
     if (remoteLocal !== null) {
         if (remoteLocal !== run.runId) throw new Error('Remote invocation run identity mismatch');
         if (expectedManifestDigest !== digest(bytes)) throw new Error('Remote manifest bytes do not match authorized local input');
@@ -763,5 +847,8 @@ export async function runLiveCommand({
                 : await executeLiveRun({ run, action, ...local });
         writePrivateJson(path.join(path.dirname(runPath), `report_${action}.json`), report);
         return report;
-    } finally { process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); process.removeListener('SIGHUP', abort); }
+    } finally {
+        await ownershipClient?.close();
+        process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); process.removeListener('SIGHUP', abort);
+    }
 }

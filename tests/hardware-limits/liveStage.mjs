@@ -13,6 +13,9 @@ import { EXIT, validateRunManifest } from './fixtures.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { assertLocalSshPins, dispatchRemoteRun, safePath, sshOptions, validateRemoteTarget } from './liveRemote.mjs';
 import { HASH, OWNER_MARKER, RUN_ID, artifactPathFor, c5CleanupProofName, digest, failureEvidenceNames, jsonDigest, keys } from './liveCommon.mjs';
+import { isApuModel } from './liveApuPins.mjs';
+import { validateApuReceipt, validateApuHostProof, validateApuIdleProof } from './liveApuEvidence.mjs';
+import { MODEL_PROFILES, assertModelContainer, assertModelObservation } from './liveModelCases.mjs';
 
 const WORD = /^[A-Za-z0-9_./:=,%+@-]+$/;
 export const REMOTE_PARENT = '.cache/ploinky-hwlimits';
@@ -185,7 +188,24 @@ export function c5RequiredArtifacts({ profile, action, remoteReport, fetched = n
 }
 
 // What a run must have left for its PASS to be certified: the proof each action ends with.
-export function requiredArtifacts({ profile, action, remoteReport, fetched = null }) {
+export function requiredArtifacts({ profile, action, remoteReport, fetched = null, dispatchHistory = null }) {
+    if (profile?.model) {
+        if (isApuModel(profile.model)) {
+            const gpu = profile.model.profile !== 'amd-apu-cpu';
+            if (action === 'provision') return ['box-inspect', 'box-contract', 'linux-host-guard-baseline', ...(gpu ? ['amd-idle-gate-initial'] : [])];
+            if (['live', 'cleanup'].includes(action)) return ['llm-cleanup-proof', 'linux-host-guard', ...(gpu ? ['amd-idle-gate-final'] : []),
+                ...(action === 'cleanup' && modelProvisionOnlyCleanupProven({ fetched, dispatchHistory }) ? [] : profile.cases.map(id => `model-${id.toLowerCase()}`))];
+            return [];
+        }
+        if (profile.model.measurement && action === 'live') return [
+            ...profile.cases.map(id => `${id.startsWith('LIVE-M') ? 'measurement' : 'model'}-${id.toLowerCase()}`),
+            'llm-cleanup-proof', 'model-stop-proof', 'model-a15-host-guard',
+        ];
+        if (action === 'provision') return ['box-inspect', 'box-contract', ...(profile.gpu ? ['gpu-initial-gate'] : []), ...(['apple', 'apple-cpu'].includes(profile.model.profile) ? ['model-apple-machine'] : [])];
+        if (action === 'live') return [`model-${profile.cases[0].toLowerCase()}`, 'llm-cleanup-proof', ...(remoteReport?.verdict === 'PASS' ? ['model-stop-proof', 'model-container-mounts', 'model-source-binding-before', 'model-container-mounts-after', 'model-source-binding-after'] : []), ...(profile.gpu ? ['gpu-final-observation'] : []), ...(['apple', 'apple-cpu'].includes(profile.model.profile) ? ['model-a15-host-guard'] : [])];
+        if (action === 'cleanup') return ['llm-cleanup-proof', ...(modelProvisionOnlyCleanupProven({ fetched, dispatchHistory }) ? [] : [`model-${profile.cases[0].toLowerCase()}`]), ...(profile.gpu ? ['gpu-final-observation'] : [])];
+        return [];
+    }
     if (!profile?.gpu) return profile?.cases?.includes('LIVE-C5') ? c5RequiredArtifacts({ profile, action, remoteReport, fetched }) : [];
     // A failed or blocked MPS case that ran left its failure evidence (the daemon's state and logs, the Router and
     // Watchdog tails, the Apply response) before the Box was destroyed; a missing item is reported with the run.
@@ -198,14 +218,52 @@ export function requiredArtifacts({ profile, action, remoteReport, fetched = nul
     return [];
 }
 
+// Absence of an inference artifact is never proof that live was not attempted.
+// The caller's persisted dispatch intent precedes the remote command, including
+// cancellation or failed transport. Only a complete, bound non-live history
+// may certify cleanup of a cohort that was provisioned but never tested.
+export function modelProvisionOnlyCleanupProven({ fetched, dispatchHistory }) {
+    if (!fetched || !RUN_ID.test(fetched.runId || '') || dispatchHistory?.schema !== 1 || dispatchHistory.runId !== fetched.runId
+        || dispatchHistory.rootIntent !== true || dispatchHistory.staged !== true
+        || !['dev', 'ino', 'uid'].every(key => typeof dispatchHistory.identity?.[key] === 'string' && /^[0-9]+$/.test(dispatchHistory.identity[key]))
+        || typeof fetched.target?.stage?.root !== 'string' || dispatchHistory.root !== fetched.target.stage.root
+        || !Array.isArray(fetched.operations) || fetched.operations.some(op => !op || typeof op.kind !== 'string')) return false;
+    const liveKinds = new Set(['model-box', 'model-agent', 'model-source-view', 'model-agent-after', 'model-box-after']);
+    if (fetched.operations.some(op => liveKinds.has(op.kind) || op.kind.startsWith('model-local_llm_'))) return false;
+    const history = dispatchHistory.dispatches;
+    if (!Array.isArray(history) || history.length < 2 || history.length > 1024
+        || history.some(entry => !entry || !['provision', 'cleanup'].includes(entry.action)
+            || !['intent', 'returned', 'incomplete'].includes(entry.state) || !HASH.test(entry.manifestDigest || ''))
+        || history[0].action !== 'provision' || history.at(-1).action !== 'cleanup' || history.at(-1).state !== 'returned') return false;
+    return true;
+}
+
+export function modelInferenceProofProblem(bytes, { runId, caseId, workspace, requirePass = false }) {
+    let proof;
+    try { proof = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch { return 'model inference proof is not JSON'; }
+    if (proof?.schema !== 1 || proof.runId !== runId || proof.case !== caseId) return 'model inference proof identity mismatch';
+    if (!['pass', 'fail'].includes(proof.status) || requirePass && proof.status !== 'pass') return 'model inference proof is not a terminal result';
+    if (proof.status === 'pass' && (typeof proof.answer?.text !== 'string' || !proof.answer.text.trim() || !Number.isFinite(proof.answer.generationTokensPerSecond) || proof.answer.generationTokensPerSecond <= 0
+        || !proof.agent?.id || !HASH.test(proof.source?.stagedTreeDigest || '') || !Array.isArray(proof.processes) || proof.processes.length !== 1
+        || typeof workspace !== 'string' || !workspace.startsWith('/') || proof.source?.path !== `${workspace}/local-llms/local-llm`
+        || proof.source.binding?.code !== proof.source.path
+        || proof.source.binding.treeDigest !== proof.source.stagedTreeDigest || !/^[a-f0-9]{64}$/.test(proof.source.binding.dependency?.generationId || '')
+        || proof.source.binding.provider?.mode !== 'image' || proof.source.binding.provider.path !== '/opt/ploinky-agentlib'
+        || !/^[a-f0-9]{64}$/.test(proof.source.binding.provider.sourceIdHash || '')
+        || proof.source.binding.provider.boxId !== proof.box?.id || !HASH.test(proof.source.binding.provider.supplyingImageId || '')
+        || proof.source.binding.provider.supplyingImageId !== `sha256:${String(proof.box?.image).replace(/^sha256:/, '')}`
+        || !Number.isInteger(proof.source.binding.files) || proof.source.binding.files < 1)) return 'model inference proof lacks runtime evidence';
+    return null;
+}
+
 // Why a fetched `llm-cleanup-proof` does not certify THIS cleanup, or null: it must be this run's, written by a cleanup
 // action (not by the live run), and list nothing remaining.
-export function llmCleanupProofProblem(bytes, { runId }) {
+export function llmCleanupProofProblem(bytes, { runId, action = 'cleanup' }) {
     let proof;
     try { proof = JSON.parse(Buffer.from(bytes).toString('utf8')); } catch { return 'the LLM cleanup proof is not JSON'; }
     if (!proof || typeof proof !== 'object' || proof.schema !== 1) return 'the LLM cleanup proof has an unknown shape';
     if (proof.runId !== runId) return 'the LLM cleanup proof belongs to another run';
-    if (proof.action !== 'cleanup') return `the LLM cleanup proof was written by the ${String(proof.action).slice(0, 20)} action, not by this cleanup`;
+    if (proof.action !== action) return `the LLM cleanup proof was written by the ${String(proof.action).slice(0, 20)} action, not by this ${action}`;
     if (!Number.isSafeInteger(proof.at) || proof.at <= 0) return 'the LLM cleanup proof has no time';
     if (!Array.isArray(proof.remaining) || proof.remaining.length) return 'the LLM cleanup proof lists model data that remains';
     return null;
@@ -356,12 +414,35 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         if (jsonDigest(JSON.parse(reportText)) !== jsonDigest(remoteReport)) throw new Error('Fetched remote report differs from the dispatched result');
         writePrivateBytes(path.join(runDirectory, `report_${action}_remote_${suffix}.json`), Buffer.from(reportText, 'utf8'));
         // The side artifacts, with digest proof, before anything can be removed.
-        const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport, fetched }) });
+        const artifacts = await fetchArtifacts({ required: requiredFor({ profile, action, remoteReport, fetched,
+            dispatchHistory: { schema: journal.schema, runId: journal.runId, root: journal.root, rootIntent: journal.rootIntent,
+                staged: journal.staged, identity: journal.identity, dispatches: journal.dispatches } }) });
         // A cleanup's LLM proof must be this action's own, for this run, with nothing remaining.
-        const proofEntry = action === 'cleanup' ? artifacts.fetched.find(entry => entry.name === 'llm-cleanup-proof') : null;
+        const proofEntry = action === 'cleanup' || profile.model && action === 'live' ? artifacts.fetched.find(entry => entry.name === 'llm-cleanup-proof') : null;
         if (proofEntry) {
-            const problem = llmCleanupProofProblem(fs.readFileSync(path.join(runDirectory, proofEntry.file)), { runId: run.runId });
+            const problem = llmCleanupProofProblem(fs.readFileSync(path.join(runDirectory, proofEntry.file)), { runId: run.runId, action });
             if (problem) { artifacts.failures.push({ name: 'llm-cleanup-proof', reason: problem }); artifacts.complete = false; }
+        }
+        if (profile.model && ['live', 'cleanup'].includes(action)) {
+            if (isApuModel(profile.model)) {
+                const exempt = action === 'cleanup' && modelProvisionOnlyCleanupProven({ fetched, dispatchHistory: journal });
+                if (!exempt) {
+                    const problem = apuFetchedProofProblem({ run, fetched, remoteReport, action,
+                        read: name => {
+                            const entries = artifacts.fetched.filter(item => item.name === name);
+                            if (entries.length !== 1) throw new Error('APU artifact is missing or duplicated');
+                            return fs.readFileSync(path.join(runDirectory, entries[0].file));
+                        } });
+                    if (problem) { artifacts.failures.push({ name: 'apu-case-receipts', reason: problem }); artifacts.complete = false; }
+                }
+            } else {
+            const name = `model-${profile.cases[0].toLowerCase()}`;
+            const entry = artifacts.fetched.find(item => item.name === name);
+            if (entry) {
+                const problem = modelInferenceProofProblem(fs.readFileSync(path.join(runDirectory, entry.file)), { runId: run.runId, caseId: profile.cases[0], workspace: profile.provision.workspace.path, requirePass: action === 'live' && remoteReport.verdict === 'PASS' });
+                if (problem) { artifacts.failures.push({ name, reason: problem }); artifacts.complete = false; }
+            }
+            }
         }
         const c5Entry = action === 'cleanup' && profile.cases?.includes('LIVE-C5') && !profile.gpu ? artifacts.fetched.find(entry => entry.name === C5_CLEANUP_PROOF) : null;
         if (c5Entry) {
@@ -472,5 +553,63 @@ export async function stageAndDispatch({ run, bytes, authorizationBytes, action,
         if (after.status === 0 || !/No such file/.test(after.stderr)) throw new Error('Remote staging root remains after removal');
         journal.removal = 'complete'; save();
     }
+}
+
+export function apuFetchedProofProblem({ run, fetched, remoteReport, action, read }) {
+    try {
+        const profile = run.target.execution;
+        const receipts = new Map(profile.cases.map(caseId => [caseId, JSON.parse(Buffer.from(read(`model-${caseId.toLowerCase()}`)).toString('utf8'))]));
+        const allocationRecords = new Map([...receipts].map(([caseId, proof]) => [caseId, proof.bufferObservations || []]));
+        const host = JSON.parse(Buffer.from(read('linux-host-guard')).toString('utf8'));
+        if (host.runId !== run.runId) throw new Error('APU host history belongs to another run');
+        validateApuHostProof(host, profile.model, { requireUntripped: action === 'cleanup' || remoteReport.verdict === 'PASS' });
+        if (profile.model.profile !== 'amd-apu-cpu') {
+            const idle = JSON.parse(Buffer.from(read('amd-idle-gate-final')).toString('utf8'));
+            if (idle.runId !== run.runId) throw new Error('AMD idle history belongs to another run');
+            validateApuIdleProof(idle, { requireUntripped: action === 'cleanup' || remoteReport.verdict === 'PASS',
+                requireFinal: true, runId: run.runId, profile, allocationRecords });
+            // In the live action one cumulative gate wrote every case snapshot and
+            // the final history: each case receipt's history is an exact prefix of
+            // the final one. The cleanup action's final history comes from its own
+            // fresh gate, which never carries a case context.
+            if (action === 'cleanup' && idle.history.some(receipt => receipt.context !== null)) throw new Error('AMD cleanup idle history carries a case context');
+            let covered = 0;
+            for (const proof of action === 'live' ? receipts.values() : []) {
+                if (proof?.gpuGate === undefined) continue;
+                const history = proof.gpuGate?.history;
+                if (!Array.isArray(history) || history.length > idle.history.length || jsonDigest(proof.gpuGate.baseline) !== jsonDigest(idle.baseline)
+                    || history.some((receipt, index) => jsonDigest(receipt) !== jsonDigest(idle.history[index]))) throw new Error('AMD case idle history is not a prefix of the final idle history');
+                covered = Math.max(covered, history.length);
+            }
+            // A blocked check belongs to a nonpassing case, or (with no case
+            // context) to the final cleanup window after every case snapshot.
+            for (const [index, receipt] of idle.history.entries()) {
+                if (receipt.state === 'complete') continue;
+                const owner = receipt.context?.case;
+                if (owner ? !receipts.has(owner) || receipts.get(owner)?.status === 'pass' : index < covered) throw new Error('AMD blocked idle check belongs to a passing case');
+            }
+        }
+        const outcomes = action === 'live' ? remoteReport.cases : fetched.operations.filter(op => op.kind === 'apu-case-result')
+            .map(op => ({ id: op.case, result: op.status }));
+        if (!Array.isArray(outcomes) || outcomes.length !== profile.cases.length
+            || new Set(outcomes.map(entry => entry.id)).size !== outcomes.length
+            || outcomes.some(entry => !profile.cases.includes(entry.id))) throw new Error('APU report case inventory differs');
+        for (const caseId of profile.cases) {
+            const proof = receipts.get(caseId);
+            const records = fetched.operations.filter(op => op.kind === 'apu-case-result' && op.case === caseId);
+            if (records.length !== 1 || records[0].receiptDigest !== jsonDigest(proof) || records[0].status !== proof.status) throw new Error('APU receipt transfer/outcome binding differs');
+            const reportedStatus = outcomes.find(entry => entry.id === caseId).result;
+            if (action === 'live' && remoteReport.verdict === 'PASS' && reportedStatus !== 'pass') throw new Error('APU nonpassing case cannot certify live PASS');
+            validateApuReceipt(proof, { runId: run.runId, block: run.block, profile, caseId, reportedStatus,
+                functional: value => assertModelObservation({ spec: MODEL_PROFILES[profile.model.profile], model: profile.model,
+                    pins: profile.llm.models.small, status: value.deployment, answer: value.answer,
+                    processes: value.processes, imageId: value.agent.image }) });
+            if (proof.status === 'pass') {
+                assertModelContainer(proof.containers.box, { profile, role: 'box' });
+                assertModelContainer(proof.containers.agent, { profile, role: 'agent' });
+            }
+        }
+        return null;
+    } catch (error) { return String(error.message).slice(0, 400); }
 }
 

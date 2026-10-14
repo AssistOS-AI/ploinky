@@ -814,7 +814,7 @@ test('L1.prepare-live-mac-cpu-concrete-manifest-and-summary', async t => {
     const run = JSON.parse(fs.readFileSync(runPath, 'utf8'));
     const profile = validateProfile(run, { partial: true });
     assert.equal(run.state, 'proposed'); assert.deepEqual(profile.cases, ['LIVE-C1', 'LIVE-C2']); assert.deepEqual(run.target.cases, ['LIVE-C1', 'LIVE-C2']);
-    assert.deepEqual(Object.keys(run.target.unsupported), ['LIVE-C3', 'LIVE-C4', 'LIVE-C5', 'LIVE-C6', 'LIVE-C7']);
+    assert.deepEqual(Object.keys(run.target.unsupported), ['LIVE-C4', 'LIVE-C7']);
     assert.equal(profile.provision.revision, f.revision);
     assert.equal(profile.source.root, path.join(f.evidence, `candidate-${run.runId}`));
     assert.equal(liveSourceDigest(profile.source.root), profile.source.digest);
@@ -833,7 +833,7 @@ test('L1.prepare-live-mac-cpu-concrete-manifest-and-summary', async t => {
     const summary = fs.readFileSync(summaryPathFor(runPath, 'claude'), 'utf8');
     assert.equal(summaryPathFor(runPath, 'claude'), path.join(f.evidence, 'mac-cpu-run_summary_claude.md'));
     for (const text of ['Nothing has run', 'TCP 24680', 'UDP 35791', profile.provision.workspace.path, 'memory 64m, cpus 0.5, pids 64', BOX_IMAGE, IMAGE,
-        'destroy --delete-cache', 'LIVE-C3 | not run', f.revision, os.hostname(),
+        'destroy --delete-cache', 'LIVE-C4 | not run', 'LIVE-C7 | not run', f.revision, os.hostname(),
         'PLOINKY_BOX_HARDWARE_LIMITS=on', '$SOURCE/ploinky-box/bin/ploinky-box.mjs --port 24680 --udp-port 35791 start hwlfixture/memory`']) assert.ok(summary.includes(text), text);
     assert.equal(fs.statSync(runPath).mode & 0o077, 0); assert.equal(fs.statSync(summaryPathFor(runPath, 'claude')).mode & 0o077, 0);
 });

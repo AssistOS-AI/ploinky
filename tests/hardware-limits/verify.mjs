@@ -1050,6 +1050,16 @@ async function runLive(options, command) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
+    if (argv.length === 1 && ['help', '--help'].includes(argv[0])) {
+        console.log('Optional local-llm suite (explicit opt-in): apple=mac-model-venus/LIVE-L6; apple-cpu=mac-model-cpu/LIVE-L7; nvidia=apparatus-model-nvidia/LIVE-L4; cpu=apparatus-model-cpu/LIVE-L5.\n'
+            + 'AMD profiles: amd-apu=linux-model-amd-apu/LIVE-L13,L9,L11,L12; amd-apu-pressure=linux-model-amd-apu-pressure/LIVE-L10; amd-apu-cpu=linux-model-amd-apu-cpu/LIVE-L8. L12 remains pending instrumentation; no APU qualification.\n'
+            + 'Mac pins.model.measurement selects frozen baseline-v1/longer-context-v1/two-slots-v1/larger-model-v1/load-cancel-v1/generation-cancel-v1 scenarios. No later configuration override.\n'
+            + 'prepare-live --block BLOCK --config ABS_PATH --pins ABS_PATH --run ABS_PATH\n'
+            + 'provision|live|cleanup --run ABS_PATH --authorization ABS_PATH\n'
+            + 'Each action requires its own execution-time authorization for the exact manifest. Apple uses the already-selected rootless libkrun machine; its caller owns setup and restoration.\n'
+            + 'Other commands: configure, self-test, baseline, offline. Existing suites remain separate.');
+        return EXIT.PASS;
+    }
     const { command, options } = parseArgs(argv);
     switch (command) {
     case 'configure': return configure(options);

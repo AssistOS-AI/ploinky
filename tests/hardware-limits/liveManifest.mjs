@@ -26,8 +26,19 @@ import { DRIVER_FILE } from './liveStoreTransition.mjs';
 import { remoteRoot, remoteReportName } from './liveStage.mjs';
 import { DOCUMENT_SUFFIXES, GPU_TOLERATED_MAX, GPU_TOLERATED_MAX_MIB } from './fixtures.mjs';
 import { sshOptions } from './liveRemote.mjs';
+import { MODEL_PROFILES, modelPlan, validateModelPins } from './liveModelCases.mjs';
+import { normalizeMeasurement, measurementCases, MEASUREMENT_DEADLINES, MEASUREMENT_SCENARIOS, MEASUREMENT_MODEL } from './liveModelMeasurements.mjs';
+import { isApuModel, prepareApuModel } from './liveApuPins.mjs';
 
+// The deadlines recorded in a block's manifest. Only the two Linux ordinary-model blocks have the longer provision start.
+export function blockDeadlines(block, execution = {}) {
+    const spec = CONCRETE_BLOCKS[block];
+    if (!spec) throw new Error(`Unknown hardware-limits block ${block}`);
+    return { ...(execution.model?.measurement ? { ...DEADLINES, ...MEASUREMENT_DEADLINES } : LINUX_MODEL_START_BLOCKS.includes(block) ? LINUX_MODEL_DEADLINES
+        : spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : spec.store ? STORE_DEADLINES : spec.availability ? AVAILABILITY_DEADLINES : DEADLINES) };
+}
 export const CONCRETE_BLOCKS = Object.freeze({
+    ...Object.fromEntries(Object.entries(MODEL_PROFILES).map(([model, spec]) => [spec.block, { platform: spec.platform, remote: spec.platform === 'linux', cases: spec.cases || [spec.case], llm: true, model, gpu: model === 'nvidia' }])),
     'mac-cpu': { platform: 'darwin', remote: false, cases: ['LIVE-C1', 'LIVE-C2'] },
     'apparatus-cpu': { platform: 'linux', remote: true, cases: ['LIVE-A1'] },
     // C1 and C2 on native Linux (release plan C8b): the same owned CPU fixture and executors as mac-cpu, on the apparatus.
@@ -52,6 +63,17 @@ export const CONCRETE_BLOCKS = Object.freeze({
 // approver sees exactly what a PASS means. `row` names the spec line; `procedure` is what the runner does; `passes` the observable
 // artifact; `evidence` the files the case writes. The summary prints every selected case that has an entry.
 export const CASE_PASS_CONDITIONS = Object.freeze({
+    ...Object.fromEntries(Object.entries(MEASUREMENT_SCENARIOS).map(([scenario, id]) => [id, {
+        row: `Apple measurement ${scenario}`, procedure: 'Frozen canonical measurement through owned routed commands, with host guard and monotonic deadlines.',
+        passes: 'Every required load, prompt, source, model, memory and Stop receipt validates. Refused, blocked, incomplete and not-exercised are never pass.',
+        evidence: `measurement-${id.toLowerCase()} and all indexed artifacts; final settlement, cleanup and restoration remain mandatory.`,
+    }])),
+    ...Object.fromEntries(Object.values(MODEL_PROFILES).map(spec => [spec.case, {
+        row: `Optional local-llm ${spec.block}`,
+        procedure: 'A fresh budget-off Box runs committed ordinary local-llm source through bounded Router MCP calls. CPU withdraws GPU access before startup. Apple revalidates the selected rootless libkrun machine and observes the bounded A15 host guard; the caller owns machine setup and restoration.',
+        passes: `Exactly one successful pinned Qwen2.5-0.5B-Instruct Q4_K_M prompt with nonempty text and positive finite generation rate, ${spec.backend} profile, ${spec.runner} b11159 executable hash, expected backend/device/offload or strict CPU launch facts, exact image config and read-only source binding. Stop and owned cleanup must succeed with model data and runtime removed.`,
+        evidence: `model-${spec.case.toLowerCase()}, model-stop-proof, llm-cleanup-proof; Apple adds model-apple-machine/model-a15-host-guard, NVIDIA adds gpu-initial-gate/gpu-final-observation`,
+    }])),
     'LIVE-C1': {
         row: 'spec 15.4 LIVE-C1 (:1322) with amendment A4',
         procedure: 'The owned CPU fixture (memory, cpu and pids agents, 64m/0.5 CPU/64 pids, readiness none) is started with the gate on and started again without the flag; the Box and workload cgroups and owners are inspected read-only (no write is ever attempted).',
@@ -101,6 +123,15 @@ export const GPU_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 24 * 60 * 10
 // for the block, cleanup and margin), and the install and the load are bounded inside them. An install or a load that does not fit
 // is BLOCKED with the progress it made, never an indefinite poll.
 export const LLM_DEADLINES = Object.freeze({ ...GPU_DEADLINES });
+// The Linux ordinary-model blocks (LIVE-L4 NVIDIA, LIVE-L5 CPU) start a cold Box in a fresh workspace: the host Box image and the
+// nested local-llm image are pulled during the provision start. The local-llm image alone has a 2,453,102,477-byte layer, about
+// 23 minutes at the 1.76 MB/s single-connection Docker Hub rate measured on the apparatus, so the start has 60 minutes. The block,
+// which is also the remote action bound (min(18,000,000, block + cleanup + 30 s) = 4,830,000 ms), is 75 minutes: the 60-minute
+// start plus 15 minutes for the provision's other bounded steps (engine identity, inventories and inspects at 30 s each, the GPU
+// grant or withdrawal, the GPU query) and its failure-path owned cleanup (destroy 5 minutes). The block deadline is also the live
+// action's ceiling for these two blocks; every live, load, stop and cleanup bound inside it is unchanged.
+export const LINUX_MODEL_DEADLINES = Object.freeze({ ...LLM_DEADLINES, startMs: 60 * 60 * 1000, blockMs: 75 * 60 * 1000 });
+const LINUX_MODEL_START_BLOCKS = Object.freeze(['apparatus-model-nvidia', 'apparatus-model-cpu']);
 // The availability blocks restart the whole graph up to three times and poll for it to settle after each.
 export const AVAILABILITY_DEADLINES = Object.freeze({ ...DEADLINES, blockMs: 60 * 60 * 1000 });
 // The store block waits for the product's own 10 s lock wait several times, stops the Box once, restarts it with the gate on, runs the two actual
@@ -124,7 +155,9 @@ const canonicalFile = file => path.isAbsolute(file) && fs.realpathSync(file) ===
 // are rechecked by the runner on arrival, before any mutation.
 export function validatePins(value, block) {
     const spec = CONCRETE_BLOCKS[block];
-    keys(value, ['schema', 'host', 'node', 'engine', 'boxImage'], 'pins', ['ssh', 'workspaceParentRoot', 'ports', 'gpu', 'llm']);
+    keys(value, ['schema', 'host', 'node', 'engine', 'boxImage'], 'pins', ['ssh', 'workspaceParentRoot', 'ports', 'gpu', 'llm', 'model']);
+    if (spec.model) validateModelPins(value.model, block);
+    else if (value.model !== undefined) throw new Error('Only model blocks accept model pins');
     if (value.schema !== 1) throw new Error('Unsupported pins schema');
     keys(value.host, ['hostname', 'platform', 'home'], 'pinned host');
     keys(value.node, ['path', 'digest'], 'pinned node');
@@ -141,14 +174,14 @@ export function validatePins(value, block) {
     // The observed GPU device and NVIDIA tools: required for the GPU block and
     // refused for every other (a CPU block never names a GPU).
     if (spec.gpu) {
-        keys(value.gpu, ['uuid', 'name', 'driverVersion', 'memoryMiB', 'expectedSmCount', 'smi', 'mpsControl', 'mpsServer'], 'pinned GPU');
-        for (const tool of ['smi', 'mpsControl', 'mpsServer']) {
+        keys(value.gpu, ['uuid', 'name', 'driverVersion', 'memoryMiB', 'smi', ...(spec.model ? [] : ['expectedSmCount', 'mpsControl', 'mpsServer'])], 'pinned GPU');
+        for (const tool of spec.model ? ['smi'] : ['smi', 'mpsControl', 'mpsServer']) {
             keys(value.gpu[tool], ['path', 'digest'], `pinned GPU tool ${tool}`);
             if (!SAFE.test(value.gpu[tool].path) || !HASH.test(value.gpu[tool].digest)) throw new Error(`Invalid pinned GPU tool ${tool}`);
         }
         if (!/^GPU-[a-fA-F0-9-]{8,64}$/.test(value.gpu.uuid) || typeof value.gpu.name !== 'string' || !value.gpu.name || value.gpu.name.length > 256
             || !/^[0-9]+(?:\.[0-9]+)+$/.test(value.gpu.driverVersion) || !Number.isInteger(value.gpu.memoryMiB) || value.gpu.memoryMiB < 1024
-            || !Number.isInteger(value.gpu.expectedSmCount) || value.gpu.expectedSmCount < 1) throw new Error('Invalid pinned GPU device');
+            || (!spec.model && (!Number.isInteger(value.gpu.expectedSmCount) || value.gpu.expectedSmCount < 1))) throw new Error('Invalid pinned GPU device');
     } else if (value.gpu !== undefined) throw new Error('A non-GPU block names no GPU');
     // The immutable local-llm image (and, for vLLM, the pins of the image's lock entry) the operator observed.
     if (spec.llm) {
@@ -206,18 +239,20 @@ export function proposedWorkspace(block, pins, runId) {
 // The pins of the local-llm candidate carried in the frozen payload (.hwl-local-llms/local-llm): its
 // tree digest, its manifest before and after the image is pinned, and the two models' catalog pins
 // the live cases compare the agent's own catalog with.
-export function describeLlmCandidate({ root, sourceRoot, revision, image }) {
+export function describeLlmCandidate({ root, sourceRoot, revision, image, measurement, apuModel }) {
     const local = path.join(root, LLM_SOURCE_DIRECTORY, 'local-llm');
     const bytes = fs.readFileSync(path.join(local, 'manifest.json'));
     const catalog = JSON.parse(fs.readFileSync(path.join(local, 'catalog', 'models.json'), 'utf8'));
     const model = id => { const found = catalog.models.find(entry => entry.id === id); if (!found) throw new Error(`The local-llm catalog has no model ${id}`); return found; };
     const gguf = model(LLM_MODELS.small).sources.gguf;
     const hf = model(LLM_MODELS.awq).sources.hf;
+    const larger = measurement?.scenario === 'larger-model-v1' ? model(MEASUREMENT_MODEL).sources.gguf : null;
     const files = hf.files.map(file => ({ path: file.path, size: file.size, sha256: file.sha256 }));
     return {
         revision, sourcePath: `${sourceRoot}/${LLM_SOURCE_DIRECTORY}/local-llm`, treeDigest: liveSourceDigest(local),
-        manifest: { originalContainer: JSON.parse(bytes).container, originalDigest: digest(bytes), rewrittenDigest: digest(rewriteLlmManifest(bytes, image)) },
+        manifest: { originalContainer: JSON.parse(bytes).container, originalDigest: digest(bytes), rewrittenDigest: digest(rewriteLlmManifest(bytes, image, apuModel)) },
         models: {
+            ...(larger ? { larger: { id: MEASUREMENT_MODEL, repo: larger.repo, file: larger.file, commit: larger.commit, size: larger.size, sha256: larger.sha256 } } : {}),
             small: { id: LLM_MODELS.small, repo: gguf.repo, file: gguf.file, commit: gguf.commit, size: gguf.size, sha256: gguf.sha256 },
             awq: { id: LLM_MODELS.awq, repo: hf.repo, commit: hf.commit, size: files.reduce((sum, file) => sum + file.size, 0), files },
         },
@@ -239,7 +274,9 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
     const agents = fixturePlan(spec.cases);
     // The local-llm candidate runs from its own immutable image, not the Explorer's fixture image.
     if (spec.llm) image = pins.llm.image;
-    const llmCandidate = spec.llm ? describeLlmCandidate({ root: candidate.root, sourceRoot, revision: candidate.llm.revision, image }) : null;
+    const apuModel = isApuModel(pins.model) ? prepareApuModel(pins.model,
+        JSON.parse(fs.readFileSync(path.join(candidate.root, LLM_SOURCE_DIRECTORY, 'local-llm', 'catalog', 'models.json')))) : null;
+    const llmCandidate = spec.llm ? describeLlmCandidate({ root: candidate.root, sourceRoot, revision: candidate.llm.revision, image, measurement: pins.model?.measurement, apuModel }) : null;
     const execution = {
         protocol: 'owned-fixture-v1',
         host: { ...pins.host },
@@ -257,7 +294,20 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
             workspace: { parent, parentMode: remote ? 'staged' : 'create', path: workspacePath },
         },
     };
-    if (spec.llm) {
+    if (spec.model) {
+        const { models, ...plan } = llmCandidate;
+        execution.model = apuModel || structuredClone(pins.model);
+        if (apuModel) execution.provision.apuModel = structuredClone(apuModel);
+        if (pins.model.measurement !== undefined) {
+            execution.model.measurement = normalizeMeasurement(pins.model.measurement, models, spec.model);
+            execution.cases = measurementCases(spec.model, execution.model.measurement);
+        }
+        execution.provision.ordinarySource = true;
+        execution.provision.llm = plan;
+        execution.llm = { image, revision: plan.revision, models };
+        if (spec.model === 'nvidia') execution.gpu = { ...pins.gpu };
+        if (MODEL_PROFILES[spec.model].backend !== 'cpu') execution.provision.gpu = { uuid: spec.model === 'nvidia' ? pins.gpu.uuid : null, grantAgents: [LLM_REF] };
+    } else if (spec.llm) {
         const { models, ...plan } = llmCandidate;
         execution.gpu = { ...pins.gpu };
         execution.provision.gpu = { uuid: pins.gpu.uuid, grantAgents: [LLM_REF] };
@@ -281,7 +331,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         engine: { binary: pins.engine.path, kind: 'podman', identity: pins.engine.identityDigest },
         ssh: remote ? { alias: pins.ssh.alias, expectedAddress: pins.ssh.address, expectedHostKeyAlias: pins.ssh.hostKeyAlias } : null,
         note: 'Proposal only. Each action (provision, live, cleanup) needs its own separate execution-time authorization binding over the exact manifest bytes; no file grants permission.',
-        cases: [...spec.cases],
+        cases: [...execution.cases],
         unsupported,
         execution,
     };
@@ -298,7 +348,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         schema: 1, runId, configDigest, casesDigest, block, target, state: 'proposed',
         workspace: { proposedParent: parent, proposedPath: workspacePath, instance: identity.instance, pathHash: identity.pathHash },
         ports: { tcp: ports.tcp, udp: ports.udp },
-        deadlines: { ...(spec.vllm ? VLLM_DEADLINES : spec.llm ? LLM_DEADLINES : spec.gpu ? GPU_DEADLINES : spec.store ? STORE_DEADLINES : spec.availability ? AVAILABILITY_DEADLINES : DEADLINES) },
+        deadlines: blockDeadlines(block, execution),
         images: [
             { role: 'fixture-agent', ref: image, source: spec.llm ? 'operator pins (local-llm image)' : 'AssistOSExplorer explorer/manifest.json line 2' },
             { role: 'box', ref: pins.boxImage, source: 'operator pins' },
@@ -322,7 +372,7 @@ export function plannedCommands(run) {
     const box = '<BOX_ID>';
     const core = ['container', 'exec', '--user', 'podman', box];
     const nested = [...core, 'podman', '--cgroup-manager=cgroupfs'];
-    const env = { PLOINKY_BOX_HARDWARE_LIMITS: 'on', PLOINKY_BOX_IMAGE: plan.boxImage };
+    const env = { PLOINKY_BOX_HARDWARE_LIMITS: profile.model ? 'off' : 'on', PLOINKY_BOX_IMAGE: plan.boxImage };
     const ps = ['container', 'ps', '--all', '--no-trunc', '--format', '{{.ID}}'];
     const provision = [
         { id: 'engine-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], deadlineMs: run.deadlines.coreMs, note: 'Stable facts only: host arch/os/hostname/kernel, engine version, store graphRoot/runRoot and the service socket; a remote client adds its one default connection (name and URI). A missing fact refuses the run.' },
@@ -337,15 +387,17 @@ export function plannedCommands(run) {
         { id: 'pre-inventory', binary: engine, argv: ps, deadlineMs: run.deadlines.coreMs },
         { id: 'pre-inventory-inspect', binary: engine, argv: ['container', 'inspect', '--format', INSPECT, '<CONTAINER_ID>'], deadlineMs: run.deadlines.coreMs },
         ...(plan.llm
-            ? [{ id: 'fixture-write-local-llm', action: `Copy the frozen local-llm tree ${plan.llm.sourcePath} (${plan.llm.treeDigest}, revision ${plan.llm.revision}) byte for byte to ${workspace}/.ploinky/repos/${LLM_REPOSITORY}/local-llm; its manifest (${plan.llm.manifest.originalDigest}, image ${plan.llm.manifest.originalContainer}) is rewritten to the immutable image ${plan.image} and must then be ${plan.llm.manifest.rewrittenDigest}. The model data and the runner caches are created by the agent under ${workspace}/.data/local-llm and ${workspace}/.data/shared, inside the new workspace only` }]
+            ? [{ id: 'fixture-write-local-llm', action: `Copy the frozen local-llm tree ${plan.llm.sourcePath} (${plan.llm.treeDigest}, revision ${plan.llm.revision}) byte for byte to ${workspace}/${profile.model ? '' : '.ploinky/repos/'}${LLM_REPOSITORY}/local-llm; its manifest (${plan.llm.manifest.originalDigest}, image ${plan.llm.manifest.originalContainer}) is rewritten to the immutable image ${plan.image} and must then be ${plan.llm.manifest.rewrittenDigest}. The model data and the runner caches are created by the agent under ${workspace}/.data/local-llm and ${workspace}/.data/shared, inside the new workspace only` }]
             : plan.agents.map(agent => ({ id: `fixture-write-${agent.name}`, action: `Write ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${agent.name}/manifest.json`, content: fixtureManifest(agent, { image: plan.image, agents: plan.agents }) }))),
-        ...(profile.gpu ? [
-            ...(profile.gpu.probe ? [{ id: 'fixture-write-probe-file', action: `Copy ${profile.gpu.probe.sourcePath} (${profile.gpu.probe.digest}) to ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${GPU_PROBE_TARGET}; the nested engine stages it at /code/${PROBE_FILE}` }] : []),
+        ...(plan.gpu ? [
+            ...(profile.gpu?.probe ? [{ id: 'fixture-write-probe-file', action: `Copy ${profile.gpu.probe.sourcePath} (${profile.gpu.probe.digest}) to ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${GPU_PROBE_TARGET}; the nested engine stages it at /code/${PROBE_FILE}` }] : []),
             { id: 'gpu-grant', binary: node, argv: [profile.candidate.path, 'gpu', 'grant', ...plan.gpu.grantAgents.flatMap(ref => ['--agent', ref])], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs,
                 note: 'The supported product path: records the grant under ~/.ploinky-box/gpu-grants and discovers the host driver. No Box exists yet, so the next start applies it.' },
         ] : []),
+        ...(['cpu', 'apple-cpu', 'amd-apu-cpu'].includes(profile.model?.profile) ? [{ id: 'gpu-withdraw', binary: node, argv: [profile.candidate.path, 'gpu', 'revoke'], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs }] : []),
+        ...(isApuModel(profile.model) ? [{ id: 'apu-manifest-default', action: `Before first start, verify the exact manifest-default rewrite ${JSON.stringify(profile.model.env)} and its pinned digest; no post-start var operation is permitted.` }] : []),
         { id: 'fixture-start', binary: node, argv: startArgs(profile, run.ports), cwd: workspace, env, deadlineMs: run.deadlines.startMs,
-            note: 'Production start creates the gate-on Box and runs its bounded root preparation before graph work; this is the declared provisioning step that may change cgroup state.' },
+            note: profile.model ? 'Production start creates a budget-off Box after the explicit GPU grant or withdrawal.' : 'Production start creates the gate-on Box and runs its bounded root preparation before graph work; this is the declared provisioning step that may change cgroup state.' },
         { id: 'box-inventory', binary: engine, argv: ps, deadlineMs: run.deadlines.coreMs },
         { id: 'box-inspect', binary: engine, argv: ['container', 'inspect', '--format', INSPECT, '<NEW_CONTAINER_ID>'], deadlineMs: run.deadlines.coreMs },
         { id: 'box-contract', binary: engine, argv: ['container', 'inspect', '--format', BOX_CONTRACT_INSPECT, '<BOX_ID>'], deadlineMs: run.deadlines.coreMs, note: 'Read-only evidence of the Box labels, privileges and publications; a failure is recorded, never a provisioning failure' },
@@ -435,7 +487,8 @@ export function plannedCommands(run) {
         { id: 'A1-handshake', binary: engine, argv: [...nested, 'container', 'exec', '<MEMORY_AGENT_ID>', 'node', '-e', '<ALLOCATION_HANDSHAKE>', run.runId, 'observe|release'], deadlineMs: 5000 },
         { id: 'A1-leaf-observer', binary: engine, argv: [...core, 'node', '-e', '<LEAF_OBSERVATION>', '<VERIFIED_LEAF>'], deadlineMs: 5000 },
     );
-    if (profile.llm) live.push(...llmPlan(run).commands);
+    if (profile.model) live.push(...modelPlan(run));
+    else if (profile.llm) live.push(...llmPlan(run).commands);
     else if (profile.gpu) live.push(...gpuPlan(run).commands);
     const cleanup = [
         ...(profile.gpu ? [{ id: 'gpu-stop-owned-helpers', action: 'Remove the control helpers by exact recorded identity (name and run label re-proved first). The probes and the holder end with their commands or with the Box; nothing foreign is ever signalled.' }] : []),
@@ -703,9 +756,9 @@ export function renderSummary(run, manifestPath) {
         `| Host ports | TCP ${run.ports.tcp} (Router, loopback), UDP ${run.ports.udp} (media); a collision aborts |`,
         `| Box image | \`${plan.boxImage}\` |`,
         `| Fixture image | \`${plan.image}\` |`,
-        ...plan.agents.map(agent => (agent.hardwareLimits ? `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | hardwareLimits memory ${agent.hardwareLimits.memory}, cpus ${agent.hardwareLimits.cpus}, pids ${agent.hardwareLimits.pidsLimit}, readiness none |` : agent.role === 'llm' ? `| Agent ${LLM_REF} | the local-llm candidate's own manifest, which declares no limits; the administrator's Apply sets them |`
+        ...plan.agents.map(agent => (agent.hardwareLimits ? `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | hardwareLimits memory ${agent.hardwareLimits.memory}, cpus ${agent.hardwareLimits.cpus}, pids ${agent.hardwareLimits.pidsLimit}, readiness none |` : agent.role === 'llm' ? `| Agent ${LLM_REF} | ${profile.model ? 'ordinary committed source, immutable image rewrite, budgets and MPS off' : "the local-llm candidate's own manifest, which declares no limits; the administrator's Apply sets them"} |`
             : `| Fixture agent ${FIXTURE_REPOSITORY}/${agent.name} | declares no hardware limits of its own (readiness none); the stored override the live case saves through the administrator route is its only request |`)),
-        `| Deadlines | core ${run.deadlines.coreMs} ms, start ${run.deadlines.startMs} ms, destroy ${run.deadlines.destroyMs} ms, cleanup ${run.deadlines.cleanupMs} ms${remote ? `, staging ${run.deadlines.stagingMs} ms` : ''} |`,
+        `| Deadlines | core ${run.deadlines.coreMs} ms, start ${run.deadlines.startMs} ms, destroy ${run.deadlines.destroyMs} ms, cleanup ${run.deadlines.cleanupMs} ms${remote ? `, staging ${run.deadlines.stagingMs} ms` : ''}${LINUX_MODEL_START_BLOCKS.includes(run.block) ? `; block ${run.deadlines.blockMs} ms (the remote action bound is ${Math.min(18_000_000, run.deadlines.blockMs + run.deadlines.cleanupMs + 30000)} ms): the cold provision start pulls the host Box image and the nested local-llm image (a 2,453,102,477-byte layer, about 23 minutes at the measured 1.76 MB/s)` : ''} |`,
         '',
         '## Commands',
         '',
@@ -717,7 +770,9 @@ export function renderSummary(run, manifestPath) {
         '| --- | --- |',
         ...commands,
         '',
-        ...(profile.gpu ? gpuSummary(run) : []),
+        ...(profile.model ? [`Model profile: ${profile.model.profile}. Hardware budgets and MPS are disabled. Pins: ${JSON.stringify(profile.model)}. Required cases: ${profile.cases.join(', ')}.`,
+            isApuModel(profile.model) ? 'AMD profiles use the proven manifest-default delivery before first start. L12 is pending without reviewed generation binding. Functional observations do not qualify an APU.'
+                : 'Apple setup and restoration belong to the enclosing D10 operator envelope; this suite does not certify restoration.'] : profile.gpu ? gpuSummary(run) : []),
         ...(profile.fixtures?.availability ? availabilitySummary(run) : []),
         ...(profile.fixtures?.store ? storeSummary(run) : []),
         '## Cleanup',

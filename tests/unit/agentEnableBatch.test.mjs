@@ -328,3 +328,87 @@ test('same-name re-enable uses fail-closed replacement instead of an additive sh
         reason: 'test-same-name-replacement-complete',
     });
 });
+
+for (const requests of [[], [{ agentName: 'demo/staticRoot' }]]) {
+    test(`replacement batch persists a private complete policy without direct overwrite (${requests.length} requests)`, (t) => {
+        const { paths } = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+        const previousPolicy = fs.readFileSync(paths.policyFile, 'utf8');
+        const originalWrite = fs.writeFileSync;
+        const originalRename = fs.renameSync;
+        let replacements = 0;
+        t.mock.method(fs, 'writeFileSync', (file, ...args) => {
+            if (file === paths.policyFile) {
+                throw Object.assign(new Error('shared filesystem rejects direct policy overwrite'), { code: 'EBADF' });
+            }
+            return originalWrite(file, ...args);
+        });
+        t.mock.method(fs, 'renameSync', (source, destination) => {
+            if (destination === paths.policyFile) {
+                replacements += 1;
+                assert.equal(fs.readFileSync(paths.policyFile, 'utf8'), previousPolicy);
+                assert.equal(fs.statSync(source).mode & 0o777, 0o600);
+                assert.equal(JSON.parse(fs.readFileSync(source, 'utf8')).schema, 'router-policy');
+                assert.equal(JSON.parse(fs.readFileSync(paths.activeSelectorFile, 'utf8')).state, 'inactive');
+            }
+            return originalRename(source, destination);
+        });
+
+        let prepared;
+        try {
+            prepared = agents.prepareAgentEnableBatch(requests, { availabilityMode: 'replacement' });
+            const { generation, preparationLease } = prepared.preparedGeneration;
+            const policy = JSON.parse(fs.readFileSync(paths.policyFile, 'utf8'));
+            assert.equal(replacements, 1);
+            assert.equal(fs.statSync(paths.policyFile).mode & 0o777, 0o600);
+            assert.deepEqual(policy, generation.policy);
+            assert.deepEqual(policy, JSON.parse(previousPolicy));
+            assert.ok(policy.mcpTools.some((entry) => entry.agent === 'staticRoot' && entry.tool === 'inspect_workspace'));
+            const selector = JSON.parse(fs.readFileSync(paths.activeSelectorFile, 'utf8'));
+            assert.equal(selector.state, 'inactive');
+            assert.equal(preparationLease.mode, 'replacement');
+            assert.equal(preparationLease.preparedGeneration, selector.generation);
+            assert.equal(preparationLease.selectorActivationId, selector.activationId);
+            assert.equal(preparationLease.selectorDigest, selector.selectorDigest);
+            const persistedLease = JSON.parse(fs.readFileSync(paths.preparationLeaseFile, 'utf8'));
+            for (const [key, value] of Object.entries(preparationLease)) assert.equal(persistedLease[key], value);
+            assert.throws(() => edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }), {
+                code: 'EDGE_GENERATION_INACTIVE',
+            });
+        } finally {
+            if (prepared) edge.abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease);
+        }
+        assert.equal(fs.existsSync(paths.preparationLeaseFile), false);
+        assert.equal(JSON.parse(fs.readFileSync(paths.activeSelectorFile, 'utf8')).state, 'inactive');
+        assert.deepEqual(fs.readdirSync(path.dirname(paths.policyFile)).filter((name) => name.endsWith('.tmp')), []);
+    });
+}
+
+test('replacement policy rename failure preserves the previous policy and removes the temporary file', (t) => {
+    const { paths } = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    const previousPolicy = fs.readFileSync(paths.policyFile, 'utf8');
+    const generationsBefore = fs.readdirSync(paths.generationsDir).sort();
+    const originalRename = fs.renameSync;
+    let temporaryFile;
+    t.mock.method(fs, 'renameSync', (source, destination) => {
+        if (destination === paths.policyFile) {
+            temporaryFile = source;
+            assert.equal(fs.statSync(source).mode & 0o777, 0o600);
+            assert.deepEqual(JSON.parse(fs.readFileSync(source, 'utf8')), JSON.parse(previousPolicy));
+            throw Object.assign(new Error('injected policy replacement failure'), { code: 'EIO' });
+        }
+        return originalRename(source, destination);
+    });
+
+    assert.throws(() => agents.prepareAgentEnableBatch([], { availabilityMode: 'replacement' }), {
+        code: 'EIO',
+        message: 'prepare agent enable batch: candidate generation rejected: injected policy replacement failure',
+    });
+    assert.ok(temporaryFile);
+    assert.equal(fs.existsSync(temporaryFile), false);
+    assert.equal(fs.readFileSync(paths.policyFile, 'utf8'), previousPolicy);
+    assert.equal(fs.statSync(paths.policyFile).mode & 0o777, 0o600);
+    assert.equal(JSON.parse(fs.readFileSync(paths.activeSelectorFile, 'utf8')).state, 'inactive');
+    assert.equal(fs.existsSync(paths.preparationLeaseFile), false);
+    assert.deepEqual(fs.readdirSync(paths.generationsDir).sort(), generationsBefore);
+    assert.deepEqual(fs.readdirSync(path.dirname(paths.policyFile)).filter((name) => name.endsWith('.tmp')), []);
+});

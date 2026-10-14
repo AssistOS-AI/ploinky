@@ -25,6 +25,13 @@ export function createHostProc({ fsApi = fs, procRoot = PROC_ROOT, cgroupRoot = 
         },
         // The runner's own effective UID: the host UID of the Box user under keep-id.
         uid: () => (typeof process.getuid === 'function' ? process.getuid() : null),
+        pidNamespace(pid) {
+            if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Invalid host PID');
+            let value;
+            try { value = fsApi.readlinkSync(`${procRoot}/${pid}/ns/pid`); } catch (error) { if (goneCode(error)) return null; throw error; }
+            if (!/^pid:\[[1-9][0-9]*\]$/.test(value)) throw new Error('Unsupported PID namespace identity');
+            return value;
+        },
         observe(pid) {
             if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Invalid host PID');
             let stat; let status; let cgroup;
@@ -57,10 +64,42 @@ export function createHostProc({ fsApi = fs, procRoot = PROC_ROOT, cgroupRoot = 
             return pids.map(Number);
         },
         cgroupDirectories(cgroupPath) {
-            try { return fsApi.readdirSync(`${cgroupRoot}${cgroupPath}`).slice(0, MAX_PROCS); } catch (error) { if (goneCode(error)) return null; throw error; }
+            let names;
+            try { names = fsApi.readdirSync(`${cgroupRoot}${cgroupPath}`); } catch (error) { if (goneCode(error)) return null; throw error; }
+            if (names.length > MAX_PROCS) throw new Error('Cgroup directory observation exceeded its bound');
+            return names;
         },
     };
     return host;
+}
+
+// Budget-off agents can share the Box cgroup. Discovery proves only ancestry;
+// callers must independently establish the exact agent namespace and identity.
+export function processesWithin(host, prefix) {
+    const observed = []; const seen = new Set();
+    let directories = 0; let observations = 0;
+    function visit(directory, depth, pids) {
+        if (++directories > 128 || depth > 8) throw new Error('Ordinary GPU ancestry observation exceeded its bound');
+        if (!Array.isArray(pids)) throw new Error('Ordinary GPU cgroup processes unavailable');
+        observations += pids.length;
+        if (observations > MAX_PROCS) throw new Error('Ordinary GPU process observation exceeded its bound');
+        for (const pid of pids) {
+            if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Invalid host PID');
+            if (seen.has(pid)) continue;
+            seen.add(pid);
+            const value = host.observe(pid);
+            if (value && cgroupWithin(value.cgroup, prefix)) observed.push(value);
+        }
+        const names = host.cgroupDirectories(directory);
+        if (!Array.isArray(names) || names.length > MAX_PROCS) throw new Error('Ordinary GPU cgroup directories unavailable or exceeded bound');
+        for (const name of new Set(names)) {
+            if (!/^[A-Za-z0-9_:@-][A-Za-z0-9_.:@-]*$/.test(name)) throw new Error('Invalid observed cgroup directory');
+            const child = `${directory}/${name}`; const childPids = host.cgroupProcs(child);
+            if (childPids !== null) visit(child, depth + 1, childPids);
+        }
+    }
+    visit(prefix, 0, host.cgroupProcs(prefix));
+    return observed;
 }
 
 // The exact cgroup prefix of one Box, from its init process: the host path

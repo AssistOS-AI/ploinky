@@ -10,7 +10,7 @@ import {
     buildPersistentAgentRunArgs,
     buildPodmanStagedTargetMounts,
     ensurePodmanStagedAgentLibDir,
-    ensurePodmanStagedCodeDir,
+    ensureCodeMountPoint,
     podmanMountSuffix,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { CONTROLLER_STATE_DIR, PLOINKY_WORKSPACE_ROOT, SECRETS_FILE } from '../../cli/utils/config.js';
@@ -77,6 +77,7 @@ function productionRunArgs(workspace, layout, containerName) {
         fs.mkdirSync(dir, { recursive: true });
     }
     fs.writeFileSync(path.join(agentCodePath, 'index.js'), 'export default 1;\n');
+    ensureCodeMountPoint(agentCodePath, 'node_modules');
     fs.symlinkSync(agentLib.sourceDir, path.join(nodeModulesDir, 'achillesAgentLib'));
     const runtimeRoot = path.join(workspace, '.ploinky', 'container-runtime', containerName);
     const cwdMountTarget = layout.target(workspace);
@@ -86,9 +87,9 @@ function productionRunArgs(workspace, layout, containerName) {
         envHash: 'controller-secrets-podman-test',
         containerWorkdir: layout.workdir,
         agentLibMountPath: ensurePodmanStagedAgentLibDir(agentName, nodeModulesDir, { runtimeRoot, linkedRepositories: [] }),
-        codeMountPath: ensurePodmanStagedCodeDir(agentName, agentCodePath, nodeModulesDir, new Map(), { runtimeRoot }),
+        codeMountPath: agentCodePath,
         codeMountMode: ':z,ro',
-        useNestedDependencyMounts: false,
+        stagedAgentLib: true,
         preparedNodeModulesDir: nodeModulesDir,
         sharedDir,
         healthProbeHostDir,

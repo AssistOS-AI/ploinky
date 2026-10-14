@@ -1,14 +1,45 @@
 // Fixed-command transport. Every POSIX child starts a new owned process group;
 // deadlines terminate that group and have a separate final settlement bound.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
+export function signalOwnedProcessGroup(pgid, signal, { allowTerminalEperm = false, kill = process.kill, query = spawnSync } = {}) {
+    if (!Number.isSafeInteger(pgid) || pgid <= 1 || !['SIGTERM', 'SIGKILL'].includes(signal)) throw new Error('Invalid owned process group signal');
+    try { kill(-pgid, signal); return { errorCode: null, terminal: false }; }
+    catch (error) {
+        if (error.code === 'EPERM' && signal === 'SIGKILL' && allowTerminalEperm && terminalGroup(pgid, query)) return { errorCode: null, terminal: true };
+        return { errorCode: error.code === 'ESRCH' ? null : error.code || 'PROCESS_GROUP_SIGNAL_FAILED', terminal: false };
+    }
+}
+
+function terminalGroup(pgid, query) {
+    try {
+        const maxBuffer = 8 * 1024 * 1024;
+        const result = query('/bin/ps', ['-axo', 'pid=,pgid=,stat='], {
+            encoding: 'utf8', timeout: 100, maxBuffer, env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+        });
+        if (result.error || result.signal || result.status !== 0 || typeof result.stdout !== 'string'
+            || !result.stdout.endsWith('\n') || !result.stdout.trim() || Buffer.byteLength(result.stdout) > maxBuffer) return false;
+        const seen = new Set(); let live = false;
+        for (const line of result.stdout.trim().split('\n')) {
+            const row = /^\s*(\d+)\s+(\d+)\s+([RSDTtWIXZU][<N+LsEVXsl-]*)\s*$/.exec(line);
+            if (!row) return false;
+            const pid = Number(row[1]), group = Number(row[2]);
+            if (!Number.isSafeInteger(pid) || pid < 1 || !Number.isSafeInteger(group) || group < 0 || seen.has(pid)) return false;
+            seen.add(pid);
+            if (group === pgid && !row[3].startsWith('Z')) live = true;
+        }
+        return !live;
+    } catch { return false; }
+}
+
 // stdinPath, when given, is one private regular file streamed as the child's
 // standard input (remote staging uploads); otherwise standard input is closed.
+// Local test dependencies stay outside the options forwarded by the ownership broker.
 export function runBoundedProcess(binary, args, {
     cwd, env, deadlineMs = 30000, maxBytes = 65536, signal, spawnProcess = spawn, stdinPath = null,
-} = {}) {
+} = {}, { kill = process.kill, query = spawnSync } = {}) {
     if (!path.isAbsolute(binary) || !path.isAbsolute(cwd || '')
         || !Array.isArray(args) || args.some(value => typeof value !== 'string' || value.includes('\0'))
         || !Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 18_000_000
@@ -19,7 +50,7 @@ export function runBoundedProcess(binary, args, {
         let child, timer, killTimer, settlementTimer, groupTimer;
         let stdout = '', stderr = '', bytes = 0;
         let timedOut = false, truncated = false, cancelled = Boolean(signal?.aborted);
-        let errorCode = null, settled = false, stopping = false, settlementForced = false;
+        let errorCode = null, settled = false, stopping = false, settlementForced = false, terminal = false;
         let exitStatus = null, exitSignal = null;
         const finish = (status = exitStatus, childSignal = exitSignal) => {
             if (settled) return;
@@ -29,13 +60,14 @@ export function runBoundedProcess(binary, args, {
             resolve({ status, signal: childSignal, stdout, stderr, timedOut, truncated, cancelled, errorCode, settlementForced });
         };
         const killGroup = kind => {
-            if (!Number.isInteger(child?.pid) || child.pid <= 0) return;
-            try { process.kill(-child.pid, kind); }
-            catch (error) { if (error.code !== 'ESRCH') errorCode ||= error.code || 'PROCESS_GROUP_SIGNAL_FAILED'; }
+            if (terminal || !Number.isSafeInteger(child?.pid) || child.pid <= 1) return;
+            const result = signalOwnedProcessGroup(child.pid, kind, { allowTerminalEperm: stopping && !settlementForced, kill, query });
+            errorCode ||= result.errorCode;
+            terminal ||= result.terminal;
         };
         const groupPresent = () => {
             if (!Number.isInteger(child?.pid) || child.pid <= 0) return false;
-            try { process.kill(-child.pid, 0); return true; }
+            try { kill(-child.pid, 0); return true; }
             catch (error) { if (error.code === 'ESRCH') return false; errorCode ||= error.code || 'PROCESS_GROUP_QUERY_FAILED'; return true; }
         };
         const waitForGroup = () => {
