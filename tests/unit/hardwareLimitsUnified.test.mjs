@@ -10,7 +10,7 @@ import { STORE_SCHEMA, validateStoreDocument, validateAgentEntry } from '../../c
 const UUID = 'GPU-12345678-1234-1234-1234-123456789012';
 const FIX = 'Clear the GPU share. CPU/RAM controls remain separately available.';
 const GB10_PCI = '0x2E1210DE';
-const Q2_SENTENCE = 'On unified-memory NVIDIA GPUs (GB10 / DGX Spark) a RAM limit does not cap the GPU memory an agent allocates (measured for llama.cpp\'s CUDA buffers); only the agent\'s own admission check keeps that memory within the budget, and an overrun takes memory from the whole host, which has no separate GPU memory.';
+const Q2_SENTENCE = 'On unified-memory NVIDIA GPUs (GB10 / DGX Spark) a RAM limit does not cap the GPU device memory (cudaMalloc) an agent allocates, such as llama.cpp\'s model buffers; only the agent\'s own admission check keeps that memory within the budget, and an overrun takes memory from the whole host, which has no separate GPU memory. Managed, pinned-host and ATS allocations are charged to the RAM limit (measured on driver 580.178.04).';
 const line = (name, memory = '122570', driver = '580.95.05') => `0, ${UUID}, ${name}, ${memory}, ${driver}`;
 const grant = { valid: true, state: 'active', fingerprint: 'wiring', agents: ['demo/worker'], mps: { control: { source: '/private/tool' } } };
 const statusFor = (observeGpu) => readMpsStatus({ readGrant: () => grant, observeGpu, readState: () => null });

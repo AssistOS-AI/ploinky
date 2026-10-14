@@ -36,7 +36,7 @@ export const HARDWARE_HELP = Object.freeze({
         'The MPS device-memory limit applies to each CUDA process, not to the sum of every process in an agent.',
         'A RAM cgroup limit does not cap dedicated GPU memory.',
         'Only the host operator may choose EXCLUSIVE_PROCESS. It affects other CUDA users and workspaces. Ploinky never changes compute mode.',
-        'On unified-memory NVIDIA GPUs (GB10 / DGX Spark) a RAM limit does not cap the GPU memory an agent allocates (measured for llama.cpp\'s CUDA buffers); only the agent\'s own admission check keeps that memory within the budget, and an overrun takes memory from the whole host, which has no separate GPU memory.',
+        'On unified-memory NVIDIA GPUs (GB10 / DGX Spark) a RAM limit does not cap the GPU device memory (cudaMalloc) an agent allocates, such as llama.cpp\'s model buffers; only the agent\'s own admission check keeps that memory within the budget, and an overrun takes memory from the whole host, which has no separate GPU memory. Managed, pinned-host and ATS allocations are charged to the RAM limit (measured on driver 580.178.04).',
     ],
 });
 
