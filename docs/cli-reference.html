@@ -159,7 +159,7 @@ enable agent demo as demo2           # second container with alias "demo2"</code
                         </div>
 
                         <h3>reinstall agent</h3>
-                        <p>Stops, removes, and re-creates the agent's container. This is a destructive operation that ensures the agent starts from a clean state. This command only has an effect if the agent's container is currently running.</p>
+                        <p>Stops, removes, and re-creates the agent's container. This is a destructive operation that ensures the agent starts from a clean state. It is refused, before anything is removed, while the agent's route is draining after a refused targeted drain; use <code>restart &lt;agentName&gt; --accept-failed-drain &lt;container-id&gt;</code> instead.</p>
                         <pre><code>reinstall &lt;agentName&gt;
 # Example
 reinstall demo  # stop, remove, and re-create the container for the 'demo' agent</code></pre>
@@ -272,11 +272,14 @@ Routing configuration (.ploinky/routing.json):
   demo -&gt; agent=demo method=- hostPort=-</code></pre>
 
                         <h3>restart</h3>
-                        <p>Restarts services. If an agent name is provided, it performs a non-destructive stop and start of that agent's container, preserving the container ID. This only affects running containers. If no agent name is provided, it restarts all agents and the router.</p>
-                        <pre><code>restart [agentName]</code></pre>
+                        <p>Restarts services. If no agent name is provided, it restarts all agents and the router. If an agent name is provided, it replaces that agent's runtime under the same instance identity and reopens its route only after the successor passes readiness. For a managed container with a route this is a targeted drain: Ploinky withdraws the route, sends SIGTERM and replaces the container only after the application exits with status 0 within 35 seconds. Any other exit status (including 143), an OOM kill or a timeout refuses the replacement and keeps the route draining, which also blocks the container monitor, <code>start</code> and <code>reinstall</code> for that agent.</p>
+                        <p>Once the refused container has stopped, <code>--accept-failed-drain</code> with its full 64-hex container ID (the <code>containerId</code> of its record in <code>.ploinky/agents.json</code>) replaces it and reopens the route, accepting that data the container did not persist may be lost. The flag never signals or replaces a running container and is not available for GPU/MPS clients or Bubblewrap/Seatbelt runtimes.</p>
+                        <pre><code>restart [agentName [--accept-failed-drain &lt;container-id&gt;]]</code></pre>
                         <pre><code># Examples
 restart          # Restart all agents and the router
-restart MyAPI    # Stop and then start the existing container for MyAPI</code></pre>
+restart MyAPI    # Drain and replace the runtime of MyAPI
+restart MyAPI --accept-failed-drain &lt;container-id&gt;
+                 # Replace the stopped container whose drain was refused</code></pre>
                     </div>
 
                     <div class="doc-section" id="variables">

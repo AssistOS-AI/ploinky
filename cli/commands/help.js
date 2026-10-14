@@ -326,9 +326,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
         },
         'restart': {
             description: 'Restarts services. A named agent is reconciled through the managed ownership, network, and endpoint transaction. With no name, all agents and the router restart.',
-            syntax: 'restart [agentName]',
-            examples: [ 'restart', 'restart MyAPI' ],
-            notes: 'A named restart requires the persisted RoutingServer port and refuses foreign or old-contract containers. The general restart fails if start was not configured yet.'
+            syntax: 'restart [agentName [--accept-failed-drain <container-id>]]',
+            examples: [ 'restart', 'restart MyAPI', 'restart MyAPI --accept-failed-drain <64-hex container ID>' ],
+            notes: 'A named restart requires the persisted RoutingServer port and refuses foreign or old-contract containers. The general restart fails if start was not configured yet. A named managed-container restart withdraws the route, sends SIGTERM and replaces the container only after it exits 0; any other exit, an OOM kill or a 35-second timeout refuses the replacement and keeps the route draining, which also blocks the monitor, start and reinstall for that agent. Once the refused container has stopped, --accept-failed-drain with its full ID (containerId in .ploinky/agents.json) replaces it and reopens the route, accepting that data it did not persist may be lost. A running container is never signalled or replaced under that flag.'
         },
         'logs': {
             description: 'Inspect Router or agent runtime logs without changing lifecycle state',

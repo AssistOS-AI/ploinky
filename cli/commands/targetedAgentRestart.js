@@ -1,6 +1,7 @@
 import {
   TARGETED_DRAIN_ACKNOWLEDGEMENT,
   cleanupExactAgentRuntimeCandidate,
+  normalizeAcceptedFailedDrain,
 } from '../sandbox/docker/index.js';
 import { loadActiveEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
 import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
@@ -11,8 +12,37 @@ import {
 import * as workspaceSvc from '../utils/workspace.js';
 import { retireSameTupleAfterApply } from './hardwareAvailabilityRetirement.js';
 
+export const ACCEPT_FAILED_DRAIN_FLAG = '--accept-failed-drain';
+const RESTART_USAGE = `Usage: restart [router | <agent> [${ACCEPT_FAILED_DRAIN_FLAG} <container-id>]]`;
+
 function text(value) {
   return String(value || '').trim();
+}
+
+/**
+ * Parse `restart` arguments. The agent is the first argument; the only
+ * option is the operator's acceptance of one refused drain, which must name
+ * the full immutable ID of the stopped predecessor it accepts.
+ */
+export function parseTargetedRestartArguments(options = []) {
+  const tokens = options.map((value) => text(value));
+  const target = tokens[0] || '';
+  if (target.startsWith('-')) throw new Error(RESTART_USAGE);
+  let acceptedFailedDrain = null;
+  for (let index = 1; index < tokens.length; index += 1) {
+    if (tokens[index] !== ACCEPT_FAILED_DRAIN_FLAG) continue;
+    if (acceptedFailedDrain) throw new Error(`${ACCEPT_FAILED_DRAIN_FLAG} was supplied more than once`);
+    const containerId = tokens[index + 1] || '';
+    if (!/^[a-f0-9]{64}$/.test(containerId)) {
+      throw new Error(`${ACCEPT_FAILED_DRAIN_FLAG} requires the full 64-hex ID of the stopped predecessor container. ${RESTART_USAGE}`);
+    }
+    acceptedFailedDrain = Object.freeze({ containerId });
+    index += 1;
+  }
+  if (acceptedFailedDrain && (!target || target.toLowerCase() === 'router')) {
+    throw new Error(`${ACCEPT_FAILED_DRAIN_FLAG} applies only to a named agent. ${RESTART_USAGE}`);
+  }
+  return Object.freeze({ target, acceptedFailedDrain });
 }
 
 function exactRuntimeIdentity(record) {
@@ -92,6 +122,7 @@ export async function prepareTargetedAgentRestart({
   shortAgentName: shortAgentNameInput,
   record,
   networkLifecycleCapability,
+  acceptedFailedDrain: acceptedFailedDrainInput = null,
 } = {}, {
   mergeRouting = mergeRoutingConfig,
   loadActive = loadActiveEdgeRoutingGeneration,
@@ -105,6 +136,7 @@ export async function prepareTargetedAgentRestart({
     throw new Error('targeted agent restart requires its exact container, route, repository, and agent names');
   }
   const identity = exactRuntimeIdentity(record);
+  const acceptedFailedDrain = normalizeAcceptedFailedDrain(acceptedFailedDrainInput);
   let predecessorRoute = null;
 
   await mergeRouting((routing) => {
@@ -119,6 +151,16 @@ export async function prepareTargetedAgentRestart({
       shortAgentName,
       routeKey,
     });
+    if (acceptedFailedDrain) {
+      // Acceptance answers one earlier refusal; it never starts a new drain.
+      if (route.draining !== true) {
+        throw new Error(`targeted agent restart route '${routeKey}' has no refused targeted drain to accept`);
+      }
+      if (text(currentRecord.containerId) !== acceptedFailedDrain.containerId
+        || text(record.containerId) !== acceptedFailedDrain.containerId) {
+        throw new Error(`the accepted container ${acceptedFailedDrain.containerId} is not the registered predecessor of '${containerName}'`);
+      }
+    }
     predecessorRoute = structuredClone(route);
     delete predecessorRoute.draining;
     routing.routes[routeKey] = { ...route, draining: true };
@@ -164,6 +206,7 @@ export async function prepareTargetedAgentRestart({
       acknowledgement: TARGETED_DRAIN_ACKNOWLEDGEMENT,
       affectedSelectors,
       assertSelectorsInactive,
+      ...(acceptedFailedDrain ? { acceptedFailedDrain } : {}),
     }),
   });
 }

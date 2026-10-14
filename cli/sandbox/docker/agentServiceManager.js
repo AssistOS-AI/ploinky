@@ -75,6 +75,7 @@ import {
     TARGETED_DRAIN_ACKNOWLEDGEMENT,
     drainAndRemoveTargetedContainer,
     drainTargetedContainer,
+    normalizeAcceptedFailedDrain,
 } from './targetedContainerLifecycle.js';
 import {
     admitManifestRuntimeCapabilities,
@@ -937,11 +938,13 @@ function normalizeTargetedRestart(value) {
     if (typeof value.assertSelectorsInactive !== 'function') {
         throw new Error('targetedRestart.assertSelectorsInactive must prove the exact affected selectors are inactive');
     }
+    const acceptedFailedDrain = normalizeAcceptedFailedDrain(value.acceptedFailedDrain);
     return Object.freeze({
         acknowledgement: value.acknowledgement,
         affectedSelectors: Object.freeze([...value.affectedSelectors]),
         assertSelectorsInactive: value.assertSelectorsInactive,
         ...(value.timeoutMs === undefined ? {} : { timeoutMs: value.timeoutMs }),
+        ...(acceptedFailedDrain ? { acceptedFailedDrain } : {}),
     });
 }
 
@@ -4464,13 +4467,18 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             assertSelectorsInactive: targetedRestart.assertSelectorsInactive,
             retireControlSocket: retireRuntimeRelaySocket,
             ...(targetedRestart.timeoutMs === undefined ? {} : { timeoutMs: targetedRestart.timeoutMs }),
+            ...(targetedRestart.acceptedFailedDrain ? { acceptedFailedDrain: targetedRestart.acceptedFailedDrain } : {}),
         };
+        let drained = null;
         if (runtimeNetworkPlan.requiresManagedNetwork) {
             // The managed transaction preserves a stopped predecessor for
             // diagnostics/rollback, but never restarts it after this drain.
-            drainTargetedContainer(containerName, drainOptions);
+            drained = drainTargetedContainer(containerName, drainOptions);
         } else {
-            drainAndRemoveTargetedContainer(containerName, drainOptions);
+            drained = drainAndRemoveTargetedContainer(containerName, drainOptions);
+        }
+        if (drained?.state === 'accepted-failed-drain') {
+            console.log(`[restart] ${agentName}: replacing predecessor ${drained.containerId.slice(0, 12)} after its refused drain (exit=${drained.exitCode ?? 'unknown'}${drained.oomKilled ? ', oom-killed' : ''}); the operator accepted possible data loss`);
         }
         clearLivenessState(containerName);
     }

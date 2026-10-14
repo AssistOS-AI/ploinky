@@ -7,7 +7,7 @@ import { reinstallAgent } from '../../cli/commands/workspaceUtil.js';
 // Execute the command body with runtime boundaries replaced, so recovery can
 // be tested without installing agents or mutating a real workspace.
 function fixture({ runtime = 'docker', running = false, active = true, failure, enabled = true, changedRegistration = false,
-    routerRunning = true, routerFailure = null, ambiguous = false, settlementFailure = false, applied = true } = {}) {
+    routerRunning = true, routerFailure = null, ambiguous = false, settlementFailure = false, applied = true, draining = false } = {}) {
     let resolutions = 0;
     let routerReady = routerRunning;
     const calls = [];
@@ -78,6 +78,13 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
         isSandboxRuntime: value => ['bwrap', 'seatbelt'].includes(value),
         isBwrapProcessRunning: () => running,
         dockerSvc: {
+            assertAgentServiceNotDraining(name) {
+                assert.equal(name, record.containerName);
+                if (!draining) return;
+                throw Object.assign(new Error(`agent '${name}' still requires an acknowledged targeted drain; automatic replacement is blocked`), {
+                    code: 'PLOINKY_AGENT_DRAINING',
+                });
+            },
             getAgentContainerName: () => assert.fail('must preserve registered target'),
             isContainerRunning: () => running,
             removeAgentContainerForRecreate(name) { calls.push(['remove', name]); },
@@ -247,6 +254,17 @@ test('a registration that changed while waiting never receives a rebuild request
     await assert.rejects(run('chosen-name'), /changed while waiting for reinstall/);
     assert.deepEqual(rebuild, []);
 });
+
+// Removing the stopped predecessor of a refused targeted drain would leave no
+// runtime and let a later restart replace it without any acknowledgement.
+for (const active of [false, true]) {
+    test(`reinstall refuses a draining predecessor before any rebuild request or removal; routing active=${active}`, async () => {
+        const { run, calls, rebuild } = fixture({ draining: true, active });
+        await assert.rejects(run('chosen-name'), { code: 'PLOINKY_AGENT_DRAINING' });
+        assert.deepEqual(calls.map(([step]) => step), ['cleanup']);
+        assert.deepEqual(rebuild, []);
+    });
+}
 
 for (const options of [{ settlementFailure: true }, { applied: false }]) {
     test(`an activated reinstall reports settlement failure without destroying the admitted runtime (${JSON.stringify(options)})`, async () => {

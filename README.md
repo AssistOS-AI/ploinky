@@ -275,6 +275,8 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in the workspace directory, at its host path |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
+| `ploinky restart AGENT` | Replace one agent's runtime in the existing Box generation; a routed managed container is drained and replaced only after it exits 0 within 35 seconds, otherwise its route stays draining and automatic replacement is blocked |
+| `ploinky restart AGENT --accept-failed-drain CONTAINER_ID` | Replace the stopped container whose targeted drain was refused (its full `containerId` from `.ploinky/agents.json`), accepting possible loss of data it did not persist, and reopen the route after readiness |
 | `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
 | `ploinky bind [ADDRESS:PORT:8080]` | Publish the public Router on this machine's IPv4 `ADDRESS` (`0` for all interfaces) and TCP `PORT`; recreate the Box and restart the configured graph when the mapping changes; save the binding for later lifecycle commands |
 | `ploinky bind 127.0.0.1:PORT:8080` | Restore local-only Router access |

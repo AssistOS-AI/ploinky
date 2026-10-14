@@ -90,10 +90,11 @@ Operators must be able to control the outer Box and the in-Box workspace without
 | --- | --- |
 | Public `ploinky start ...` | Reconcile or create the validated rootless Box, then start the Router and complete manifest graph behind the fixed Box boundary. |
 | Core `start` | Prepare repositories, profile inputs, dependencies, identities, inactive routing state, dependency waves, readiness, and final coordinated route publication. |
-| `restart <agent>` | Stop and recreate the selected sandbox runtime or perform the admitted managed-container restart path, then require readiness and coordinated route activation before success. |
+| `restart <agent>` | Stop and recreate the selected sandbox runtime or perform the admitted managed-container restart path, which drains a routed container under the targeted drain acknowledgement contract below, then require readiness and coordinated route activation before success. |
+| `restart <agent> --accept-failed-drain <container-id>` | Replace the exact stopped predecessor whose targeted drain was refused, accepting the loss of data it did not persist, and reopen its route only after the successor is ready. |
 | `restart router` | Inactivate routing, replace only the Router process, and rebuild the configured workspace routing state without treating agent containers as newly created runtimes. |
 | Workspace `restart` | Stop the Router and configured agents, then execute the complete configured startup path again. |
-| `reinstall <agent>` | Remove the exact selected runtime and recreate it with `forceRecreate`, while reusing a dependency cache only when it remains valid. |
+| `reinstall <agent>` | Remove the exact selected runtime and recreate it with `forceRecreate`, while reusing a dependency cache only when it remains valid. A route left draining by a refused targeted drain refuses the reinstall before any rebuild request or removal. |
 | Core `stop` | Stop the Router and configured agents without removing their owned runtimes or durable workspace data. |
 | Core `shutdown` | Stop the Router and remove exact workspace agent containers while retaining registry, caches, and per-agent data. |
 | Core `destroy` or `clean` | Stop the Router, remove exact workspace agent runtimes, clear `.ploinky/deps`, and preserve `.data`. |
@@ -102,6 +103,35 @@ Operators must be able to control the outer Box and the in-Box workspace without
 | Public `ploinky destroy --delete-cache` | Remove the exact owned outer Box and those records, and then delete only `.ploinky/box/dependencies` and `.ploinky/box/images`; the cache of a gone Box is deleted even when the records are kept. |
 
 The outer Box must publish exactly one Router TCP mapping to in-Box `8080/tcp` and one wildcard media UDP mapping to in-Box `7882/udp`. Router TCP must remain loopback-only unless the operator explicitly selects an admitted IPv4 host binding through `ploinky bind`; unknown Host headers must remain rejected. A lifecycle action must not expose an agent listener, the private Router listener, or a third publication. A failed transactional Box replacement must restore the prior validated Box or report failure without adopting ambiguous state.
+
+### Targeted drain acknowledgement
+
+A targeted drain replaces one running managed container (Docker or Podman) while the rest of the graph keeps serving. `restart <agent>` uses it when the agent has a published route without a hardware-unavailability mark; hardware Apply and the GPU/MPS cohort drain their clients through the same primitive. Bubblewrap and Seatbelt runtimes have no targeted drain. The drain withdraws the route by marking `routes.<key>.draining: true` in `.ploinky/routing.json` through a coordinated routing apply, so the Router refuses new traffic (`404 AGENT_OWNER_INACTIVE` on the agent selector, `503 HOST_SELECTOR_INACTIVE` on a bound host) while the predecessor keeps its exact registered `instanceId` and `enableGeneration`. Ploinky then proves the affected selectors (`agent-root:<key>`, `agent-port:<key>` and every `host:<name>` bound to the route) inactive, retires the predecessor's relay control socket and sends SIGTERM once.
+
+The application acknowledges that its own drain and persistence completed by exiting with status 0 within 35 seconds. The bound is fixed and callers cannot extend it. Ploinky never sends SIGKILL during a drain.
+
+| Predecessor outcome | Result |
+| --- | --- |
+| Exit status 0 after SIGTERM, or already stopped with status 0 | Acknowledged. The predecessor is removed without force (the managed-network transaction keeps it stopped for diagnostics), the successor starts under the same instance identity, readiness passes, the registry records the successor's container ID and the route is republished without `draining`. |
+| Any other exit status (including 143, the default SIGTERM termination), an OOM kill or a runtime error, while draining or already stopped | Refused with `TARGETED_DRAIN_FAILED`. Signal termination is never an acknowledgement. |
+| Still running after 35 seconds | Refused with `TARGETED_DRAIN_TIMEOUT`. The container keeps running and is not signalled again. |
+| Absent | Nothing is left to drain or acknowledge, so the restart proceeds. Callers that remove runtimes must therefore refuse a draining route first. |
+
+A refusal fails the restart and changes nothing further: the route stays `draining`, the registry record keeps the predecessor's identity and container ID, and the refused container stays where it is (stopped, or running after a timeout). Every other admission of that runtime is refused with `PLOINKY_AGENT_DRAINING` until a targeted restart publishes a successor. The container monitor's recreates fail this way, retry with backoff and then trip its circuit breaker. Agent and workspace `start` and workspace `restart` are refused when they reach that agent. `reinstall` is refused before it issues a rebuild request or removes anything. A workspace start that would replace that runtime refuses the whole graph before it logs, revokes, rotates or removes anything, because removing the predecessor would let a later restart replace it without any acknowledgement. Repeating `restart <agent>` evaluates the same stopped container and refuses again.
+
+The operator recovers with `ploinky restart <agent> --accept-failed-drain <container-id>`, naming the full 64-hex `containerId` of the agent's record in `.ploinky/agents.json`. The command never signals anything. Every precondition below must hold, or the restart is refused without replacing the predecessor:
+
+| Precondition | Checked by |
+| --- | --- |
+| The agent runs as a managed container with a route; GPU/MPS clients are excluded | `restart` argument handling and the exact-instance reconcile |
+| The container is not running when the command starts | `restart`, before any routing change |
+| The route is already `draining` and the ID equals the registered predecessor's `containerId` | The targeted-restart preparation, atomically inside its routing mutation |
+| The affected selectors are proved inactive | The drain primitive |
+| A predecessor that still exists is stopped and its inspected immutable ID equals the accepted ID | The drain primitive (a running or different container is refused with `TARGETED_DRAIN_ACCEPTANCE_REFUSED`; an absent one has nothing left to accept) |
+
+When the preconditions hold, the recorded refusal is accepted: the stopped predecessor is replaced exactly as after an acknowledgement, the successor keeps the instance identity, and the route reopens only after readiness. Whatever the predecessor had not persisted before it exited may be lost; the command logs one line naming the predecessor's short ID and exit status. Publishing the successor changes the registry record, which resets the container monitor's restart state and circuit breaker. Only the CLI restart of one agent can accept a refusal; hardware Apply never carries an acceptance.
+
+The acceptance never stops a predecessor that is still running after a timeout; it applies once the container has exited. Core `stop` and workspace `restart` stop every configured agent container, including a timed-out predecessor, with SIGTERM and then SIGKILL after 5 seconds; the workspace restart then refuses its graph while the route is draining, and `--accept-failed-drain` applies to the stopped container. Core `shutdown`, `destroy` and `clean` remove workspace containers explicitly, including a refused predecessor, which leaves an absent predecessor that the next targeted restart replaces without an acknowledgement.
 
 ### Manifest profiles
 

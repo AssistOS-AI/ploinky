@@ -53,6 +53,9 @@ Commands:
   ploinky start [AGENT [PORT]]    Start the graph; omit AGENT to reuse the saved workspace agent
   ploinky restart                 Reconcile sources and restart the whole workspace graph
   ploinky restart AGENT           Restart one agent in the existing Box generation
+  ploinky restart AGENT --accept-failed-drain CONTAINER_ID
+                                  Replace the stopped predecessor whose targeted drain
+                                  was refused, accepting possible loss of its data
   ploinky --udp-port PORT start AGENT [PORT]
                                   Select the media host UDP port; defaults to 7882
   ploinky bind [ADDRESS:PORT:8080]

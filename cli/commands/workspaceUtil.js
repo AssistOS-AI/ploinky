@@ -2115,6 +2115,15 @@ function ensureGraphNodesEnabled(graph, reg, {
     .filter((plan) => plan.executionChanged || plan.profileChanged || plan.runtimeReason)
     .sort((left, right) => left.node.id.localeCompare(right.node.id));
   const changedContainers = changedPlans.map((plan) => plan.existing.key);
+  // Removing the predecessor of a refused targeted drain would let a later
+  // restart replace it without any acknowledgement. Refuse the whole graph
+  // while nothing has been logged, revoked, rotated or removed.
+  if (changedPlans.length) {
+    const currentRouting = loadRouting();
+    for (const plan of changedPlans) {
+      dockerSvc.assertAgentServiceNotDraining(plan.existing.key, { loadRouting: () => currentRouting });
+    }
+  }
   // Say why each runtime is replaced before anything is revoked or removed.
   for (const plan of changedPlans) logLine(graphReplacementLine(plan));
   // Every retained route must be target-less in the prelaunch generation,
@@ -4253,6 +4262,9 @@ async function reinstallAgent(agentName) {
                 )) {
               throw new Error(`Agent '${agentName}' changed while waiting for reinstall; retry with its current registration.`);
             }
+            // A refused targeted drain keeps its stopped predecessor for the
+            // operator's explicit recovery; refuse before any request or removal.
+            dockerSvc.assertAgentServiceNotDraining(containerName);
             // One exact logical registration gets a persistent desired rebuild
             // request (reused while it is still pending or failed). Its runtime
             // then builds from empty npm state, bypassing seeds.
