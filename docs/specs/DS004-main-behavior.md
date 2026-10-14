@@ -98,8 +98,8 @@ Operators must be able to control the outer Box and the in-Box workspace without
 | Core `shutdown` | Stop the Router and remove exact workspace agent containers while retaining registry, caches, and per-agent data. |
 | Core `destroy` or `clean` | Stop the Router, remove exact workspace agent runtimes, clear `.ploinky/deps`, and preserve `.data`. |
 | Public `ploinky stop` | Stop core services and then stop the outer Box while preserving workspace data and Box caches. |
-| Public `ploinky destroy` | Remove the exact owned outer Box and preserve the workspace and `.ploinky/box` caches. |
-| Public `ploinky destroy --delete-cache` | Remove the exact owned outer Box and then delete only `.ploinky/box/dependencies` and `.ploinky/box/images`. |
+| Public `ploinky destroy` | Remove the exact owned outer Box, then this workspace's host GPU-grant and hardware-limits records (`~/.ploinky-box/gpu-grants/<instance>{.json,/}` and `~/.ploinky-box/hardware-limits/<instance>{.json,/}`), and preserve the workspace, the `.ploinky/box` caches and the saved Router binding. A refused record removal keeps the records, exits 1 with a message that names the fix (supervisor error code `PLOINKY_BOX_DESTROY_RECORDS_KEPT`), and is finished by running destroy again. |
+| Public `ploinky destroy --delete-cache` | Remove the exact owned outer Box and those records, and then delete only `.ploinky/box/dependencies` and `.ploinky/box/images`; the cache of a gone Box is deleted even when the records are kept. |
 
 The outer Box must publish exactly one Router TCP mapping to in-Box `8080/tcp` and one wildcard media UDP mapping to in-Box `7882/udp`. Router TCP must remain loopback-only unless the operator explicitly selects an admitted IPv4 host binding through `ploinky bind`; unknown Host headers must remain rejected. A lifecycle action must not expose an agent listener, the private Router listener, or a third publication. A failed transactional Box replacement must restore the prior validated Box or report failure without adopting ambiguous state.
 
