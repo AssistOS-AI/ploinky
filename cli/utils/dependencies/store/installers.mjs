@@ -63,7 +63,8 @@ function runBounded(command, args, { cwd, env, timeoutMs, outputLimitBytes, logF
 const FAILURE_REASON_LIMIT = 400;
 const FAILURE_REASON_LINES = 4;
 // Lines that state the cause: first choice.
-const CAUSE_REASON_LINE = /reason:|fatal:|npm error code|npm ERR! code|\b(ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN)\b/i;
+const CODE_REASON_LINE = /^npm (error|ERR!) code /i;
+const CAUSE_REASON_LINE = /reason:|fatal:|\b(ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN)\b/i;
 const PREFERRED_REASON_LINE = /^(npm error|npm ERR!|fatal:|error:)/i;
 // Heartbeats, log pointers, generic npm network advice and repeated syscall/errno detail.
 const NOISE_REASON_LINE = /^\[deps-cache\]|complete log of this run|^npm (error|ERR!) network\s*$|behind a proxy|bad network settings|'proxy' config|npm help config|make sure that the$|problem related to network|^npm (error|ERR!) (syscall|errno) /i;
@@ -75,20 +76,23 @@ function redactUserinfo(text) {
 }
 
 /**
- * Short single-line reason from the installer output tail: the cause lines
- * (npm code, `reason:`, git `fatal:`, network error codes) when present, else
- * the last few npm/git error lines, else the last lines; generic advice and
- * heartbeats dropped, credentials in URL userinfo removed, bounded in length.
- * Returns '' when the tail has nothing useful.
+ * Short single-line reason from the installer output tail: the npm error code
+ * line as a header, then the last cause lines (`reason:`, git `fatal:`, network
+ * error codes) or, when there are none, the last npm/git error lines, else the
+ * last lines. Generic advice and heartbeats are dropped, credentials in URL
+ * userinfo removed, and the length bounded. Returns '' when nothing is useful.
  */
 function failureReason(outputTail) {
     const lines = String(outputTail || '').split(/\r?\n/)
         .map((line) => redactUserinfo(line.replace(UNSAFE_REASON_CHARS, ' ').trim()))
         .filter((line) => line && !NOISE_REASON_LINE.test(line));
-    const cause = lines.filter((line) => CAUSE_REASON_LINE.test(line));
-    const preferred = lines.filter((line) => PREFERRED_REASON_LINE.test(line));
-    const pool = cause.length ? cause : (preferred.length ? preferred : lines);
-    const joined = pool.slice(-FAILURE_REASON_LINES).join(' | ');
+    const header = lines.find((line) => CODE_REASON_LINE.test(line)) || null;
+    const body = lines.filter((line) => line !== header);
+    const cause = body.filter((line) => CAUSE_REASON_LINE.test(line));
+    const preferred = body.filter((line) => PREFERRED_REASON_LINE.test(line));
+    const pool = cause.length ? cause : (preferred.length ? preferred : body);
+    const picked = [...(header ? [header] : []), ...pool.slice(-(FAILURE_REASON_LINES - (header ? 1 : 0)))];
+    const joined = picked.join(' | ');
     return joined.length > FAILURE_REASON_LIMIT ? `...${joined.slice(-(FAILURE_REASON_LIMIT - 3))}` : joined;
 }
 

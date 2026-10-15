@@ -321,3 +321,11 @@ test('dependency store installers: control, separator and bidi characters never 
         assert.equal(error.message, 'host npm install exited with 1: npm error fatal: bad thing', `U+${ch.codePointAt(0).toString(16)}`);
     }
 });
+
+test('dependency store installers: non-network npm failures keep the descriptive lines after the code', (t) => {
+    const etarget = failingHostInstall(t, fs.readFileSync(new URL('./fixtures/npmEtarget.txt', import.meta.url), 'utf8'));
+    assert.match(etarget.message, /npm error code ETARGET \| npm error notarget No matching version found for left-pad@\^99\.0\.0\./);
+    assert.doesNotMatch(etarget.message, /complete log/);
+    const lifecycle = failingHostInstall(t, fs.readFileSync(new URL('./fixtures/npmLifecycleFailure.txt', import.meta.url), 'utf8'));
+    assert.match(lifecycle.message, /npm error code 3 \| npm error path \/work\/pkg \| npm error command failed \| npm error command sh -c echo building native module; exit 3$/);
+});
