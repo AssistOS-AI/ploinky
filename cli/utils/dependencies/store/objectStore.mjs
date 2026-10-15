@@ -122,6 +122,22 @@ function stageError(error, stage) {
  *   uuid?: Function, hooks?: { at?: Function }, copySeed?: Function,
  *   proveBuildQuiescent?: Function, proveReaderQuiescent?: Function }} options
  */
+const MAX_NAMED_DEPENDENCIES = 12;
+
+/** Readable consumer of a failed build: package, source path and dependency names, with the input key prefix last. */
+function describeBuildConsumer(plan) {
+    const inputId = `input ${String(plan.inputKey).slice(0, 12)}`;
+    const agent = plan.contract?.agent;
+    const manifest = agent?.manifest || plan.contract?.global?.manifest;
+    if (!manifest) return `${plan.kind} ${inputId}`;
+    const names = Object.keys(manifest.dependencies || {});
+    const listed = names.slice(0, MAX_NAMED_DEPENDENCIES).join(', ') + (names.length > MAX_NAMED_DEPENDENCIES ? `, +${names.length - MAX_NAMED_DEPENDENCIES} more` : '');
+    const parts = [];
+    if (agent?.packageSource?.relativePath) parts.push(agent.packageSource.relativePath);
+    parts.push(`dependencies: ${listed || 'none'}`, inputId);
+    return `${plan.kind} ${manifest.name || '(unnamed)'} (${parts.join('; ')})`;
+}
+
 export function createCacheStore({
     depsDir,
     workspaceRoot,
@@ -654,7 +670,7 @@ export function createCacheStore({
         }
         if (!built) {
             const failure = dependencyStoreError('PLOINKY_DEPS_BUILD_FAILED',
-                `dependency build for ${plan.kind} ${plan.inputKey.slice(0, 12)} failed: ${lastError?.message || 'unknown error'}`,
+                `dependency build for ${describeBuildConsumer(plan)} failed: ${lastError?.message || 'unknown error'}`,
                 { cause: lastError?.code || null, corruption: found.corruption });
             failure.cause = lastError;
             throw failure;

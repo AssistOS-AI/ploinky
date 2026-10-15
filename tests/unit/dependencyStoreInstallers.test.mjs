@@ -238,3 +238,67 @@ test('host sandbox receipts in their production shape are proven through their p
     assert.equal(otherScope.quiescent, false, 'a different boot/PID namespace is never proof');
     assert.equal(inspected, 0, 'no engine inspection for sandbox consumers');
 });
+
+function failingHostInstall(t, output, result = { status: 1 }) {
+    const root = tempRoot(t);
+    fs.mkdirSync(path.join(root, 'work'));
+    const { policy } = resolveHostNpmPolicy({ env: {}, files: [] });
+    const installer = createHostNpmInstaller({
+        toolchain: hostProbe(),
+        policy,
+        spawn: (_command, _args, options) => {
+            if (output) fs.writeSync(options.stdio[1], output);
+            return result;
+        },
+    });
+    try {
+        installer.install({ payloadDir: root, workDir: path.join(root, 'work') });
+    } catch (error) {
+        return error;
+    }
+    assert.fail('install must fail');
+}
+
+const GITHUB_FAILURE = [
+    '[deps-cache] npm install still running (30s)',
+    'npm error code 128',
+    'npm error An unknown git error occurred',
+    "npm error fatal: unable to access 'https://github.com/AssistOS-AI/Ploinky-Worker.git/': Failed to connect to github.com port 443",
+    '[deps-cache] npm install still running (60s)',
+    '',
+    'npm error A complete log of this run can be found in: /root/.npm/_logs/x-debug-0.log',
+].join('\n');
+
+test('dependency store installers: a non-zero exit names the cause from the output tail, without heartbeats', (t) => {
+    const error = failingHostInstall(t, GITHUB_FAILURE);
+    assert.equal(error.code, 'PLOINKY_DEPS_INSTALL_FAILED');
+    assert.match(error.message, /^host npm install exited with 1: /);
+    assert.match(error.message, /fatal: unable to access 'https:\/\/github\.com\/AssistOS-AI\/Ploinky-Worker\.git\/': Failed to connect to github\.com port 443/);
+    assert.doesNotMatch(error.message, /deps-cache|complete log/);
+    assert.ok(!error.message.includes('\n'));
+    assert.match(error.details.outputTail, /deps-cache/, 'the full tail stays in details');
+});
+
+test('dependency store installers: URL credentials are redacted from the failure reason', (t) => {
+    const error = failingHostInstall(t, 'npm error fatal: unable to access https://user:tok3n@github.com/x.git: Could not resolve host\n');
+    assert.doesNotMatch(error.message, /tok3n|user:/);
+    assert.match(error.message, /https:\/\/\*\*\*@github\.com\/x\.git/);
+});
+
+test('dependency store installers: an empty output tail keeps the plain failure text', (t) => {
+    assert.equal(failingHostInstall(t, '').message, 'host npm install exited with 1');
+    assert.equal(failingHostInstall(t, '[deps-cache] npm install still running\n\n').message, 'host npm install exited with 1');
+    const slow = failingHostInstall(t, '', { status: null, signal: 'SIGKILL', error: { code: 'ETIMEDOUT' } });
+    assert.equal(slow.code, 'PLOINKY_DEPS_INSTALL_TIMEOUT');
+});
+
+test('dependency store installers: timeout and spawn failures also carry the reason, bounded to one short line', (t) => {
+    const slow = failingHostInstall(t, 'npm error network timeout\n', { status: null, signal: 'SIGKILL', error: { code: 'ETIMEDOUT' } });
+    assert.match(slow.message, /deadline: npm error network timeout$/);
+    const spawnFail = failingHostInstall(t, 'error: boom\n', { status: null, error: { code: 'ENOENT' } });
+    assert.match(spawnFail.message, /failed: ENOENT: error: boom$/);
+    const long = failingHostInstall(t, `${'npm error filler '.repeat(200)}\nnpm error fatal: the-end\n`);
+    const reason = long.message.slice('host npm install exited with 1: '.length);
+    assert.ok(reason.length <= 400, `reason is ${reason.length} characters`);
+    assert.match(reason, /the-end$/);
+});

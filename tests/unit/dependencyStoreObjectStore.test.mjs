@@ -246,6 +246,23 @@ test('dependency store: a failed rebuild is bounded and leaves the index untouch
     assert.ok(store.describeObjects().filter((item) => item.buildReceipt?.state === 'failed').every((item) => item.retain));
 });
 
+test('dependency store: a failed agent build names the package, source path, dependencies and input prefix', (t) => {
+    const { store, lease, agentPlan } = setup(t);
+    const plan = agentPlan({
+        registration: 'local-llms/local-llm',
+        manifest: { name: 'local-llm', dependencies: { pworker: 'git+https://github.com/AssistOS-AI/Ploinky-Worker.git#4668a3f' } },
+    });
+    const broken = { describe: () => ({ kind: 'fake-npm' }), install() { throw new Error('container npm install exited with 1: npm error fatal: no route'); } };
+    assert.throws(() => store.ensureGeneration(lease, plan, { installer: broken, consumer: CONSUMER }), (error) => {
+        assert.equal(error.code, 'PLOINKY_DEPS_BUILD_FAILED');
+        assert.match(error.message, /^dependency build for agent local-llm \(local-llms\/local-llm\/code\/package\.json; dependencies: [^;]*pworker[^;]*; input [0-9a-f]{12}\) failed: container npm install exited with 1: npm error fatal: no route$/);
+        assert.ok(error.message.includes(`input ${plan.inputKey.slice(0, 12)}`));
+        return true;
+    });
+    assert.throws(() => store.ensureGeneration(lease, setup(t).seedPlan(), { installer: broken, consumer: CONSUMER }),
+        /dependency build for seed ploinky-global-deps \(dependencies: left-pad; input [0-9a-f]{12}\) failed: /);
+});
+
 test('dependency store: a competing index entry is accepted only after full validation', (t) => {
     const { store, lease, seedPlan, root } = setup(t);
     const plan = seedPlan();

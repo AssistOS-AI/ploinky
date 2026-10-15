@@ -60,12 +60,42 @@ function runBounded(command, args, { cwd, env, timeoutMs, outputLimitBytes, logF
     return { result, outputTail, durationMs: Date.now() - started };
 }
 
+const FAILURE_REASON_LIMIT = 400;
+const FAILURE_REASON_LINES = 4;
+const PREFERRED_REASON_LINE = /^(npm error|npm ERR!|fatal:|error:)/i;
+const NOISE_REASON_LINE = /^\[deps-cache\]|complete log of this run/i;
+
+function redactUserinfo(text) {
+    return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, '$1***@');
+}
+
+/**
+ * Short single-line reason from the installer output tail: the last few
+ * meaningful lines, credentials in URL userinfo removed, bounded in length.
+ * Returns '' when the tail has nothing useful.
+ */
+function failureReason(outputTail) {
+    const lines = String(outputTail || '').split(/\r?\n/)
+        // eslint-disable-next-line no-control-regex
+        .map((line) => redactUserinfo(line.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()))
+        .filter((line) => line && !NOISE_REASON_LINE.test(line));
+    const preferred = lines.filter((line) => PREFERRED_REASON_LINE.test(line));
+    const picked = (preferred.length ? preferred : lines).slice(-FAILURE_REASON_LINES);
+    const joined = picked.join(' | ');
+    return joined.length > FAILURE_REASON_LIMIT ? `...${joined.slice(-(FAILURE_REASON_LIMIT - 3))}` : joined;
+}
+
+function withReason(message, outputTail) {
+    const reason = failureReason(outputTail);
+    return reason ? `${message}: ${reason}` : message;
+}
+
 function installFailure(kind, { result, outputTail, durationMs }, timeoutMs) {
     if (result?.error?.code === 'ETIMEDOUT' || result?.signal === 'SIGKILL' && durationMs >= timeoutMs) {
-        return dependencyStoreError('PLOINKY_DEPS_INSTALL_TIMEOUT', `${kind} exceeded its ${Math.round(timeoutMs / 1000)}s deadline`, { outputTail });
+        return dependencyStoreError('PLOINKY_DEPS_INSTALL_TIMEOUT', withReason(`${kind} exceeded its ${Math.round(timeoutMs / 1000)}s deadline`, outputTail), { outputTail });
     }
-    if (result?.error) return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', `${kind} failed: ${result.error.code || result.error.message}`, { outputTail });
-    return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', `${kind} exited with ${result?.status ?? result?.signal}`, { outputTail });
+    if (result?.error) return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', withReason(`${kind} failed: ${result.error.code || result.error.message}`, outputTail), { outputTail });
+    return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', withReason(`${kind} exited with ${result?.status ?? result?.signal}`, outputTail), { outputTail });
 }
 
 /**
