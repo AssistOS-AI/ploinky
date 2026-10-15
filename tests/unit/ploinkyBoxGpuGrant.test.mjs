@@ -764,6 +764,59 @@ test('generation files are content addressed, private and pruned only by name', 
     assert.equal(fs.existsSync(path.join(state.store.directory, state.identity.instance)), false);
 });
 
+test('destroy teardown preflight is read-only and refuses symlinked, foreign or unexpected GPU state', (t) => {
+    // A fresh home: the preflight creates nothing and plans nothing.
+    const fresh = workspaceFixture(t, 'fresh');
+    assert.equal(typeof fresh.store.planTeardown, 'function', 'the GPU store has a destroy preflight');
+    assert.deepEqual(fresh.store.planTeardown(fresh.identity, fresh.lock), { recordPath: null, instanceDir: null, entries: [] });
+    assert.equal(fs.existsSync(path.join(fresh.home, '.ploinky-box')), false, 'the preflight never creates state directories');
+    assert.throws(() => fresh.store.planTeardown(fresh.identity, null), /requires the workspace mutation lock/);
+
+    // A complete record plus generation: planned exactly, nothing deleted.
+    const state = workspaceFixture(t);
+    state.store.write(state.identity, GRANT, state.lock);
+    const wiring = activeWiring(state.identity, { homeDirectory: state.home });
+    state.store.materialize(state.identity, wiring, state.lock);
+    const instanceDir = path.join(state.store.directory, state.identity.instance);
+    const generation = path.join(instanceDir, wiring.fingerprint);
+    assert.deepEqual(state.store.planTeardown(state.identity, state.lock), {
+        recordPath: state.store.pathFor(state.identity), instanceDir, entries: [generation],
+    });
+    assert.equal(fs.existsSync(state.store.pathFor(state.identity)), true);
+    assert.equal(fs.existsSync(generation), true);
+
+    // A 65-hex fingerprint-like name or a file entry is refused, nothing deleted.
+    for (const [label, make] of [
+        ['65-hex name', (target) => fs.mkdirSync(target, { mode: 0o700 })],
+        ['file entry', (target) => fs.writeFileSync(target, 'x', { mode: 0o600 })],
+    ]) {
+        const odd = path.join(instanceDir, label === 'file entry' ? 'b'.repeat(64) : 'c'.repeat(65));
+        make(odd);
+        assert.throws(() => state.store.planTeardown(state.identity, state.lock), /Unexpected entry in GPU grant generations/, label);
+        assert.equal(fs.existsSync(generation), true, label);
+        assert.equal(fs.existsSync(state.store.pathFor(state.identity)), true, label);
+        fs.rmSync(odd, { recursive: true, force: true });
+    }
+
+    // A directory where the record should be is refused, not removed.
+    const dirRecord = workspaceFixture(t, 'dir-record');
+    fs.mkdirSync(path.dirname(dirRecord.store.pathFor(dirRecord.identity)), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(dirRecord.store.pathFor(dirRecord.identity), { mode: 0o700 });
+    assert.throws(() => dirRecord.store.planTeardown(dirRecord.identity, dirRecord.lock), /non-regular GPU grant state path/);
+    assert.equal(fs.statSync(dirRecord.store.pathFor(dirRecord.identity)).isDirectory(), true);
+
+    // gpu-grants/<instance> as a symlink to an outside directory is refused and its target survives.
+    const linked = workspaceFixture(t, 'linked');
+    linked.store.write(linked.identity, GRANT, linked.lock);
+    const outside = path.join(linked.root, 'outside');
+    fs.mkdirSync(path.join(outside, 'a'.repeat(64)), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(outside, 'a'.repeat(64), 'keep'), 'outside data', { mode: 0o600 });
+    fs.symlinkSync(outside, path.join(linked.store.directory, linked.identity.instance));
+    assert.throws(() => linked.store.planTeardown(linked.identity, linked.lock), /is not a real directory/);
+    assert.equal(fs.readFileSync(path.join(outside, 'a'.repeat(64), 'keep'), 'utf8'), 'outside data');
+    assert.equal(fs.existsSync(linked.store.pathFor(linked.identity)), true, 'the record is kept too');
+});
+
 test('two workspaces keep separate grants and generations', (t) => {
     const left = workspaceFixture(t, 'left');
     const rightWorkspace = path.join(left.root, 'right');

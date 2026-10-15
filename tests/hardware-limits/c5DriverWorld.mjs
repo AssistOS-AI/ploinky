@@ -18,6 +18,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { containerCreateArgs } from '../../ploinky-box/lifecycle/container.mjs';
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
+import { createGpuGrantStore } from '../../ploinky-box/gpuGrant.mjs';
 import { createHardwareGateStore, resolveDesiredHardwareWiring } from '../../ploinky-box/hardwareLimitsGate.mjs';
 import { writeGraphSkillScope } from '../../ploinky-box/graphSkillScope.mjs';
 import { buildHostSkillScope } from '../../ploinky-box/skillScope.mjs';
@@ -322,7 +323,8 @@ export function createDowngradeWorld({
             runUpdateCore: fakeUpdateCore({ onCall: () => {} }),
             startCore: async () => { events.push('start-core'); }, healthCheck: async () => {}, revalidateAgentLibSource: () => {}, commitAgentLibSelection: () => {},
             validateExistingImage: () => ({ immutableId: `sha256:${'d'.repeat(64)}` }), validateContainer: () => {},
-            hardwareGateStore: gateStore, prepareHardwareGeneration: async () => { events.push('prepare'); return { structurallyPrepared: true }; },
+            hardwareGateStore: gateStore, gpuGrantStore: createGpuGrantStore({ homeDirectory: home }),
+            prepareHardwareGeneration: async () => { events.push('prepare'); return { structurallyPrepared: true }; },
             stdout: { write() { return true; } }, stderr: { write: text => { events.push(`stderr:${String(text).trim().slice(0, 120)}`); return true; } },
         });
     }

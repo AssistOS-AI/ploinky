@@ -17,6 +17,7 @@ import {
 } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import {
+    assertPrivateDirectoryIfPresent,
     ensurePrivateDirectory,
     readPrivateFile,
     writePrivateFileAtomically,
@@ -31,7 +32,12 @@ import {
     readBarrier,
     readStoreSnapshot,
 } from '../cli/sandbox/hardwareLimits/store.mjs';
-import { readStoreLockOwner, withStaleStoreLockRecovery } from '../cli/sandbox/hardwareLimits/storeLock.mjs';
+import {
+    readStoreLockOwner,
+    recoverStaleStoreLock,
+    STORE_LOCK_DIRECTORY,
+    withStaleStoreLockRecovery,
+} from '../cli/sandbox/hardwareLimits/storeLock.mjs';
 import { createTransitionStore, downgradeRecoveryAdvice } from './hardwareLimitsTransition.mjs';
 
 export const HARDWARE_GATE_ENV = 'PLOINKY_BOX_HARDWARE_LIMITS';
@@ -140,7 +146,114 @@ export function createHardwareGateStore({ homeDirectory = os.homedir(), fsApi = 
         else clear(identity, lock);
     }
 
-    return Object.freeze({ homeDirectory, root, recordPath, read, write, clear, restore });
+    function lstatOrNull(target) {
+        try {
+            return fsApi.lstatSync(target);
+        } catch (error) {
+            if (error?.code === 'ENOENT') return null;
+            throw gateError(`Unable to inspect hardware-limits state: ${target}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+        }
+    }
+
+    /**
+     * Read-only preflight of removing this workspace's whole hardware-limits
+     * state on destroy: the saved gate record and the INSTANCE directory
+     * (store, transitions and generation markers). Only the exact identity's
+     * paths are planned, the directory must be a private real directory whose
+     * top-level entries are the known real directories, and contents are never
+     * parsed, so a store a crash left half-deleted is still removable. With
+     * `inspectBox`, a stale store lock is first recovered under the usual proof
+     * (§5.2); a lock that remains always refuses. Nothing is created.
+     */
+    function planInstanceTeardown(identity, lock, { inspectBox = null } = {}) {
+        requireLock(identity, lock);
+        assertHardwareStateConfined({ workspaceRoot: identity.workspaceRoot, dataPaths: identity.dataPaths, homeDirectory, fsApi });
+        const empty = Object.freeze({ identity, recordPath: null, instanceDir: null, dirStat: null, entries: Object.freeze([]) });
+        if (!assertPrivateDirectoryIfPresent(fsApi, root, STATE_FILES)) return empty;
+        const record = recordPath(identity);
+        const recordStat = lstatOrNull(record);
+        if (recordStat && !recordStat.isFile() && !recordStat.isSymbolicLink()) {
+            throw gateError(`Refusing to remove a non-regular hardware-limits gate path: ${record}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+        }
+        const instanceDir = path.join(root, identity.instance);
+        if (!assertPrivateDirectoryIfPresent(fsApi, instanceDir, STATE_FILES)) {
+            return Object.freeze({ ...empty, recordPath: recordStat ? record : null });
+        }
+        if (fsApi.realpathSync.native(instanceDir) !== path.join(fsApi.realpathSync.native(root), identity.instance)) {
+            throw gateError(`Hardware-limits state directory resolves outside its root: ${instanceDir}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+        }
+        const dirStat = fsApi.lstatSync(instanceDir);
+        const entries = [];
+        for (const name of fsApi.readdirSync(instanceDir)) {
+            const target = path.join(instanceDir, name);
+            const stat = fsApi.lstatSync(target);
+            if (!['store', 'transitions'].includes(name) && !/^[a-f0-9]{64}$/.test(name)) {
+                throw gateError(`Unexpected entry in hardware-limits state: ${target}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+            }
+            if (stat.isSymbolicLink() || !stat.isDirectory()) {
+                throw gateError(`Hardware-limits state entry is not a real directory: ${target}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+            }
+            entries.push(Object.freeze({ name, path: target, dev: stat.dev, ino: stat.ino }));
+        }
+        // The journals go first and the store last; the gate record goes before all of them.
+        const rank = (name) => (name === 'transitions' ? 0 : name === 'store' ? 2 : 1);
+        entries.sort((left, right) => rank(left.name) - rank(right.name) || left.name.localeCompare(right.name));
+        if (entries.some((entry) => entry.name === 'store')) {
+            const storeRoot = path.join(instanceDir, 'store');
+            if (inspectBox) recoverStaleStoreLock({ storeRoot, hostLock: lock, instance: identity.instance, inspectBox, fsApi });
+            if (readStoreLockOwner(storeRoot, { fsApi })) {
+                throw gateError(`Hardware policy store lock ${path.join(storeRoot, STORE_LOCK_DIRECTORY)} is still held`, 'PLOINKY_BOX_HARDWARE_STORE_BUSY');
+            }
+        }
+        return Object.freeze({
+            identity,
+            recordPath: recordStat ? record : null,
+            instanceDir,
+            dirStat: Object.freeze({ dev: dirStat.dev, ino: dirStat.ino }),
+            entries: Object.freeze(entries),
+        });
+    }
+
+    /**
+     * Remove what `planInstanceTeardown` planned, under the workspace lock:
+     * the gate record first, then each planned entry (revalidated by device
+     * and inode; recursive removal never follows a symlink), then the empty
+     * INSTANCE directory. Idempotent: a path already gone counts as removed.
+     * Returns the canonical paths that existed: the record, then the directory.
+     */
+    function removeInstanceState(plan, lock) {
+        const identity = plan?.identity;
+        requireLock(identity, lock);
+        const removed = [];
+        if (clear(identity, lock) || plan.recordPath) removed.push(recordPath(identity));
+        if (!plan.instanceDir) return Object.freeze(removed);
+        const current = lstatOrNull(plan.instanceDir);
+        if (current) {
+            if (current.isSymbolicLink() || !current.isDirectory()
+                || current.dev !== plan.dirStat.dev || current.ino !== plan.dirStat.ino) {
+                throw gateError(`Hardware-limits state directory changed after it was checked: ${plan.instanceDir}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+            }
+            for (const entry of plan.entries) {
+                const stat = lstatOrNull(entry.path);
+                if (!stat) continue;
+                if (stat.isSymbolicLink() || !stat.isDirectory() || stat.dev !== entry.dev || stat.ino !== entry.ino) {
+                    throw gateError(`Hardware-limits state entry changed after it was checked: ${entry.path}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
+                }
+                fsApi.rmSync(entry.path, { recursive: true, force: true });
+            }
+            try {
+                fsApi.rmdirSync(plan.instanceDir);
+            } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+            }
+        }
+        removed.push(plan.instanceDir);
+        return Object.freeze(removed);
+    }
+
+    return Object.freeze({
+        homeDirectory, root, recordPath, read, write, clear, restore, planInstanceTeardown, removeInstanceState,
+    });
 }
 
 /**

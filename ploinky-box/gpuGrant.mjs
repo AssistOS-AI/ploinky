@@ -1201,6 +1201,49 @@ export function createGpuGrantStore({
         return removed;
     }
 
+    /**
+     * Read-only preflight of removing this workspace's whole GPU state on
+     * destroy: the checks of `clear` and of `prune` with nothing kept, without
+     * deleting anything. The deletion itself is `clear` (the decision record
+     * first) and then `prune(identity, [], lock)`.
+     */
+    function planTeardown(identity, lock) {
+        exactIdentity(identity);
+        assertLock(identity, lock);
+        assertConfined(identity);
+        const recordPath = targetFor(identity);
+        const root = instanceDirectory(identity);
+        const empty = Object.freeze({ recordPath: null, instanceDir: null, entries: Object.freeze([]) });
+        if (!assertPrivateDirectoryIfPresent(fsApi, stateRoot)
+            || !assertPrivateDirectoryIfPresent(fsApi, directory)) return empty;
+        let record = null;
+        try {
+            const stat = fsApi.lstatSync(recordPath);
+            if (!stat.isFile() && !stat.isSymbolicLink()) {
+                throw stateError(`Refusing to remove a non-regular GPU grant state path: ${recordPath}`);
+            }
+            record = recordPath;
+        } catch (error) {
+            if (error?.code !== 'ENOENT') {
+                if (error instanceof PloinkyBoxError) throw error;
+                throw stateError(`Unable to inspect saved GPU grant: ${recordPath}`, error);
+            }
+        }
+        if (!assertPrivateDirectoryIfPresent(fsApi, root)) {
+            return Object.freeze({ recordPath: record, instanceDir: null, entries: Object.freeze([]) });
+        }
+        const entries = [];
+        for (const entry of fsApi.readdirSync(root).sort()) {
+            const target = path.join(root, entry);
+            const stat = fsApi.lstatSync(target);
+            if (!FINGERPRINT_RE.test(entry) || stat.isSymbolicLink() || !stat.isDirectory()) {
+                throw stateError(`Unexpected entry in GPU grant generations: ${target}`);
+            }
+            entries.push(target);
+        }
+        return Object.freeze({ recordPath: record, instanceDir: root, entries: Object.freeze(entries) });
+    }
+
     return Object.freeze({
         homeDirectory: path.resolve(homeDirectory),
         directory,
@@ -1213,5 +1256,6 @@ export function createGpuGrantStore({
         restore,
         materialize,
         prune,
+        planTeardown,
     });
 }

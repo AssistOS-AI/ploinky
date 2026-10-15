@@ -140,6 +140,14 @@ test('dispatch order keeps marker, built-ins, explicit start, REPL, bash, and ge
     }
 });
 
+test('a targeted restart forwards the accepted failed-drain predecessor unchanged to core', () => {
+    const containerId = 'a'.repeat(64);
+    const argv = ['restart', 'Agent', '--accept-failed-drain', containerId];
+    const parsed = parseOuterArguments(argv);
+    assert.deepEqual(parsed.commandArgs, ['Agent', '--accept-failed-drain', containerId]);
+    assert.deepEqual(routeOuterCommand(parsed), { kind: 'restart', coreArgv: argv });
+});
+
 test('status accepts only verbose detail and preserves debug for read-only core forwarding', () => {
     assert.deepEqual(routeOuterCommand(parseOuterArguments(['status'])), {
         kind: 'status',

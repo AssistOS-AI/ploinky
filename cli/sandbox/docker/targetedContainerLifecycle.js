@@ -11,6 +11,7 @@ export const TARGETED_DRAIN_POLL_MS = 100;
 export const TARGETED_DRAIN_ACKNOWLEDGEMENT = 'exit-zero-after-drain';
 
 const SELECTOR_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+const CONTAINER_ID = /^[a-f0-9]{64}$/;
 
 function lifecycleError(message, code, details = {}) {
     const error = new Error(message);
@@ -104,27 +105,94 @@ function validateAffectedSelectors(value) {
     return Object.freeze(selectors);
 }
 
-function assertCleanTermination(name, inspection) {
+/**
+ * The operator's acceptance of one refused drain names the exact immutable
+ * container ID it accepts. Anything else is not an acceptance.
+ */
+export function normalizeAcceptedFailedDrain(value) {
+    if (value === undefined || value === null) return null;
+    const containerId = String(value?.containerId || '').trim();
+    if (!value || typeof value !== 'object' || Array.isArray(value) || !CONTAINER_ID.test(containerId)) {
+        throw lifecycleError(
+            'an accepted failed drain must name the full 64-hex predecessor container ID',
+            'TARGETED_DRAIN_INVALID',
+        );
+    }
+    return Object.freeze({ containerId });
+}
+
+function terminationOf(inspection) {
     const state = inspection?.State || inspection?.state || {};
     const exitCode = Number(state.ExitCode ?? state.exitCode);
     const oomKilled = state.OOMKilled === true || state.oomKilled === true;
     const stateError = String(state.Error || state.error || '').trim();
-    // A targeted restart is not an ordinary process stop. Exit zero is the
-    // application acknowledgement that its own drain/persistence contract
-    // completed. Signal termination (including 143) is never an acknowledgement.
-    if (oomKilled || stateError || exitCode !== 0) {
+    return {
+        running: state.Running === true || state.running === true,
+        exitCode: Number.isFinite(exitCode) ? exitCode : null,
+        oomKilled,
+        stateError,
+        // A targeted restart is not an ordinary process stop. Exit zero is the
+        // application acknowledgement that its own drain/persistence contract
+        // completed. Signal termination (including 143) is never an acknowledgement.
+        clean: !oomKilled && !stateError && exitCode === 0,
+    };
+}
+
+function describeTermination(termination) {
+    return `exit=${termination.exitCode ?? 'unknown'}${termination.oomKilled ? ', oom-killed' : ''}${termination.stateError ? `, error=${termination.stateError}` : ''}`;
+}
+
+function assertCleanTermination(name, inspection) {
+    const termination = terminationOf(inspection);
+    if (!termination.clean) {
         throw lifecycleError(
-            `targeted drain for '${name}' did not exit cleanly (exit=${Number.isFinite(exitCode) ? exitCode : 'unknown'}${oomKilled ? ', oom-killed' : ''}${stateError ? `, error=${stateError}` : ''}); refusing removal or recreate`,
+            `targeted drain for '${name}' did not exit cleanly (${describeTermination(termination)}); refusing removal or recreate`,
             'TARGETED_DRAIN_FAILED',
-            { exitCode: Number.isFinite(exitCode) ? exitCode : null, oomKilled },
+            { exitCode: termination.exitCode, oomKilled: termination.oomKilled },
         );
     }
-    return exitCode;
+    return termination.exitCode;
+}
+
+function acceptanceRefused(message) {
+    return lifecycleError(message, 'TARGETED_DRAIN_ACCEPTANCE_REFUSED');
+}
+
+// The operator accepts the recorded outcome of an earlier refused drain. It
+// never applies to a running container and never signals anything: the exact
+// predecessor must already be stopped and must be the container the operator
+// named, so a different or newer runtime can never be accepted by mistake.
+function acceptStoppedPredecessor(name, inspection, accepted, selectors) {
+    const inspectedId = String(inspection?.Id || inspection?.id || '').trim();
+    if (inspectedId !== accepted.containerId) {
+        throw acceptanceRefused(
+            `targeted container '${name}' is ${inspectedId || 'an unidentified container'}, not the accepted predecessor ${accepted.containerId}; refusing removal or recreate`,
+        );
+    }
+    const termination = terminationOf(inspection);
+    if (termination.running) {
+        throw acceptanceRefused(
+            `targeted container '${name}' is running; an accepted failed drain applies only to an already-stopped predecessor`,
+        );
+    }
+    if (termination.clean) {
+        return Object.freeze({ state: 'already-stopped', containerName: name, exitCode: termination.exitCode, affectedSelectors: selectors });
+    }
+    return Object.freeze({
+        state: 'accepted-failed-drain',
+        containerName: name,
+        containerId: inspectedId,
+        exitCode: termination.exitCode,
+        oomKilled: termination.oomKilled,
+        ...(termination.stateError ? { stateError: termination.stateError } : {}),
+        affectedSelectors: selectors,
+    });
 }
 
 export function drainTargetedContainer(name, {
     reason = 'targeted-container-recreate',
     acknowledgement,
+    acceptedFailedDrain = null,
     affectedSelectors,
     assertSelectorsInactive,
     timeoutMs = TARGETED_DRAIN_TIMEOUT_MS,
@@ -147,6 +215,7 @@ export function drainTargetedContainer(name, {
             'TARGETED_DRAIN_INVALID',
         );
     }
+    const accepted = normalizeAcceptedFailedDrain(acceptedFailedDrain);
     const selectors = validateAffectedSelectors(affectedSelectors);
     if (typeof assertSelectorsInactive !== 'function') {
         throw lifecycleError(
@@ -177,12 +246,21 @@ export function drainTargetedContainer(name, {
             'TARGETED_SELECTOR_ACTIVE',
         );
     }
+    // An absent predecessor has nothing left to drain or acknowledge. Callers
+    // that remove runtimes must therefore refuse a draining route first.
     if (!exists(containerName)) {
         return Object.freeze({ state: 'absent', containerName, affectedSelectors: selectors });
     }
     if (!isRunning(containerName)) {
-        const exitCode = assertCleanTermination(containerName, inspect(runtime, containerName));
+        const inspection = inspect(runtime, containerName);
+        if (accepted) return acceptStoppedPredecessor(containerName, inspection, accepted, selectors);
+        const exitCode = assertCleanTermination(containerName, inspection);
         return Object.freeze({ state: 'already-stopped', containerName, exitCode, affectedSelectors: selectors });
+    }
+    if (accepted) {
+        throw acceptanceRefused(
+            `targeted container '${containerName}' is running; an accepted failed drain applies only to an already-stopped predecessor; refusing SIGTERM, SIGKILL, removal, or recreate`,
+        );
     }
 
     retireControlSocket(containerName);

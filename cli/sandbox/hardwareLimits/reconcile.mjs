@@ -10,6 +10,7 @@ import { findAgent } from '../../utils/utils.js';
 import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
 import { resolveRouterEndpoint } from '../routerPort.js';
 import { ensureAgentService, retireExactAgentRuntimePredecessor } from '../docker/agentServiceManager.js';
+import { normalizeAcceptedFailedDrain } from '../docker/targetedContainerLifecycle.js';
 import { getRuntimeForAgent, isSandboxRuntime, getContainerLabel, getRuntime } from '../docker/common.js';
 import { registeredRuntimeTuple } from '../bwrap/bwrapFleet.js';
 import { resolveLlmRuntimeAdmissionContext } from '../docker/llmRuntimeIntegration.js';
@@ -37,6 +38,7 @@ import { inApplyStep, markApplyStep, describeApplyCause, formatApplyCause } from
 
 const APPLY_FAILED_FIX = 'This exact instance was not applied. Reload its state and retry.';
 function failure(code, message, status = 409) { return new HardwareStoreError(message, { code, status }); }
+function acceptanceRefused(message) { return Object.assign(new Error(message), { code: 'TARGETED_DRAIN_ACCEPTANCE_REFUSED' }); }
 
 export function captureExactHardwareInstances(registry, keys) {
     return [...new Set(keys)].map((key) => {
@@ -170,6 +172,7 @@ export async function reconcileExactHardwareInstance(captured, {
     origin = 'cli', expectedToken = undefined, networkLifecycleCapability = null,
     deadline = Date.now() + 15 * 60 * 1000,
     authorize = () => true, isCancelled = () => false, mpsLaunch = null, onMpsPlan = () => {}, onMpsResult = () => {},
+    acceptedFailedDrain: acceptedFailedDrainInput = null,
 } = {}, {
     loadRegistry = readAgentRegistrySnapshot, loadPlan = readPlan, readPolicy = defaultPolicy,
     policyCheck = assertHardwareApplyInputs, maintenance = withMaintenanceLock, network = withNetworkLifecycleLock,
@@ -179,6 +182,10 @@ export async function reconcileExactHardwareInstance(captured, {
     loadRouting = readRoutingConfig, publishUnavailable = mergeRoutingConfig,
     retireUnavailable = retireExactAgentRuntimePredecessor,
 } = {}) {
+    // Only an operator's CLI restart may accept a refused drain; Apply and the
+    // GPU/MPS cohort never carry that acceptance.
+    const acceptedFailedDrain = normalizeAcceptedFailedDrain(acceptedFailedDrainInput);
+    if (acceptedFailedDrain && origin !== 'cli') throw acceptanceRefused('Only the CLI restart of one agent may accept a refused targeted drain.');
     let capturedToken = expectedToken;
     const checkPolicy = () => {
         if (isCancelled() || Date.now() >= deadline) throw failure('apply_timeout', `The deadline for ${captured.key} expired.`, 504);
@@ -208,17 +215,24 @@ export async function reconcileExactHardwareInstance(captured, {
             if (plan.hardwareOutcome) throw new HardwareLimitsError(plan.hardwareOutcome);
             const priorMps = readAppliedObservation(captured.key, captured.record.containerId);
             if (!hasMpsLaunch(mpsLaunch) && (plan.runtimeAdmission?.descriptor?.hardwareGpu || priorMps?.mpsGeneration)) {
+                if (acceptedFailedDrain) throw acceptanceRefused(`A refused targeted drain of GPU/MPS client ${captured.key} cannot be accepted by restart.`);
                 phase = 'mps-coordination';
                 return await coordinateMpsLifecycle({ target: captured, options: { origin, expectedToken: capturedToken, deadline, authorize, isCancelled, onMpsPlan, onMpsResult, networkLifecycleCapability: capability },
                     launchTarget: (next) => reconcileExactHardwareInstance(captured, next) });
             }
             const routeKey = captured.record.alias || captured.record.agentName;
             const route = loadRouting().routes?.[routeKey];
-            if (!isSandboxRuntime(plan.runtime) && route && !route.hardwareAvailability) {
+            // A start keeps a refused-drain predecessor of a hardware-refused node and marks its draining route
+            // unavailable; once admitted again, only its accepted targeted restart may replace it and clear both marks.
+            const acceptsDrainingRoute = Boolean(acceptedFailedDrain) && route?.draining === true;
+            if (!isSandboxRuntime(plan.runtime) && route && (!route.hardwareAvailability || acceptsDrainingRoute)) {
                 check();
                 phase = 'restart-preparation';
-                transition = await prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability });
+                transition = await prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability,
+                    ...(acceptedFailedDrain ? { acceptedFailedDrain } : {}) });
                 phase = 'apply';
+            } else if (acceptedFailedDrain) {
+                throw acceptanceRefused(`${captured.key} has no managed-container route with a refused targeted drain to accept.`);
             }
             // Preparation can rotate the registry. Revalidate its own exact
             // successor before create, while token/barrier checks stay fresh.

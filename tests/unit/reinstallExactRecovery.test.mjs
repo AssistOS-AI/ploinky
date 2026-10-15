@@ -134,6 +134,7 @@ function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = f
             calls.push(['retire-preparation', name]);
         },
         dockerSvc: {
+            assertAgentServiceNotDraining: manager.assertAgentServiceNotDraining,
             removeAgentContainerForRecreate,
             async ensureAgentService(name, manifest, agentPath, options) {
                 assert.equal(current, null, 'failed container must be gone before retrying installation');

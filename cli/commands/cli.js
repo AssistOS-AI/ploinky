@@ -25,8 +25,10 @@ import {
     admitDirectAgentRuntimeManifest,
 } from './workspaceUtil.js';
 import {
+    ACCEPT_FAILED_DRAIN_FLAG,
     cleanupFailedTargetedAgentRestart,
     commitTargetedAgentRestart,
+    parseTargetedRestartArguments,
     prepareTargetedAgentRestart,
 } from './targetedAgentRestart.js';
 import { withHeldOrAcquiredWorkspaceMutationLease, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
@@ -431,7 +433,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             throw new Error('Usage: network status [--json] | network prune');
         }
         case 'restart': {
-            const target = (options[0] || '').trim();
+            const { target, acceptedFailedDrain } = parseTargetedRestartArguments(options);
             if (target && target.toLowerCase() === 'router') {
                 const cfg = workspaceSvc.getConfig();
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
@@ -496,6 +498,9 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 const agentRuntime = getRuntimeForAgent(manifest);
                 const containerName = registryRecord?.containerName || getAgentContainerName(resolved.shortAgentName, resolved.repo);
 
+                if (acceptedFailedDrain && isSandboxRuntime(agentRuntime)) {
+                    throw new Error(`${ACCEPT_FAILED_DRAIN_FLAG} applies only to a managed container; ${agentRuntime} runtimes have no targeted drain.`);
+                }
                 if (isSandboxRuntime(agentRuntime)) {
                     // Sandbox restart: stop process, then re-create via ensureAgentService
                     const bwrapRunning = Boolean(
@@ -633,6 +638,11 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                         throw new Error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
                     }
                     if (!registryRecord) throw new Error('Restart requires one exact registered agent.');
+                    // Acceptance answers an earlier refusal of a stopped predecessor;
+                    // it never stops, signals, or replaces a running runtime.
+                    if (acceptedFailedDrain && containerRunning) {
+                        throw new Error(`Agent '${agentName}' is running; ${ACCEPT_FAILED_DRAIN_FLAG} applies only to an already-stopped predecessor whose targeted drain was refused.`);
+                    }
 
                     const runtimeAction = 'restart';
                     console.log(`Restarting (${getRuntime()}) agent '${agentName}'...`);
@@ -640,7 +650,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                         await withHeldOrAcquiredWorkspaceMutationLease({ operation: 'exact-agent-restart' }, () => reconcileExactHardwareInstance({
                             key: registryRecord.containerName,
                             record: structuredClone(registryRecord.record),
-                        }, { origin: 'cli' }));
+                        }, { origin: 'cli', ...(acceptedFailedDrain ? { acceptedFailedDrain } : {}) }));
                         console.log('✓ Agent restarted.');
                     } catch (e) {
                         throw wrapPreservingHardwareCause(

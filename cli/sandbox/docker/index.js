@@ -21,6 +21,7 @@ export {
 } from './containerFleet.js';
 
 export {
+    assertAgentServiceNotDraining,
     cleanupExactAgentRuntimeCandidate,
     ensureAgentService,
     getFailedRuntimeIdentityRotation,
@@ -57,4 +58,5 @@ export {
     TARGETED_DRAIN_TIMEOUT_MS,
     drainAndRemoveTargetedContainer,
     drainTargetedContainer,
+    normalizeAcceptedFailedDrain,
 } from './targetedContainerLifecycle.js';

@@ -40,6 +40,7 @@ test('host and core lifecycle help have different scopes', () => {
     assert.match(host, /destroy \[--delete-cache\]/i);
     assert.match(host, /remove the outer runtime without prompting/i);
     assert.match(host, /optionally delete \.ploinky\/box cache data/i);
+    assert.match(host, /GPU grants and hardware-limits records/);
     assert.doesNotMatch(host, /--delete-volumes/i);
     assert.match(core, /leave the outer runtime running/i);
     assert.match(core, /status \[--verbose\]/i);
@@ -65,6 +66,10 @@ test('detailed lifecycle help preserves the selected host or core scope', () => 
     assert.match(hostDestroy, /both forms run without prompting/i);
     assert.match(hostDestroy, /\.ploinky\/box\/dependencies and \.ploinky\/box\/images/i);
     assert.match(hostDestroy, /\.ploinky\/data\/master-key.*are never deleted/i);
+    // Destroy removes the host operator records; only router bindings are kept.
+    assert.match(hostDestroy, /GPU grants and hardware-limits records/);
+    assert.match(hostDestroy, /router bindings are kept/);
+    assert.doesNotMatch(hostDestroy, /routing state, and secrets are never deleted/);
     // Nested state is disposable now; help must not promise it is retained.
     assert.match(hostDestroy, /nested agents are stopped through the in-box helper/i);
     assert.match(hostDestroy, /persistent agent data must use workspace binds/i);

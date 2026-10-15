@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,7 +9,11 @@ import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../../ploinky-box/constants.mjs
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
 import { writeGraphSkillScope } from '../../ploinky-box/graphSkillScope.mjs';
 import { buildHostSkillScope } from '../../ploinky-box/skillScope.mjs';
+import { hardwareStorePaths, initializeStore, setAgentLimits } from '../../cli/sandbox/hardwareLimits/store.mjs';
+import { createGpuGrantStore } from '../../ploinky-box/gpuGrant.mjs';
+import { createHardwareGateStore } from '../../ploinky-box/hardwareLimitsGate.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
+import { createMutationLockManager } from '../../ploinky-box/locks.mjs';
 import { readInboxStatus } from '../../ploinky-box/inbox/readStatus.mjs';
 import {
     captureConfiguredCoreStartArgv,
@@ -32,7 +37,17 @@ function fixture(t) {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
     fs.mkdirSync(workspace);
-    return { root, workspace };
+    // Host operator state lives in a private home under the fixture, never the real one.
+    const home = path.join(root, 'home');
+    fs.mkdirSync(home, { mode: 0o700 });
+    return { root, workspace, home, stores: hostStores(home) };
+}
+
+function hostStores(home) {
+    return {
+        gpuGrantStore: createGpuGrantStore({ homeDirectory: home }),
+        hardwareGateStore: createHardwareGateStore({ homeDirectory: home }),
+    };
 }
 
 function fakeLockManager(root, events) {
@@ -141,6 +156,7 @@ test('status, dry-run, stop, and destroy need no prerequisite probes', async t =
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: false });
     const events = [];
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         platform: 'linux',
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
@@ -164,6 +180,7 @@ test('destroying a running Box stops nested agents before the outer Box is remov
     const events = [];
     const ownership = owned(identity, { running: true });
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -192,6 +209,7 @@ test('destroy revalidates the exact container after stopping it', async (t) => {
     fs.mkdirSync(replacedRoot);
     const replacedEvents = [];
     const replaced = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(replacedRoot, replacedEvents),
@@ -216,6 +234,7 @@ test('destroy revalidates the exact container after stopping it', async (t) => {
     fs.mkdirSync(recoveryRoot);
     const recoveryEvents = [];
     const recovery = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(recoveryRoot, recoveryEvents),
@@ -242,6 +261,7 @@ test('a failed nested stop halts the Box but removes nothing', async (t) => {
     const events = [];
     const ownership = owned(identity, { running: true });
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -278,6 +298,7 @@ test('a failed outer removal retains the workspace cache data', async (t) => {
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -638,6 +659,7 @@ test('destroy revalidates the inspected immutable ID and retains cache data by d
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -666,6 +688,7 @@ test('explicit cache deletion happens only after the outer container is removed'
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -706,6 +729,7 @@ test('cache deletion works when the outer container is already absent', async (t
     seedBoxCache(identity);
     const events = [];
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -838,6 +862,7 @@ test('status reports an older owned image as incompatible while destroy remains 
     const events = [];
     const lockManager = fakeLockManager(state.root, events);
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager,
@@ -1528,6 +1553,7 @@ test('destroy retires retained markers and workspace lease only after exact Box 
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -1552,6 +1578,7 @@ test('repeat destroy recovers markers when the Box is already absent without rea
     fs.writeFileSync(path.join(identity.anchorPath, 'agents.json'), '{malformed retained registry');
     const events = [];
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -1573,6 +1600,7 @@ test('failed Box removal preserves current no-wait markers and workspace lease',
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -1601,6 +1629,7 @@ test('an unmountable workspace path fails before locking inspection, anchoring, 
         const events = [];
         const unexpected = label => () => { events.push(label); throw new Error(`Unexpected ${label}`); };
         const supervisor = createBoxSupervisor({
+            ...state.stores,
             resolveIdentity: () => identity,
             launchCwd: selected,
             lockManager: fakeLockManager(path.join(state.root, name.replace(/\s/g, '-')), events),
@@ -1620,4 +1649,321 @@ test('an unmountable workspace path fails before locking inspection, anchoring, 
         assert.deepEqual(events, ['lock', 'release'], name);
         assert.equal(fs.existsSync(path.join(selected, '.ploinky')), false, name);
     }
+});
+
+// ---------------------------------------------------------------------------
+// Destroy removes this workspace's host operator records (GPU grants and
+// hardware limits), keeps router bindings, and finishes on a re-run.
+
+function hostLockFor(identity) {
+    return { assertHeld: (instance) => assert.equal(instance, identity.instance) };
+}
+
+function canonicalRecords(home, identity) {
+    const root = path.join(home, '.ploinky-box');
+    return [
+        path.join(root, 'gpu-grants', `${identity.instance}.json`),
+        path.join(root, 'gpu-grants', identity.instance),
+        path.join(root, 'hardware-limits', `${identity.instance}.json`),
+        path.join(root, 'hardware-limits', identity.instance),
+    ];
+}
+
+// Every host operator record of one workspace, through the real stores, plus
+// a router binding that destroy must keep.
+function seedOperatorRecords(home, identity) {
+    const lock = hostLockFor(identity);
+    const { gpuGrantStore, hardwareGateStore } = hostStores(home);
+    gpuGrantStore.write(identity, { vendor: 'nvidia', agents: ['demo/agent'], denied: ['other/agent'] }, lock);
+    const [, gpuDir, , instanceDir] = canonicalRecords(home, identity);
+    const generation = path.join(gpuDir, 'e'.repeat(64));
+    fs.mkdirSync(generation, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(generation, 'marker.json'), '{}\n', { mode: 0o600 });
+    hardwareGateStore.write(identity, true, lock);
+    const paths = hardwareStorePaths({ identity, homeDirectory: home });
+    const { token } = initializeStore({ paths, identity });
+    setAgentLimits({
+        paths, identity, expectedToken: token, agentRef: 'demo/agent', limits: { cpus: 2 },
+        installedRefs: new Set(['demo/agent']), capabilities: { gate: 'on', controllers: ['cpu', 'memory', 'pids'] },
+        envelope: { cpus: 8, memoryBytes: 16 * 1024 ** 3 },
+    });
+    const transitions = path.join(instanceDir, 'transitions');
+    fs.mkdirSync(transitions, { mode: 0o700 });
+    fs.writeFileSync(path.join(transitions, `sha256-${'1'.repeat(64)}.json`), '{}\n', { mode: 0o600 });
+    const marker = path.join(instanceDir, 'f'.repeat(64), 'marker.json');
+    fs.mkdirSync(path.dirname(marker), { mode: 0o700 });
+    fs.writeFileSync(marker, '{}\n', { mode: 0o600 });
+    const binding = path.join(home, '.ploinky-box', 'router-bindings', `${identity.instance}.json`);
+    fs.mkdirSync(path.dirname(binding), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(binding, '{"address":"0.0.0.0","hostPort":8080}\n', { mode: 0o600 });
+    return { canonical: canonicalRecords(home, identity), details: [generation, paths.policyPath, transitions, marker], binding };
+}
+
+function treeDigest(target) {
+    const hash = crypto.createHash('sha256');
+    const visit = (current) => {
+        const stat = fs.lstatSync(current);
+        hash.update(`${path.relative(target, current)}:${stat.mode}:`);
+        if (stat.isDirectory()) for (const name of fs.readdirSync(current).sort()) visit(path.join(current, name));
+        else if (stat.isSymbolicLink()) hash.update(fs.readlinkSync(current));
+        else hash.update(fs.readFileSync(current));
+    };
+    visit(target);
+    return hash.digest('hex');
+}
+
+function absentOwnership() {
+    return { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: null };
+}
+
+function recordsSupervisor(state, identity, { discover = () => absentOwnership(), runner, ...overrides } = {}) {
+    const events = [];
+    const supervisor = createBoxSupervisor({
+        ...hostStores(state.home),
+        resolveIdentity: () => identity,
+        launchCwd: identity.workspaceRoot,
+        lockManager: fakeLockManager(fs.mkdtempSync(path.join(state.root, 'locks-')), events),
+        discover,
+        runner: runner || { run(command, args) { events.push(args.join(' ')); } },
+        stderr: { write: (text) => events.push(`stderr:${text}`) },
+        ...overrides,
+    });
+    return { supervisor, events };
+}
+
+function destroyFixture(t, name = 'workspace') {
+    const state = fixture(t);
+    const workspace = name === 'workspace' ? state.workspace : path.join(state.root, name);
+    fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
+    return { state, identity: buildWorkspaceIdentity(workspace, { markerFound: true }) };
+}
+
+test('destroy removes the GPU-grant and hardware-limits records only after the Box, and keeps the router binding', async (t) => {
+    const { state, identity } = destroyFixture(t);
+    const seeded = seedOperatorRecords(state.home, identity);
+    const bindingBytes = fs.readFileSync(seeded.binding);
+    const ownership = owned(identity, { running: false });
+    let atRemoval = null;
+    const { supervisor, events } = recordsSupervisor(state, identity, {
+        discover: () => ownership,
+        runner: {
+            run(command, args) {
+                events.push(args.join(' '));
+                if (args[1] === 'rm') atRemoval = [...seeded.canonical, ...seeded.details].map((target) => fs.existsSync(target));
+            },
+        },
+    });
+    const result = await supervisor.runDestroyTransaction(ownership.handles.container.id);
+    assert.deepEqual(atRemoval, [...seeded.canonical, ...seeded.details].map(() => true), 'every record existed at container rm');
+    for (const target of [...seeded.canonical, ...seeded.details]) assert.equal(fs.existsSync(target), false, target);
+    assert.equal(result.action, 'destroyed');
+    assert.deepEqual(result.removedRecords, seeded.canonical);
+    assert.deepEqual(fs.readFileSync(seeded.binding), bindingBytes, 'the router binding survives destroy');
+    assert.equal(events.some((event) => event.startsWith('stderr:')), false, events.join('\n'));
+});
+
+test('destroy removes the records of a Box that is already absent or was never created, and creates no state', async (t) => {
+    const { state, identity } = destroyFixture(t);
+    const seeded = seedOperatorRecords(state.home, identity);
+    const { supervisor } = recordsSupervisor(state, identity, {
+        runner: { run() { assert.fail('an absent Box needs no engine command'); }, query() { assert.fail('an absent Box needs no engine query'); } },
+    });
+    const result = await supervisor.runDestroyTransaction(null);
+    assert.equal(result.action, 'absent');
+    assert.deepEqual(result.removedRecords, seeded.canonical);
+    for (const target of seeded.canonical) assert.equal(fs.existsSync(target), false, target);
+    assert.ok(fs.existsSync(seeded.binding));
+
+    // A fresh home: nothing to remove and no state directory is created.
+    const fresh = destroyFixture(t);
+    const empty = recordsSupervisor(fresh.state, fresh.identity, { runner: { run() { assert.fail('no engine command'); } } });
+    assert.deepEqual((await empty.supervisor.runDestroyTransaction(null)).removedRecords, []);
+    assert.equal(fs.existsSync(path.join(fresh.state.home, '.ploinky-box')), false);
+});
+
+test('destroy is idempotent and finishes what a crash left behind', async (t) => {
+    const { state, identity } = destroyFixture(t);
+    const seeded = seedOperatorRecords(state.home, identity);
+    const { supervisor } = recordsSupervisor(state, identity);
+    assert.deepEqual((await supervisor.runDestroyTransaction(null)).removedRecords, seeded.canonical);
+    for (let round = 0; round < 2; round += 1) {
+        const again = await supervisor.runDestroyTransaction(null);
+        assert.equal(again.action, 'absent');
+        assert.deepEqual(again.removedRecords, [], `round ${round}`);
+    }
+    // Crash states: a half-deleted store, a gate record removed before the tree, and generations left after the GPU record.
+    const [gpuRecord, gpuDir, hardwareRecord, instanceDir] = canonicalRecords(state.home, identity);
+    fs.mkdirSync(path.join(instanceDir, 'store'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(instanceDir, 'store', 'limits.json'), '{"half":', { mode: 0o600 });
+    fs.mkdirSync(path.join(gpuDir, 'e'.repeat(64)), { recursive: true, mode: 0o700 });
+    const recovered = await supervisor.runDestroyTransaction(null);
+    assert.deepEqual(recovered.removedRecords, [gpuDir, instanceDir]);
+    for (const target of [gpuRecord, gpuDir, hardwareRecord, instanceDir]) assert.equal(fs.existsSync(target), false, target);
+});
+
+test('destroy preflights both stores before deleting anything', async (t) => {
+    for (const [label, corrupt] of [
+        ['hardware-limits/INSTANCE is a symlink', (home, identity, outside) => {
+            const [, , , instanceDir] = canonicalRecords(home, identity);
+            fs.rmSync(instanceDir, { recursive: true, force: true });
+            fs.symlinkSync(outside, instanceDir);
+        }],
+        ['gpu-grants/INSTANCE is a symlink', (home, identity, outside) => {
+            const [, gpuDir] = canonicalRecords(home, identity);
+            fs.rmSync(gpuDir, { recursive: true, force: true });
+            fs.symlinkSync(outside, gpuDir);
+        }],
+        ['hardware-limits/INSTANCE has an unexpected entry', (home, identity) => {
+            fs.mkdirSync(path.join(canonicalRecords(home, identity)[3], 'evil'), { mode: 0o700 });
+        }],
+        ['gpu-grants/INSTANCE.json is a directory', (home, identity) => {
+            const [gpuRecord] = canonicalRecords(home, identity);
+            fs.rmSync(gpuRecord);
+            fs.mkdirSync(gpuRecord, { mode: 0o700 });
+        }],
+    ]) {
+        const { state, identity } = destroyFixture(t);
+        const seeded = seedOperatorRecords(state.home, identity);
+        const outside = path.join(state.root, 'outside');
+        fs.mkdirSync(path.join(outside, 'store'), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(outside, 'store', 'keep'), 'outside data', { mode: 0o600 });
+        corrupt(state.home, identity, outside);
+        const before = seeded.canonical.map((target) => (fs.existsSync(target) ? treeDigest(target) : null));
+        const { supervisor } = recordsSupervisor(state, identity);
+        await assert.rejects(supervisor.runDestroyTransaction(null), (error) => {
+            assert.equal(error.code, 'PLOINKY_BOX_DESTROY_RECORDS_KEPT', label);
+            assert.match(error.message, /host operator records were kept: .*, then run ploinky destroy again\.$/, label);
+            return true;
+        }, label);
+        assert.deepEqual(seeded.canonical.map((target) => (fs.existsSync(target) ? treeDigest(target) : null)), before, `${label}: nothing deleted`);
+        assert.equal(fs.readFileSync(path.join(outside, 'store', 'keep'), 'utf8'), 'outside data', label);
+    }
+});
+
+test('destroy leaves every record of another workspace in the same home byte-identical', async (t) => {
+    const { state, identity } = destroyFixture(t);
+    fs.mkdirSync(path.join(state.root, 'other', '.ploinky'), { recursive: true });
+    const other = buildWorkspaceIdentity(path.join(state.root, 'other'), { markerFound: true });
+    const seeded = seedOperatorRecords(state.home, identity);
+    const kept = seedOperatorRecords(state.home, other);
+    const before = kept.canonical.map(treeDigest);
+    const ownership = owned(identity, { running: false });
+    const { supervisor } = recordsSupervisor(state, identity, { discover: () => ownership });
+    const result = await supervisor.runDestroyTransaction(ownership.handles.container.id);
+    assert.deepEqual(result.removedRecords, seeded.canonical);
+    for (const target of seeded.canonical) assert.equal(fs.existsSync(target), false, `destroyed workspace: ${target}`);
+    assert.deepEqual(kept.canonical.map(treeDigest), before, 'the other workspace is untouched');
+});
+
+test('destroy never deletes records when the workspace overlaps the host control-state directory', async (t) => {
+    const state = fixture(t);
+    const nested = path.join(state.home, '.ploinky-box', 'nested-workspace');
+    fs.mkdirSync(path.join(nested, '.ploinky'), { recursive: true, mode: 0o700 });
+    const identity = buildWorkspaceIdentity(nested, { markerFound: true });
+    const records = canonicalRecords(state.home, identity);
+    for (const directory of [path.dirname(records[0]), records[1], records[3]]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(records[0], '{}\n', { mode: 0o600 });
+    fs.writeFileSync(records[2], '{}\n', { mode: 0o600 });
+    const { supervisor } = recordsSupervisor(state, identity);
+    await assert.rejects(supervisor.runDestroyTransaction(null), (error) => {
+        assert.equal(error.code, 'PLOINKY_BOX_DESTROY_RECORDS_KEPT');
+        assert.match(error.message, /overlaps ~\/\.ploinky-box, so destroy never deletes there/);
+        return true;
+    });
+    for (const target of records) assert.ok(fs.existsSync(target), target);
+});
+
+test('destroy --delete-cache deletes the cache of a gone Box even when the records are kept, then reports both', async (t) => {
+    const { state, identity } = destroyFixture(t);
+    seedBoxCache(identity);
+    const seeded = seedOperatorRecords(state.home, identity);
+    fs.mkdirSync(path.join(seeded.canonical[3], 'evil'), { mode: 0o700 });
+    const ownership = owned(identity, { running: false });
+    const { supervisor, events } = recordsSupervisor(state, identity, { discover: () => ownership });
+    await assert.rejects(supervisor.runDestroyTransaction(ownership.handles.container.id, { deleteCache: true }), (error) => {
+        assert.equal(error.code, 'PLOINKY_BOX_DESTROY_RECORDS_KEPT');
+        assert.match(error.message, /host operator records were kept: .*Unexpected entry in hardware-limits state/);
+        assert.ok(error.message.includes(`The cache data was deleted: ${identity.dataPaths.dependencies}, ${identity.dataPaths.images}.`), error.message);
+        assert.deepEqual(error.deletedPaths, [identity.dataPaths.dependencies, identity.dataPaths.images]);
+        return true;
+    });
+    assert.ok(events.some((event) => /container rm -f/.test(event)));
+    assert.equal(boxCacheExists(identity), false, 'the cache was deleted');
+    for (const target of seeded.canonical) assert.ok(fs.existsSync(target), target);
+});
+
+test('destroy refuses an unproven Box observation without deleting the cache or any record', async (t) => {
+    const { state, identity } = destroyFixture(t);
+    seedBoxCache(identity);
+    const seeded = seedOperatorRecords(state.home, identity);
+    for (const observation of [{ state: 'unknown', message: 'engine unavailable' }, { state: 'foreign' }]) {
+        const { supervisor } = recordsSupervisor(state, identity, {
+            discover: () => observation,
+            runner: { run() { assert.fail('no engine mutation'); } },
+        });
+        await assert.rejects(supervisor.runDestroyTransaction(null, { deleteCache: true }),
+            (error) => error.code === `PLOINKY_BOX_${observation.state.toUpperCase()}`);
+        assert.equal(boxCacheExists(identity), true, observation.state);
+        for (const target of seeded.canonical) assert.ok(fs.existsSync(target), `${observation.state}: ${target}`);
+    }
+});
+
+test('a deletion failure midway keeps the rest for a re-run, which finishes', async (t) => {
+    const { state, identity } = destroyFixture(t);
+    const seeded = seedOperatorRecords(state.home, identity);
+    let failures = 0;
+    const failingFs = new Proxy(fs, {
+        get(target, property) {
+            if (property === 'rmSync') {
+                return (entry, options) => {
+                    if (failures === 0 && path.basename(entry) === 'f'.repeat(64)) {
+                        failures += 1;
+                        throw Object.assign(new Error(`EACCES: permission denied, rm '${entry}'`), { code: 'EACCES' });
+                    }
+                    return fs.rmSync(entry, options);
+                };
+            }
+            return Reflect.get(target, property);
+        },
+    });
+    const failing = recordsSupervisor(state, identity, {
+        hardwareGateStore: createHardwareGateStore({ homeDirectory: state.home, fsApi: failingFs }),
+    });
+    await assert.rejects(failing.supervisor.runDestroyTransaction(null), (error) => {
+        assert.equal(error.code, 'PLOINKY_BOX_DESTROY_RECORDS_KEPT');
+        assert.match(error.message, /host operator records were only partly removed: EACCES.*, then run ploinky destroy again to remove the rest\.$/);
+        return true;
+    });
+    assert.equal(failures, 1);
+    assert.equal(fs.existsSync(seeded.canonical[2]), false, 'the gate decision went first');
+    assert.ok(fs.existsSync(seeded.canonical[3]), 'the tree remains');
+    const rerun = recordsSupervisor(state, identity);
+    const result = await rerun.supervisor.runDestroyTransaction(null);
+    for (const target of seeded.canonical) assert.equal(fs.existsSync(target), false, target);
+    assert.deepEqual(result.removedRecords, [seeded.canonical[0], seeded.canonical[1], seeded.canonical[3]]);
+});
+
+test('two concurrent destroys serialize on the real workspace lock; the second sees nothing left', async (t) => {
+    const { state, identity } = destroyFixture(t);
+    const seeded = seedOperatorRecords(state.home, identity);
+    let present = true;
+    const ownership = owned(identity, { running: false });
+    const lockManager = createMutationLockManager({ homeDirectory: state.home });
+    const supervisor = createBoxSupervisor({
+        ...hostStores(state.home),
+        resolveIdentity: () => identity,
+        launchCwd: identity.workspaceRoot,
+        lockManager,
+        discover: () => (present ? ownership : absentOwnership()),
+        runner: { run(command, args) { if (args[1] === 'rm') present = false; } },
+    });
+    const [first, second] = await Promise.all([
+        supervisor.runDestroyTransaction(ownership.handles.container.id),
+        supervisor.runDestroyTransaction(null),
+    ]);
+    assert.equal(first.action, 'destroyed');
+    assert.deepEqual(first.removedRecords, seeded.canonical);
+    assert.equal(second.action, 'absent');
+    assert.deepEqual(second.removedRecords, []);
+    assert.ok(fs.existsSync(seeded.binding));
 });

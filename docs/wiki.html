@@ -164,6 +164,11 @@
                             <p>Liveness answers whether an already admitted runtime remains healthy enough to keep serving. The Watchdog applies the declared recurring probe and bounded failure threshold to the exact recorded runtime, withdraws a stale route before recovery, and uses bounded restart backoff. Liveness does not replace initial readiness, and an activation-only readiness probe requires separate recurring liveness coverage.</p>
                         </article>
 
+                        <article id="definition-targeted-drain">
+                            <h3>Targeted drain</h3>
+                            <p>A targeted drain replaces one running managed container while the rest of the graph keeps serving. Ploinky withdraws the agent's route, sends SIGTERM once and accepts the replacement only when the application exits with status 0 within 35 seconds, which acknowledges that its own drain and persistence completed. Any other outcome is a refusal that keeps the route draining and blocks every automatic replacement until the operator either completes a later acknowledged restart or accepts the refusal of the exact stopped container with <code>restart &lt;agent&gt; --accept-failed-drain &lt;container-id&gt;</code>.</p>
+                        </article>
+
                         <article id="definition-no-wait-dependency">
                             <h3>No-wait dependency</h3>
                             <p>A no-wait dependency is a graph node allowed to continue startup asynchronously after its identity, direct dependencies, and final preparation generation have been fixed. Its detached worker has a run-specific identifier, status, log, deadline, and terminal ready, failed, or superseded state. No-wait shortens the synchronous command boundary but does not permit raw route activation, stale-runtime adoption, or unobservable readiness failure.</p>

@@ -53,6 +53,9 @@ Commands:
   ploinky start [AGENT [PORT]]    Start the graph; omit AGENT to reuse the saved workspace agent
   ploinky restart                 Reconcile sources and restart the whole workspace graph
   ploinky restart AGENT           Restart one agent in the existing Box generation
+  ploinky restart AGENT --accept-failed-drain CONTAINER_ID
+                                  Replace the stopped predecessor whose targeted drain
+                                  was refused, accepting possible loss of its data
   ploinky --udp-port PORT start AGENT [PORT]
                                   Select the media host UDP port; defaults to 7882
   ploinky bind [ADDRESS:PORT:8080]
@@ -85,9 +88,10 @@ Commands:
   ploinky update [PATH]           Verified fast-forward update of repos and skills
   ploinky update all [PATH]       (Ploinky only when its checkout is within PATH)
   ploinky update repos|repo NAME  Update registered repositories; activation is pending
-  ploinky destroy                 Remove the outer Box without prompting; retain .ploinky/box
-  ploinky destroy --delete-cache  Remove the outer Box and delete .ploinky/box/dependencies
-                                  and .ploinky/box/images without prompting
+  ploinky destroy                 Remove the outer Box without prompting, then this workspace's
+                                  GPU grants and hardware-limits records; retain .ploinky/box
+  ploinky destroy --delete-cache  Remove the outer Box and those records, and delete
+                                  .ploinky/box/dependencies and .ploinky/box/images without prompting
   ploinky cli                     Open Bash in the Box
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
   ploinky logs tail [TARGET]      Follow Router or agent logs; inspect-only
@@ -116,7 +120,8 @@ saves the binding for later start, restart, update, and Box recreation. A later
 Router traffic is plain HTTP, and the bind address is not a client access rule.
 
 A GPU grant is an operator decision for this workspace only, saved outside the
-workspace in ~/.ploinky-box. The Box gets the NVIDIA device nodes and read-only
+workspace in ~/.ploinky-box until ploinky destroy removes it (with the saved
+hardware-limits gate and stored limits; router bindings are kept). The Box gets the NVIDIA device nodes and read-only
 driver libraries (no privileged mode or added capabilities), and only the named
 agents may request the device ploinky.local/gpu=all. A grant needs a configured
 graph once a Box exists, starts it if it is stopped, and keeps the current
@@ -344,6 +349,11 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
         const destroyed = await selectedSupervisor.runDestroyTransaction(container?.id || null, {
             deleteCache: route.deleteCache,
         });
+        const removedRecords = destroyed?.removedRecords || [];
+        output.write(
+            `Ploinky Box ${status.identity.instance} was destroyed; host operator records removed: `
+            + `${removedRecords.length > 0 ? removedRecords.join(', ') : 'none remained'}.\n`,
+        );
         if (route.deleteCache) {
             const deletedPaths = destroyed?.deletedPaths || [];
             output.write(
