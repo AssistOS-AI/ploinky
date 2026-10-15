@@ -2046,6 +2046,15 @@ function ensureGraphNodesEnabled(graph, reg, {
     const preliminary = {
       node, existing, expectedExecution, executionChanged, profileChanged, predecessorBackend,
     };
+    let observedRuntimeReason = '';
+    let runtimeReasonObserved = false;
+    const observeRuntimeReplacementReason = () => {
+      if (!runtimeReasonObserved) {
+        observedRuntimeReason = String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+        runtimeReasonObserved = true;
+      }
+      return observedRuntimeReason;
+    };
     // A stalled worker of an earlier start still holds this exact staged
     // identity and would resume under any generation that carries it again, so
     // the identity always rotates and its unpublished runtime is removed.
@@ -2061,7 +2070,7 @@ function ensureGraphNodesEnabled(graph, reg, {
         ? 'hardwareUnavailable'
         : superseded
           ? 'noWaitRunSuperseded'
-          : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+          : observeRuntimeReplacementReason();
     }
     // A start that stopped after persisting this record's rotated tuple but
     // before removing its predecessor left that predecessor's own tuple in a
@@ -2103,6 +2112,8 @@ function ensureGraphNodesEnabled(graph, reg, {
       ...preliminary,
       executionDifferences,
       runtimeReason,
+      supersededNoWaitRun: superseded,
+      observeRuntimeReplacementReason,
       registryRecord: structuredClone(existing.rec),
       priorPredecessorReceipt,
       predecessorProcess,
@@ -2127,9 +2138,13 @@ function ensureGraphNodesEnabled(graph, reg, {
     try {
       dockerSvc.assertAgentServiceNotDraining(plan.existing.key, { loadRouting: () => drainingRouting });
     } catch (error) {
+      if (error?.code !== 'PLOINKY_AGENT_DRAINING') throw error;
+      // The displayed reason can hide independent supersession or MPS facts.
+      // Observe a skipped runtime reason only when containment needs that fact.
       const containable = (deferredNodeIds.has(plan.node.id) || unavailableNodeIds.has(plan.node.id))
-        && !['noWaitRunSuperseded', 'mpsCohortTransition'].includes(plan.runtimeReason);
-      if (error?.code !== 'PLOINKY_AGENT_DRAINING' || !containable) throw error;
+        && !plan.supersededNoWaitRun
+        && plan.observeRuntimeReplacementReason() !== 'mpsCohortTransition';
+      if (!containable) throw error;
       retainedDrainingPlans.push(plan);
     }
   }
