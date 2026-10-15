@@ -104,12 +104,19 @@ for (const runtime of ['podman', 'docker']) {
         if (runtime === 'docker') {
             assert.deepEqual(dependencyMounts.map((mount) => mount.Destination).sort(), ['/Agent/node_modules', '/code/node_modules']);
         } else {
-            assert.deepEqual(dependencyMounts.map((mount) => mount.Destination), [first.dependencies.nodeModulesPath], 'Podman self-mount');
-            const staged = container.Mounts.filter((mount) => mount.Destination === '/code' || mount.Destination === '/Agent');
-            for (const mount of staged) {
-                assert.equal(fs.readlinkSync(path.join(mount.Source, 'node_modules')), first.dependencies.nodeModulesPath,
-                    `staged ${mount.Destination}/node_modules names the admitted payload`);
-            }
+            assert.deepEqual(dependencyMounts, [
+                { Type: 'bind', Source: first.dependencies.nodeModulesPath, Destination: '/code/node_modules', RW: false },
+                { Type: 'bind', Source: first.dependencies.nodeModulesPath, Destination: first.dependencies.nodeModulesPath, RW: false },
+            ], 'Podman binds the direct code dependency path and the staged Agent symlink target read-only');
+            assert.deepEqual(container.Mounts.filter((mount) => mount.Destination === '/code'), [
+                { Type: 'bind', Source: path.join(w.agentDir, 'code'), Destination: '/code', RW: false },
+            ], 'Podman binds the agent code directly read-only');
+            const staged = container.Mounts.filter((mount) => mount.Destination === '/Agent');
+            assert.equal(staged.length, 1, 'Podman binds one staged Agent tree');
+            assert.equal(staged[0].Type, 'bind');
+            assert.equal(staged[0].RW, false, 'the staged Agent tree stays read-only');
+            assert.equal(fs.readlinkSync(path.join(staged[0].Source, 'node_modules')), first.dependencies.nodeModulesPath,
+                'staged /Agent/node_modules names the admitted payload');
         }
 
         const warm = assertOk(steps, 'warm');
