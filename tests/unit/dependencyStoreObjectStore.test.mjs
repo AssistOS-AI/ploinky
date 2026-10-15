@@ -263,6 +263,13 @@ test('dependency store: a failed agent build names the package, source path, dep
         /dependency build for seed ploinky-global-deps \(dependencies: left-pad; input [0-9a-f]{12}\) failed: /);
 });
 
+test('dependency store: a seed failure while serving an agent names the requesting agent', (t) => {
+    const { store, lease, agentPlan, seedPlan } = setup(t);
+    const broken = { describe: () => ({ kind: 'fake-npm' }), install() { throw new Error('container npm install exited with 1'); } };
+    assert.throws(() => store.ensureAgentGeneration(lease, { agentPlan: agentPlan({ registration: 'local-llms/local-llm' }), seedPlan: seedPlan(), installer: broken, consumer: CONSUMER }),
+        /dependency build for seed ploinky-global-deps for agent local-llms\/local-llm \(dependencies: left-pad; input [0-9a-f]{12}\) failed: /);
+});
+
 test('dependency store: a competing index entry is accepted only after full validation', (t) => {
     const { store, lease, seedPlan, root } = setup(t);
     const plan = seedPlan();

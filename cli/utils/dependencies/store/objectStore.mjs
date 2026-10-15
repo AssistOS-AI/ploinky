@@ -114,18 +114,10 @@ function stageError(error, stage) {
     return error;
 }
 
-/**
- * Create a store bound to one workspace.
- *
- * @param {{ depsDir: string, workspaceRoot: string, assertLease?: Function, fsApi?: object,
- *   checkDiskSpace?: Function, minFreeBytes?: number, writerIdentity?: Function, now?: Function,
- *   uuid?: Function, hooks?: { at?: Function }, copySeed?: Function,
- *   proveBuildQuiescent?: Function, proveReaderQuiescent?: Function }} options
- */
 const MAX_NAMED_DEPENDENCIES = 12;
 
 /** Readable consumer of a failed build: package, source path and dependency names, with the input key prefix last. */
-function describeBuildConsumer(plan) {
+function describeBuildConsumer(plan, requester = null) {
     const inputId = `input ${String(plan.inputKey).slice(0, 12)}`;
     const agent = plan.contract?.agent;
     const manifest = agent?.manifest || plan.contract?.global?.manifest;
@@ -135,9 +127,18 @@ function describeBuildConsumer(plan) {
     const parts = [];
     if (agent?.packageSource?.relativePath) parts.push(agent.packageSource.relativePath);
     parts.push(`dependencies: ${listed || 'none'}`, inputId);
-    return `${plan.kind} ${manifest.name || '(unnamed)'} (${parts.join('; ')})`;
+    const forAgent = requester ? ` for agent ${requester}` : '';
+    return `${plan.kind} ${manifest.name || '(unnamed)'}${forAgent} (${parts.join('; ')})`;
 }
 
+/**
+ * Create a store bound to one workspace.
+ *
+ * @param {{ depsDir: string, workspaceRoot: string, assertLease?: Function, fsApi?: object,
+ *   checkDiskSpace?: Function, minFreeBytes?: number, writerIdentity?: Function, now?: Function,
+ *   uuid?: Function, hooks?: { at?: Function }, copySeed?: Function,
+ *   proveBuildQuiescent?: Function, proveReaderQuiescent?: Function }} options
+ */
 export function createCacheStore({
     depsDir,
     workspaceRoot,
@@ -644,6 +645,7 @@ export function createCacheStore({
         prelookup = null,
         maxAttempts = DEFAULT_MAX_BUILD_ATTEMPTS,
         installOptions = {},
+        requester = null,
     }) {
         requireLease(lease);
         ensureLayout();
@@ -670,7 +672,7 @@ export function createCacheStore({
         }
         if (!built) {
             const failure = dependencyStoreError('PLOINKY_DEPS_BUILD_FAILED',
-                `dependency build for ${describeBuildConsumer(plan)} failed: ${lastError?.message || 'unknown error'}`,
+                `dependency build for ${describeBuildConsumer(plan, requester)} failed: ${lastError?.message || 'unknown error'}`,
                 { cause: lastError?.code || null, corruption: found.corruption });
             failure.cause = lastError;
             throw failure;
@@ -723,6 +725,7 @@ export function createCacheStore({
             installer,
             operation,
             installOptions,
+            requester: agentPlan.registration || agentPlan.contract?.agent?.manifest?.name || null,
             consumer: { kind: 'seed-copy', process: writerIdentity(), registration: agentPlan.registration || null, phase: 'copying' },
         });
         try {

@@ -62,26 +62,33 @@ function runBounded(command, args, { cwd, env, timeoutMs, outputLimitBytes, logF
 
 const FAILURE_REASON_LIMIT = 400;
 const FAILURE_REASON_LINES = 4;
+// Lines that state the cause: first choice.
+const CAUSE_REASON_LINE = /reason:|fatal:|npm error code|npm ERR! code|\b(ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN)\b/i;
 const PREFERRED_REASON_LINE = /^(npm error|npm ERR!|fatal:|error:)/i;
-const NOISE_REASON_LINE = /^\[deps-cache\]|complete log of this run/i;
+// Heartbeats, log pointers, generic npm network advice and repeated syscall/errno detail.
+const NOISE_REASON_LINE = /^\[deps-cache\]|complete log of this run|^npm (error|ERR!) network\s*$|behind a proxy|bad network settings|'proxy' config|npm help config|make sure that the$|problem related to network|^npm (error|ERR!) (syscall|errno) /i;
+// C0/C1 controls, line/paragraph separators and bidi controls.
+const UNSAFE_REASON_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g; // eslint-disable-line no-control-regex
 
 function redactUserinfo(text) {
     return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, '$1***@');
 }
 
 /**
- * Short single-line reason from the installer output tail: the last few
- * meaningful lines, credentials in URL userinfo removed, bounded in length.
+ * Short single-line reason from the installer output tail: the cause lines
+ * (npm code, `reason:`, git `fatal:`, network error codes) when present, else
+ * the last few npm/git error lines, else the last lines; generic advice and
+ * heartbeats dropped, credentials in URL userinfo removed, bounded in length.
  * Returns '' when the tail has nothing useful.
  */
 function failureReason(outputTail) {
     const lines = String(outputTail || '').split(/\r?\n/)
-        // eslint-disable-next-line no-control-regex
-        .map((line) => redactUserinfo(line.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()))
+        .map((line) => redactUserinfo(line.replace(UNSAFE_REASON_CHARS, ' ').trim()))
         .filter((line) => line && !NOISE_REASON_LINE.test(line));
+    const cause = lines.filter((line) => CAUSE_REASON_LINE.test(line));
     const preferred = lines.filter((line) => PREFERRED_REASON_LINE.test(line));
-    const picked = (preferred.length ? preferred : lines).slice(-FAILURE_REASON_LINES);
-    const joined = picked.join(' | ');
+    const pool = cause.length ? cause : (preferred.length ? preferred : lines);
+    const joined = pool.slice(-FAILURE_REASON_LINES).join(' | ');
     return joined.length > FAILURE_REASON_LIMIT ? `...${joined.slice(-(FAILURE_REASON_LIMIT - 3))}` : joined;
 }
 

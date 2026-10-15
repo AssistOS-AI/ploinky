@@ -302,3 +302,22 @@ test('dependency store installers: timeout and spawn failures also carry the rea
     assert.ok(reason.length <= 400, `reason is ${reason.length} characters`);
     assert.match(reason, /the-end$/);
 });
+
+test('dependency store installers: a real npm registry outage keeps the cause and drops the proxy advice', (t) => {
+    const output = fs.readFileSync(new URL('./fixtures/npmRegistryOutage.txt', import.meta.url), 'utf8');
+    const error = failingHostInstall(t, output);
+    assert.match(error.message, /npm error code ENOTFOUND/);
+    assert.match(error.message, /request to http:\/\/nonexistent-host\.invalid\/left-pad failed, reason: getaddrinfo ENOTFOUND nonexistent-host\.invalid/);
+    assert.doesNotMatch(error.message, /proxy|npm help config|connectivity|complete log|syscall/);
+    // Git case keeps working in the same ranking.
+    const git = failingHostInstall(t, GITHUB_FAILURE);
+    assert.match(git.message, /npm error code 128 \| npm error fatal: unable to access/);
+});
+
+test('dependency store installers: control, separator and bidi characters never reach the failure reason', (t) => {
+    const unsafe = ['\u0085', '\u0080', '\u009f', '\u2028', '\u2029', '\u202a', '\u202e', '\u2066', '\u2069', '\u007f'];
+    for (const ch of unsafe) {
+        const error = failingHostInstall(t, `npm error fatal: bad${ch}thing\n`);
+        assert.equal(error.message, 'host npm install exited with 1: npm error fatal: bad thing', `U+${ch.codePointAt(0).toString(16)}`);
+    }
+});
