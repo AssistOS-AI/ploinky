@@ -2,7 +2,7 @@
 // the exact candidate with the pworker engine installed by one uniform command (decision U13). Offline: the engine is a local
 // git+file fixture repository, and npm is the real npm.
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -376,6 +376,29 @@ test('SCR.a-clean-digest-that-is-not-the-head-tree-is-refused-before-anything-is
     assert.throws(() => prepareLocalLlmsLayout({ candidateRoot: candidate, sourceDigest: `git-tree:${'0'.repeat(40)}`, stageParent, runId: randomRunId(),
         install: () => assert.fail('nothing is installed') }), /changed before staging/);
     assert.deepEqual(fs.readdirSync(stageParent), []);
+});
+
+test('SCR.the-capture-tool-takes-a-clean-candidate-never-installs-into-it-and-removes-its-scratch', (t) => {
+    const tool = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'hardware-limits', 'captureLocalLlmRunnerEnv.mjs');
+    const engine = pworkerFixture(t);
+    const candidate = postMoveCandidate(t, engine);
+    const temporary = scratchDirectory(t, 'hwl-cap-');
+    const run = (...args) => spawnSync(process.execPath, [tool, ...args], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: temporary, TMPDIR: temporary } });
+    assert.match(run().stderr, /Usage: --candidate <local-llms repository root>/);
+    assert.match(run('--tree', path.join(candidate, 'local-llm')).stderr, /Usage: --candidate/, 'the old flag is gone');
+    // A candidate that is not clean is refused before anything is staged or installed.
+    write(candidate, { 'local-llm/src/dirty.mjs': 'export const dirty = true;\n' });
+    const dirty = run('--candidate', candidate);
+    assert.notEqual(dirty.status, 0);
+    assert.match(dirty.stderr, /is not clean/);
+    fs.rmSync(path.join(candidate, 'local-llm', 'src', 'dirty.mjs'));
+    // A clean candidate is staged and installed in the scratch copy, which fails here only because the fixture is no agent.
+    const clean = run('--candidate', candidate);
+    assert.notEqual(clean.status, 0);
+    assert.match(clean.stderr, /agentHost\.mjs/);
+    assert.equal(fs.existsSync(path.join(candidate, 'local-llm', 'node_modules')), false, 'nothing was installed into the candidate');
+    assert.equal(git(candidate, 'status', '--porcelain', '--untracked-files=all', '--ignored'), '');
+    assert.deepEqual(fs.readdirSync(temporary).filter(name => name.startsWith('hwl-capture-')), [], 'the scratch is removed');
 });
 
 // --- the vLLM calibration tool ---------------------------------------------------------------------------------------------
