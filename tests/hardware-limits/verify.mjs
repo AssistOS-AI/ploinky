@@ -258,7 +258,7 @@ function dependencyIdentity(name, linkPath) {
     return { name, realpath, revision, treeDigest: digest || treeDigest(realpath) };
 }
 
-function candidateDigest(root) {
+export function candidateDigest(root) {
     const dirty = git(root, ['status', '--porcelain', '--untracked-files=all']);
     if (dirty) return treeDigest(root);
     return `git-tree:${git(root, ['rev-parse', 'HEAD^{tree}'])}`;
@@ -703,7 +703,15 @@ export function recordLocalLlmInstall(root) {
     const declaredSpec = readOptionalJson(path.join(root, 'local-llm', 'package.json'), 1024 * 1024, 'local-llm/package.json')?.dependencies?.pworker;
     const declared = declaredSpec === undefined ? null : pinnedCommit(declaredSpec, 'the pworker dependency of local-llm/package.json');
     const modules = path.join(root, LOCAL_LLMS_INSTALL_OUTPUT);
+    // pworker is the one package the install may leave: it is the only one recorded, and the identity check excludes the
+    // whole install output. Anything else, a dependency of the candidate or of pworker, is refused.
+    for (const name of fs.existsSync(modules) ? fs.readdirSync(modules) : []) {
+        if (!['pworker', '.package-lock.json'].includes(name)) throw new SchemaError(`local-llm/node_modules holds ${name}; pworker is the only package the install may leave`);
+    }
     const lock = readOptionalJson(path.join(modules, '.package-lock.json'), 8 * 1024 * 1024, 'local-llm/node_modules/.package-lock.json');
+    for (const key of Object.keys(lock?.packages ?? {})) {
+        if (key !== 'node_modules/pworker') throw new SchemaError(`local-llm/node_modules/.package-lock.json lists ${key}; pworker is the only package the install may leave`);
+    }
     const entry = lock?.packages?.['node_modules/pworker'];
     const installed = entry === undefined ? null : pinnedCommit(entry?.resolved, 'the resolved pworker of local-llm/node_modules/.package-lock.json');
     if (installed !== declared) {
@@ -776,10 +784,13 @@ export function prepareLocalLlmsLayout({ candidateRoot, sourceDigest: digest, st
     try {
         fs.mkdirSync(home, { mode: 0o700 });
         if (digest.startsWith('git-tree:')) {
-            // A clean candidate: its exact committed tree, every blob verified. The revision is resolved once.
-            // Clean means no tracked change and no untracked file, so HEAD is the whole candidate.
-            if (candidateDigest(candidateRoot) !== digest) throw new SchemaError('local-llms candidate changed before staging');
-            createBaselineStage(candidateRoot, git(candidateRoot, ['rev-parse', 'HEAD']), root);
+            // A clean candidate: its exact committed tree, every blob verified. The revision is resolved once, its tree is
+            // the configured one, and that same revision is archived. Clean means no tracked change and no untracked file.
+            const revision = git(candidateRoot, ['rev-parse', 'HEAD']);
+            if (`git-tree:${git(candidateRoot, ['rev-parse', `${revision}^{tree}`])}` !== digest || candidateDigest(candidateRoot) !== digest) {
+                throw new SchemaError('local-llms candidate changed before staging');
+            }
+            createBaselineStage(candidateRoot, revision, root);
         } else {
             assertNoNodeModules(candidateRoot, 'the local-llms candidate');
             copyOwnedTree(candidateRoot, root);

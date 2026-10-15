@@ -54,12 +54,12 @@ function commit(root, message) {
 }
 
 // A stand-in for the engine package: pworker's package shape and the one module the measurement snippet imports.
-function pworkerFixture(t, marker = 'pworker-fixture') {
+function pworkerFixture(t, marker = 'pworker-fixture', dependencies = {}) {
     const root = path.join(scratchDirectory(t, 'hwl-pw-'), 'pworker');
     fs.mkdirSync(root);
     git(root, 'init', '-q', '-b', 'main');
     write(root, {
-        'package.json': JSON.stringify({ name: 'pworker', version: '0.0.0', type: 'module', exports: { './local-llm': './lib/local-llm/index.mjs' }, dependencies: {} }),
+        'package.json': JSON.stringify({ name: 'pworker', version: '0.0.0', type: 'module', exports: { './local-llm': './lib/local-llm/index.mjs' }, dependencies }),
         'lib/local-llm/index.mjs': `export const marker = ${JSON.stringify(marker)};\n`,
         'lib/local-llm/controller/downloader.mjs': `import path from 'node:path';
 export function artifactPaths({ root, artifact }) {
@@ -78,14 +78,14 @@ test('the scratch copy resolves the installed engine', () => assert.equal(marker
 `;
 
 // A local-llms tree that pins the fixture engine, as the post-move candidate pins pworker.
-function postMoveCandidate(t, engine, { pin = engine.sha, extra = {} } = {}) {
+function postMoveCandidate(t, engine, { pin = engine.sha, extra = {}, dependencies = {} } = {}) {
     const root = path.join(scratchDirectory(t, 'hwl-ll-'), 'local-llms');
     fs.mkdirSync(root);
     git(root, 'init', '-q', '-b', 'main');
     write(root, {
         '.gitignore': 'node_modules/\n',
         'local-llm/.npmrc': 'bin-links=false\nignore-scripts=true\n',
-        'local-llm/package.json': JSON.stringify({ name: 'local-llm', private: true, type: 'module', dependencies: { pworker: `git+file://${engine.root}#${pin}` } }),
+        'local-llm/package.json': JSON.stringify({ name: 'local-llm', private: true, type: 'module', dependencies: { pworker: `git+file://${engine.root}#${pin}`, ...dependencies } }),
         'local-llm/src/value.mjs': 'export const value = 1;\n',
         'local-llm/tests/pworker.test.mjs': POST_MOVE_TEST,
         ...extra,
@@ -228,9 +228,9 @@ test('SCR.d-a-scratch-copy-changed-during-the-suite-fails-the-recheck-and-only-l
     const { layout } = prepare(t, candidate, cleanDigest(candidate));
     assertLocalLlmsLayoutUnchanged(layout);
     const tree = path.join(layout.root, 'local-llm');
-    // Writes into the install output that leave the installed pworker as it was are the one thing excluded.
+    // The install output is excluded from the identity but not from the record: an entry other than pworker and npm's lock is refused.
     write(tree, { 'node_modules/.cache/x': 'cache\n' });
-    assertLocalLlmsLayoutUnchanged(layout);
+    assert.throws(() => assertLocalLlmsLayoutUnchanged(layout), /node_modules holds \.cache/);
     fs.rmSync(path.join(tree, 'node_modules', '.cache'), { recursive: true });
     const mutate = (file, text) => { const target = path.join(tree, file); const before = fs.existsSync(target) ? fs.readFileSync(target) : null; write(tree, { [file]: text });
         return () => (before === null ? fs.rmSync(target, { recursive: true, force: true }) : fs.writeFileSync(target, before)); };
@@ -289,16 +289,18 @@ test('SCR.a-failed-install-never-passes-and-leaves-nothing-behind', (t) => {
     assert.deepEqual(fs.readdirSync(stageParent), []);
 });
 
-function recordFixture(t, { declared, resolved, entry = true, symlink = false }) {
+function recordFixture(t, { declared, resolved, entry = true, symlink = false, extraDirectory = null, extraLockKey = null }) {
     const root = scratchDirectory(t, 'hwl-rec-');
     write(root, { 'local-llm/package.json': JSON.stringify(declared === undefined ? { name: 'x' } : { name: 'x', dependencies: { pworker: declared } }) });
     if (resolved !== undefined) {
         const packages = entry ? { 'node_modules/pworker': { version: '0.0.0', resolved } } : { 'node_modules/other': { version: '1.0.0', resolved: 'https://registry.example/other.tgz' } };
+        if (extraLockKey) packages[extraLockKey] = { version: '1.0.0', resolved: 'https://registry.example/x.tgz' };
         write(root, { 'local-llm/node_modules/.package-lock.json': JSON.stringify({ packages }) });
         if (symlink) {
             fs.mkdirSync(path.join(root, 'elsewhere'));
             fs.symlinkSync(path.join(root, 'elsewhere'), path.join(root, 'local-llm', 'node_modules', 'pworker'));
         } else write(root, { 'local-llm/node_modules/pworker/index.js': 'code\n' });
+        if (extraDirectory) write(root, { [`local-llm/node_modules/${extraDirectory}/index.js`]: 'code\n' });
     }
     return root;
 }
@@ -319,7 +321,9 @@ test('SCR.the-recorded-commit-is-the-text-after-the-hash-of-a-ssh-or-https-resol
         ['a declared dependency that is not a full commit', { declared: 'git+https://github.com/AssistOS-AI/Ploinky-Worker.git#main', resolved: ssh }, /not pinned to a full 40-hex commit/],
         ['a declared range', { declared: '^1.0.0', resolved: ssh }, /not pinned to a full 40-hex commit/],
         ['a pinned dependency with nothing installed', { declared: https }, /installed pworker \(none\)/],
-        ['an installed lock without the pworker entry', { declared: https, resolved: ssh, entry: false }, /installed pworker \(none\)/],
+        ['an installed lock that lists another package instead of pworker', { declared: https, resolved: ssh, entry: false }, /holds other|lists node_modules\/other/],
+        ['a package other than pworker in node_modules', { declared: https, resolved: ssh, extraDirectory: 'left-pad' }, /node_modules holds left-pad/],
+        ['a package other than pworker in the lock', { declared: https, resolved: ssh, extraLockKey: 'node_modules/left-pad' }, /lists node_modules\/left-pad/],
         ['an installed pworker that nothing pins', { declared: undefined, resolved: ssh }, /is not the one local-llm\/package\.json pins \(none\)/],
         ['an installed pworker that is a link', { declared: https, resolved: ssh, symlink: true }, /not a real directory/],
     ];
@@ -343,6 +347,35 @@ test('SCR.the-report-carries-a-validated-install-record-for-the-suite-that-has-o
         { ...record, pworkerCommit: null },
         { ...record, pworkerTreeDigest: 'sha256:xyz' },
     ]) assert.throws(() => make(bad), /install record/, JSON.stringify(bad));
+});
+
+test('SCR.an-extra-package-installed-by-the-candidate-or-by-pworker-is-refused-and-the-stage-is-removed', (t) => {
+    // The candidate itself depends on a second package.
+    const second = path.join(scratchDirectory(t, 'hwl-ot-'), 'other');
+    fs.mkdirSync(second);
+    git(second, 'init', '-q', '-b', 'main');
+    write(second, { 'package.json': JSON.stringify({ name: 'other', version: '1.0.0', type: 'module' }), 'index.mjs': 'export const other = 1;\n' });
+    const otherSha = commit(second, 'other package');
+    const engine = pworkerFixture(t);
+    const stageParent = scratchDirectory(t, 'hwl-st-');
+    const direct = postMoveCandidate(t, engine, { dependencies: { other: `git+file://${second}#${otherSha}` } });
+    assert.throws(() => prepareLocalLlmsLayout({ candidateRoot: direct, sourceDigest: cleanDigest(direct), stageParent, runId: randomRunId() }),
+        (error) => error.name === 'SchemaError' && /node_modules holds other; pworker is the only package/.test(error.message));
+    assert.deepEqual(fs.readdirSync(stageParent), []);
+    // pworker itself depends on a second package: npm installs it beside pworker, and that is refused as well.
+    const dependent = pworkerFixture(t, 'dependent', { other: `git+file://${second}#${otherSha}` });
+    const transitive = postMoveCandidate(t, dependent);
+    assert.throws(() => prepareLocalLlmsLayout({ candidateRoot: transitive, sourceDigest: cleanDigest(transitive), stageParent, runId: randomRunId() }), /node_modules holds other/);
+    assert.deepEqual(fs.readdirSync(stageParent), []);
+});
+
+test('SCR.a-clean-digest-that-is-not-the-head-tree-is-refused-before-anything-is-archived', (t) => {
+    const engine = pworkerFixture(t);
+    const candidate = postMoveCandidate(t, engine);
+    const stageParent = scratchDirectory(t, 'hwl-st-');
+    assert.throws(() => prepareLocalLlmsLayout({ candidateRoot: candidate, sourceDigest: `git-tree:${'0'.repeat(40)}`, stageParent, runId: randomRunId(),
+        install: () => assert.fail('nothing is installed') }), /changed before staging/);
+    assert.deepEqual(fs.readdirSync(stageParent), []);
 });
 
 // --- the vLLM calibration tool ---------------------------------------------------------------------------------------------
