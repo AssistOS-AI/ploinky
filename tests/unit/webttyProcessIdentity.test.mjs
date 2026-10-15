@@ -3,12 +3,15 @@ import test from 'node:test';
 
 import {
     capturePtyProcessIdentity,
+    capturePtySessionSnapshot,
+    cleanupPtySession,
     captureWorkerProcessIdentity,
     parseLinuxProcessStat,
     revalidatePtyProcessIdentity,
     revalidatePtyProcessLiveness,
     revalidateWorkerProcessIdentity,
     signalVerifiedPtyProcessGroup,
+    signalExactPtySessionSnapshot,
     waitForPtyProcessExit,
 } from '../../core-services/webtty/process-identity.mjs';
 
@@ -45,6 +48,340 @@ test('Linux stat parsing handles closing parentheses and exact topology fields',
     assert.throws(() => parseLinuxProcessStat('malformed', 4242));
     assert.throws(() => parseLinuxProcessStat(procStat(4243), 4242));
     assert.throws(() => identity(4242, { startTicks: '0' }));
+});
+
+function gone() {
+    const error = new Error('gone');
+    error.code = 'WEBTTY_PROCESS_IDENTITY_STALE';
+    throw error;
+}
+
+function sessionFixture(members, { entries = [...members.keys()].map(String), read = (pid) => members.get(pid) || gone() } = {}) {
+    let cursor = 0;
+    return {
+        fsApi: { async opendir() {
+            return {
+                async read() {
+                    const name = entries[cursor++];
+                    return name ? { name, isDirectory: () => true } : null;
+                },
+                async close() {},
+            };
+        } },
+        readIdentityImpl: read,
+    };
+}
+
+const shell = identity();
+const child = identity(5252, { sessionId: shell.pid, startTicks: '54321' });
+
+test('session snapshot includes different groups only under an exact continuous live anchor', async () => {
+    const unrelated = identity(6000);
+    const snapshot = await capturePtySessionSnapshot(shell, sessionFixture(new Map([
+        [shell.pid, shell], [child.pid, child], [unrelated.pid, unrelated],
+    ])));
+    assert.deepEqual(snapshot.map((member) => member.pid), [shell.pid, child.pid]);
+    assert.ok(Object.isFrozen(snapshot) && snapshot.every(Object.isFrozen));
+    assert.equal(snapshot[1].startToken, child.startToken);
+});
+
+test('session scan refuses unanchored, replaced and disappearing anchors', async () => {
+    const members = new Map([[child.pid, child]]);
+    await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(members)), {
+        category: 'session-anchor-missing',
+    });
+    members.set(shell.pid, identity(shell.pid, { startTicks: '9999' }));
+    await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(members)), {
+        category: 'session-anchor-missing',
+    });
+    let reads = 0;
+    await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(members, {
+        entries: [String(shell.pid), String(child.pid)],
+        read: (pid) => {
+            if (pid === shell.pid && ++reads === 3) return gone();
+            return pid === shell.pid ? shell : child;
+        },
+    })), { code: 'WEBTTY_PROCESS_IDENTITY_STALE' });
+});
+
+test('captured child can preserve continuity after shell exit, but SID alone cannot', async () => {
+    const members = new Map([[child.pid, child]]);
+    const snapshot = await capturePtySessionSnapshot(shell, {
+        ...sessionFixture(members), anchors: [shell, child],
+    });
+    assert.deepEqual(snapshot.map((member) => member.pid), [child.pid]);
+    const escaped = { ...child, sessionId: 6000 };
+    await assert.rejects(() => capturePtySessionSnapshot(shell, {
+        ...sessionFixture(new Map([[child.pid, escaped], [7000, identity(7000, { sessionId: shell.pid })]])),
+        anchors: [child],
+    }), { category: 'session-anchor-missing' });
+    assert.deepEqual(await capturePtySessionSnapshot(shell, sessionFixture(new Map())), []);
+});
+
+test('session scans reject malformed evidence, unreadable files and entry limits', async () => {
+    for (const invalid of [
+        { ...shell, pid: 0 }, { ...shell, pid: -1 }, { ...shell, pid: Number.MAX_SAFE_INTEGER + 1 },
+        { ...shell, sessionId: 0 }, { ...shell, startToken: 'bad' },
+    ]) {
+        await assert.rejects(() => capturePtySessionSnapshot(invalid, sessionFixture(new Map())));
+    }
+    await assert.rejects(() => capturePtySessionSnapshot(shell, {
+        ...sessionFixture(new Map([[shell.pid, shell]]), { entries: ['4242', '5252'] }), maxEntries: 1,
+    }), { category: 'proc-scan-limit' });
+    await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(new Map(), {
+        read: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); },
+    })), { code: 'EACCES' });
+    await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(new Map(), {
+        read: () => ({ ...shell, state: '' }),
+    })), { category: 'session-identity' });
+});
+
+test('bounded proc reads reject overlong stat evidence and close owned handles', async () => {
+    let closed = 0;
+    const fsApi = {
+        async open() { return {
+            async read() { return { bytesRead: 64 * 1024 + 1 }; },
+            async close() { closed += 1; },
+        }; },
+    };
+    await assert.rejects(() => capturePtySessionSnapshot(shell, { fsApi }), { category: 'proc-file-limit' });
+    assert.equal(closed, 1);
+});
+
+test('positive PID signaling revalidates every start token and session immediately', () => {
+    const calls = [];
+    signalExactPtySessionSnapshot([shell, child], 'SIGKILL', {
+        deadlineAt: 100, nowImpl: () => 0,
+        readIdentityImpl: (pid) => { calls.push(['read', pid]); return pid === shell.pid ? shell : child; },
+        killImpl: (pid, signal) => calls.push(['kill', pid, signal]),
+    });
+    assert.deepEqual(calls, [
+        ['read', shell.pid], ['kill', shell.pid, 'SIGKILL'],
+        ['read', child.pid], ['kill', child.pid, 'SIGKILL'],
+    ]);
+    for (const current of [{ ...child, startToken: 'linux-proc:9999' }, { ...child, sessionId: 9999 }]) {
+        assert.throws(() => signalExactPtySessionSnapshot([child], 'SIGTERM', {
+            deadlineAt: 100, nowImpl: () => 0, readIdentityImpl: () => current,
+            killImpl: () => assert.fail('wrong process must not receive a signal'),
+        }), { category: 'session-member-changed' });
+    }
+});
+
+test('missing and zombie targets are gone; signal permission failures stay unproven', () => {
+    for (const readIdentityImpl of [gone, () => ({ ...child, state: 'Z' })]) {
+        signalExactPtySessionSnapshot([child], 'SIGTERM', {
+            deadlineAt: 100, nowImpl: () => 0, readIdentityImpl,
+            killImpl: () => assert.fail('gone process must not receive signal'),
+        });
+    }
+    assert.throws(() => signalExactPtySessionSnapshot([child], 'SIGTERM', {
+        deadlineAt: 100, nowImpl: () => 0, readIdentityImpl: () => child,
+        killImpl: () => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); },
+    }), { code: 'EPERM' });
+    signalExactPtySessionSnapshot([child], 'SIGTERM', {
+        deadlineAt: 100, nowImpl: () => 0, readIdentityImpl: () => child,
+        killImpl: () => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); },
+    });
+});
+
+test('invalid snapshots and expired revalidations never authorize signals', () => {
+    for (const snapshot of [[{ ...child, pid: -1 }], [{ ...child, sessionId: 0 }],
+        [{ ...child, startToken: 'malformed' }], [shell, identity(6000)]]) {
+        assert.throws(() => signalExactPtySessionSnapshot(snapshot, 'SIGTERM', {
+            deadlineAt: 100, nowImpl: () => 0,
+            killImpl: () => assert.fail('invalid evidence must not signal'),
+        }));
+    }
+    let now = 0;
+    assert.throws(() => signalExactPtySessionSnapshot([child], 'SIGTERM', {
+        deadlineAt: 100, nowImpl: () => now,
+        readIdentityImpl: () => { now = 100; return child; },
+        killImpl: () => assert.fail('late read must not signal'),
+    }), { category: 'session-deadline' });
+});
+
+test('cleanup requires stable empty scans even after the original shell is gone', async () => {
+    let now = 0;
+    const scans = [];
+    assert.equal(await cleanupPtySession(shell, {
+        nowImpl: () => now, delayImpl: async (ms) => { now += ms; },
+        snapshotImpl: async () => { scans.push(now); return []; },
+        signalImpl: () => assert.fail('empty session must not signal'),
+    }), true);
+    assert.deepEqual(scans, [0, 25]);
+});
+
+test('cleanup discovers TERM-phase children, transfers anchors and escalates within one budget', async () => {
+    let now = 0;
+    const calls = [];
+    const newChild = { ...child, pid: 6262, startToken: 'linux-proc:6262' };
+    let killed = false;
+    assert.equal(await cleanupPtySession(shell, {
+        nowImpl: () => now, delayImpl: async (ms) => { now += ms; },
+        snapshotImpl: async (_record, { anchors }) => {
+            if (now >= 50 && !killed) assert.ok(anchors.some((member) => member.pid === newChild.pid));
+            return killed ? [] : (now >= 25 ? [shell, child, newChild] : [shell, child]);
+        },
+        signalImpl: (snapshot, signal, { deadlineAt }) => {
+            calls.push({ snapshot, signal, now, deadlineAt });
+            if (signal === 'SIGKILL') killed = true;
+        },
+    }), true);
+    assert.deepEqual(calls.filter((call) => call.signal === 'SIGTERM').map((call) => call.snapshot.map((p) => p.pid)), [
+        [child.pid, shell.pid], [newChild.pid],
+    ]);
+    assert.equal(calls.find((call) => call.signal === 'SIGKILL').now, 750);
+    assert.ok(calls.every((call) => call.now < call.deadlineAt));
+    assert.ok(now < 1_500);
+});
+
+for (const termSignalsBeforeCutoff of [0, 1]) {
+    test(`TERM cutoff after ${termSignalsBeforeCutoff} signals rescans before KILL within the original budget`, async () => {
+        let now = 0;
+        let termReads = 0;
+        let scans = 0;
+        const members = new Map([[shell.pid, shell], [child.pid, child]]);
+        const calls = [];
+        assert.equal(await cleanupPtySession(shell, {
+            nowImpl: () => now,
+            delayImpl: async (ms) => { now += ms; },
+            snapshotImpl: (record, options) => {
+                scans += 1;
+                return capturePtySessionSnapshot(record, { ...options, ...sessionFixture(members) });
+            },
+            signalImpl: (snapshot, signal, options) => signalExactPtySessionSnapshot(snapshot, signal, {
+                ...options,
+                readIdentityImpl: (pid) => {
+                    if (signal === 'SIGTERM' && termReads++ === termSignalsBeforeCutoff) now = 750;
+                    return members.get(pid) || gone();
+                },
+                killImpl: (pid, selectedSignal) => {
+                    calls.push({ pid, signal: selectedSignal, now, scans });
+                    if (selectedSignal === 'SIGKILL') members.delete(pid);
+                },
+            }),
+        }), true);
+        assert.equal(calls.filter((call) => call.signal === 'SIGTERM').length, termSignalsBeforeCutoff);
+        assert.deepEqual(calls.filter((call) => call.signal === 'SIGKILL').map((call) => call.pid), [child.pid, shell.pid]);
+        assert.ok(calls.filter((call) => call.signal === 'SIGKILL').every((call) => call.scans === 2));
+        assert.ok(calls.every((call) => call.now < (call.signal === 'SIGTERM' ? 750 : 1_500)));
+        assert.ok(now < 1_500);
+    });
+}
+
+test('TERM cutoff does not swallow permission failures, replacement or total deadline expiry', async () => {
+    for (const failure of ['permission', 'replacement', 'total-deadline']) {
+        let now = 0;
+        let signals = 0;
+        await assert.rejects(() => cleanupPtySession(shell, {
+            nowImpl: () => now,
+            snapshotImpl: async () => [shell, child],
+            signalImpl: (snapshot, signal, options) => signalExactPtySessionSnapshot(snapshot, signal, {
+                ...options,
+                readIdentityImpl: () => {
+                    now = failure === 'total-deadline' ? 1_500 : 750;
+                    if (failure === 'permission') throw Object.assign(new Error('denied'), { code: 'EACCES' });
+                    return failure === 'replacement' ? { ...child, startToken: 'linux-proc:9999' } : child;
+                },
+                killImpl: () => { signals += 1; },
+            }),
+        }), failure === 'permission' ? { code: 'EACCES' } : {
+            category: failure === 'replacement' ? 'session-member-changed' : 'session-deadline',
+        });
+        assert.equal(signals, 0);
+    }
+});
+
+for (const failure of ['permission', 'anchor']) {
+    test(`TERM rollover refuses KILL when the fresh scan has a ${failure} failure`, async () => {
+        let now = 0;
+        let scans = 0;
+        let signals = 0;
+        const members = new Map([[shell.pid, shell], [child.pid, child]]);
+        await assert.rejects(() => cleanupPtySession(shell, {
+            nowImpl: () => now,
+            snapshotImpl: (record, options) => {
+                scans += 1;
+                return capturePtySessionSnapshot(record, {
+                    ...options,
+                    ...sessionFixture(members, {
+                        read: (pid) => {
+                            if (scans === 2 && failure === 'permission') {
+                                throw Object.assign(new Error('denied'), { code: 'EACCES' });
+                            }
+                            return members.get(pid) || gone();
+                        },
+                    }),
+                });
+            },
+            signalImpl: (snapshot, signal, options) => signalExactPtySessionSnapshot(snapshot, signal, {
+                ...options,
+                readIdentityImpl: () => {
+                    now = 750;
+                    members.delete(shell.pid);
+                    members.set(child.pid, { ...child, startToken: 'linux-proc:9999' });
+                    return child;
+                },
+                killImpl: () => { signals += 1; },
+            }),
+        }), failure === 'permission' ? { code: 'EACCES' } : { category: 'session-anchor-missing' });
+        assert.equal(scans, 2);
+        assert.equal(signals, 0);
+    });
+}
+
+test('continuing churn and hanging snapshots stop at the absolute deadline', async () => {
+    let now = 0;
+    const signals = [];
+    await assert.rejects(() => cleanupPtySession(shell, {
+        nowImpl: () => now, delayImpl: async (ms) => { now += ms; },
+        snapshotImpl: async () => [shell],
+        signalImpl: (_snapshot, signal) => signals.push([now, signal]),
+    }), { category: 'session-deadline' });
+    assert.equal(now, 1_500);
+    assert.ok(signals.every(([at]) => at < 1_500));
+    let finish;
+    const late = new Promise((resolve) => { finish = resolve; });
+    const started = Date.now();
+    await assert.rejects(() => capturePtySessionSnapshot(shell, {
+        ...sessionFixture(new Map()), deadlineAt: started + 20,
+        readIdentityImpl: () => late,
+    }), { category: 'session-deadline' });
+    assert.ok(Date.now() - started < 250);
+    finish(shell);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(signals.every(([at]) => at < 1_500));
+});
+
+test('late cleanup snapshots cannot start any signal after the transaction timed out', async () => {
+    let reads = 0;
+    let finish;
+    let signaled = 0;
+    const pending = new Promise((resolve) => { finish = resolve; });
+    await assert.rejects(() => cleanupPtySession(shell, {
+        nowImpl: () => (++reads === 1 ? 0 : 1_490),
+        snapshotImpl: () => pending,
+        signalImpl: () => { signaled += 1; },
+    }), { category: 'session-deadline' });
+    finish([shell, child]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(signaled, 0);
+});
+
+test('a timed-out proc open closes its eventual handle without reading it', async () => {
+    let finish;
+    let closed = 0;
+    const pending = new Promise((resolve) => { finish = resolve; });
+    await assert.rejects(() => capturePtySessionSnapshot(shell, {
+        deadlineAt: Date.now() + 20,
+        fsApi: { open: () => pending },
+    }), { category: 'session-deadline' });
+    finish({
+        read: () => assert.fail('late handle must not read'),
+        async close() { closed += 1; },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closed, 1);
 });
 
 test('PTY evidence requires pid=pgrp=session=tpgid and a controlling terminal', () => {

@@ -83,7 +83,7 @@ function harness(overrides = {}) {
     const processApi = overrides.processApi || new FakeProcess();
     const terminal = fakePty();
     const spawnCalls = [];
-    const signals = [];
+    const cleanups = [];
     const worker = new TerminalWorker({
         processApi,
         ...(overrides.defaultDirectoryResolver ? {} : {
@@ -100,12 +100,14 @@ function harness(overrides = {}) {
             },
         })),
         capturePtyIdentityImpl: overrides.capturePtyIdentityImpl || (() => PTY_IDENTITY),
-        signalGroupImpl: overrides.signalGroupImpl || ((identity, signal) => signals.push([identity, signal])),
-        waitForExitImpl: overrides.waitForExitImpl || (async () => true),
+        cleanupSessionImpl: async (identity) => {
+            cleanups.push(identity);
+            return overrides.cleanupSessionImpl ? overrides.cleanupSessionImpl(identity) : true;
+        },
         delayImpl: async () => {},
         identityWaitMs: overrides.identityWaitMs ?? 0,
     });
-    return { worker, processApi, terminal, spawnCalls, signals };
+    return { worker, processApi, terminal, spawnCalls, cleanups };
 }
 
 test('one init creates one fixed bash PTY after cwd revalidation and reports evidence', async () => {
@@ -146,12 +148,12 @@ test('output is UTF-8 byte chunked, sequenced, and never precedes ready', async 
     assert.equal(h.processApi.sent[0].type, 'ready');
 });
 
-test('close and parent IPC EOF use verified TERM cleanup and exact-once exit', async () => {
+test('close and parent IPC EOF use session cleanup and exact-once exit', async () => {
     for (const category of ['requested', 'parent-disconnect']) {
         const h = harness();
         await h.worker.initialize(init());
         await h.worker.cleanup(category);
-        assert.deepEqual(h.signals, [[PTY_IDENTITY, 'SIGTERM']]);
+        assert.deepEqual(h.cleanups, [PTY_IDENTITY]);
         assert.equal(h.terminal.state.disposed, 0);
         const exits = h.processApi.sent.filter((message) => message.type === 'exit');
         assert.equal(exits.length, 1);
@@ -160,26 +162,29 @@ test('close and parent IPC EOF use verified TERM cleanup and exact-once exit', a
     }
 });
 
-test('force cleanup revalidates again before SIGKILL', async () => {
-    let waits = 0;
-    const h = harness({ waitForExitImpl: async () => (++waits === 1 ? false : true) });
+test('concurrent close, disconnect and native exit share one pending cleanup', async () => {
+    let finish;
+    const h = harness({ cleanupSessionImpl: () => new Promise((resolve) => { finish = resolve; }) });
     await h.worker.initialize(init());
-    await h.worker.cleanup('requested');
-    assert.deepEqual(h.signals, [
-        [PTY_IDENTITY, 'SIGTERM'],
-        [PTY_IDENTITY, 'SIGKILL'],
-    ]);
-    assert.equal(h.terminal.state.disposed, 0);
+    const first = h.worker.cleanup('requested');
+    assert.equal(h.worker.cleanup('parent-disconnect'), first);
+    h.terminal.state.exitHandler({ exitCode: 0, signal: 9 });
+    h.terminal.state.exitHandler({ exitCode: 1, signal: 1 });
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 0);
+    finish(true);
+    await first;
+    assert.deepEqual(h.cleanups, [PTY_IDENTITY]);
+    const exits = h.processApi.sent.filter((message) => message.type === 'exit');
+    assert.equal(exits.length, 1);
+    assert.equal(exits[0].category, 'requested');
+    assert.equal(exits[0].signal, 9);
 });
 
 test('cleanup reports unproven when the process remains after TERM and KILL waits', async () => {
-    const h = harness({ waitForExitImpl: async () => false });
+    const h = harness({ cleanupSessionImpl: async () => false });
     await h.worker.initialize(init());
     await h.worker.cleanup('requested');
-    assert.deepEqual(h.signals, [
-        [PTY_IDENTITY, 'SIGTERM'],
-        [PTY_IDENTITY, 'SIGKILL'],
-    ]);
+    assert.deepEqual(h.cleanups, [PTY_IDENTITY]);
     assert.equal(h.terminal.state.disposed, 0);
     const cleanupErrorIndex = h.processApi.sent.findIndex(
         (message) => message.type === 'error' && message.category === 'cleanup-unproven',
@@ -189,11 +194,9 @@ test('cleanup reports unproven when the process remains after TERM and KILL wait
     assert.ok(cleanupErrorIndex < exitIndex, 'Router must receive ambiguity before the worker exit');
 });
 
-test('cleanup revalidation ambiguity emits cleanup-unproven and never force-signals', async () => {
-    const signals = [];
+test('cleanup revalidation ambiguity emits cleanup-unproven once', async () => {
     const h = harness({
-        signalGroupImpl: (identity, signal) => {
-            signals.push([identity, signal]);
+        cleanupSessionImpl: () => {
             const error = new Error('identity changed');
             error.code = 'WEBTTY_PROCESS_IDENTITY_UNPROVEN';
             throw error;
@@ -201,7 +204,7 @@ test('cleanup revalidation ambiguity emits cleanup-unproven and never force-sign
     });
     await h.worker.initialize(init());
     await h.worker.cleanup('requested');
-    assert.equal(signals.length, 1);
+    assert.equal(h.cleanups.length, 1);
     assert.equal(h.terminal.state.disposed, 0);
     assert.equal(
         h.processApi.sent.filter((message) => message.type === 'error' && message.category === 'cleanup-unproven').length,
@@ -209,11 +212,9 @@ test('cleanup revalidation ambiguity emits cleanup-unproven and never force-sign
     );
 });
 
-test('stale identity proves the original process gone without invoking native dispose', async () => {
-    let signalAttempts = 0;
+test('stale shell identity alone does not prove session cleanup', async () => {
     const h = harness({
-        signalGroupImpl: () => {
-            signalAttempts += 1;
+        cleanupSessionImpl: () => {
             const error = new Error('original process gone or pid reused');
             error.code = 'WEBTTY_PROCESS_IDENTITY_STALE';
             throw error;
@@ -221,11 +222,11 @@ test('stale identity proves the original process gone without invoking native di
     });
     await h.worker.initialize(init());
     await h.worker.cleanup('requested');
-    assert.equal(signalAttempts, 1);
+    assert.equal(h.cleanups.length, 1);
     assert.equal(h.terminal.state.disposed, 0);
     assert.equal(
         h.processApi.sent.some((message) => message.type === 'error' && message.category === 'cleanup-unproven'),
-        false,
+        true,
     );
     assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.category, 'requested');
 });
@@ -240,7 +241,7 @@ test('ambiguous identity never calls a native PID kill helper and reports unprov
     });
     await h.worker.initialize(init());
     assert.equal(h.terminal.state.disposed, 0);
-    assert.equal(h.signals.length, 0);
+    assert.equal(h.cleanups.length, 0);
     assert.equal(
         h.processApi.sent.filter((message) => message.type === 'error' && message.category === 'cleanup-unproven').length,
         1,
@@ -269,16 +270,30 @@ test('cwd and environment failures happen before loading native bytes', async ()
     assert.equal(altered.spawnCalls.length, 0);
 });
 
-test('normal native exit reports once and disposes without group signaling', async () => {
+test('normal native exit checks the whole session before notifying and disposing', async () => {
     const h = harness();
     await h.worker.initialize(init());
     h.terminal.state.exitHandler({ exitCode: 7, signal: 0 });
     await h.worker.cleanupPromise;
-    assert.equal(h.signals.length, 0);
+    assert.deepEqual(h.cleanups, [PTY_IDENTITY]);
     assert.equal(h.terminal.state.disposed, 1);
     assert.deepEqual(h.processApi.sent.filter((message) => message.type === 'exit'), [
         workerMessage('exit', TERMINAL_ID, { exitCode: 7, signal: 0, category: 'clean' }),
     ]);
+});
+
+test('native exit with unproven residue reports ambiguity before its single exit', async () => {
+    let finish;
+    const h = harness({ cleanupSessionImpl: () => new Promise((resolve) => { finish = resolve; }) });
+    await h.worker.initialize(init());
+    h.terminal.state.exitHandler({ exitCode: 7, signal: 0 });
+    assert.equal(h.processApi.sent.some((message) => message.type === 'exit'), false);
+    finish(false);
+    await h.worker.cleanupPromise;
+    const notifications = h.processApi.sent.filter((message) => message.type !== 'ready');
+    assert.deepEqual(notifications.map((message) => message.category), ['cleanup-unproven', 'clean']);
+    assert.equal(notifications[1].exitCode, 7);
+    assert.equal(h.cleanups.length, 1);
 });
 
 test('the worker resolves cwd and validates its shell environment against its own trusted root', async (t) => {
