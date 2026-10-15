@@ -203,7 +203,7 @@ ploinky [--port &lt;hostPort&gt;] start [staticAgent] [branch-options...]</code>
                             </tr>
                             <tr>
                                 <td><code>--branch &lt;branch&gt;</code></td>
-                                <td>Candidate branch for all repos involved in this start</td>
+                                <td>Candidate branch for all repos involved in this start. It also governs the <code>link-install</code> repositories of every enabled agent, including no-wait agents and agents this start leaves stopped, before anything launches: a missing repository is cloned at the requested branch and an existing workspace checkout is checked without being modified, so the start stops when it is not on the requested branch (a detached HEAD does not count). Restart, enable and update are unchanged</td>
                             </tr>
                             <tr>
                                 <td><code>--repo-branch &lt;repo=branch&gt;</code></td>
@@ -211,7 +211,7 @@ ploinky [--port &lt;hostPort&gt;] start [staticAgent] [branch-options...]</code>
                             </tr>
                             <tr>
                                 <td><code>--branch-fallback</code></td>
-                                <td><code>default</code> (keep configured branch when candidate is missing) or <code>fail</code> (abort when the targeted branch is missing or cannot be refreshed). Default: <code>default</code></td>
+                                <td><code>default</code> (keep configured branch when candidate is missing) or <code>fail</code> (abort when the targeted branch is missing or cannot be refreshed). Default: <code>default</code>. For <code>link-install</code> repositories, <code>default</code> clones the remote default branch or accepts the existing checkout as is (logging whether the branch was absent or the remote could not be queried), and <code>fail</code> aborts when the remote lacks the branch or cannot be queried</td>
                             </tr>
                             <tr>
                                 <td><code>--reset-repos</code></td>

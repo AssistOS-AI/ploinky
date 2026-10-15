@@ -35,10 +35,15 @@ export function linkInstallDeclarations(manifest) {
 }
 
 // Called under the lifecycle workspace mutation lease. Adoption uses create:false.
+// `branchPolicy.branch` (the start's `--branch`) selects the branch of a new
+// clone and is checked, never applied, against an existing workspace checkout.
+// Without it no remote is queried and no branch is inspected.
 export function prepareLinkedRepositories(manifest, { workspaceRoot, create = true, writable = false,
-    execFile = execFileSync } = {}) {
+    execFile = execFileSync, branchPolicy = null, log = console.log } = {}) {
     const declarations = linkInstallDeclarations(manifest);
     if (!declarations.length) return [];
+    const requestedBranch = branchPolicy?.branch || null;
+    const strict = branchPolicy?.fallback === 'fail';
     const root = fs.realpathSync(workspaceRoot);
     const git = args => execFile('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 120000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
@@ -49,6 +54,33 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
         catch { return null; }
     };
     const known = workspaceRepositories(root).map(entry => ({ directory: entry.directory, identity: origin(entry.directory) }));
+    const checkedOutBranch = directory => {
+        try { return String(git(['-C', directory, 'symbolic-ref', '--short', '-q', 'HEAD'])).trim() || null; }
+        catch { return null; }
+    };
+    // The branch to honour for this repository, or null when the requested one
+    // is absent from the remote (or the remote cannot be queried) and the
+    // fallback policy allows the repository's own default or current branch.
+    const branchFor = (repo, outcome) => {
+        if (!requestedBranch) return null;
+        // Same timeout and non-interactive environment as the clone.
+        let listing;
+        try { listing = String(git(['ls-remote', '--heads', repo.url, `refs/heads/${requestedBranch}`])); }
+        catch { listing = null; }
+        if (listing?.trim()) return requestedBranch;
+        if (listing === null) {
+            if (strict) {
+                throw new Error(`Could not query the remote of repo '${repo.name}' for branch '${requestedBranch}'. Aborting (--branch-fallback fail).`);
+            }
+            log(`[link-install] Could not query the remote for '${repo.name}' to check branch '${requestedBranch}'; ${outcome}.`);
+            return null;
+        }
+        if (strict) {
+            throw new Error(`Branch '${requestedBranch}' does not exist on remote for repo '${repo.name}'. Aborting (--branch-fallback fail).`);
+        }
+        log(`[link-install] Branch '${requestedBranch}' not found on remote for '${repo.name}'; ${outcome}.`);
+        return null;
+    };
     return declarations.map(repo => {
         const matches = known.filter(entry => entry.identity === repo.identity);
         if (matches.length > 1) throw new Error(`Multiple workspace repositories match link-install ${repo.name}`);
@@ -59,10 +91,11 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
                 throw new Error(`link-install target ${repo.name} exists but has a different or missing Git origin`);
             }
             if (!create) throw new Error(`link-install repository ${repo.name} is missing from the workspace`);
+            const cloneBranch = branchFor(repo, 'falling back to default branch');
             const temporary = fs.mkdtempSync(path.join(root, '.ploinky-link-install-'));
             try {
                 // A complete clone is published atomically. Existing checkouts are never fetched/reset.
-                git(['-c', 'core.hooksPath=/dev/null', 'clone', '--', repo.url, temporary]);
+                git(['-c', 'core.hooksPath=/dev/null', 'clone', ...(cloneBranch ? ['--branch', cloneBranch] : []), '--', repo.url, temporary]);
                 if (origin(temporary) !== repo.identity) throw new Error('Cloned repository origin does not match');
                 if (fs.existsSync(source)) throw new Error('link-install destination appeared during clone');
                 fs.renameSync(temporary, source);
@@ -74,9 +107,32 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
         if (!fs.lstatSync(source).isDirectory() || fs.realpathSync(source) !== source || origin(source) !== repo.identity) {
             throw new Error(`link-install repository identity changed: ${repo.name}`);
         }
+        if (requestedBranch && matches.length) {
+            // An adopted checkout belongs to the developer: report, never switch.
+            const branch = branchFor(repo, 'keeping the existing checkout');
+            const current = branch && checkedOutBranch(source);
+            if (branch && current !== branch) {
+                throw new Error(`link-install repository ${repo.name} is on '${current || 'detached HEAD'}', not requested branch '${branch}'; switch it yourself (Ploinky never modifies workspace checkouts)`);
+            }
+        }
         // The checkout keeps its workspace path in the agent runtime, matching
         // the same-path project grant of global and development agents.
         return { name: repo.name, source, target: source,
             link: `linked/${repo.name}`, readOnly: !writable };
     });
+}
+
+// `start --branch` resolves every link-install repository of the whole admitted
+// graph once, in the parent and before any agent (including a detached no-wait
+// worker) launches, so a mismatch or `--branch-fallback fail` stops the start.
+// The per-agent preparation later adopts the checkouts resolved here.
+export function preflightLinkedRepositories(manifests, options = {}) {
+    if (!options.branchPolicy?.branch) return [];
+    const unique = new Map();
+    for (const manifest of manifests) {
+        for (const declaration of linkInstallDeclarations(manifest)) {
+            if (!unique.has(declaration.identity)) unique.set(declaration.identity, declaration.url);
+        }
+    }
+    return prepareLinkedRepositories({ 'link-install': [...unique.values()] }, { ...options, create: true });
 }

@@ -94,6 +94,7 @@ import {
   REPOS_DIR,
   RUNNING_DIR,
 } from '../utils/config.js';
+import { preflightLinkedRepositories } from '../utils/linkInstall.mjs';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from '../utils/workspaceDependencyGraph.js';
 import {
   mergeRoutingConfig,
@@ -2813,6 +2814,20 @@ function buildRouterUrl(staticPort, env = process.env) {
     : `http://127.0.0.1:${staticPort}`;
 }
 
+// Every admitted node counts, blocking or no-wait: a no-wait agent is launched
+// by a detached worker after startWorkspace has returned, so only this parent
+// step can stop the start on a link-install branch mismatch.
+export function preflightStartLinkedRepositories(admittedStart, {
+  workspaceRoot,
+  branchPolicy,
+  preflight = preflightLinkedRepositories,
+  ...options
+} = {}) {
+  if (!branchPolicy?.branch) return [];
+  const nodes = [...admittedStart.graph.nodes.values(), ...(admittedStart.additionalNodes || [])];
+  return preflight(nodes.map((node) => node.manifest), { ...options, workspaceRoot, branchPolicy });
+}
+
 export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { hardwareContext, boxMarkerOptions } = {}) {
   const configured = workspaceSvc.getConfig()?.static?.agent || '';
   let staticAgent = String(staticAgentArg || configured || '').trim();
@@ -2924,6 +2939,9 @@ async function startWorkspace(staticAgentArg, portArg, {
       .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
   }
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  // `--branch` reaches link-install repositories here, for the whole admitted
+  // graph including no-wait agents, before any mutation, wave or worker.
+  preflightStartLinkedRepositories(lockedStart, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, branchPolicy });
   // Hardware refusals are recorded per exact instance; blocking and explicit
   // waiting consumers become blocked, unrelated agents start (plan §9.1).
   // A refusal raised later at launch is recorded in the same tracker.
