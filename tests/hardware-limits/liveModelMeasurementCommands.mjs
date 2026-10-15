@@ -242,10 +242,15 @@ export function observeCachedWeights(pin, root, { fs, path, crypto, artifactPath
     return { root: 'controller-gguf-cache', files: results, weightsReused: true, pageCacheState: 'unverified', shaderCachePolicy: 'unchanged-no-harness-purge' };
 }
 
+// The controller's path resolver ships in the pworker engine package, which Ploinky binds read-only from the agent's
+// dependency store at /code/node_modules. It is imported by this absolute path, not by the package name: an eval'd
+// script resolves a bare specifier from its working directory, and NODE_PATH does not apply to ES modules.
+export const MEASUREMENT_DOWNLOADER_MODULE = '/code/node_modules/pworker/lib/local-llm/controller/downloader.mjs';
+
 export const MEASUREMENT_WEIGHTS = `
 (async()=>{
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
-const {artifactPaths}=await import('/code/src/controller/downloader.mjs');
+const {artifactPaths}=await import(${JSON.stringify(MEASUREMENT_DOWNLOADER_MODULE)});
 const observe=${observeCachedWeights.toString()};
 process.stdout.write(JSON.stringify(observe(JSON.parse(process.argv[1]),'/data/models/gguf',{fs,path,crypto,artifactPaths})));
 })().catch(()=>{process.stderr.write('Bounded weights observation failed');process.exitCode=3;});`;
