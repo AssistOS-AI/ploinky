@@ -67,7 +67,7 @@ function requireNamedList(value, field) {
  * widening assertDenied (whose content rule serves hundreds of authorization denials). The
  * RoboTeam listing refuses a verified non-admin user without the Explorer capability with
  * 403 {"ok":false,"error":"Explorer access is required to list robots"}
- * (AchillesCLI roboTeamAgent/server/listing-access.mjs authorizeRobotListing).
+ * (AssistOSExplorer roboTeamAgent/server/listing-access.mjs authorizeRobotListing).
  */
 export const AGENT_HTTP_CAPABILITY_REFUSALS = Object.freeze({
     'agent.robot.list': Object.freeze({ status: 403, error: 'Explorer access is required to list robots' }),
@@ -813,7 +813,7 @@ export function reconcileAgentRegistry(registry) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// RoboTeam RoboFlow HTTP routes. Source: AchillesCLI roboTeamAgent/server/http-server.mjs,
+// RoboTeam RoboFlow HTTP routes. Source: AssistOSExplorer roboTeamAgent/server/http-server.mjs,
 // handleRoboFlow, as served at 3cd94b10 (line ranges are cited per probe). The Router requires
 // authentication for roboTeamAgent/3001/*. The administrator gate is the handler's own
 // isAdminActor check (roboTeamAgent/server/request-identity.mjs), so on administrator routes userA
@@ -843,7 +843,7 @@ export const ROBOFLOW_BASE = '/base-agent-additional-server/roboTeamAgent/3001/a
 export const ROBOFLOW_ADMIN_REFUSAL = Object.freeze({ status: 403, error: 'administrator role is required' });
 /**
  * Decision D13: RoboTeam gates every /api/roboflow* request on the signed Explorer entitlement and refuses a user
- * without it (selfRegistered) with exactly this 403, before any role check. The wording is merged in AchillesCLI 3cd94b10
+ * without it (selfRegistered) with exactly this 403, before any role check. The wording is merged in AchillesCLI 3cd94b10 (RoboTeam now in AssistOSExplorer)
  * (listing-access.mjs ROBOFLOW_ENTITLEMENT_ERROR); if it ever changes there, change it here, in this one place.
  */
 export const ROBOFLOW_ENTITLEMENT_REFUSAL = Object.freeze({ status: 403, error: 'Explorer access permission is required to use RoboFlow' });
@@ -857,7 +857,7 @@ export const ROBOFLOW_GAPS = Object.freeze({
     flowStart: 'agent.roboflow.flows.start.positive',
     flowRuns: 'agent.roboflow.flows.run-mutations.positive',
 });
-const ROBOFLOW_SOURCE = 'AchillesCLI/roboTeamAgent/server/http-server.mjs';
+const ROBOFLOW_SOURCE = 'AchillesIDE/roboTeamAgent/server/http-server.mjs';
 const reach = (status, error) => Object.freeze({ status, error });
 const NO_DESCRIPTION = reach(400, 'description requires 1 to 32768 characters');
 const NO_RUN = reach(404, 'workflow run not found');
@@ -1229,7 +1229,7 @@ export async function runRoboflowProbes(ctx, { mcp = createResourceMcp(ctx) } = 
 }
 
 // ---------------------------------------------------------------------------------------------
-// RoboTeam family gate (decision D14, AchillesCLI roboTeamAgent/server/http-server.mjs at 3cd94b10; the table and
+// RoboTeam family gate (decision D14, AssistOSExplorer roboTeamAgent/server/http-server.mjs at 3cd94b10; the table and
 // reach answers are in the combined D13+D14 SPEC, "Harness additions"). Every gated path of the 3001 family refuses a
 // signed user without the Explorer entitlement with exactly this 403, before any role or route logic.
 // selfRegistered must receive it exactly; anonymous needs an authorization denial (Router 401); userA, userB and
@@ -1242,7 +1242,7 @@ export const ROBOTEAM_BASE = '/base-agent-additional-server/roboTeamAgent/3001';
 export const ROBOTEAM_GAPS = Object.freeze({
     websocketLive: 'agent.roboteam.session.websocket.live',
 });
-const ROBOTEAM_SOURCE = 'AchillesCLI/roboTeamAgent/server/http-server.mjs';
+const ROBOTEAM_SOURCE = 'AchillesIDE/roboTeamAgent/server/http-server.mjs';
 const RT_ZERO_UUID = '00000000-0000-4000-8000-000000000000';
 const RT_ZERO_UUID_2 = '00000000-0000-4000-8000-000000000001';
 const notFound = (error = 'robot not found') => Object.freeze({ kind: 'json-error', status: 404, error });

@@ -1,8 +1,8 @@
 # Local skill propagation acceptance
 
-This suite exercises the four implementation candidates together. It checks that skills in locally registered repositories, including uncommitted and untracked skill folders, are discovered within Ploinky's launch scope, linked by Ploinky's real link installer, and reach the next execution of an existing conversation. It also keeps regressions for rejected selections, disabled sources, and activation rollback visible.
+This suite exercises the three implementation candidates together. It checks that skills in locally registered repositories, including uncommitted and untracked skill folders, are discovered within Ploinky's launch scope, linked by Ploinky's real link installer, and reach the next execution of an existing conversation. It also keeps regressions for rejected selections, disabled sources, and activation rollback visible.
 
-The deterministic suite contains twelve tests. Run it against the exact four revisions selected for deployment, and retain its output with the deployment evidence.
+The deterministic suite contains twelve tests. Run it against the exact three revisions selected for deployment, and retain its output with the deployment evidence.
 
 ## Run the deterministic suite
 
@@ -11,14 +11,13 @@ The suite uses Node's built-in test runner and needs Linux because the real Robo
 On a Linux host, run:
 
 ```sh
-SKILLS_TEST_ACHILLES=/absolute/path/to/AchillesCLI \
 SKILLS_TEST_ALA=/absolute/path/to/ala \
 SKILLS_TEST_PLOINKY=/absolute/path/to/ploinky \
 SKILLS_TEST_EXPLORER=/absolute/path/to/AssistOSExplorer \
 node /absolute/path/to/ploinky/tests/integration/local-skills/run.mjs
 ```
 
-Use Node 22 or later and the four reconciled implementation trees. `SKILLS_TEST_EXPLORER` names the repository containing `explorer/package.json`; the suite uses only its managed skill exporter, because Explorer Settings no longer has a skill-management surface. `SKILLS_TEST_ACHILLES` names the repository containing the RoboTeam agent manifest `roboTeamAgent/manifest.json` (AchillesCLI no longer ships `roboTeamAgent/package.json`). `SKILLS_TEST_ALA` names the ALA checkout; the suite uses its real argument parser, session transcript and `bin/ala.mjs`, and ALA no longer parses skill catalogs. RoboTeam must be at a revision that exports `ACHILLES_PRIVATE_DIRECTORY_NAME` from `privateDataRoot.mjs` and records conversations through ALA's transcript, as `bf8a8e73` with ALA `a93b8229` does; the harness reads the private directory name from RoboTeam instead of hard-coding it. The runner validates these manifests. A missing source tree or unsupported Linux capability is an error, not an automatic skip.
+Use Node 22 or later and the three reconciled implementation trees. `SKILLS_TEST_EXPLORER` names the AssistOSExplorer repository containing `explorer/package.json` and the RoboTeam agent manifest `roboTeamAgent/manifest.json` (RoboTeam moved from AchillesCLI into AssistOSExplorer); the suite imports RoboTeam from it and uses Explorer's managed skill exporter, because Explorer Settings no longer has a skill-management surface. `SKILLS_TEST_ALA` names the ALA checkout; the suite uses its real argument parser, session transcript and `bin/ala.mjs`, and ALA no longer parses skill catalogs. RoboTeam must be at a revision that exports `ACHILLES_PRIVATE_DIRECTORY_NAME` from `privateDataRoot.mjs` and records conversations through ALA's transcript, as `bf8a8e73` with ALA `a93b8229` does; the harness reads the private directory name from RoboTeam instead of hard-coding it. The runner validates these manifests. A missing source tree or unsupported Linux capability is an error, not an automatic skip.
 
 ## Coverage
 
@@ -84,7 +83,6 @@ It requires a Linux environment that already supports Bubblewrap with private `/
 After provisioning that environment, run:
 
 ```sh
-SKILLS_TEST_ACHILLES=/absolute/path/to/AchillesCLI \
 SKILLS_TEST_ALA=/absolute/path/to/ala \
 SKILLS_TEST_PLOINKY=/absolute/path/to/ploinky \
 SKILLS_TEST_EXPLORER=/absolute/path/to/AssistOSExplorer \

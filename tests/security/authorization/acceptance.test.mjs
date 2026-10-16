@@ -360,7 +360,7 @@ test('REJECT: runtime set empty, duplicated, extra, missing or not running', () 
     const negatives = {
         RUNTIME_SET_EMPTY: [],
         RUNTIME_SET_DUPLICATE: [...live, live[0]],
-        RUNTIME_SET_EXTRA: [...live, { repoName: 'AchillesIDE', agentName: 'webmeetStt', enabled: true, state: { running: true } }],
+        RUNTIME_SET_EXTRA: [...live, { repoName: 'webmeet', agentName: 'webmeetStt', enabled: true, state: { running: true } }],
         RUNTIME_SET_MISSING: live.slice(1),
         RUNTIME_NOT_RUNNING: live.map((r, i) => i ? r : { ...r, state: { running: false } }),
     };
@@ -1036,7 +1036,7 @@ test('capability probes: retained controls pass on the real shapes and fail on m
         readRouting: async () => ({ routes: { liveKitServerAgent: { agent: 'liveKitServerAgent', hostPort: overrides.hostPort ?? null } } }),
         readManifest: async () => ({ container: 'docker.io/assistos/livekit-server-agent@sha256:x' }),
         inspectContainer: async () => ({ State: { Running: overrides.running ?? true }, Config: { Image: overrides.image ?? 'docker.io/assistos/livekit-server-agent@sha256:x' } }) });
-    const good = fakeCtx(handler()); good.report.deployment = { classifiedContainers: { 'AchillesIDE/liveKitServerAgent': 'ploinky_AchillesIDE_liveKitServerAgent_testExplorerFresh_d8f88a10' } };
+    const good = fakeCtx(handler()); good.report.deployment = { classifiedContainers: { 'webmeet/liveKitServerAgent': 'ploinky_webmeet_liveKitServerAgent_testExplorerFresh_d8f88a10' } };
     await runCapabilityProbes(good, deps());
     assert.deepEqual(good.report.checks.map(c => c.id).sort(), [...lk.retainedControls, 'capability:soul-gateway:health:anonymous'].sort());
     assert.ok(good.report.checks.every(c => c.status === 'PASS'), JSON.stringify(good.report.checks));

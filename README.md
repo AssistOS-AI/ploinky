@@ -259,7 +259,7 @@ workspace therefore performs no MCP SDK Git or npm operation and needs no
 GitHub credentials. Ploinky compares the SDK with no expected revision and
 hashes none of its files.
 
-Automatic repository bootstrap prepares `AchillesIDE`, `AchillesCLI`, and `copilot-agents`, reusing matching workspace checkouts before cloning missing repositories into `.ploinky/repos`. Explorer's manifest declares its additional repositories and uses `AchillesIDE/liveKitServerAgent` for LiveKit. The `basic` repository is optional: install it explicitly with `ploinky install repo basic` when needed.
+Automatic repository bootstrap prepares `AchillesIDE`, `AchillesCLI`, and `copilot-agents`, reusing matching workspace checkouts before cloning missing repositories into `.ploinky/repos`. Explorer's manifest declares its additional repositories and uses `webmeet/liveKitServerAgent` for LiveKit (the WebMeet agents live in the `webmeet` repository; `multimedia`, `soplangAgent`, `tasksAgent` and `webAssist` live in `legacy-agents`; `soul-gateway` and `roboTeamAgent` live in `AchillesIDE`). The `basic` repository is optional: install it explicitly with `ploinky install repo basic` when needed.
 
 ### Agent repositories in the workspace
 

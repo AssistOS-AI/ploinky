@@ -49,9 +49,9 @@ export async function runCapabilityProbes(ctx, {
         assert.ok(!routes[0].hostPort, 'LiveKit is classified without a primary agent port; a primary port means the contract changed');
     });
     if (ids.has('capability:liveKitServerAgent:runtime-image')) await ctx.check('capability:liveKitServerAgent:runtime-image', async () => {
-        const container = ctx.report.deployment?.classifiedContainers?.['AchillesIDE/liveKitServerAgent'];
-        assert.match(String(container || ''), /^ploinky_AchillesIDE_liveKitServerAgent_[A-Za-z0-9_.-]+$/, 'Captured LiveKit container is required');
-        const manifest = await readManifest('AchillesIDE', 'liveKitServerAgent');
+        const container = ctx.report.deployment?.classifiedContainers?.['webmeet/liveKitServerAgent'];
+        assert.match(String(container || ''), /^ploinky_webmeet_liveKitServerAgent_[A-Za-z0-9_.-]+$/, 'Captured LiveKit container is required');
+        const manifest = await readManifest('webmeet', 'liveKitServerAgent');
         const inspected = await inspectContainer(container);
         assert.equal(inspected?.State?.Running, true, 'LiveKit runtime must be running');
         assert.equal(String(inspected?.Config?.Image || inspected?.ImageName || ''), manifest.container, 'LiveKit runtime must use the pinned manifest image');

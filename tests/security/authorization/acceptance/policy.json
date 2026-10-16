@@ -18,7 +18,7 @@
     {
       "name": "AchillesCLI",
       "path": ".ploinky/repos/AchillesCLI",
-      "reason": "Boot repository (cli/utils/repos.js:146); roboTeamAgent is enabled by the Explorer manifest"
+      "reason": "Boot repository (cli/utils/repos.js:146); no agent is enabled by the Explorer graph (roboTeamAgent now lives in the AchillesIDE repository)"
     },
     {
       "name": "copilot-agents",
@@ -26,9 +26,14 @@
       "reason": "Boot repository (cli/utils/repos.js:146); no agent is enabled by the Explorer graph"
     },
     {
-      "name": "proxies",
-      "path": ".ploinky/repos/proxies",
-      "reason": "Installed by the explorer enable entry proxies/soul-gateway (bootstrapManifest.js ensurePrefixedRepoInstalled)"
+      "name": "webmeet",
+      "path": ".ploinky/repos/webmeet",
+      "reason": "Declared in explorer/manifest.json repos; holds the enabled liveKitServerAgent, webmeetAgent and webmeetStt"
+    },
+    {
+      "name": "legacy-agents",
+      "path": ".ploinky/repos/legacy-agents",
+      "reason": "Declared in explorer/manifest.json repos; holds the enabled multimedia, soplangAgent, tasksAgent and webAssist"
     },
     {
       "name": "UmamiAgent",
@@ -123,7 +128,7 @@
   "capabilities": [
     {
       "id": "D3-livekit-no-mcp",
-      "repo": "AchillesIDE",
+      "repo": "webmeet",
       "agent": "liveKitServerAgent",
       "decision": "r2b_remediation_decisions_codex.md D3",
       "summary": "Custom start, script readiness, host networking: Ploinky resolves start_only without an implicit AgentServer, the sidecar needs an explicit agent command, the start script never launches AgentServer, and a route without a primary port is planned as agent-root-pending (cli/server/edgeRoutePlan.js) and answered by the startup dispatcher with 503 TARGET_INACTIVE for any non-GET request, before MCP dispatch.",
@@ -144,12 +149,12 @@
       "contract": {
         "files": [
           {
-            "repo": "AchillesIDE",
+            "repo": "webmeet",
             "path": "liveKitServerAgent/manifest.json",
             "sha256": "c6e313130176f32089c2f97a385e2113d75fda99b34fa9c025634609c57250a0"
           },
           {
-            "repo": "AchillesIDE",
+            "repo": "webmeet",
             "path": "liveKitServerAgent/scripts/start-livekit-server-agent.sh",
             "sha256": "1cdd921f9b9824cf31fabdec62c1d2cf3952e8491b9057557dbc3ce94e9b1bd2"
           }
@@ -178,7 +183,7 @@
         },
         "absent": [
           {
-            "repo": "AchillesIDE",
+            "repo": "webmeet",
             "path": "liveKitServerAgent/scripts/start-livekit-server-agent.sh",
             "text": "AgentServer"
           }
@@ -234,7 +239,7 @@
     },
     {
       "id": "D4-soul-no-upstream-mcp",
-      "repo": "proxies",
+      "repo": "AchillesIDE",
       "agent": "soul-gateway",
       "decision": "r2b_remediation_decisions_codex.md D4",
       "summary": "startup.sh executes the custom src/index.mjs whose core, public API and management routers serve health, /v1 and /management, never /mcp. Only the Router-forwarded tools/list and resources/list are not applicable; Router-local initialize, the -32601 default and the GET 405 contract stay asserted.",
@@ -248,27 +253,27 @@
       "contract": {
         "files": [
           {
-            "repo": "proxies",
+            "repo": "AchillesIDE",
             "path": "soul-gateway/manifest.json",
             "sha256": "d655ad327921d1dff36c2d1e92aa19566cfd874e3fb0cc2ef4c99f279116a9e1"
           },
           {
-            "repo": "proxies",
+            "repo": "AchillesIDE",
             "path": "soul-gateway/startup.sh",
             "sha256": "09981225eed7f8a7a675facaf45eb23af602154db6f7a888df05eb7d419df7a0"
           },
           {
-            "repo": "proxies",
+            "repo": "AchillesIDE",
             "path": "soul-gateway/src/bootstrap.mjs",
             "sha256": "cf6acec366c26559a1ffbe6b74a4c785adc2d7ce4ffede5cd59cd244c100a08f"
           },
           {
-            "repo": "proxies",
+            "repo": "AchillesIDE",
             "path": "soul-gateway/src/public-api/register-routes.mjs",
             "sha256": "aef2bda141a48c29f933f4564a155d877e392f3a97976eca26b8e76da3e603f8"
           },
           {
-            "repo": "proxies",
+            "repo": "AchillesIDE",
             "path": "soul-gateway/src/management/build-routes.mjs",
             "sha256": "65e5b87b10c03657c0b2e7d020e97d6822c2e8990072988a0f081cd234fa861b"
           }
@@ -279,24 +284,24 @@
         },
         "absent": [
           {
-            "repo": "proxies",
+            "repo": "AchillesIDE",
             "path": "soul-gateway/src/bootstrap.mjs",
             "text": "/mcp"
           },
           {
-            "repo": "proxies",
+            "repo": "AchillesIDE",
             "path": "soul-gateway/src/public-api/register-routes.mjs",
             "text": "/mcp"
           },
           {
-            "repo": "proxies",
+            "repo": "AchillesIDE",
             "path": "soul-gateway/src/management/build-routes.mjs",
             "text": "/mcp"
           }
         ],
         "present": [
           {
-            "repo": "proxies",
+            "repo": "AchillesIDE",
             "path": "soul-gateway/startup.sh",
             "text": "exec node src/index.mjs"
           },

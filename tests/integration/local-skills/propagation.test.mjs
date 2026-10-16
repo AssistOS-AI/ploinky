@@ -8,7 +8,7 @@ import { fixture, write, writeSkill, source, exportPloinky, exportExplorer } fro
 const selected = (catalog) => catalog.skills.filter((entry) => entry.enabled && !entry.required).map((entry) => entry.name).sort();
 // The links RoboTeam published for one execution, as the native backend sees them.
 const linked = (view) => Object.entries(view.output).filter(([, entry]) => entry.link).map(([name]) => name).sort();
-const { INITIAL_SKILL_INSTRUCTIONS, HUMAN_REPORT_INSTRUCTIONS } = await source('achilles', 'roboTeamAgent/copilot/src/lib/prompts.mjs');
+const { INITIAL_SKILL_INSTRUCTIONS, HUMAN_REPORT_INSTRUCTIONS } = await source('explorer', 'roboTeamAgent/copilot/src/lib/prompts.mjs');
 
 test('local edits propagate through a queued existing conversation and both exporters preserve author files', { timeout: 60000 }, async (t) => {
     const f = await fixture(t);
