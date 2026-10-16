@@ -1,0 +1,10 @@
+npm error code ENOTFOUND
+npm error syscall getaddrinfo
+npm error errno ENOTFOUND
+npm error network request to http://nonexistent-host.invalid/left-pad failed, reason: getaddrinfo ENOTFOUND nonexistent-host.invalid
+npm error network This is a problem related to network connectivity.
+npm error network In most cases you are behind a proxy or have bad network settings.
+npm error network
+npm error network If you are behind a proxy, please make sure that the
+npm error network 'proxy' config is set properly.  See: 'npm help config'
+npm error A complete log of this run can be found in: /home/user/.npm/_logs/2026-10-15T19_26_17_614Z-debug-0.log

@@ -215,13 +215,16 @@ function instructionDigests(root) {
 
 // Bounded deterministic tree digest over regular files, never following
 // symlinks. Used for dependencies that are not git checkouts.
-function treeDigest(root, { maxFiles = 20000 } = {}) {
+// `skip` lists exact relative paths left out of the digest (a path, not a name).
+export function treeDigest(root, { maxFiles = 20000, skip = [] } = {}) {
     const entries = [];
+    const skipped = new Set(skip);
     const walk = (directory, relative) => {
         for (const name of fs.readdirSync(directory).sort()) {
             if (name === '.git') continue;
             const absolute = path.join(directory, name);
             const rel = relative ? `${relative}/${name}` : name;
+            if (skipped.has(rel)) continue;
             const stat = fs.lstatSync(absolute);
             if (stat.isDirectory()) walk(absolute, rel);
             else if (stat.isFile()) {
@@ -255,7 +258,7 @@ function dependencyIdentity(name, linkPath) {
     return { name, realpath, revision, treeDigest: digest || treeDigest(realpath) };
 }
 
-function candidateDigest(root) {
+export function candidateDigest(root) {
     const dirty = git(root, ['status', '--porcelain', '--untracked-files=all']);
     if (dirty) return treeDigest(root);
     return `git-tree:${git(root, ['rev-parse', 'HEAD^{tree}'])}`;
@@ -663,6 +666,191 @@ export function assertExplorerLayoutUnchanged(layout) {
     if (layout?.staged && treeDigest(layout.root) !== layout.stageDigest) throw new SchemaError('candidate source changed during the suite: explorer (staged layout)');
 }
 
+// The local-llms candidate's offline suites and the vLLM calibration tool import the pworker engine as a package. The
+// harness gives them a runner-owned scratch copy of the exact candidate and installs that package there with one
+// uniform command on every tree (decision U13). The command does nothing on a tree that depends on no package, and
+// the harness never looks at which layout a tree has. The candidate itself, the frozen stage and the live path never
+// get a node_modules.
+export const LOCAL_LLMS_INSTALL_COMMAND = Object.freeze(['npm', '--prefix', 'local-llm', 'install', '--ignore-scripts', '--no-bin-links', '--no-package-lock']);
+const LOCAL_LLMS_INSTALL_OUTPUT = 'local-llm/node_modules';
+const FULL_COMMIT = /^[0-9a-f]{40}$/;
+const TREE_DIGEST = /^sha256:[0-9a-f]{64}$/;
+
+// The commit after the '#' of a pinned git dependency (package.json) or of its resolved URL (npm's lock record,
+// git+ssh or git+https). Anything but a full 40-hex commit is refused.
+function pinnedCommit(specifier, label) {
+    const text = typeof specifier === 'string' ? specifier : '';
+    const commit = text.includes('#') ? text.slice(text.lastIndexOf('#') + 1) : '';
+    if (!FULL_COMMIT.test(commit)) throw new SchemaError(`${label} is not pinned to a full 40-hex commit`);
+    return commit;
+}
+
+function readOptionalJson(file, maxBytes, label) {
+    try {
+        return readJsonBounded(file, maxBytes);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        if (error instanceof SyntaxError) throw new SchemaError(`${label} is not valid JSON`);
+        throw error;
+    }
+}
+
+// What the install left, recorded separately from the source identity: the pworker commit npm resolved
+// (node_modules/.package-lock.json) and a digest of the installed package. The commit must equal the one the tree's
+// own package.json pins. A tree that depends on no package and has nothing installed records null for both; a tree
+// that pins pworker but has none installed, or the reverse, is an error and never a pass.
+export function recordLocalLlmInstall(root) {
+    const declaredSpec = readOptionalJson(path.join(root, 'local-llm', 'package.json'), 1024 * 1024, 'local-llm/package.json')?.dependencies?.pworker;
+    const declared = declaredSpec === undefined ? null : pinnedCommit(declaredSpec, 'the pworker dependency of local-llm/package.json');
+    const modules = path.join(root, LOCAL_LLMS_INSTALL_OUTPUT);
+    // pworker is the one package the install may leave: it is the only one recorded, and the identity check excludes the
+    // whole install output. Anything else, a dependency of the candidate or of pworker, is refused.
+    for (const name of fs.existsSync(modules) ? fs.readdirSync(modules) : []) {
+        if (!['pworker', '.package-lock.json'].includes(name)) throw new SchemaError(`local-llm/node_modules holds ${name}; pworker is the only package the install may leave`);
+    }
+    const lock = readOptionalJson(path.join(modules, '.package-lock.json'), 8 * 1024 * 1024, 'local-llm/node_modules/.package-lock.json');
+    for (const key of Object.keys(lock?.packages ?? {})) {
+        if (key !== 'node_modules/pworker') throw new SchemaError(`local-llm/node_modules/.package-lock.json lists ${key}; pworker is the only package the install may leave`);
+    }
+    const entry = lock?.packages?.['node_modules/pworker'];
+    const installed = entry === undefined ? null : pinnedCommit(entry?.resolved, 'the resolved pworker of local-llm/node_modules/.package-lock.json');
+    if (installed !== declared) {
+        throw new SchemaError(`the installed pworker (${installed ?? 'none'}) is not the one local-llm/package.json pins (${declared ?? 'none'})`);
+    }
+    if (installed === null) return { pworkerCommit: null, pworkerTreeDigest: null };
+    const installedDirectory = path.join(modules, 'pworker');
+    const stat = fs.lstatSync(installedDirectory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new SchemaError('local-llm/node_modules/pworker is not a real directory');
+    return { pworkerCommit: installed, pworkerTreeDigest: treeDigest(installedDirectory) };
+}
+
+export function validateInstallRecord(value) {
+    const label = 'install record';
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new SchemaError(`${label} must be an object`);
+    const keys = Object.keys(value).sort().join();
+    if (keys !== 'command,pworkerCommit,pworkerTreeDigest') throw new SchemaError(`${label} has keys ${keys}`);
+    if (JSON.stringify(value.command) !== JSON.stringify(LOCAL_LLMS_INSTALL_COMMAND)) throw new SchemaError(`${label}.command is not the uniform install command`);
+    const none = value.pworkerCommit === null && value.pworkerTreeDigest === null;
+    const both = FULL_COMMIT.test(value.pworkerCommit ?? '') && TREE_DIGEST.test(value.pworkerTreeDigest ?? '');
+    if (!none && !both) throw new SchemaError(`${label} pworker commit and digest must both be a full commit and a sha256 digest, or both null`);
+    return value;
+}
+
+// The one install command, from the scratch root. npm's home and cache live beside the tree so that they cannot
+// change its digest. The command is bounded and a failure throws: the run never continues on a half installed tree.
+function runLocalLlmInstall(root, home, { timeoutMs = 10 * 60 * 1000 } = {}) {
+    const [program, ...args] = LOCAL_LLMS_INSTALL_COMMAND;
+    const result = spawnSync(program, args, {
+        cwd: root, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+            PATH: process.env.PATH || '/usr/bin:/bin', HOME: home, npm_config_cache: path.join(home, '.npm'),
+            npm_config_audit: 'false', npm_config_fund: 'false', npm_config_update_notifier: 'false', GIT_TERMINAL_PROMPT: '0',
+        },
+    });
+    boundedStep(result, `the uniform local-llm install (${args.join(' ')})`, timeoutMs);
+}
+
+function assertNoNodeModules(root, label) {
+    let count = 0;
+    const walk = (directory) => {
+        for (const name of fs.readdirSync(directory)) {
+            if (name === '.git') continue;
+            if (++count > 100000) throw new SchemaError(`${label} inventory exceeds bound`);
+            if (name === 'node_modules') throw new SchemaError(`${label} contains a node_modules at ${path.relative(root, path.join(directory, name)) || name}; the scratch install owns it, so a candidate must not carry one`);
+            const target = path.join(directory, name);
+            if (fs.lstatSync(target).isDirectory()) walk(target);
+        }
+    };
+    walk(root);
+}
+
+// Install into the scratch tree and prove the install touched nothing but local-llm/node_modules.
+function installIntoScratch(root, home, stageDigest, install) {
+    install(root, home);
+    if (treeDigest(root, { skip: [LOCAL_LLMS_INSTALL_OUTPUT] }) !== stageDigest) throw new SchemaError('the install changed files outside local-llm/node_modules');
+    return validateInstallRecord({ command: [...LOCAL_LLMS_INSTALL_COMMAND], ...recordLocalLlmInstall(root) });
+}
+
+// Offline suites of the local-llms candidate run in a runner-owned scratch copy of exactly the configured candidate,
+// as Explorer's layout does. A clean candidate is archived from the commit whose tree its digest names; a dirty one
+// (a content digest, ignored files included) is copied byte for byte and its copy must match the digest before
+// anything is installed. A dirty candidate that already holds a node_modules is refused before it is copied.
+export function prepareLocalLlmsLayout({ candidateRoot, sourceDigest: digest, stageParent, runId, install = runLocalLlmInstall }) {
+    const stage = path.join(stageParent, `local-llms-layout-${runId}`);
+    if (fs.existsSync(stage)) throw new SchemaError(`refusing existing local-llms layout stage ${stage}`);
+    fs.mkdirSync(stage, { recursive: true, mode: 0o700 });
+    const root = path.join(stage, 'tree');
+    const home = path.join(stage, 'npm-home');
+    try {
+        fs.mkdirSync(home, { mode: 0o700 });
+        if (digest.startsWith('git-tree:')) {
+            // A clean candidate: its exact committed tree, every blob verified. The revision is resolved once, its tree is
+            // the configured one, and that same revision is archived. Clean means no tracked change and no untracked file.
+            const revision = git(candidateRoot, ['rev-parse', 'HEAD']);
+            if (`git-tree:${git(candidateRoot, ['rev-parse', `${revision}^{tree}`])}` !== digest || candidateDigest(candidateRoot) !== digest) {
+                throw new SchemaError('local-llms candidate changed before staging');
+            }
+            createBaselineStage(candidateRoot, revision, root);
+        } else {
+            assertNoNodeModules(candidateRoot, 'the local-llms candidate');
+            copyOwnedTree(candidateRoot, root);
+            if (treeDigest(root) !== digest) throw new SchemaError('staged local-llms copy differs from the configured candidate digest');
+        }
+        assertNoNodeModules(root, 'the staged local-llms copy');
+        const stageDigest = treeDigest(root);
+        const recorded = installIntoScratch(root, home, stageDigest, install);
+        return { root, staged: true, stage, stageDigest, install: recorded };
+    } catch (error) {
+        fs.rmSync(stage, { recursive: true, force: true });
+        throw error;
+    }
+}
+
+// The copy is what the suites run. A suite that changes any file of it except the install output, or the installed
+// pworker itself, invalidates the run exactly like a change of the candidate.
+export function assertLocalLlmsLayoutUnchanged(layout) {
+    if (treeDigest(layout.root, { skip: [LOCAL_LLMS_INSTALL_OUTPUT] }) !== layout.stageDigest) throw new SchemaError('candidate source changed during the suite: local-llms (scratch copy)');
+    const current = recordLocalLlmInstall(layout.root);
+    if (current.pworkerCommit !== layout.install.pworkerCommit || current.pworkerTreeDigest !== layout.install.pworkerTreeDigest) {
+        throw new SchemaError('the installed pworker changed during the suite: local-llms (scratch copy)');
+    }
+}
+
+function copyOwnedTree(from, to) {
+    fs.mkdirSync(to, { mode: 0o700 });
+    for (const name of fs.readdirSync(from).sort()) {
+        if (name === '.git') continue;
+        const entry = fs.lstatSync(path.join(from, name));
+        if (entry.isDirectory()) copyOwnedTree(path.join(from, name), path.join(to, name));
+        else if (entry.isFile()) fs.copyFileSync(path.join(from, name), path.join(to, name), fs.constants.COPYFILE_EXCL);
+        else if (entry.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(path.join(from, name)), path.join(to, name));
+    }
+}
+
+// The calibration tool imports the pworker engine, and the frozen stage never gets a node_modules. The tool is
+// imported from a scratch copy of the frozen stage's local-llm tree, installed with the same command, outside the
+// frozen stage so that its digest never sees the copy.
+export function prepareVllmToolTree({ frozenTree, stageParent, runId, install = runLocalLlmInstall }) {
+    if (fs.existsSync(path.join(frozenTree, 'node_modules'))) throw new SchemaError('the frozen local-llm tree has a node_modules');
+    const stage = path.join(stageParent, `llm-tool-${runId}`);
+    if (fs.existsSync(stage)) throw new SchemaError(`refusing existing vLLM tool stage ${stage}`);
+    fs.mkdirSync(stage, { recursive: true, mode: 0o700 });
+    const root = path.join(stage, 'tree');
+    const home = path.join(stage, 'npm-home');
+    try {
+        fs.mkdirSync(home, { mode: 0o700 });
+        fs.mkdirSync(root, { mode: 0o700 });
+        copyFrozenTree(frozenTree, path.join(root, 'local-llm'));
+        if (treeDigest(path.join(root, 'local-llm')) !== treeDigest(frozenTree)) throw new SchemaError('the vLLM tool copy differs from the frozen local-llm tree');
+        const stageDigest = treeDigest(root);
+        const recorded = installIntoScratch(root, home, stageDigest, install);
+        return { root, stage, stageDigest, install: recorded };
+    } catch (error) {
+        fs.rmSync(stage, { recursive: true, force: true });
+        throw error;
+    }
+}
+
 function phaseFiles(cases, phase, repo) {
     const required = cases.cases.filter((entry) => entry.phase === phase && REPO_KEYS[entry.repo] === repo);
     const regressions = PHASE_REGRESSIONS[phase]?.[repo] || [];
@@ -684,7 +872,7 @@ function summarize(report) {
     };
 }
 
-function buildReport({ runId, command, phase, suites, cases, sources, verdict }) {
+export function buildReport({ runId, command, phase, suites, cases, sources, verdict }) {
     const counts = {
         discovered: suites.reduce((sum, suite) => sum + suite.discovered, 0),
         completed: suites.reduce((sum, suite) => sum + suite.completed, 0),
@@ -712,6 +900,7 @@ function buildReport({ runId, command, phase, suites, cases, sources, verdict })
             signal: suite.signal,
             streamComplete: suite.streamComplete,
             ...(suite.children ? { children: suite.children } : {}),
+            ...(suite.install ? { install: validateInstallRecord(suite.install) } : {}),
             discovered: suite.discovered,
             completed: suite.completed,
             problems: suite.problems.slice(0, 200),
@@ -778,7 +967,14 @@ async function baselineCommand(options) {
     return report.exitCode;
 }
 
+// Scratch stages are removed on every exit, including a throw between staging and the post-run identity check.
 async function offlineCommand(options) {
+    const stages = [];
+    try { return await offlineRun(options, stages); }
+    finally { for (const stage of stages) fs.rmSync(stage, { recursive: true, force: true }); }
+}
+
+async function offlineRun(options, stages) {
     const { config, cases } = loadConfig(requireAbsolute(options.config, 'config'));
     let verifiedSources = verifyCandidateSources(config);
     const phase = options.phase;
@@ -793,7 +989,11 @@ async function offlineCommand(options) {
         const layout = repo === 'explorer' ? prepareExplorerLayout({
             explorerRoot: config.repos.explorer.candidateRoot, explorerDigest: config.repos.explorer.sourceDigest,
             ploinkyRoot: config.repos.ploinky.candidateRoot, stageParent: config.evidenceRoot, runId: randomRunId(),
+        }) : repo === 'localLlms' ? prepareLocalLlmsLayout({
+            candidateRoot: config.repos.localLlms.candidateRoot, sourceDigest: config.repos.localLlms.sourceDigest,
+            stageParent: config.evidenceRoot, runId: randomRunId(),
         }) : null;
+        if (layout?.staged) stages.push(layout.stage);
         const root = layout?.root || config.repos[repo].candidateRoot;
         const existing = files.filter((file) => fs.existsSync(path.join(root, file)));
         const missing = files.filter((file) => !existing.includes(file));
@@ -827,14 +1027,14 @@ async function offlineCommand(options) {
                 log: (line) => console.error(line),
             })
             : evaluateSuiteRun({ exitCode: 1, eventText: '', files: [], required });
-        // The staged Explorer layout is a runner-owned copy; the events file
+        // The staged layouts are runner-owned copies; the events file
         // and report are the evidence.
-        try { assertExplorerLayoutUnchanged(layout); }
+        try { if (repo === 'localLlms') assertLocalLlmsLayoutUnchanged(layout); else assertExplorerLayoutUnchanged(layout); }
         finally { if (layout?.staged) fs.rmSync(layout.stage, { recursive: true, force: true }); }
         verifiedSources = verifyCandidateSources(config);
         for (const file of missing) result.problems.push(`required test file is missing: ${file}`);
         if (missing.length) result.verdict = 'FAIL';
-        suites.push({ ...result, repo, files: existing, eventsPaths: result.eventsPaths || [] });
+        suites.push({ ...result, repo, files: existing, eventsPaths: result.eventsPaths || [], ...(repo === 'localLlms' ? { install: layout.install } : {}) });
         allCases.push(...result.cases);
     }
     verifiedSources = verifyCandidateSources(config);
@@ -928,7 +1128,7 @@ function buildFrozenCandidate(config, runId, { llm = false } = {}) {
     return { root, revision, digest: liveSourceDigest(root), ...(llm ? { llm: { revision: llmRevision } } : {}) };
 }
 
-function copyFrozenTree(from, to) {
+export function copyFrozenTree(from, to) {
     fs.mkdirSync(to, { mode: 0o755 });
     for (const name of fs.readdirSync(from).sort()) {
         const entry = fs.lstatSync(path.join(from, name));
@@ -940,7 +1140,7 @@ function copyFrozenTree(from, to) {
 
 // Stage 2 of apparatus-vllm: the stage 1 evidence, checked with the candidate's own digest function, and
 // whether the candidate's reviewed data already qualifies its tuple (production's resolver decides).
-async function vllmStage(options, candidate) {
+export async function vllmStage(options, candidate, { scratchParent, runId, install = runLocalLlmInstall } = {}) {
     const stage = options.stage ?? 'calibration';
     if (!['calibration', 'qualified'].includes(stage)) throw new UsageError('--stage must be calibration or qualified');
     if (stage === 'calibration') {
@@ -951,14 +1151,28 @@ async function vllmStage(options, candidate) {
     const document = readJsonBounded(requireAbsolute(options['calibration-evidence'], 'calibration-evidence'), 512 * 1024);
     const evidence = document.evidence ?? document;
     const tree = path.join(candidate.root, LLM_SOURCE_DIRECTORY, 'local-llm');
-    const tool = await import(pathToFileURL(path.join(tree, 'tools', 'vllm_mps_calibration.mjs')).href);
-    const qualification = await import(pathToFileURL(path.join(tree, 'src', 'controller', 'vllmMpsQualification.mjs')).href);
-    if (evidence?.schema !== tool.CALIBRATION_SCHEMA || evidence.verdict?.qualifiable !== true || evidence.evidenceDigest !== tool.evidenceDigest(evidence)) {
-        throw new UsageError('the calibration evidence is not a qualifiable stage 1 document that matches its own digest');
+    // The tool imports the pworker engine, so it runs from a scratch copy of the frozen tree with that package installed.
+    // The scratch sits beside the frozen stage, never in it: the frozen stage and its digest never see a node_modules.
+    const tooling = prepareVllmToolTree({ frozenTree: tree, stageParent: scratchParent, runId, install });
+    let result;
+    try {
+        const tool = await import(pathToFileURL(path.join(tooling.root, 'local-llm', 'tools', 'vllm_mps_calibration.mjs')).href);
+        // Only node:crypto is imported by the qualification data, so the frozen tree serves it as it is.
+        const qualification = await import(pathToFileURL(path.join(tree, 'src', 'controller', 'vllmMpsQualification.mjs')).href);
+        assertLocalLlmsLayoutUnchanged({ root: tooling.root, stageDigest: tooling.stageDigest, install: tooling.install });
+        writePrivateJson(path.join(scratchParent, `vllm-tool-install-${runId}.json`), { schema: 1, runId, frozenTreeDigest: treeDigest(tree), install: tooling.install });
+        if (evidence?.schema !== tool.CALIBRATION_SCHEMA || evidence.verdict?.qualifiable !== true || evidence.evidenceDigest !== tool.evidenceDigest(evidence)) {
+            throw new UsageError('the calibration evidence is not a qualifiable stage 1 document that matches its own digest');
+        }
+        const tuple = Object.fromEntries(tool.TUPLE_FIELDS.map((field) => [field, evidence.tuple[field]]));
+        const resolved = qualification.resolveVllmMpsQualification(tuple);
+        result = { stage, calibration: { evidenceDigest: evidence.evidenceDigest, tuple, expectQualified: resolved.qualified === true && resolved.evidenceDigest === evidence.evidenceDigest } };
+    } finally {
+        fs.rmSync(tooling.stage, { recursive: true, force: true });
     }
-    const tuple = Object.fromEntries(tool.TUPLE_FIELDS.map((field) => [field, evidence.tuple[field]]));
-    const resolved = qualification.resolveVllmMpsQualification(tuple);
-    return { stage, calibration: { evidenceDigest: evidence.evidenceDigest, tuple, expectQualified: resolved.qualified === true && resolved.evidenceDigest === evidence.evidenceDigest } };
+    if (fs.existsSync(path.join(tree, 'node_modules'))) throw new SchemaError('the frozen local-llm tree has a node_modules');
+    if (candidate.digest !== undefined && liveSourceDigest(candidate.root) !== candidate.digest) throw new SchemaError('the frozen candidate changed while the calibration tool was loaded');
+    return result;
 }
 
 function writePrivateText(target, text) {
@@ -992,7 +1206,7 @@ async function prepareLive(options) {
         });
         if (foreign) { console.error(`[prepare-live] BLOCKED: ${foreign}`); return EXIT.BLOCKED; }
         const candidate = buildFrozenCandidate(config, runId, { llm: Boolean(CONCRETE_BLOCKS[block].llm) });
-        const vllm = CONCRETE_BLOCKS[block].vllm ? await vllmStage(options, candidate) : null;
+        const vllm = CONCRETE_BLOCKS[block].vllm ? await vllmStage(options, candidate, { scratchParent: config.evidenceRoot, runId }) : null;
         if (CONCRETE_BLOCKS[block].remote) {
             const payloadPath = path.join(config.evidenceRoot, `candidate-${runId}.tar`);
             candidate.payload = { path: payloadPath, ...writeUstar(candidate.root, payloadPath) };
