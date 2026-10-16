@@ -1,5 +1,5 @@
 // The RoboFlow HTTP probes (agent-probes.mjs runRoboflowProbes) against an offline model of the
-// handlers served by roboTeamAgent/server/http-server.mjs at 3cd94b10. A product that
+// handlers served by AssistOSExplorer roboTeamAgent/server/http-server.mjs at a08b0005. A product that
 // answers 2xx to an ordinary user's POST /schedules, or 403 to an ordinary user's GET /schedules, must
 // fail exactly that check; no probe may start work even when the product fails open; nothing the
 // run created may remain; and every schedule the run writes is disabled.
@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     ROBOFLOW_BASE, ROBOFLOW_ABSENT, ROBOFLOW_GAPS, roboflowProbes, roboflowCheckDefinitions, roboflowCheckId, roboflowAdminCheckId,
-    runRoboflowProbes, assertRoboflowAdminRefusal, assertRoboflowEntitlementRefusal, assertRoboflowReach, roboflowScheduleBody, ROBOFLOW_UNPROBED_READS, ROBOFLOW_ENTITLEMENT_REFUSAL,
+    runRoboflowProbes, assertRoboflowAdminRefusal, assertRoboflowEntitlementRefusal, assertRoboflowReach, roboflowScheduleBody, roboflowScheduleMarker, ROBOFLOW_UNPROBED_READS, ROBOFLOW_ENTITLEMENT_REFUSAL,
 } from './agent-probes.mjs';
 import { runOwnedCleanup } from './run-cleanup.mjs';
 
@@ -30,7 +30,9 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
     if (preexisting?.type === 'file') files.add(preexisting.name);
     if (preexisting?.type === 'symlink') { folders.add(preexisting.target); symlinks.set(preexisting.name, preexisting.target); }
     const started = { flows: 0, generations: 0 };
-    let sequence = 0;
+    let sequence = 0, contentRevision = 0;
+    // Workflow revisions are a hash of the workflow file's content (workflow-files.mjs); any 16-hex value that changes on each write models it.
+    const nextWorkflowRevision = () => (++contentRevision).toString(16).padStart(16, 'a');
     const gate = (actor, name) => actor === 'admin' || everyoneReaches || open.has(name) ? null
         : json(403, routerRefusesUsers ? { ok: false, error: 'csrf token invalid' } : REFUSAL);
     const listed = (schedule) => ({ ...schedule });
@@ -51,7 +53,7 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
             if (!folders.has(name)) return json(404, { ok: false, error: 'Folder not found' });
             return json(200, { ok: true, path: name, folder: `/workspace/${name}`, folders: [] });
         }
-        if (method === 'GET' && route === '/schedule-folders') return refuse('schedule-folders.list') || json(200, { ok: true, folder: '/workspace', folders: [...folders].map((name) => ({ name, path: name })), defaultPath: 'cron-jobs-results' });
+        if (method === 'GET' && route === '/schedule-folders') return refuse('schedule-folders.list') || json(200, { ok: true, folder: '/workspace', folders: [...folders].map((name) => ({ name, path: name })), defaultPath: 'workflow-runs' });
         if (method === 'POST' && route === '/schedule-folders') {
             const refused = refuse('schedule-folders.create'); if (refused) return refused;
             if (typeof body?.name !== 'string' || body.name.includes('/')) return json(400, { ok: false, error: 'Enter one folder name without slashes' });
@@ -70,14 +72,14 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
         if (method === 'POST' && route === '/workflows') {
             const refused = refuse('workflows.create'); if (refused) return refused;
             if (workflows.some((item) => item.id === body.id)) return json(409, { ok: false, error: 'workflow id already exists' });
-            const workflow = { id: body.id, name: body.name, revision: 1 }; workflows.push(workflow); return json(201, { ok: true, workflow: { ...workflow } });
+            const workflow = { id: body.id, name: body.name, revision: nextWorkflowRevision() }; workflows.push(workflow); return json(201, { ok: true, workflow: { ...workflow } });
         }
         if ((match = route.match(/^\/workflows\/([a-z0-9][a-z0-9-]{2,63})$/)) && method === 'PUT') {
             const refused = refuse('workflows.update'); if (refused) return refused;
             const workflow = workflows.find((item) => item.id === match[1]);
             if (!workflow) return json(404, { ok: false, error: 'workflow not found' });
             if (body.revision !== workflow.revision) return json(409, { ok: false, error: 'workflow changed; reload before saving' });
-            workflow.name = body.name; workflow.revision++; return json(200, { ok: true, workflow: { ...workflow } });
+            workflow.name = body.name; workflow.revision = nextWorkflowRevision(); return json(200, { ok: true, workflow: { ...workflow } });
         }
         if (match && method === 'DELETE') {
             const refused = refuse('workflows.delete'); if (refused) return refused;
@@ -93,8 +95,9 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
             const refused = refuse('schedules.create'); if (refused) return refused;
             if (adminCreateFails && actor === 'admin') return json(500, { ok: false, error: 'request failed' });
             // The store's default is enabled:true with a computed next run, so a body that omits enabled would arm the schedule.
+            // The store keeps the objective and drops any name (schedule-store.mjs).
             const enabled = body.enabled ?? true;
-            const schedule = { id: `cron_${String(++sequence).padStart(24, '0')}`, revision: 1, name: body.name, enabled, workflowTypeId: body.workflowTypeId, nextRunAt: enabled ? 'soon' : null };
+            const schedule = { id: `cron_${String(++sequence).padStart(24, '0')}`, revision: 1, objective: body.objective, enabled, workflowTypeId: body.workflowTypeId, nextRunAt: enabled ? 'soon' : null };
             schedules.push(schedule); return json(201, { ok: true, schedule: listed(schedule) });
         }
         if ((match = route.match(/^\/schedules\/(cron_[0-9a-f]{24})$/)) && (method === 'PUT' || method === 'DELETE')) {
@@ -106,7 +109,7 @@ function roboflowWorld({ open = new Set(), selfRegisteredReaches = false, selfRe
             }
             if (!schedule) return json(404, { ok: false, error: 'Cron job not found' });
             if (body.revision !== schedule.revision) return json(409, { ok: false, error: 'Cron job changed; reload before saving' });
-            Object.assign(schedule, { name: body.name ?? schedule.name, enabled: body.enabled ?? schedule.enabled }); schedule.revision++; schedule.nextRunAt = schedule.enabled ? 'soon' : null;
+            Object.assign(schedule, { objective: body.objective ?? schedule.objective, enabled: body.enabled ?? schedule.enabled }); schedule.revision++; schedule.nextRunAt = schedule.enabled ? 'soon' : null;
             return json(200, { ok: true, schedule: listed(schedule) });
         }
         if ((match = route.match(/^\/schedules\/(cron_[0-9a-f]{24})\/run-now$/)) && method === 'POST') {
@@ -239,7 +242,7 @@ test('NEGATIVE: an ordinary user whose POST /schedules succeeds fails that check
     const run = await runWorld({ open: new Set(['schedules.create']) });
     assert.deepEqual([...run.failed.keys()].sort(), ['agent.roboflow.schedules.create.userA', 'agent.roboflow.schedules.create.userB']);
     assert.ok(run.passed.includes('agent.roboflow.schedules.create.admin'), 'the administrator positive still passes');
-    assert.ok(run.world.schedules.some((item) => item.name.startsWith('authz-mk1-0a1b2c3d-deny')), 'the model leaked a schedule');
+    assert.ok(run.world.schedules.some((item) => item.objective.startsWith('authz-mk1-0a1b2c3d-deny')), 'the model leaked a schedule');
     assert.ok(run.world.schedules.every((item) => item.enabled === false), 'even a leaked schedule is disabled');
     await cleanAll(run);
     assert.deepEqual(run.world.schedules, []);
@@ -321,6 +324,8 @@ test('schedule payloads are always disabled, whatever the caller asks for', () =
     assert.strictEqual(roboflowScheduleBody('n', '/w').enabled, false);
     assert.strictEqual(roboflowScheduleBody('n', '/w', { enabled: true }).enabled, false);
     assert.equal(roboflowScheduleBody('n', '/w').workflowTypeId, 'default');
+    assert.equal(roboflowScheduleMarker(roboflowScheduleBody('authz-x-schedule', '/w')), 'authz-x-schedule', 'the run-owned marker leads the objective the store keeps');
+    assert.equal('name' in roboflowScheduleBody('n', '/w'), false, 'the store keeps no schedule name, so none is sent');
 });
 
 const FOLDER_CHECK = 'agent.roboflow.schedule-folders.create.admin';

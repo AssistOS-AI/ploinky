@@ -18,7 +18,7 @@
     {
       "name": "AchillesCLI",
       "path": ".ploinky/repos/AchillesCLI",
-      "reason": "Boot repository (cli/utils/repos.js:146); no agent is enabled by the Explorer graph (roboTeamAgent now lives in the AchillesIDE repository)"
+      "reason": "Boot repository (cli/utils/repos.js:146); holds no first-level agent manifest since roboTeamAgent moved to AchillesIDE and GPTResearcher to legacy-agents"
     },
     {
       "name": "copilot-agents",
@@ -28,7 +28,7 @@
     {
       "name": "webmeet",
       "path": ".ploinky/repos/webmeet",
-      "reason": "Declared in explorer/manifest.json repos; holds the enabled liveKitServerAgent, webmeetAgent and webmeetStt"
+      "reason": "Declared in explorer/manifest.json repos; holds the enabled liveKitServerAgent and webmeetAgent; moderator, webmeetScribeAgent and webmeetStt are not enabled by the graph"
     },
     {
       "name": "legacy-agents",
@@ -38,7 +38,7 @@
     {
       "name": "UmamiAgent",
       "path": ".ploinky/repos/UmamiAgent",
-      "reason": "Declared in explorer/manifest.json repos"
+      "reason": "Declared in explorer/manifest.json repos; umamiAgent is not enabled by the graph"
     },
     {
       "name": "local-llms",
