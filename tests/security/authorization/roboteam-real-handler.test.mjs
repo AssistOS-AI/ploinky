@@ -1,11 +1,12 @@
-// Drives the RoboFlow and RoboTeam probes against the REAL AchillesCLI RoboTeam server (createRoboTeamServer with a real
+// Drives the RoboFlow and RoboTeam probes against the REAL RoboTeam server (AssistOSExplorer/roboTeamAgent) (createRoboTeamServer with a real
 // RobotStore, a real RoboFlowService on a temporary SQLite database and the real family gate) instead of the offline model.
 // Requests are signed by this checkout's real HTTP-route minter and verified by this checkout's real Agent helper, so
 // signature, audience, method, path, query and body binding are all real. Only the runtime manager (nothing may start) and
 // Explorer's file tools (real filesystem calls confined to the temporary workspace) are stubs.
 //
-// Prerequisite: an AchillesCLI checkout whose tree is exactly 3cd94b10 (reviewed D13+D14 merge), clean, at
-// AUTHZ_ROBOTEAM_DIR or the default sibling lane. Without it the test is skipped, like the DPU tests without their checkout.
+// Prerequisite: an AssistOSExplorer checkout whose roboTeamAgent/ subtree is exactly the one reviewed at AchillesCLI 3cd94b10
+// (D13+D14 merge), clean, at AUTHZ_ROBOTEAM_DIR or the default sibling lane. RoboTeam moved from AchillesCLI into AssistOSExplorer;
+// the pin is the roboTeamAgent/ subtree, so the test skips on any AssistOSExplorer revision whose RoboTeam differs and must be re-pinned then. Without it the test is skipped, like the DPU tests without their checkout.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -14,17 +15,17 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const ROBOTEAM_TREE = 'f1484642c23d3267c561e054fb0172f7edd54511'; // tree of AchillesCLI 3cd94b10 (identical to its first parent 798c3d86)
-const dir = process.env.AUTHZ_ROBOTEAM_DIR || '/Users/danielsava/work/perf-lanes/d13-achillescli';
+const ROBOTEAM_TREE = '4e374c18ce51d7dbb4ede6d0b93334be606e5819'; // roboTeamAgent/ subtree of AchillesCLI 3cd94b10 (git rev-parse 3cd94b10:roboTeamAgent)
+const dir = process.env.AUTHZ_ROBOTEAM_DIR || '/Users/danielsava/work/perf-lanes/d13-assistosexplorer';
 const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim();
 let skip = false;
 try {
-    if (git('rev-parse', 'HEAD^{tree}') !== ROBOTEAM_TREE) skip = `AchillesCLI checkout ${dir} is not the 3cd94b10 tree`;
-    else if (git('status', '--porcelain', '--untracked-files=no')) skip = `AchillesCLI checkout ${dir} has tracked changes`;
-} catch { skip = `AchillesCLI checkout not found (tried ${dir})`; }
+    if (git('rev-parse', 'HEAD:roboTeamAgent') !== ROBOTEAM_TREE) skip = `AssistOSExplorer checkout ${dir} roboTeamAgent/ is not the 3cd94b10 subtree`;
+    else if (git('status', '--porcelain', '--untracked-files=no')) skip = `AssistOSExplorer checkout ${dir} has tracked changes`;
+} catch { skip = `AssistOSExplorer checkout not found (tried ${dir})`; }
 
 const PLOINKY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-const AGENT_ID = 'agent:AchillesCLI/roboTeamAgent';
+const AGENT_ID = 'agent:AchillesIDE/roboTeamAgent';
 const PREFIX = '/base-agent-additional-server/roboTeamAgent/3001';
 
 test('the RoboFlow and RoboTeam probes pass against the real 3cd94b10 server and start nothing', { skip }, async (t) => {
@@ -93,7 +94,7 @@ test('the RoboFlow and RoboTeam probes pass against the real 3cd94b10 server and
         if (actor !== 'anonymous') {
             const parsed = new URL(`http://127.0.0.1:8080${external}`);
             Object.assign(headers, buildHttpRouteAuthInfoHeader({ method, url: external, headers: {}, user: principals[actor] }, parsed,
-                { includeAuthInfo: true, issueInvocation: true, routeKey: 'roboTeamAgent', route: { repo: 'AchillesCLI', agent: 'roboTeamAgent' } },
+                { includeAuthInfo: true, issueInvocation: true, routeKey: 'roboTeamAgent', route: { repo: 'AchillesIDE', agent: 'roboTeamAgent' } },
                 { bodyHash: sha256RawBodyHash(Buffer.from(bodyString)), routePath: new URL(`http://127.0.0.1:8080${inner}`).pathname }));
         }
         const response = await fetch(base + inner, { method, headers, ...(body === undefined ? {} : { body: bodyString }) });

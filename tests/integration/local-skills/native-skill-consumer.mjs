@@ -15,7 +15,7 @@ const { parseArguments } = await alaModule('src/arguments.mjs');
 const { openSessionState, resolveSessionsRoot } = await alaModule('src/session-state.mjs');
 const { createTranscriptRecorder } = await alaModule('src/transcript-recorder.mjs');
 // The private directory name belongs to the system under test; never hard-code it here.
-const { ACHILLES_PRIVATE_DIRECTORY_NAME } = await import(pathToFileURL(path.join(process.env.SKILLS_TEST_ACHILLES,
+const { ACHILLES_PRIVATE_DIRECTORY_NAME } = await import(pathToFileURL(path.join(process.env.SKILLS_TEST_EXPLORER,
     'roboTeamAgent/copilot/src/lib/storage/privateDataRoot.mjs')).href);
 const args = process.argv.slice(2);
 // ALA no longer accepts skill catalog options; the real parser rejects any unknown option RoboTeam might still forward.

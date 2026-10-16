@@ -114,7 +114,7 @@ test('pinned Explorer graph starts through one immutable Box candidate', {
         workspaceRoot,
     ]));
     assert.deepEqual(graphState.agents.filter((entry) => entry.agentName === 'liveKitServerAgent'), [
-        { repoName: 'AchillesIDE', agentName: 'liveKitServerAgent' },
+        { repoName: 'webmeet', agentName: 'liveKitServerAgent' },
     ]);
     for (const retired of ['basic', 'webmeetInfra']) {
         assert.equal(graphState.repositories.includes(retired), false);

@@ -1,5 +1,5 @@
 // The RoboFlow HTTP probes (agent-probes.mjs runRoboflowProbes) against an offline model of the
-// handlers served by AchillesCLI roboTeamAgent/server/http-server.mjs at 3cd94b10. A product that
+// handlers served by roboTeamAgent/server/http-server.mjs at 3cd94b10. A product that
 // answers 2xx to an ordinary user's POST /schedules, or 403 to an ordinary user's GET /schedules, must
 // fail exactly that check; no probe may start work even when the product fails open; nothing the
 // run created may remain; and every schedule the run writes is disabled.
@@ -189,7 +189,7 @@ test('the probe table lists the seven schedule method/path combinations and ever
         'POST /generate', 'POST /generations', 'POST /validate', 'POST /workflows', 'PUT /workflows/:workflow',
     ]);
     for (const entry of roboflowProbes) {
-        assert.match(entry.source, /^AchillesCLI\/roboTeamAgent\/server\/http-server\.mjs:\d+-\d+$/);
+        assert.match(entry.source, /^AchillesIDE\/roboTeamAgent\/server\/http-server\.mjs:\d+-\d+$/);
         assert.ok(['admin', 'workspace'].includes(entry.policy));
         assert.ok(['positive', 'reach'].includes(entry.control));
         assert.equal(Boolean(entry.reach), entry.control === 'reach', `${entry.name}: a reach control carries its exact documented answer`);
