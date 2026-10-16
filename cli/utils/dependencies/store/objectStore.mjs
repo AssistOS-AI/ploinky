@@ -114,6 +114,23 @@ function stageError(error, stage) {
     return error;
 }
 
+const MAX_NAMED_DEPENDENCIES = 12;
+
+/** Readable consumer of a failed build: package, source path and dependency names, with the input key prefix last. */
+function describeBuildConsumer(plan, requester = null) {
+    const inputId = `input ${String(plan.inputKey).slice(0, 12)}`;
+    const agent = plan.contract?.agent;
+    const manifest = agent?.manifest || plan.contract?.global?.manifest;
+    if (!manifest) return `${plan.kind} ${inputId}`;
+    const names = Object.keys(manifest.dependencies || {});
+    const listed = names.slice(0, MAX_NAMED_DEPENDENCIES).join(', ') + (names.length > MAX_NAMED_DEPENDENCIES ? `, +${names.length - MAX_NAMED_DEPENDENCIES} more` : '');
+    const parts = [];
+    if (agent?.packageSource?.relativePath) parts.push(agent.packageSource.relativePath);
+    parts.push(`dependencies: ${listed || 'none'}`, inputId);
+    const forAgent = requester ? ` for agent ${requester}` : '';
+    return `${plan.kind} ${manifest.name || '(unnamed)'}${forAgent} (${parts.join('; ')})`;
+}
+
 /**
  * Create a store bound to one workspace.
  *
@@ -628,6 +645,7 @@ export function createCacheStore({
         prelookup = null,
         maxAttempts = DEFAULT_MAX_BUILD_ATTEMPTS,
         installOptions = {},
+        requester = null,
     }) {
         requireLease(lease);
         ensureLayout();
@@ -654,7 +672,7 @@ export function createCacheStore({
         }
         if (!built) {
             const failure = dependencyStoreError('PLOINKY_DEPS_BUILD_FAILED',
-                `dependency build for ${plan.kind} ${plan.inputKey.slice(0, 12)} failed: ${lastError?.message || 'unknown error'}`,
+                `dependency build for ${describeBuildConsumer(plan, requester)} failed: ${lastError?.message || 'unknown error'}`,
                 { cause: lastError?.code || null, corruption: found.corruption });
             failure.cause = lastError;
             throw failure;
@@ -707,6 +725,7 @@ export function createCacheStore({
             installer,
             operation,
             installOptions,
+            requester: agentPlan.registration || agentPlan.contract?.agent?.manifest?.name || null,
             consumer: { kind: 'seed-copy', process: writerIdentity(), registration: agentPlan.registration || null, phase: 'copying' },
         });
         try {

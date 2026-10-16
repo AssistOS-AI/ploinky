@@ -1,6 +1,8 @@
 # Dependencies for graph skill scope persistence
 
-The optional Apple CPU and measurement tests use Node.js built-ins and repository modules. They add no package or runtime dependency. Live execution uses the existing pinned Podman, Node.js, llama.cpp image and macOS observers through the owned process provider. Preparation checks executable and image pins before execution; it never installs a missing prerequisite. The fixed cache observer imports the staged local-llm downloader's path resolver and reads only the controller's `/data/models/gguf` tree. Offline tests use the existing engine-spawn guard and need `PLOINKY_AGENTLIB_DIR` to name the canonical AchillesAgentLib checkout.
+The optional Apple CPU and measurement tests use Node.js built-ins and repository modules. They add no package or runtime dependency. Live execution uses the existing pinned Podman, Node.js, llama.cpp image and macOS observers through the owned process provider. Preparation checks executable and image pins before execution; it never installs a missing prerequisite. The fixed cache observer imports the path resolver of the pworker engine package by the absolute path `/code/node_modules/pworker/lib/local-llm/controller/downloader.mjs`, where Ploinky binds the agent's installed dependencies read-only (a bare package name would resolve from the exec's working directory), and reads only the controller's `/data/models/gguf` tree. Offline tests use the existing engine-spawn guard and need `PLOINKY_AGENTLIB_DIR` to name the canonical AchillesAgentLib checkout.
+
+The offline hardware-limits suites of the local-llms candidate run in a runner-owned scratch copy of the exact candidate (a clean candidate is archived from its commit, a dirty one is copied byte for byte and must match its configured digest first; a dirty candidate that already holds a `node_modules` is refused). The harness runs `npm --prefix local-llm install --ignore-scripts --no-bin-links --no-package-lock` in that copy on every tree without looking at the tree's layout: the command installs the pworker engine when `local-llm/package.json` pins it, which needs network access to the pinned commit, and does nothing for a tree without dependencies. The report records the install separately from the source identity (the pworker commit npm resolved, which must equal the pinned one, and a digest of the installed package; both null when nothing is installed). After the suites, the candidate and the copy are checked again, excluding only `local-llm/node_modules`, and the copy is removed. The candidate itself, the frozen live stage and the agent's `/code` never get a `node_modules`.
 
 Host-path workspace mounts, path admission, diagnostics, and their tests use
 Node.js 22+ built-ins and repository-owned modules. They introduce no new
@@ -188,8 +190,16 @@ Ploinky. They run the committed local-llm candidate from its own pinned immutabl
 image, and drive it only through its MCP tools and the administrator route. While
 the model generates they read the agent's cgroup interface files (`cpu.stat`,
 `cpu.max`, `memory.*`) and the pinned host `nvidia-smi` XML query. The local-llm
-repository's calibration tool (`local-llm/tools/vllm_mps_calibration.mjs`) uses
-only Node.js built-ins and the vLLM installation the product itself makes from its
+repository's calibration tool (`local-llm/tools/vllm_mps_calibration.mjs`) imports
+the pworker engine package, which the harness installs with
+`npm --prefix local-llm install --ignore-scripts --no-bin-links --no-package-lock`
+into a runner-owned scratch copy of the frozen `local-llm` tree outside the frozen
+stage (stage 2 of `prepare-live --block apparatus-vllm`, which therefore needs
+network access to the pinned pworker commit; its commit and installed digest are
+recorded in `vllm-tool-install-<runId>.json` in the evidence root, and the scratch
+copy is removed afterwards). The frozen stage and the agent's `/code` never get a
+`node_modules`. Inside the agent, the tool uses only that package, Node.js built-ins
+and the vLLM installation the product itself makes from its
 own pinned runner lock: the lock entry (wheels, about 3.9 GB for the pinned vLLM
 version) is downloaded by the agent's own installer inside the owned Box and is
 removed with the owned workspace. Nothing is installed on the host and nothing

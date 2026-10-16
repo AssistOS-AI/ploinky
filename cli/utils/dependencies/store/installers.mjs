@@ -60,12 +60,53 @@ function runBounded(command, args, { cwd, env, timeoutMs, outputLimitBytes, logF
     return { result, outputTail, durationMs: Date.now() - started };
 }
 
+const FAILURE_REASON_LIMIT = 400;
+const FAILURE_REASON_LINES = 4;
+// Lines that state the cause: first choice.
+const CODE_REASON_LINE = /^npm (error|ERR!) code /i;
+const CAUSE_REASON_LINE = /reason:|fatal:|\b(ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN)\b/i;
+const PREFERRED_REASON_LINE = /^(npm error|npm ERR!|fatal:|error:)/i;
+// Heartbeats, log pointers, generic npm network advice and repeated syscall/errno detail.
+const NOISE_REASON_LINE = /^\[deps-cache\]|complete log of this run|^npm (error|ERR!) network\s*$|behind a proxy|bad network settings|'proxy' config|npm help config|make sure that the$|problem related to network|^npm (error|ERR!) (syscall|errno) /i;
+// C0/C1 controls, line/paragraph separators and bidi controls.
+const UNSAFE_REASON_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g; // eslint-disable-line no-control-regex
+
+function redactUserinfo(text) {
+    return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, '$1***@');
+}
+
+/**
+ * Short single-line reason from the installer output tail: the npm error code
+ * line as a header, then the last cause lines (`reason:`, git `fatal:`, network
+ * error codes) or, when there are none, the last npm/git error lines, else the
+ * last lines. Generic advice and heartbeats are dropped, credentials in URL
+ * userinfo removed, and the length bounded. Returns '' when nothing is useful.
+ */
+function failureReason(outputTail) {
+    const lines = String(outputTail || '').split(/\r?\n/)
+        .map((line) => redactUserinfo(line.replace(UNSAFE_REASON_CHARS, ' ').trim()))
+        .filter((line) => line && !NOISE_REASON_LINE.test(line));
+    const header = lines.find((line) => CODE_REASON_LINE.test(line)) || null;
+    const body = lines.filter((line) => line !== header);
+    const cause = body.filter((line) => CAUSE_REASON_LINE.test(line));
+    const preferred = body.filter((line) => PREFERRED_REASON_LINE.test(line));
+    const pool = cause.length ? cause : (preferred.length ? preferred : body);
+    const picked = [...(header ? [header] : []), ...pool.slice(-(FAILURE_REASON_LINES - (header ? 1 : 0)))];
+    const joined = picked.join(' | ');
+    return joined.length > FAILURE_REASON_LIMIT ? `...${joined.slice(-(FAILURE_REASON_LIMIT - 3))}` : joined;
+}
+
+function withReason(message, outputTail) {
+    const reason = failureReason(outputTail);
+    return reason ? `${message}: ${reason}` : message;
+}
+
 function installFailure(kind, { result, outputTail, durationMs }, timeoutMs) {
     if (result?.error?.code === 'ETIMEDOUT' || result?.signal === 'SIGKILL' && durationMs >= timeoutMs) {
-        return dependencyStoreError('PLOINKY_DEPS_INSTALL_TIMEOUT', `${kind} exceeded its ${Math.round(timeoutMs / 1000)}s deadline`, { outputTail });
+        return dependencyStoreError('PLOINKY_DEPS_INSTALL_TIMEOUT', withReason(`${kind} exceeded its ${Math.round(timeoutMs / 1000)}s deadline`, outputTail), { outputTail });
     }
-    if (result?.error) return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', `${kind} failed: ${result.error.code || result.error.message}`, { outputTail });
-    return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', `${kind} exited with ${result?.status ?? result?.signal}`, { outputTail });
+    if (result?.error) return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', withReason(`${kind} failed: ${result.error.code || result.error.message}`, outputTail), { outputTail });
+    return dependencyStoreError('PLOINKY_DEPS_INSTALL_FAILED', withReason(`${kind} exited with ${result?.status ?? result?.signal}`, outputTail), { outputTail });
 }
 
 /**
