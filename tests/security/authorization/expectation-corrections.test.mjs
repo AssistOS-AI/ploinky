@@ -82,8 +82,10 @@ test('profile_get for selfRegistered: the owned dashboard route is the positive 
 
 // ---- agent-card fan-out -------------------------------------------------------------
 const absent = name => ({ name, statusCode: 404, error: '{"error":"agent-card not configured"}' });
+// No enabled runtime of the pinned graph declares an agent-card (umamiAgent, the one that does, is disabled), so the live fan-out
+// carries no card and only the reviewed absences.
 const liveCard = () => ({
-    agents: [{ name: 'umamiAgent', statusCode: 200, payload: { agent: 'umamiAgent', about: '', 'agent-card': { name: 'Umami Agent' } } }],
+    agents: [],
     errors: ['roboTeamAgent', 'dpuAgent', 'emailAgent', 'explorer', 'gitAgent', 'multimedia', 'soplangAgent', 'tasksAgent', 'userPersistoAgent', 'webAssist', 'webmeetAgent', 'workspaceMonitorAgent', 'local-llm'].map(absent)
         .concat([{ name: 'soul-gateway', statusCode: 404, error: '{"error":{"message":"Not found","type":"not_found"}}' }]),
 });
@@ -98,16 +100,22 @@ test('agent-card fan-out: the live shape is a declared absence; every other erro
         agentServerBodyOnSoul: c => { c.errors[13] = { ...absent('soul-gateway') }; },
         extraField: c => { c.errors[0] = { ...absent('roboTeamAgent'), detail: 'x' }; },
         unknownAgent: c => { c.errors.push(absent('not-an-enabled-agent')); },
-        declaredCardMissing: c => { c.errors.push(absent('umamiAgent')); },
+        disabledAgentAbsence: c => { c.errors.push(absent('umamiAgent')); },
+        cardFromDisabledDeclaring: c => { c.agents.push({ name: 'umamiAgent', statusCode: 200, payload: { agent: 'umamiAgent', about: '', 'agent-card': { name: 'Umami Agent' } } }); },
         duplicate: c => { c.errors.push(absent('dpuAgent')); },
         cardFromUndeclaring: c => { c.agents.push({ name: 'dpuAgent', statusCode: 200, payload: {} }); },
-        cardNon200: c => { c.agents[0] = { ...c.agents[0], statusCode: 201 }; },
     };
     for (const [name, mutate] of Object.entries(variants)) {
         const card = liveCard();
         mutate(card);
         assert.notDeepEqual(classifyAgentCardFanout(card).unexplained, [], name);
     }
+    // The declared-card branch, against a catalog in which an enabled agent declares its card.
+    const declaring = [{ agent: 'cardAgent', enabled: true, endpointDeclarations: ['agent-card'] }];
+    const card = (statusCode) => ({ agents: [{ name: 'cardAgent', statusCode, payload: {} }], errors: [] });
+    assert.deepEqual(classifyAgentCardFanout(card(200), declaring).unexplained, []);
+    assert.notDeepEqual(classifyAgentCardFanout(card(201), declaring).unexplained, [], 'cardNon200');
+    assert.notDeepEqual(classifyAgentCardFanout({ agents: [], errors: [absent('cardAgent')] }, declaring).unexplained, [], 'declaredCardMissing');
 });
 
 test('agent-card fan-out: the allow probe records an observation for declared absences and the forbidden gap otherwise', async () => {

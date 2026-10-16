@@ -4,9 +4,10 @@
 // signature, audience, method, path, query and body binding are all real. Only the runtime manager (nothing may start) and
 // Explorer's file tools (real filesystem calls confined to the temporary workspace) are stubs.
 //
-// Prerequisite: an AssistOSExplorer checkout whose roboTeamAgent/ subtree is exactly the one reviewed at AchillesCLI 3cd94b10
-// (D13+D14 merge), clean, at AUTHZ_ROBOTEAM_DIR or the default sibling lane. RoboTeam moved from AchillesCLI into AssistOSExplorer;
-// the pin is the roboTeamAgent/ subtree, so the test skips on any AssistOSExplorer revision whose RoboTeam differs and must be re-pinned then. Without it the test is skipped, like the DPU tests without their checkout.
+// Prerequisite: an AssistOSExplorer checkout whose roboTeamAgent/ subtree is exactly the one at AssistOSExplorer a08b0005 (the
+// revision pinned by agent-inventory.mjs), clean, at AUTHZ_ROBOTEAM_DIR or the sibling ../AssistOSExplorer of this checkout.
+// The pin is the roboTeamAgent/ subtree, so the test skips on any AssistOSExplorer revision whose RoboTeam differs and must be
+// re-pinned then. Without it the test is skipped, like the DPU tests without their checkout.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -15,20 +16,20 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const ROBOTEAM_TREE = '4e374c18ce51d7dbb4ede6d0b93334be606e5819'; // roboTeamAgent/ subtree of AchillesCLI 3cd94b10 (git rev-parse 3cd94b10:roboTeamAgent)
-const dir = process.env.AUTHZ_ROBOTEAM_DIR || '/Users/danielsava/work/perf-lanes/d13-assistosexplorer';
+const PLOINKY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+const ROBOTEAM_TREE = '2bd5c7855066903501114b6a553758803ca750d1'; // roboTeamAgent/ subtree of AssistOSExplorer a08b0005 (git rev-parse a08b0005:roboTeamAgent)
+const dir = process.env.AUTHZ_ROBOTEAM_DIR || path.resolve(PLOINKY, '../AssistOSExplorer');
 const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim();
 let skip = false;
 try {
-    if (git('rev-parse', 'HEAD:roboTeamAgent') !== ROBOTEAM_TREE) skip = `AssistOSExplorer checkout ${dir} roboTeamAgent/ is not the 3cd94b10 subtree`;
+    if (git('rev-parse', 'HEAD:roboTeamAgent') !== ROBOTEAM_TREE) skip = `AssistOSExplorer checkout ${dir} roboTeamAgent/ is not the a08b0005 subtree`;
     else if (git('status', '--porcelain', '--untracked-files=no')) skip = `AssistOSExplorer checkout ${dir} has tracked changes`;
 } catch { skip = `AssistOSExplorer checkout not found (tried ${dir})`; }
 
-const PLOINKY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const AGENT_ID = 'agent:AchillesIDE/roboTeamAgent';
 const PREFIX = '/base-agent-additional-server/roboTeamAgent/3001';
 
-test('the RoboFlow and RoboTeam probes pass against the real 3cd94b10 server and start nothing', { skip }, async (t) => {
+test('the RoboFlow and RoboTeam probes pass against the real a08b0005 server and start nothing', { skip }, async (t) => {
     process.env.PLOINKY_MASTER_KEY ||= '5'.repeat(64);
     process.env.PLOINKY_AGENTLIB_DIR ||= path.join(PLOINKY, 'node_modules', 'achillesAgentLib');
     const { buildHttpRouteAuthInfoHeader } = await import(pathToFileURL(path.join(PLOINKY, 'cli/server/routerHandlers.js')).href);
