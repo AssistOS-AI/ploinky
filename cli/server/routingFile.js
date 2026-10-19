@@ -13,19 +13,20 @@ import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 
 const ROUTING_LOCK_FILE = `${ROUTING_FILE}.lock`;
 
-// Inactivate before mutating candidate bytes, remembering the active selector
-// this hold withdrew. The apply may then carry that predecessor's ready
-// publication forward when the publication semantics are unchanged.
-function inactivateForRoutingMutation(reason, applyLockCapability) {
-    let predecessor = null;
+// The active selector a routing mutation is about to inactivate. Its apply may
+// carry that predecessor's ready publication forward when the publication
+// semantics are unchanged, proven by the inactivation this hold performed.
+function activeSelectorBeforeInactivation() {
     try {
         const { selector } = readEdgeRoutingSelection();
-        if (selector?.state === 'active') predecessor = selector;
-    } catch (_) {}
-    const inactivation = inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
-    return predecessor
-        ? { publicationPredecessor: predecessor, publicationPredecessorInactivation: inactivation }
-        : {};
+        return selector?.state === 'active' ? selector : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function publicationCarry(publicationPredecessor, publicationPredecessorInactivation) {
+    return publicationPredecessor ? { publicationPredecessor, publicationPredecessorInactivation } : {};
 }
 
 function sleep(ms) {
@@ -98,7 +99,11 @@ function writeRoutingConfig(config, {
             // the prepared apply can validate it. The preparation phase has
             // already installed the fail-closed selector; ordinary unprepared
             // writes still have to inactivate before mutating candidate bytes.
-            const carry = preparationLease ? {} : inactivateForRoutingMutation(reason, applyLockCapability);
+            let carry = {};
+            if (!preparationLease) {
+                const predecessor = activeSelectorBeforeInactivation();
+                carry = publicationCarry(predecessor, inactivateEdgeRoutingGeneration(reason, { applyLockCapability }));
+            }
             write();
             const expectedGeneration = captureEdgeRoutingCandidateGeneration({ applyLockCapability });
             applyEdgeRoutingGeneration({
@@ -129,9 +134,11 @@ async function mergeRoutingConfig(mutator, {
         if (coordinate && typeof validateActiveGeneration === 'function') {
             validatedActiveGeneration = await validateActiveGeneration();
         }
-        const carry = coordinate && !preparationLease
-            ? inactivateForRoutingMutation(reason, applyLockCapability)
-            : {};
+        let carry = {};
+        if (coordinate && !preparationLease) {
+            const predecessor = activeSelectorBeforeInactivation();
+            carry = publicationCarry(predecessor, inactivateEdgeRoutingGeneration(reason, { applyLockCapability }));
+        }
         const current = readRoutingConfig();
         // The live capabilities a coordinated merge holds are handed to the mutator so that a ready
         // publication can retire its availability entries under them. A `coordinate: false` merge holds
