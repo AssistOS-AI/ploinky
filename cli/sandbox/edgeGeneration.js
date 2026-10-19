@@ -2350,6 +2350,9 @@ export function retireAbandonedActiveBoundPreparation(options = {}) {
                 'EDGE_PREPARATION_BUSY',
             );
         }
+        // An owner that stopped inside its coordinated apply may have left its
+        // withdrawn candidate in the mutable sources.
+        if (lease.mode === 'withdrawn') restoreWithdrawnPredecessorSources(paths, lease);
         removePreparationLease(paths, lease);
         return { retired: true, mode: lease.mode, transactionId: lease.transactionId, pid: lease.pid };
     } finally {
@@ -3143,29 +3146,11 @@ export function assertAdditivePreparedRuntimeIdentity(preparationLease, options 
     return preparedRuntimeRegistryRecord(preparationLease, options, { requiredMode: 'additive' });
 }
 
-/**
- * Commit one prepared additive candidate. Only locator/runtime-only fields may
- * differ from preparation, so the launched runtime can supply its final port
- * and registry metadata without changing the admitted lifecycle identity.
- */
-export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = {}) {
-    const paths = resolveEdgeGenerationPaths(options);
-    if (!hasApplyLockCapability(paths, options.applyLockCapability)) {
-        throw edgeError(
-            'additive edge commit requires the exact live apply-lock capability',
-            'EDGE_GENERATION_CAPABILITY_REQUIRED',
-        );
-    }
-    const lease = assertPreparationLeaseForApply(paths, preparationLease);
-    if (!lease || !ACTIVE_BOUND_LEASE_MODES.has(lease.mode)) {
-        throw edgeError('additive edge commit requires one additive or withdrawn preparation lease', 'EDGE_PREPARATION_STALE');
-    }
-    assertPreparedSelectorStillSelected(paths, lease);
+// The commit checks that run before any write: the sources must keep the
+// prepared lifecycle binding and live manifests, and supplied sources leave
+// the mutable sources at the active predecessor.
+function assertAdditiveCommitSources(paths, lease, options, fromMutableSources) {
     const prepared = loadCapturedGeneration(paths, lease.preparedGeneration);
-    // A coordinated apply holding a withdrawn lease has already written its
-    // candidate into the mutable sources; anything else supplies it here and
-    // leaves the mutable sources at the active predecessor until commit.
-    const fromMutableSources = options[COMMIT_FROM_MUTABLE_SOURCES] === true;
     const captured = fromMutableSources ? collectCapturedSources(paths) : collectCandidateSources(paths, {
         routing: options.routing === undefined ? prepared.bytes.routingBytes : options.routing,
         policy: options.policy === undefined ? prepared.bytes.policyBytes : options.policy,
@@ -3208,6 +3193,67 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
                 'EDGE_GENERATION_SOURCE_CHANGED',
             );
         }
+    }
+    return { prepared, captured };
+}
+
+// Return the mutable sources of a withdrawn lease to its drained active
+// predecessor. Only a coordinated apply holding that lease writes them before
+// its commit; the lease denies every other apply meanwhile.
+function restoreWithdrawnPredecessorSources(paths, lease) {
+    let current = null;
+    try { current = collectCapturedSources(paths).generation; } catch (_) {}
+    if (current !== lease.predecessorGeneration) {
+        restoreMutableSourcesFromGeneration(paths, lease.predecessorGeneration);
+    }
+}
+
+function restoreWithdrawnPredecessorAfterRefusal(paths, lease, error) {
+    try {
+        restoreWithdrawnPredecessorSources(paths, lease);
+        return error;
+    } catch (restoreError) {
+        const restoreFailure = edgeError(
+            `withdrawn edge predecessor restoration failed: ${restoreError?.message || restoreError}`,
+            'EDGE_ADDITIVE_RESTORE_FAILED',
+        );
+        restoreFailure.cause = error;
+        restoreFailure.restoreCauses = Object.freeze([restoreError]);
+        return restoreFailure;
+    }
+}
+
+/**
+ * Commit one prepared additive candidate. Only locator/runtime-only fields may
+ * differ from preparation, so the launched runtime can supply its final port
+ * and registry metadata without changing the admitted lifecycle identity.
+ */
+export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    if (!hasApplyLockCapability(paths, options.applyLockCapability)) {
+        throw edgeError(
+            'additive edge commit requires the exact live apply-lock capability',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
+    const lease = assertPreparationLeaseForApply(paths, preparationLease);
+    if (!lease || !ACTIVE_BOUND_LEASE_MODES.has(lease.mode)) {
+        throw edgeError('additive edge commit requires one additive or withdrawn preparation lease', 'EDGE_PREPARATION_STALE');
+    }
+    assertPreparedSelectorStillSelected(paths, lease);
+    // A coordinated apply holding a withdrawn lease has already written its
+    // candidate into the mutable sources; anything else supplies it here and
+    // leaves the mutable sources at the active predecessor until commit. A
+    // refused written candidate is returned to the drained predecessor, so no
+    // later apply can publish its unproven identity.
+    const fromMutableSources = options[COMMIT_FROM_MUTABLE_SOURCES] === true;
+    let prepared;
+    let captured;
+    try {
+        ({ prepared, captured } = assertAdditiveCommitSources(paths, lease, options, fromMutableSources));
+    } catch (error) {
+        if (fromMutableSources) throw restoreWithdrawnPredecessorAfterRefusal(paths, lease, error);
+        throw error;
     }
 
     let selectorCommitted = false;
@@ -3800,8 +3846,10 @@ export function abortEdgeRoutingPreparation(preparationLease, options = {}) {
         if (!current) throw edgeError('no edge lifecycle preparation is outstanding', 'EDGE_PREPARATION_STALE');
         if (ACTIVE_BOUND_LEASE_MODES.has(current.mode)) {
             // The active predecessor stays selected. A withdrawn candidate's
-            // routes therefore stay withdrawn until a later proven commit.
+            // routes therefore stay withdrawn until a later proven commit, and
+            // a candidate its holder wrote into the mutable sources is dropped.
             assertPreparedSelectorStillSelected(paths, current);
+            if (current.mode === 'withdrawn') restoreWithdrawnPredecessorSources(paths, current);
             const selector = readSelector(paths);
             removePreparationLease(paths, current);
             return { selector: deepFreeze(selector), paths };

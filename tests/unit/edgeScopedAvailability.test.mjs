@@ -699,6 +699,123 @@ test('D4 a withdrawn preparation requires drained routes and may change only the
     edge.abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: workspace });
 });
 
+// B1: a coordinated apply holding a withdrawn lease writes its candidate into
+// the mutable sources before the commit. Every refusal of that commit, and an
+// abort after a failure before it, returns them to the drained predecessor, so
+// no later apply can publish the refused identity.
+function mutableSourceBytes() {
+    const files = edgeStateBytes().files;
+    return Object.fromEntries(Object.entries(files).filter(([file]) => !file.endsWith('current.json')));
+}
+
+function assertBetaStillDrained(label) {
+    const active = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    for (const [source, routes, agents] of [
+        ['active generation', active.generation.routing.routes, active.generation.agents],
+        ['mutable sources', readRouting().routes, readAgents()],
+    ]) {
+        assert.equal(routes.beta.draining, true, `${label}: ${source} keeps beta draining`);
+        assert.deepEqual(routes.beta.drainOwner, BETA_OWNER, `${label}: ${source} keeps the drain owner`);
+        assert.equal(routes.beta.hostPort, undefined, `${label}: ${source} grants beta no target`);
+        assert.equal(agents['beta-container'].instanceId, 'beta-instance', `${label}: ${source} keeps the predecessor identity`);
+    }
+}
+
+function writeWithdrawnCandidate(agents) {
+    writeJson(path.join(ploinkyDir, 'agents.json'), agents);
+    writeJson(path.join(ploinkyDir, 'routing.json'), reopenedRouting(43999));
+}
+
+const WITHDRAWN_REFUSALS = [
+    {
+        label: 'a live manifest change',
+        code: 'EDGE_PREPARATION_SOURCE_CHANGED',
+        candidate: () => rotatedBetaAgents(),
+        afterWrite: () => writeJson(path.join(repoDir, 'beta', 'manifest.json'), { about: 'changed after preparation' }),
+    },
+    {
+        label: 'a lifecycle binding change',
+        code: 'EDGE_PREPARATION_SOURCE_CHANGED',
+        candidate: () => rotatedBetaAgents({ instanceId: 'beta-unprepared-instance' }),
+    },
+    {
+        label: 'a stale expected generation',
+        code: 'EDGE_GENERATION_RACE',
+        candidate: () => rotatedBetaAgents(),
+        applyOptions: (drained) => ({ expectedGeneration: drained.generation }),
+    },
+];
+
+for (const refusal of WITHDRAWN_REFUSALS) {
+    test(`B1 a withdrawn commit refused for ${refusal.label} restores the drained predecessor`, async () => {
+        resetWorkspace({ publicationState: 'ready' });
+        const drained = drainBeta();
+        const candidate = refusal.candidate();
+        const prepared = prepareWithdrawn(rotatedBetaAgents());
+        const predecessorBytes = mutableSourceBytes();
+        writeWithdrawnCandidate(candidate);
+        refusal.afterWrite?.();
+        assert.throws(() => edge.applyEdgeRoutingGeneration({
+            workspaceRoot: workspace,
+            reason: 'b1-withdrawn-refusal',
+            preparationLease: prepared.preparationLease,
+            ...(refusal.applyOptions ? refusal.applyOptions(drained) : {}),
+        }), { code: refusal.code });
+        assert.deepEqual(mutableSourceBytes(), predecessorBytes, 'the refusal restores the drained predecessor bytes');
+        assert.deepEqual(activeSelector(), drained);
+        assertBetaStillDrained('after the refusal');
+
+        // The lifecycle cleanup aborts the lease; nothing publishes the candidate.
+        // The unrelated merge also applies a changed manifest, which is a
+        // separate pending source change the next withdrawal would refuse.
+        edge.abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: workspace });
+        assert.deepEqual(mutableSourceBytes(), predecessorBytes);
+        await routingFile.mergeRoutingConfig((current) => current, { reason: 'b1-unrelated-merge' });
+        assert.equal(activeSelector().state, 'active');
+        assertBetaStillDrained('after an unrelated merge');
+        const { writes } = withdraw([{ containerName: 'gamma-container', mode: 'remove' }]);
+        assert.deepEqual(writes.map((entry) => [entry.before.state, entry.after.state]), [['active', 'active']],
+            'the next withdrawal stays scoped');
+        assertBetaStillDrained('after the next withdrawal');
+    });
+}
+
+test('B1 a coordinated merge holding a withdrawn lease refused for a manifest change restores the predecessor', async () => {
+    resetWorkspace({ publicationState: 'ready' });
+    const drained = drainBeta();
+    const prepared = prepareWithdrawn(rotatedBetaAgents());
+    const predecessorBytes = mutableSourceBytes();
+    writeJson(path.join(repoDir, 'beta', 'manifest.json'), { about: 'changed during readiness' });
+    await assert.rejects(routingFile.mergeRoutingConfig((current) => {
+        writeJson(path.join(ploinkyDir, 'agents.json'), rotatedBetaAgents());
+        current.routes.beta = reopenedRouting(43998).routes.beta;
+        return current;
+    }, { reason: 'b1-withdrawn-merge', preparationLease: prepared.preparationLease }), { code: 'EDGE_PREPARATION_SOURCE_CHANGED' });
+    assert.deepEqual(mutableSourceBytes(), predecessorBytes);
+    assert.deepEqual(activeSelector(), drained);
+    assertBetaStillDrained('after the refused merge');
+    edge.abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: workspace });
+    await routingFile.mergeRoutingConfig((current) => current, { reason: 'b1-unrelated-merge' });
+    assertBetaStillDrained('after an unrelated merge');
+});
+
+test('B1 aborting a withdrawn lease after a failure before its commit drops the written candidate', async () => {
+    resetWorkspace({ publicationState: 'ready' });
+    const drained = drainBeta();
+    const prepared = prepareWithdrawn(rotatedBetaAgents());
+    const predecessorBytes = mutableSourceBytes();
+    await assert.rejects(routingFile.mergeRoutingConfig(() => {
+        writeJson(path.join(ploinkyDir, 'agents.json'), rotatedBetaAgents());
+        throw Object.assign(new Error('mutator failed after its registry write'), { code: 'INJECTED' });
+    }, { reason: 'b1-withdrawn-merge', preparationLease: prepared.preparationLease }), { code: 'INJECTED' });
+    assert.equal(readAgents()['beta-container'].instanceId, 'beta-next-instance', 'the failed merge left its write');
+    edge.abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: workspace });
+    assert.deepEqual(mutableSourceBytes(), predecessorBytes, 'the abort restores the drained predecessor bytes');
+    assert.deepEqual(activeSelector(), drained);
+    await routingFile.mergeRoutingConfig((current) => current, { reason: 'b1-unrelated-merge' });
+    assertBetaStillDrained('after an unrelated merge');
+});
+
 test('m2 an operator drain over an automatic drain clears its owner and blocks automatic restarts', () => {
     resetWorkspace({ publicationState: 'ready' });
     drainBeta();
@@ -712,4 +829,26 @@ test('m2 an operator drain over an automatic drain clears its owner and blocks a
         [{ containerName: 'beta-container', mode: 'drain', drainOwner: BETA_OWNER }],
         'EDGE_WITHDRAWAL_OPERATOR_DRAIN',
     );
+});
+
+test('B1 retiring an abandoned withdrawn lease drops the candidate its stopped owner wrote', async () => {
+    const { spawnSync } = await import('node:child_process');
+    resetWorkspace({ publicationState: 'ready' });
+    const drained = drainBeta();
+    prepareWithdrawn(rotatedBetaAgents());
+    const predecessorBytes = mutableSourceBytes();
+    writeWithdrawnCandidate(rotatedBetaAgents());
+    // The owner stopped inside its coordinated apply, after its writes.
+    const stoppedPid = spawnSync(process.execPath, ['-e', '']).pid;
+    const leaseFile = path.join(edgeDir, 'preparation-lease.json');
+    assert.ok(fs.existsSync(leaseFile), 'the fixture names the live preparation lease file');
+    fs.writeFileSync(leaseFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(leaseFile, 'utf8')), pid: stoppedPid }));
+    const retired = edge.retireAbandonedActiveBoundPreparation({ workspaceRoot: workspace });
+    assert.equal(retired.retired, true);
+    assert.equal(retired.mode, 'withdrawn');
+    assert.equal(edge.readEdgeRoutingPreparationOwner({ workspaceRoot: workspace }), null);
+    assert.deepEqual(mutableSourceBytes(), predecessorBytes, 'the retirement restores the drained predecessor bytes');
+    assert.deepEqual(activeSelector(), drained);
+    await routingFile.mergeRoutingConfig((current) => current, { reason: 'b1-unrelated-merge' });
+    assertBetaStillDrained('after an unrelated merge');
 });
