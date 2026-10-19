@@ -115,8 +115,19 @@ test('an unresolvable no-wait dependency is reported unavailable and the rest st
     assert.deepEqual(refs(result.before), ['nw/present']);
     assert.deepEqual(result.after, []);
     assert.equal(result.unavailable.length, 1);
-    assert.equal(result.unavailable[0].ref, 'absentRepo/absent no-wait');
+    assert.equal(result.unavailable[0].ref, 'absentRepo/absent');
     assert.match(result.unavailable[0].error, /absentRepo\/absent/);
+});
+
+test('an unresolvable no-wait object directive is reported by its agent, with no alias or no-wait tokens', () => {
+    writeManifest('nwo', 'root', {
+        enable: [
+            { agent: 'absentRepo/gone', noWait: true, alias: 'later' },
+            'unqualified-absent as other no-wait',
+        ],
+    });
+    const result = plan('nwo/root');
+    assert.deepEqual(result.unavailable.map((entry) => entry.ref), ['absentRepo/gone', 'unqualified-absent']);
 });
 
 test('an unresolvable blocking dependency fails the plan with the Marketplace code', () => {

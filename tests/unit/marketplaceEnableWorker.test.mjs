@@ -435,6 +435,77 @@ test('a background dependency is skipped when a dependency of its own failed, an
     marketplaceTestables.marketplaceDependencyStatus.clear();
 });
 
+test('a pending no-wait dependency does not hold the next enable, whose route-lease fence still runs against the current generation', async () => {
+    // Models the exact-generation fence: a request captures the generation on arrival and
+    // beforeEnable fails if a publication happened since. Each worker publishes a new generation
+    // when it finishes, as an enable does.
+    let generation = 1;
+    const fenceFromArrival = () => {
+        const captured = generation;
+        return () => {
+            if (generation !== captured) throw Object.assign(new Error('Refresh Marketplace before retrying'), { code: 'EDGE_GENERATION_CHANGED' });
+        };
+    };
+    const calls = [];
+    const ends = [];
+    let releaseLiveKit;
+    const liveKitGate = new Promise((resolve) => { releaseLiveKit = resolve; });
+    const runEnableWorker = async (input) => {
+        calls.push(input.agentRef);
+        if (input.agentRef === 'webmeet/liveKitServerAgent') await liveKitGate;
+        generation += 1;
+        ends.push(input.agentRef);
+        return { containerName: input.agentRef };
+    };
+    const secondLiveKit = { ref: 'webmeet/second', agentRef: 'webmeet/second', alias: '', profile: '', dependsOn: [] };
+
+    const a = await enableMarketplaceAgent({ agentRef: 'webmeet/webmeetAgent', mode: 'global' }, {
+        beforeEnable: fenceFromArrival(),
+        runEnableWorker,
+        planDependencies: () => ({ ...noPlan, after: [liveKit, secondLiveKit] }),
+    });
+    assert.deepEqual(a.dependencies.map((entry) => entry.status), ['queued', 'queued']);
+    assert.deepEqual(calls, ['webmeet/webmeetAgent', 'webmeet/liveKitServerAgent']);
+
+    // The LiveKit enable is still pending. The next enable passes its fence and runs to completion.
+    const pending = Symbol('pending');
+    const b = enableMarketplaceAgent({ agentRef: 'repo/other', mode: 'global' }, {
+        beforeEnable: fenceFromArrival(),
+        runEnableWorker,
+        planDependencies: () => noPlan,
+    });
+    const settled = await Promise.race([b, new Promise((resolve) => setTimeout(() => resolve(pending), 100))]);
+    assert.notEqual(settled, pending, 'the next enable must not wait for the pending no-wait dependency');
+    assert.deepEqual(settled.result, { containerName: 'repo/other' });
+    assert.deepEqual(marketplaceTestables.marketplaceDependencyStatus.get('webmeet/liveKitServerAgent'), { status: 'queued' });
+    assert.deepEqual(marketplaceTestables.marketplaceDependencyStatus.get('webmeet/second'), { status: 'queued' });
+    assert.equal(calls.includes('webmeet/second'), false, 'a later no-wait dependency waits for the one before it');
+
+    // After the dependency publishes, the chain continues in order and records its outcomes.
+    releaseLiveKit();
+    await marketplaceTestables.marketplaceEnableQueueIdle();
+    assert.deepEqual(calls, ['webmeet/webmeetAgent', 'webmeet/liveKitServerAgent', 'repo/other', 'webmeet/second']);
+    assert.deepEqual(ends, ['webmeet/webmeetAgent', 'repo/other', 'webmeet/liveKitServerAgent', 'webmeet/second']);
+    assert.equal(marketplaceTestables.marketplaceDependencyStatus.size, 0, 'finished dependencies leave no pending status');
+
+    // The fence still rejects a request that arrived before a publication it did not see.
+    const stale = fenceFromArrival();
+    generation += 1;
+    await assert.rejects(enableMarketplaceAgent({ agentRef: 'repo/late', mode: 'global' }, {
+        beforeEnable: stale,
+        runEnableWorker,
+        planDependencies: () => noPlan,
+    }), { code: 'EDGE_GENERATION_CHANGED' });
+    assert.equal(calls.includes('repo/late'), false);
+    // And a request arriving after the last publication succeeds.
+    const c = await enableMarketplaceAgent({ agentRef: 'repo/after', mode: 'global' }, {
+        beforeEnable: fenceFromArrival(),
+        runEnableWorker,
+        planDependencies: () => noPlan,
+    });
+    assert.deepEqual(c.result, { containerName: 'repo/after' });
+});
+
 test('a failing blocking dependency rejects the request with no root call and lists what was already enabled', async () => {
     const calls = [];
     await assert.rejects(enableMarketplaceAgent({ agentRef: 'repo/root' }, {
@@ -515,7 +586,10 @@ test('the enable worker request skips an existing dependency record and keeps th
     assert.deepEqual(found.at(-1), { spec: 'repo/dep', alias: 'primary' });
 });
 
-test('concurrent dependency enables serialize on the workspace lease and create exactly one record', async () => {
+// This models the ifMissing logic only: `underLease` is a local serializer standing in for the
+// workspace mutation lease. The real worker runs find+enable inside
+// withHeldOrAcquiredWorkspaceMutationLease (marketplaceEnableWorkerThread.js), which this test does not exercise.
+test('ifMissing creates exactly one record when concurrent dependency enables are serialized (lease modeled, not real)', async () => {
     const { runMarketplaceEnableRequest } = await import('../../cli/server/marketplaceEnableWorkerThread.js');
     const store = new Set();
     let creations = 0;

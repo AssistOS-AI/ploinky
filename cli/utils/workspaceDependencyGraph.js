@@ -443,6 +443,18 @@ function topologicallyGroupDependencyGraph(graph) {
     return waves;
 }
 
+// The agent reference of a dependency directive, without its no-wait and alias
+// tokens, so an object directive is reported by its agent rather than as text.
+function unavailableDependencyRef(rawDependency, parentRef) {
+    try {
+        const parsed = parseEnableDirective(rawDependency);
+        const qualified = qualifyEnableSpecForRepo(parsed?.spec, String(parentRef || '').split('/')[0]);
+        return (parseManifestDependencyRef(qualified) || 'unknown').slice(0, 256);
+    } catch (_) {
+        return 'unknown';
+    }
+}
+
 // The manifest dependencies a Marketplace enable of `agentRef` must also enable,
 // resolved by the same graph `start` uses (record-aware SSO gate, a blocking
 // edge winning over a duplicate no-wait edge, fail-closed resolution). Blocking
@@ -471,8 +483,8 @@ function planManifestDependencyEnables(agentRef, {
             rootAlias: alias,
             rootProfile: profile,
             onCycle,
-            onUnresolvedNoWait: ({ rawDependency, message }) => {
-                plan.unavailable.push({ ref: String(rawDependency).trim().slice(0, 256), error: message.slice(0, 512) });
+            onUnresolvedNoWait: ({ rawDependency, parentRef, message }) => {
+                plan.unavailable.push({ ref: unavailableDependencyRef(rawDependency, parentRef), error: message.slice(0, 512) });
             },
         });
     } catch (error) {

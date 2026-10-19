@@ -376,12 +376,21 @@ function dependencyWork(item) {
 
 const dependencyStatusOf = (outcome) => (outcome?.status === 'already-enabled' ? 'already-enabled' : 'enabled');
 
-// No-wait dependencies run after the request returned, one workspace mutation
-// at a time behind the enables already queued. They never take the route lease
-// and no outcome can fail the root; every outcome is logged and recorded.
+// No-wait dependencies run after the request returned, in order, on their own
+// chain. They must not share marketplaceEnableQueue: each enable commits the
+// route lease against the exact active generation, and a task queued ahead of
+// the next enable publishes a newer generation first, so that enable would fail
+// EDGE_GENERATION_CHANGED. The worker's workspace mutation lease serializes
+// them against every other mutation instead; a later enable's worker waits for
+// it up to the lease wait (ten minutes by default) and then fails with
+// workspace_mutation_lock_timeout, which is the price of not blocking the
+// request. They never take the route lease and no outcome can fail the root;
+// every outcome is logged and recorded.
+let marketplaceAfterQueue = Promise.resolve();
+
 function queueAfterDependencies(rootRef, items, runEnableWorker) {
     for (const item of items) recordMarketplaceDependencyStatus(item.ref, 'queued');
-    marketplaceEnableQueue = marketplaceEnableQueue.then(async () => {
+    marketplaceAfterQueue = marketplaceAfterQueue.then(async () => {
         const failed = new Set();
         for (const item of items) {
             if ((item.dependsOn || []).some((ref) => failed.has(ref))) {
@@ -1050,8 +1059,13 @@ export const __testables = {
     marketplaceDependencyStatus,
     // Resolves once every enable queued so far, including background dependencies, has finished.
     marketplaceEnableQueueIdle: async () => {
-        let tail;
-        do { tail = marketplaceEnableQueue; await tail; } while (tail !== marketplaceEnableQueue);
+        let enableTail;
+        let afterTail;
+        do {
+            enableTail = marketplaceEnableQueue;
+            afterTail = marketplaceAfterQueue;
+            await Promise.all([enableTail, afterTail]);
+        } while (enableTail !== marketplaceEnableQueue || afterTail !== marketplaceAfterQueue);
     },
     MARKETPLACE_INVENTORY_SKIPPED,
     buildMarketplaceState,
