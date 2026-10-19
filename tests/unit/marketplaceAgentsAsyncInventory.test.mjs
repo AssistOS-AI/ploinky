@@ -15,7 +15,7 @@ const previousPath = process.env.PATH;
 process.chdir(workspace);
 process.env.PLOINKY_MASTER_KEY = '5'.repeat(64);
 fs.mkdirSync('.ploinky');
-const { handleMarketplaceRoutes, __testables } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
+const { handleMarketplaceRoutes, enableMarketplaceAgent, __testables } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
 const { collectLiveAgentContainersAsync, collectLiveAgentContainersStrictAsync } = await import('../../cli/sandbox/docker/containerRegistry.js');
 const { authService, SSO_AUTH_COOKIE_NAME } = await import('../../cli/server/authHandlers/shared.js');
 const { mintBrowserCsrfToken } = await import('../../cli/server/browserMutationSecurity.js');
@@ -242,6 +242,106 @@ test('POST enable builds its response through the inventory collector too', asyn
         collector.releaseAll();
         await request.done;
     }
+});
+
+// A Marketplace enable with manifest dependencies, driven through the handler with injected planner and workers.
+const livekitItem = { ref: 'webmeet/liveKitServerAgent', agentRef: 'webmeet/liveKitServerAgent', alias: '', profile: '', dependsOn: [] };
+function enableThroughHandler({ plan, runEnableWorker, ...routeOptions }) {
+    return startRequest({
+        method: 'POST',
+        body: { action: 'enable_agent', agentRef: 'webmeet/webmeetAgent', mode: 'global' },
+        agentListOptions: { summaries, liveContainers: [runningWorker] },
+        enableAgentAction: (body) => enableMarketplaceAgent(body, { runEnableWorker, planDependencies: () => plan }),
+        ...routeOptions,
+    });
+}
+
+test('POST enable returns the dependency outcomes next to the root result', async () => {
+    const calls = [];
+    const request = enableThroughHandler({
+        plan: { before: [], after: [livekitItem], unavailable: [] },
+        runEnableWorker: async (input) => { calls.push(input); return { containerName: 'runtime' }; },
+    });
+    await request.res.ended;
+    await request.done;
+    assert.equal(request.res.status, 200, JSON.stringify(request.res.body));
+    assert.deepEqual(request.res.body.result, { containerName: 'runtime' });
+    assert.deepEqual(request.res.body.dependencies, [{ ref: 'webmeet/liveKitServerAgent', phase: 'after', status: 'queued' }]);
+    await __testables.marketplaceEnableQueueIdle();
+    assert.deepEqual(calls.map(call => call.agentRef), ['webmeet/webmeetAgent', 'webmeet/liveKitServerAgent']);
+});
+
+test('POST enable with an unresolvable blocking dependency answers 422 and runs no worker', async () => {
+    let workers = 0;
+    const request = enableThroughHandler({
+        plan: undefined,
+        runEnableWorker: async () => { workers += 1; return {}; },
+        enableAgentAction: (body) => enableMarketplaceAgent(body, {
+            runEnableWorker: async () => { workers += 1; return {}; },
+            planDependencies: () => { throw Object.assign(new Error('[manifest enable] Failed to resolve dependency'), { code: 'MARKETPLACE_DEPENDENCY_UNAVAILABLE' }); },
+        }),
+    });
+    await request.res.ended;
+    await request.done;
+    assert.equal(request.res.status, 422);
+    assert.equal(request.res.body.error, 'MARKETPLACE_DEPENDENCY_UNAVAILABLE');
+    assert.equal(workers, 0);
+});
+
+test('POST enable whose blocking dependency fails reports the dependencies already enabled and never runs the root', async () => {
+    const calls = [];
+    const request = enableThroughHandler({
+        plan: { before: [{ ...livekitItem, ref: 'repo/good', agentRef: 'repo/good' }, { ...livekitItem, ref: 'repo/bad', agentRef: 'repo/bad' }], after: [], unavailable: [] },
+        runEnableWorker: async (input) => {
+            calls.push(input.agentRef);
+            if (input.agentRef === 'repo/bad') throw Object.assign(new Error('refused'), { code: 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED' });
+            return {};
+        },
+    });
+    await request.res.ended;
+    await request.done;
+    assert.equal(request.res.status, 422);
+    assert.equal(request.res.body.error, 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED');
+    assert.deepEqual(request.res.body.dependencies, [
+        { ref: 'repo/good', phase: 'before', status: 'enabled' },
+        { ref: 'repo/bad', phase: 'before', status: 'failed', error: 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED' },
+    ]);
+    assert.deepEqual(calls, ['repo/good', 'repo/bad']);
+});
+
+test('a background dependency failure shows in the agent listing until the agent is disabled', async () => {
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+        const request = enableThroughHandler({
+            plan: { before: [], after: [{ ...livekitItem, ref: 'repo/worker', agentRef: 'repo/worker' }], unavailable: [] },
+            runEnableWorker: async (input) => {
+                if (input.ifMissing) throw Object.assign(new Error('pull failed in /private/secret/path'), { code: 'PLOINKY_DEPENDENCY_PULL' });
+                return {};
+            },
+        });
+        await request.res.ended;
+        await request.done;
+        await __testables.marketplaceEnableQueueIdle();
+    } finally {
+        console.warn = originalWarn;
+    }
+    const listing = get({ agentListOptions: { summaries, liveContainers: [runningWorker] } });
+    await listing.res.ended;
+    await listing.done;
+    const row = listing.res.body.marketplace.agents.find(agent => agent.ref === 'repo/worker');
+    assert.deepEqual(row.dependencyStatus, { status: 'failed', code: 'PLOINKY_DEPENDENCY_PULL' });
+    assert.equal(JSON.stringify(row).includes('/private/secret'), false, 'the listing carries a code, never the error text');
+
+    const disable = startRequest({
+        method: 'POST',
+        body: { action: 'disable_agent', agentRef: 'repo/worker' },
+        agentListOptions: { summaries, liveContainers: [runningWorker] },
+        disableAgentAction: async () => ({ status: 'removed' }),
+    });
+    await disable.res.ended;
+    await disable.done;
+    assert.equal(disable.res.body.marketplace.agents.find(agent => agent.ref === 'repo/worker').dependencyStatus, undefined);
 });
 
 test('5 concurrent GETs run at most 2 inventories at once and each collects for itself', async () => {

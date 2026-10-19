@@ -1,6 +1,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 
 import { enableAgent } from '../utils/agents.js';
+import { findEnabledDirectiveRecord } from '../utils/runtime/bootstrapManifest.js';
 import { findHardwareOutcome } from '../sandbox/hardwareLimits/errors.mjs';
 import { withHeldOrAcquiredWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 
@@ -23,10 +24,31 @@ export function serializeError(error, depth = 0) {
     return serialized;
 }
 
-if (parentPort) try {
-    const agentRef = boundedString(workerData?.agentRef);
-    const mode = boundedString(workerData?.mode);
+// One enable request, run under the workspace lease its caller holds. A
+// dependency request (`ifMissing`) looks for its record here, under the lease,
+// so two concurrent enables can never create the same instance twice.
+export async function runMarketplaceEnableRequest(data, {
+    enableAgent: enable = enableAgent,
+    findEnabledRecord = findEnabledDirectiveRecord,
+} = {}) {
+    const agentRef = boundedString(data?.agentRef);
+    const mode = boundedString(data?.mode);
+    const alias = boundedString(data?.alias);
+    const profile = boundedString(data?.profile);
     const repoName = agentRef.split('/')[0] || '';
+    if (data?.ifMissing === true && findEnabledRecord({ spec: agentRef, alias })) {
+        return { status: 'already-enabled' };
+    }
+    const args = [
+        agentRef,
+        mode || undefined,
+        mode === 'devel' ? repoName : undefined,
+    ];
+    if (alias || profile) args.push(alias || undefined, undefined, { profile: profile || undefined });
+    return enable(...args);
+}
+
+if (parentPort) try {
     const operationId = boundedString(workerData?.operationId);
     if (!/^[0-9a-f-]{36}$/.test(operationId)) throw new Error('Marketplace worker operation identity is missing.');
     // An abnormal thread end cannot prove its subprocesses or installer
@@ -35,11 +57,7 @@ if (parentPort) try {
         operation: `marketplace-enable:${operationId}`, requireQuiescenceOnOwnerDeath: true,
     }, (lease) => {
         parentPort?.postMessage({ type: 'workspace-lease', token: lease.token });
-        return enableAgent(
-            agentRef,
-            mode || undefined,
-            mode === 'devel' ? repoName : undefined,
-        );
+        return runMarketplaceEnableRequest(workerData);
     });
     parentPort?.postMessage({ ok: true, result });
 } catch (error) {

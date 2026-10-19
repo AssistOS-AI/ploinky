@@ -31,7 +31,7 @@ test('a no-wait manifest dependency is planned after the root, as the WebMeet ma
     writeManifest('wm', 'liveKitServerAgent');
     const result = plan('wm/webmeetAgent');
     assert.deepEqual(result.before, []);
-    assert.deepEqual(result.after, [{ ref: 'wm/liveKitServerAgent', agentRef: 'wm/liveKitServerAgent', alias: '', profile: '' }]);
+    assert.deepEqual(result.after, [{ ref: 'wm/liveKitServerAgent', agentRef: 'wm/liveKitServerAgent', alias: '', profile: '', dependsOn: [] }]);
     assert.deepEqual(result.unavailable, []);
 });
 
@@ -42,6 +42,15 @@ test('blocking dependencies are planned deepest first and the root is never list
     const result = plan('chain/root');
     assert.deepEqual(refs(result.before), ['chain/leaf', 'chain/mid']);
     assert.deepEqual(result.after, []);
+});
+
+test('a planned dependency names the planned agents it depends on', () => {
+    writeManifest('dep', 'root', { enable: ['first no-wait'] });
+    writeManifest('dep', 'first', { enable: ['second'] });
+    writeManifest('dep', 'second');
+    const result = plan('dep/root');
+    assert.deepEqual(refs(result.after), ['dep/second', 'dep/first']);
+    assert.deepEqual(result.after.map((entry) => entry.dependsOn), [[], ['dep/second']]);
 });
 
 test('a dependency cycle terminates and each agent is listed once', () => {
@@ -153,4 +162,27 @@ test('the planner reads only: it mutates neither the registry it is given nor th
     assert.deepEqual(refs(result.after), ['ro/late']);
     assert.equal(JSON.stringify(registry), snapshot);
     assert.equal(fs.existsSync(path.join(tempDir, '.ploinky', 'agents.json')), false);
+});
+
+test('Marketplace enable plans from the workspace manifests by default and enables dependencies in plan order', async () => {
+    writeManifest('wired', 'webmeetAgent', { enable: ['guard', 'liveKitServerAgent no-wait'] });
+    writeManifest('wired', 'guard');
+    writeManifest('wired', 'liveKitServerAgent');
+    const { enableMarketplaceAgent, __testables } = await import(
+        new URL(`../../cli/server/authHandlers/marketplaceRoutes.js?test=${Date.now()}`, import.meta.url).href
+    );
+    const calls = [];
+    const result = await enableMarketplaceAgent({ agentRef: 'wired/webmeetAgent', mode: 'global' }, {
+        runEnableWorker: async (input) => { calls.push(input); return {}; },
+    });
+    await __testables.marketplaceEnableQueueIdle();
+    assert.deepEqual(calls, [
+        { agentRef: 'wired/guard', mode: '', ifMissing: true },
+        { agentRef: 'wired/webmeetAgent', mode: 'global' },
+        { agentRef: 'wired/liveKitServerAgent', mode: '', ifMissing: true },
+    ]);
+    assert.deepEqual(result.dependencies.map((entry) => [entry.ref, entry.phase, entry.status]), [
+        ['wired/guard', 'before', 'enabled'],
+        ['wired/liveKitServerAgent', 'after', 'queued'],
+    ]);
 });

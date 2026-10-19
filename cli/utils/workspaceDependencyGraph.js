@@ -498,6 +498,7 @@ function planManifestDependencyEnables(agentRef, {
                 agentRef: node.enableSpec,
                 alias: node.alias,
                 profile: node.profileExplicit ? node.profile : '',
+                dependsOn: [...node.dependencies].map((dependencyId) => graph.nodes.get(dependencyId)?.agentRef).filter(Boolean),
             });
         }
     }
