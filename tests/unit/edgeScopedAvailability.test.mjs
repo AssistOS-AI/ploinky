@@ -246,3 +246,127 @@ test('A4 control: a forged predecessor selector cannot lend readiness', () => {
     });
     assert.equal(forged.selector.publicationState, 'reconciling');
 });
+
+const { resolveEdgeRoutePlan } = await import('../../cli/server/edgeRoutePlan.js');
+
+function routePlanFor(host, url = '/beta/') {
+    return resolveEdgeRoutePlan({ req: { method: 'GET', url, headers: { host } }, listener: 'public' });
+}
+
+test('A9 inactive edge denials carry Retry-After: 2 and other denials do not', () => {
+    resetWorkspace({ publicationState: 'reconciling' });
+    const hostInactive = routePlanFor(PUBLIC_HOST, '/');
+    assert.equal(hostInactive.status, 503);
+    assert.equal(hostInactive.code, 'HOST_SELECTOR_INACTIVE');
+    assert.equal(hostInactive.retryAfterSeconds, 2);
+
+    const unknownHost = routePlanFor('unknown.example.com', '/');
+    assert.equal(unknownHost.status, 421);
+    assert.equal(unknownHost.retryAfterSeconds, undefined);
+
+    edge.inactivateEdgeRoutingGeneration('a9-inactive', { workspaceRoot: workspace });
+    const inactive = routePlanFor('127.0.0.1:18080');
+    assert.equal(inactive.status, 503);
+    assert.equal(inactive.code, 'EDGE_GENERATION_INACTIVE');
+    assert.equal(inactive.retryAfterSeconds, 2);
+
+    // RoutingServer's deny branch is the only writer of these plan denials; it
+    // turns the plan's retry hint into the response header.
+    const routerSource = fs.readFileSync(new URL('../../cli/server/RoutingServer.js', import.meta.url), 'utf8');
+    const denyBranch = routerSource.slice(
+        routerSource.indexOf('if (!routePlan.ok && !controlMiss) {'),
+        routerSource.indexOf('const parsedUrl = routePlan.ok && routePlan.parsedUrl'),
+    );
+    assert.match(denyBranch, /'Retry-After': String\(routePlan\.retryAfterSeconds\)/);
+});
+
+const { dispatchAgentStartupAfterRouterSurfaces } = await import('../../cli/server/agentStartupDispatch.js');
+
+class RecordingResponse {
+    constructor() {
+        this.statusCode = 0;
+        this.headers = {};
+        this.body = '';
+    }
+
+    writeHead(statusCode, headers = {}) {
+        this.statusCode = statusCode;
+        this.headers = { ...headers };
+    }
+
+    end(body = '') {
+        this.body += body === undefined ? '' : String(body);
+    }
+}
+
+function drainBetaInSources({ keepPort = false } = {}) {
+    const routing = readRouting();
+    routing.routes.beta = { ...routing.routes.beta, draining: true };
+    if (!keepPort) delete routing.routes.beta.hostPort;
+    writeJson(path.join(ploinkyDir, 'routing.json'), routing);
+    edge.applyEdgeRoutingGeneration({ workspaceRoot: workspace, reason: 'd5-drain-fixture', publicationState: 'ready' });
+}
+
+test('D5 a draining route answers 503 AGENT_ROUTE_DRAINING with Retry-After only after authorization', async () => {
+    for (const keepPort of [false, true]) {
+        resetWorkspace({ publicationState: 'ready' });
+        drainBetaInSources({ keepPort });
+        const req = { method: 'GET', url: '/beta/api/items', headers: { host: '127.0.0.1:18080', accept: 'application/json' } };
+        const routePlan = resolveEdgeRoutePlan({ req, listener: 'public' });
+        assert.equal(routePlan.ok, true);
+        assert.equal(routePlan.kind, 'agent-root-pending');
+        assert.equal(routePlan.target, null, 'a drained route never targets its predecessor, even with a kept port');
+        assert.equal(routePlan.diagnosticCategory, 'AGENT_ROUTE_DRAINING');
+
+        const denied = new RecordingResponse();
+        let accessChecks = 0;
+        assert.equal(await dispatchAgentStartupAfterRouterSurfaces({
+            req,
+            res: denied,
+            parsedUrl: routePlan.parsedUrl,
+            routePlan,
+            ensureRouteAccess: async (_req, res) => {
+                accessChecks += 1;
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end('{"error":"authentication_required"}');
+                return { ok: false };
+            },
+        }), true);
+        assert.equal(accessChecks, 1);
+        assert.equal(denied.statusCode, 401, 'an unauthorized caller learns nothing about the drain');
+
+        const allowed = new RecordingResponse();
+        assert.equal(await dispatchAgentStartupAfterRouterSurfaces({
+            req,
+            res: allowed,
+            parsedUrl: routePlan.parsedUrl,
+            routePlan,
+            ensureRouteAccess: async () => ({ ok: true }),
+        }), true);
+        assert.equal(allowed.statusCode, 503);
+        assert.equal(allowed.headers['Retry-After'], '2');
+        assert.deepEqual(JSON.parse(allowed.body), { error: 'AGENT_ROUTE_DRAINING' });
+    }
+});
+
+test('D5 other transports, relays and dependency selection keep excluding a draining route', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    drainBetaInSources();
+    const ws = resolveEdgeRoutePlan({
+        req: { method: 'GET', url: '/beta/socket', headers: { host: '127.0.0.1:18080' } },
+        listener: 'public',
+        transport: 'websocket',
+    });
+    assert.equal(ws.ok, false);
+    assert.equal(ws.status, 503);
+    assert.equal(ws.code, 'AGENT_ROUTE_DRAINING');
+    assert.equal(ws.retryAfterSeconds, 2);
+
+    const relay = routePlanFor('127.0.0.1:18080', '/base-agent-additional-server/beta/7000/');
+    assert.equal(relay.ok, false);
+    assert.equal(relay.code, 'AGENT_OWNER_INACTIVE');
+
+    const other = routePlanFor('127.0.0.1:18080', '/gamma/');
+    assert.equal(other.kind, 'agent-root');
+    assert.equal(other.target.hostPort, 43103);
+});

@@ -1,4 +1,5 @@
 import { hardwareStartupResultFromCompiled } from './hardwareAvailability.mjs';
+import { EDGE_DENIAL_RETRY_AFTER_SECONDS } from './edgeRetryAfter.js';
 import {
     buildAgentStartupDocumentResponse,
     buildAgentStartupProbeResponse,
@@ -8,19 +9,28 @@ import {
 
 const AGENT_ROOT_KINDS = new Set(['agent-root', 'agent-root-pending']);
 
-function writeJson(res, statusCode, body) {
+function writeJson(res, statusCode, body, extraHeaders = {}) {
     const data = Buffer.from(JSON.stringify(body));
     res.writeHead(statusCode, {
         'Content-Type': 'application/json',
         'Content-Length': data.length,
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
+        ...extraHeaders,
     });
     res.end(data);
 }
 
 function writeInactive(res) {
     writeJson(res, 503, { error: 'TARGET_INACTIVE' });
+}
+
+// A drained agent is replaced or restarted shortly; the rest of the edge keeps
+// serving. Answer only after route authorization, with a retry hint.
+function writeDraining(res) {
+    writeJson(res, 503, { error: 'AGENT_ROUTE_DRAINING' }, {
+        'Retry-After': String(EDGE_DENIAL_RETRY_AFTER_SECONDS),
+    });
 }
 
 function writeGenerationChanged(req, res, requestKind) {
@@ -201,7 +211,8 @@ export async function dispatchAgentStartupRequest({
     });
 
     const hardwareEntry = pending ? routePlan.hardwareAvailability || null : null;
-    if (!requestKind) {
+    const draining = pending && !hardwareEntry && routePlan.diagnosticCategory === 'AGENT_ROUTE_DRAINING';
+    if (!requestKind && !draining) {
         if (!pending) return false;
         if (hardwareEntry) writeHardwareUnavailable(res, hardwareEntry);
         else writeInactive(res);
@@ -222,6 +233,11 @@ export async function dispatchAgentStartupRequest({
 
     if (!pending) {
         await writeReady(req, res, routePlan, requestKind, { commitPlan, readMutationState });
+        return true;
+    }
+
+    if (draining) {
+        writeDraining(res);
         return true;
     }
 

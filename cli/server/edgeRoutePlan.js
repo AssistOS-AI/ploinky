@@ -37,7 +37,7 @@ const AGENT_ROOT_AUTH_SUPPORT_PATHS = new Set([
 ]);
 
 function deny(status, code, details = {}) {
-    return { matched: false, ok: false, status, code, ...details };
+    return { matched: false, ok: false, status, code, ...retryableDenial(status, code), ...details };
 }
 
 function normalizedHostName(value) {
@@ -615,7 +615,7 @@ function agentRootPlan({
     lease,
     transport = 'http',
 }) {
-    const agent = resolveAgentPath(pathname, routes, selectedRoot);
+    const agent = resolveAgentPath(pathname, routes, selectedRoot) || (selectedRoot ? null : resolveDrainingAgentPath(pathname, routes));
     if (!agent) return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
     const policy = snapshotPolicy(snapshot);
     if (!policy) return deny(503, 'POLICY_GENERATION_INVALID', {
@@ -673,21 +673,21 @@ function agentRootPlan({
             hardwareAvailability,
         };
     }
-    const hostPort = Number(agent.route?.hostPort || 0);
+    // A draining route is resolved only to answer it after authorization with a
+    // retryable unavailable state. It never yields its predecessor's target,
+    // even when an operator drain kept the predecessor's port.
+    const draining = agent.route?.draining === true;
+    const hostPort = draining ? 0 : Number(agent.route?.hostPort || 0);
     if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+        const pendingCode = draining ? 'AGENT_ROUTE_DRAINING' : 'TARGET_INACTIVE';
         if (transport !== 'http') {
-            return deny(503, 'TARGET_INACTIVE', {
-                matched: true,
-                lease,
-                hostSelection,
-                decision,
-            });
+            return deny(503, pendingCode, { matched: true, lease, hostSelection, decision });
         }
         return {
             ...common,
             kind: 'agent-root-pending',
             target: null,
-            diagnosticCategory: 'TARGET_INACTIVE',
+            diagnosticCategory: pendingCode,
         };
     }
     return {
@@ -993,3 +993,40 @@ export default {
     normalizeExactHost,
     resolveEdgeRoutePlan,
 };
+
+// Imported here, not with the others above, so the reviewed Router reference
+// lines of this file keep their positions.
+import { EDGE_DENIAL_RETRY_AFTER_SECONDS } from './edgeRetryAfter.js';
+
+// Denials that end when the next generation activates or a drained agent's
+// replacement is committed. Clients may retry them after a short delay.
+const RETRYABLE_DENIAL_CODES = new Set([
+    'EDGE_GENERATION_INACTIVE',
+    'HOST_SELECTOR_INACTIVE',
+    'AGENT_ROUTE_DRAINING',
+]);
+
+function retryableDenial(status, code) {
+    return status === 503 && RETRYABLE_DENIAL_CODES.has(code)
+        ? { retryAfterSeconds: EDGE_DENIAL_RETRY_AFTER_SECONDS }
+        : {};
+}
+
+// The agent-root plan of a route withdrawn by a drain. Only a direct
+// `/<routeKey>/...` path resolves it; selected-root hosts already deny a
+// draining root, and relay, dependency and MCP selection keep excluding it.
+function resolveDrainingAgentPath(pathname, routes) {
+    const segments = String(pathname || '').split('/').filter(Boolean);
+    if (!segments.length) return null;
+    let routeKey = '';
+    try { routeKey = decodeURIComponent(segments[0]); } catch (_) { return null; }
+    const route = Object.hasOwn(routes || {}, routeKey) ? routes[routeKey] : null;
+    if (!route || route.disabled || route.draining !== true) return null;
+    const firstSlash = pathname.indexOf('/', 1);
+    return {
+        routeKey,
+        route,
+        canonicalPath: pathname,
+        upstreamPath: firstSlash < 0 ? '/' : pathname.slice(firstSlash) || '/',
+    };
+}

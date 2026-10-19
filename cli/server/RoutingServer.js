@@ -433,7 +433,7 @@ async function processRequest(req, res) {
             res,
             routePlan.status || 404,
             { error: routePlan.code || 'route_denied' },
-            { 'Cache-Control': 'no-store', ...proofHeaders },
+            { 'Cache-Control': 'no-store', ...proofHeaders, ...(routePlan.retryAfterSeconds ? { 'Retry-After': String(routePlan.retryAfterSeconds) } : {}) },
         );
         return;
     }
