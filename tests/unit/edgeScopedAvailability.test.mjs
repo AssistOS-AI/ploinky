@@ -705,6 +705,9 @@ test('D4 a withdrawn preparation requires drained routes and may change only the
 // no later apply can publish the refused identity.
 function mutableSourceBytes() {
     const files = edgeStateBytes().files;
+    for (const file of [path.join(policyDir, 'policy-state.json'), path.join(edgeDir, 'desired.json')]) {
+        files[file] = fs.readFileSync(file).toString('base64');
+    }
     return Object.fromEntries(Object.entries(files).filter(([file]) => !file.endsWith('current.json')));
 }
 
@@ -766,17 +769,22 @@ for (const refusal of WITHDRAWN_REFUSALS) {
         assertBetaStillDrained('after the refusal');
 
         // The lifecycle cleanup aborts the lease; nothing publishes the candidate.
-        // The unrelated merge also applies a changed manifest, which is a
-        // separate pending source change the next withdrawal would refuse.
         edge.abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: workspace });
         assert.deepEqual(mutableSourceBytes(), predecessorBytes);
+        const nextWithdrawal = () => {
+            const { writes } = withdraw([{ containerName: 'gamma-container', mode: 'remove' }]);
+            assert.deepEqual(writes.map((entry) => [entry.before.state, entry.after.state]), [['active', 'active']],
+                'the next withdrawal stays scoped');
+            assertBetaStillDrained('after the next withdrawal');
+        };
+        // A pending manifest edit is its own unapplied source change that any
+        // withdrawal refuses until an apply publishes it, independently of B1;
+        // only that case applies it before the withdrawal.
+        if (!refusal.afterWrite) nextWithdrawal();
         await routingFile.mergeRoutingConfig((current) => current, { reason: 'b1-unrelated-merge' });
         assert.equal(activeSelector().state, 'active');
         assertBetaStillDrained('after an unrelated merge');
-        const { writes } = withdraw([{ containerName: 'gamma-container', mode: 'remove' }]);
-        assert.deepEqual(writes.map((entry) => [entry.before.state, entry.after.state]), [['active', 'active']],
-            'the next withdrawal stays scoped');
-        assertBetaStillDrained('after the next withdrawal');
+        if (refusal.afterWrite) nextWithdrawal();
     });
 }
 

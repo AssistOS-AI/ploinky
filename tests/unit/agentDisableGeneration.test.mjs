@@ -772,6 +772,28 @@ test('m4 a disable refuses at once when the outstanding preparation owner proces
     assert.deepEqual(abandoned.registry(), { old_container: agentRecord('old') });
     assert.equal(abandoned.events.some((event) => event.startsWith('retire:') || event.startsWith('withdraw:')), false);
 
+    // A repository uninstall disables through the batch entry under its held lease.
+    const batch = lifecycleHarness({
+        initialRegistry: { old_container: agentRecord('old') },
+        initialRouting: singleAgentRouting(38300),
+        preparationOwners: [{ pid: 424243, mode: 'withdrawn' }],
+    });
+    let batchHolds = 0;
+    await assert.rejects(
+        agents.disableAgentContainers(['old_container'], {
+            ...batch.dependencies,
+            workspaceLeaseWaitMs: 1500,
+            disableBusyRetryMs: 50,
+            preparationOwnerStopped: () => true,
+            withWorkspaceLeaseImpl: async (_options, callback) => { batchHolds += 1; return callback(); },
+            withNetworkLockImpl: async (callback) => callback(),
+        }),
+        (error) => error.code === 'EDGE_PREPARATION_BUSY' && error.preparationOwnerStopped === true,
+    );
+    assert.equal(batchHolds, 1);
+    assert.deepEqual(batch.registry(), { old_container: agentRecord('old') });
+    assert.equal(batch.events.some((event) => event.startsWith('retire:') || event.startsWith('withdraw:')), false);
+
     const { edgePreparationOwnerStopped } = await import('../../cli/sandbox/edgeGeneration.js');
     assert.equal(edgePreparationOwnerStopped({ pid: process.pid }), false, 'this process is never a stopped owner');
     assert.equal(edgePreparationOwnerStopped({ pid: 1 }), false, 'a live process, even one it cannot signal, is not stopped');
