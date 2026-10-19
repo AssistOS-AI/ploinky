@@ -788,7 +788,11 @@ test('host-bound browser token admits any enabled agent on an SSO Marketplace ho
         : null);
 
     // A fresh snapshot per case: the derived routes are cached per generation object.
-    const planFor = (surfaces) => {
+    // The compiled route defaults a real compile gives these none-mode agents under the SSO static
+    // agent: authenticated. The hand-built snapshot must carry them, since admission reads them.
+    const authenticatedDefaults = Object.fromEntries(['explorer', 'webAdmin', 'guestAgent']
+        .map((routeKey) => [routeKey, { access: 'authenticated', routeKey, source: 'routeDefault' }]));
+    const planFor = (surfaces, routeDefaults = authenticatedDefaults) => {
         const base = createRoutePlan();
         const snapshot = {
             ...base.snapshot,
@@ -797,7 +801,7 @@ test('host-bound browser token admits any enabled agent on an SSO Marketplace ho
                 surfaces: { 'explorer.localhost': surfaces },
                 agentMcpRoutes: { 'explorer.localhost': ['explorer', 'webAdmin'] },
                 dependencyHttpRoutes: { 'explorer.localhost': [] },
-                policy: { entries: [], routeDefaults: {} },
+                policy: { entries: [], routeDefaults },
             },
         };
         return createRoutePlan({
@@ -836,6 +840,12 @@ test('host-bound browser token admits any enabled agent on an SSO Marketplace ho
         assert.equal(denied.status, 503, surfaces.join());
         assert.equal(denied.body.error, 'browser_mutation_route_denied', surfaces.join());
     }
+
+    // A none-mode agent whose compiled default is guest (the static agent is not authenticated) stays outside the closure.
+    const guestDefault = { guestAgent: { access: 'guest', routeKey: 'guestAgent', source: 'routeDefault' } };
+    const widened = await mint(planFor(['agent-mcp', 'marketplace-ui'], { ...authenticatedDefaults, ...guestDefault }), 'guestAgent');
+    assert.equal(widened.status, 503);
+    assert.equal(widened.body.error, 'browser_mutation_route_denied');
 });
 
 test('browser token GET denies a generation change during session resolution before issuing proofs or cookies', async (t) => {

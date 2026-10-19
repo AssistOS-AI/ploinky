@@ -1226,6 +1226,61 @@ test('only an SSO host root extends the closure, and a none-mode target there is
     }
 });
 
+function setFixtureStaticAgent(fixture, name) {
+    const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    routing.static.agent = name;
+    fs.writeFileSync(routingFile, JSON.stringify(routing, null, 2));
+}
+
+const GUEST_BY_DESIGN_MANIFEST = {
+    guest: true,
+    routerAccess: {
+        httpRoutes: [{ path: '/roomLoader.html', access: 'guest', guestScope: 'room:join', guestScopeParam: 'roomId' }],
+    },
+};
+
+test('a none-mode target joins the SSO Marketplace host only when its route default is authenticated; a guest-by-design agent always joins', (t) => {
+    // The static agent is not the host root and is not SSO, so a none-mode
+    // target's route default is guest and it must stay off the host.
+    const fixture = marketplaceClosureFixture(t, { unrelatedAuth: { mode: 'none' } });
+    addFixtureAgent(fixture, 'plain', { auth: { mode: 'none' } });
+    addFixtureAgent(fixture, 'guestful', { manifest: GUEST_BY_DESIGN_MANIFEST, auth: { mode: 'guest' } });
+    setFixtureStaticAgent(fixture, 'plain');
+    const { generation } = applyMarketplaceClosure(fixture, 'marketplace-static-not-root');
+    assert.equal(generation.compiled.policy.routeDefaults.unrelated.access, 'guest');
+    assert.equal(generation.compiled.policy.routeDefaults.plain.access, 'guest');
+    assert.equal(generation.compiled.policy.routeDefaults.guestful.access, 'guest');
+    assert.equal(resolveAuthContextForRouteKey('alpha', { snapshot: generation }).mode, 'sso');
+
+    for (const host of ['market.example.test', 'ui-only.example.test']) {
+        const routes = edgeApi.edgeHostServiceRoutes(generation, host);
+        assert.deepEqual(plain(routes.dependencyHttpRoutes), [
+            { path: '/guestful/roomLoader.html', routeKey: 'guestful' },
+        ], host);
+    }
+    // MCP admission is added only with the agent-mcp surface; the base is unchanged.
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes(generation, 'market.example.test').agentMcpRoutes], ['alpha', 'guestful']);
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes(generation, 'mcp-only.example.test').agentMcpRoutes], ['alpha']);
+
+    // The Router agrees: the none-mode target is not routed on this host, the guest-by-design one is.
+    const plan = (method, url) => resolveEdgeRoutePlan({
+        req: { method, url, headers: { host: 'market.example.test' } },
+        listener: 'public',
+    });
+    assert.equal(plan('POST', '/unrelated/mcp').routeKey, 'alpha');
+    assert.equal(plan('POST', '/plain/mcp').routeKey, 'alpha');
+    assert.equal(plan('POST', '/guestful/mcp').routeKey, 'guestful');
+    assert.equal(plan('GET', '/guestful/roomLoader.html').routeKey, 'guestful');
+
+    // When the static agent is the SSO root, the same none-mode target is authenticated and joins.
+    const sso = marketplaceClosureFixture(t, { unrelatedAuth: { mode: 'none' } });
+    addFixtureAgent(sso, 'guestful', { manifest: GUEST_BY_DESIGN_MANIFEST, auth: null });
+    const ssoGeneration = applyMarketplaceClosure(sso, 'marketplace-static-is-root').generation;
+    assert.equal(ssoGeneration.compiled.policy.routeDefaults.unrelated.access, 'authenticated');
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes(ssoGeneration, 'market.example.test').agentMcpRoutes], ['alpha', 'guestful', 'unrelated']);
+});
+
 test('Router plans route an enabled agent on a Marketplace host and leave it with the host root elsewhere', (t) => {
     const fixture = marketplaceClosureFixture(t);
     applyMarketplaceClosure(fixture, 'marketplace-route-plan');

@@ -1158,12 +1158,25 @@ function hostServiceRoutesOf(generation, hostname) {
         .trim().toLowerCase();
     if (rootMode !== 'sso') return base;
 
+    const policyEntries = compiled.policy?.entries;
+    const routeDefaults = compiled.policy?.routeDefaults;
+    if (!Array.isArray(policyEntries)) throw edgeError('compiled policy entries are missing');
+    if (!routeDefaults || typeof routeDefaults !== 'object') throw edgeError('compiled route defaults are missing');
+    // An enabled agent joins only when reaching it on this host cannot widen
+    // admission: its compiled route default is authenticated, or its own
+    // resolved mode is explicitly guest (guest-by-design agents such as
+    // WebMeet). A none-mode agent inherits its default from the workspace
+    // static agent, which need not be the host root; if that default is guest
+    // the agent stays off this host, as before the extension.
     const enabled = new Set();
     for (const [routeKey, route] of Object.entries(routes)) {
-        if (route && !route.disabled && routeAgentRecord(route, generation.agents)) enabled.add(routeKey);
+        if (!route || route.disabled) continue;
+        const record = routeAgentRecord(route, generation.agents);
+        if (!record) continue;
+        const ownMode = String(resolveAgentAuthPolicy(generation.manifests?.[routeKey], record.auth).mode || '')
+            .trim().toLowerCase();
+        if (routeDefaults[routeKey]?.access === 'authenticated' || ownMode === 'guest') enabled.add(routeKey);
     }
-    const policyEntries = compiled.policy?.entries;
-    if (!Array.isArray(policyEntries)) throw edgeError('compiled policy entries are missing');
     const dependencyEntries = new Map();
     const admit = ({ path: routePath, routeKey }) => {
         if (typeof routePath !== 'string' || typeof routeKey !== 'string') {
@@ -1187,8 +1200,8 @@ function hostServiceRoutesOf(generation, hostname) {
 // The Router surfaces a host admits for agents other than its selected root.
 // The compiled closure (the root's manifest `enable` graph) is the base. On a
 // host that exposes the Marketplace UI with an SSO root, every enabled agent
-// of this generation joins it, because Marketplace enables agents outside the
-// root manifest. Like edgeWebchatTargets this is derived from the generation's
+// of this generation whose route default is authenticated or whose own mode is
+// guest joins it, because Marketplace enables agents outside the root manifest. Like edgeWebchatTargets this is derived from the generation's
 // own digest-bound sources and never stored, so generations written before it
 // load and verify byte for byte; any failure yields the compiled base only.
 export function edgeHostServiceRoutes(generation, host) {
