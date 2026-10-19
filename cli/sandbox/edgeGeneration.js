@@ -41,6 +41,10 @@ import {
     sweepHardwareAvailabilityTemps,
 } from './hardwareAvailabilityStore.mjs';
 import { resolveEffectiveHardwareAvailability } from '../server/hardwareAvailabilityResolver.mjs';
+import {
+    edgeGenerationPublicationSemantics,
+    publicationSemanticDigest,
+} from '../../ploinky-box/cloudflared/publicationPlan.mjs';
 
 export const EDGE_GENERATION_SCHEMA_VERSION = 1;
 export const EDGE_TOPOLOGY_CONTAINER_DIR = '/run/ploinky-edge-topology';
@@ -2600,6 +2604,65 @@ function selectPublicationState(compiled, requested) {
     return state;
 }
 
+function generationPublicationSemanticDigest(generation) {
+    try {
+        return publicationSemanticDigest(edgeGenerationPublicationSemantics(generation));
+    } catch (_) {
+        return null;
+    }
+}
+
+// A lifecycle generation keeps its active predecessor's ready publication only
+// when both publish exactly the same Cloudflare semantics: mode, management,
+// tunnel, origin, secret handles and every host's compiled route key. The
+// predecessor's ready proof then still describes the path from each hostname
+// to this Router; anything else is proven again by cloudflared from reconciling.
+function carriedPublicationState(predecessor, predecessorState, candidate) {
+    if (predecessorState !== 'ready' || !predecessor || !candidate) return null;
+    if (candidate.compiled?.publication?.mode !== 'cloudflare'
+        || predecessor.compiled?.publication?.mode !== 'cloudflare') return null;
+    const before = generationPublicationSemanticDigest(predecessor);
+    const after = generationPublicationSemanticDigest(candidate);
+    return before && after && before === after ? 'ready' : null;
+}
+
+function verifiedSelectorDocument(value) {
+    if (!isPlainObject(value)) return null;
+    const { selectorDigest, ...body } = value;
+    return selectorDigest === sourceDigest(Buffer.from(stableStringify(body))) ? value : null;
+}
+
+// The active predecessor whose publication a lifecycle apply may carry
+// forward. The caller names the selector it read before the inactivation it
+// performed under this same apply-lock hold; that inactive selector must still
+// be selected and name the predecessor, so no older or foreign generation can
+// lend its readiness.
+function publicationCarrySource(paths, selectedBefore, options) {
+    if (options.publicationState !== undefined) return null;
+    const predecessor = verifiedSelectorDocument(options.publicationPredecessor);
+    if (predecessor?.state !== 'active' || !predecessor.generation) return null;
+    let publicationState = null;
+    if (selectedBefore?.state === 'active') {
+        if (selectedBefore.generation !== predecessor.generation
+            || selectedBefore.activationId !== predecessor.activationId) return null;
+        publicationState = selectedBefore.publicationState;
+    } else {
+        const inactivation = verifiedSelectorDocument(options.publicationPredecessorInactivation);
+        if (selectedBefore?.state !== 'inactive'
+            || inactivation?.state !== 'inactive'
+            || selectedBefore.activationId !== inactivation.activationId
+            || selectedBefore.selectorDigest !== inactivation.selectorDigest
+            || selectedBefore.previousGeneration !== predecessor.generation) return null;
+        publicationState = predecessor.publicationState;
+    }
+    if (publicationState !== 'ready') return null;
+    try {
+        return { generation: loadGenerationById(paths, predecessor.generation), publicationState };
+    } catch (_) {
+        return null;
+    }
+}
+
 function topologyMedia(desired, mediaHostPort) {
     if (!desired.media && !desired.turn) return undefined;
     const media = {};
@@ -2707,7 +2770,9 @@ export function applyEdgeRoutingGeneration(options = {}) {
             preparing: options.createPreparationLease === true,
         });
         assertPreparedSelectorStillSelected(paths, preparationLease);
-        const previous = selectedPreviousGeneration(paths, readSelector(paths));
+        const selectedBefore = readSelector(paths);
+        const previous = selectedPreviousGeneration(paths, selectedBefore);
+        const carrySource = publicationCarrySource(paths, selectedBefore, options);
         transactionStarted = true;
         let inactiveSelector = inactivateEdgeRoutingGeneration(options.reason || 'coordinated-apply', {
             ...options,
@@ -2744,7 +2809,12 @@ export function applyEdgeRoutingGeneration(options = {}) {
         if (recaptured.generation !== captured.generation) {
             throw edgeError('edge routing sources changed during coordinated apply', 'EDGE_GENERATION_RACE');
         }
-        const publicationState = selectPublicationState(captured.compiled, options.publicationState);
+        const publicationState = selectPublicationState(
+            captured.compiled,
+            options.publicationState === undefined
+                ? carriedPublicationState(carrySource?.generation, carrySource?.publicationState, captured) || undefined
+                : options.publicationState,
+        );
         const selector = sealSelector({
             schemaVersion: EDGE_GENERATION_SCHEMA_VERSION,
             state: 'active',
@@ -3063,7 +3133,16 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
         if (recaptured.generation !== captured.generation) {
             throw edgeError('edge routing sources changed during additive commit', 'EDGE_GENERATION_RACE');
         }
-        const publicationState = selectPublicationState(captured.compiled, options.publicationState);
+        const publicationState = selectPublicationState(
+            captured.compiled,
+            options.publicationState === undefined
+                ? carriedPublicationState(
+                    loadGenerationById(paths, lease.predecessorGeneration),
+                    readSelector(paths)?.publicationState,
+                    captured,
+                ) || undefined
+                : options.publicationState,
+        );
         const generation = capturedGenerationSnapshot(captured, publicationState);
         const selector = sealSelector({
             schemaVersion: EDGE_GENERATION_SCHEMA_VERSION,

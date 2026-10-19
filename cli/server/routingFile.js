@@ -5,12 +5,28 @@ import { ROUTING_FILE } from '../utils/config.js';
 import {
     captureEdgeRoutingCandidateGeneration,
     inactivateEdgeRoutingGeneration,
+    readEdgeRoutingSelection,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 
 const ROUTING_LOCK_FILE = `${ROUTING_FILE}.lock`;
+
+// Inactivate before mutating candidate bytes, remembering the active selector
+// this hold withdrew. The apply may then carry that predecessor's ready
+// publication forward when the publication semantics are unchanged.
+function inactivateForRoutingMutation(reason, applyLockCapability) {
+    let predecessor = null;
+    try {
+        const { selector } = readEdgeRoutingSelection();
+        if (selector?.state === 'active') predecessor = selector;
+    } catch (_) {}
+    const inactivation = inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
+    return predecessor
+        ? { publicationPredecessor: predecessor, publicationPredecessorInactivation: inactivation }
+        : {};
+}
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -82,9 +98,7 @@ function writeRoutingConfig(config, {
             // the prepared apply can validate it. The preparation phase has
             // already installed the fail-closed selector; ordinary unprepared
             // writes still have to inactivate before mutating candidate bytes.
-            if (!preparationLease) {
-                inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
-            }
+            const carry = preparationLease ? {} : inactivateForRoutingMutation(reason, applyLockCapability);
             write();
             const expectedGeneration = captureEdgeRoutingCandidateGeneration({ applyLockCapability });
             applyEdgeRoutingGeneration({
@@ -93,6 +107,7 @@ function writeRoutingConfig(config, {
                 expectedGeneration,
                 applyLockCapability,
                 networkLifecycleCapability: liveNetworkLifecycleCapability,
+                ...carry,
             });
             return target;
         }, { preparationLease })
@@ -114,9 +129,9 @@ async function mergeRoutingConfig(mutator, {
         if (coordinate && typeof validateActiveGeneration === 'function') {
             validatedActiveGeneration = await validateActiveGeneration();
         }
-        if (coordinate && !preparationLease) {
-            inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
-        }
+        const carry = coordinate && !preparationLease
+            ? inactivateForRoutingMutation(reason, applyLockCapability)
+            : {};
         const current = readRoutingConfig();
         // The live capabilities a coordinated merge holds are handed to the mutator so that a ready
         // publication can retire its availability entries under them. A `coordinate: false` merge holds
@@ -128,20 +143,21 @@ async function mergeRoutingConfig(mutator, {
                 ? await captureExpectedGeneration(validatedActiveGeneration)
                 : captureEdgeRoutingCandidateGeneration({ applyLockCapability }))
             : undefined;
-        return { next, expectedGeneration };
+        return { next, expectedGeneration, carry };
     };
     const mergeUnderRoutingLock = async (liveNetworkLifecycleCapability = undefined) => {
         const release = await acquireRoutingLock();
         try {
             if (!coordinate) return (await mutate()).next;
             return await withEdgeGenerationApplyLock(async (applyLockCapability) => {
-                const { next, expectedGeneration } = await mutate(applyLockCapability, liveNetworkLifecycleCapability);
+                const { next, expectedGeneration, carry } = await mutate(applyLockCapability, liveNetworkLifecycleCapability);
                 await applyEdgeRoutingGeneration({
                     reason,
                     preparationLease,
                     expectedGeneration,
                     applyLockCapability,
                     networkLifecycleCapability: liveNetworkLifecycleCapability,
+                    ...carry,
                 });
                 return next;
             }, { preparationLease });

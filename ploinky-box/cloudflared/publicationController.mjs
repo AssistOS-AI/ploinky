@@ -9,6 +9,7 @@ import {
     materializeManagedCloudflarePublicationPlan,
     normalizeCloudflarePublicationDesired,
     publicationDigest,
+    publicationSemanticDigest,
     publicPlanSummary,
     redactCloudflareText,
     stablePublicationJson,
@@ -51,6 +52,17 @@ function freezeClone(value) {
         return Object.freeze(entry);
     };
     return freeze(cloned);
+}
+
+// The semantic key identifies what one ready proof covers independent of the
+// edge generation. An input the semantic digest rejects has no key and can
+// only take the full reconcile.
+function semanticKeyOf(input) {
+    try {
+        return publicationSemanticDigest(input || {});
+    } catch (_) {
+        return null;
+    }
 }
 
 function sameScope(left, right) {
@@ -400,6 +412,7 @@ export class CloudflarePublicationController {
         this.restartTimer = null;
         this.activeRequest = null;
         this.readyRequestKey = null;
+        this.readySemanticKey = null;
         this.stopped = false;
     }
 
@@ -634,9 +647,11 @@ export class CloudflarePublicationController {
         const captured = cloneJson(input);
         let requestKey = null;
         let requestPlan = null;
+        let semanticKey = null;
         try {
             requestPlan = normalizeCloudflarePublicationDesired(captured);
             requestKey = `${requestPlan.configurationGeneration}:${requestPlan.desiredDigest}`;
+            semanticKey = semanticKeyOf(captured);
         } catch (_) {}
         if (requestKey && this.activeRequest?.key === requestKey) {
             this.safeAudit('cloudflare-reconcile-coalesced', {
@@ -702,6 +717,88 @@ export class CloudflarePublicationController {
             run.then(clearActiveRequest, clearActiveRequest);
             return run;
         }
+        // A generation that changes only agent routes keeps the semantics its
+        // predecessor's ready proof covered: same tunnel, hosts, origin, secret
+        // handles and per-host route keys. The connector keeps running, so the
+        // selected generation is adopted instead of stopped and re-proved. The
+        // request revision stays untouched so the running connector's exit
+        // handler remains current for the adopted generation.
+        if (requestKey
+            && semanticKey
+            && selectedGenerationRequest
+            && typeof this.routeCoordinator.adopt === 'function'
+            && this.readySemanticKey === semanticKey
+            && this.state.state === 'ready'
+            && this.state.connectorState === 'running'
+            && this.connector.isRunning()) {
+            const stillReady = () => this.readySemanticKey === semanticKey
+                && this.state.state === 'ready'
+                && this.state.connectorState === 'running'
+                && this.connector.isRunning();
+            const run = this.queue.then(async () => {
+                if (!stillReady()) {
+                    throw new CloudflarePublicationError(
+                        'Ready Cloudflare publication changed before route adoption',
+                        {
+                            code: 'CLOUDFLARE_RECONCILIATION_SUPERSEDED',
+                            operation: 'adopt-ready-route',
+                            retryable: true,
+                        },
+                    );
+                }
+                try {
+                    await this.routeCoordinator.adopt({
+                        configurationGeneration: requestPlan.configurationGeneration,
+                        semanticDigest: semanticKey,
+                    });
+                    if (captured.selectedPublicationState !== 'ready') {
+                        await this.routeCoordinator.commit({
+                            mode: 'cloudflare',
+                            publicationState: 'ready',
+                            configurationGeneration: requestPlan.configurationGeneration,
+                            hosts: asHostObject(requestPlan),
+                            canonicalScheme: 'https',
+                        });
+                    }
+                    if (!stillReady()) {
+                        await this.inactivate(captured, 'cloudflared-exit-during-route-adoption');
+                        throw new CloudflarePublicationError(
+                            'Cloudflare connector changed during ready route adoption',
+                            {
+                                code: 'CLOUDFLARED_NOT_RUNNING',
+                                operation: 'adopt-ready-route',
+                                retryable: true,
+                            },
+                        );
+                    }
+                } catch (error) {
+                    // A refused or failed adoption may already have inactivated
+                    // the selected generation. The ready proof no longer covers
+                    // what is selected, so a retry must take the full reconcile.
+                    if (this.readySemanticKey === semanticKey) this.readySemanticKey = null;
+                    throw error;
+                }
+                this.lastInput = cloneJson(captured);
+                this.readyRequestKey = requestKey;
+                await this.transition({
+                    configurationGeneration: requestPlan.configurationGeneration,
+                    reconciliation: { desiredDigest: requestPlan.desiredDigest, phase: 'ready' },
+                });
+                this.safeAudit('cloudflare-reconcile-adopted-ready', {
+                    configurationGeneration: String(captured.configurationGeneration || ''),
+                    reason,
+                    semantic: true,
+                });
+                return this.getStatus();
+            });
+            this.queue = run.catch(() => {});
+            this.activeRequest = { key: requestKey, promise: run };
+            const clearActiveRequest = () => {
+                if (this.activeRequest?.promise === run) this.activeRequest = null;
+            };
+            run.then(clearActiveRequest, clearActiveRequest);
+            return run;
+        }
         const revision = ++this.requestRevision;
         this.currentAbort?.abort(new CloudflarePublicationError('Cloudflare publication was superseded', {
             code: 'CLOUDFLARE_RECONCILIATION_SUPERSEDED',
@@ -714,6 +811,7 @@ export class CloudflarePublicationController {
             (status) => {
                 if (requestKey && status?.state === 'ready' && status?.connectorState === 'running') {
                     this.readyRequestKey = requestKey;
+                    this.readySemanticKey = semanticKey;
                 }
                 if (this.activeRequest?.promise === run) this.activeRequest = null;
             },
@@ -743,10 +841,11 @@ export class CloudflarePublicationController {
         }
     }
 
-    async inactivate(input, reason) {
-        await this.routeCoordinator.inactivate({
+    async inactivate(input, reason, { semanticDigest } = {}) {
+        return this.routeCoordinator.inactivate({
             configurationGeneration: String(input?.configurationGeneration || ''),
             reason,
+            ...(semanticDigest ? { semanticDigest } : {}),
         });
     }
 
@@ -760,6 +859,7 @@ export class CloudflarePublicationController {
         let reconciledIngress = null;
         let currentJournal = null;
         let adoptSelectedLocalState = false;
+        this.readySemanticKey = null;
         await this.connector.stop('reconcile');
         try {
             plan = normalizeCloudflarePublicationDesired(input);
@@ -1195,6 +1295,7 @@ export class CloudflarePublicationController {
                 retry: null,
             });
         } catch (error) {
+            this.readySemanticKey = null;
             await this.connector.stop('error');
             try {
                 await this.inactivate(input, 'cloudflare-error');
@@ -1436,6 +1537,7 @@ export class CloudflarePublicationController {
     async onConnectorExit(event, revision) {
         if (event?.intentional || this.stopped || revision !== this.requestRevision) return;
         if (this.state.state !== 'ready') return;
+        this.readySemanticKey = null;
         let plan = null;
         try { plan = normalizeCloudflarePublicationDesired(this.lastInput); } catch (_) {}
         if (plan?.tunnelManagement === 'ploinky-managed') {
@@ -1451,7 +1553,25 @@ export class CloudflarePublicationController {
             } catch (_) {}
         }
         try {
-            await this.inactivate(this.lastInput, 'cloudflared-exit');
+            // The CLI may have activated a newer generation with the same
+            // publication semantics that this controller has not adopted yet.
+            // The dead connector served it too, so it is inactivated as well.
+            const exitedInput = this.lastInput;
+            const inactivated = await this.inactivate(exitedInput, 'cloudflared-exit', {
+                semanticDigest: semanticKeyOf(exitedInput),
+            });
+            const inactivatedGeneration = String(inactivated?.generation || '');
+            if (/^sha256:[a-f0-9]{64}$/.test(inactivatedGeneration)
+                && inactivatedGeneration !== exitedInput?.configurationGeneration
+                && this.lastInput === exitedInput
+                && revision === this.requestRevision) {
+                // The bounded restart must name the generation the coordinator
+                // now holds as its captured inactive candidate.
+                this.lastInput = {
+                    ...exitedInput,
+                    configurationGeneration: inactivatedGeneration,
+                };
+            }
             if (plan?.management === 'connector-only') {
                 this.assertCurrent(revision);
                 await this.routeCoordinator.commit({
@@ -1528,6 +1648,8 @@ export class CloudflarePublicationController {
         this.currentAbort?.abort(new Error('Cloudflare publication controller stopped'));
         clearTimeout(this.restartTimer);
         this.restartTimer = null;
+        this.readySemanticKey = null;
+        const stopSemanticDigest = semanticKeyOf(this.lastInput);
         await this.connector.stop('controller-stop');
         // A stop withdraws only the exact active generation this controller
         // serves. An already inactive selector keeps the failure or lifecycle
@@ -1537,6 +1659,7 @@ export class CloudflarePublicationController {
             await this.routeCoordinator.inactivateForStop({
                 configurationGeneration: String(this.lastInput?.configurationGeneration || ''),
                 reason: 'cloudflare-controller-stop',
+                ...(stopSemanticDigest ? { semanticDigest: stopSemanticDigest } : {}),
             });
         } catch (_) {}
         await this.transition({

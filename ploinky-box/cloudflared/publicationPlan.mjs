@@ -421,6 +421,52 @@ export function normalizeCloudflarePublicationDesired({
     });
 }
 
+const SEMANTIC_PLACEHOLDER_GENERATION = `sha256:${'0'.repeat(64)}`;
+
+function normalizeHostRouteKeys(value) {
+    if (value === undefined || value === null) return {};
+    if (!isPlainObject(value)) {
+        fail('Cloudflare host route keys must be an object keyed by exact hostname', {
+            code: 'CLOUDFLARE_CONFIGURATION_INVALID',
+            operation: 'validate',
+        });
+    }
+    return Object.fromEntries(Object.entries(value)
+        .map(([hostname, routeKey]) => [normalizePublicHostname(hostname), String(routeKey || '')])
+        .sort(([left], [right]) => left.localeCompare(right)));
+}
+
+/**
+ * The publication semantics one ready proof covers: everything the plan digest
+ * binds except the configuration generation, plus the secret handles and each
+ * public host's compiled route key. A generation that changes only agent routes
+ * keeps this digest, so its predecessor's ready proof still describes the path
+ * from every hostname through this connector to this Router. The CLI and the
+ * cloudflared controller both use this one function.
+ */
+export function publicationSemanticDigest({ cloudflare, hosts, hostRouteKeys } = {}) {
+    const plan = normalizeCloudflarePublicationDesired({
+        configurationGeneration: SEMANTIC_PLACEHOLDER_GENERATION,
+        cloudflare,
+        hosts,
+    });
+    const { configurationGeneration: _generation, desiredDigest: _digest, ...semantic } = plan;
+    return publicationDigest({
+        ...semantic,
+        hostRouteKeys: normalizeHostRouteKeys(hostRouteKeys),
+    });
+}
+
+/** The semantic publication inputs of one verified edge routing generation. */
+export function edgeGenerationPublicationSemantics(generation) {
+    return {
+        cloudflare: generation?.desired?.cloudflare,
+        hosts: generation?.desired?.hosts,
+        hostRouteKeys: Object.fromEntries(Object.entries(generation?.compiled?.hosts || {})
+            .map(([hostname, record]) => [hostname, String(record?.routeKey || '')])),
+    };
+}
+
 export function materializeManagedCloudflarePublicationPlan(plan, tunnelId) {
     if (plan?.management !== 'api-managed' || plan?.tunnelManagement !== 'ploinky-managed') {
         return plan;

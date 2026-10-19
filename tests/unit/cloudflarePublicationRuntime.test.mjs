@@ -11,6 +11,7 @@ import {
     releaseExactPublicationLease,
     startCloudflarePublicationRuntime,
 } from '../../ploinky-box/cloudflared/runtime.mjs';
+import * as publicationPlan from '../../ploinky-box/cloudflared/publicationPlan.mjs';
 import * as edgeGeneration from '../../cli/sandbox/edgeGeneration.js';
 import { makeWorld } from './hardwareAvailabilityResolverFixtures.mjs';
 
@@ -1203,3 +1204,313 @@ for (const damage of ['corrupted in place', 'deleted']) {
         await runtime.stop();
     });
 }
+
+// Semantic adoption: a route-only generation keeps the publication semantics of
+// the ready proof, so the coordinator rebinds to it without touching the selector.
+const SEMANTIC_GENERATION_ONE = `sha256:${'1'.repeat(64)}`;
+const SEMANTIC_GENERATION_TWO = `sha256:${'2'.repeat(64)}`;
+const SEMANTIC_GENERATION_THREE = `sha256:${'3'.repeat(64)}`;
+
+function semanticGeneration({ hostname = 'office.example.test', routeKey = 'route-office' } = {}) {
+    return {
+        desired: {
+            cloudflare: {
+                accountId: 'account_123',
+                zoneId: 'zone_123',
+                tunnelId: 'tunnel_123',
+                tunnelTokenSecret: 'publication/cloudflare-connector',
+                apiTokenSecret: 'publication/cloudflare-api',
+            },
+            hosts: { [hostname]: { agent: 'repo/office' } },
+        },
+        compiled: { publication: { mode: 'cloudflare' }, hosts: { [hostname]: { routeKey } } },
+    };
+}
+
+function semanticDigestOf(generation) {
+    return publicationPlan.publicationSemanticDigest(
+        publicationPlan.edgeGenerationPublicationSemantics(generation),
+    );
+}
+
+function createSemanticEdge(initial) {
+    const state = { active: initial, inactivations: [], applies: [] };
+    const edgeOps = {
+        load() {
+            return structuredClone(state.active);
+        },
+        selection() { return { selector: { state: 'inactive' } }; },
+        inactivate(reason, options) {
+            state.inactivations.push({ reason, options: structuredClone(options) });
+            return { state: 'inactive', activationId: 'inactive-1', selectorDigest: 'digest' };
+        },
+        apply(options) {
+            state.applies.push(structuredClone(options));
+            return {
+                selector: {
+                    state: 'active',
+                    generation: options.expectedGeneration,
+                    activationId: 'activation-applied',
+                },
+                generation: structuredClone(state.active.generation),
+            };
+        },
+    };
+    return { state, edgeOps };
+}
+
+function activeOf(generation, generationId, activationId = 'activation-1') {
+    return {
+        selector: { state: 'active', generation: generationId, activationId, publicationState: 'ready' },
+        generation,
+    };
+}
+
+test('coordinator adopt() rebinds its captured generation without inactivating or applying', async () => {
+    const one = semanticGeneration();
+    const { state, edgeOps } = createSemanticEdge(activeOf(one, SEMANTIC_GENERATION_ONE));
+    const coordinator = createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps });
+    await coordinator.inactivate({ configurationGeneration: SEMANTIC_GENERATION_ONE, reason: 'initial' });
+    state.inactivations.length = 0;
+    const digest = semanticDigestOf(one);
+    state.active = activeOf(semanticGeneration(), SEMANTIC_GENERATION_TWO, 'activation-2');
+
+    const adopted = await coordinator.adopt({
+        configurationGeneration: SEMANTIC_GENERATION_TWO,
+        semanticDigest: digest,
+    });
+
+    assert.equal(adopted.selector.generation, SEMANTIC_GENERATION_TWO);
+    assert.deepEqual(state.inactivations, []);
+    assert.deepEqual(state.applies, []);
+    await coordinator.commit({
+        mode: 'cloudflare',
+        publicationState: 'ready',
+        configurationGeneration: SEMANTIC_GENERATION_TWO,
+        hosts: one.desired.hosts,
+    });
+    assert.equal(state.applies.length, 1);
+    assert.equal(state.applies[0].expectedGeneration, SEMANTIC_GENERATION_TWO);
+    await assert.rejects(() => coordinator.commit({
+        mode: 'cloudflare',
+        publicationState: 'ready',
+        configurationGeneration: SEMANTIC_GENERATION_ONE,
+        hosts: one.desired.hosts,
+    }), /outside its captured immutable generation/);
+});
+
+for (const [label, changed] of [
+    ['host', { hostname: 'meet.example.test', routeKey: 'route-office' }],
+    ['route key', { routeKey: 'route-other' }],
+]) {
+    test(`coordinator adopt() refuses a generation whose ${label} semantics changed`, async () => {
+        const one = semanticGeneration();
+        const { state, edgeOps } = createSemanticEdge(activeOf(
+            semanticGeneration(changed),
+            SEMANTIC_GENERATION_TWO,
+            'activation-2',
+        ));
+        const coordinator = createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps });
+        await assert.rejects(
+            () => coordinator.adopt({
+                configurationGeneration: SEMANTIC_GENERATION_TWO,
+                semanticDigest: semanticDigestOf(one),
+            }),
+            (error) => error.code === 'CLOUDFLARE_ADOPTION_SEMANTICS_CHANGED',
+        );
+        assert.deepEqual(state.inactivations, []);
+        await assert.rejects(() => coordinator.commit({
+            mode: 'cloudflare',
+            publicationState: 'ready',
+            configurationGeneration: SEMANTIC_GENERATION_TWO,
+            hosts: changed.hostname ? { [changed.hostname]: { agent: 'repo/office' } } : one.desired.hosts,
+        }), /outside its captured immutable generation/);
+    });
+}
+
+test('coordinator adopt() refuses a generation that is not the selected active one', async () => {
+    const one = semanticGeneration();
+    const { edgeOps } = createSemanticEdge(activeOf(one, SEMANTIC_GENERATION_THREE, 'activation-3'));
+    const coordinator = createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps });
+    await assert.rejects(
+        () => coordinator.adopt({
+            configurationGeneration: SEMANTIC_GENERATION_TWO,
+            semanticDigest: semanticDigestOf(one),
+        }),
+        (error) => error.code === 'CLOUDFLARE_ADOPTION_GENERATION_CHANGED',
+    );
+    await assert.rejects(
+        () => coordinator.adopt({ configurationGeneration: SEMANTIC_GENERATION_THREE }),
+        /requires an exact edge generation and semantic digest/,
+    );
+});
+
+test('coordinator inactivate() withdraws a same-semantics active generation only when given its digest', async () => {
+    const one = semanticGeneration();
+    const { state, edgeOps } = createSemanticEdge(activeOf(
+        semanticGeneration(),
+        SEMANTIC_GENERATION_THREE,
+        'activation-3',
+    ));
+    const coordinator = createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps });
+
+    await assert.rejects(
+        () => coordinator.inactivate({ configurationGeneration: SEMANTIC_GENERATION_ONE, reason: 'exit' }),
+        /not the selected active generation/,
+    );
+    assert.deepEqual(state.inactivations, []);
+
+    const result = await coordinator.inactivate({
+        configurationGeneration: SEMANTIC_GENERATION_ONE,
+        reason: 'cloudflared-exit',
+        semanticDigest: semanticDigestOf(one),
+    });
+
+    assert.deepEqual(result, { generation: SEMANTIC_GENERATION_THREE });
+    assert.deepEqual(state.inactivations, [{
+        reason: 'cloudflared-exit',
+        options: {
+            workspaceRoot: '/fixture',
+            expectedActiveSelector: {
+                generation: SEMANTIC_GENERATION_THREE,
+                activationId: 'activation-3',
+            },
+        },
+    }]);
+});
+
+test('coordinator inactivate() keeps a newer generation with different semantics selected', async () => {
+    const one = semanticGeneration();
+    const { state, edgeOps } = createSemanticEdge(activeOf(
+        semanticGeneration({ routeKey: 'route-other' }),
+        SEMANTIC_GENERATION_THREE,
+        'activation-3',
+    ));
+    const coordinator = createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps });
+    await assert.rejects(
+        () => coordinator.inactivate({
+            configurationGeneration: SEMANTIC_GENERATION_ONE,
+            reason: 'cloudflared-exit',
+            semanticDigest: semanticDigestOf(one),
+        }),
+        /not the selected active generation/,
+    );
+    assert.deepEqual(state.inactivations, []);
+});
+
+test('coordinator inactivate() leaves an exact generation withdrawal unchanged when a digest is supplied', async () => {
+    const one = semanticGeneration();
+    const { state, edgeOps } = createSemanticEdge(activeOf(one, SEMANTIC_GENERATION_ONE));
+    const coordinator = createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps });
+    const result = await coordinator.inactivate({
+        configurationGeneration: SEMANTIC_GENERATION_ONE,
+        reason: 'cloudflared-exit',
+        semanticDigest: semanticDigestOf(one),
+    });
+    assert.equal(result, undefined);
+    assert.deepEqual(state.inactivations, [{
+        reason: 'cloudflared-exit',
+        options: { workspaceRoot: '/fixture' },
+    }]);
+});
+
+test('coordinator inactivateForStop() records the actually active same-semantics generation', async () => {
+    const one = semanticGeneration();
+    const stops = [];
+    const { state, edgeOps } = createSemanticEdge(activeOf(
+        semanticGeneration(),
+        SEMANTIC_GENERATION_THREE,
+        'activation-3',
+    ));
+    const coordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps,
+        onStopInactivation: (record) => stops.push(record),
+    });
+
+    assert.equal(await coordinator.inactivateForStop({
+        configurationGeneration: SEMANTIC_GENERATION_ONE,
+        reason: 'cloudflare-controller-stop',
+    }), null, 'without a digest a different generation is never withdrawn');
+    assert.deepEqual(state.inactivations, []);
+
+    const stopped = await coordinator.inactivateForStop({
+        configurationGeneration: SEMANTIC_GENERATION_ONE,
+        reason: 'cloudflare-controller-stop',
+        semanticDigest: semanticDigestOf(one),
+    });
+
+    assert.equal(stopped.generation, SEMANTIC_GENERATION_THREE);
+    assert.equal(stopped.restorePublicationState, 'reconciling');
+    assert.equal(stops.length, 1);
+    assert.deepEqual(state.inactivations[0].options.expectedActiveSelector, {
+        generation: SEMANTIC_GENERATION_THREE,
+        activationId: 'activation-3',
+    });
+});
+
+test('coordinator inactivateForStop() ignores a different-semantics generation even with a digest', async () => {
+    const one = semanticGeneration();
+    const { state, edgeOps } = createSemanticEdge(activeOf(
+        semanticGeneration({ hostname: 'meet.example.test' }),
+        SEMANTIC_GENERATION_THREE,
+        'activation-3',
+    ));
+    const coordinator = createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps });
+    assert.equal(await coordinator.inactivateForStop({
+        configurationGeneration: SEMANTIC_GENERATION_ONE,
+        reason: 'cloudflare-controller-stop',
+        semanticDigest: semanticDigestOf(one),
+    }), null);
+    assert.deepEqual(state.inactivations, []);
+});
+
+test('publication runtime passes each selected host route key to the controller and its retry', async (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-publication-runtime-routekeys-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    let selected = null;
+    const inputs = [];
+    let releaseRetry;
+    const retryCompleted = new Promise((resolve) => { releaseRetry = resolve; });
+    const inactive = Object.assign(new Error('inactive'), { code: 'EDGE_GENERATION_INACTIVE' });
+    const runtime = startCloudflarePublicationRuntime({
+        workspaceRoot: workspace,
+        statusFile: path.join(workspace, 'status.json'),
+        pollIntervalMs: 60_000,
+        retryInitialDelayMs: 1,
+        retryMaximumDelayMs: 1,
+        loadActive: () => {
+            if (!selected) throw inactive;
+            return selected;
+        },
+        routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
+        controllerFactory: () => ({
+            reconcile: async (input) => {
+                inputs.push(structuredClone(input));
+                if (inputs.length === 1) throw new Error('transient fixture failure');
+                releaseRetry();
+            },
+            getStatus: () => ({ state: 'fixture' }),
+            stop: async () => {},
+        }),
+        probeHostname: async () => ({ ok: true }),
+        audit: () => {},
+    });
+    const generation = semanticGeneration({ routeKey: 'route-office' });
+    selected = {
+        selector: { generation: GENERATION, activationId: 'activation-route-keys', publicationState: 'ready' },
+        generation,
+    };
+    await runtime.scan();
+    await Promise.race([
+        retryCompleted,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('retry did not run')), 1_000)),
+    ]);
+    assert.equal(inputs.length, 2);
+    for (const input of inputs) {
+        assert.deepEqual(input.hostRouteKeys, { 'office.example.test': 'route-office' });
+        assert.deepEqual(input.hosts, generation.desired.hosts);
+        assert.deepEqual(input.cloudflare, generation.desired.cloudflare);
+    }
+    await runtime.stop();
+});

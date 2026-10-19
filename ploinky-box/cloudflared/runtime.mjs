@@ -3,7 +3,11 @@ import path from 'node:path';
 import { appendLog } from '../../cli/server/utils/logger.js';
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 import { createCloudflarePublicationController } from './publicationController.mjs';
-import { stablePublicationJson } from './publicationPlan.mjs';
+import {
+    edgeGenerationPublicationSemantics,
+    publicationSemanticDigest,
+    stablePublicationJson,
+} from './publicationPlan.mjs';
 import {
     inactivateEdgeRoutingGeneration,
     loadActiveEdgeRoutingGeneration,
@@ -201,8 +205,47 @@ export function createEdgePublicationRouteCoordinator({
         throw publicationRuntimeError('edge generation apply retry exhausted');
     }
 
+    // The semantic digest of the active generation, or null when its
+    // publication inputs are not valid. Both callers treat null as different.
+    function activeSemanticDigest(active) {
+        try {
+            return publicationSemanticDigest(edgeGenerationPublicationSemantics(active.generation));
+        } catch (_) {
+            return null;
+        }
+    }
+
     return Object.freeze({
-        async inactivate({ configurationGeneration, reason } = {}) {
+        // Rebinds the captured generation to the selected active generation
+        // that carries the semantics of the ready publication, without
+        // touching the selector. Only a generation whose publication
+        // semantics equal the verified ones may be adopted.
+        async adopt({ configurationGeneration, semanticDigest } = {}) {
+            const expected = String(configurationGeneration || '');
+            if (!EXACT_GENERATION.test(expected) || !semanticDigest) {
+                throw publicationRuntimeError('publication adoption requires an exact edge generation and semantic digest');
+            }
+            const active = edgeOps.load({ workspaceRoot });
+            if (active.selector.generation !== expected) {
+                throw publicationRuntimeError(
+                    'publication adoption is not the selected active generation',
+                    'CLOUDFLARE_ADOPTION_GENERATION_CHANGED',
+                );
+            }
+            if (activeSemanticDigest(active) !== semanticDigest) {
+                throw publicationRuntimeError(
+                    'publication adoption changed the verified publication semantics',
+                    'CLOUDFLARE_ADOPTION_SEMANTICS_CHANGED',
+                );
+            }
+            captured = {
+                generation: expected,
+                desired: active.generation.desired,
+            };
+            return { selector: active.selector };
+        },
+
+        async inactivate({ configurationGeneration, reason, semanticDigest } = {}) {
             const expected = String(configurationGeneration || '');
             if (!/^sha256:[a-f0-9]{64}$/.test(expected)) {
                 throw publicationRuntimeError('publication coordination requires an exact edge generation');
@@ -210,6 +253,25 @@ export function createEdgePublicationRouteCoordinator({
             try {
                 const active = edgeOps.load({ workspaceRoot });
                 if (active.selector.generation !== expected) {
+                    // Exit and stop paths may find a newer generation the CLI
+                    // activated with the same publication semantics before this
+                    // process adopted it. The dead connector served it too, so
+                    // it is withdrawn; the exact activation guard keeps a
+                    // concurrent newer flip intact.
+                    if (semanticDigest && activeSemanticDigest(active) === semanticDigest) {
+                        captured = {
+                            generation: active.selector.generation,
+                            desired: active.generation.desired,
+                        };
+                        edgeOps.inactivate(String(reason || 'publication-reconcile'), {
+                            workspaceRoot,
+                            expectedActiveSelector: {
+                                generation: active.selector.generation,
+                                activationId: active.selector.activationId,
+                            },
+                        });
+                        return { generation: active.selector.generation };
+                    }
                     throw publicationRuntimeError('publication request is not the selected active generation');
                 }
                 captured = {
@@ -231,6 +293,7 @@ export function createEdgePublicationRouteCoordinator({
         async inactivateForStop({
             configurationGeneration,
             reason = ROUTER_STOP_INACTIVATION_REASON,
+            semanticDigest,
         } = {}) {
             const expected = String(configurationGeneration || '');
             if (!EXACT_GENERATION.test(expected)) return null;
@@ -244,7 +307,8 @@ export function createEdgePublicationRouteCoordinator({
                 if (error?.code === 'EDGE_GENERATION_INACTIVE') return null;
                 throw error;
             }
-            if (active.selector.generation !== expected) return null;
+            if (active.selector.generation !== expected
+                && !(semanticDigest && activeSemanticDigest(active) === semanticDigest)) return null;
             const inactiveSelector = edgeOps.inactivate(String(reason), {
                 workspaceRoot,
                 expectedActiveSelector: {
@@ -254,7 +318,7 @@ export function createEdgePublicationRouteCoordinator({
             });
             if (!inactiveSelector) return null;
             const stopped = Object.freeze({
-                generation: expected,
+                generation: active.selector.generation,
                 restorePublicationState: restorePublicationStateFor(active),
                 inactiveSelector,
             });
@@ -757,6 +821,7 @@ export function startCloudflarePublicationRuntime({
                 selectedPublicationState: active.selector.publicationState,
                 cloudflare: active.generation.desired.cloudflare,
                 hosts: active.generation.desired.hosts,
+                hostRouteKeys: edgeGenerationPublicationSemantics(active.generation).hostRouteKeys,
             };
             inFlight = controller.reconcile(input, { reason: 'selected-edge-generation' });
             await inFlight;
@@ -775,6 +840,7 @@ export function startCloudflarePublicationRuntime({
                         selectedPublicationState: active.selector.publicationState,
                         cloudflare: active.generation.desired.cloudflare,
                         hosts: active.generation.desired.hosts,
+                        hostRouteKeys: edgeGenerationPublicationSemantics(active.generation).hostRouteKeys,
                     },
                 });
             }
