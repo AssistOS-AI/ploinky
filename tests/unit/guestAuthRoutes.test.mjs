@@ -777,6 +777,67 @@ test('host-bound browser token mints only an admitted service mutation proof', a
     assert.equal(JSON.parse(switchedRes.body).error, 'auth_route_context_mismatch');
 });
 
+test('host-bound browser token admits any enabled agent on an SSO Marketplace host and only the closure elsewhere', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
+    t.mock.method(authService, 'validateSession', async (sessionId) => sessionId === 'sso-session'
+        ? {
+            user: { id: 'sso:admin', username: 'admin', name: 'Admin', email: 'admin@example.test', roles: ['user', 'admin'] },
+            tokens: null,
+            expiresAt: Date.now() + 60_000,
+        }
+        : null);
+
+    // A fresh snapshot per case: the derived routes are cached per generation object.
+    const planFor = (surfaces) => {
+        const base = createRoutePlan();
+        const snapshot = {
+            ...base.snapshot,
+            compiled: {
+                hosts: { 'explorer.localhost': { routeKey: 'explorer' } },
+                surfaces: { 'explorer.localhost': surfaces },
+                agentMcpRoutes: { 'explorer.localhost': ['explorer', 'webAdmin'] },
+                dependencyHttpRoutes: { 'explorer.localhost': [] },
+                policy: { entries: [], routeDefaults: {} },
+            },
+        };
+        return createRoutePlan({
+            ok: true,
+            kind: 'router-surface',
+            surface: 'browser-auth',
+            host: 'explorer.localhost',
+            hostSelection: { kind: 'agent-root', source: 'public-host', host: 'explorer.localhost', record: { routeKey: 'explorer' } },
+            forwarding: { protocol: 'https', authority: 'explorer.localhost' },
+            snapshot,
+            lease: { id: snapshot.generation, snapshot, commit: () => true },
+        });
+    };
+    const mint = async (routePlan, mutationRoute) => {
+        const req = makeRequest({
+            method: 'GET',
+            url: `/auth/token?mutationRoute=${mutationRoute}`,
+            host: 'explorer.localhost',
+            cookie: 'ploinky_sso=sso-session',
+        });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'https://explorer.localhost'), { routePlan });
+        return { status: res.statusCode, body: JSON.parse(res.body || '{}') };
+    };
+
+    const marketplace = planFor(['agent-mcp', 'marketplace-ui']);
+    const issued = await mint(marketplace, 'guestAgent');
+    assert.equal(issued.status, 200, JSON.stringify(issued.body));
+    assert.equal(issued.body.browserMutation.hostRouteKey, 'explorer');
+    assert.equal(issued.body.browserMutation.routeKey, 'guestAgent');
+    assert.equal((await mint(marketplace, 'webAdmin')).status, 200);
+    assert.equal((await mint(marketplace, 'absentAgent')).body.error, 'browser_mutation_route_denied');
+
+    for (const surfaces of [['agent-mcp'], ['marketplace-ui']]) {
+        const denied = await mint(planFor(surfaces), 'guestAgent');
+        assert.equal(denied.status, 503, surfaces.join());
+        assert.equal(denied.body.error, 'browser_mutation_route_denied', surfaces.join());
+    }
+});
+
 test('browser token GET denies a generation change during session resolution before issuing proofs or cookies', async (t) => {
     const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
     let resolveSession;

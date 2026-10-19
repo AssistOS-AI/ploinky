@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import net from 'node:net';
 import { domainToASCII } from 'node:url';
 
-import { captureEdgeRoutingLease, captureEdgeRoutingObservationLease } from '../sandbox/edgeGeneration.js';
+import { captureEdgeRoutingLease, captureEdgeRoutingObservationLease, edgeHostServiceRoutes } from '../sandbox/edgeGeneration.js';
 import { observeEdgeActivation } from './edgeActivationClock.js';
 import { selectedRouterHostPort } from '../sandbox/routerPort.js';
 import { isTrustedPublicRouterHost } from '../utils/publicRouterHosts.mjs';
@@ -837,7 +837,7 @@ export function resolveEdgeRoutePlan({
         const surface = surfaceForPath(
             pathname,
             snapshot.compiled.surfaces?.[host] || [],
-            snapshot.compiled.agentMcpRoutes?.[host] || [],
+            edgeHostServiceRoutes(snapshot, host).agentMcpRoutes,
             hostSelection.record?.routeKey,
         );
         if (surface?.routerOwned) {
@@ -870,7 +870,7 @@ export function resolveEdgeRoutePlan({
             pathname,
             routes,
             hostSelection.record?.routeKey,
-            snapshot.compiled.dependencyHttpRoutes?.[host] || [],
+            edgeHostServiceRoutes(snapshot, host).dependencyHttpRoutes,
         );
         if (dependencyHttpRoute) {
             return agentRootPlan({

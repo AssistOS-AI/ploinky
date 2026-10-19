@@ -1226,6 +1226,31 @@ test('only an SSO host root extends the closure, and a none-mode target there is
     }
 });
 
+test('Router plans route an enabled agent on a Marketplace host and leave it with the host root elsewhere', (t) => {
+    const fixture = marketplaceClosureFixture(t);
+    applyMarketplaceClosure(fixture, 'marketplace-route-plan');
+    const plan = (host, method, url) => resolveEdgeRoutePlan({
+        req: { method, url, headers: { host } },
+        listener: 'public',
+    });
+    const marketMcp = plan('market.example.test', 'POST', '/unrelated/mcp');
+    assert.equal(marketMcp.ok, true);
+    assert.equal(marketMcp.routeKey, 'unrelated');
+    const marketPage = plan('market.example.test', 'GET', '/unrelated/roomLoader.html');
+    assert.equal(marketPage.ok, true);
+    assert.equal(marketPage.routeKey, 'unrelated');
+    assert.equal(plan('ui-only.example.test', 'GET', '/unrelated/roomLoader.html').routeKey, 'unrelated');
+
+    // Outside the closure the path is not an agent route: it falls through to the host root.
+    for (const [method, url] of [['POST', '/unrelated/mcp'], ['GET', '/unrelated/roomLoader.html']]) {
+        const mcpOnly = plan('mcp-only.example.test', method, url);
+        assert.equal(mcpOnly.routeKey, 'alpha', url);
+        assert.equal(mcpOnly.upstreamPath, url, url);
+    }
+    const absent = plan('market.example.test', 'POST', '/ghost/mcp');
+    assert.equal(absent.routeKey === 'ghost', false);
+});
+
 test('encoded spellings of Router-owned mounts are rejected before surface or agent selection', (t) => {
     const fixture = createFixture(t, {
         desired: {
