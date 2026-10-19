@@ -3383,12 +3383,13 @@ function deriveWithdrawalCandidate(predecessor, withdrawals, { routing: supplied
                 throw edgeError(`'${containerName}' is held by an operator drain`, 'EDGE_WITHDRAWAL_OPERATOR_DRAIN');
             }
             // Re-draining an automatically drained route keeps the owner that
-            // already admits its restart, provided it names the same identity;
-            // an operator drain records no owner and keeps an existing one.
+            // already admits its restart, provided it names the same identity.
+            // An operator drain records no owner and clears an existing one, so
+            // it blocks automatic restarts like every operator drain.
             let owner = withdrawal.drainOwner;
-            if (current.draining === true && current.drainOwner && (!owner
-                || (current.drainOwner.instanceId === owner.instanceId
-                    && current.drainOwner.enableGeneration === owner.enableGeneration))) {
+            if (current.draining === true && current.drainOwner && owner
+                && current.drainOwner.instanceId === owner.instanceId
+                && current.drainOwner.enableGeneration === owner.enableGeneration) {
                 owner = current.drainOwner;
             }
             routing.routes[routeKey] = drainedRoute(current, owner);

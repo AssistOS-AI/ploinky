@@ -698,3 +698,18 @@ test('D4 a withdrawn preparation requires drained routes and may change only the
     assertRefusedWithoutWrite([{ containerName: 'gamma-container', mode: 'remove' }], 'EDGE_PREPARATION_BUSY');
     edge.abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: workspace });
 });
+
+test('m2 an operator drain over an automatic drain clears its owner and blocks automatic restarts', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    drainBeta();
+    const { writes } = withdraw([{ containerName: 'beta-container', mode: 'drain' }]);
+    assert.deepEqual(writes.map((entry) => [entry.before.state, entry.after.state]), [['active', 'active']]);
+    const route = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }).generation.routing.routes.beta;
+    assert.equal(route.draining, true);
+    assert.equal(route.drainOwner, undefined, 'the operator drain records no owner');
+    assert.equal(readRouting().routes.beta.drainOwner, undefined);
+    assertRefusedWithoutWrite(
+        [{ containerName: 'beta-container', mode: 'drain', drainOwner: BETA_OWNER }],
+        'EDGE_WITHDRAWAL_OPERATOR_DRAIN',
+    );
+});
