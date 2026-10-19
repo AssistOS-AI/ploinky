@@ -1514,3 +1514,75 @@ test('publication runtime passes each selected host route key to the controller 
     }
     await runtime.stop();
 });
+
+// m1: an exit inactivation that loses its exact activation guard to a newer
+// flip with the same publication semantics withdraws that flip too, within a
+// bound, and never touches a flip with different semantics.
+function flippingSemanticEdge(flips) {
+    const { state, edgeOps } = createSemanticEdge(flips[0]);
+    let index = 0;
+    edgeOps.inactivate = (reason, options) => {
+        state.inactivations.push({ reason, options: structuredClone(options) });
+        if (index + 1 < flips.length) {
+            index += 1;
+            state.active = flips[index];
+            return null;
+        }
+        return { state: 'inactive', activationId: 'inactive-1', selectorDigest: 'digest' };
+    };
+    return { state, edgeOps };
+}
+
+test('coordinator inactivate() withdraws a same-semantics flip that raced its exact guard', async () => {
+    const one = semanticGeneration();
+    const { state, edgeOps } = flippingSemanticEdge([
+        activeOf(semanticGeneration(), SEMANTIC_GENERATION_TWO, 'activation-2'),
+        activeOf(semanticGeneration(), SEMANTIC_GENERATION_THREE, 'activation-3'),
+    ]);
+    const coordinator = createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps });
+    const result = await coordinator.inactivate({
+        configurationGeneration: SEMANTIC_GENERATION_ONE,
+        reason: 'cloudflared-exit',
+        semanticDigest: semanticDigestOf(one),
+    });
+    assert.deepEqual(result, { generation: SEMANTIC_GENERATION_THREE });
+    assert.deepEqual(state.inactivations.map((entry) => entry.options), [
+        { workspaceRoot: '/fixture', expectedActiveSelector: { generation: SEMANTIC_GENERATION_TWO, activationId: 'activation-2' } },
+        { workspaceRoot: '/fixture', expectedActiveSelector: { generation: SEMANTIC_GENERATION_THREE, activationId: 'activation-3' } },
+    ]);
+});
+
+test('coordinator inactivate() stops at a different-semantics flip and bounds endless same-semantics flips', async () => {
+    const one = semanticGeneration();
+    const different = flippingSemanticEdge([
+        activeOf(semanticGeneration(), SEMANTIC_GENERATION_TWO, 'activation-2'),
+        activeOf(semanticGeneration({ hostname: 'meet.example.test' }), SEMANTIC_GENERATION_THREE, 'activation-3'),
+    ]);
+    await assert.rejects(
+        () => createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps: different.edgeOps }).inactivate({
+            configurationGeneration: SEMANTIC_GENERATION_ONE,
+            reason: 'cloudflared-exit',
+            semanticDigest: semanticDigestOf(one),
+        }),
+        /not the selected active generation/,
+    );
+    assert.equal(different.state.inactivations.length, 1, 'the different-semantics flip stays selected');
+
+    const flips = Array.from({ length: 20 }, (_, index) => activeOf(
+        semanticGeneration(),
+        `sha256:${String(index % 10).repeat(64)}`,
+        `activation-${index}`,
+    ));
+    const endless = flippingSemanticEdge(flips);
+    await assert.rejects(
+        () => createEdgePublicationRouteCoordinator({ workspaceRoot: '/fixture', edgeOps: endless.edgeOps }).inactivate({
+            configurationGeneration: SEMANTIC_GENERATION_ONE,
+            reason: 'cloudflared-exit',
+            semanticDigest: semanticDigestOf(one),
+        }),
+        (error) => error.code === 'CLOUDFLARE_INACTIVATION_UNSETTLED',
+    );
+    assert.equal(endless.state.inactivations.length, 8);
+    assert.ok(endless.state.inactivations.every((entry) => entry.options.expectedActiveSelector),
+        'every attempt keeps the exact activation guard');
+});

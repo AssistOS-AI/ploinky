@@ -43,6 +43,7 @@ const RETRYABLE_SELECTED_PUBLICATION_STATES = new Set([
 const DEFAULT_EDGE_APPLY_BUSY_RETRY_ATTEMPTS = 50;
 const DEFAULT_EDGE_APPLY_BUSY_RETRY_DELAY_MS = 100;
 const EXACT_GENERATION = /^sha256:[a-f0-9]{64}$/;
+const SAME_SEMANTIC_INACTIVATION_ATTEMPTS = 8;
 export const ROUTER_STOP_INACTIVATION_REASON = 'cloudflare-controller-stop';
 export const ROUTER_RESTART_RESTORE_REASON = 'router-restart-restore';
 // Pre-mutation contention on a lock or an outstanding lifecycle preparation.
@@ -257,20 +258,39 @@ export function createEdgePublicationRouteCoordinator({
                     // activated with the same publication semantics before this
                     // process adopted it. The dead connector served it too, so
                     // it is withdrawn; the exact activation guard keeps a
-                    // concurrent newer flip intact.
-                    if (semanticDigest && activeSemanticDigest(active) === semanticDigest) {
+                    // concurrent newer flip intact, and a newer flip with the
+                    // same semantics is withdrawn in turn.
+                    let current = active;
+                    for (let attempt = 1;
+                        semanticDigest && activeSemanticDigest(current) === semanticDigest;
+                        attempt += 1) {
+                        if (attempt > SAME_SEMANTIC_INACTIVATION_ATTEMPTS) {
+                            throw publicationRuntimeError(
+                                'same-semantic edge generations kept changing during exit inactivation',
+                                'CLOUDFLARE_INACTIVATION_UNSETTLED',
+                            );
+                        }
                         captured = {
-                            generation: active.selector.generation,
-                            desired: active.generation.desired,
+                            generation: current.selector.generation,
+                            desired: current.generation.desired,
                         };
-                        edgeOps.inactivate(String(reason || 'publication-reconcile'), {
+                        const inactivated = edgeOps.inactivate(String(reason || 'publication-reconcile'), {
                             workspaceRoot,
                             expectedActiveSelector: {
-                                generation: active.selector.generation,
-                                activationId: active.selector.activationId,
+                                generation: current.selector.generation,
+                                activationId: current.selector.activationId,
                             },
                         });
-                        return { generation: active.selector.generation };
+                        if (inactivated) return { generation: current.selector.generation };
+                        try {
+                            current = edgeOps.load({ workspaceRoot });
+                        } catch (loadError) {
+                            // Another writer already failed routing closed.
+                            if (loadError?.code === 'EDGE_GENERATION_INACTIVE') {
+                                return { generation: current.selector.generation };
+                            }
+                            throw loadError;
+                        }
                     }
                     throw publicationRuntimeError('publication request is not the selected active generation');
                 }
