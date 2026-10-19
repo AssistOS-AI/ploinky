@@ -1129,6 +1129,96 @@ export function edgeWebchatTargets(generation, host) {
     return frozen;
 }
 
+const hostServiceRouteCache = new WeakMap();
+
+function compiledHostServiceRoutes(generation, hostname) {
+    const compiled = generation.compiled;
+    return {
+        agentMcpRoutes: [...(compiled?.agentMcpRoutes?.[hostname] || [])],
+        dependencyHttpRoutes: (compiled?.dependencyHttpRoutes?.[hostname] || [])
+            .map(({ path: routePath, routeKey }) => ({ path: routePath, routeKey })),
+    };
+}
+
+function hostServiceRoutesOf(generation, hostname) {
+    const compiled = generation.compiled;
+    const base = compiledHostServiceRoutes(generation, hostname);
+    const surfaces = compiled?.surfaces?.[hostname];
+    if (!Array.isArray(surfaces) || !surfaces.includes('marketplace-ui')) return base;
+
+    const rootRouteKey = String(compiled.hosts?.[hostname]?.routeKey || '');
+    const routes = generation.routing?.routes || {};
+    const rootRoute = routes[rootRouteKey];
+    if (!rootRouteKey || !rootRoute || rootRoute.disabled) return base;
+    // The extension is limited to the Marketplace UI's own admission class: an
+    // SSO host root, the predicate publicMarketplaceAuthContext applies. Any
+    // other host keeps the compiled closure.
+    const rootRecord = routeAgentRecord(rootRoute, generation.agents);
+    const rootMode = String(resolveAgentAuthPolicy(generation.manifests?.[rootRouteKey], rootRecord?.auth).mode || '')
+        .trim().toLowerCase();
+    if (rootMode !== 'sso') return base;
+
+    const enabled = new Set();
+    for (const [routeKey, route] of Object.entries(routes)) {
+        if (route && !route.disabled && routeAgentRecord(route, generation.agents)) enabled.add(routeKey);
+    }
+    const policyEntries = compiled.policy?.entries;
+    if (!Array.isArray(policyEntries)) throw edgeError('compiled policy entries are missing');
+    const dependencyEntries = new Map();
+    const admit = ({ path: routePath, routeKey }) => {
+        if (typeof routePath !== 'string' || typeof routeKey !== 'string') {
+            throw edgeError('compiled route entry is malformed');
+        }
+        dependencyEntries.set(`${routeKey}\u0000${routePath}`, { path: routePath, routeKey });
+    };
+    base.dependencyHttpRoutes.forEach(admit);
+    for (const entry of policyEntries) {
+        if (entry?.source === 'manifest' && enabled.has(entry.routeKey) && entry.routeKey !== rootRouteKey) admit(entry);
+    }
+    return {
+        agentMcpRoutes: surfaces.includes('agent-mcp') ? [...new Set([...base.agentMcpRoutes, ...enabled])].sort() : base.agentMcpRoutes,
+        dependencyHttpRoutes: [...dependencyEntries.values()].sort((left, right) => (
+            left.routeKey.localeCompare(right.routeKey)
+            || left.path.localeCompare(right.path)
+        )),
+    };
+}
+
+// The Router surfaces a host admits for agents other than its selected root.
+// The compiled closure (the root's manifest `enable` graph) is the base. On a
+// host that exposes the Marketplace UI with an SSO root, every enabled agent
+// of this generation joins it, because Marketplace enables agents outside the
+// root manifest. Like edgeWebchatTargets this is derived from the generation's
+// own digest-bound sources and never stored, so generations written before it
+// load and verify byte for byte; any failure yields the compiled base only.
+export function edgeHostServiceRoutes(generation, host) {
+    const empty = { agentMcpRoutes: Object.freeze([]), dependencyHttpRoutes: Object.freeze([]) };
+    if (!generation || typeof generation !== 'object') return Object.freeze(empty);
+    const hostname = String(host || '');
+    let byHost = hostServiceRouteCache.get(generation);
+    if (!byHost) {
+        byHost = new Map();
+        hostServiceRouteCache.set(generation, byHost);
+    }
+    if (byHost.has(hostname)) return byHost.get(hostname);
+    let routes;
+    try {
+        routes = hostServiceRoutesOf(generation, hostname);
+    } catch (_) {
+        try {
+            routes = compiledHostServiceRoutes(generation, hostname);
+        } catch (__) {
+            routes = { agentMcpRoutes: [], dependencyHttpRoutes: [] };
+        }
+    }
+    const frozen = Object.freeze({
+        agentMcpRoutes: Object.freeze(routes.agentMcpRoutes),
+        dependencyHttpRoutes: Object.freeze(routes.dependencyHttpRoutes.map((entry) => Object.freeze(entry))),
+    });
+    byHost.set(hostname, frozen);
+    return frozen;
+}
+
 function compileGeneration({ routing, policy, desired, agents, manifests }) {
     validatePolicy(policy);
     validateRoutingShape(routing, manifests);

@@ -24,6 +24,8 @@ import {
     readCurrentEdgeTopology,
     withEdgeGenerationApplyLock,
 } from '../../cli/sandbox/edgeGeneration.js';
+import * as edgeApi from '../../cli/sandbox/edgeGeneration.js';
+import { resolveAuthContextForRouteKey } from '../../cli/server/authHandlers/authContext.js';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { retireQuiescentBoxEdgePreparation } from '../../ploinky-box/edgePreparationCleanup.mjs';
 import {
@@ -1036,6 +1038,192 @@ test('a generation already written for unchanged sources loads and re-applies ac
     const empty = apply('upgrade-no-hosts');
     assert.deepEqual([...edgeWebchatTargets(empty.generation, 'chat.example.test')], []);
     assert.ok(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).generation);
+});
+
+// Marketplace enables agents outside the root manifest; on an SSO Marketplace
+// host those enabled agents join the closure, derived when a generation is read.
+const MARKETPLACE_HOSTS = {
+    'market.example.test': { agent: 'fixtures/alpha', routerSurfaces: ['agent-mcp', 'marketplace-ui'] },
+    'mcp-only.example.test': { agent: 'fixtures/alpha', routerSurfaces: ['agent-mcp'] },
+    'ui-only.example.test': { agent: 'fixtures/alpha', routerSurfaces: ['marketplace-ui'] },
+};
+
+function addFixtureAgent(fixture, name, { manifest = {}, record = true, disabled = false, auth = { mode: 'sso' } } = {}) {
+    const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const agentDir = path.join(fixture.ploinkyDir, 'repos', 'fixtures', name);
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    routing.routes[name] = {
+        repo: 'fixtures',
+        agent: name,
+        container: `${name}-container`,
+        hostPath: agentDir,
+        hostPort: 43200 + Object.keys(routing.routes).length,
+        ...(disabled ? { disabled: true } : {}),
+    };
+    fs.writeFileSync(routingFile, JSON.stringify(routing, null, 2));
+    if (record) {
+        const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+        agents[`${name}-container`] = {
+            type: 'agent',
+            repoName: 'fixtures',
+            agentName: name,
+            instanceId: `${name}-instance`,
+            enableGeneration: `${name}-enable-generation`,
+            auth,
+        };
+        fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+    }
+}
+
+function removeFixtureAgent(fixture, name) {
+    const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    delete routing.routes[name];
+    fs.writeFileSync(routingFile, JSON.stringify(routing, null, 2));
+    const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    delete agents[`${name}-container`];
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+}
+
+const UNRELATED_MANIFEST = {
+    routerAccess: {
+        httpRoutes: [
+            { path: '/roomLoader.html', access: 'public' },
+            { path: '/guest.html', access: 'guest' },
+            { path: '/disabled.html', access: 'authenticated', enabled: false },
+        ],
+    },
+};
+
+function marketplaceClosureFixture(t, { alphaManifest = {}, alphaAuth = { mode: 'sso' }, unrelatedAuth = { mode: 'sso' } } = {}) {
+    const fixture = createFixture(t, {
+        desired: { hosts: MARKETPLACE_HOSTS, cloudflare: { tunnelTokenSecret: 'publication/test-connector' } },
+        alphaManifest,
+    });
+    removeFixtureAgent(fixture, 'beta');
+    addFixtureAgent(fixture, 'unrelated', { manifest: UNRELATED_MANIFEST, auth: unrelatedAuth });
+    addFixtureAgent(fixture, 'off', { disabled: true });
+    if (alphaAuth.mode !== 'sso') {
+        const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+        const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+        agents['alpha-container'].auth = alphaAuth;
+        fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+    }
+    return fixture;
+}
+
+const applyMarketplaceClosure = (fixture, reason) => applyEdgeRoutingGeneration({
+    workspaceRoot: fixture.workspace,
+    reason,
+    publicationState: 'ready',
+});
+
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+test('an SSO Marketplace host admits every enabled agent without changing the compiled generation', (t) => {
+    const fixture = marketplaceClosureFixture(t);
+    const applied = applyMarketplaceClosure(fixture, 'marketplace-closure');
+    const { compiled } = applied.generation;
+    assert.deepEqual(Object.keys(compiled).sort(), BASE_COMPILED_KEYS);
+    assert.deepEqual(compiled.agentMcpRoutes['market.example.test'], ['alpha']);
+    assert.deepEqual(compiled.dependencyHttpRoutes['market.example.test'], []);
+
+    const loaded = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).generation;
+    for (const generation of [applied.generation, loaded]) {
+        const market = edgeApi.edgeHostServiceRoutes(generation, 'market.example.test');
+        assert.deepEqual([...market.agentMcpRoutes], ['alpha', 'unrelated']);
+        assert.deepEqual(plain(market.dependencyHttpRoutes), [
+            { path: '/unrelated/guest.html', routeKey: 'unrelated' },
+            { path: '/unrelated/roomLoader.html', routeKey: 'unrelated' },
+        ]);
+        assert.deepEqual([...edgeApi.edgeHostServiceRoutes(generation, 'mcp-only.example.test').agentMcpRoutes], ['alpha']);
+        assert.deepEqual(plain(edgeApi.edgeHostServiceRoutes(generation, 'mcp-only.example.test').dependencyHttpRoutes), []);
+        const uiOnly = edgeApi.edgeHostServiceRoutes(generation, 'ui-only.example.test');
+        assert.deepEqual([...uiOnly.agentMcpRoutes], []);
+        assert.deepEqual(plain(uiOnly.dependencyHttpRoutes), plain(market.dependencyHttpRoutes));
+        // Disabled routes never join; unknown hosts get nothing.
+        assert.equal(market.agentMcpRoutes.includes('off'), false);
+        assert.deepEqual([...edgeApi.edgeHostServiceRoutes(generation, 'unknown.example.test').agentMcpRoutes], []);
+        assert.equal(Object.isFrozen(market) && Object.isFrozen(market.agentMcpRoutes), true);
+    }
+    // The derivation never mutates the stored compiled state.
+    assert.deepEqual(applied.generation.compiled.agentMcpRoutes['market.example.test'], ['alpha']);
+    assert.equal(edgeApi.edgeHostServiceRoutes(applied.generation, 'market.example.test'),
+        edgeApi.edgeHostServiceRoutes(applied.generation, 'market.example.test'));
+});
+
+test('the helper never throws and never widens for degenerate input or a malformed policy', (t) => {
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes(null, 'market.example.test').agentMcpRoutes], []);
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes({}, '').agentMcpRoutes], []);
+    assert.deepEqual(plain(edgeApi.edgeHostServiceRoutes({ compiled: {} }, 'x').dependencyHttpRoutes), []);
+    const fixture = marketplaceClosureFixture(t);
+    const { generation } = applyMarketplaceClosure(fixture, 'marketplace-closure-malformed');
+    const malformed = structuredClone(generation);
+    malformed.compiled.policy.entries = [{ source: 'manifest', routeKey: 'unrelated', path: 7 }];
+    const routes = edgeApi.edgeHostServiceRoutes(malformed, 'market.example.test');
+    assert.deepEqual([...routes.agentMcpRoutes], ['alpha']);
+    assert.deepEqual(plain(routes.dependencyHttpRoutes), []);
+    const noPolicy = structuredClone(generation);
+    delete noPolicy.compiled.policy;
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes(noPolicy, 'market.example.test').agentMcpRoutes], ['alpha']);
+    // A route without an agent record (compile rejects it, so synthesize one) never joins.
+    const orphan = structuredClone(generation);
+    orphan.routing.routes.ghost = { repo: 'fixtures', agent: 'ghost', container: 'ghost-container' };
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes(orphan, 'market.example.test').agentMcpRoutes], ['alpha', 'unrelated']);
+    // A generation from this workspace answers only with its own routes for any host name.
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes(generation, 'other-workspace.example.test').agentMcpRoutes], []);
+});
+
+test('the extension is exactly what the root manifest closure would have compiled', (t) => {
+    const enabledOnly = applyMarketplaceClosure(marketplaceClosureFixture(t), 'marketplace-parity-enabled-only').generation;
+    const declared = applyMarketplaceClosure(
+        marketplaceClosureFixture(t, { alphaManifest: { enable: ['unrelated global'] } }),
+        'marketplace-parity-declared',
+    ).generation;
+    assert.deepEqual(declared.compiled.agentMcpRoutes['market.example.test'], ['alpha', 'unrelated']);
+    for (const host of ['market.example.test', 'ui-only.example.test']) {
+        const derived = edgeApi.edgeHostServiceRoutes(enabledOnly, host);
+        assert.deepEqual([...derived.agentMcpRoutes], declared.compiled.agentMcpRoutes[host], host);
+        assert.deepEqual(plain(derived.dependencyHttpRoutes), declared.compiled.dependencyHttpRoutes[host], host);
+    }
+});
+
+test('disabling an agent removes it from the derived closure and publishes a new generation', (t) => {
+    const fixture = marketplaceClosureFixture(t);
+    const first = applyMarketplaceClosure(fixture, 'marketplace-disable-before');
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes(first.generation, 'market.example.test').agentMcpRoutes], ['alpha', 'unrelated']);
+    removeFixtureAgent(fixture, 'unrelated');
+    const second = applyMarketplaceClosure(fixture, 'marketplace-disable-after');
+    assert.notEqual(second.selector.generation, first.selector.generation);
+    const market = edgeApi.edgeHostServiceRoutes(second.generation, 'market.example.test');
+    assert.deepEqual([...market.agentMcpRoutes], ['alpha']);
+    assert.deepEqual(plain(market.dependencyHttpRoutes), []);
+});
+
+test('only an SSO host root extends the closure, and a none-mode target there is an authenticated route', (t) => {
+    const sso = applyMarketplaceClosure(
+        marketplaceClosureFixture(t, { unrelatedAuth: { mode: 'none' } }),
+        'marketplace-sso-root',
+    ).generation;
+    assert.deepEqual([...edgeApi.edgeHostServiceRoutes(sso, 'market.example.test').agentMcpRoutes], ['alpha', 'unrelated']);
+    // The widened none-mode target inherits the SSO static agent's decision.
+    assert.equal(sso.compiled.policy.routeDefaults.unrelated.access, 'authenticated');
+    assert.equal(resolveAuthContextForRouteKey('alpha', { snapshot: sso }).mode, 'sso');
+
+    const open = applyMarketplaceClosure(
+        marketplaceClosureFixture(t, { alphaAuth: { mode: 'none' }, unrelatedAuth: { mode: 'none' } }),
+        'marketplace-non-sso-root',
+    ).generation;
+    assert.equal(resolveAuthContextForRouteKey('alpha', { snapshot: open }).mode, 'none');
+    for (const host of ['market.example.test', 'ui-only.example.test', 'mcp-only.example.test']) {
+        const routes = edgeApi.edgeHostServiceRoutes(open, host);
+        assert.deepEqual([...routes.agentMcpRoutes], host === 'ui-only.example.test' ? [] : ['alpha'], host);
+        assert.deepEqual(plain(routes.dependencyHttpRoutes), [], host);
+    }
 });
 
 test('encoded spellings of Router-owned mounts are rejected before surface or agent selection', (t) => {
