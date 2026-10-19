@@ -11,6 +11,7 @@ import {
 } from '../utils/workspacePaths.js';
 import { ROUTING_FILE } from '../../utils/config.js';
 import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
+import { serveWorkspaceDownload } from './workspace-downloads.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -775,6 +776,10 @@ async function serveWorkspaceFileRequest(req, res) {
         }
 
         const rel = pathname.slice(WORKSPACE_FILES_URL_PREFIX.length);
+        if (new URL(req.url, 'http://localhost').searchParams.get('download') === '1') {
+            await serveWorkspaceDownload(req, res, rel, getWorkspaceRoot());
+            return true;
+        }
         const resolved = await resolveWorkspaceFile(rel);
         if (resolved.status === 'denied') {
             res.writeHead(403, { 'Content-Type': 'text/plain' });

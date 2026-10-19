@@ -345,6 +345,8 @@ for (const selector of ['missing', 'webAdmin', 'guestAgent', 'webAssist']) {
             { method: 'POST', url: `/blobs/explorer?agent=${selector}` },
             { method: 'GET', url: `/workspace-files/f.txt?agent=${selector}`, accept: 'text/html' },
             { method: 'GET', url: `/workspace-files/f.txt?agent=${selector}`, accept: 'application/json' },
+            { method: 'GET', url: `/workspace-files/f.txt?download=1&agent=${selector}`, accept: 'text/html' },
+            { method: 'HEAD', url: `/workspace-files/folder?download=1&agent=${selector}`, accept: 'application/json' },
         ];
         for (const input of cases) {
             for (const withPlan of [false, true]) {
