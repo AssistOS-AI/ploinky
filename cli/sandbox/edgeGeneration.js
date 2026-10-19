@@ -2327,6 +2327,37 @@ export function retireAbandonedAgentPreparation(containerName, options = {}) {
 }
 
 /**
+ * Retire an additive or withdrawn preparation whose owner process stopped.
+ * Such a lease keeps its active predecessor selected and grants nothing until
+ * its commit, so removing it changes no authorization: a withdrawn route stays
+ * drained. A live owner, or a lease of another mode, is refused.
+ */
+export function retireAbandonedActiveBoundPreparation(options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    const { release } = acquireApplyLockCapability(paths, options);
+    try {
+        const lease = readPreparationLease(paths);
+        if (!lease) return { retired: false };
+        if (!ACTIVE_BOUND_LEASE_MODES.has(lease.mode)) {
+            throw edgeError(
+                `edge lifecycle preparation ${JSON.stringify(lease.reason)} is a ${lease.mode} preparation; retire it through the host stop and start`,
+                'EDGE_PREPARATION_BUSY',
+            );
+        }
+        if (lease.pid === process.pid || !preparationOwnerStopped(lease.pid)) {
+            throw edgeError(
+                `edge lifecycle preparation ${JSON.stringify(lease.reason)} is still owned by pid ${lease.pid}; wait for that operation to finish`,
+                'EDGE_PREPARATION_BUSY',
+            );
+        }
+        removePreparationLease(paths, lease);
+        return { retired: true, mode: lease.mode, transactionId: lease.transactionId, pid: lease.pid };
+    } finally {
+        release();
+    }
+}
+
+/**
  * Retire the graph preparation of a workspace start whose process stopped
  * before committing or aborting it. Start and restart call this before their
  * first selector rewrite: only the exact inactive selector captured in the
