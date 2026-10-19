@@ -106,6 +106,7 @@ import {
   commitAdditiveEdgeRoutingGeneration,
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
+  isActiveBoundPreparationLease,
   prepareHostModeCapabilityForInactiveGeneration,
   readEdgeRoutingPreparationOwner,
   readEdgeRoutingSelection,
@@ -2663,6 +2664,11 @@ async function activatePreparedRuntimeAfterReadiness({
       };
       if (!result.hostPort) delete cfg.routes[routeKey].hostPort;
       delete cfg.routes[routeKey].hardwareAvailability;
+      // A withdrawn replacement completes the automatic drain of its route.
+      if (cfg.routes[routeKey].drainOwner) {
+        delete cfg.routes[routeKey].draining;
+        delete cfg.routes[routeKey].drainOwner;
+      }
       return cfg;
     }, {
       reason: 'runtime-replacement-ready',
@@ -2725,7 +2731,9 @@ export function cleanupFailedPreparedRuntime(
     }
   }
   if (!failedResult.preparationLease) return;
-  if (failedResult.preparationLease.mode !== 'additive') {
+  // An additive or withdrawn preparation keeps its active predecessor
+  // selected; aborting it is enough, and a withdrawn route stays drained.
+  if (!isActiveBoundPreparationLease(failedResult.preparationLease)) {
     try {
       inactivate(reason, { preserveSelectedGeneration: true });
     } catch (cleanupError) {

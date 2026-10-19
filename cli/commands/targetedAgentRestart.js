@@ -2,11 +2,20 @@ import {
   TARGETED_DRAIN_ACKNOWLEDGEMENT,
   cleanupExactAgentRuntimeCandidate,
 } from '../sandbox/docker/index.js';
-import { loadActiveEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+import {
+  abortEdgeRoutingPreparation,
+  commitAdditiveEdgeRoutingGeneration,
+  commitWithdrawalEdgeRoutingGeneration,
+  edgeWithdrawalRefusalDisposition,
+  loadActiveEdgeRoutingGeneration,
+  prepareWithdrawnReplacementEdgeRoutingGeneration,
+  withEdgeGenerationApplyLock,
+} from '../sandbox/edgeGeneration.js';
 import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 import {
   mergeRoutingConfig,
   mergeRuntimeRoute,
+  readRoutingConfig,
 } from '../server/routingFile.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import { retireSameTupleAfterApply } from './hardwareAvailabilityRetirement.js';
@@ -80,6 +89,78 @@ function assertTransitionSelected(transition, loadActive) {
   return active;
 }
 
+// Withdraw the route from the active generation by an operator drain (W8,
+// D3): the selector stays active and every other route stays served. Returns
+// the route as it was before the drain.
+function withdrawTargetedRoute({ containerName, routeKey, repoName, shortAgentName, identity }, {
+  loadActive = loadActiveEdgeRoutingGeneration,
+  loadAgents = workspaceSvc.loadAgents,
+  withApplyLock = withEdgeGenerationApplyLock,
+  commitWithdrawal = commitWithdrawalEdgeRoutingGeneration,
+} = {}) {
+  return withApplyLock((applyLockCapability) => {
+    const active = loadActive();
+    const route = assertExactRouteOwner(active.generation?.routing?.routes?.[routeKey], {
+      containerName,
+      repoName,
+      shortAgentName,
+      routeKey,
+    });
+    if (!sameRuntimeIdentity(loadAgents()?.[containerName], identity)) {
+      throw new Error('targeted agent restart registry identity changed before route withdrawal');
+    }
+    const predecessorRoute = structuredClone(route);
+    delete predecessorRoute.draining;
+    commitWithdrawal({
+      withdraw: [{ containerName, mode: 'drain' }],
+      reason: `manual-targeted-restart-drain:${containerName}`,
+      applyLockCapability,
+    });
+    return predecessorRoute;
+  });
+}
+
+// Reopen a withdrawn route with its ready successor active to active (W8,
+// D4): the successor is prepared beside the drained predecessor and committed
+// through the additive checks in one apply-lock hold.
+function reopenTargetedRoute(transition, buildRoute, result, {
+  readRouting = readRoutingConfig,
+  loadAgents = workspaceSvc.loadAgents,
+  withApplyLock = withEdgeGenerationApplyLock,
+  prepareWithdrawn = prepareWithdrawnReplacementEdgeRoutingGeneration,
+  commitAdditive = commitAdditiveEdgeRoutingGeneration,
+  abortPreparation = abortEdgeRoutingPreparation,
+} = {}) {
+  return withApplyLock((applyLockCapability) => {
+    const routing = readRouting();
+    routing.routes = routing.routes || {};
+    const drainingRoute = assertExactRouteOwner(routing.routes[transition.routeKey], transition);
+    if (drainingRoute.draining !== true) {
+      throw new Error('targeted agent restart route changed before successor commit');
+    }
+    const agents = loadAgents();
+    if (!sameRuntimeIdentity(agents?.[transition.containerName], transition.identity)) {
+      throw new Error('targeted agent restart registry identity changed before successor commit');
+    }
+    agents[transition.containerName] = structuredClone(result.registryRecord);
+    const prepared = prepareWithdrawn({
+      containerName: transition.containerName,
+      agents,
+      reason: `manual-targeted-restart-ready:${transition.containerName}`,
+      applyLockCapability,
+    });
+    routing.routes[transition.routeKey] = buildRoute();
+    try {
+      return commitAdditive(prepared.preparationLease, { routing, agents, applyLockCapability });
+    } catch (error) {
+      // The drained predecessor stays active; release the preparation so the
+      // inactive commit can still take over.
+      try { abortPreparation(prepared.preparationLease, { reason: 'manual-targeted-restart-reopen-failed', applyLockCapability }); } catch (_) {}
+      throw error;
+    }
+  });
+}
+
 /**
  * Withdraw one agent's external selectors while retaining its exact runtime
  * identity and policy in the active generation. The predecessor can therefore
@@ -96,6 +177,7 @@ export async function prepareTargetedAgentRestart({
   mergeRouting = mergeRoutingConfig,
   loadActive = loadActiveEdgeRoutingGeneration,
   loadAgents = workspaceSvc.loadAgents,
+  withdrawRoute = withdrawTargetedRoute,
 } = {}) {
   const containerName = text(containerNameInput);
   const routeKey = text(routeKeyInput);
@@ -107,7 +189,16 @@ export async function prepareTargetedAgentRestart({
   const identity = exactRuntimeIdentity(record);
   let predecessorRoute = null;
 
-  await mergeRouting((routing) => {
+  try {
+    predecessorRoute = await withdrawRoute({ containerName, routeKey, repoName, shortAgentName, identity });
+  } catch (error) {
+    // Contention is the caller's to retry; a withdrawal that cannot be proven
+    // takes the inactive drain below (D7).
+    if (edgeWithdrawalRefusalDisposition(error) === 'defer') throw error;
+    predecessorRoute = null;
+  }
+
+  if (!predecessorRoute) await mergeRouting((routing) => {
     const currentRecord = loadAgents()?.[containerName];
     if (!sameRuntimeIdentity(currentRecord, identity)) {
       throw new Error('targeted agent restart registry identity changed before route withdrawal');
@@ -176,7 +267,7 @@ export async function commitTargetedAgentRestart({
   alias = '',
   networkLifecycleCapability,
 } = {}, {
-  mergeRouting = mergeRoutingConfig,
+  mergeRouting: mergeRoutingDependency = mergeRoutingConfig,
   mergeRoute = mergeRuntimeRoute,
   loadActive = loadActiveEdgeRoutingGeneration,
   loadAgents = workspaceSvc.loadAgents,
@@ -184,6 +275,7 @@ export async function commitTargetedAgentRestart({
   retireCandidate = retireRuntimeCandidate,
   retireEntriesAfterApply = retireSameTupleAfterApply,
   reportRetirementFailure = (error) => console.warn(`[edge] published targeted restart candidate receipt could not be retired: ${error?.message || error}`),
+  reopenRoute = reopenTargetedRoute,
 } = {}) {
   if (!transition || !result?.containerName || !result?.registryRecord) {
     throw new Error('targeted agent restart commit requires its transition and exact ready runtime');
@@ -193,6 +285,32 @@ export async function commitTargetedAgentRestart({
     throw new Error('targeted agent restart successor does not preserve the coordinated runtime identity');
   }
   assertTransitionSelected(transition, loadActive);
+
+  const restoredRoute = () => {
+    const restored = mergeRoute({
+      ...transition.predecessorRoute,
+      draining: false,
+    }, {
+      container: transition.containerName,
+      hostPath: agentPath,
+      repo: transition.repoName,
+      agent: transition.shortAgentName,
+      ...(alias ? { alias } : {}),
+    }, { hostPort: result.hostPort || 0 });
+    delete restored.draining;
+    delete restored.hardwareAvailability;
+    return restored;
+  };
+  // Reopen the withdrawn route active to active; only a reopen that cannot be
+  // proven takes the inactive merge below (D7).
+  const mergeRouting = async (mutator, options) => {
+    try {
+      return await reopenRoute(transition, restoredRoute, result);
+    } catch (error) {
+      if (edgeWithdrawalRefusalDisposition(error) === 'defer') throw error;
+    }
+    return mergeRoutingDependency(mutator, options);
+  };
 
   await mergeRouting((routing) => {
     routing.routes = routing.routes || {};

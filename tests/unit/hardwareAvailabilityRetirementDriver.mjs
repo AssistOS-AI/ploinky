@@ -285,12 +285,16 @@ async function run() {
                 const dependencies = {
                     retireEntriesAfterApply: spyAfterApply,
                     retireCandidate: () => {},
-                    // The real merge inactivates the selector and runs the mutator; the publication then fails before its apply completes.
+                    // The active-to-active reopen fails, so the commit falls back to the real merge, which inactivates the
+                    // selector and runs the mutator; the publication then fails before its apply completes.
                     ...(argument.failure === 'apply'
-                        ? { mergeRouting: (mutator, options) => routing.mergeRoutingConfig((current, capabilities) => {
-                            mutator(current, capabilities);
-                            throw new Error('the successor publication failed');
-                        }, options) }
+                        ? {
+                            reopenRoute: async () => { throw new Error('the successor reopen failed'); },
+                            mergeRouting: (mutator, options) => routing.mergeRoutingConfig((current, capabilities) => {
+                                mutator(current, capabilities);
+                                throw new Error('the successor publication failed');
+                            }, options),
+                        }
                         : {}),
                     ...(argument.failure === 'verify'
                         ? { loadActive: (() => {

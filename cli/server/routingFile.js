@@ -186,6 +186,12 @@ function mergeRuntimeRoute(existingRoute, route, {
 } = {}) {
     const next = { ...(existingRoute || {}), ...(route || {}) };
     delete next.serviceTargets;
+    // Publishing the replacement completes an automatic drain; an operator
+    // drain has no owner and stays until its own commit lifts it.
+    if (next.drainOwner) {
+        delete next.draining;
+        delete next.drainOwner;
+    }
     if (hostPort) {
         // A concrete target is published only for a freshly admitted, ready
         // runtime; it supersedes a prior hardware-unavailable state.

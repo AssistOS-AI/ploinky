@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'url';
 import { loadAgents, saveAgents } from './workspace.js';
 import { readAgentRegistrySnapshot } from './agentRegistrySnapshot.js';
@@ -52,9 +53,11 @@ import {
     commitWithdrawalEdgeRoutingGeneration,
     edgeWithdrawalRefusalDisposition,
     inactivateEdgeRoutingGeneration,
+    loadActiveEdgeRoutingGeneration,
     prepareAdditiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
     prepareHostModeCapabilityForInactiveGeneration,
+    prepareWithdrawnReplacementEdgeRoutingGeneration,
     readEdgeRoutingPreparationOwner,
     readEdgeRoutingSelection,
     resolveEdgeGenerationPaths,
@@ -646,6 +649,47 @@ function bootstrapPreparedMcpToolPolicy(routes) {
     return store.read().document;
 }
 
+function withoutRuntimeLocator(route) {
+    const next = { ...(route || {}) };
+    for (const field of ['hostPort', 'serviceTargets', 'draining', 'drainOwner']) delete next[field];
+    return next;
+}
+
+// A same-name re-enable that changes nothing but the runtime identity of one
+// registered agent can replace it beside its drained active predecessor
+// instead of inactivating the whole edge (D4, W2). Any other difference (its
+// manifest bytes, policy, routing or another agent) takes the inactive
+// replacement staging.
+function withdrawnReplacementEligible(plans, previousAgents, routing, policy) {
+    if (plans.length !== 1) return null;
+    const [plan] = plans;
+    const predecessor = previousAgents?.[plan.containerName];
+    if (predecessor?.type !== 'agent' || !predecessor.instanceId || !predecessor.enableGeneration) return null;
+    let active;
+    try { active = loadActiveEdgeRoutingGeneration(); } catch (_) { return null; }
+    const activeRouting = active.generation.routing || {};
+    if (!isDeepStrictEqual(active.generation.agents?.[plan.containerName], predecessor)
+        || !isDeepStrictEqual(JSON.parse(JSON.stringify(active.generation.policy)), JSON.parse(JSON.stringify(policy)))) return null;
+    const activeManifest = active.generation.sourceDigests?.manifests?.[plan.routeKey];
+    const routeKeys = new Set([...Object.keys(activeRouting.routes || {}), ...Object.keys(routing.routes || {})]);
+    for (const routeKey of routeKeys) {
+        const before = activeRouting.routes?.[routeKey];
+        const after = routing.routes?.[routeKey];
+        if (routeKey === plan.routeKey) {
+            if (!before || before.container !== plan.containerName
+                || !isDeepStrictEqual(withoutRuntimeLocator(before), withoutRuntimeLocator(after))) return null;
+        } else if (!isDeepStrictEqual(before, after)) {
+            return null;
+        }
+    }
+    const { routes: _activeRoutes, ...activeRest } = activeRouting;
+    const { routes: _routes, ...rest } = routing;
+    if (!isDeepStrictEqual(JSON.parse(JSON.stringify(activeRest)), JSON.parse(JSON.stringify(rest)))) return null;
+    const manifestDigest = `sha256:${createHash('sha256').update(plan.manifestBytes).digest('hex')}`;
+    if (!activeManifest || activeManifest !== manifestDigest) return null;
+    return { plan, predecessor };
+}
+
 /**
  * Stage exact identities and target-less routes for a set of agents, then
  * compile one immutable generation before any of their processes start.
@@ -734,9 +778,46 @@ export function prepareAgentEnableBatch(requests, {
             const manifestBytes = Object.fromEntries(
                 plans.map((plan) => [plan.routeKey, plan.manifestBytes]),
             );
-            if (effectiveAvailabilityMode === 'replacement') {
-                inactivateEdgeRoutingGeneration(`${reason}:source-stage`, { applyLockCapability });
+            const withdrawn = effectiveAvailabilityMode === 'replacement'
+                ? withdrawnReplacementEligible(plans, previousAgents, routing, policy)
+                : null;
+            let markersRetired = false;
+            if (withdrawn) {
                 retireNoWaitMarkers(supersededNoWaitRecords);
+                markersRetired = true;
+                try {
+                    commitWithdrawalEdgeRoutingGeneration({
+                        withdraw: [{
+                            containerName: withdrawn.plan.containerName,
+                            mode: 'drain',
+                            drainOwner: {
+                                containerName: withdrawn.plan.containerName,
+                                instanceId: String(withdrawn.predecessor.instanceId),
+                                enableGeneration: String(withdrawn.predecessor.enableGeneration),
+                                reason: 'replacement',
+                            },
+                        }],
+                        reason: `${reason}:withdraw`,
+                        applyLockCapability,
+                    });
+                    preparedGeneration = prepareWithdrawnReplacementEdgeRoutingGeneration({
+                        containerName: withdrawn.plan.containerName,
+                        agents: map,
+                        reason,
+                        applyLockCapability,
+                    });
+                } catch (error) {
+                    // A drain that succeeded leaves the route drained; the
+                    // inactive replacement below stages the plan's undrained
+                    // route, so it may still take over.
+                    if (preparedGeneration || edgeWithdrawalRefusalDisposition(error) === 'defer') throw error;
+                }
+            }
+            if (preparedGeneration) {
+                // Prepared beside the drained active predecessor.
+            } else if (effectiveAvailabilityMode === 'replacement') {
+                inactivateEdgeRoutingGeneration(`${reason}:source-stage`, { applyLockCapability });
+                if (!markersRetired) retireNoWaitMarkers(supersededNoWaitRecords);
                 saveAgents(map, { coordinate: false, applyLockCapability });
                 writeRoutingConfig(routing, { coordinate: false });
                 const policyFile = path.join(
@@ -923,7 +1004,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 || prepared.preparedGeneration?.preparationLease;
             await mps.verifyMpsRuntimeReady(started);
             withEdgeGenerationApplyLock((applyLockCapability) => {
-                if (finalLease?.mode === 'additive') {
+                // Additive and withdrawn leases keep their active predecessor
+                // selected until this commit publishes the ready runtime.
+                if (finalLease?.mode === 'additive' || finalLease?.mode === 'withdrawn') {
                     commitAdditiveEdgeRoutingGeneration(finalLease, {
                         routing: finalRouting,
                         agents: finalAgents,

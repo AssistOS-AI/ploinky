@@ -203,13 +203,17 @@ import {
     assertAdditivePreparedRuntimeIdentity,
     assertHostModeGenerationCapability,
     assertPreparedRuntimeIdentity,
+    commitWithdrawalEdgeRoutingGeneration,
     createRouterAttestationGenerationLease,
     edgeRuntimeEnvironment,
     edgeTopologyMount,
+    edgeWithdrawalRefusalDisposition,
     inactivateEdgeRoutingGeneration,
+    isActiveBoundPreparationLease,
     prepareAdditiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration as prepareEdgeRoutingGenerationRaw,
     prepareHostModeCapabilityForInactiveGeneration,
+    prepareWithdrawnReplacementEdgeRoutingGeneration,
     withEdgeGenerationApplyLock,
 } from '../edgeGeneration.js';
 import { readRoutingConfig, writeRoutingConfig } from '../../server/routingFile.js';
@@ -1438,10 +1442,30 @@ export function runHardwareGuardedLaunch(hardwareLaunch, {
     return launched;
 }
 
+// Withdraw one runtime's routes from the active generation by an automatic
+// drain whose owner admits its own restart (W10, D3).
+function drainRuntimeForHardwareReadback({ containerName, record }) {
+    return withEdgeGenerationApplyLock((applyLockCapability) => commitWithdrawalEdgeRoutingGeneration({
+        withdraw: [{
+            containerName,
+            mode: 'drain',
+            drainOwner: {
+                containerName,
+                instanceId: String(record?.instanceId || ''),
+                enableGeneration: String(record?.enableGeneration || ''),
+                reason: 'hardware-readback',
+            },
+        }],
+        reason: `hardware-reuse-readback-failed:${containerName}`,
+        applyLockCapability,
+    }));
+}
+
 export function verifyReusableHardwareRuntime(runtimeAdmission, {
     containerName, containerId, runtime, network, record, key, ref, alias = null, mpsLaunch,
 }, {
     createGuard = createHardwareLaunchGuard,
+    withdraw = drainRuntimeForHardwareReadback,
     inactivate = inactivateEdgeRoutingGeneration,
     removeExact = removeExactGenerationCandidate,
     query = (command, args) => {
@@ -1452,11 +1476,16 @@ export function verifyReusableHardwareRuntime(runtimeAdmission, {
     try {
         createGuard(runtimeAdmission, { key, observationKey: containerName, ref, alias, runtime, query, instanceId: record.instanceId, enableGeneration: record.enableGeneration, mpsLaunch }).afterLaunch({ containerId, adopted: true });
     } catch (error) {
-        // A reused runtime is still an affected runtime. Revoke authorization
-        // before removing only its captured immutable identity.
-        try { inactivate('hardware-reuse-readback-failed', { preserveSelectedGeneration: true }); } catch (cleanupError) {
-            appendExactCleanupFailure(error, `routing inactivation: ${cleanupError.message}`);
-            throw error;
+        // A reused runtime is still an affected runtime. Withdraw its routes
+        // (or, when that cannot be proven, all authorization) before removing
+        // only its captured immutable identity.
+        let withdrawn = false;
+        try { withdrawn = withdraw({ containerName, record })?.selector?.state === 'active'; } catch (_) {}
+        if (!withdrawn) {
+            try { inactivate('hardware-reuse-readback-failed', { preserveSelectedGeneration: true }); } catch (cleanupError) {
+                appendExactCleanupFailure(error, `routing inactivation: ${cleanupError.message}`);
+                throw error;
+            }
         }
         let exactCleanupPerformed = false;
         try {
@@ -3166,10 +3195,15 @@ export function assertPreparedRegistryRecordPreservation(existingRecord, options
     const stagedEnableGeneration = String(existingRecord?.enableGeneration || '');
     const requestedInstanceId = String(options.instanceId || stagedInstanceId);
     const requestedEnableGeneration = String(options.enableGeneration || stagedEnableGeneration);
-    if (options.preparationLease?.mode === 'additive'
+    // Additive and withdrawn preparations leave the active predecessor's
+    // mutable registry untouched; the immutable prepared record is authority.
+    if (isActiveBoundPreparationLease(options.preparationLease)
         && requestedInstanceId
         && requestedEnableGeneration) {
-        const preparedRecord = assertAdditivePreparedRuntimeIdentity(options.preparationLease, {
+        const assertPrepared = options.preparationLease.mode === 'additive'
+            ? assertAdditivePreparedRuntimeIdentity
+            : assertPreparedRuntimeIdentity;
+        const preparedRecord = assertPrepared(options.preparationLease, {
             containerName: options.containerName,
             instanceId: requestedInstanceId,
             enableGeneration: requestedEnableGeneration,
@@ -3179,7 +3213,7 @@ export function assertPreparedRegistryRecordPreservation(existingRecord, options
             : null;
         if (!canonicalProvided || !isDeepStrictEqual(preparedRecord, canonicalProvided)) {
             throw new Error(
-                `preserving the additive registry record for ${ownerRef} requires the exact immutable prepared record`,
+                `preserving the ${options.preparationLease.mode} registry record for ${ownerRef} requires the exact immutable prepared record`,
             );
         }
         return true;
@@ -3201,10 +3235,10 @@ function capturePreparedRegistryRecord(containerName, runtimeIdentity) {
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
     });
-    // Additive preparation deliberately leaves the active predecessor's
-    // mutable registry untouched. Its immutable candidate record is therefore
-    // the staged launch authority until the additive commit publishes it.
-    if (runtimeIdentity.preparationLease.mode === 'additive') {
+    // Additive and withdrawn preparations deliberately leave the active
+    // predecessor's mutable registry untouched. Their immutable candidate
+    // record is therefore the staged launch authority until their commit.
+    if (isActiveBoundPreparationLease(runtimeIdentity.preparationLease)) {
         return structuredClone(prepared);
     }
     const record = loadAgentsMap()?.[containerName];
@@ -3257,6 +3291,22 @@ export function getFailedRuntimeIdentityRotation(error) {
         : null;
 }
 
+// Remove the automatic drain of one exact runtime from a candidate routing
+// document. Its replacement candidate reopens those routes without a target;
+// only the replacement's commit publishes a ready target.
+function reopenAutomaticDrains(routing, containerName, record) {
+    for (const route of Object.values(routing?.routes || {})) {
+        if (!route || route.container !== containerName || route.draining !== true) continue;
+        const owner = route.drainOwner;
+        if (!owner || owner.containerName !== containerName
+            || owner.instanceId !== String(record?.instanceId || '')
+            || owner.enableGeneration !== String(record?.enableGeneration || '')) continue;
+        delete route.draining;
+        delete route.drainOwner;
+    }
+    return routing;
+}
+
 export function coordinateReplacementRuntimeIdentity({
     containerName,
     existingRecord,
@@ -3271,9 +3321,14 @@ export function coordinateReplacementRuntimeIdentity({
     assertNetworkCapability = assertNetworkLifecycleCapability,
     prepare = prepareAdditiveEdgeRoutingGeneration,
     prepareReplacement = prepareEdgeRoutingGenerationRaw,
+    commitWithdrawal = commitWithdrawalEdgeRoutingGeneration,
+    prepareWithdrawn = prepareWithdrawnReplacementEdgeRoutingGeneration,
     inactivate = inactivateEdgeRoutingGeneration,
     loadRegistry = loadAgentsMap,
     loadRouting = readRoutingConfig,
+    // Read only to find an automatic drain to reopen; a same-name rotation
+    // otherwise never loads or rewrites routing.
+    loadDrainRouting = readRoutingConfig,
     saveRegistry = saveAgentsMap,
     saveRouting = writeRoutingConfig,
     withApplyLock = withEdgeGenerationApplyLock,
@@ -3285,8 +3340,8 @@ export function coordinateReplacementRuntimeIdentity({
         throw new Error('coordinated runtime replacement requires an exact container name');
     }
     // Fixed host publications cannot be acquired by a staged candidate while
-    // its predecessor owns them. Rotate through the inactive same-name path,
-    // whose managed transaction removes the exact predecessor before launch.
+    // its predecessor owns them. Rotate under the same name instead: the
+    // launch removes the exact predecessor before it starts the replacement.
     if (portMappings.some((mapping) => Number(mapping?.hostPort) > 0)) {
         stageAlongsidePredecessor = false;
         preserveActiveAuthorization = false;
@@ -3301,11 +3356,38 @@ export function coordinateReplacementRuntimeIdentity({
     let candidateContainerName = exactContainerName;
     let prepared;
     let stagedRotation = null;
+    let withdrawnRotation = false;
     let rotationPhase = 'registry-save';
     try {
     withApplyLock((applyLockCapability) => {
         if (!preserveActiveAuthorization) {
-            inactivate(coordinationReason, { applyLockCapability });
+            // Withdraw only this runtime's routes from the active generation,
+            // then prepare its replacement identity beside that drained
+            // predecessor in the same apply-lock hold (D3, D4); every other
+            // route stays served. A selector that is not active, or a
+            // withdrawal that cannot be proven a subset, takes the inactive
+            // same-name rotation below (D7). The drain owner is the expected
+            // predecessor; the withdrawal proves it is the registered one.
+            try {
+                commitWithdrawal({
+                    withdraw: [{
+                        containerName: exactContainerName,
+                        mode: 'drain',
+                        drainOwner: {
+                            containerName: exactContainerName,
+                            instanceId: String(existingRecord?.instanceId || ''),
+                            enableGeneration: String(existingRecord?.enableGeneration || ''),
+                            reason: 'replacement',
+                        },
+                    }],
+                    reason: `${coordinationReason}:withdraw`,
+                    applyLockCapability,
+                });
+                withdrawnRotation = true;
+            } catch (error) {
+                if (edgeWithdrawalRefusalDisposition(error) === 'defer') throw error;
+                inactivate(coordinationReason, { applyLockCapability });
+            }
         }
         const agents = loadRegistry();
         const current = agents?.[exactContainerName];
@@ -3330,15 +3412,13 @@ export function coordinateReplacementRuntimeIdentity({
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
         };
-        const routing = candidateContainerName !== exactContainerName ? loadRouting() : null;
-        if (routing) {
+        if (preserveActiveAuthorization) {
+            const routing = reopenAutomaticDrains(loadRouting(), exactContainerName, current);
             for (const route of Object.values(routing?.routes || {})) {
                 if (route && route.container === exactContainerName) {
                     route.container = candidateContainerName;
                 }
             }
-        }
-        if (preserveActiveAuthorization) {
             prepared = prepare({
                 agents,
                 routing,
@@ -3351,6 +3431,31 @@ export function coordinateReplacementRuntimeIdentity({
         // Retire it before a non-additive write replaces or removes that tuple.
         // Additive preparation above retains the active predecessor until commit.
         retireNoWaitMarker(exactContainerName, { expectedRecord: current });
+        if (withdrawnRotation) {
+            // Once drained, the route stays drained until a proven commit; a
+            // failed preparation is retried from the drain owner.
+            prepared = prepareWithdrawn({
+                containerName: exactContainerName,
+                agents,
+                reason: coordinationReason,
+                applyLockCapability,
+            });
+            return;
+        }
+        // An automatic drain left by an earlier withdrawal reopens with the
+        // replacement, which publishes the route's target when it commits.
+        const drainRouting = loadDrainRouting();
+        const drainRoutingBefore = JSON.stringify(drainRouting);
+        reopenAutomaticDrains(drainRouting, exactContainerName, current);
+        const reopenedRouting = JSON.stringify(drainRouting) !== drainRoutingBefore ? drainRouting : null;
+        const routing = candidateContainerName !== exactContainerName ? (reopenedRouting || loadRouting()) : reopenedRouting;
+        if (routing && candidateContainerName !== exactContainerName) {
+            for (const route of Object.values(routing?.routes || {})) {
+                if (route && route.container === exactContainerName) {
+                    route.container = candidateContainerName;
+                }
+            }
+        }
         // Capture before the write: persistence can succeed and then throw.
         // This receipt records only this coordinator's attempted rotation;
         // consumers must still match the exact live staged registry record.
@@ -3386,7 +3491,9 @@ export function coordinateReplacementRuntimeIdentity({
     const preparedRecord = prepared?.generation?.agents?.[candidateContainerName];
     const preparationMatchesMode = preserveActiveAuthorization
         ? prepared?.selector?.state === 'active' && prepared?.preparationLease?.mode === 'additive'
-        : prepared?.selector?.state === 'inactive' && prepared?.preparationLease?.mode !== 'additive';
+        : withdrawnRotation
+            ? prepared?.selector?.state === 'active' && prepared?.preparationLease?.mode === 'withdrawn'
+            : prepared?.selector?.state === 'inactive' && !isActiveBoundPreparationLease(prepared?.preparationLease);
     if (!preparationMatchesMode
         || (candidateContainerName !== exactContainerName
             && prepared?.generation?.agents?.[exactContainerName] !== undefined)
@@ -3401,14 +3508,14 @@ export function coordinateReplacementRuntimeIdentity({
                 aborted = true;
             }
         } catch (_) {}
-        if (!preserveActiveAuthorization && !aborted) {
+        if (!preserveActiveAuthorization && !withdrawnRotation && !aborted) {
             try {
                 inactivate(`${coordinationReason}:identity-mismatch`, {
                     preserveSelectedGeneration: true,
                 });
             } catch (_) {}
         }
-        throw new Error(preserveActiveAuthorization
+        throw new Error(preserveActiveAuthorization || withdrawnRotation
             ? `coordinated replacement candidate did not retain the active predecessor with the fresh runtime identity for '${exactContainerName}'`
             : `coordinated replacement candidate did not remain inactive with the fresh runtime identity for '${exactContainerName}'`);
     }
@@ -3487,13 +3594,21 @@ export function resolveReplacementRuntimeIdentity({
 
 export function assertAgentServiceNotDraining(containerName, {
     targetedRestart = false,
+    expectedPredecessor = null,
     loadRouting = readRoutingConfig,
 } = {}) {
     if (targetedRestart) return;
-    const draining = Object.values(loadRouting()?.routes || {}).some((route) => (
+    const draining = Object.values(loadRouting()?.routes || {}).filter((route) => (
         route?.container === containerName && route.draining === true
     ));
-    if (draining) {
+    // An automatic drain admits the Watchdog or replacement restart of exactly
+    // the runtime it withdrew; an operator drain has no owner and still blocks.
+    const admitted = draining.length > 0 && Boolean(expectedPredecessor) && draining.every((route) => (
+        route.drainOwner?.containerName === containerName
+        && route.drainOwner.instanceId === String(expectedPredecessor.instanceId || '')
+        && route.drainOwner.enableGeneration === String(expectedPredecessor.enableGeneration || '')
+    ));
+    if (draining.length > 0 && !admitted) {
         const error = new Error(`agent '${containerName}' still requires an acknowledged targeted drain; automatic replacement is blocked`);
         error.code = 'PLOINKY_AGENT_DRAINING';
         throw error;
@@ -3721,7 +3836,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = containerOverride || getAgentContainerName(agentName, repoName);
-    assertAgentServiceNotDraining(containerName, { targetedRestart: Boolean(targetedRestart) });
+    assertAgentServiceNotDraining(containerName, {
+        targetedRestart: Boolean(targetedRestart),
+        expectedPredecessor: options.expectedPredecessor || null,
+    });
     const snapshot = loadAgentsMap();
     const existingRecord = snapshot[containerName] || {};
     const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
