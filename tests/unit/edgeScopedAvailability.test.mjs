@@ -370,3 +370,331 @@ test('D5 other transports, relays and dependency selection keep excluding a drai
     assert.equal(other.kind, 'agent-root');
     assert.equal(other.target.hostPort, 43103);
 });
+
+const { withEdgeSelectionObserver } = await import('../../cli/sandbox/edgeSelectionMutations.mjs');
+const { refusalOutcome } = await import('./hardwareAvailabilityFixtures.mjs');
+const { buildAvailabilityProjection } = await import('../../cli/server/hardwareAvailability.mjs');
+
+function edgeStateBytes() {
+    const files = [
+        path.join(ploinkyDir, 'routing.json'),
+        path.join(ploinkyDir, 'agents.json'),
+        path.join(edgeDir, 'active.json'),
+        path.join(ploinkyDir, 'run', 'edge-topology', 'current.json'),
+    ];
+    return {
+        files: Object.fromEntries(files.map((file) => [file, fs.readFileSync(file).toString('base64')])),
+        generations: fs.readdirSync(path.join(edgeDir, 'generations')).sort(),
+    };
+}
+
+function withdraw(entries, options = {}) {
+    const writes = [];
+    const result = withEdgeSelectionObserver((record) => writes.push(record), () => edge.withEdgeGenerationApplyLock(
+        (applyLockCapability) => edge.commitWithdrawalEdgeRoutingGeneration({
+            workspaceRoot: workspace,
+            withdraw: entries,
+            applyLockCapability,
+            ...options,
+        }),
+        { workspaceRoot: workspace },
+    ));
+    return { result, writes };
+}
+
+function assertRefusedWithoutWrite(entries, code, options = {}, message = /./) {
+    const before = edgeStateBytes();
+    const writes = [];
+    assert.throws(
+        () => withEdgeSelectionObserver((record) => writes.push(record), () => edge.withEdgeGenerationApplyLock(
+            (applyLockCapability) => edge.commitWithdrawalEdgeRoutingGeneration({
+                workspaceRoot: workspace,
+                withdraw: entries,
+                applyLockCapability,
+                ...options,
+            }),
+            { workspaceRoot: workspace },
+        )),
+        (error) => error.code === code && message.test(error.message),
+    );
+    assert.deepEqual(writes, [], 'a refused withdrawal never writes the selector');
+    assert.deepEqual(edgeStateBytes(), before, 'a refused withdrawal leaves every edge byte identical');
+}
+
+const BETA_OWNER = Object.freeze({
+    containerName: 'beta-container',
+    instanceId: 'beta-instance',
+    enableGeneration: 'beta-enable-generation',
+    reason: 'probe-failure',
+});
+
+test('A5 a removal flips the selector active to active and drops only the withdrawn runtime', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    const before = activeSelector();
+    const { result, writes } = withdraw([{ containerName: 'beta-container', mode: 'remove' }]);
+    assert.equal(writes.length, 1);
+    assert.deepEqual(writes.map((entry) => [entry.before.state, entry.after.state]), [['active', 'active']]);
+    assert.equal(result.selector.state, 'active');
+    assert.equal(result.selector.publicationState, 'ready');
+    assert.notEqual(result.selector.generation, before.generation);
+    const active = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    assert.equal(active.generation.routing.routes.beta, undefined);
+    assert.equal(active.generation.agents['beta-container'], undefined);
+    assert.equal(active.generation.routing.routes.gamma.hostPort, 43103);
+    assert.equal(readRouting().routes.beta, undefined, 'mutable sources follow the committed generation');
+
+    // Replaying the same removal is inert.
+    assertRefusedWithoutWrite([{ containerName: 'beta-container', mode: 'remove' }], 'EDGE_WITHDRAWAL_NOT_SUBSET');
+});
+
+test('A5 a drain keeps the identity, records its automatic owner and is idempotent', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    const { writes } = withdraw([{ containerName: 'beta-container', mode: 'drain', drainOwner: BETA_OWNER }]);
+    assert.deepEqual(writes.map((entry) => [entry.before.state, entry.after.state]), [['active', 'active']]);
+    const active = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    const route = active.generation.routing.routes.beta;
+    assert.equal(route.draining, true);
+    assert.equal(route.hostPort, undefined);
+    assert.deepEqual(route.drainOwner, BETA_OWNER);
+    assert.equal(active.generation.agents['beta-container'].instanceId, 'beta-instance');
+
+    const again = withdraw([{ containerName: 'beta-container', mode: 'drain', drainOwner: { ...BETA_OWNER, reason: 'replacement' } }]);
+    assert.equal(again.result.unchanged, true);
+    assert.deepEqual(again.writes, []);
+    assert.deepEqual(edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace })
+        .generation.routing.routes.beta.drainOwner, BETA_OWNER, 'an admitting owner is kept');
+
+    assertRefusedWithoutWrite([{
+        containerName: 'gamma-container',
+        mode: 'drain',
+        drainOwner: { ...BETA_OWNER, containerName: 'gamma-container' },
+    }], 'EDGE_WITHDRAWAL_OWNER_STALE');
+});
+
+test('A5 an unavailable withdrawal only removes targets and adds the validated projection', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    const projection = buildAvailabilityProjection({
+        outcome: refusalOutcome('beta-container', { ref: 'fixtures/beta' }),
+        instanceId: 'beta-instance',
+        enableGeneration: 'beta-enable-generation',
+    });
+    const { writes } = withdraw([{ containerName: 'beta-container', mode: 'unavailable', projection }]);
+    assert.deepEqual(writes.map((entry) => [entry.before.state, entry.after.state]), [['active', 'active']]);
+    const active = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    const route = active.generation.routing.routes.beta;
+    assert.equal(route.hostPort, undefined);
+    assert.equal(route.draining, undefined);
+    assert.equal(route.drainOwner, undefined);
+    assert.equal(route.hardwareAvailability.key, 'beta-container');
+    assert.equal(active.generation.compiled.hardwareAvailability.beta.state, 'refused');
+});
+
+test('A5 a removal that disambiguates a dependency name reference is refused without writing', () => {
+    resetWorkspace({
+        publicationState: 'ready',
+        desired: cloudflareDesired({
+            hosts: { [PUBLIC_HOST]: { agent: 'fixtures/alpha', routerSurfaces: ['agent-mcp'] } },
+        }),
+        manifests: { alpha: { enable: ['beta'] } },
+        routing: {
+            routes: {
+                alpha: route('alpha', 43101),
+                'beta-one': route('beta', 43102, { repo: 'one', alias: 'beta-one' }),
+                'beta-two': route('beta', 43104, { repo: 'two', alias: 'beta-two', container: 'beta-two-container', hostPath: path.join(repoDir, 'gamma') }),
+            },
+        },
+        agents: {
+            'alpha-container': agentRecord('alpha'),
+            'beta-container': agentRecord('beta', { repoName: 'one', alias: 'beta-one' }),
+            'beta-two-container': agentRecord('beta', { repoName: 'two', alias: 'beta-two' }),
+        },
+    });
+    const before = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    assert.deepEqual(before.generation.compiled.agentMcpRoutes[PUBLIC_HOST], ['alpha'], 'the ambiguous name resolves to nothing');
+    assertRefusedWithoutWrite([{ containerName: 'beta-two-container', mode: 'remove' }], 'EDGE_WITHDRAWAL_NOT_SUBSET', {}, /agentMcpRoutes/);
+});
+
+test('A5 removing the routing static agent is refused when it changes a route default', () => {
+    resetWorkspace({
+        publicationState: 'ready',
+        routing: {
+            static: { agent: 'beta', container: 'beta-container' },
+            routes: {
+                alpha: route('alpha', 43101),
+                beta: route('beta', 43102),
+                gamma: route('gamma', 43103),
+            },
+        },
+        agents: {
+            'alpha-container': agentRecord('alpha'),
+            'beta-container': agentRecord('beta'),
+            'gamma-container': agentRecord('gamma', { auth: { mode: 'none' } }),
+        },
+    });
+    const before = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    assert.equal(before.generation.compiled.policy.routeDefaults.gamma.access, 'authenticated');
+    assertRefusedWithoutWrite([{ containerName: 'beta-container', mode: 'remove' }], 'EDGE_WITHDRAWAL_NOT_SUBSET', {}, /route defaults\.gamma/);
+});
+
+test('A5 a withdrawal refuses an unknown runtime, an outstanding preparation and changed sources', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    assertRefusedWithoutWrite([{ containerName: 'missing-container', mode: 'remove' }], 'EDGE_WITHDRAWAL_NOT_SUBSET');
+
+    const routing = readRouting();
+    routing.routes.gamma.hostPort = 43999;
+    writeJson(path.join(ploinkyDir, 'routing.json'), routing);
+    assertRefusedWithoutWrite([{ containerName: 'beta-container', mode: 'remove' }], 'EDGE_GENERATION_SOURCE_CHANGED');
+
+    resetWorkspace({ publicationState: 'ready' });
+    const lease = edge.withEdgeGenerationApplyLock((applyLockCapability) => edge.prepareAdditiveEdgeRoutingGeneration({
+        workspaceRoot: workspace,
+        applyLockCapability,
+    }).preparationLease, { workspaceRoot: workspace });
+    assertRefusedWithoutWrite([{ containerName: 'beta-container', mode: 'remove' }], 'EDGE_PREPARATION_BUSY');
+    edge.abortEdgeRoutingPreparation(lease, { workspaceRoot: workspace });
+    assert.equal(edge.edgeWithdrawalRefusalDisposition({ code: 'EDGE_PREPARATION_BUSY' }), 'defer');
+    assert.equal(edge.edgeWithdrawalRefusalDisposition({ code: 'EDGE_GENERATION_BUSY' }), 'defer');
+    assert.equal(edge.edgeWithdrawalRefusalDisposition({ code: 'EDGE_WITHDRAWAL_NOT_SUBSET' }), 'global');
+});
+
+test('A5 a failure before the selector commit restores the predecessor sources and keeps it active', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    const before = edgeStateBytes();
+    const selector = activeSelector();
+    assert.throws(() => withdraw([{ containerName: 'beta-container', mode: 'remove' }], {
+        testHooks: { beforeSelectorCommit() { throw Object.assign(new Error('injected'), { code: 'INJECTED' }); } },
+    }), /injected/);
+    assert.deepEqual(activeSelector(), selector);
+    const after = edgeStateBytes();
+    for (const [file, bytes] of Object.entries(before.files)) {
+        if (file.endsWith('current.json')) continue;
+        assert.equal(after.files[file], bytes, `${file} restored`);
+    }
+});
+
+function drainBeta() {
+    withdraw([{ containerName: 'beta-container', mode: 'drain', drainOwner: BETA_OWNER }]);
+    return activeSelector();
+}
+
+function rotatedBetaAgents(extra = {}) {
+    const agents = readAgents();
+    agents['beta-container'] = {
+        ...agents['beta-container'],
+        instanceId: 'beta-next-instance',
+        enableGeneration: 'beta-next-generation',
+        containerId: 'beta-next-container-id',
+        ...extra,
+    };
+    return agents;
+}
+
+function prepareWithdrawn(agents, options = {}) {
+    return edge.withEdgeGenerationApplyLock((applyLockCapability) => edge.prepareWithdrawnReplacementEdgeRoutingGeneration({
+        workspaceRoot: workspace,
+        containerName: 'beta-container',
+        agents,
+        applyLockCapability,
+        ...options,
+    }), { workspaceRoot: workspace });
+}
+
+function reopenedRouting(hostPort) {
+    const routing = readRouting();
+    routing.routes.beta = { ...routing.routes.beta, hostPort };
+    delete routing.routes.beta.draining;
+    delete routing.routes.beta.drainOwner;
+    return routing;
+}
+
+test('D4 a withdrawn replacement prepares beside the drained active predecessor and commits active to active', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    const drained = drainBeta();
+    const mutableBefore = edgeStateBytes();
+    const agents = rotatedBetaAgents();
+    const prepared = prepareWithdrawn(agents);
+    assert.equal(prepared.preparationLease.mode, 'withdrawn');
+    assert.equal(prepared.preparationLease.predecessorGeneration, drained.generation);
+    assert.deepEqual(activeSelector(), drained, 'preparation never moves the selector');
+    for (const [file, bytes] of Object.entries(mutableBefore.files)) {
+        if (!file.endsWith('current.json')) assert.equal(edgeStateBytes().files[file], bytes, `${file} unchanged`);
+    }
+    const candidateRoute = prepared.generation.routing.routes.beta;
+    assert.equal(candidateRoute.draining, undefined);
+    assert.equal(candidateRoute.drainOwner, undefined);
+    assert.equal(candidateRoute.hostPort, undefined, 'the candidate grants no target before its commit');
+
+    const writes = [];
+    const committed = withEdgeSelectionObserver((entry) => writes.push(entry), () => edge.withEdgeGenerationApplyLock(
+        (applyLockCapability) => edge.commitAdditiveEdgeRoutingGeneration(prepared.preparationLease, {
+            workspaceRoot: workspace,
+            routing: reopenedRouting(43902),
+            agents,
+            applyLockCapability,
+        }),
+        { workspaceRoot: workspace, preparationLease: prepared.preparationLease },
+    ));
+    assert.deepEqual(writes.map((entry) => [entry.before.state, entry.after.state]), [['active', 'active']]);
+    assert.equal(committed.selector.publicationState, 'ready');
+    const active = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    assert.equal(active.generation.routing.routes.beta.hostPort, 43902);
+    assert.equal(active.generation.routing.routes.beta.draining, undefined);
+    assert.equal(active.generation.routing.routes.beta.drainOwner, undefined);
+    assert.equal(active.generation.agents['beta-container'].instanceId, 'beta-next-instance');
+    assert.equal(edge.readEdgeRoutingPreparationOwner({ workspaceRoot: workspace }), null);
+});
+
+test('D4 a coordinated apply holding a withdrawn lease commits the written sources without an inactive window', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    drainBeta();
+    const agents = rotatedBetaAgents();
+    const prepared = prepareWithdrawn(agents);
+    writeJson(path.join(ploinkyDir, 'agents.json'), agents);
+    writeJson(path.join(ploinkyDir, 'routing.json'), reopenedRouting(43903));
+    const writes = [];
+    const applied = withEdgeSelectionObserver((entry) => writes.push(entry), () => edge.applyEdgeRoutingGeneration({
+        workspaceRoot: workspace,
+        reason: 'd4-withdrawn-apply',
+        preparationLease: prepared.preparationLease,
+    }));
+    assert.deepEqual(writes.map((entry) => [entry.before.state, entry.after.state]), [['active', 'active']]);
+    assert.equal(applied.selector.publicationState, 'ready');
+    assert.equal(edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }).generation.routing.routes.beta.hostPort, 43903);
+});
+
+test('D4 a withdrawn commit that would keep the drain fails and leaves the route drained and active', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    const drained = drainBeta();
+    const agents = rotatedBetaAgents();
+    const prepared = prepareWithdrawn(agents);
+    const routing = readRouting();
+    routing.routes.beta = { ...routing.routes.beta, hostPort: 43904 };
+    assert.throws(() => edge.withEdgeGenerationApplyLock(
+        (applyLockCapability) => edge.commitAdditiveEdgeRoutingGeneration(prepared.preparationLease, {
+            workspaceRoot: workspace,
+            routing,
+            agents,
+            applyLockCapability,
+        }),
+        { workspaceRoot: workspace, preparationLease: prepared.preparationLease },
+    ), { code: 'EDGE_PREPARATION_SOURCE_CHANGED' });
+    assert.deepEqual(activeSelector(), drained);
+    edge.abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: workspace });
+    assert.deepEqual(activeSelector(), drained, 'an aborted withdrawn preparation keeps the drained predecessor active');
+    assert.equal(edge.readEdgeRoutingPreparationOwner({ workspaceRoot: workspace }), null);
+    assert.equal(readRouting().routes.beta.draining, true);
+});
+
+test('D4 a withdrawn preparation requires drained routes and may change only the runtime identity', () => {
+    resetWorkspace({ publicationState: 'ready' });
+    assert.throws(() => prepareWithdrawn(rotatedBetaAgents()), { code: 'EDGE_WITHDRAWAL_NOT_DRAINED' });
+    drainBeta();
+    assert.throws(() => prepareWithdrawn(rotatedBetaAgents({ profile: 'other' })), { code: 'EDGE_WITHDRAWAL_NOT_SUBSET' });
+    const otherChanged = rotatedBetaAgents();
+    otherChanged['gamma-container'] = { ...otherChanged['gamma-container'], instanceId: 'gamma-other' };
+    assert.throws(() => prepareWithdrawn(otherChanged), { code: 'EDGE_WITHDRAWAL_NOT_SUBSET' });
+    const prepared = prepareWithdrawn(rotatedBetaAgents());
+    assert.throws(() => prepareWithdrawn(rotatedBetaAgents()), { code: 'EDGE_PREPARATION_BUSY' });
+    assertRefusedWithoutWrite([{ containerName: 'gamma-container', mode: 'remove' }], 'EDGE_PREPARATION_BUSY');
+    edge.abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: workspace });
+});

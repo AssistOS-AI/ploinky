@@ -33,7 +33,11 @@ import {
     selectedMediaHostPort,
     selectedRouterHostPort,
 } from './routerPort.js';
-import { compileHardwareAvailability, validateAvailabilityProjection } from '../server/hardwareAvailability.mjs';
+import {
+    compileHardwareAvailability,
+    markRouteHardwareUnavailable,
+    validateAvailabilityProjection,
+} from '../server/hardwareAvailability.mjs';
 import {
     inspectHardwareAvailabilityStore,
     installHardwareAvailabilityStore,
@@ -82,6 +86,16 @@ const TOPOLOGY_STATES = new Set([
     'error',
 ]);
 const EDGE_PREPARATION_LEASE_SCHEMA_VERSION = 3;
+// Preparation lease modes. A replacement lease binds one exact inactive
+// selector. Additive and withdrawn leases bind the exact active predecessor
+// whose mutable sources stay untouched until their commit: an additive
+// candidate stages beside its predecessor, a withdrawn candidate replaces the
+// identity of a runtime whose routes that predecessor already withdrew.
+const PREPARATION_LEASE_MODES = Object.freeze(['replacement', 'additive', 'withdrawn']);
+const ACTIVE_BOUND_LEASE_MODES = new Set(['additive', 'withdrawn']);
+const DRAIN_OWNER_REASONS = new Set(['probe-failure', 'replacement', 'hardware-readback']);
+const DRAIN_OWNER_KEYS = Object.freeze(['containerName', 'enableGeneration', 'instanceId', 'reason']);
+const COMMIT_FROM_MUTABLE_SOURCES = Symbol('commitFromMutableSources');
 const APPLY_LOCK_CAPABILITIES = new WeakMap();
 const PREPARED_HOST_MODE_CAPABILITIES = new WeakMap();
 
@@ -830,6 +844,23 @@ function normalizeDesired(desired) {
     };
 }
 
+// The automatic owner of a drain: the exact runtime identity whose withdrawal
+// a Watchdog or replacement restart may complete. An operator drain has none.
+function normalizeDrainOwner(value, label = 'drain owner') {
+    if (!isPlainObject(value)
+        || stableStringify(Object.keys(value).sort()) !== stableStringify(DRAIN_OWNER_KEYS)
+        || DRAIN_OWNER_KEYS.some((key) => typeof value[key] !== 'string' || !value[key])
+        || !DRAIN_OWNER_REASONS.has(value.reason)) {
+        throw edgeError(`${label} must name one exact container, instanceId, enableGeneration and automatic reason`);
+    }
+    return {
+        containerName: value.containerName,
+        instanceId: value.instanceId,
+        enableGeneration: value.enableGeneration,
+        reason: value.reason,
+    };
+}
+
 function validateRoutingShape(routing, manifests) {
     assertObject(routing, 'routing state');
     const routes = routing.routes === undefined ? {} : assertObject(routing.routes, 'routing.routes');
@@ -846,6 +877,12 @@ function validateRoutingShape(routing, manifests) {
         }
         if (route.draining !== undefined && typeof route.draining !== 'boolean') {
             throw edgeError(`routing.routes.${routeKey}.draining must be a boolean`);
+        }
+        if (route.drainOwner !== undefined) {
+            normalizeDrainOwner(route.drainOwner, `routing.routes.${routeKey}.drainOwner`);
+            if (route.draining !== true || String(route.container || '') !== route.drainOwner.containerName) {
+                throw edgeError(`routing.routes.${routeKey}.drainOwner requires a draining route of its exact container`);
+            }
         }
         const manifest = manifests[routeKey];
         if (manifest) {
@@ -1846,7 +1883,7 @@ export function prepareHostModeCapabilityForInactiveGeneration(owner, options = 
         : null;
     if (preparationLease) assertPreparedSelectorStillSelected(paths, preparationLease);
     const selector = readSelector(paths);
-    const generationId = preparationLease?.mode === 'additive'
+    const generationId = ACTIVE_BOUND_LEASE_MODES.has(preparationLease?.mode)
         ? preparationLease.preparedGeneration
         : selector?.generation;
     if (!generationId
@@ -2091,8 +2128,8 @@ function readPreparationLease(paths) {
             || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(String(lease.transactionId || ''))
             || !/^sha256:[a-f0-9]{64}$/.test(String(lease.preparedGeneration || ''))
             || !/^sha256:[a-f0-9]{64}$/.test(String(lease.lifecycleBindingDigest || ''))
-            || !['replacement', 'additive'].includes(String(lease.mode || ''))
-            || (lease.mode === 'additive' && !/^sha256:[a-f0-9]{64}$/.test(String(lease.predecessorGeneration || '')))
+            || !PREPARATION_LEASE_MODES.includes(String(lease.mode || ''))
+            || (ACTIVE_BOUND_LEASE_MODES.has(lease.mode) && !/^sha256:[a-f0-9]{64}$/.test(String(lease.predecessorGeneration || '')))
             || (lease.mode === 'replacement' && String(lease.predecessorGeneration || '') !== '')
             || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(String(lease.selectorActivationId || ''))
             || !/^sha256:[a-f0-9]{64}$/.test(String(lease.selectorDigest || ''))
@@ -2118,8 +2155,8 @@ function normalizePreparationLease(value) {
     const mode = String(value.mode || '');
     const predecessorGeneration = String(value.predecessorGeneration || '');
     if (!transactionId || !preparedGeneration || !binding || !selectorActivationId || !selectorDigest
-        || !['replacement', 'additive'].includes(mode)
-        || (mode === 'additive' && !predecessorGeneration)
+        || !PREPARATION_LEASE_MODES.includes(mode)
+        || (ACTIVE_BOUND_LEASE_MODES.has(mode) && !predecessorGeneration)
         || (mode === 'replacement' && predecessorGeneration)) return null;
     return {
         transactionId,
@@ -2137,13 +2174,13 @@ function createPreparationLease(paths, captured, reason, { mode = 'replacement',
         throw edgeError('another edge lifecycle preparation is already outstanding', 'EDGE_PREPARATION_BUSY');
     }
     const selector = suppliedSelector || readSelector(paths);
-    const validSelector = mode === 'additive'
+    const validSelector = ACTIVE_BOUND_LEASE_MODES.has(mode)
         ? selector?.state === 'active' && Boolean(selector.generation)
         : selector?.state === 'inactive' && selector.generation === captured.generation;
     if (!validSelector || !selector.activationId || !selector.selectorDigest) {
         throw edgeError(
-            mode === 'additive'
-                ? 'additive edge preparation requires the exact predecessor generation to remain active'
+            ACTIVE_BOUND_LEASE_MODES.has(mode)
+                ? `${mode} edge preparation requires the exact predecessor generation to remain active`
                 : 'edge preparation requires the exact captured generation to remain selected and inactive',
             'EDGE_PREPARATION_RACE',
         );
@@ -2154,7 +2191,7 @@ function createPreparationLease(paths, captured, reason, { mode = 'replacement',
         preparedGeneration: captured.generation,
         lifecycleBindingDigest: lifecycleBindingDigest(captured),
         mode,
-        predecessorGeneration: mode === 'additive' ? selector.generation : '',
+        predecessorGeneration: ACTIVE_BOUND_LEASE_MODES.has(mode) ? selector.generation : '',
         selectorActivationId: selector.activationId,
         selectorDigest: selector.selectorDigest,
         reason: String(reason || 'edge-generation-prepare-inactive'),
@@ -2203,10 +2240,10 @@ function assertPreparationLeaseForApply(paths, provided, { preparing = false } =
 function assertPreparedSelectorStillSelected(paths, lease) {
     if (!lease) return;
     const selector = readSelector(paths);
-    const expectedGeneration = lease.mode === 'additive'
+    const expectedGeneration = ACTIVE_BOUND_LEASE_MODES.has(lease.mode)
         ? lease.predecessorGeneration
         : lease.preparedGeneration;
-    const expectedState = lease.mode === 'additive' ? 'active' : 'inactive';
+    const expectedState = ACTIVE_BOUND_LEASE_MODES.has(lease.mode) ? 'active' : 'inactive';
     if (selector?.state !== expectedState
         || selector.generation !== expectedGeneration
         || selector.activationId !== lease.selectorActivationId
@@ -2751,6 +2788,17 @@ export function applyEdgeRoutingGeneration(options = {}) {
     let applyLockHeld = true;
     let transactionStarted = false;
     try {
+        // A withdrawn lease commits active to active: its predecessor already
+        // withdrew the replaced runtime's routes, so no inactive window is
+        // needed. Every other check is the additive commit's.
+        if (normalizePreparationLease(options.preparationLease)?.mode === 'withdrawn'
+            && options.activate !== false && options.createPreparationLease !== true) {
+            return commitAdditiveEdgeRoutingGeneration(options.preparationLease, {
+                ...options,
+                applyLockCapability,
+                [COMMIT_FROM_MUTABLE_SOURCES]: true,
+            });
+        }
         const expectedGeneration = options.expectedGeneration === undefined
             ? null
             : String(options.expectedGeneration || '');
@@ -3078,18 +3126,26 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
         );
     }
     const lease = assertPreparationLeaseForApply(paths, preparationLease);
-    if (!lease || lease.mode !== 'additive') {
-        throw edgeError('additive edge commit requires one additive preparation lease', 'EDGE_PREPARATION_STALE');
+    if (!lease || !ACTIVE_BOUND_LEASE_MODES.has(lease.mode)) {
+        throw edgeError('additive edge commit requires one additive or withdrawn preparation lease', 'EDGE_PREPARATION_STALE');
     }
     assertPreparedSelectorStillSelected(paths, lease);
     const prepared = loadCapturedGeneration(paths, lease.preparedGeneration);
-    const captured = collectCandidateSources(paths, {
+    // A coordinated apply holding a withdrawn lease has already written its
+    // candidate into the mutable sources; anything else supplies it here and
+    // leaves the mutable sources at the active predecessor until commit.
+    const fromMutableSources = options[COMMIT_FROM_MUTABLE_SOURCES] === true;
+    const captured = fromMutableSources ? collectCapturedSources(paths) : collectCandidateSources(paths, {
         routing: options.routing === undefined ? prepared.bytes.routingBytes : options.routing,
         policy: options.policy === undefined ? prepared.bytes.policyBytes : options.policy,
         desired: options.desired === undefined ? prepared.bytes.desiredBytes : options.desired,
         agents: options.agents === undefined ? prepared.bytes.agentsBytes : options.agents,
         manifestBytes: options.manifestBytes === undefined ? prepared.bytes.manifestBytes : options.manifestBytes,
     });
+    if (fromMutableSources && options.expectedGeneration !== undefined
+        && captured.generation !== String(options.expectedGeneration || '')) {
+        throw edgeError('edge routing sources changed before exact generation commit', 'EDGE_GENERATION_RACE');
+    }
     if (lease.lifecycleBindingDigest !== lifecycleBindingDigest(captured)) {
         const changed = lifecycleBindingChangeLabels(prepared.generation, captured);
         const detail = changed.length
@@ -3113,12 +3169,14 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
             'EDGE_PREPARATION_SOURCE_CHANGED',
         );
     }
-    const predecessorSources = collectCapturedSources(paths);
-    if (predecessorSources.generation !== lease.predecessorGeneration) {
-        throw edgeError(
-            'mutable edge sources changed while the additive predecessor remained active',
-            'EDGE_GENERATION_SOURCE_CHANGED',
-        );
+    if (!fromMutableSources) {
+        const predecessorSources = collectCapturedSources(paths);
+        if (predecessorSources.generation !== lease.predecessorGeneration) {
+            throw edgeError(
+                'mutable edge sources changed while the additive predecessor remained active',
+                'EDGE_GENERATION_SOURCE_CHANGED',
+            );
+        }
     }
 
     let selectorCommitted = false;
@@ -3209,13 +3267,506 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
     }
 }
 
+const WITHDRAWAL_MODES = new Set(['remove', 'drain', 'unavailable']);
+
+function withdrawalError(message) {
+    return edgeError(`edge withdrawal is not a subset of its active predecessor: ${message}`, 'EDGE_WITHDRAWAL_NOT_SUBSET');
+}
+
+function sameRuntimeIdentity(record, owner) {
+    return isPlainObject(record) && record.type === 'agent'
+        && String(record.instanceId || '') === owner.instanceId
+        && String(record.enableGeneration || '') === owner.enableGeneration;
+}
+
+function drainedRoute(route, drainOwner) {
+    const next = { ...route, draining: true };
+    delete next.hostPort;
+    delete next.serviceTargets;
+    if (drainOwner) next.drainOwner = drainOwner;
+    else delete next.drainOwner;
+    return next;
+}
+
+function normalizeWithdrawals(withdraw) {
+    if (!Array.isArray(withdraw) || withdraw.length === 0) {
+        throw withdrawalError('it names no runtime');
+    }
+    const seen = new Set();
+    return withdraw.map((entry) => {
+        const containerName = String(entry?.containerName || '').trim();
+        const mode = String(entry?.mode || '');
+        if (!containerName || seen.has(containerName) || !WITHDRAWAL_MODES.has(mode)) {
+            throw withdrawalError('each entry must name one distinct container and a remove, drain or unavailable mode');
+        }
+        seen.add(containerName);
+        return {
+            containerName,
+            mode,
+            drainOwner: mode === 'drain' && entry.drainOwner !== undefined && entry.drainOwner !== null
+                ? normalizeDrainOwner(entry.drainOwner)
+                : null,
+            projection: mode === 'unavailable' ? validateAvailabilityProjection(entry.projection) : null,
+        };
+    });
+}
+
+// Derive the withdrawn candidate from the exact active predecessor. A caller
+// may supply its own routing/registry candidate (a disable that also clears
+// workspace configuration); proveWithdrawalSubset checks it either way.
+function deriveWithdrawalCandidate(predecessor, withdrawals, { routing: suppliedRouting, agents: suppliedAgents } = {}) {
+    const routing = suppliedRouting === undefined ? structuredClone(predecessor.routing) : structuredClone(suppliedRouting);
+    const agents = suppliedAgents === undefined ? structuredClone(predecessor.agents) : structuredClone(suppliedAgents);
+    routing.routes = isPlainObject(routing.routes) ? routing.routes : {};
+    for (const withdrawal of withdrawals) {
+        const { containerName, mode } = withdrawal;
+        const record = predecessor.agents?.[containerName];
+        const routeKeys = Object.entries(predecessor.routing?.routes || {})
+            .filter(([, route]) => String(route?.container || '') === containerName)
+            .map(([routeKey]) => routeKey);
+        if (mode === 'remove') {
+            if (!isPlainObject(record) && routeKeys.length === 0) {
+                throw withdrawalError(`'${containerName}' is neither registered nor routed`);
+            }
+            if (suppliedRouting === undefined) {
+                for (const routeKey of routeKeys) delete routing.routes[routeKey];
+                if (String(routing.static?.container || '') === containerName) delete routing.static;
+            }
+            if (suppliedAgents === undefined) delete agents[containerName];
+            continue;
+        }
+        if (!isPlainObject(record) || record.type !== 'agent' || routeKeys.length === 0) {
+            throw withdrawalError(`'${containerName}' has no registered routed runtime to ${mode}`);
+        }
+        if (withdrawal.drainOwner && (withdrawal.drainOwner.containerName !== containerName
+            || !sameRuntimeIdentity(record, withdrawal.drainOwner))) {
+            throw edgeError(`drain owner of '${containerName}' is not its registered runtime identity`, 'EDGE_WITHDRAWAL_OWNER_STALE');
+        }
+        for (const routeKey of routeKeys) {
+            const current = predecessor.routing.routes[routeKey];
+            if (mode === 'unavailable') {
+                routing.routes[routeKey] = markRouteHardwareUnavailable(current, withdrawal.projection);
+                continue;
+            }
+            if (current.draining === true && !current.drainOwner && withdrawal.drainOwner) {
+                throw edgeError(`'${containerName}' is held by an operator drain`, 'EDGE_WITHDRAWAL_OPERATOR_DRAIN');
+            }
+            // Re-draining an automatically drained route keeps the owner that
+            // already admits its restart, provided it names the same identity.
+            const owner = current.draining === true && current.drainOwner
+                && current.drainOwner.instanceId === withdrawal.drainOwner?.instanceId
+                && current.drainOwner.enableGeneration === withdrawal.drainOwner?.enableGeneration
+                ? current.drainOwner
+                : withdrawal.drainOwner;
+            routing.routes[routeKey] = drainedRoute(current, owner);
+        }
+    }
+    return { routing, agents };
+}
+
+function stableSet(values, key = (value) => stableStringify(value)) {
+    return new Set((values || []).map(key));
+}
+
+function assertSubsetOf(candidate, predecessor, label, key) {
+    const allowed = stableSet(predecessor, key);
+    for (const value of candidate || []) {
+        if (!allowed.has(key ? key(value) : stableStringify(value))) {
+            throw withdrawalError(`${label} gains ${JSON.stringify(value).slice(0, 200)}`);
+        }
+    }
+}
+
+function assertMapSubsetOf(candidate, predecessor, label) {
+    for (const [key, value] of Object.entries(candidate || {})) {
+        if (!Object.hasOwn(predecessor || {}, key) || stableStringify(predecessor[key]) !== stableStringify(value)) {
+            throw withdrawalError(`${label}.${key} changed`);
+        }
+    }
+}
+
+const routeEntryKey = (entry) => `${entry?.routeKey}\u0000${entry?.path}`;
+
+/**
+ * Prove that a withdrawal grants nothing its predecessor did not. Sources may
+ * change only by removing routes and registry records, draining routes or
+ * marking them unavailable; the compiled authority is then compared directly,
+ * because removing a route can still make a name reference unique or change a
+ * workspace default (RF-I2). Any other difference refuses the withdrawal.
+ */
+function proveWithdrawalSubset(predecessor, candidate, withdrawals) {
+    const byContainer = new Map(withdrawals.map((entry) => [entry.containerName, entry]));
+    for (const source of ['policy', 'desired', 'routerHostPort', 'mediaHostPort', 'routerPublicHosts']) {
+        if (predecessor.sourceDigests?.[source] !== candidate.sourceDigests?.[source]) {
+            throw withdrawalError(`${source} changed`);
+        }
+    }
+    for (const [routeKey, digest] of Object.entries(candidate.sourceDigests?.manifests || {})) {
+        if (predecessor.sourceDigests?.manifests?.[routeKey] !== digest) throw withdrawalError(`manifest(${routeKey}) changed`);
+    }
+
+    const beforeRoutes = predecessor.routing?.routes || {};
+    const afterRoutes = candidate.routing?.routes || {};
+    const removedRecords = withdrawals.filter((entry) => entry.mode === 'remove')
+        .map((entry) => ({ containerName: entry.containerName, record: predecessor.agents?.[entry.containerName] }));
+    for (const [routeKey, before] of Object.entries(beforeRoutes)) {
+        const after = afterRoutes[routeKey];
+        const withdrawal = byContainer.get(String(before?.container || ''));
+        if (after === undefined) {
+            const owned = removedRecords.some(({ containerName, record }) => (
+                String(before?.container || '') === containerName
+                || (record && String(before?.repo || '') === String(record.repoName || '')
+                    && String(before?.agent || '') === String(record.agentName || '')
+                    && String(before?.alias || '') === String(record.alias || ''))
+            ));
+            if (!owned) throw withdrawalError(`route '${routeKey}' was removed without withdrawing its runtime`);
+            continue;
+        }
+        let expected = before;
+        if (withdrawal?.mode === 'drain') {
+            expected = drainedRoute(before, after.drainOwner && before.drainOwner
+                && stableStringify(after.drainOwner) === stableStringify(before.drainOwner)
+                ? before.drainOwner
+                : withdrawal.drainOwner);
+        } else if (withdrawal?.mode === 'unavailable') {
+            expected = markRouteHardwareUnavailable(before, withdrawal.projection);
+        }
+        if (stableStringify(after) !== stableStringify(expected)) throw withdrawalError(`route '${routeKey}' changed`);
+    }
+    for (const routeKey of Object.keys(afterRoutes)) {
+        if (!Object.hasOwn(beforeRoutes, routeKey)) throw withdrawalError(`route '${routeKey}' was added`);
+    }
+    const { routes: _beforeRoutes, static: beforeStatic, ...beforeRouting } = predecessor.routing || {};
+    const { routes: _afterRoutes, static: afterStatic, ...afterRouting } = candidate.routing || {};
+    if (stableStringify(beforeRouting) !== stableStringify(afterRouting)) throw withdrawalError('routing configuration changed');
+    if (afterStatic !== undefined ? stableStringify(afterStatic) !== stableStringify(beforeStatic)
+        : beforeStatic !== undefined && !byContainer.has(String(beforeStatic.container || ''))) {
+        throw withdrawalError('the routing static agent changed');
+    }
+
+    const beforeAgents = predecessor.agents || {};
+    const afterAgents = candidate.agents || {};
+    for (const [key, value] of Object.entries(afterAgents)) {
+        if (!Object.hasOwn(beforeAgents, key)) throw withdrawalError(`registry record '${key}' was added`);
+        if (key === '_config' && isPlainObject(value) && isPlainObject(beforeAgents[key])) {
+            assertMapSubsetOf(value, beforeAgents[key], 'registry configuration');
+            continue;
+        }
+        if (stableStringify(value) !== stableStringify(beforeAgents[key])) throw withdrawalError(`registry record '${key}' changed`);
+    }
+    for (const key of Object.keys(beforeAgents)) {
+        if (!Object.hasOwn(afterAgents, key) && key !== '_config' && byContainer.get(key)?.mode !== 'remove') {
+            throw withdrawalError(`registry record '${key}' was removed without withdrawing it`);
+        }
+    }
+
+    const before = predecessor.compiled;
+    const after = candidate.compiled;
+    if (stableStringify(before.hosts) !== stableStringify(after.hosts)) throw withdrawalError('public host selection changed');
+    if (stableStringify(before.surfaces) !== stableStringify(after.surfaces)) throw withdrawalError('public host surfaces changed');
+    if (stableStringify(before.publication) !== stableStringify(after.publication)) throw withdrawalError('publication changed');
+    for (const hostname of Object.keys(after.hosts || {})) {
+        assertSubsetOf(after.agentMcpRoutes?.[hostname], before.agentMcpRoutes?.[hostname], `agentMcpRoutes(${hostname})`);
+        assertSubsetOf(after.dependencyHttpRoutes?.[hostname], before.dependencyHttpRoutes?.[hostname], `dependencyHttpRoutes(${hostname})`, routeEntryKey);
+        const beforeService = edgeHostServiceRoutes(predecessor, hostname);
+        const afterService = edgeHostServiceRoutes(candidate, hostname);
+        assertSubsetOf(afterService.agentMcpRoutes, beforeService.agentMcpRoutes, `host service MCP routes(${hostname})`);
+        assertSubsetOf(afterService.dependencyHttpRoutes, beforeService.dependencyHttpRoutes, `host service HTTP routes(${hostname})`, routeEntryKey);
+        assertSubsetOf(edgeWebchatTargets(candidate, hostname), edgeWebchatTargets(predecessor, hostname), `webchat targets(${hostname})`);
+    }
+    assertSubsetOf(after.policy?.entries, before.policy?.entries, 'policy entries');
+    assertMapSubsetOf(after.policy?.routeDefaults, before.policy?.routeDefaults, 'policy route defaults');
+    const beforeNamespaces = new Map((before.policy?.namespaces || []).map((entry) => [entry.id, stableStringify(entry)]));
+    for (const namespace of after.policy?.namespaces || []) {
+        if (beforeNamespaces.get(namespace.id) !== stableStringify(namespace)) {
+            throw withdrawalError(`policy namespace '${namespace.id}' changed`);
+        }
+    }
+    for (const field of ['hostNetworkCapabilities', 'workspaceLogConsumers', 'turnCredentialConsumers']) {
+        assertSubsetOf(after.security?.[field], before.security?.[field], `security.${field}`);
+    }
+    for (const [routeKey, entry] of Object.entries(after.hardwareAvailability || {})) {
+        const beforeEntry = before.hardwareAvailability?.[routeKey];
+        if (beforeEntry !== undefined && stableStringify(beforeEntry) === stableStringify(entry)) continue;
+        if (byContainer.get(String(afterRoutes[routeKey]?.container || ''))?.mode !== 'unavailable') {
+            throw withdrawalError(`hardware availability of '${routeKey}' changed`);
+        }
+    }
+    for (const routeKey of Object.keys(before.hardwareAvailability || {})) {
+        if (afterRoutes[routeKey] && !Object.hasOwn(after.hardwareAvailability || {}, routeKey)) {
+            throw withdrawalError(`hardware unavailability of '${routeKey}' was lifted`);
+        }
+    }
+}
+
+// Publish one already-validated candidate as the new active selector, from the
+// exact active predecessor it was derived from. The selector is never written
+// inactive; a failure before it restores the predecessor's mutable sources.
+function publishActiveSuccessor(paths, captured, {
+    predecessorSelector,
+    publicationState,
+    options = {},
+}) {
+    let selectorCommitted = false;
+    const predecessorTopology = fs.existsSync(paths.topologyCurrentFile)
+        ? { exists: true, bytes: fs.readFileSync(paths.topologyCurrentFile) }
+        : { exists: false, bytes: null };
+    const assertPredecessorSelected = () => {
+        const current = readSelector(paths);
+        if (current?.state !== 'active'
+            || current.generation !== predecessorSelector.generation
+            || current.activationId !== predecessorSelector.activationId
+            || current.selectorDigest !== predecessorSelector.selectorDigest) {
+            throw edgeError('active edge selector changed before withdrawal commit', 'EDGE_GENERATION_RACE');
+        }
+    };
+    try {
+        persistCapturedGeneration(paths, captured, options);
+        writeCapturedMutableSources(paths, captured);
+        const recaptured = collectCapturedSources(paths);
+        if (recaptured.generation !== captured.generation) {
+            throw edgeError('edge routing sources changed during withdrawal commit', 'EDGE_GENERATION_RACE');
+        }
+        const generation = capturedGenerationSnapshot(captured, publicationState);
+        const selector = sealSelector({
+            schemaVersion: EDGE_GENERATION_SCHEMA_VERSION,
+            state: 'active',
+            generation: captured.generation,
+            publicationState,
+            activationId: crypto.randomUUID(),
+            activatedAt: new Date().toISOString(),
+        });
+        const topology = writeTopologyForGeneration(paths, generation, publicationState, options);
+        if (typeof options.testHooks?.beforeSelectorCommit === 'function') {
+            options.testHooks.beforeSelectorCommit({ paths, generation, topology, selector });
+        }
+        assertPredecessorSelected();
+        writeOwnedEdgeSelector(paths, selector);
+        selectorCommitted = true;
+        return { selector: deepFreeze(selector), generation, topology, paths };
+    } catch (error) {
+        if (!selectorCommitted) {
+            const restoreErrors = [];
+            try {
+                restoreMutableSourcesFromGeneration(paths, predecessorSelector.generation);
+            } catch (restoreError) {
+                restoreErrors.push(restoreError);
+            }
+            try {
+                if (predecessorTopology.exists) {
+                    atomicWrite(paths.topologyCurrentFile, predecessorTopology.bytes, { mode: 0o644 });
+                } else {
+                    try { fs.unlinkSync(paths.topologyCurrentFile); } catch (restoreError) {
+                        if (restoreError?.code !== 'ENOENT') throw restoreError;
+                    }
+                    fsyncDirectory(path.dirname(paths.topologyCurrentFile));
+                }
+            } catch (restoreError) {
+                restoreErrors.push(restoreError);
+            }
+            if (restoreErrors.length > 0) {
+                const restoreFailure = edgeError(
+                    `edge withdrawal predecessor restoration failed: ${restoreErrors.map((item) => item?.message || item).join('; ')}`,
+                    'EDGE_WITHDRAWAL_RESTORE_FAILED',
+                );
+                restoreFailure.cause = error;
+                restoreFailure.restoreCauses = Object.freeze([...restoreErrors]);
+                throw restoreFailure;
+            }
+        }
+        throw error;
+    }
+}
+
+/**
+ * Withdraw runtimes from the active generation without an inactive window
+ * (D3). `remove` deletes their routes and registry records (disable), `drain`
+ * marks their routes draining without a target while keeping their identity
+ * (an automatic drain records its `drainOwner`), and `unavailable` applies a
+ * hardware refusal projection. The candidate must be a proven subset of its
+ * exact active predecessor, whose mutable sources must still be current, and
+ * no preparation lease may be outstanding. Nothing is written on refusal.
+ * Returns the new active selector; an unchanged candidate returns the
+ * predecessor with `unchanged: true`.
+ */
+export function commitWithdrawalEdgeRoutingGeneration({
+    withdraw,
+    reason = 'edge-withdrawal',
+    routing,
+    agents,
+    ...options
+} = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    if (!hasApplyLockCapability(paths, options.applyLockCapability)) {
+        throw edgeError(
+            'edge withdrawal requires the exact live apply-lock capability',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
+    if (readPreparationLease(paths)) {
+        throw edgeError('edge lifecycle preparation is outstanding; withdrawal must wait for it', 'EDGE_PREPARATION_BUSY');
+    }
+    const withdrawals = normalizeWithdrawals(withdraw);
+    const active = loadActiveEdgeRoutingGeneration(options);
+    const mutable = collectCapturedSources(paths);
+    if (mutable.generation !== active.selector.generation) {
+        throw edgeError(
+            'mutable edge sources no longer match the active predecessor',
+            'EDGE_GENERATION_SOURCE_CHANGED',
+        );
+    }
+    const predecessorDocument = loadCapturedGeneration(paths, active.selector.generation);
+    const derived = deriveWithdrawalCandidate(active.generation, withdrawals, { routing, agents });
+    const captured = collectCandidateSources(paths, {
+        routing: derived.routing,
+        agents: derived.agents,
+        policy: mutable.bytes.policyBytes,
+        desired: mutable.bytes.desiredBytes,
+        manifestBytes: predecessorDocument.bytes.manifestBytes,
+    });
+    const candidate = capturedGenerationSnapshot(captured, active.selector.publicationState);
+    proveWithdrawalSubset(active.generation, candidate, withdrawals);
+    if (generationPublicationSemanticDigest(active.generation) !== generationPublicationSemanticDigest(candidate)) {
+        throw withdrawalError('publication semantics changed');
+    }
+    if (stableStringify(candidate.routing) === stableStringify(active.generation.routing)
+        && stableStringify(candidate.agents) === stableStringify(active.generation.agents)) {
+        return { selector: active.selector, generation: active.generation, paths, unchanged: true };
+    }
+    return publishActiveSuccessor(paths, captured, {
+        predecessorSelector: active.selector,
+        publicationState: active.selector.publicationState,
+        options: { ...options, reason },
+    });
+}
+
+/**
+ * Classify a refused withdrawal. Lock or preparation contention is retried by
+ * its owner (`defer`); anything else falls back to global inactivation.
+ */
+export function edgeWithdrawalRefusalDisposition(error) {
+    return ['EDGE_PREPARATION_BUSY', 'EDGE_GENERATION_BUSY'].includes(error?.code) ? 'defer' : 'global';
+}
+
+const REPLACEMENT_IDENTITY_FIELDS = Object.freeze(['instanceId', 'enableGeneration']);
+
+/**
+ * Prepare the replacement identity of one runtime whose routes the active
+ * generation already withdrew by a drain (D4). The candidate reopens those
+ * routes without a target and may change only that runtime's identity and
+ * runtime-only registry fields; it is installed immutably, never selected, and
+ * bound to the exact active predecessor by a `withdrawn` lease. Its commit
+ * reuses the additive checks and publishes the ready target.
+ */
+export function prepareWithdrawnReplacementEdgeRoutingGeneration({
+    containerName,
+    agents: suppliedAgents,
+    reason,
+    ...options
+} = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    if (!hasApplyLockCapability(paths, options.applyLockCapability)) {
+        throw edgeError(
+            'withdrawn edge preparation requires the exact live apply-lock capability',
+            'EDGE_GENERATION_CAPABILITY_REQUIRED',
+        );
+    }
+    assertPreparationLeaseForApply(paths, undefined, { preparing: true });
+    const exactContainerName = String(containerName || '').trim();
+    const active = loadActiveEdgeRoutingGeneration(options);
+    const mutable = collectCapturedSources(paths);
+    if (mutable.generation !== active.selector.generation) {
+        throw edgeError(
+            'mutable edge sources no longer match the active predecessor',
+            'EDGE_GENERATION_SOURCE_CHANGED',
+        );
+    }
+    const routing = structuredClone(active.generation.routing);
+    const routeKeys = Object.entries(routing.routes || {})
+        .filter(([, route]) => String(route?.container || '') === exactContainerName)
+        .map(([routeKey]) => routeKey);
+    if (!exactContainerName || routeKeys.length === 0
+        || routeKeys.some((routeKey) => routing.routes[routeKey].draining !== true
+            || routing.routes[routeKey].hostPort !== undefined
+            || routing.routes[routeKey].serviceTargets !== undefined)) {
+        throw edgeError(
+            `withdrawn replacement of '${exactContainerName}' requires every one of its routes to be drained in the active generation`,
+            'EDGE_WITHDRAWAL_NOT_DRAINED',
+        );
+    }
+    for (const routeKey of routeKeys) {
+        delete routing.routes[routeKey].draining;
+        delete routing.routes[routeKey].drainOwner;
+    }
+    const agents = suppliedAgents === undefined ? structuredClone(active.generation.agents) : structuredClone(suppliedAgents);
+    const before = active.generation.agents || {};
+    for (const key of new Set([...Object.keys(before), ...Object.keys(agents || {})])) {
+        if (key === exactContainerName) continue;
+        if (stableStringify(agents?.[key]) !== stableStringify(before[key])) {
+            throw edgeError(`withdrawn replacement may not change registry record '${key}'`, 'EDGE_WITHDRAWAL_NOT_SUBSET');
+        }
+    }
+    const beforeProjection = lifecycleAgentProjection({ [exactContainerName]: before[exactContainerName] })[exactContainerName];
+    const afterProjection = lifecycleAgentProjection({ [exactContainerName]: agents?.[exactContainerName] })[exactContainerName];
+    if (!beforeProjection || !afterProjection || !afterProjection.instanceId || !afterProjection.enableGeneration
+        || Object.keys(beforeProjection).some((field) => !REPLACEMENT_IDENTITY_FIELDS.includes(field)
+            && beforeProjection[field] !== afterProjection[field])) {
+        throw edgeError(
+            `withdrawn replacement of '${exactContainerName}' may change only its runtime identity`,
+            'EDGE_WITHDRAWAL_NOT_SUBSET',
+        );
+    }
+    const predecessorDocument = loadCapturedGeneration(paths, active.selector.generation);
+    const captured = collectCandidateSources(paths, {
+        routing,
+        agents,
+        policy: mutable.bytes.policyBytes,
+        desired: mutable.bytes.desiredBytes,
+        manifestBytes: predecessorDocument.bytes.manifestBytes,
+    });
+    // Reopening grants nothing beyond the predecessor except the rotated
+    // identity: compiled authority is identical once that identity is mapped
+    // back to the one it replaces.
+    const rotated = String(agents[exactContainerName].instanceId || '');
+    const rotatedGeneration = String(agents[exactContainerName].enableGeneration || '');
+    const previous = before[exactContainerName];
+    const restoreIdentity = (value) => JSON.parse(JSON.stringify(value), (_key, field) => (
+        isPlainObject(field) && field.containerName === exactContainerName
+            && field.instanceId === rotated && field.enableGeneration === rotatedGeneration
+            ? { ...field, instanceId: String(previous.instanceId || ''), enableGeneration: String(previous.enableGeneration || '') }
+            : field
+    ));
+    if (stableStringify(restoreIdentity(captured.compiled)) !== stableStringify(active.generation.compiled)) {
+        throw edgeError(
+            `withdrawn replacement of '${exactContainerName}' changes compiled authority`,
+            'EDGE_WITHDRAWAL_NOT_SUBSET',
+        );
+    }
+    persistCapturedGeneration(paths, captured, options);
+    const generation = capturedGenerationSnapshot(captured, 'error');
+    const preparationLease = createPreparationLease(
+        paths,
+        captured,
+        reason || `edge-generation-prepare-withdrawn:${exactContainerName}`,
+        { mode: 'withdrawn', selector: active.selector },
+    );
+    return { selector: active.selector, generation, paths, preparationLease };
+}
+
+/** Whether a preparation lease keeps its exact active predecessor selected. */
+export function isActiveBoundPreparationLease(lease) {
+    return ACTIVE_BOUND_LEASE_MODES.has(String(lease?.mode || ''));
+}
+
 export function abortEdgeRoutingPreparation(preparationLease, options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
     const { capability: applyLockCapability, release } = acquireApplyLockCapability(paths, options);
     try {
         const current = assertPreparationLeaseForApply(paths, preparationLease);
         if (!current) throw edgeError('no edge lifecycle preparation is outstanding', 'EDGE_PREPARATION_STALE');
-        if (current.mode === 'additive') {
+        if (ACTIVE_BOUND_LEASE_MODES.has(current.mode)) {
+            // The active predecessor stays selected. A withdrawn candidate's
+            // routes therefore stay withdrawn until a later proven commit.
             assertPreparedSelectorStillSelected(paths, current);
             const selector = readSelector(paths);
             removePreparationLease(paths, current);
@@ -3549,7 +4100,7 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
                 : loadGenerationById(paths, expected);
         } else {
             const preparationLease = readPreparationLease(paths);
-            if (preparationLease?.mode !== 'additive'
+            if (!ACTIVE_BOUND_LEASE_MODES.has(preparationLease?.mode)
                 || preparationLease.preparedGeneration !== expected) {
                 throw edgeError(
                     'registered Router authority observation generation is no longer selected',
@@ -3655,7 +4206,7 @@ function assertRouterAttestationOwner(generation, expectedOwner, {
 function preparedRouterAttestationSnapshot(paths, preparationLease, expectedOwner) {
     const current = assertPreparationLeaseForApply(paths, preparationLease);
     assertPreparedSelectorStillSelected(paths, current);
-    const prepared = current.mode === 'additive'
+    const prepared = ACTIVE_BOUND_LEASE_MODES.has(current.mode)
         ? loadCapturedGeneration(paths, current.preparedGeneration)
         : null;
     const generation = prepared?.generation
@@ -3831,7 +4382,7 @@ export function assertHostModeGenerationCapability({
     if (options.preparedCapability !== undefined) {
         const prepared = PREPARED_HOST_MODE_CAPABILITIES.get(options.preparedCapability);
         let selectorCurrent = false;
-        if (prepared?.preparationLease?.mode === 'additive') {
+        if (ACTIVE_BOUND_LEASE_MODES.has(prepared?.preparationLease?.mode)) {
             try {
                 const current = assertPreparationLeaseForApply(prepared.paths, prepared.preparationLease);
                 assertPreparedSelectorStillSelected(prepared.paths, current);
@@ -3893,6 +4444,7 @@ export default {
     abortEdgeRoutingPreparation,
     applyEdgeRoutingGeneration,
     commitAdditiveEdgeRoutingGeneration,
+    commitWithdrawalEdgeRoutingGeneration,
     captureEdgeRoutingLease,
     captureEdgeRoutingObservationLease,
     createRouterAttestationGenerationLease,
@@ -3908,6 +4460,7 @@ export default {
     prepareAdditiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
     prepareHostModeCapabilityForInactiveGeneration,
+    prepareWithdrawnReplacementEdgeRoutingGeneration,
     readCurrentEdgeTopology,
     resolveEdgeGenerationPaths,
     withEdgeGenerationApplyLock,
