@@ -4113,6 +4113,12 @@ export function readEdgeRoutingPreparationOwner(options = {}) {
     return lease ? deepFreeze({ pid: lease.pid, reason: lease.reason, mode: lease.mode }) : null;
 }
 
+/** Whether a preparation owner's process provably stopped (never this process). */
+export function edgePreparationOwnerStopped(owner) {
+    const pid = Number(owner?.pid);
+    return Number.isInteger(pid) && pid > 0 && pid !== process.pid && preparationOwnerStopped(pid);
+}
+
 // The hardware-availability resolver's output for one captured generation
 // (M-NW-01 D2-S). Both lease families capture it and fence commit()/isCurrent()
 // on its revision; a store that cannot be read fails the capture and the fence.

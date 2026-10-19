@@ -51,6 +51,7 @@ import {
     abortEdgeRoutingPreparation,
     commitAdditiveEdgeRoutingGeneration,
     commitWithdrawalEdgeRoutingGeneration,
+    edgePreparationOwnerStopped,
     edgeWithdrawalRefusalDisposition,
     inactivateEdgeRoutingGeneration,
     loadActiveEdgeRoutingGeneration,
@@ -1116,15 +1117,27 @@ const DISABLE_BUSY_RETRY_MS = 250;
 // outstanding and the edge lock is free. Both refusals happen before any
 // mutation, so the disable releases its locks (the preparation owner needs
 // them to finish) and retries until the workspace mutation lease wait elapses.
+// A preparation whose owner process stopped can never finish, so the disable
+// refuses at once instead of waiting (a caller reusing a held workspace lease
+// would otherwise hold it for the whole wait).
 async function withAgentDisableRetry(operation, dependencies, callback) {
     const waitMs = Math.max(0, Number(dependencies.workspaceLeaseWaitMs ?? DISABLE_BUSY_WAIT_MS) || 0);
     const retryMs = Math.max(1, Number(dependencies.disableBusyRetryMs ?? DISABLE_BUSY_RETRY_MS) || DISABLE_BUSY_RETRY_MS);
+    const ownerStopped = dependencies.preparationOwnerStopped || edgePreparationOwnerStopped;
     const deadline = Date.now() + waitMs;
     for (;;) {
         try {
             return await withAgentDisableLocks(operation, dependencies, callback);
         } catch (error) {
             if (edgeWithdrawalRefusalDisposition(error) !== 'defer' || Date.now() + retryMs > deadline) throw error;
+            if (error?.code === 'EDGE_PREPARATION_BUSY') {
+                const owner = error.preparationOwner;
+                if (owner && ownerStopped(owner)) {
+                    error.message += `; its owner pid ${owner.pid} stopped, so waiting cannot clear it`;
+                    error.preparationOwnerStopped = true;
+                    throw error;
+                }
+            }
         }
         await new Promise((resolve) => setTimeout(resolve, retryMs));
     }
@@ -1238,9 +1251,11 @@ function stageAgentDisableGeneration(map, disabledRecords, {
     readPreparationOwner = readEdgeRoutingPreparationOwner,
 } = {}) {
     return withApplyLock((applyLockCapability) => {
-        if (readPreparationOwner()) {
+        const preparationOwner = readPreparationOwner();
+        if (preparationOwner) {
             const busy = new Error('disable agent: an edge lifecycle preparation is outstanding');
             busy.code = 'EDGE_PREPARATION_BUSY';
+            busy.preparationOwner = preparationOwner;
             throw busy;
         }
         retireNoWaitMarkersImpl(disabledRecords.map(({ containerName, record }) => (

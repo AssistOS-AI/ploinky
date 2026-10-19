@@ -743,3 +743,37 @@ test('A7 a disable waits for an outstanding preparation outside its locks, then 
     assert.deepEqual(timedOut.registry(), { old_container: agentRecord('old') });
     assert.equal(timedOut.events.some((event) => event.startsWith('retire:') || event.startsWith('withdraw:')), false);
 });
+
+test('m4 a disable refuses at once when the outstanding preparation owner process stopped', async () => {
+    const abandoned = lifecycleHarness({
+        initialRegistry: { old_container: agentRecord('old') },
+        initialRouting: singleAgentRouting(38200),
+        preparationOwners: [{ pid: 424242, mode: 'withdrawn' }],
+    });
+    let leaseHolds = 0;
+    const probed = [];
+    const started = Date.now();
+    await assert.rejects(
+        agents.disableAgent('old_container', {
+            ...abandoned.dependencies,
+            workspaceLeaseWaitMs: 1500,
+            disableBusyRetryMs: 50,
+            preparationOwnerStopped: (owner) => { probed.push(owner.pid); return true; },
+            withWorkspaceLeaseImpl: async (_options, callback) => { leaseHolds += 1; return callback(); },
+            withNetworkLockImpl: async (callback) => callback(),
+        }),
+        (error) => error.code === 'EDGE_PREPARATION_BUSY'
+            && error.preparationOwnerStopped === true
+            && /owner pid 424242 stopped/.test(error.message),
+    );
+    assert.ok(Date.now() - started < 1000, 'no busy wait');
+    assert.equal(leaseHolds, 1, 'one attempt and no retry keeps the workspace lease held');
+    assert.deepEqual(probed, [424242]);
+    assert.deepEqual(abandoned.registry(), { old_container: agentRecord('old') });
+    assert.equal(abandoned.events.some((event) => event.startsWith('retire:') || event.startsWith('withdraw:')), false);
+
+    const { edgePreparationOwnerStopped } = await import('../../cli/sandbox/edgeGeneration.js');
+    assert.equal(edgePreparationOwnerStopped({ pid: process.pid }), false, 'this process is never a stopped owner');
+    assert.equal(edgePreparationOwnerStopped({ pid: 1 }), false, 'a live process, even one it cannot signal, is not stopped');
+    assert.equal(edgePreparationOwnerStopped({ pid: 'x' }), false);
+});
