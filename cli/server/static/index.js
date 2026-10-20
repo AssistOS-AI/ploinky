@@ -12,7 +12,8 @@ import {
 } from '../utils/workspacePaths.js';
 import {
     isProtectedWorkspaceRequestPath,
-    isProtectedWorkspaceTarget
+    isProtectedWorkspaceTarget,
+    openClassifiedWorkspaceFile
 } from '../utils/protectedWorkspacePaths.js';
 import { ROUTING_FILE } from '../../utils/config.js';
 import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
@@ -569,26 +570,27 @@ async function sendOpenedFile(req, res, filePath, {
     extraHeaders = {},
     templateAware = false,
     fetchedTemplate = false,
-    admitOpened = null,
+    openFile = null,
 } = {}) {
     if (responseGone(res)) return true;
     let handle;
     try {
-        handle = await fs.promises.open(filePath, 'r');
+        handle = openFile ? await openFile(filePath) : await fs.promises.open(filePath, 'r');
     } catch (_) {
         return false;
+    }
+    // The opener refused the file its open reached.
+    if (!handle) {
+        if (!responseGone(res)) {
+            res.writeHead(403, { 'Content-Type': 'text/plain' });
+            res.end('Access denied');
+        }
+        return true;
     }
     let streamStarted = false;
     try {
         const stat = await handle.stat({ bigint: true });
         if (!stat.isFile()) return false;
-        if (admitOpened && !await admitOpened(stat)) {
-            if (!responseGone(res)) {
-                res.writeHead(403, { 'Content-Type': 'text/plain' });
-                res.end('Access denied');
-            }
-            return true;
-        }
         // Last await is behind us: a gone client is handled here, and the
         // finally block closes the handle because no stream was started.
         if (responseGone(res)) return true;
@@ -677,22 +679,11 @@ async function sendFile(res, filePath, {
     return sendOpenedFile(req, res, filePath, { authenticated, templateAware, fetchedTemplate });
 }
 
-// The open follows the path again, so a symlink swapped in after the target
-// was classified could lead it into a protected entry. The opened file must
-// still be the classified canonical file, at that same canonical path.
 async function sendWorkspaceFileStream(req, res, filePath) {
     return sendOpenedFile(req, res, filePath, {
         authenticated: true,
         extraHeaders: getWorkspaceFileHeaders(filePath),
-        admitOpened: async (opened) => {
-            if (await toRealPathSafeAsync(filePath) !== filePath) return false;
-            try {
-                const current = await fs.promises.stat(filePath, { bigint: true });
-                return current.dev === opened.dev && current.ino === opened.ino;
-            } catch (_) {
-                return false;
-            }
-        },
+        openFile: openClassifiedWorkspaceFile,
     });
 }
 

@@ -44,6 +44,8 @@ write('.data/site/index.html');
 write('docs/readme.md', '# Ordinary\n');
 write('docs/app.secrets');
 write('docs/master-key');
+write('.env', `PLOINKY_MASTER_KEY=${SENTINEL}\n`);
+write('projects/site/.env');
 write('projects/site/.data/cache.json');
 write('projects/site/.ploinky/data/state.json');
 write('.ploinky-notes/notes.txt', 'notes\n');
@@ -134,12 +136,15 @@ test('agent private data under .data is refused, including blobs and directory i
     }
 });
 
-test('secret stores and master keys are refused anywhere in the workspace', async (t) => {
+test('secret stores, master keys and .env files are refused anywhere in the workspace', async (t) => {
     await assertPositiveControls();
     for (const target of [
         'docs/app.secrets',
         'docs/master-key',
         'docs/missing.secrets',
+        '.env',
+        '.ENV',
+        'projects/site/.env',
         '.ploinky/repos/repo/agent/IDE-plugins/plugin/deploy.secrets',
         '.ploinky/repos/repo/agent/master-key',
         '.ploinky/repos/repo/agent/.data/state.json',
@@ -223,36 +228,95 @@ test('case and Unicode variants that a folding filesystem resolves are refused',
     }
 });
 
-test('a symlink swapped in between classification and open is refused', async (t) => {
-    await assertPositiveControls();
-    const target = path.join(workspace, 'docs', 'swap.txt');
-    const protectedTarget = path.join(workspace, '.ploinky', 'data', 'router-key');
+function swapToProtectedDuringOpen(target, protectedTarget, { restoreAfterOpen }) {
     const originalOpen = fs.promises.open;
-    t.after(() => {
-        fs.promises.open = originalOpen;
-        fs.rmSync(target, { force: true });
-    });
-    for (const restoreAfterOpen of [false, true]) {
-        fs.rmSync(target, { force: true });
-        fs.writeFileSync(target, 'benign\n');
-        fs.promises.open = async (filePath, ...rest) => {
-            if (filePath !== target) return originalOpen(filePath, ...rest);
-            fs.rmSync(target);
-            fs.symlinkSync(protectedTarget, target);
-            const handle = await originalOpen(filePath, ...rest);
+    fs.promises.open = async (filePath, ...rest) => {
+        if (filePath !== target) return originalOpen(filePath, ...rest);
+        fs.rmSync(target);
+        fs.symlinkSync(protectedTarget, target);
+        try {
+            return await originalOpen(filePath, ...rest);
+        } finally {
             if (restoreAfterOpen) {
                 fs.rmSync(target);
                 fs.writeFileSync(target, 'benign\n');
             }
-            return handle;
-        };
-        try {
-            await assertDenied('/workspace-files/docs/swap.txt');
-        } finally {
-            fs.promises.open = originalOpen;
         }
+    };
+    return () => { fs.promises.open = originalOpen; };
+}
+
+test('a symlink swapped in between classification and open is refused', async (t) => {
+    await assertPositiveControls();
+    const target = path.join(workspace, 'docs', 'swap.txt');
+    const protectedTarget = path.join(workspace, '.ploinky', 'data', 'router-key');
+    t.after(() => fs.rmSync(target, { force: true }));
+    for (const restoreAfterOpen of [false, true]) {
+        await t.test(`restore after open: ${restoreAfterOpen}`, async () => {
+            fs.rmSync(target, { force: true });
+            fs.writeFileSync(target, 'benign\n');
+            const restore = swapToProtectedDuringOpen(target, protectedTarget, { restoreAfterOpen });
+            try {
+                await assertDenied('/workspace-files/docs/swap.txt');
+            } finally {
+                restore();
+            }
+        });
     }
     fs.rmSync(target, { force: true });
     fs.writeFileSync(target, 'benign\n');
     await assertServed('/workspace-files/docs/swap.txt', 'benign\n');
+});
+
+// A writer that flips the path in step with the Router can make every path
+// lookup after the open report the benign file while the open itself reached
+// the protected one. Only a check bound to the opened descriptor holds.
+test('path lookups after the open cannot vouch for a file the open did not reach', async (t) => {
+    await assertPositiveControls();
+    const target = path.join(workspace, 'docs', 'flip.txt');
+    const protectedTarget = path.join(workspace, '.ploinky', 'data', 'router-key');
+    const { realpath: originalRealpath, stat: originalStat } = fs.promises;
+    fs.rmSync(target, { force: true });
+    fs.writeFileSync(target, 'benign\n');
+    const restoreOpen = swapToProtectedDuringOpen(target, protectedTarget, { restoreAfterOpen: true });
+    let opened = false;
+    fs.promises.realpath = async (value, ...rest) => {
+        if (value === target && opened) return target;
+        return originalRealpath(value, ...rest);
+    };
+    fs.promises.stat = async (value, ...rest) => {
+        if (value === target && opened) return originalStat(protectedTarget, ...rest);
+        return originalStat(value, ...rest);
+    };
+    const openDuringSwap = fs.promises.open;
+    fs.promises.open = async (...args) => {
+        try {
+            return await openDuringSwap(...args);
+        } finally {
+            if (args[0] === target) opened = true;
+        }
+    };
+    t.after(() => {
+        restoreOpen();
+        fs.promises.realpath = originalRealpath;
+        fs.promises.stat = originalStat;
+        fs.rmSync(target, { force: true });
+    });
+    await assertDenied('/workspace-files/docs/flip.txt');
+});
+
+// Simulates a filesystem whose name matching ignores U+200C (as HFS+ does), so
+// `.plo\u200Cinky` opens the workspace's own `.ploinky`: no name rule matches
+// it, and only the file-identity check refuses it.
+test('a top-level entry that the filesystem resolves to .ploinky is refused by identity', async (t) => {
+    await assertPositiveControls();
+    const alias = path.join(workspace, '.plo\u200Cinky');
+    write('.plo\u200Cinky/agents.json');
+    const originalStat = fs.promises.stat;
+    fs.promises.stat = (value, ...rest) => originalStat(value === alias ? path.join(workspace, '.ploinky') : value, ...rest);
+    t.after(() => {
+        fs.promises.stat = originalStat;
+        fs.rmSync(alias, { recursive: true, force: true });
+    });
+    await assertDenied('/workspace-files/.plo%E2%80%8Cinky/agents.json');
 });

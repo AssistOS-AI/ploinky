@@ -32,6 +32,7 @@ write('.ploinky/repos/repo/agent/IDE-plugins/plugin/main.js', 'export const plug
 write('.data/userPersistoAgent/users.json');
 write('docs/readme.md', '# Ordinary\n');
 write('docs/app.secrets');
+write('.env', `PLOINKY_MASTER_KEY=${SENTINEL}\n`);
 fs.symlinkSync('../.ploinky/data/router-key', path.join(workspace, 'docs', 'key-link'));
 
 const server = http.createServer(async (req, res) => {
@@ -85,6 +86,7 @@ test('raw HTTP requests for each protected class answer 403 and keep both positi
         '/workspace-files/.ploinky/data/router-key',
         '/workspace-files/.data/userPersistoAgent/users.json',
         '/workspace-files/docs/app.secrets',
+        '/workspace-files/.env',
         '/workspace-files/docs/key-link',
     ]) {
         await t.test(target, () => assertDenied(target));

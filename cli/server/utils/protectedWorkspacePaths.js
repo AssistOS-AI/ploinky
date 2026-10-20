@@ -4,15 +4,18 @@ import path from 'path';
 import { resolveCanonicalPathAsync, toRealPathSafeAsync } from './workspacePaths.js';
 
 // Router-served workspace files never include controller state (`.ploinky`),
-// agent private data (`.data`) or key material (`master-key`, `*.secrets`).
+// agent private data (`.data`) or key material (`master-key`, `*.secrets`, and
+// `.env`, which Ploinky reads for PLOINKY_MASTER_KEY and provider keys).
 // Repository checkouts under the workspace's `.ploinky/repos` stay readable:
 // Explorer previews, downloads, plugin assets and WebChat source links read
 // agent source there.
 const CONTROLLER_ROOT = '.ploinky';
 const REPOSITORIES_DIRECTORY = 'repos';
 const AGENT_DATA_ROOT = '.data';
-const MASTER_KEY_NAME = 'master-key';
+const PROTECTED_FILE_NAMES = new Set(['master-key', '.env']);
 const SECRETS_SUFFIX = '.secrets';
+// macOS 11+ <sys/fcntl.h>: the open fails with ELOOP if any path component is a symlink.
+const O_NOFOLLOW_ANY = 0x20000000;
 
 // The workspace may sit on a filesystem that matches names regardless of case
 // or Unicode form (APFS, also through the Box's virtiofs mount), where
@@ -26,7 +29,7 @@ export function foldWorkspaceName(name) {
 export function isProtectedWorkspaceSegments(segments) {
     for (let index = 0; index < segments.length; index += 1) {
         const name = foldWorkspaceName(segments[index]);
-        if (name === MASTER_KEY_NAME || name.endsWith(SECRETS_SUFFIX) || name === AGENT_DATA_ROOT) return true;
+        if (PROTECTED_FILE_NAMES.has(name) || name.endsWith(SECRETS_SUFFIX) || name === AGENT_DATA_ROOT) return true;
         if (name === CONTROLLER_ROOT && !(index === 0 && segments[1] === REPOSITORIES_DIRECTORY)) return true;
     }
     return false;
@@ -93,4 +96,27 @@ export async function isProtectedWorkspaceTarget(workspaceRoot, targetPath) {
     if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return true;
     const segments = relative.split(path.sep);
     return isProtectedWorkspaceSegments(segments) || await aliasesProtectedRoot(root, segments);
+}
+
+// Opens a classified canonical file so that a symlink swapped in after
+// classification cannot redirect the open. A path check repeated after the
+// open is another lookup an attacker can race, so the check binds to the
+// opened descriptor: macOS refuses a symlink in any component of the canonical
+// path, and on Linux the descriptor's own path must be the classified path.
+// Resolves to null when the open reached anything else, including on a
+// platform that offers neither check.
+export async function openClassifiedWorkspaceFile(filePath) {
+    if (process.platform === 'darwin') {
+        try {
+            return await fs.promises.open(filePath, fs.constants.O_RDONLY | O_NOFOLLOW_ANY);
+        } catch (error) {
+            if (error?.code === 'ELOOP') return null;
+            throw error;
+        }
+    }
+    const handle = await fs.promises.open(filePath, 'r');
+    const opened = await fs.promises.readlink(`/proc/self/fd/${handle.fd}`).catch(() => null);
+    if (opened === filePath) return handle;
+    await handle.close().catch(() => { });
+    return null;
 }
