@@ -33,7 +33,7 @@
                     <p>Browser-facing routes use the Router login session. The table names the stable route families and their observable purpose.</p>
                     <table class="command-table"><thead><tr><th>API route</th><th>Purpose and access boundary</th></tr></thead><tbody>
                         <tr><td><code>/webchat/*</code></td><td>Hosts the TTY-backed chat page, EventSource stream, interactions, and workspace-scoped upload flow for an authenticated session.</td></tr>
-                        <tr><td><code>/workspace-files/*</code></td><td>Reads an approved workspace file for preview after path validation and route authorization.</td></tr>
+                        <tr><td><code>/workspace-files/*</code></td><td>Reads an approved workspace file for preview after path validation and route authorization. Controller state under <code>.ploinky</code> (except repository checkouts under <code>.ploinky/repos</code>), agent data under <code>.data</code>, and any <code>master-key</code> or <code>*.secrets</code> entry answer 403, whatever the spelling, case or symlink that reaches them.</td></tr>
                         <tr><td><code>/status/*</code></td><td>Returns a read-only status snapshot or NDJSON metric stream to a local administrator.</td></tr>
                         <tr><td><code>/auth/*</code></td><td>Runs local or configured SSO login, logout, session, and invitation flows.</td></tr>
                     </tbody></table>
