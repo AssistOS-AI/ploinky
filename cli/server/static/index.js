@@ -7,8 +7,14 @@ import {
     isPathWithinRoots,
     isPathWithinRootsAsync,
     sanitizeRelativeRequestPath,
-    toRealPathSafe
+    toRealPathSafe,
+    toRealPathSafeAsync
 } from '../utils/workspacePaths.js';
+import {
+    isProtectedWorkspaceRequestPath,
+    isProtectedWorkspaceTarget,
+    openClassifiedWorkspaceFile
+} from '../utils/protectedWorkspacePaths.js';
 import { ROUTING_FILE } from '../../utils/config.js';
 import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
 
@@ -564,13 +570,22 @@ async function sendOpenedFile(req, res, filePath, {
     extraHeaders = {},
     templateAware = false,
     fetchedTemplate = false,
+    openFile = null,
 } = {}) {
     if (responseGone(res)) return true;
     let handle;
     try {
-        handle = await fs.promises.open(filePath, 'r');
+        handle = openFile ? await openFile(filePath) : await fs.promises.open(filePath, 'r');
     } catch (_) {
         return false;
+    }
+    // The opener refused the file its open reached.
+    if (!handle) {
+        if (!responseGone(res)) {
+            res.writeHead(403, { 'Content-Type': 'text/plain' });
+            res.end('Access denied');
+        }
+        return true;
     }
     let streamStarted = false;
     try {
@@ -664,10 +679,11 @@ async function sendFile(res, filePath, {
     return sendOpenedFile(req, res, filePath, { authenticated, templateAware, fetchedTemplate });
 }
 
-async function sendFileStream(req, res, filePath) {
+async function sendWorkspaceFileStream(req, res, filePath) {
     return sendOpenedFile(req, res, filePath, {
         authenticated: true,
         extraHeaders: getWorkspaceFileHeaders(filePath),
+        openFile: openClassifiedWorkspaceFile,
     });
 }
 
@@ -680,6 +696,16 @@ function getWorkspaceFileHeaders(filePath) {
     };
 }
 
+// The response serves the canonical file that was classified, not a path that
+// a later symlink change could redirect.
+async function admitWorkspaceFile(workspaceRoot, filePath) {
+    const canonical = await toRealPathSafeAsync(filePath);
+    if (!canonical || await isProtectedWorkspaceTarget(workspaceRoot, canonical)) {
+        return { status: 'denied', filePath: null };
+    }
+    return { status: 'ok', filePath: canonical };
+}
+
 async function resolveWorkspaceFile(requestPath) {
     const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) {
@@ -687,7 +713,7 @@ async function resolveWorkspaceFile(requestPath) {
     }
 
     const rel = sanitizeRelativeRequestPath(requestPath);
-    if (rel === null || !rel.length) {
+    if (rel === null || !rel.length || isProtectedWorkspaceRequestPath(rel)) {
         return { status: 'denied', filePath: null };
     }
 
@@ -714,7 +740,8 @@ async function resolveWorkspaceFile(requestPath) {
                 allowedRoots = [sourceRoot];
             }
         }
-        if (!await isPathWithinAllowedRootsAsync(allowedRoots, candidate, { allowMissing: true })) {
+        if (!await isPathWithinAllowedRootsAsync(allowedRoots, candidate, { allowMissing: true })
+            || await isProtectedWorkspaceTarget(workspaceRoot, candidate)) {
             return { status: 'denied', filePath: null };
         }
         const stat = await fs.promises.stat(candidate);
@@ -725,7 +752,7 @@ async function resolveWorkspaceFile(requestPath) {
                 try {
                     if ((await fs.promises.stat(idx)).isFile()
                         && await isPathWithinAllowedRootsAsync(allowedRoots, idx)) {
-                        return { status: 'ok', filePath: idx };
+                        return await admitWorkspaceFile(workspaceRoot, idx);
                     }
                 } catch (_) {
                     continue;
@@ -734,7 +761,7 @@ async function resolveWorkspaceFile(requestPath) {
             return { status: 'not_found', filePath: null };
         }
         if (stat.isFile()) {
-            return { status: 'ok', filePath: candidate };
+            return await admitWorkspaceFile(workspaceRoot, candidate);
         }
     } catch (_) {
         return { status: 'not_found', filePath: null };
@@ -786,7 +813,7 @@ async function serveWorkspaceFileRequest(req, res) {
             res.end('Not Found');
             return true;
         }
-        if (await sendFileStream(req, res, resolved.filePath)) {
+        if (await sendWorkspaceFileStream(req, res, resolved.filePath)) {
             return true;
         }
         res.writeHead(500, { 'Content-Type': 'text/plain' });
