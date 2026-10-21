@@ -21,6 +21,7 @@ import {
     readManifestStartCommand
 } from '../docker/agentCommands.js';
 import { LOGS_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
+import { acquireHostLaunchExclusion, ensureHostLaunchSkeleton, runHostInteractiveSession } from '../hostLaunchExclusion.js';
 import { openSandboxLogHandle, readSandboxCrashLog } from '../sandboxLogFiles.js';
 import { sanitizeDiagnosticText } from '../../utils/diagnosticText.js';
 import { guardSpawnedChild } from '../../utils/childSpawn.js';
@@ -562,6 +563,9 @@ function buildSeatbeltRuntimeBinds(layout) {
  * Start a seatbelt-sandboxed agent process.
  */
 function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
+    // The host state skeleton exists before any launch; a launch that cannot
+    // create it fails.
+    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const profileRecord = loadAgentsMap()[containerName] || {};
@@ -734,7 +738,14 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
     });
     let child;
+    let launchExclusion = null;
     try {
+        // Spawn and record under the workspace lock, after the caller's start
+        // lease: a Box transaction never runs between this launch and its record.
+        launchExclusion = acquireHostLaunchExclusion({
+            workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+            label: `seatbelt launch of ${containerName}`,
+        });
         child = spawn('sandbox-exec', ['-f', profilePath, 'sh', '-c', entryCmd], {
             detached: true,
             stdio: logHandle.stdio,
@@ -782,6 +793,8 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         logHandle.discard();
         if (!child?.pid) dependencies.prepared?.release();
         throw error;
+    } finally {
+        launchExclusion?.release();
     }
     if (dependencies.prepared) {
         try {
@@ -1035,7 +1048,9 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
 /**
  * Spawn an interactive seatbelt session (for `ploinky cli` / `ploinky shell`).
  */
-function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entryCommand, options = {}) {
+async function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entryCommand, options = {}) {
+    // The skeleton exists before the sandbox profile is built.
+    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agents = loadAgentsMap();
@@ -1203,11 +1218,12 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         containerName,
     });
     options.onReady?.();
-    const result = spawnSync('sandbox-exec', ['-f', profilePath, 'sh', '-lc', `cd '${wd}' && ${rewrittenCmd}`], {
-        stdio: 'inherit',
+    // The session runs in the foreground; the workspace lock is held only until
+    // the sandbox has settled (runHostInteractiveSession).
+    const result = await runHostInteractiveSession('sandbox-exec', ['-f', profilePath, 'sh', '-lc', `cd '${wd}' && ${rewrittenCmd}`], {
         env: envMap,
-        cwd
-    });
+        cwd,
+    }, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, label: `interactive seatbelt session of ${containerName}` });
     return result.status ?? 0;
     } finally {
         attached?.release();

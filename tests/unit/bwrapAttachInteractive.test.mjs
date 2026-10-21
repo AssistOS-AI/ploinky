@@ -55,7 +55,7 @@ function attach(t, projectPathFor, { agentLibInWorkspace = false } = {}) {
         const { detectHostRuntimeKey } = await import(${JSON.stringify(RUNTIME_KEY_URL)});
         const { buildRouterEndpoint } = await import(${JSON.stringify(ROUTER_URL)});
         const grant = agentLibGrant(detectHostRuntimeKey('bwrap'));
-        const code = manager.attachBwrapInteractive('demo', ${JSON.stringify(MANIFEST)}, ${JSON.stringify(w.agentDir)},
+        const code = await manager.attachBwrapInteractive('demo', ${JSON.stringify(MANIFEST)}, ${JSON.stringify(w.agentDir)},
             ${JSON.stringify(projectPath)}, '/bin/sh', {
                 containerName: ${JSON.stringify(CONTAINER)},
                 routerEndpoint: buildRouterEndpoint('host', 8080),

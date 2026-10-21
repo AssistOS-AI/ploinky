@@ -138,7 +138,7 @@ test('every host-sandbox launch boundary revalidates exact generation authority 
             functions: [
                 ['startSeatbeltProcess', "spawn('sandbox-exec'"],
                 ['ensureSeatbeltService', 'startSeatbeltProcess('],
-                ['attachSeatbeltInteractive', "spawnSync('sandbox-exec'"],
+                ['attachSeatbeltInteractive', "runHostInteractiveSession('sandbox-exec'"],
             ],
         },
     ];
@@ -233,7 +233,8 @@ test('host-sandbox service and interactive boundaries deny an inactive generatio
                     ['start', () => manager[${JSON.stringify(startName)}]('agent', manifest, ${JSON.stringify(agentDir)}, options)],
                     ['attach', () => manager[${JSON.stringify(attachName)}]('agent', manifest, ${JSON.stringify(agentDir)}, ${JSON.stringify(root)}, '/bin/sh', options)],
                 ]) {
-                    try { invoke(); failures[name] = 'UNEXPECTED_SUCCESS'; }
+                    // The interactive attach is asynchronous: its denial is a rejection.
+                    try { await invoke(); failures[name] = 'UNEXPECTED_SUCCESS'; }
                     catch (error) { failures[name] = error.code || error.message; }
                 }
                 console.log(JSON.stringify(failures));

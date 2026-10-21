@@ -193,7 +193,7 @@ test('native Box Router publications preserve the public-only boundary across bi
     assert.equal(initial.state, 'absent', initial.message);
     engine = initial.engine;
     assert.equal(engine.hostKind, 'native-linux');
-    lock = await createMutationLockManager({ homeDirectory: stateHome }).acquire(identity.instance);
+    lock = await createMutationLockManager({ homeDirectory: stateHome }).acquire(identity.instance, { workspaceRoot: identity.workspaceRoot });
     const imageBundle = probeImageAgentLib(engine.name, imageId, runner);
     const agentLib = buildImageSelection({
         workspaceRoot: workspace,

@@ -801,6 +801,11 @@ export function createBoxSupervisor({
         return withWorkspaceMutationLock({
             resolveIdentity,
             lockManager,
+            // The lock lives inside the workspace: an unmountable path is
+            // refused before the lock writes anything there.
+            beforeLock(identity) {
+                assertBoxWorkspaceRoot(identity.workspaceRoot);
+            },
             beforeAnchor(identity) {
                 // The selected path is also the Box mount and working directory;
                 // an unmountable path fails before the workspace is anchored.

@@ -279,12 +279,13 @@ test('T.rollforward-restored-records', async (t) => {
 
 test('T.ownerless-host-lock', async (t) => {
     const w = world(t);
-    const manager = createMutationLockManager({ homeDirectory: w.home, timeoutMs: 100, retryMs: 10 });
-    const lockPath = path.join(manager.locksRoot, `${w.identity.instance}.lock`);
+    const manager = createMutationLockManager({ timeoutMs: 100, retryMs: 10 });
+    const lockPath = manager.lockPathFor(w.identity.workspaceRoot);
     fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
-    // An ownerless lock is a transient observation (an acquirer publishes the directory before its owner file): the acquirer keeps waiting
-    // and times out, never reclaiming it.
-    await assert.rejects(manager.acquire(w.identity.instance), /Timed out waiting for mutation lock/);
+    fs.writeFileSync(path.join(lockPath, 'candidate-0123456789abcdef.cid'), 'f'.repeat(64));
+    // Locks are published with their owner record, so an ownerless lock that still holds content was abandoned: the acquirer keeps
+    // waiting and times out, never reclaiming it. (An empty one holds nothing and is replaced by the next publish.)
+    await assert.rejects(manager.acquire(w.identity.instance, { workspaceRoot: w.identity.workspaceRoot }), /Timed out waiting for the workspace lock/);
     assert.ok(fs.existsSync(lockPath), 'an ownerless lock is preserved, never reclaimed by age');
 });
 
@@ -292,16 +293,24 @@ test('T.cid-outside-lock', async (t) => {
     const w = world(t);
     const store = createTransitionStore({ identity: w.identity, homeDirectory: w.home });
     const receipt = store.receiptPath('4'.repeat(32));
-    const locksRoot = createMutationLockManager({ homeDirectory: w.home }).locksRoot;
+    const locksRoot = path.dirname(createMutationLockManager().lockPathFor(w.identity.workspaceRoot));
     assert.equal(receipt.startsWith(`${locksRoot}${path.sep}`), false);
     assert.equal(path.dirname(receipt), store.directory);
-    // Legacy residue in a stale host lock is preserved, never deleted.
-    const manager = createMutationLockManager({ homeDirectory: w.home, timeoutMs: 100, retryMs: 10, kill: () => { throw Object.assign(new Error('dead'), { code: 'ESRCH' }); } });
-    const lockPath = path.join(manager.locksRoot, `${w.identity.instance}.lock`);
+    // Residue in a stale host lock is preserved, never deleted.
+    const stale = {
+        selfFields: () => ({ hostname: os.hostname(), machineId: null, bootId: null, pidNamespace: null, pid: process.pid, processStart: null }),
+        classify: () => ({ state: 'stale', reason: 'its process no longer exists' }),
+    };
+    const manager = createMutationLockManager({ timeoutMs: 100, retryMs: 10, liveness: stale });
+    const lockPath = manager.lockPathFor(w.identity.workspaceRoot);
     fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({ hostname: os.hostname(), pid: 999999, instance: w.identity.instance, startedAt: new Date().toISOString() })}\n`, { mode: 0o600 });
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
+        schema: 'ploinky-lock', version: 2, label: 'workspace', instance: w.identity.instance, workspaceRoot: w.identity.workspaceRoot,
+        hostname: os.hostname(), machineId: null, bootId: null, pidNamespace: null, pid: 999999, processStart: null,
+        startedAt: new Date().toISOString(),
+    })}\n`, { mode: 0o600 });
     fs.writeFileSync(path.join(lockPath, 'candidate-0123456789abcdef.cid'), 'f'.repeat(64));
-    await assert.rejects(manager.acquire(w.identity.instance), /unexpected entries/);
+    await assert.rejects(manager.acquire(w.identity.instance, { workspaceRoot: w.identity.workspaceRoot }), /still holds candidate-0123456789abcdef\.cid/);
     assert.ok(fs.existsSync(path.join(lockPath, 'owner.json')), 'the owner record is not deleted before the residue check');
 });
 

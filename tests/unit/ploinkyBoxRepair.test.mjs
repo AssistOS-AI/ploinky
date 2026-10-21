@@ -117,7 +117,9 @@ test('optional administrator inspection does not become a required sudo deployme
 
 test('an independent image repair cannot silently tighten shared-writable control-state directories', { skip: process.getuid?.() === 0 }, async (t) => {
     const state = fixture(t);
-    const control = path.join(state.home, '.ploinky-box'); fs.chmodSync(control, 0o777);
+    // The workspace lock lives in `<workspace>/.ploinky-host/locks`.
+    const control = path.join(state.workspace, '.ploinky-host');
+    fs.mkdirSync(control, { recursive: true }); fs.chmodSync(control, 0o777);
     const report = await repairWorkspace({ ...state.options,
         diagnose: async () => ({ version: 1, workspace: state.workspace, platform: 'linux', exitCode: 1, commands: [], checks: [
             ...inspectBindingPermissions({ identity: state.identity, homeDirectory: state.home }),

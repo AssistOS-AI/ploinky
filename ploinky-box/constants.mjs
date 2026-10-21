@@ -17,6 +17,9 @@ export const BOX_READY_LINE = 'PLOINKY_BOX_READY';
 export const BOX_MARKER_PATH = '/etc/ploinky-box';
 export const BOX_MARKER_CONTENT = 'assistos/ploinky-box\n';
 export const BOX_ROUTER_HEALTH_SOCKET = '/run/ploinky/router-health.sock';
+// Host-owned Box state lives in this direct child of the workspace root. Every
+// Box and agent runtime masks it read-only, so only host processes write it.
+export const HOST_STATE_DIRECTORY_NAME = '.ploinky-host';
 
 export const BOX_LABELS = Object.freeze({
     pathHash: 'io.assistos.ploinky-box.path-hash',

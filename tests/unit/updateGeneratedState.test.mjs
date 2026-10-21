@@ -85,7 +85,7 @@ function runScenario(body) {
                 receipt: fs.existsSync(path.join(repo, exclusions.IGNORE_RECEIPT)),
             });
             const out = {};
-            const lockManager = { async acquire() { return { assertHeld() {}, release() {} }; } };
+            const lockManager = { async acquireAt() { return { assertHeld() {}, release() {} }; } };
             for (const [label, prepare] of [['unverified', unverified], ['receipt', receiptProven]]) {
                 const registered = path.join(REPOS_DIR, 'Reg-' + label);
                 const upstream = checkout('reg-' + label, registered);

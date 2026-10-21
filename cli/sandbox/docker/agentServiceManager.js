@@ -95,6 +95,7 @@ import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, read
 import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
 import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, PLOINKY_SKILL_SCOPE_ENV, SHARED_DIR } from '../../utils/config.js';
+import { ensureHostLaunchSkeleton, withHostLaunchExclusion } from '../hostLaunchExclusion.js';
 import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
@@ -1516,6 +1517,9 @@ export function selectLaunchImages({ resolvedImage, launch = null } = {}) {
 }
 
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
+    // Host Podman launches create the host state skeleton first and fail if
+    // they cannot; in-Box (nested) launches skip it.
+    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const managedControlEnv = buildManagedControlEnv(manifest);
@@ -2733,9 +2737,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         networkLifecycleCapability: options.networkLifecycleCapability,
                         beforeDestructiveWork: options.beforeHardwareMutation,
                 };
+                // Create and start run under the workspace lock, after the
+                // caller's start lease (host only; adoption launches nothing).
                 const launched = adoptManagedRuntimeOnly
                     ? networkLifecycle.adoptManagedContainerTransaction(transaction)
-                    : networkLifecycle.runManagedContainerTransaction({
+                    : withHostLaunchExclusion(() => networkLifecycle.runManagedContainerTransaction({
                         ...transaction,
                         createContainer,
                         prepareLaunch: prepareGeneratedRouterLaunch,
@@ -2744,7 +2750,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         finalizeLaunch: finalizeGeneratedRouterLaunch,
                         onContainerCreated: recordCreatedIdentity,
                         commandPrefix: hardwareLaunch.commandPrefix(),
-                    });
+                    }), { workspaceRoot: PLOINKY_WORKSPACE_ROOT, label: `container launch of ${containerName}` });
                 if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
                     const mismatch = new Error(
                         `managed candidate '${containerName}' failed exact active-generation adoption: ${String(launched?.reason || 'mismatch')}`,
@@ -2781,7 +2787,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     predecessorId: String(existingRecord.containerId || ''),
                     ownershipProof: { predecessorRegistryIdentity: true, predecessorRemoved: predecessorRemoval.state },
                 });
-                launchedContainerId = withNetworkLifecycleLock(() => {
+                launchedContainerId = withNetworkLifecycleLock(() => withHostLaunchExclusion(() => {
                     const createdId = createContainer(unmanagedNetworkLifecyclePlan);
                     return String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
                         network: manifestNetwork,
@@ -2792,7 +2798,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         afterStart: cleanupGuardMountpointsAfterStart,
                         commandPrefix: hardwareLaunch.commandPrefix(),
                     }) || '');
-                }, { waitMs: 15 * 60 * 1000 });
+                }, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, label: `container launch of ${containerName}` }),
+                { waitMs: 15 * 60 * 1000 });
             }
             if (!launchedContainerId) {
                 throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);

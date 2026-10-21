@@ -151,7 +151,7 @@ function hostCli(f, discover) {
             return updateHostPloinkySource({
                 ...options,
                 boxMarkerPath: path.join(f.root, 'not-a-box'),
-                lockManager: { async acquire() { return { assertHeld() {}, release() {} }; } },
+                lockManager: { async acquireAt() { return { assertHeld() {}, release() {} }; } },
             });
         },
         relaunch() { events.push('relaunch'); return 0; },

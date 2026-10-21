@@ -47,7 +47,7 @@ test('interactive Ploinky self-update is deferred when upstream has a new versio
                 throw new Error('interactive update must not update the checkout');
             },
             sourceLockManager: {
-                async acquire() { throw new Error('interactive update must not take the source lock'); },
+                async acquireAt() { throw new Error('interactive update must not take the source lock'); },
             },
         });
 
@@ -69,8 +69,8 @@ function fakeRecord(outcome, code, { before = 'old-head', after = 'new-head' } =
 
 function recordingLockManager(events) {
     return {
-        async acquire(identity) {
-            events.push(['acquire', identity]);
+        async acquireAt(lockPath, identity) {
+            events.push(['acquire', identity, lockPath]);
             return {
                 assertHeld(value) { events.push(['held', value]); },
                 release() { events.push(['release', identity]); },
@@ -104,6 +104,7 @@ test('non-interactive Ploinky self-update fast-forwards under the host source lo
         assert.equal(result.record.outcome, 'changed');
         assert.deepEqual(events.map(entry => entry[0]), ['acquire', 'held', 'update', 'release']);
         assert.equal(events[0][1], expected.lockIdentity);
+        assert.equal(events[0][2], path.join(expected.canonicalRoot, '.git', 'ploinky-source.lock'));
         assert.equal(events[2][1].repoPath, expected.canonicalRoot);
         assert.equal(events[2][1].phase, 'host-ploinky');
         assert.deepEqual(events[2][1].policy, { kind: 'generic' });
@@ -165,7 +166,7 @@ test('Ploinky self-update reuses a held source lock only for the same checkout',
         fs.mkdirSync(path.join(root, '.git'), { recursive: true });
         const events = [];
         const lock = { assertHeld(value) { events.push(['held', value]); }, release() { events.push(['release']); } };
-        const noAcquire = { async acquire() { throw new Error('a held lock must not be re-acquired'); } };
+        const noAcquire = { async acquireAt() { throw new Error('a held lock must not be re-acquired'); } };
         const identity = ploinkySourceLockIdentity(root);
         const result = await updatePloinkySelf({
             repoPath: root,
@@ -207,7 +208,7 @@ test('Ploinky self-update skips an installed checkout outside the selected folde
             logger: { warn(message) { warnings.push(message); } },
             checkUpdate: unexpected,
             updateCheckout: unexpected,
-            sourceLockManager: { acquire: unexpected },
+            sourceLockManager: { acquireAt: unexpected },
         });
 
         assert.equal(result.skipped, true);
@@ -241,7 +242,7 @@ test('Ploinky box self-update skips the read-only source before running git oper
             logger: { warn(message) { warnings.push(message); } },
             checkUpdate: unexpected,
             updateCheckout: unexpected,
-            sourceLockManager: { acquire: unexpected },
+            sourceLockManager: { acquireAt: unexpected },
         });
 
         assert.deepEqual(result, {

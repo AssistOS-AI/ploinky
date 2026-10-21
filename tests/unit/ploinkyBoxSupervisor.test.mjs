@@ -1646,8 +1646,10 @@ test('an unmountable workspace path fails before locking inspection, anchoring, 
         await assert.rejects(invoke(supervisor), (error) => (
             error.code === 'PLOINKY_BOX_WORKSPACE_ROOT_INVALID' && /contains ':'/.test(error.message)
         ), name);
-        assert.deepEqual(events, ['lock', 'release'], name);
+        // The lock lives inside the workspace, so the path is refused before it is taken.
+        assert.deepEqual(events, [], name);
         assert.equal(fs.existsSync(path.join(selected, '.ploinky')), false, name);
+        assert.equal(fs.existsSync(path.join(selected, '.ploinky-host')), false, name);
     }
 });
 

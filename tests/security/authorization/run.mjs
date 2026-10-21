@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { TARGET, assertRuntimeSet, collectSecrets, digest, ownershipGuard, responseSummary, runVerdict, safeError, sanitizeGapEvidence, validateArtifactRoots, validateTarget, writePrivate } from './core.mjs';
+import { TARGET, WORKSPACE, assertRuntimeSet, collectSecrets, digest, ownershipGuard, responseSummary, runVerdict, safeError, sanitizeGapEvidence, validateArtifactRoots, validateTarget, writePrivate } from './core.mjs';
 import { loadPins, verifyCandidate } from './acceptance/pins.mjs';
 import { setupPrincipals } from './principals.mjs';
 import { runAccountProbes, runSessionProbes } from './account-probes.mjs';
@@ -81,7 +81,7 @@ try {
     const { createWebAssistSessionFactory } = await import('./webassist-fixture.mjs');
     ctx.webAssistSessionFactory = createWebAssistSessionFactory(ctx, { workspace: () => pins.workspace });
     ctx.report.deployment = await ctx.guard();
-    mutationLock = await createMutationLockManager({ timeoutMs: 1000 }).acquire(ctx.report.deployment.instance);
+    mutationLock = await createMutationLockManager({ timeoutMs: 1000 }).acquire(ctx.report.deployment.instance, { workspaceRoot: WORKSPACE });
     await ctx.guard();
     ctx.report.workspaceMutationLock = 'HELD';
     console.log('PASS: exact loopback target, Box identity/confinement and all source pins');

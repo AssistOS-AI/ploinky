@@ -714,13 +714,19 @@ async function waitForRouterReady(port, child, timeoutMs = 15000, {
   throw new Error(`router TCP listener did not become ready at 127.0.0.1:${validatedPort}`);
 }
 
+// Input stays suspended until an asynchronous foreground session has ended.
 function runWithSuspendedInput(callback) {
   const restoreInput = inputState.prepareForExternalCommand?.() || (() => {});
+  let result;
   try {
-    return callback();
-  } finally {
+    result = callback();
+  } catch (error) {
     restoreInput();
+    throw error;
   }
+  if (typeof result?.then === 'function') return Promise.resolve(result).finally(restoreInput);
+  restoreInput();
+  return result;
 }
 
 function getCliCmd(manifest) {
@@ -4004,13 +4010,13 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   if (actualRuntime === 'bwrap') {
     const attach = attachBwrapInteractive
       || (await import('../sandbox/bwrap/bwrapServiceManager.js')).attachBwrapInteractive;
-    exitCode = withSuspendedInput(() => {
+    exitCode = await withSuspendedInput(() => {
       return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint, onReady: notifyCliReady });
     });
   } else if (actualRuntime === 'seatbelt') {
     const attach = attachSeatbeltInteractive
       || (await import('../sandbox/seatbelt/seatbeltServiceManager.js')).attachSeatbeltInteractive;
-    exitCode = withSuspendedInput(() => {
+    exitCode = await withSuspendedInput(() => {
       return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint, onReady: notifyCliReady });
     });
   } else {
@@ -4163,16 +4169,12 @@ async function runShell(agentName) {
     console.log(`[shell] bwrap agent: ${shortAgentName}`);
     console.log(`[shell] command: ${cmd}`);
     const { attachBwrapInteractive } = await import('../sandbox/bwrap/bwrapServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
-    });
+    await runWithSuspendedInput(() => attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint }));
   } else if (actualRuntime === 'seatbelt') {
     console.log(`[shell] seatbelt agent: ${shortAgentName}`);
     console.log(`[shell] command: ${cmd}`);
     const { attachSeatbeltInteractive } = await import('../sandbox/seatbelt/seatbeltServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
-    });
+    await runWithSuspendedInput(() => attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint }));
   } else {
     console.log(`[shell] container: ${containerName}`);
     console.log(`[shell] command: ${cmd}`);

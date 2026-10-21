@@ -4,279 +4,490 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { PloinkyBoxError } from './errors.mjs';
+import { ensureHostStateSkeleton, hostStatePaths } from './hostState/root.mjs';
 import { materializeIdentityAnchor } from './identity.mjs';
+import {
+    INSTANCE_PATTERN,
+    LABEL_PATTERN,
+    LOCK_OWNER_SCHEMA,
+    LOCK_OWNER_VERSION,
+    OWNER_FILE,
+    describeHolder,
+    discardDirectory,
+    publishLock,
+    readOwnerRecord,
+    retireLock,
+    serializeOwner,
+    stageLock,
+    sweepLockDebris,
+} from './lockFiles.mjs';
+import { createLockLiveness, LIVENESS } from './lockLiveness.mjs';
 
-function lockError(message, cause) {
-    return new PloinkyBoxError(message, {
-        code: 'PLOINKY_BOX_LOCK_FAILED',
-        cause,
-    });
+export { LOCK_OWNER_SCHEMA, LOCK_OWNER_VERSION, parseLockOwner } from './lockFiles.mjs';
+
+// The workspace mutation lock lives in `<workspace>/.ploinky-host/locks/` and
+// so follows the workspace directory: every spelling of one directory shares
+// it, and a renamed workspace carries it along. QA tooling feature-detects
+// this generation through MUTATION_LOCK_LOCATION. The on-disk protocol (atomic
+// publish and retire, crash debris) is in lockFiles.mjs.
+export const MUTATION_LOCK_LOCATION = 'workspace';
+export const WORKSPACE_LOCK_LABEL = 'workspace';
+
+const RECLAIM_SUFFIX = '.reclaim';
+const MAX_IMMEDIATE_RETRIES = 8;
+const PROCESS_STARTED_AT_MS = Date.now() - process.uptime() * 1000;
+
+function lockError(message, { code = 'PLOINKY_BOX_LOCK_FAILED', cause, ...details } = {}) {
+    return Object.assign(new PloinkyBoxError(message, { code, cause }), details);
 }
 
 function currentUid() {
     return typeof process.getuid === 'function' ? process.getuid() : null;
 }
 
-function assertOwnedDirectory(directory, fsApi) {
-    const stat = fsApi.lstatSync(directory);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw lockError(`Lock path component is not a real directory: ${directory}`);
-    }
-    const uid = currentUid();
-    if (uid !== null && stat.uid !== uid) {
-        throw lockError(`Lock path component is not owned by the current user: ${directory}`);
-    }
-    return stat;
+// Shared by every manager that does not inject its own probe; successful
+// probes of this process's own tokens are kept, failed ones are retried.
+let processLiveness = null;
+function defaultLiveness() {
+    processLiveness ??= createLockLiveness();
+    return processLiveness;
 }
 
-function ensurePrivateDirectory(directory, fsApi) {
-    try {
-        assertOwnedDirectory(directory, fsApi);
-    } catch (error) {
-        if (error.code !== 'ENOENT') {
-            throw error;
-        }
-        try {
-            fsApi.mkdirSync(directory, { recursive: false, mode: 0o700 });
-        } catch (mkdirError) {
-            if (mkdirError.code !== 'EEXIST') {
-                throw mkdirError;
-            }
-        }
-        assertOwnedDirectory(directory, fsApi);
-    }
-    fsApi.chmodSync(directory, 0o700);
-}
-
-function parseOwner(ownerPath, fsApi) {
-    let stat;
-    let bytes;
-    try {
-        stat = fsApi.lstatSync(ownerPath);
-        if (stat.isSymbolicLink() || !stat.isFile()) {
-            throw lockError(`Mutation lock owner is not a regular file: ${ownerPath}`);
-        }
-        bytes = fsApi.readFileSync(ownerPath);
-    } catch (error) {
-        if (error instanceof PloinkyBoxError) {
-            throw error;
-        }
-        throw lockError(`Unable to read mutation lock owner: ${ownerPath}`, error);
-    }
-
-    let owner;
-    try {
-        owner = JSON.parse(bytes.toString('utf8'));
-    } catch (error) {
-        throw lockError(`Mutation lock owner is malformed: ${ownerPath}`, error);
-    }
-    const expectedKeys = ['hostname', 'instance', 'pid', 'startedAt'];
-    if (!owner
-        || JSON.stringify(Object.keys(owner).sort()) !== JSON.stringify(expectedKeys)
-        || typeof owner.hostname !== 'string'
-        || !Number.isSafeInteger(owner.pid)
-        || owner.pid <= 0
-        || typeof owner.instance !== 'string'
-        || typeof owner.startedAt !== 'string') {
-        throw lockError(`Mutation lock owner is incomplete: ${ownerPath}`);
-    }
-    return {
-        owner,
-        fingerprint: {
-            device: String(stat.dev),
-            inode: String(stat.ino),
-            size: stat.size,
-            bytes,
-        },
-    };
-}
-
-// Names the holder when its owner record can be read.
-function lockBusyError(lockPath, ownerPath, fsApi) {
-    let holder = '';
-    try {
-        const { owner } = parseOwner(ownerPath, fsApi);
-        holder = ` (pid ${owner.pid} on ${owner.hostname}, since ${owner.startedAt})`;
-    } catch {}
-    const error = lockError(`Timed out waiting for mutation lock: ${lockPath}. Another Ploinky command${holder} `
-        + 'holds it. Run the command again after that command finishes.');
-    error.lockBusy = true;
-    return error;
-}
-
-function ownerUnchanged(ownerPath, fingerprint, fsApi) {
-    const stat = fsApi.lstatSync(ownerPath);
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-        return false;
-    }
-    if (String(stat.dev) !== fingerprint.device
-        || String(stat.ino) !== fingerprint.inode
-        || stat.size !== fingerprint.size) {
-        return false;
-    }
-    return fsApi.readFileSync(ownerPath).equals(fingerprint.bytes);
-}
-
-function processIsProvenDead(pid, kill) {
-    try {
-        kill(pid, 0);
-        return false;
-    } catch (error) {
-        if (error.code === 'ESRCH') {
-            return true;
-        }
-        return false;
-    }
+function defaultSleepSync(milliseconds) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
 export function createMutationLockManager({
+    // Selects only the update host-state store (`stateRoot`) until that store
+    // moves into the workspace; no lock lives under it.
     homeDirectory = os.homedir(),
-    hostname = os.hostname(),
-    pid = process.pid,
-    now = () => new Date(),
-    kill = (targetPid, signal) => process.kill(targetPid, signal),
     fsApi = fs,
+    liveness = defaultLiveness(),
+    now = () => new Date(),
+    clock = () => Date.now(),
     retryMs = 50,
     timeoutMs = 30_000,
+    sleepSync = defaultSleepSync,
+    uid = currentUid(),
 } = {}) {
     const stateRoot = path.join(homeDirectory, '.ploinky-box');
-    const locksRoot = path.join(stateRoot, 'locks');
 
-    function ensureRoots() {
-        ensurePrivateDirectory(stateRoot, fsApi);
-        ensurePrivateDirectory(locksRoot, fsApi);
+    function ownerRecord({ label, instance, workspaceRoot }) {
+        const self = liveness.selfFields();
+        return {
+            schema: LOCK_OWNER_SCHEMA,
+            version: LOCK_OWNER_VERSION,
+            label,
+            instance,
+            workspaceRoot,
+            hostname: self.hostname,
+            machineId: self.machineId,
+            bootId: self.bootId,
+            pidNamespace: self.pidNamespace,
+            pid: self.pid,
+            processStart: self.processStart,
+            startedAt: now().toISOString(),
+        };
     }
 
-    function recoverStaleLock(lockPath, ownerPath, instance) {
-        let captured;
+    // A lock directory must be a real directory owned by the invoking user.
+    // Anything else is tampering, never a busy lock to wait for.
+    function inspectLockDirectory(lockPath) {
+        let dirStat;
         try {
-            assertOwnedDirectory(lockPath, fsApi);
-            captured = parseOwner(ownerPath, fsApi);
+            dirStat = fsApi.lstatSync(lockPath, { bigint: true });
         } catch (error) {
-            // An acquirer publishes the lock directory before its owner file and
-            // a releaser removes the owner file first. An ownerless or vanished
-            // lock is a transient observation: keep waiting, never reclaim it.
-            if (error?.code === 'ENOENT' || error?.cause?.code === 'ENOENT') {
-                return false;
+            if (error?.code === 'ENOENT') return { kind: 'vanished' };
+            throw lockError(`Unable to inspect lock ${lockPath}`, { cause: error });
+        }
+        if (dirStat.isSymbolicLink() || !dirStat.isDirectory()
+            || (uid !== null && Number(dirStat.uid) !== uid)) {
+            throw lockError(`Lock path is not a private directory owned by the current user: ${lockPath}`);
+        }
+        let record;
+        try {
+            record = readOwnerRecord(fsApi, lockPath);
+        } catch (error) {
+            if (error?.code === 'ENOENT') return { kind: 'vanished' };
+            throw lockError(`Unable to read the owner of lock ${lockPath}`, { cause: error });
+        }
+        // Locks are published with their record, so an ownerless lock that a
+        // publish could not replace is not empty: abandoned, never reclaimed.
+        if (!record) return { kind: 'ownerless', dirStat };
+        if (record.invalid) return { kind: 'malformed', dirStat, reason: record.invalid };
+        return { kind: 'owner', dirStat, owner: record.owner, bytes: record.bytes };
+    }
+
+    function sameDirectory(left, right) {
+        return left.dev === right.dev && left.ino === right.ino;
+    }
+
+    function residueOf(lockPath) {
+        return fsApi.readdirSync(lockPath).filter((entry) => entry !== OWNER_FILE).sort();
+    }
+
+    function residueError(lockPath, label, residue, reason) {
+        const hint = label === WORKSPACE_LOCK_LABEL ? 'Run `ploinky unlock` in the workspace after inspecting it.'
+            : 'Inspect and remove it once you are sure no command is using it.';
+        return lockError(
+            `The ${label} lock ${lockPath} belongs to a command that is no longer running (${reason}), but it `
+            + `still holds ${residue.slice(0, 8).join(', ')}, which may be needed for recovery. `
+            + `It was left in place. ${hint}`,
+            { lockResidue: true, residue },
+        );
+    }
+
+    // Serializes reclaimers. Without it, two waiters that both saw the same dead
+    // owner could interleave so that the second removes the lock a third
+    // command acquired after the first reclaim. Under the guard the lock
+    // directory can change only through its holder, which is proven gone.
+    function reclaimStale(lockPath, observed) {
+        const guard = `${lockPath}${RECLAIM_SUFFIX}`;
+        try {
+            fsApi.mkdirSync(guard, { recursive: false, mode: 0o700 });
+        } catch (error) {
+            if (error?.code === 'EEXIST') return { outcome: 'contended', guard };
+            if (error?.code === 'ENOENT') return { outcome: 'retry' };
+            throw lockError(`Unable to reclaim lock ${lockPath}`, { cause: error });
+        }
+        const guardOwner = path.join(guard, OWNER_FILE);
+        try {
+            const { label, instance, workspaceRoot } = observed.owner;
+            fsApi.writeFileSync(guardOwner, serializeOwner(ownerRecord({ label, instance, workspaceRoot })),
+                { flag: 'wx', mode: 0o600 });
+            const current = inspectLockDirectory(lockPath);
+            if (current.kind !== 'owner' || !sameDirectory(current.dirStat, observed.dirStat)
+                || !current.bytes.equals(observed.bytes)) {
+                return { outcome: 'retry' };
             }
-            throw error;
+            const verdict = liveness.classify(current.owner);
+            if (verdict.state !== LIVENESS.stale) return { outcome: 'retry' };
+            const residue = residueOf(lockPath);
+            if (residue.length) return { outcome: 'residue', residue, reason: verdict.reason };
+            retireLock(fsApi, lockPath);
+            return { outcome: 'reclaimed' };
+        } finally {
+            try { fsApi.unlinkSync(guardOwner); } catch {}
+            try { fsApi.rmdirSync(guard); } catch {}
         }
-        if (captured.owner.instance !== instance) {
-            throw lockError(`Mutation lock identity does not match ${instance}`);
-        }
-        if (captured.owner.hostname !== hostname) {
-            return false;
-        }
-        if (!processIsProvenDead(captured.owner.pid, kill)) {
-            return false;
-        }
-        if (!ownerUnchanged(ownerPath, captured.fingerprint, fsApi)) {
-            throw lockError(`Mutation lock owner changed during stale-lock recovery: ${lockPath}`);
-        }
-        // Inspect the whole lock before deleting anything: residue such as an
-        // interrupted create receipt must be preserved for exact recovery, so
-        // the owner record is never removed only to find the directory busy.
-        const residue = fsApi.readdirSync(lockPath).filter((entry) => entry !== 'owner.json');
-        if (residue.length) {
-            throw lockError(
-                `Stale mutation lock contains unexpected entries (${residue.slice(0, 8).join(', ')}); it was left in place: ${lockPath}`,
-            );
-        }
-        fsApi.unlinkSync(ownerPath);
-        try {
-            fsApi.rmdirSync(lockPath);
-        } catch (error) {
-            throw lockError(`Stale mutation lock contains unexpected entries: ${lockPath}`, error);
-        }
-        return true;
     }
 
-    async function acquire(instance) {
-        if (!/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance)) {
+    function busyError(state) {
+        const { lockPath, label, observed, verdict, contendedGuard } = state;
+        let holder;
+        if (observed?.kind === 'owner') {
+            holder = `It is held by ${describeHolder(observed.owner)}; ${verdict?.reason ?? 'its state is unknown'}.`;
+        } else if (observed?.kind === 'ownerless') {
+            holder = 'It has no owner record but is not empty, so it was abandoned with content inside.';
+        } else if (observed?.kind === 'malformed') {
+            holder = `It cannot be attributed: ${observed.reason}.`;
+        } else {
+            holder = 'Another command holds it.';
+        }
+        if (contendedGuard) holder += ` Another command is reclaiming it (${contendedGuard}).`;
+        const owner = observed?.kind === 'owner' ? observed.owner : null;
+        const forced = owner ? ` (or \`ploinky unlock --force-holder ${owner.pid}@${owner.machineId ?? owner.hostname}\`)` : '';
+        const hint = label === WORKSPACE_LOCK_LABEL
+            ? 'Run the command again after that command finishes. If it is no longer running, run `ploinky unlock` '
+                + `in the workspace${forced}.`
+            : 'Run the command again after that command finishes. If it is no longer running, '
+                + 'inspect and remove the lock.';
+        return lockError(`Timed out waiting for the ${label} lock ${lockPath}. ${holder} ${hint}`, {
+            lockBusy: true,
+            holder: owner ? Object.freeze({ ...owner }) : null,
+        });
+    }
+
+    // One acquisition attempt, shared by the asynchronous and synchronous
+    // drivers. Returns a handle, or tells the driver to retry now or after a wait.
+    function attempt(state) {
+        if (!state.ready) {
+            try {
+                state.prepare(state.first);
+            } catch (error) {
+                // The skeleton was removed while it was being created: rebuild it.
+                if (error?.code === 'ENOENT') return { wait: true };
+                throw error;
+            }
+            state.first = false;
+            state.ready = true;
+            if (!state.swept) {
+                state.swept = true;
+                sweepLockDebris({
+                    fsApi, lockPath: state.lockPath, uid,
+                    classify: (owner) => liveness.classify(owner), processStartedAtMs: PROCESS_STARTED_AT_MS,
+                });
+            }
+        }
+        if (!state.staged) {
+            const ownerBytes = serializeOwner(ownerRecord(state));
+            try {
+                state.staged = { ...stageLock(fsApi, state.lockPath, ownerBytes), ownerBytes };
+            } catch (error) {
+                if (error?.code === 'ENOENT') {
+                    state.ready = false;
+                    return { wait: true };
+                }
+                throw lockError(`Unable to stage the ${state.label} lock ${state.lockPath}`, { cause: error });
+            }
+        }
+        let outcome;
+        try {
+            outcome = publishLock(fsApi, state.staged.staging, state.lockPath);
+        } catch (error) {
+            throw lockError(`Unable to acquire the ${state.label} lock ${state.lockPath}`, { cause: error });
+        }
+        if (outcome === 'published') {
+            const { ownerBytes, dirStat } = state.staged;
+            state.staged = null;
+            return { handle: createHandle({ ...state, ownerBytes, dirStat }) };
+        }
+        if (outcome === 'vanished') {
+            discardDirectory(fsApi, state.staged.staging);
+            state.staged = null;
+            state.ready = false;
+            return { wait: true };
+        }
+        const observed = inspectLockDirectory(state.lockPath);
+        if (observed.kind === 'vanished') return { retry: true };
+        state.observed = observed;
+        state.verdict = null;
+        state.contendedGuard = null;
+        if (observed.kind === 'owner') {
+            state.verdict = liveness.classify(observed.owner);
+            if (state.verdict.state === LIVENESS.stale) {
+                const reclaim = reclaimStale(state.lockPath, observed);
+                if (reclaim.outcome === 'reclaimed') return { retry: true };
+                if (reclaim.outcome === 'residue') {
+                    throw residueError(state.lockPath, state.label, reclaim.residue, reclaim.reason);
+                }
+                if (reclaim.outcome === 'contended') state.contendedGuard = reclaim.guard;
+            }
+        }
+        return { wait: true };
+    }
+
+    function createHandle({ lockPath, label, instance, workspaceRoot, ownerBytes, dirStat }) {
+        let released = false;
+        const heldName = instance ?? label;
+
+        function assertNotReleased() {
+            if (released) {
+                throw lockError(`The ${label} lock was already released: ${lockPath}`, { code: 'PLOINKY_BOX_LOCK_NOT_HELD' });
+            }
+        }
+
+        function assertWorkspaceLock() {
+            if (!workspaceRoot) {
+                throw lockError(`The ${label} lock is not a workspace lock: ${lockPath}`, {
+                    code: 'PLOINKY_BOX_LOCK_WORKSPACE_REQUIRED',
+                });
+            }
+        }
+
+        // The held lock is this exact directory with these exact owner bytes.
+        function verifyAt(candidate, code) {
+            const fail = (cause) => lockError(
+                `The ${label} lock held by this command is not at ${candidate}`,
+                { code, cause },
+            );
+            let stat;
+            let bytes;
+            try {
+                stat = fsApi.lstatSync(candidate, { bigint: true });
+                if (stat.isSymbolicLink() || !stat.isDirectory() || !sameDirectory(stat, dirStat)) throw fail();
+                const ownerPath = path.join(candidate, OWNER_FILE);
+                const ownerStat = fsApi.lstatSync(ownerPath);
+                if (ownerStat.isSymbolicLink() || !ownerStat.isFile() || ownerStat.nlink !== 1) throw fail();
+                bytes = fsApi.readFileSync(ownerPath);
+            } catch (error) {
+                if (error instanceof PloinkyBoxError) throw error;
+                throw fail(error);
+            }
+            if (!bytes.equals(ownerBytes)) throw fail();
+        }
+
+        function removeAt(candidate) {
+            const residue = residueOf(candidate);
+            if (residue.length) {
+                throw lockError(
+                    `The ${label} lock ${candidate} still holds ${residue.slice(0, 8).join(', ')}; it was not released `
+                    + 'and is kept for recovery.',
+                    { lockResidue: true, residue },
+                );
+            }
+            retireLock(fsApi, candidate);
+            released = true;
+        }
+
+        const relocatedPath = (root) => {
+            assertWorkspaceLock();
+            return hostStatePaths(root).workspaceLock;
+        };
+
+        return Object.freeze({
+            instance: heldName,
+            label,
+            path: lockPath,
+            workspaceRoot,
+            assertHeld(expected) {
+                assertNotReleased();
+                if (expected !== heldName) {
+                    throw lockError(`The ${label} lock is held for ${heldName}, not ${expected}`, {
+                        code: 'PLOINKY_BOX_LOCK_INSTANCE_MISMATCH',
+                    });
+                }
+                verifyAt(lockPath, 'PLOINKY_BOX_LOCK_RELOCATED');
+            },
+            // The relocation custody operations take the workspace root the
+            // held lock moved to, not a lock path.
+            assertHeldAt(relocatedWorkspaceRoot) {
+                assertNotReleased();
+                verifyAt(relocatedPath(relocatedWorkspaceRoot), 'PLOINKY_BOX_LOCK_NOT_AT_PATH');
+            },
+            release() {
+                assertNotReleased();
+                verifyAt(lockPath, 'PLOINKY_BOX_LOCK_RELOCATED');
+                removeAt(lockPath);
+            },
+            releaseRelocated(relocatedWorkspaceRoot) {
+                assertNotReleased();
+                const candidate = relocatedPath(relocatedWorkspaceRoot);
+                verifyAt(candidate, 'PLOINKY_BOX_LOCK_NOT_AT_PATH');
+                removeAt(candidate);
+            },
+            // The workspace, and the lock with it, has been deleted: give up the
+            // handle without touching anything.
+            relinquishDeleted() {
+                assertNotReleased();
+                assertWorkspaceLock();
+                try {
+                    fsApi.lstatSync(workspaceRoot);
+                } catch (error) {
+                    if (error?.code === 'ENOENT') {
+                        released = true;
+                        return;
+                    }
+                    throw lockError(`Unable to inspect ${workspaceRoot}`, { cause: error });
+                }
+                throw lockError(`The workspace still exists: ${workspaceRoot}`, { code: 'PLOINKY_BOX_WORKSPACE_PRESENT' });
+            },
+        });
+    }
+
+    function workspaceState(instance, options) {
+        if (typeof instance !== 'string' || !INSTANCE_PATTERN.test(instance)) {
             throw lockError(`Invalid mutation lock identity: ${instance}`);
         }
-        ensureRoots();
-        const lockPath = path.join(locksRoot, `${instance}.lock`);
-        const ownerPath = path.join(lockPath, 'owner.json');
-        const deadline = Date.now() + timeoutMs;
+        const { workspaceRoot, requireNewSkeleton = false } = options ?? {};
+        if (typeof workspaceRoot !== 'string' || !path.isAbsolute(workspaceRoot)) {
+            throw lockError('The workspace mutation lock requires the absolute workspace root', {
+                code: 'PLOINKY_BOX_LOCK_WORKSPACE_REQUIRED',
+            });
+        }
+        return {
+            lockPath: hostStatePaths(workspaceRoot).workspaceLock,
+            label: WORKSPACE_LOCK_LABEL,
+            instance,
+            workspaceRoot,
+            first: true,
+            ready: false,
+            prepare(first) {
+                ensureHostStateSkeleton(workspaceRoot, { fsApi, uid, requireNew: first && requireNewSkeleton });
+            },
+        };
+    }
 
-        while (true) {
-            try {
-                fsApi.mkdirSync(lockPath, { recursive: false, mode: 0o700 });
-                fsApi.chmodSync(lockPath, 0o700);
-                const owner = {
-                    hostname,
-                    pid,
-                    instance,
-                    startedAt: now().toISOString(),
-                };
+    function pathState(lockPath, label) {
+        if (typeof lockPath !== 'string' || !path.isAbsolute(lockPath)) {
+            throw lockError(`Lock path must be absolute: ${lockPath}`);
+        }
+        if (typeof label !== 'string' || !LABEL_PATTERN.test(label)) {
+            throw lockError(`Invalid lock label: ${label}`);
+        }
+        const parent = path.dirname(lockPath);
+        return {
+            lockPath,
+            label,
+            instance: null,
+            workspaceRoot: null,
+            first: true,
+            ready: false,
+            prepare() {
+                // The parent is never created here: it must already be a real directory.
+                let stat;
                 try {
-                    fsApi.writeFileSync(ownerPath, `${JSON.stringify(owner)}\n`, {
-                        flag: 'wx',
-                        mode: 0o600,
-                    });
-                    fsApi.chmodSync(ownerPath, 0o600);
+                    stat = fsApi.lstatSync(parent);
                 } catch (error) {
-                    try {
-                        fsApi.rmdirSync(lockPath);
-                    } catch {}
-                    throw lockError(`Unable to write mutation lock owner: ${lockPath}`, error);
+                    throw lockError(`Lock parent directory is missing: ${parent}`, { cause: error });
                 }
+                if (stat.isSymbolicLink() || !stat.isDirectory()) {
+                    throw lockError(`Lock parent is not a real directory: ${parent}`);
+                }
+            },
+        };
+    }
 
-                let released = false;
-                return {
-                    instance,
-                    path: lockPath,
-                    assertHeld(expectedInstance) {
-                        if (released || expectedInstance !== instance) {
-                            throw lockError(`Mutation lock is not held for ${expectedInstance}`);
-                        }
-                    },
-                    release() {
-                        if (released) {
-                            throw lockError(`Mutation lock was already released: ${lockPath}`);
-                        }
-                        const captured = parseOwner(ownerPath, fsApi);
-                        if (captured.owner.hostname !== hostname
-                            || captured.owner.pid !== pid
-                            || captured.owner.instance !== instance) {
-                            throw lockError(`Mutation lock ownership changed before release: ${lockPath}`);
-                        }
-                        fsApi.unlinkSync(ownerPath);
-                        fsApi.rmdirSync(lockPath);
-                        released = true;
-                    },
-                };
-            } catch (error) {
-                if (error.code !== 'EEXIST') {
-                    if (error instanceof PloinkyBoxError) {
-                        throw error;
-                    }
-                    throw lockError(`Unable to acquire mutation lock: ${lockPath}`, error);
-                }
+    // A retry right after a reclaim or a vanished lock is attempted at once,
+    // even past the deadline, so that a slow attempt never turns a lock that
+    // was just freed into a busy error; consecutive immediate retries are bounded.
+    // An unpublished staging directory is always removed on the way out.
+    function nextStep(state, progress) {
+        const step = attempt(state);
+        if (step.handle) return step;
+        if (step.retry && progress.immediate < MAX_IMMEDIATE_RETRIES) {
+            progress.immediate += 1;
+            return { again: true };
+        }
+        if (clock() >= progress.deadline) throw busyError(state);
+        progress.immediate = 0;
+        return { sleep: true };
+    }
 
-                if (recoverStaleLock(lockPath, ownerPath, instance)) {
-                    continue;
-                }
-                if (Date.now() >= deadline) {
-                    throw lockBusyError(lockPath, ownerPath, fsApi);
-                }
-                await delay(retryMs);
+    async function drive(state) {
+        const progress = { deadline: clock() + timeoutMs, immediate: 0 };
+        try {
+            while (true) {
+                const step = nextStep(state, progress);
+                if (step.handle) return step.handle;
+                if (step.sleep) await delay(retryMs);
             }
+        } finally {
+            if (state.staged) discardDirectory(fsApi, state.staged.staging);
         }
     }
 
-    return {
-        acquire,
-        locksRoot,
+    function driveSync(state) {
+        const progress = { deadline: clock() + timeoutMs, immediate: 0 };
+        try {
+            while (true) {
+                const step = nextStep(state, progress);
+                if (step.handle) return step.handle;
+                if (step.sleep) sleepSync(retryMs);
+            }
+        } finally {
+            if (state.staged) discardDirectory(fsApi, state.staged.staging);
+        }
+    }
+
+    return Object.freeze({
+        acquire: async (instance, options) => drive(workspaceState(instance, options)),
+        // For synchronous host-runtime launch paths. It blocks the calling
+        // thread while it waits, for at most `timeoutMs`.
+        acquireSync: (instance, options) => driveSync(workspaceState(instance, options)),
+        acquireAt: async (lockPath, label) => drive(pathState(lockPath, label)),
+        lockPathFor: (workspaceRoot) => hostStatePaths(workspaceRoot).workspaceLock,
         stateRoot,
-    };
+    });
 }
 
 export async function withWorkspaceMutationLock({
     resolveIdentity,
     lockManager,
     execute,
+    // Read-only checks that must pass before anything is written into the
+    // selected workspace, including the lock's own skeleton.
+    beforeLock = async () => undefined,
     beforeAnchor = async () => undefined,
     materializeAnchor = materializeIdentityAnchor,
     maxHandoffs = 4,
@@ -294,7 +505,8 @@ export async function withWorkspaceMutationLock({
         visited.add(identity.instance);
         let lock;
         try {
-            lock = await lockManager.acquire(identity.instance);
+            await beforeLock(identity);
+            lock = await lockManager.acquire(identity.instance, { workspaceRoot: identity.workspaceRoot });
         } catch (error) {
             // Nothing runs before this lock is held: the transaction never started.
             error.workspaceTransactionStarted = false;

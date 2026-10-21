@@ -363,8 +363,8 @@ export async function collectRuntimeDiagnostics({ identity, repositoryRoot, env,
         if (!exported) return;
         const ownership = discoverBoxOwnership(fixture, { runner, env, platform });
         if (ownership.state !== 'absent') throw new Error('Temporary diagnostic workspace is not unambiguously absent');
-        fs.mkdirSync(path.join(scratch, 'state'), { mode: 0o700 });
-        lock = await createMutationLockManager({ homeDirectory: path.join(scratch, 'state') }).acquire(fixture.instance);
+        // The fixture's lock lives inside the fixture workspace, like any workspace lock.
+        lock = await createMutationLockManager().acquire(fixture.instance, { workspaceRoot: fixture.workspaceRoot });
         const wrapped = {
             ...runner,
             run(file, args, options) {

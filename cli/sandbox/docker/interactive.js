@@ -1,4 +1,4 @@
-import { PLOINKY_SKILL_SCOPE_ENV } from '../../utils/config.js';
+import { PLOINKY_SKILL_SCOPE_ENV, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import fs from 'fs';
 import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
 import { execSync, spawnSync } from 'child_process';
@@ -44,6 +44,7 @@ import {
     agentLibGrantEnv,
 } from '../agentLibGrant.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
+import { withHostLaunchExclusion } from '../hostLaunchExclusion.js';
 import { HardwareLimitsError } from '../hardwareLimits/errors.mjs';
 import { captureHardwareContext, interactiveHardwareRefusal } from '../hardwareLimits/requestedLimits.mjs';
 
@@ -85,15 +86,17 @@ function controllerGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) 
     return mounts.map(binding => `-v "${binding.hostPath}:${binding.runtimePath}${binding.suffix || ''}"`);
 }
 
+// Every interactive container create and start runs here. On the host it also
+// holds the workspace lock, which first creates the host state skeleton.
 function withGuardMountpointCleanup(operation) {
-    return withNetworkLifecycleLock(() => {
+    return withNetworkLifecycleLock(() => withHostLaunchExclusion(() => {
         const cleanup = prepareControllerGuardMountpointCleanup();
         try {
             return operation();
         } finally {
             cleanup();
         }
-    }, { waitMs: 15 * 60 * 1000 });
+    }, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, label: 'interactive container launch' }), { waitMs: 15 * 60 * 1000 });
 }
 
 function buildInteractiveCommandCreateCommand({
