@@ -746,9 +746,30 @@ function normalizeDesired(desired) {
             throw edgeError(`duplicate desired hostname '${hostname}'`);
         }
         const entry = assertObject(rawEntry, `edge desired host '${hostname}'`);
-        assertOnlyKeys(entry, new Set(['agent', 'routerSurfaces']), `edge desired host '${hostname}'`);
+        assertOnlyKeys(entry, new Set([
+            'agent', 'routerSurfaces', 'rootApplication', 'dnsManagement',
+        ]), `edge desired host '${hostname}'`);
         const agent = normalizeAgentReference(entry.agent, `edge desired host '${hostname}'.agent`);
         const normalized = { agent };
+        if (entry.rootApplication !== undefined) {
+            const label = `edge desired host '${hostname}'.rootApplication`;
+            const rootApplication = assertObject(entry.rootApplication, label);
+            assertOnlyKeys(rootApplication, new Set(['agent', 'port']), label);
+            if (!Number.isInteger(rootApplication.port) || rootApplication.port < 1 || rootApplication.port > 65535) {
+                throw edgeError(`${label}.port must be an integer port`);
+            }
+            normalized.rootApplication = {
+                agent: normalizeAgentReference(rootApplication.agent, `${label}.agent`),
+                port: rootApplication.port,
+            };
+        }
+        // DNS ownership is publication input only; routing never reads it.
+        if (entry.dnsManagement !== undefined) {
+            if (!['managed', 'external'].includes(entry.dnsManagement)) {
+                throw edgeError(`edge desired host '${hostname}'.dnsManagement is invalid`);
+            }
+            normalized.dnsManagement = entry.dnsManagement;
+        }
         if (entry.routerSurfaces !== undefined) {
             const surfaces = uniqueStrings(entry.routerSurfaces, `edge desired host '${hostname}'.routerSurfaces`);
             for (const surface of surfaces) {
@@ -958,6 +979,23 @@ function resolveAgentRoute(agentRef, routing) {
         throw edgeError(`agent '${agentRef}' must resolve to exactly one enabled effective route`);
     }
     return { routeKey: matches[0][0], route: matches[0][1], agent: agentRef };
+}
+
+// A root application is resolved among installed routes, disabled ones
+// included: its availability is answered per request (inactive owner or
+// runtime), while an uninstalled reference can never compile.
+function resolveRootApplicationRoute(rootApplication, ownerRouteKey, routing, hostname) {
+    const matches = Object.entries(routing.routes || {}).filter(([, route]) => (
+        route && routeMatchesAgent(route, rootApplication.agent)
+    ));
+    if (matches.length !== 1) {
+        throw edgeError(`edge desired host '${hostname}'.rootApplication agent '${rootApplication.agent}' must resolve to exactly one installed route`);
+    }
+    const [routeKey] = matches[0];
+    if (routeKey === ownerRouteKey) {
+        throw edgeError(`edge desired host '${hostname}'.rootApplication must differ from the host owner`);
+    }
+    return routeKey;
 }
 
 function resolveEnabledIdentity(routeSelection, agents) {
@@ -1320,17 +1358,29 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
     const dependencyHttpRoutes = {};
     for (const [hostname, entry] of Object.entries(normalizedDesired.hosts)) {
         const selectedRoute = resolveAgentRoute(entry.agent, routing);
-        const dependencyRouteKeys = compileAgentMcpRouteClosure(
-            selectedRoute.routeKey,
-            routing,
-            manifests,
-            agents,
-        );
+        const rootApplicationRouteKey = entry.rootApplication
+            ? resolveRootApplicationRoute(entry.rootApplication, selectedRoute.routeKey, routing, hostname)
+            : '';
+        // A root application's own closure joins the owner's; a host without
+        // one compiles exactly as before.
+        const dependencyRouteKeys = [...new Set([
+            ...compileAgentMcpRouteClosure(selectedRoute.routeKey, routing, manifests, agents),
+            ...(rootApplicationRouteKey
+                ? compileAgentMcpRouteClosure(rootApplicationRouteKey, routing, manifests, agents)
+                : []),
+        ])].sort();
         const dependencyRouteKeySet = new Set(dependencyRouteKeys);
         hosts[hostname] = {
             kind: 'agent-root',
             agent: entry.agent,
             routeKey: selectedRoute.routeKey,
+            ...(entry.rootApplication ? {
+                rootApplication: {
+                    agent: entry.rootApplication.agent,
+                    routeKey: rootApplicationRouteKey,
+                    port: entry.rootApplication.port,
+                },
+            } : {}),
         };
         surfaces[hostname] = [...(entry.routerSurfaces || [])];
         agentMcpRoutes[hostname] = surfaces[hostname].includes('agent-mcp')
@@ -3871,6 +3921,40 @@ export function applyEdgeDesiredStateFile(candidateFile, options = {}) {
         reason: options.reason || 'operator-edge-desired-apply',
         desiredCandidateFile: candidateFile,
     });
+}
+
+/**
+ * Compile a desired-state candidate against the workspace's current routing,
+ * policy, agent and manifest sources under the edge apply lock, writing
+ * nothing. A coordinator validates its successor bytes with this before it
+ * replaces any authority, because a failed apply leaves the selector
+ * inactive. Any compile error throws; success returns the would-be generation.
+ */
+export function validateEdgeDesiredCandidate(bytes, options = {}) {
+    if (!Buffer.isBuffer(bytes) && typeof bytes !== 'string') {
+        throw edgeError('edge desired candidate must be bytes', 'EDGE_DESIRED_CANDIDATE_INVALID');
+    }
+    const candidate = Buffer.from(bytes);
+    if (candidate.length > EDGE_DESIRED_CANDIDATE_MAX_BYTES) {
+        throw edgeError(
+            `edge desired candidate exceeds ${EDGE_DESIRED_CANDIDATE_MAX_BYTES} bytes`,
+            'EDGE_DESIRED_CANDIDATE_TOO_LARGE',
+        );
+    }
+    const paths = resolveEdgeGenerationPaths(options);
+    const { release } = acquireApplyLockCapability(paths, options);
+    try {
+        const captured = collectCandidateSources(paths, { desired: candidate });
+        buildGenerationDocument(captured);
+        return deepFreeze({
+            generation: captured.generation,
+            desiredDigest: sourceDigest(candidate),
+            hostnames: Object.keys(captured.desired.hosts).sort(),
+            publicationMode: captured.compiled.publication?.mode || '',
+        });
+    } finally {
+        release();
+    }
 }
 
 // A generation binds the public hosts the Box was created with.

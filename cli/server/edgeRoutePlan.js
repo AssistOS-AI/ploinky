@@ -8,6 +8,7 @@ import { selectedRouterHostPort } from '../sandbox/routerPort.js';
 import { isTrustedPublicRouterHost } from '../utils/publicRouterHosts.mjs';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import {
+    AGENT_PORT_ROUTE,
     AgentPortSelectorError,
     parseAgentPortSelector,
 } from './agentPortConvention/parseSelector.js';
@@ -202,10 +203,12 @@ function agentPortPlan({
     snapshot,
     lease,
     transport = 'http',
+    requestTarget = req?.url || `${parsedUrl.pathname}${parsedUrl.search}`,
+    rootMount = false,
 }) {
     let selector;
     try {
-        selector = parseAgentPortSelector(req?.url || `${parsedUrl.pathname}${parsedUrl.search}`);
+        selector = parseAgentPortSelector(requestTarget);
     } catch (error) {
         if (error instanceof AgentPortSelectorError) {
             return deny(error.status, error.code, {
@@ -250,7 +253,7 @@ function agentPortPlan({
     }
     const deniedPorts = runtime.networkMode === 'host' ? [8080, 8081] : [];
     try {
-        selector = parseAgentPortSelector(req?.url || `${parsedUrl.pathname}${parsedUrl.search}`, { deniedPorts });
+        selector = parseAgentPortSelector(requestTarget, { deniedPorts });
     } catch (error) {
         if (error instanceof AgentPortSelectorError) {
             return deny(error.status, error.code, {
@@ -292,6 +295,13 @@ function agentPortPlan({
             lease,
             hostSelection,
         });
+    }
+    // A root-mounted application owns `/admin*` only through its own explicit
+    // manifest policy; the Router's administration surface stays unreachable.
+    if (rootMount && isRouteMount(selector.suffix, '/admin')
+        && !snapshot.compiled.policy.entries.some(entry => entry.source === 'manifest'
+            && entry.routeKey === selected.routeKey && HttpRouteAccessPath.matches(selector.policyPath, entry.path))) {
+        return deny(404, 'ROUTE_SURFACE_DENIED', { matched: true, listener, lease, hostSelection });
     }
     const decision = accessPolicy.evaluate({
         pathname: selector.policyPath,
@@ -359,7 +369,7 @@ function agentPortPlan({
         port: selector.port,
         policyPath: selector.policyPath,
         convention: selector.convention,
-        forwardedPrefix: `/${selector.convention}/${selector.rawAgent}/${selector.canonicalPort}`,
+        forwardedPrefix: rootMount ? '' : `/${selector.convention}/${selector.rawAgent}/${selector.canonicalPort}`,
         unmatchedSuffix: selector.suffix,
         relay: {
             kind: 'container-control-socket',
@@ -465,6 +475,47 @@ function resolveAgentPath(pathname, routes, selectedRoot = null) {
 
 function isRouteMount(pathname, root) {
     return pathname === root || pathname.startsWith(`${root}/`);
+}
+
+// Classifies a path on a root-application host against the owner's explicit
+// mount. The first segment is percent-decoded exactly once; an undecodable
+// segment is reported as null so the caller can refuse it.
+function ownerMountSelection(pathname, ownerRouteKey) {
+    const segments = String(pathname || '/').split('/');
+    let first;
+    try {
+        first = decodeURIComponent(segments[1] || '');
+    } catch (_) {
+        return null;
+    }
+    if (!first || first !== String(ownerRouteKey || '')) return 'application';
+    return segments.length === 2 ? 'exact' : 'nested';
+}
+
+// The bare owner mount redirects to its directory form so relative owner URLs
+// resolve under the mount. Only HTTP GET/HEAD are redirected; nothing else
+// is ever answered for the bare mount.
+function ownerMountRedirectPlan({
+    req, host, listener, pathname, parsedUrl, hostSelection, snapshot, lease, transport,
+}) {
+    const method = String(req?.method || 'GET').toUpperCase();
+    if (transport !== 'http' || (method !== 'GET' && method !== 'HEAD')) {
+        return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
+    }
+    return {
+        matched: true,
+        ok: true,
+        kind: 'mount-redirect',
+        listener,
+        host,
+        hostSelection,
+        pathname,
+        canonicalPath: pathname,
+        parsedUrl,
+        location: `/${encodeURIComponent(hostSelection.record.routeKey)}/${parsedUrl.search || ''}`,
+        lease,
+        snapshot,
+    };
 }
 
 function selectedAgentMcpRoute(pathname, routeKeys) {
@@ -887,8 +938,31 @@ export function resolveEdgeRoutePlan({
                 transport,
             });
         }
-        if (isReservedRouterSurface(pathname) && !surface) {
+        const rootApplication = hostSelection.record?.rootApplication;
+        const applicationAdmin = Boolean(rootApplication) && isRouteMount(pathname, '/admin');
+        if (isReservedRouterSurface(pathname) && !surface && !applicationAdmin) {
             return deny(404, 'ROUTE_SURFACE_DENIED', { lease, hostSelection });
+        }
+        // A root application serves every path the owner does not claim. The
+        // owner stays the host's surface and authorization context and is
+        // reachable only through its explicit `/<owner>/` mount; the
+        // unqualified MCP surface (still pending above) remains the owner's.
+        if (rootApplication && !surface) {
+            const ownerMount = ownerMountSelection(pathname, hostSelection.record.routeKey);
+            if (ownerMount === null) return deny(400, 'MALFORMED_URL', { lease, hostSelection });
+            if (ownerMount === 'exact') {
+                return ownerMountRedirectPlan({
+                    req, host, listener, pathname, parsedUrl: url, hostSelection, snapshot, lease, transport,
+                });
+            }
+            if (ownerMount !== 'nested') {
+                return agentPortPlan({
+                    req, host, listener, parsedUrl: url, hostSelection, routes, snapshot, lease, transport,
+                    requestTarget: `/${AGENT_PORT_ROUTE}/${encodeURIComponent(rootApplication.routeKey)}`
+                        + `/${rootApplication.port}${req?.url || `${pathname}${url.search}`}`,
+                    rootMount: true,
+                });
+            }
         }
         return agentRootPlan({
             req,

@@ -6,6 +6,7 @@ import { createCloudflareManagedTunnelRegistry } from './managedTunnelRegistry.m
 import {
     CLOUDFLARE_TERMINAL_SERVICE,
     CloudflarePublicationError,
+    isManagedPublicationHost,
     materializeManagedCloudflarePublicationPlan,
     normalizeCloudflarePublicationDesired,
     publicationDigest,
@@ -1102,6 +1103,16 @@ export class CloudflarePublicationController {
             this.assertCurrent(revision, signal);
             const api = this.requireApi();
             await api.validateScope({ apiToken, ...plan.scope, signal });
+            // An externally managed host never inherits a record this Box
+            // still owns: refuse before any ingress or DNS mutation.
+            const externalHostnames = new Set(plan.hosts.filter((host) => !isManagedPublicationHost(host))
+                .map((host) => host.hostname));
+            if ((currentJournal?.managedDnsRecords || []).some((record) => externalHostnames.has(record.hostname))) {
+                throw new CloudflarePublicationError('Managed DNS ownership cannot be transferred to external management', {
+                    code: 'CLOUDFLARE_EXTERNAL_DNS_TRANSFER_REFUSED',
+                    operation: 'validate',
+                });
+            }
             if (currentJournal?.mode === 'cloudflare'
                 && !sameScope(currentJournal.scope, plan.scope)) {
                 await this.clearPreviousScope({

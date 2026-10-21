@@ -9,6 +9,7 @@ import {
     BOX_EDGE_DESIRED_MAX_BYTES,
     readWorkspaceEdgeDesired,
     stageWorkspaceEdgeDesired,
+    replaceWorkspaceEdgeDesired,
 } from '../../ploinky-box/edgeDesired.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 
@@ -46,6 +47,22 @@ test('host-owned edge desired state is optional and captured by exact digest', (
         digest: crypto.createHash('sha256').update(bytes).digest('hex'),
         size: bytes.length,
     });
+});
+
+test('host authority replacement is digest-fenced and requires coordination', t => {
+    const fixture = workspaceFixture(t);
+    fs.writeFileSync(fixture.candidatePath, JSON.stringify(desiredDocument()), { mode: 0o600 });
+    const before = readWorkspaceEdgeDesired(fixture.identity);
+    const bytes = JSON.stringify({ hosts: { 'external.test': { agent: 'demo/app', dnsManagement: 'external' } } });
+    assert.throws(() => replaceWorkspaceEdgeDesired(fixture.identity, { expectedDigest: before.digest, bytes }), /coordination/);
+    assert.throws(() => replaceWorkspaceEdgeDesired(fixture.identity, {
+        expectedDigest: 'a'.repeat(64), bytes, assertHeld() {},
+    }), /changed before replacement/);
+    assert.equal(readWorkspaceEdgeDesired(fixture.identity).digest, before.digest);
+    const after = replaceWorkspaceEdgeDesired(fixture.identity, { expectedDigest: before.digest, bytes, assertHeld() {} });
+    assert.equal(after.digest, crypto.createHash('sha256').update(bytes).digest('hex'));
+    assert.throws(() => replaceWorkspaceEdgeDesired(fixture.identity, { expectedDigest: before.digest,
+        bytes: JSON.stringify(desiredDocument()), assertHeld() {} }), /changed before replacement/);
 });
 
 test('host-owned edge desired state rejects unsafe or malformed authority files', (t) => {

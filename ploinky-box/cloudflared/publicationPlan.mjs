@@ -179,6 +179,12 @@ function normalizeHosts(value) {
             });
         }
         const selector = cloneJsonValue(rawSelector, `Cloudflare host '${hostname}'`);
+        if (selector.dnsManagement !== undefined
+            && !['managed', 'external'].includes(selector.dnsManagement)) {
+            fail(`Cloudflare host '${hostname}' has invalid DNS management`, {
+                code: 'CLOUDFLARE_HOST_INVALID', operation: 'validate',
+            });
+        }
         if (!String(selector.agent || '').trim()) {
             fail(`Cloudflare host '${hostname}' is missing its validated agent selector`, {
                 code: 'CLOUDFLARE_HOST_INVALID',
@@ -313,6 +319,12 @@ export function normalizeCloudflarePublicationDesired({
     const normalizedHosts = normalizeHosts(hosts);
     const classified = normalizeCloudflareTuple(cloudflare);
     const { management, tunnelManagement, tuple } = classified;
+    if (management === 'connector-only'
+        && normalizedHosts.some(({ selector }) => selector.dnsManagement === 'external')) {
+        fail('External DNS admission requires an API-managed existing publication', {
+            code: 'CLOUDFLARE_CONFIGURATION_INVALID', operation: 'validate',
+        });
+    }
     if (!management && normalizedHosts.length) {
         fail('Cloudflare hostnames require Cloudflare publication configuration', {
             code: 'CLOUDFLARE_CONFIGURATION_PARTIAL',
@@ -390,7 +402,7 @@ export function normalizeCloudflarePublicationDesired({
         ...normalizedHosts.map(({ hostname }) => ({ hostname, service: CLOUDFLARE_ORIGIN })),
         { service: CLOUDFLARE_TERMINAL_SERVICE },
     ];
-    const dns = scope ? normalizedHosts.map(({ hostname }) => ({
+    const dns = scope ? normalizedHosts.filter(isManagedPublicationHost).map(({ hostname }) => ({
         hostname,
         type: 'CNAME',
         content: `${scope.tunnelId}.cfargotunnel.com`,
@@ -488,7 +500,7 @@ export function materializeManagedCloudflarePublicationPlan(plan, tunnelId) {
         scope,
     };
     if (plan.mode === 'cloudflare') {
-        materialized.dns = plan.hosts.map(({ hostname }) => ({
+        materialized.dns = plan.hosts.filter(isManagedPublicationHost).map(({ hostname }) => ({
             hostname,
             type: 'CNAME',
             content: `${normalizedTunnelId}.cfargotunnel.com`,
@@ -497,6 +509,10 @@ export function materializeManagedCloudflarePublicationPlan(plan, tunnelId) {
         }));
     }
     return deepFreeze(materialized);
+}
+
+export function isManagedPublicationHost(host) {
+    return host?.selector?.dnsManagement !== 'external';
 }
 
 export function publicPlanSummary(plan) {

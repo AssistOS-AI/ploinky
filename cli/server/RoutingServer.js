@@ -437,6 +437,15 @@ async function processRequest(req, res) {
         );
         return;
     }
+    if (routePlan.kind === 'mount-redirect') {
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
+        res.writeHead(302, { Location: routePlan.location, 'Cache-Control': 'no-store', 'Content-Length': 0 });
+        res.end();
+        return;
+    }
     const parsedUrl = routePlan.ok && routePlan.parsedUrl ? routePlan.parsedUrl : requestedUrl;
     const pathname = routePlan.ok && routePlan.canonicalPath ? routePlan.canonicalPath : requestedUrl.pathname || '/';
     const routedAggregateAgentCard = pathname === '/agent-card' || pathname === '/agent-card/';

@@ -90,7 +90,7 @@ export function sanitizeRequestHeaders(headers, plan, trusted = {}) {
     result['x-forwarded-proto'] = plan.scheme;
     result['x-forwarded-host'] = plan.authority;
     result['x-forwarded-prefix'] = plan.forwardedPrefix
-        || `/${plan.convention}/${encodeURIComponent(plan.routeKey)}/${plan.port}`;
+        ?? `/${plan.convention}/${encodeURIComponent(plan.routeKey)}/${plan.port}`;
     const publicProtocol = plan?.access?.access === 'public' && plan?.access?.publicProtocol;
     if (!publicProtocol && trusted.authInfo) result['x-ploinky-auth-info'] = String(trusted.authInfo);
     if (!publicProtocol && trusted.userId) result['x-ploinky-user-id'] = String(trusted.userId);

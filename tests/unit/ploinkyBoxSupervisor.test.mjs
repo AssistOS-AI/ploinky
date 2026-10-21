@@ -651,6 +651,69 @@ test('stop relays to ploinky-local before stopping the outer Box without depende
     assert.ok(localStop >= 0 && localStop < outerStop);
 });
 
+function guardedStopSupervisor(t, { scenario, requireExistingContainerId }) {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const id = scenario === 'malformed' ? requireExistingContainerId : 'a'.repeat(64);
+    const ownership = owned(identity, { id });
+    const replaced = owned(identity, { id: 'c'.repeat(64) });
+    const absent = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} };
+    const calls = [];
+    const lockEvents = [];
+    let discoveries = 0;
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        launchCwd: identity.workspaceRoot,
+        lockManager: fakeLockManager(state.root, lockEvents),
+        discover: () => {
+            discoveries += 1;
+            if (scenario === 'absent') return absent;
+            // The Box is substituted after the anchor check but before the locked stop.
+            if (scenario === 'replaced-under-lock' && discoveries > 1) return replaced;
+            return ownership;
+        },
+        runner: {
+            run(command, args) { calls.push(args.join(' ')); },
+            query(command, args) { calls.push(`query ${args.join(' ')}`); },
+        },
+    });
+    return {
+        ownership, calls, lockEvents, get discoveries() { return discoveries; },
+        stop: () => supervisor.runStopTransaction({ requireExistingContainerId }),
+    };
+}
+
+test('guarded stop proceeds only for the matching immutable Box ID', async (t) => {
+    const h = guardedStopSupervisor(t, { scenario: 'matching', requireExistingContainerId: 'a'.repeat(64) });
+    const result = await h.stop();
+    assert.equal(result.action, 'stopped');
+    assert.equal(result.containerId, 'a'.repeat(64));
+    // Ownership is authorized before the anchor and again under the lock.
+    assert.equal(h.discoveries, 2);
+    const localStop = h.calls.findIndex((value) => value.includes('/opt/ploinky/bin/ploinky-local stop'));
+    const outerStop = h.calls.indexOf(`container stop --time 30 ${'a'.repeat(64)}`);
+    assert.ok(localStop >= 0 && localStop < outerStop, h.calls.join('\n'));
+    assert.deepEqual(h.lockEvents, ['lock', 'release']);
+});
+
+for (const [label, scenario, requireExistingContainerId] of [
+    ['a substituted ID', 'substituted', 'f'.repeat(64)],
+    ['an absent Box', 'absent', 'a'.repeat(64)],
+    // The running Box carries the same malformed ID, so only the format check refuses it.
+    ['an uppercase malformed ID', 'malformed', 'A'.repeat(64)],
+    ['a short malformed ID', 'malformed', 'a'.repeat(63)],
+    ['an empty malformed ID', 'malformed', ''],
+    ['a Box substituted under the lock', 'replaced-under-lock', 'a'.repeat(64)],
+]) {
+    test(`guarded stop refuses ${label} without stopping anything`, async (t) => {
+        const h = guardedStopSupervisor(t, { scenario, requireExistingContainerId });
+        await assert.rejects(h.stop(), { code: 'PLOINKY_BOX_EXISTING_REQUIRED' });
+        assert.deepEqual(h.calls, [], 'no ploinky-local graph stop and no container stop');
+        assert.equal(h.discoveries, scenario === 'replaced-under-lock' ? 2 : 1);
+    });
+}
+
 test('destroy revalidates the inspected immutable ID and retains cache data by default', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));

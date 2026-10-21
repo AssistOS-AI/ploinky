@@ -36,6 +36,7 @@ import { observedBoxNetworkMode, selectedBoxNetworkMode } from '../contract/netw
 import { assertBoxWorkspaceRoot } from '../contract/workspace-root.mjs';
 import { retireQuiescentBoxWorkspaceStartLock } from '../noWaitCleanup.mjs';
 import { retireQuiescentBoxEdgePreparation } from '../edgePreparationCleanup.mjs';
+import { assertExistingImageDependencies } from '../entrypoint/install-dependencies.mjs';
 import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { localCandidateExists, localCandidatePath } from '../../agentlib/source.mjs';
 import {
@@ -340,6 +341,7 @@ export async function reconcileBoxContainer({
     imageRef = BOX_IMAGE_REFERENCE,
     imagePolicy = 'pull',
     allowReplacement = true,
+    requireExistingContainerId = null,
     platform = process.platform,
     env = process.env,
     stdout = process.stdout,
@@ -374,6 +376,7 @@ export async function reconcileBoxContainer({
         readCidfile: seams.readCidfile || readContainerIdFromCidfile,
         retireStartLock: seams.retireStartLock || retireQuiescentBoxWorkspaceStartLock,
         retireEdgePreparation: seams.retireEdgePreparation || retireQuiescentBoxEdgePreparation,
+        verifyExistingDependencies: seams.verifyExistingDependencies || assertExistingImageDependencies,
         materializeGpu: seams.materializeGpu || ((selectedIdentity, wiring, selectedLock) => {
             if (wiring) createGpuGrantStore({ engineRunner: runner, platform, renderOptions: { env } })
                 .materialize(selectedIdentity, wiring, selectedLock);
@@ -390,6 +393,20 @@ export async function reconcileBoxContainer({
             return assertGateOffStoreEmpty({ paths, identity: selectedIdentity });
         }),
     };
+    if (requireExistingContainerId !== null) {
+        if (!/^[a-f0-9]{64}$/.test(requireExistingContainerId)
+            || ownership?.state !== 'owned'
+            || ownership.handles?.container?.id !== requireExistingContainerId) {
+            throw transactionError('Required existing Box identity is absent or changed');
+        }
+        const observed = dependencies.discover(identity, { runner });
+        if (observed?.state !== 'owned' || observed.handles?.container?.id !== requireExistingContainerId
+            || observed.engine?.name !== engine.name || observed.engine?.identity !== engine.identity) {
+            throw transactionError('Required existing Box identity changed before reconciliation');
+        }
+        ownership = observed;
+        allowReplacement = false;
+    }
     function validateFinalOwnership(containerId, desired) {
         lock.assertHeld(identity.instance);
         const observed = dependencies.discover(identity, { runner });
@@ -478,6 +495,14 @@ export async function reconcileBoxContainer({
         );
     }
     if (old && !requiresReplacement) {
+        const verifyRequiredDependencies = () => {
+            if (requireExistingContainerId !== null) dependencies.verifyExistingDependencies({
+                targetRoot: identity.dataPaths.dependencies,
+                imageId: normalizeImageId(old.imageId),
+                fsApi: dependencies.fsApi,
+            });
+        };
+        verifyRequiredDependencies();
         // Reuse is valid only while the host directories are the exact bind
         // sources captured at creation. Revalidation immediately before start
         // rejects any later parent or directory substitution.
@@ -495,6 +520,7 @@ export async function reconcileBoxContainer({
                 validateContainerConfiguration(handle, old);
                 dependencies.retireStartLock({ identity, lock });
                 dependencies.retireEdgePreparation({ identity, lock });
+                verifyRequiredDependencies();
                 writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
                 oldStartAttempted = true;
                 await dependencies.startAndWaitReady(
