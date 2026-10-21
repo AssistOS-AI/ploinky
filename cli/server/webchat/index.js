@@ -1,4 +1,4 @@
-import { initDom } from './domSetup.js';
+import { initDom, buildLogoutConfirmationUrl } from './domSetup.js';
 import { createSidePanel } from './sidePanel.js';
 import { createMessages } from './messages.js';
 import { createComposer } from './composer.js';
@@ -647,33 +647,11 @@ createResponsiveHeaderActions({
     mobileSection: settingsMobileActions,
 });
 
-function resolveLogoutRedirect(payload) {
-    const redirect = typeof payload?.redirect === 'string' ? payload.redirect.trim() : '';
-    if (redirect) {
-        return redirect;
-    }
-    return basePath ? `${basePath}/` : '/webchat/';
-}
-
-async function handleLogout() {
-    if (!logoutBtn) {
-        return;
-    }
-    logoutBtn.setAttribute('aria-disabled', 'true');
-    try {
-        const response = await fetch(toEndpoint('logout'), {
-            method: 'POST',
-            credentials: 'include'
-        });
-        const payload = await response.json().catch(() => ({}));
-        network.stop();
-        window.location.href = resolveLogoutRedirect(payload);
-    } catch (_) {
-        network.stop();
-        window.location.href = basePath ? `${basePath}/` : '/webchat/';
-    } finally {
-        logoutBtn.removeAttribute('aria-disabled');
-    }
+function handleLogout() {
+    if (!logoutBtn) return;
+    // The Router's confirmed POST owns logout. Opening its GET must not clear
+    // the chat session or stop its connection before the user chooses Sign out.
+    window.location.href = buildLogoutConfirmationUrl(window.location.href, toEndpoint('logout'));
 }
 
 if (logoutBtn) {

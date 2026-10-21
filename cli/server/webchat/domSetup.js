@@ -14,6 +14,18 @@ export function buildWorkspaceDirectoryUrl(workdir, workspaceRoot) {
     }
 }
 
+export function buildLogoutConfirmationUrl(currentUrl, logoutEndpoint) {
+    const current = new URL(currentUrl);
+    const endpoint = new URL(logoutEndpoint, current.origin);
+    const query = new URLSearchParams({
+        returnTo: '/auth/logged-out',
+        cancelTo: `${current.pathname}${current.search}${current.hash}`,
+    });
+    const agent = endpoint.searchParams.get('agent');
+    if (agent) query.set('agent', agent);
+    return `/auth/logout?${query.toString()}`;
+}
+
 function createBrowserId() {
     if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
     // Plain HTTP on a bound LAN interface has getRandomValues, but does not
