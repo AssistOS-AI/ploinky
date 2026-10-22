@@ -670,11 +670,26 @@ export function createBoxSupervisor({
                 }
                 return running;
             },
-            verifyBox(id, configuration) {
+            verifyBox(id, configuration, { retainedOriginal = false } = {}) {
                 const container = handleOf(id);
                 if (!container) return false;
                 try {
-                    validateContainer(container, { ...configuration, identity });
+                    // Only the original container, kept by a rollback, may carry
+                    // the legacy `N:7882` shape; any created generation is strict.
+                    const observedMedia = retainedOriginal === true
+                        ? validateContainerPublications(
+                            container,
+                            Number(container.labels?.[BOX_LABELS.routerHostPort]),
+                            Number(container.labels?.[BOX_LABELS.mediaHostPort]),
+                            null,
+                            { observeLegacyMedia: true },
+                        )
+                        : null;
+                    validateContainer(container, {
+                        ...configuration,
+                        identity,
+                        ...(observedMedia ? { mediaContainerPort: observedMedia.mediaContainerPort } : {}),
+                    });
                     return true;
                 } catch {
                     return false;
@@ -704,8 +719,9 @@ export function createBoxSupervisor({
         const container = ownership.handles.container;
         const engine = ownership.engine;
         const observed = observeBoxConfiguration(identity, ownership, repositoryRoot, engine);
-        // The downgrade creates and verifies both generations strictly, so a
-        // legacy `N:7882` Box is recreated and restored as `N:N`.
+        // Every Box the downgrade creates (candidate or rollback) is verified
+        // strictly, so a legacy `N:7882` Box is recreated as `N:N`. The
+        // retained original is observed at verification time instead.
         const { running: _running, mediaContainerPort: _observedMediaTarget, ...oldConfiguration } = observed;
         const coreArgv = captureCoreStartArgv(identity);
         // Restore the graph afterwards only if it is observed running now.

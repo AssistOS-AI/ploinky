@@ -240,7 +240,7 @@ function isDeath(error) {
  *   createBox(configuration, {receiptPath, attemptId}) -> id (writes receiptPath)
  *   startBox(id), prepareBox(id, configuration)
  *   startGraph(id, graphSnapshot) -> {state, optionalPendingKeys}
- *   verifyBox(id, configuration) -> boolean
+ *   verifyBox(id, configuration, { retainedOriginal }) -> boolean
  *   readHostRecord(name), writeHostRecord(name, value)
  */
 export async function runHardwareDowngrade({
@@ -520,7 +520,9 @@ async function rollback(ctx, journal) {
                     async () => effects.startGraph(restoredId, graph));
             }
         }
-        if (!effects.verifyBox(restoredId, oldConfiguration)) {
+        // The retained original is verified as it was observed; a Box created
+        // during rollback is a new generation and is verified strictly.
+        if (!effects.verifyBox(restoredId, oldConfiguration, { retainedOriginal: restoredId === journal.old.containerId })) {
             persist(ctx, journal, { phase: 'recovery-blocked' });
             throw transitionError('Recovery is blocked: the restored Box does not match its recorded configuration', 'PLOINKY_BOX_HARDWARE_RECOVERY_BLOCKED');
         }

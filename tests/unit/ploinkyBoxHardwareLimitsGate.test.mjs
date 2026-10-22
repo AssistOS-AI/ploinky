@@ -495,7 +495,11 @@ function completeBoxFixture(state) {
     return { ...state, root, agentLib: agentLibFixture(state.identity.workspaceRoot) };
 }
 
-function completeHandle(box, hardware) {
+function completeHandle(box, hardware, {
+    mediaHostPort = 7882,
+    // N:N for a current Box, 7882 for a legacy `N:7882` Box.
+    mediaContainerPort = mediaHostPort,
+} = {}) {
     const id = 'e'.repeat(64);
     const imageId = 'd'.repeat(64);
     return {
@@ -506,7 +510,7 @@ function completeHandle(box, hardware) {
             [BOX_LABELS.role]: 'box',
             [BOX_LABELS.imageRef]: BOX_IMAGE_REFERENCE,
             [BOX_LABELS.routerHostPort]: '8090',
-            [BOX_LABELS.mediaHostPort]: '7882',
+            [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
             [BOX_LABELS.seccompFingerprint]: nestedPodmanSeccompProfileContract(box.root).fingerprint,
             [BOX_LABELS.dependenciesFingerprint]: 'd'.repeat(64),
             [BOX_LABELS.imagesFingerprint]: 'f'.repeat(64),
@@ -530,10 +534,11 @@ function completeHandle(box, hardware) {
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_AUTHORITY: '127.0.0.1:8090',
                 PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET,
+                ...(Number(mediaContainerPort) === 7882 ? {} : { PLOINKY_BOX_MEDIA_PORT: String(mediaContainerPort) }),
                 HOSTNAME: id.slice(0, 12),
             },
             publications: [
-                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7882' },
+                { containerPort: String(mediaContainerPort), protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
                 { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: '8090' },
             ],
             running: true,
@@ -958,7 +963,18 @@ test('G.u9-stale-store-lock', async (t) => {
 // effects (stop, remove, create with a CID receipt, start and wait for the
 // ready line, dependency install, graph restore and in-Box status) run
 // against it unchanged.
-function downgradeWorld(t, { boxRunning, graphRunning }) {
+function downgradeWorld(t, {
+    boxRunning,
+    graphRunning,
+    // A gate-on Box created before the in-Box media listener followed the host port.
+    legacyMedia = false,
+    // Run the supervisor's real container validator instead of the stub.
+    realValidation = false,
+    failStop = false,
+    createFailures = 0,
+    // How the fake engine records a Box created from the create arguments.
+    recreateAs = 'arguments',
+}) {
     const state = fixture(t);
     // Box wiring observation resolves host state from the user's home, as in
     // production; point it at this fixture's home.
@@ -972,10 +988,11 @@ function downgradeWorld(t, { boxRunning, graphRunning }) {
     writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
     const engine = { name: 'podman', identity: 'engine', hostKind: 'native-linux' };
     const containers = new Map();
-    const old = completeHandle(box, wiring);
+    const old = completeHandle(box, wiring, legacyMedia ? { mediaHostPort: 17891, mediaContainerPort: 7882 } : {});
     old.runtime.running = boxRunning;
     containers.set(old.id, { handle: old, graphRunning: boxRunning && graphRunning, logs: '' });
     const events = [];
+    let remainingCreateFailures = createFailures;
     const current = () => [...containers.values()][0] || null;
     const ownership = () => (current()
         ? { state: 'owned', engine, handles: { container: current().handle } }
@@ -984,6 +1001,10 @@ function downgradeWorld(t, { boxRunning, graphRunning }) {
         run(_command, args) {
             const id = args[args.length - 1];
             if (args[0] === 'container' && args[1] === 'stop') {
+                if (failStop) {
+                    events.push('box-stop-failed');
+                    throw new Error('stub engine: stop failed');
+                }
                 const entry = containers.get(id);
                 entry.handle.runtime.running = false;
                 entry.graphRunning = false;
@@ -1000,9 +1021,21 @@ function downgradeWorld(t, { boxRunning, graphRunning }) {
                 containers.get(args[args.indexOf('/opt/ploinky/bin/ploinky-local') - 1]).graphRunning = false;
                 events.push('graph-stop');
             } else if (args.includes('--cidfile')) {
+                if (remainingCreateFailures > 0) {
+                    remainingCreateFailures -= 1;
+                    events.push('box-create-failed');
+                    throw new Error('stub engine: create failed');
+                }
                 const newId = crypto.randomBytes(32).toString('hex');
                 fs.writeFileSync(args[args.indexOf('--cidfile') + 1], `${newId}\n`);
-                const handle = completeHandle(box, null);
+                // The fake engine records the Box exactly as its create arguments describe it.
+                const udp = args.filter((arg, index) => args[index - 1] === '--publish' && String(arg).endsWith('/udp')).at(0);
+                const [, publishedHost, publishedContainer] = String(udp || '0.0.0.0:7882:7882/udp').replace(/\/udp$/, '').split(':');
+                const gateOn = args.some((arg) => String(arg).startsWith(`${BOX_LABELS.hardwareLimits}=`));
+                const handle = completeHandle(box, gateOn ? wiring : null, {
+                    mediaHostPort: Number(publishedHost),
+                    mediaContainerPort: recreateAs === 'legacy' ? 7882 : Number(publishedContainer),
+                });
                 handle.id = newId;
                 handle.runtime.running = false;
                 handle.runtime.environment.HOSTNAME = newId.slice(0, 12);
@@ -1059,13 +1092,13 @@ function downgradeWorld(t, { boxRunning, graphRunning }) {
         revalidateAgentLibSource: () => {},
         commitAgentLibSelection: () => {},
         validateExistingImage: () => ({ immutableId: `sha256:${'d'.repeat(64)}` }),
-        validateContainer: () => {},
+        ...(realValidation ? {} : { validateContainer: () => {} }),
         hardwareGateStore: state.gateStore,
         prepareHardwareGeneration: async () => { events.push('prepare'); return { structurallyPrepared: true }; },
         stdout: { write() { return true; } },
         stderr: { write: (text) => { events.push(`stderr:${text.trim()}`); return true; } },
     });
-    return { state, supervisor, events, current };
+    return { state, supervisor, events, current, containers };
 }
 
 test('G.downgrade-running-graph-restored', async (t) => {
@@ -1091,6 +1124,69 @@ test('G.downgrade-stopped-graph-not-started', async (t) => {
     assert.equal(world.events.includes('graph-stop'), false);
     assert.equal(world.events.includes('core:start explorer 8090'), false, 'no graph restored by the downgrade');
     assert.equal(world.state.gateStore.read(world.state.identity).enabled, false);
+});
+
+test('G.downgrade-legacy-media-retained-original-restores-old', async (t) => {
+    // A gate-on Box created with the former N:7882 media shape whose downgrade
+    // fails before it is removed: the rollback keeps that exact original
+    // container, which must verify as the legacy shape it was observed with.
+    const world = downgradeWorld(t, {
+        boxRunning: true, graphRunning: true, legacyMedia: true, realValidation: true, failStop: true,
+    });
+    const originalId = world.current().handle.id;
+    await assert.rejects(world.supervisor.runRestartTransaction(['restart']), /stop failed/);
+    assert.equal(world.current().handle.id, originalId, 'the original container is kept');
+    assert.equal(world.events.includes('box-create:gate-off'), false);
+    assert.equal(world.events.includes('box-remove'), false);
+    assert.deepEqual(world.current().handle.runtime.publications.find((item) => item.protocol === 'udp'), {
+        containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891',
+    });
+    const store = createTransitionStore({ identity: world.state.identity, homeDirectory: world.state.home });
+    assert.deepEqual(store.listPending(), [], 'the rollback verified the original and settled the journal');
+    assert.equal(world.state.gateStore.read(world.state.identity).enabled, true, 'the gate-on state is kept');
+});
+
+test('G.downgrade-legacy-media-recreated-generations-are-strict', async (t) => {
+    // A legacy gate-on Box is removed and the candidate create fails: the
+    // rollback recreates the old configuration as a new generation, which
+    // is N:N with the variable and verified strictly.
+    const faithful = downgradeWorld(t, {
+        boxRunning: true, graphRunning: true, legacyMedia: true, realValidation: true, createFailures: 1,
+    });
+    await assert.rejects(faithful.supervisor.runRestartTransaction(['restart']), /create failed/);
+    const recreated = faithful.current().handle;
+    assert.notEqual(recreated.id, 'e'.repeat(64));
+    assert.deepEqual(recreated.runtime.publications.find((item) => item.protocol === 'udp'), {
+        containerPort: '17891', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891',
+    });
+    assert.equal(recreated.runtime.environment.PLOINKY_BOX_MEDIA_PORT, '17891');
+    assert.equal(faithful.events.filter((event) => event === 'box-create:gate-on').length, 1, 'the restore created one gate-on Box');
+    assert.deepEqual(
+        createTransitionStore({ identity: faithful.state.identity, homeDirectory: faithful.state.home }).listPending(),
+        [],
+        'the strict check accepts the N:N restore',
+    );
+
+    // A recreated Box that still has the legacy shape is never accepted.
+    const legacyRecreate = downgradeWorld(t, {
+        boxRunning: true, graphRunning: true, legacyMedia: true, realValidation: true,
+        createFailures: 1, recreateAs: 'legacy',
+    });
+    await assert.rejects(legacyRecreate.supervisor.runRestartTransaction(['restart']), /(Recovery is blocked|restored Box does not match)/);
+    const [blocked] = createTransitionStore({ identity: legacyRecreate.state.identity, homeDirectory: legacyRecreate.state.home }).listPending();
+    assert.equal(blocked.phase, 'recovery-blocked');
+});
+
+test('G.downgrade-legacy-media-success-creates-the-strict-candidate', async (t) => {
+    const world = downgradeWorld(t, { boxRunning: true, graphRunning: true, legacyMedia: true, realValidation: true });
+    await world.supervisor.runRestartTransaction(['restart']);
+    const candidate = world.current().handle;
+    assert.deepEqual(candidate.runtime.publications.find((item) => item.protocol === 'udp'), {
+        containerPort: '17891', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891',
+    });
+    assert.equal(candidate.runtime.environment.PLOINKY_BOX_MEDIA_PORT, '17891');
+    assert.equal(world.state.gateStore.read(world.state.identity).enabled, false);
+    assert.deepEqual(createTransitionStore({ identity: world.state.identity, homeDirectory: world.state.home }).listPending(), []);
 });
 
 // ---------------------------------------------------------------------------
