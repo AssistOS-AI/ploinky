@@ -99,11 +99,19 @@ function containerHandle({
     imageRef,
     hostPort,
     mediaHostPort = 7882,
+    // The in-Box media listener: N:N for a current Box, 7882 for a legacy one.
+    mediaContainerPort = mediaHostPort,
+    // 'auto' derives the variable a current Box carries; the fake engine passes
+    // what the create arguments actually requested (a string, or null).
+    boxMediaPortEnv = 'auto',
     id,
     running = true,
     dataFingerprints = DATA_FINGERPRINTS,
     agentLib,
 }) {
+    const mediaEnv = boxMediaPortEnv === 'auto'
+        ? (Number(mediaContainerPort) === 7882 ? null : String(mediaContainerPort))
+        : boxMediaPortEnv;
     return {
         id,
         labels: {
@@ -140,10 +148,11 @@ function containerHandle({
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
                 PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET,
+                ...(mediaEnv === null ? {} : { PLOINKY_BOX_MEDIA_PORT: mediaEnv }),
                 HOSTNAME: id.slice(0, 12),
             },
             publications: [
-                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
+                { containerPort: String(mediaContainerPort), protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
                 { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: String(hostPort) },
             ],
             running,
@@ -401,6 +410,10 @@ function harness(state, {
                     imageRef: imageRefLabel.slice(imageRefLabel.indexOf('=') + 1),
                     hostPort: Number(portLabel.slice(portLabel.indexOf('=') + 1)),
                     mediaHostPort: Number(mediaPortLabel.slice(mediaPortLabel.indexOf('=') + 1)),
+                    mediaContainerPort: Number(args[args.indexOf('--publish', args.indexOf('--publish') + 1) + 1]
+                        .split(':')[2].split('/')[0]),
+                    boxMediaPortEnv: (args.find((value) => value.startsWith('PLOINKY_BOX_MEDIA_PORT='))
+                        ?? '').slice('PLOINKY_BOX_MEDIA_PORT='.length) || null,
                     id: cid,
                     running: false,
                     dataFingerprints: {
@@ -642,7 +655,8 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.some((value) => value.includes('docker.sock') || value.includes('podman.sock')), false);
     assert.equal(args.filter((value) => value === '--publish').length, 2);
     assert.equal(args.includes('127.0.0.1:19090:8080/tcp'), true);
-    assert.equal(args.includes('0.0.0.0:17891:7882/udp'), true);
+    assert.equal(args.includes('0.0.0.0:17891:17891/udp'), true);
+    assert.equal(args.includes('PLOINKY_BOX_MEDIA_PORT=17891'), true);
     assert.equal(args.includes(`${BOX_LABELS.mediaHostPort}=17891`), true);
     assert.equal(args.includes(
         `${BOX_LABELS.seccompFingerprint}=${nestedPodmanSeccompProfileContract(state.root).fingerprint}`,
@@ -898,7 +912,8 @@ test('initial transaction preflights before pull, workspace data, and container 
     }, h.seams);
     assert.equal(result.action, 'created');
     assert.equal(result.mediaHostPort, 17891);
-    assert.equal(h.calls.some((call) => call.includes('0.0.0.0:17891:7882/udp')), true);
+    assert.equal(h.calls.some((call) => call.includes('0.0.0.0:17891:17891/udp')), true);
+    assert.equal(h.calls.some((call) => call.includes('PLOINKY_BOX_MEDIA_PORT=17891')), true);
     const flat = h.calls.map((call) => call.join(' '));
     assert.ok(flat.findIndex((value) => value.includes('preflight')) < flat.findIndex((value) => value.includes('stream podman pull')));
     assert.ok(flat.findIndex((value) => value.includes('stream podman pull')) < flat.findIndex((value) => value.includes('ensure-data-paths')));
@@ -2296,4 +2311,69 @@ test('reused Boxes expose the same exact-ownership validation without settling',
     result.validate();
     h.current().runtime.running = false;
     assert.throws(() => result.validate());
+});
+
+test('an owned legacy N:7882 Box is replaced without an explicit media port, and targeted commands refuse it', async (t) => {
+    const legacyBox = (state) => containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 18080,
+        mediaHostPort: 17891,
+        mediaContainerPort: 7882,
+        id: 'e'.repeat(64),
+    });
+    const reconcile = (state, h, old, extra = {}) => reconcileBoxContainer({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        ownership: { state: 'owned', handles: { container: old } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+        explicitMediaPort: undefined,
+        ...extra,
+    }, h.seams);
+
+    const state = fixture(t);
+    const old = legacyBox(state);
+    const h = harness(state, { initial: old });
+    const result = await reconcile(state, h, old);
+    assert.equal(result.action, 'replaced');
+    assert.equal(result.mediaHostPort, 17891);
+    const create = h.calls.find((call) => call.join(' ').includes('container create'));
+    assert.equal(create.includes('0.0.0.0:17891:17891/udp'), true);
+    assert.equal(create.includes('PLOINKY_BOX_MEDIA_PORT=17891'), true);
+    assert.equal(create.includes('0.0.0.0:17891:7882/udp'), false);
+    assert.equal(h.current().runtime.environment.PLOINKY_BOX_MEDIA_PORT, '17891');
+
+    // A targeted command never replaces: the legacy Box is refused untouched.
+    const targetedState = fixture(t);
+    const targetedOld = legacyBox(targetedState);
+    const targeted = harness(targetedState, { initial: targetedOld });
+    await assert.rejects(
+        () => reconcile(targetedState, targeted, targetedOld, { allowReplacement: false }),
+        { code: 'PLOINKY_BOX_REPLACEMENT_REFUSED' },
+    );
+    assert.equal(targeted.current(), targetedOld);
+    assert.equal(targeted.calls.some((call) => call.join(' ').includes('container create')), false);
+
+    // A current N:N Box with the variable stays reusable, with no explicit port.
+    const currentState = fixture(t);
+    const current = containerHandle({
+        identity: currentState.identity,
+        agentLib: currentState.agentLib,
+        repositoryRoot: currentState.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 18080,
+        mediaHostPort: 17891,
+        id: 'e'.repeat(64),
+    });
+    const reuse = harness(currentState, { initial: current });
+    const reused = await reconcile(currentState, reuse, current, { imagePolicy: 'preserve' });
+    assert.equal(reused.action, 'reused');
+    assert.equal(reuse.calls.some((call) => call.join(' ').includes('container create')), false);
 });

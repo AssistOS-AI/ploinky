@@ -87,9 +87,11 @@ export function completeHandle(box, hardware, { id = 'e'.repeat(64), imageId = '
                 ...boxImageIdFixtureEnv(imageId),
                 PLOINKY_PRIVATE_BIND: '0.0.0.0', PLOINKY_PUBLIC_BIND: '0.0.0.0', PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
                 PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET, HOSTNAME: id.slice(0, 12),
+                // The in-Box media listener equals the host port; only a non-default port is exported.
+                ...(Number(mediaHostPort) === 7882 ? {} : { PLOINKY_BOX_MEDIA_PORT: String(mediaHostPort) }),
             },
             publications: [
-                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
+                { containerPort: String(mediaHostPort), protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
                 { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: String(hostPort) },
             ],
             running, status: running ? 'running' : 'exited', init: true, usernsMode: 'private', privileged: false,

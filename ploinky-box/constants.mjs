@@ -13,6 +13,9 @@ export function resolveBoxImageReference(env = process.env) {
 }
 export const BOX_ROUTER_CONTAINER_PORT = 8080;
 export const BOX_MEDIA_PORT = 7882;
+// Exported to in-Box processes only when the selected media port is not the
+// default, so a default Box keeps its exact create arguments and environment.
+export const BOX_MEDIA_PORT_ENV = 'PLOINKY_BOX_MEDIA_PORT';
 export const BOX_READY_LINE = 'PLOINKY_BOX_READY';
 export const BOX_MARKER_PATH = '/etc/ploinky-box';
 export const BOX_MARKER_CONTENT = 'assistos/ploinky-box\n';

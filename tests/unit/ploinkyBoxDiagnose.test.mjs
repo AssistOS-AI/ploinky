@@ -444,3 +444,40 @@ test('a successful absence check preserves the actual inspect command exit code'
     assert.equal(check.status, 'pass');
     assert.equal(check.exitCode, 125);
 });
+
+test('a legacy N:7882 Box is reported as a warning and does not fail the diagnosis', async (t) => {
+    const root = workspace(t);
+    const report = await diagnoseWorkspace({ cwd: root, env: {},
+        admitCurrentBox() {
+            return { mediaNotice: 'legacy media target 7882 (replaced on next start)' };
+        },
+        hostChecks: () => ({ checks: [], engineUsable: true }),
+        discover: () => ({ state: 'owned', handles: { container: {
+            id: ID, labels: { 'io.assistos.ploinky-box.router-host-port': '8080', 'io.assistos.ploinky-box.media-host-port': '17891' },
+            runtime: { running: false, environment: {} },
+        } } }),
+        bindingStore: { read: () => null },
+        checkPublications: async () => {},
+        runner: { query() { assert.fail('A stopped Box needs no engine query here'); } },
+        currentChecks: () => [], runtimeChecks: async () => {},
+    });
+    const media = report.checks.find((check) => check.id === 'workspace.media');
+    assert.equal(media.status, 'warn');
+    assert.match(media.detail, /legacy media target 7882 \(replaced on next start\)/);
+    assert.equal(report.checks.find((check) => check.id === 'workspace.ownership').status, 'pass');
+    assert.equal(report.checks.some((check) => check.status === 'fail'), false);
+
+    const plain = await diagnoseWorkspace({ cwd: root, env: {},
+        admitCurrentBox() {},
+        hostChecks: () => ({ checks: [], engineUsable: true }),
+        discover: () => ({ state: 'owned', handles: { container: {
+            id: ID, labels: { 'io.assistos.ploinky-box.router-host-port': '8080', 'io.assistos.ploinky-box.media-host-port': '17891' },
+            runtime: { running: false, environment: {} },
+        } } }),
+        bindingStore: { read: () => null },
+        checkPublications: async () => {},
+        runner: { query() { assert.fail('A stopped Box needs no engine query here'); } },
+        currentChecks: () => [], runtimeChecks: async () => {},
+    });
+    assert.equal(plain.checks.some((check) => check.id === 'workspace.media'), false);
+});

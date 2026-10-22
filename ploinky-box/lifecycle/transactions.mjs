@@ -18,6 +18,7 @@ import {
 import {
     observeContainerRouterBinding,
     validateContainerConfiguration,
+    validateContainerPublications,
 } from '../contract/container.mjs';
 import {
     inspectAndValidateExistingImage,
@@ -112,10 +113,20 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
     // (and a failure can restore) exactly the Box that exists.
     const gpu = observeContainerGpuWiring(container, { identity });
     const hardware = observeContainerHardwareWiring(container, { identity });
+    // Discovery: a legacy `N:7882` Box is observed with its own container port
+    // so it can be reported and replaced; create and restore stay strict.
+    const { mediaContainerPort } = validateContainerPublications(
+        container,
+        hostPort,
+        mediaHostPort,
+        routerBinding,
+        { observeLegacyMedia: true },
+    );
     const desired = {
         identity,
         hostPort,
         mediaHostPort,
+        mediaContainerPort,
         routerBinding,
         gpu,
         hardware,
@@ -469,6 +480,9 @@ export async function reconcileBoxContainer({
         old.networkMode !== selectedBoxNetworkMode(engine)
         || old.hostPort !== portPlan.hostPort
         || old.mediaHostPort !== portPlan.mediaHostPort
+        // A legacy `N:7882` Box publishes the right host port at the wrong
+        // in-Box target; only a replacement can fix its publication.
+        || old.mediaContainerPort !== portPlan.mediaHostPort
         // Podman cannot change the published address or the Box environment in
         // place, so an address-only or trusted-host change is a replacement.
         || !samePublication(old.routerBinding, portPlan)

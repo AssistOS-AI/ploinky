@@ -219,9 +219,9 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
             noHardwareBinds: !destinations.includes(BOX_HARDWARE_STORE_PATH) && !destinations.includes(BOX_HARDWARE_MARKER_PATH),
             workspaceMounted: mounts.some(mount => mount.Source === profile.workspace.path && mount.Destination === profile.workspace.path && mount.RW === true),
             sourceMounted: mounts.some(mount => mount.Destination === '/opt/ploinky' && mount.Source === profile.source.root && mount.RW === false),
-            publications: JSON.stringify(Object.keys(contract.publications || {}).sort()) === JSON.stringify(['7882/udp', '8080/tcp'])
+            publications: JSON.stringify(Object.keys(contract.publications || {}).sort()) === JSON.stringify([`${run.ports.udp}/udp`, '8080/tcp'].sort())
                 && (contract.publications['8080/tcp'] || []).length === 1 && contract.publications['8080/tcp'][0].HostIp === '127.0.0.1' && String(contract.publications['8080/tcp'][0].HostPort) === String(run.ports.tcp)
-                && (contract.publications['7882/udp'] || []).length === 1 && String(contract.publications['7882/udp'][0].HostPort) === String(run.ports.udp),
+                && (contract.publications[`${run.ports.udp}/udp`] || []).length === 1 && String(contract.publications[`${run.ports.udp}/udp`][0].HostPort) === String(run.ports.udp),
             unprivileged: contract.privileged === false,
         };
         const wrong = Object.entries(checks).filter(([, ok]) => !ok).map(([name]) => name);

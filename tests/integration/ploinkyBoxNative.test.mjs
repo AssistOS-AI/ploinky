@@ -517,7 +517,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(prepared.ownership.handles.container.runtime.running, true);
     assert.deepEqual(prepared.ownership.handles.container.runtime.publications, [
         {
-            containerPort: '7882',
+            containerPort: String(lifecyclePorts.mediaHostPort),
             protocol: 'udp',
             hostIp: '0.0.0.0',
             hostPort: String(lifecyclePorts.mediaHostPort),
@@ -711,7 +711,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(started.ownership.handles.container.runtime.publications.some((entry) => (
         entry.protocol === 'udp'
         && entry.hostPort === String(selectedMediaHostPort)
-        && entry.containerPort === String(BOX_MEDIA_PORT)
+        && entry.containerPort === String(selectedMediaHostPort)
     )), true);
     assert.equal(started.ownership.handles.container.runtime.publications
         .some((entry) => entry.containerPort === '8081'), false);
@@ -929,7 +929,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         assert.equal(remapped.ownership.handles.container.runtime.publications.some((entry) => (
             entry.protocol === 'udp'
             && entry.hostPort === String(selectedMediaHostPort)
-            && entry.containerPort === String(BOX_MEDIA_PORT)
+            && entry.containerPort === String(selectedMediaHostPort)
         )), true);
         await harness.supervisor.runDestroyTransaction(remapped.containerId);
     } finally {

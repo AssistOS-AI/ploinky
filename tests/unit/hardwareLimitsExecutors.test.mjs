@@ -435,7 +435,7 @@ test('R21.provision-saves-the-box-labels-image-privileges-and-publications-as-ar
         const contract = artifacts.get('box-contract');
         assert.equal(contract.id, box.id, block); assert.equal(contract.image, box.image, block); assert.deepEqual(contract.labels, inspect.labels, block);
         assert.equal(contract.privileged, false, block); assert.deepEqual(contract.capAdd, ['SYS_ADMIN', 'NET_ADMIN'], block); assert.deepEqual(contract.securityOpt, ['label=disable'], block);
-        assert.deepEqual(Object.keys(contract.publications).sort(), ['7882/udp', '8080/tcp'], block);
+        assert.deepEqual(Object.keys(contract.publications).sort(), ['34567/udp', '8080/tcp'], block);
         assert.equal(contract.publications['8080/tcp'][0].HostIp, '127.0.0.1', `${block}: the Router publication is loopback`);
         // The contract query is one journaled, read-only, identified command.
         const op = w.run.operations.find(entry => entry.kind === 'box-contract');

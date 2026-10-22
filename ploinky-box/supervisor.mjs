@@ -704,7 +704,9 @@ export function createBoxSupervisor({
         const container = ownership.handles.container;
         const engine = ownership.engine;
         const observed = observeBoxConfiguration(identity, ownership, repositoryRoot, engine);
-        const { running: _running, ...oldConfiguration } = observed;
+        // The downgrade creates and verifies both generations strictly, so a
+        // legacy `N:7882` Box is recreated and restored as `N:N`.
+        const { running: _running, mediaContainerPort: _observedMediaTarget, ...oldConfiguration } = observed;
         const coreArgv = captureCoreStartArgv(identity);
         // Restore the graph afterwards only if it is observed running now.
         const oldWasRunning = container.runtime?.running === true;
@@ -788,12 +790,16 @@ export function createBoxSupervisor({
             container,
             parseHostPort(container.labels?.[BOX_LABELS.routerHostPort], { source: 'owned Box host-port label' }),
             parseHostPort(container.labels?.[BOX_LABELS.mediaHostPort], { source: 'owned Box media host-port label' }),
+            null,
+            // Discovery: a legacy `N:7882` Box is observed, not rejected.
+            { observeLegacyMedia: true },
         );
         return Object.freeze({
             address: publication.address,
             hostPort: publication.hostPort,
             hosts: publication.hosts,
             mediaHostPort: publication.mediaHostPort,
+            mediaContainerPort: publication.mediaContainerPort,
         });
     }
 
@@ -3699,6 +3705,8 @@ export function createBoxSupervisor({
         if (!container) {
             return Object.freeze({ identity, ownership, state: 'absent' });
         }
+        let observedMediaContainerPort;
+        let legacyMediaNotice = null;
         try {
             const imageRef = container.labels?.[BOX_LABELS.imageRef];
             const image = validateExistingImage(
@@ -3710,12 +3718,31 @@ export function createBoxSupervisor({
             const dataState = validateContainer === validateContainerConfiguration
                 ? inspectBoxData({ identity })
                 : null;
+            const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
+            const mediaHostPort = Number(container.labels?.[BOX_LABELS.mediaHostPort]);
+            // Discovery: observe the legacy `N:7882` shape, then validate
+            // against that one exact container port.
+            if (validateContainer === validateContainerConfiguration) {
+                observedMediaContainerPort = validateContainerPublications(
+                    container,
+                    hostPort,
+                    mediaHostPort,
+                    null,
+                    { observeLegacyMedia: true },
+                ).mediaContainerPort;
+                legacyMediaNotice = observedMediaContainerPort === mediaHostPort
+                    ? null
+                    : `legacy media target ${observedMediaContainerPort} (replaced on next start)`;
+            }
             validateContainer(container, {
                 identity,
                 dataFingerprints: dataState?.fingerprints,
                 agentLib: agentLibContractFromContainer(container),
-                hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
-                mediaHostPort: Number(container.labels?.[BOX_LABELS.mediaHostPort]),
+                hostPort,
+                mediaHostPort,
+                ...(observedMediaContainerPort === undefined
+                    ? {}
+                    : { mediaContainerPort: observedMediaContainerPort }),
                 imageId: image.immutableId,
                 imageRef,
                 repositoryRoot,
@@ -3729,6 +3756,7 @@ export function createBoxSupervisor({
                 detail: String(error.message || 'Owned Box image is incompatible'),
             });
         }
+        const mediaNoticeField = legacyMediaNotice ? { mediaNotice: legacyMediaNotice } : {};
         let routerBinding = null;
         try {
             routerBinding = Object.freeze({
@@ -3739,7 +3767,7 @@ export function createBoxSupervisor({
             routerBinding = null;
         }
         if (!container.runtime.running) {
-            return Object.freeze({ identity, ownership, state: 'stopped', routerBinding });
+            return Object.freeze({ identity, ownership, state: 'stopped', routerBinding, ...mediaNoticeField });
         }
         const inbox = runner.query(ownership.engine.name, [
             'container', 'exec',
@@ -3756,6 +3784,7 @@ export function createBoxSupervisor({
                 state: 'running-transient',
                 inbox: null,
                 routerBinding,
+                ...mediaNoticeField,
             });
         }
         try {
@@ -3779,6 +3808,7 @@ export function createBoxSupervisor({
                 state: allowlisted.initialized ? 'running-initialized' : 'running-uninitialized',
                 inbox: allowlisted,
                 routerBinding,
+                ...mediaNoticeField,
             });
         } catch {
             return Object.freeze({
@@ -3787,6 +3817,7 @@ export function createBoxSupervisor({
                 state: 'running-transient',
                 inbox: null,
                 routerBinding,
+                ...mediaNoticeField,
             });
         }
     }
@@ -3827,8 +3858,10 @@ export function createBoxSupervisor({
         const mappingText = (binding) => (
             binding ? `${binding.address}:${binding.hostPort}:${BOX_ROUTER_CONTAINER_PORT}` : null
         );
-        const unchangedPublication = Boolean(current) && sameRouterBinding(current, routerBinding);
         const mediaHostPort = current?.mediaHostPort ?? BOX_MEDIA_PORT;
+        // A legacy `N:7882` Box is replaced by a bind: it is never "unchanged".
+        const unchangedPublication = Boolean(current) && sameRouterBinding(current, routerBinding)
+            && current.mediaContainerPort === current.mediaHostPort;
         return Object.freeze({
             command: 'bind',
             identity: identity.instance,
@@ -3840,7 +3873,7 @@ export function createBoxSupervisor({
             requestedMapping: mappingText(routerBinding),
             publications: Object.freeze([
                 `${routerBinding.address}:${routerBinding.hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
-                `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
+                `0.0.0.0:${mediaHostPort}:${mediaHostPort}/udp`,
             ]),
             trustedHosts: routerBinding.hosts || [],
             browserUrls: routerBindingBrowserUrls(routerBinding),
@@ -4052,7 +4085,8 @@ export function formatBindResult(result) {
     const lines = [actions[result?.action] || `Bind completed (${String(result?.action || 'unknown')}).`];
     lines.push(...formatRouterBindingLines(result?.routerBinding));
     if (result?.mediaHostPort) {
-        const media = `Media publication: 0.0.0.0:${result.mediaHostPort} -> ${BOX_MEDIA_PORT}/udp`;
+        // The in-Box listener equals the host port, so both ends print N.
+        const media = `Media publication: 0.0.0.0:${result.mediaHostPort} -> ${result.mediaHostPort}/udp`;
         lines.push(result.action === 'created' ? media : `${media} (unchanged)`);
     }
     lines.push(isLoopbackRouterBinding(result?.routerBinding)
@@ -4090,6 +4124,7 @@ export function formatBoxStatus(status) {
         `Workspace identity: ${status.identity.instance}`,
     ];
     lines.push(...formatRouterBindingLines(status.routerBinding));
+    if (status.mediaNotice) lines.push(`Media: ${status.mediaNotice}`);
     if (status.inbox) {
         lines.push(`Core initialized: ${status.inbox.initialized ? 'yes' : 'no'}`);
         lines.push(`Routing configured: ${status.inbox.routingConfigured ? 'yes' : 'no'}`);

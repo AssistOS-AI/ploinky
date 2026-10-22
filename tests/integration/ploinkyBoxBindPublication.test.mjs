@@ -10,7 +10,7 @@ import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { buildImageSelection } from '../../agentlib/source.mjs';
-import { BOX_LABELS, BOX_MEDIA_PORT, BOX_USERNS } from '../../ploinky-box/constants.mjs';
+import { BOX_LABELS, BOX_USERNS } from '../../ploinky-box/constants.mjs';
 import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
 import { normalizeImageId } from '../../ploinky-box/contract/image-id.mjs';
 import { discoverBoxOwnership } from '../../ploinky-box/engine/discovery.mjs';
@@ -101,7 +101,8 @@ function udpRoundTrip(hostname, port, token) {
     });
 }
 
-function fixtureServer(token) {
+// The in-Box media listener equals the selected host port.
+function fixtureServer(token, mediaPort) {
     return [
         "import http from 'node:http';",
         "import dgram from 'node:dgram';",
@@ -118,7 +119,7 @@ function fixtureServer(token) {
         "media.on('message', (message, remote) => {",
         '    if (String(message) === token) media.send(token, remote.port, remote.address);',
         '});',
-        `media.bind(${BOX_MEDIA_PORT}, '0.0.0.0');`,
+        `media.bind(${Number(mediaPort)}, '0.0.0.0');`,
         '',
     ].join('\n');
 }
@@ -138,7 +139,6 @@ test('native Box Router publications preserve the public-only boundary across bi
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     fs.mkdirSync(stateHome, { mode: 0o700 });
     const token = crypto.randomUUID();
-    fs.writeFileSync(path.join(workspace, 'bind-publication-fixture.mjs'), fixtureServer(token), { mode: 0o600 });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const store = createRouterBindingStore({ homeDirectory: stateHome });
     const native = createProcessRunner();
@@ -202,6 +202,7 @@ test('native Box Router publications preserve the public-only boundary across bi
     });
     const hostPort = await unusedTcpPort();
     const mediaHostPort = await unusedUdpPort();
+    fs.writeFileSync(path.join(workspace, 'bind-publication-fixture.mjs'), fixtureServer(token, mediaHostPort), { mode: 0o600 });
     let previousId = null;
     for (const mapping of [null, `0:${hostPort}:8080`, `${address}:${hostPort}:8080`, `127.0.0.1:${hostPort}:8080`]) {
         const parsed = mapping ? assertRouterBindingAssignable(parseRouterBindingMapping(mapping)) : null;
@@ -222,7 +223,7 @@ test('native Box Router publications preserve the public-only boundary across bi
         assert.equal(normalizeImageId(handle.runtime.imageId), imageId);
         assert.equal(handle.runtime.publications.length, 2);
         assert.deepEqual(publication.tcp, { containerPort: '8080', protocol: 'tcp', hostIp: selected.address, hostPort: String(hostPort) });
-        assert.deepEqual(publication.udp, { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) });
+        assert.deepEqual(publication.udp, { containerPort: String(mediaHostPort), protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) });
         assert.equal(handle.runtime.user, 'podman');
         assert.equal(handle.runtime.privileged, false);
         assert.equal(handle.runtime.init, true);
@@ -262,7 +263,7 @@ test('native Box Router publications preserve the public-only boundary across bi
         } else {
             assert.equal(store.read(identity), null);
         }
-        t.diagnostic(`Verified ${selected.address}:${hostPort}:8080/tcp + 0.0.0.0:${mediaHostPort}:7882/udp; container ${handle.id}`);
+        t.diagnostic(`Verified ${selected.address}:${hostPort}:8080/tcp + 0.0.0.0:${mediaHostPort}:${mediaHostPort}/udp; container ${handle.id}`);
     }
     assert.equal(createdIds.size, 4, 'all four publication generations used distinct real containers');
     t.diagnostic(`Immutable Box image ${imageId}; non-loopback HTTP and UDP checked through ${address}`);
