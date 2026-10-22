@@ -12,7 +12,7 @@ import { llmCleanupProof } from './liveLlmCases.mjs';
 import { createGpuGate, gpuCleanupProof, gpuQueryArgv } from './liveGpuGate.mjs';
 import { requireTransport } from './liveProcess.mjs';
 import { cgroupWithin, createHostProc, processesWithin } from './liveGpuHost.mjs';
-import { createModelHostGuard, observeAppleMachine, parseModelHostSample, assertModelGrantInventory, modelGrantInventory } from './liveModelHostGuard.mjs';
+import { createModelHostGuard, observeAppleMachine, parseModelHostSample, assertModelGrantInventory, modelGrantInventory, modelGrantInventoryWithoutOwnRecords } from './liveModelHostGuard.mjs';
 import { MODEL_CODE_MOUNT_POINT, MODEL_SOURCE_VIEW, assertModelMountPoint, modelMountFacts, modelSourceLayout, observeModelStage } from './liveModelSource.mjs';
 import { APPLE_DEVICE_INSPECT, assertAppleDeviceArguments, observeAppleDevices, AMD_DEVICE_INSPECT, assertAmdDeviceArguments, observeAmdDevices } from './liveModelDevices.mjs';
 import { normalizeMeasurement, measurementCases, measurementParams, MEASUREMENT_DEADLINES } from './liveModelMeasurements.mjs';
@@ -491,7 +491,25 @@ export function createModelCases(ctx) {
         } catch (error) { evidence.status = 'fail'; evidence.reason = String(error.message).slice(0, 400); throw Object.assign(error, { evidence }); }
         finally { write(`model-${spec.case.toLowerCase()}`, evidence); }
     }
+    // The model teardown runs first and always. The run workspace's own grant inventory is read after it and before
+    // cleanup removes the workspace (afterwards it is always empty and could not show a record that appeared after
+    // provision or while the case ran). A teardown error is never masked by an inventory error.
     async function beforeCleanup() {
+        let teardownFailure = null;
+        try { await stopModel(); } catch (error) { teardownFailure = error; }
+        let inventoryFailure = null;
+        try { assertModelGrantInventory(run, profile); } catch (error) {
+            inventoryFailure = error;
+            // The differing entries survive the removal of the workspace as evidence.
+            try { write('model-grants-changed', { runId: run.runId, baseline: run.preInventory.gpuGrants ?? null, observed: modelGrantInventoryWithoutOwnRecords(run, profile.workspace.path), reason: String(error.message).slice(0, 200) }); } catch { /* the failure itself is reported below */ }
+        }
+        if (teardownFailure) {
+            if (inventoryFailure) { run.cleanup.failures.push(String(inventoryFailure.message).slice(0, 200)); persist(); }
+            throw teardownFailure;
+        }
+        if (inventoryFailure) throw inventoryFailure;
+    }
+    async function stopModel() {
         if (apu) { if (launched) await apu.beforeCleanup(); return; }
         if (!launched) return;
         if (profile.model.measurement) {

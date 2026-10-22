@@ -12,7 +12,7 @@ import { assertRemoteArrival } from './liveRemote.mjs';
 import {
     HASH, HOST_RECORD_DIRECTORIES, ID, INSPECT, MAX_NESTED_LISTED, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, absolute, artifactPathFor, assertWorkspace,
     blocked, bounded, candidateEnv, checkedJson, commandTails, digest, hostRecordPaths, hostStateDirectory, jsonDigest, keys, liveSourceDigest, nestedContainerEvidence,
-    observeEngineIdentity, receipt, foreignGuardInput, foreignWorkspaceProblem,
+    observeEngineIdentity, receipt, foreignGuardInput, foreignWorkspaceProblem, validateAllowHostProcesses, withHostProcessAllowance,
 } from './liveCommon.mjs';
 import { recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
 import { validateC5BoxReceipts } from './liveBoxTransitionCustody.mjs';
@@ -74,7 +74,8 @@ export const LIVE_ACTIONS = Object.freeze(['provision', 'live', 'cleanup']);
 export function validateProfile(run, { partial = false } = {}) {
     validateRunManifest(run);
     const profile = run.target.execution;
-    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu', 'llm', 'model']);
+    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu', 'llm', 'model', 'allowHostProcesses']);
+    if (profile.allowHostProcesses !== undefined) validateAllowHostProcesses(profile.allowHostProcesses, 'execution allowHostProcesses');
     if (profile.fixtures !== undefined) {
         keys(profile.fixtures, [], 'fixtures', ['cpu', 'gpu', 'llm', 'availability', 'store']);
         for (const name of ['cpu', 'gpu', 'llm', 'availability', 'store']) {
@@ -285,7 +286,7 @@ export function createLiveAdapter(profile, {
         if (['pressure', 'destroy-box'].includes(kind) && liveSourceDigest(profile.source.root) !== profile.source.digest) throw new Error('Candidate source changed');
         let op = null;
         if (journal) {
-            op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds: [profile.box.id], argvDigest: jsonDigest([binary, ...args]), resultArtifact: null };
+            op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds: [profile.box.id], argvDigest: jsonDigest([binary, ...(processProvider.effectiveArgv?.(binary, args) ?? args)]), resultArtifact: null };
             if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
             run.operations.push(op); persist();
         }
@@ -664,6 +665,7 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
     if (foreign) { report.limitations.push(foreign); return report; }
     let profile;
     try { profile = validateProfile(run, { partial: true }); } catch (error) { report.limitations.push(error.message); return report; }
+    processProvider = withHostProcessAllowance(processProvider, profile);
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
     if (problem) { report.limitations.push(problem); return report; }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return report; }
@@ -737,6 +739,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     if (foreign) { report.limitations.push(foreign); return prevented(); }
     let profile;
     try { profile = validateExecutionProfile(run); } catch (error) { report.limitations.push(error.message); return prevented(); }
+    processProvider = withHostProcessAllowance(processProvider, profile);
     if (run.cleanup.state !== 'not-started') { report.limitations.push('Cleanup has already started for this run; provision a new one'); return prevented(); }
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
     if (problem) { report.limitations.push(problem); return prevented(); }

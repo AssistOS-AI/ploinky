@@ -388,7 +388,8 @@ export async function runScenario(name, options = {}) {
     const context = standalone(options.world ?? {});
     const { world, run } = context;
     // Test controls: a profile whose pinned engine digest is wrong, a recorded stamp that is not the store's.
-    const profile = options.engineDigestOverride ? { ...context.profile, engine: { identityDigest: options.engineDigestOverride } } : context.profile;
+    const pinned = options.engineDigestOverride ? { ...context.profile, engine: { identityDigest: options.engineDigestOverride } } : context.profile;
+    const profile = options.allowHostProcesses ? { ...pinned, allowHostProcesses: options.allowHostProcesses } : pinned;
     context.profile = profile;
     const receiptPath = path.join(context.root, `c5-transition-driver-${'1'.repeat(32)}_claude.json`);
     const token = readStoreSnapshot({ paths: world.paths, identity: world.identity }).token;
@@ -417,12 +418,13 @@ export async function runScenario(name, options = {}) {
     // A stepping clock makes the boundary ceiling deterministic: every reading of the time advances it, wall time never matters.
     let clock = 0;
     const now = options.steppingClockMs ? () => (clock += options.steppingClockMs) : undefined;
-    const result = await runDriver(params, { baseRunner: world.runner, supervisor: world.makeSupervisor, programRoot: REPOSITORY, onStep: world.onStep, ...(now ? { now } : {}) });
+    const supervisorCalls = [];
+    const result = await runDriver(params, { baseRunner: world.runner, supervisor: (runner, supervisorOptions) => { supervisorCalls.push({ allowHostProcesses: [...supervisorOptions.allowHostProcesses] }); return world.makeSupervisor(runner); }, programRoot: REPOSITORY, onStep: world.onStep, ...(now ? { now } : {}) });
     let receipt = null;
     if (name === 'transition') receipt = readPrivateC5File(receiptPath);
     const after = readStoreSnapshot({ paths: world.paths, identity: world.identity });
     return {
-        scenario: name, exitCode: result.exitCode, summary: result.summary, receipt, root: context.root, boxId: world.boxId,
+        scenario: name, exitCode: result.exitCode, summary: result.summary, supervisorCalls, receipt, root: context.root, boxId: world.boxId,
         engineEvents: world.events, containers: [...world.containers.entries()].map(([id, entry]) => ({ id, running: entry.handle.runtime.running, gateOn: Boolean(entry.handle.labels[BOX_LABELS.hardwareLimits]) })),
         gate: world.gateStore.read(world.identity)?.enabled ?? null, store: { token: after.token, count: after.agents.size, barrier: readBarrier({ paths: world.paths }) },
         before, adminCalls: world.adminCalls, transitions: createTransitionStore({ identity: world.identity }).listPending().map(journal => ({ id: journal.operationId, phase: journal.phase })),

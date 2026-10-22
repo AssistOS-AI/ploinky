@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { buildEngineProcessEnvironment, createProcessRunner } from '../../../ploinky-box/process.mjs';
 import { resolveWorkspaceIdentity } from '../../../ploinky-box/identity.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from '../../../ploinky-box/locks.mjs';
+import { allowHostProcessesFromEnv } from '../../helpers/allowHostProcesses.mjs';
 import { createBoxSupervisor } from '../../../ploinky-box/supervisor.mjs';
 import { discoverBoxOwnership } from '../../../ploinky-box/engine/discovery.mjs';
 import { writeCandidatePodmanProxy } from './candidatePodmanProxy.mjs';
@@ -120,6 +121,26 @@ export function requirePodmanCandidate(t, env = process.env) {
     return `docker.io/assistos/ploinky-box@${digest}`;
 }
 
+// The supervisor options of the native fixtures. A desktop Linux host can run processes that hold `/` mounted
+// writable (for example `snapd-desktop-integration`) and the real quiescence gate refuses them. The explicit
+// PLOINKY_TEST_ALLOW_HOST_PROCESSES list is forwarded as the supervisor's own `allowHostProcesses`, exactly as
+// `ploinky --allow-host-process PID` would; the product re-verifies each start time. Unset means no allowance.
+export function nativeSupervisorOptions({ runner, lockManager, resolveIdentity, workspace, output, env = process.env }) {
+    return {
+        runner,
+        lockManager,
+        resolveIdentity,
+        // Host skill scope needs a launch directory inside the fixture workspace;
+        // the test process itself runs from the Ploinky checkout.
+        launchCwd: workspace,
+        platform: process.platform,
+        env: {},
+        stdout: output,
+        stderr: output,
+        allowHostProcesses: allowHostProcessesFromEnv(env),
+    };
+}
+
 export function createPodmanHarness(t, candidateReference, {
     reconcile,
     workspaceName = 'workspace',
@@ -184,18 +205,7 @@ export function createPodmanHarness(t, candidateReference, {
     });
     const output = { bytes: '', write(chunk) { this.bytes += String(chunk); } };
     const lockManager = createMutationLockManager();
-    const supervisorOptions = {
-        runner,
-        lockManager,
-        resolveIdentity,
-        // Host skill scope needs a launch directory inside the fixture workspace;
-        // the test process itself runs from the Ploinky checkout.
-        launchCwd: workspace,
-        platform: process.platform,
-        env: {},
-        stdout: output,
-        stderr: output,
-    };
+    const supervisorOptions = nativeSupervisorOptions({ runner, lockManager, resolveIdentity, workspace, output });
     if (reconcile) supervisorOptions.reconcile = reconcile;
     const supervisor = createBoxSupervisor(supervisorOptions);
     const identity = resolveIdentity();

@@ -25,7 +25,7 @@ import { driverArgv, driverParams } from './liveStoreTransition.mjs';
 export function createJournal({ run, persist, processProvider = runBoundedProcess, signal, artifacts = () => {} }) {
     return async function journaled(kind, binary, args, { cwd, env, deadlineMs = 30000, stress = false, resourceIds = [], stdinPath = null, box = null, capture = null } = {}) {
         if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
-        const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds, argvDigest: jsonDigest([binary, ...args]), resultArtifact: null, ...(box ? { box } : {}) };
+        const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds, argvDigest: jsonDigest([binary, ...(processProvider.effectiveArgv?.(binary, args) ?? args)]), resultArtifact: null, ...(box ? { box } : {}) };
         run.operations.push(op); persist();
         const result = await processProvider(binary, args, { cwd, env, deadlineMs, maxBytes: 65536, signal, ...(stdinPath ? { stdinPath } : {}) });
         op.state = 'observed';

@@ -26,3 +26,11 @@ test('the forwarded allowance is exactly what `ploinky --allow-host-process PID`
     const parsed = parseOuterArguments([...allowHostProcessArgs(pids), 'start']);
     assert.deepEqual([...parsed.allowHostProcesses], [4242, 17]);
 });
+
+test('the native Box fixtures forward the allowance to the supervisor and nothing when it is unset', async () => {
+    const { nativeSupervisorOptions } = await import('../e2e/ploinkyBox/nativeHelpers.mjs');
+    const base = { runner: {}, lockManager: {}, resolveIdentity: () => ({}), workspace: '/w', output: {} };
+    assert.deepEqual([...nativeSupervisorOptions({ ...base, env: {} }).allowHostProcesses], [], 'unset: no allowance');
+    assert.deepEqual([...nativeSupervisorOptions({ ...base, env: { [ALLOW_HOST_PROCESSES_ENV]: '4242,17' } }).allowHostProcesses], [4242, 17]);
+    assert.throws(() => nativeSupervisorOptions({ ...base, env: { [ALLOW_HOST_PROCESSES_ENV]: '4242, 17' } }), /comma-separated list of positive process IDs/);
+});

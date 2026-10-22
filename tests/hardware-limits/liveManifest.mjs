@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { WANTED_CONTROLLERS } from '../../ploinky-box/entrypoint/cgroupDelegation.mjs';
-import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, liveSourceDigest, AGENT_INSPECT, BOX_CONTRACT_INSPECT, INSPECT } from './liveCommon.mjs';
+import { ENGINE_CONNECTIONS_ARGV, ENGINE_INFO_ARGV, HOST_RECORD_DIRECTORIES, IMAGE_REF, OWNER_MARKER, UNIX_SOCKET_PATH_LIMIT, WORKSPACE_SOCKET_NAME, digest, keys, liveSourceDigest, candidateArgvWithAllowance, validateAllowHostProcesses, AGENT_INSPECT, BOX_CONTRACT_INSPECT, INSPECT } from './liveCommon.mjs';
 import { FIXTURE_AGENT_COMMAND, FIXTURE_REPOSITORY, GPU_PROBE_TARGET, fixtureContainerName, fixtureManifest, fixturePlan, proposedWorkspaceIdentity, rewriteLlmManifest, startArgs } from './liveFixture.mjs';
 import { INSTALL_SAMPLES_HEAD, INSTALL_SAMPLES_TAIL, LLM_MODELS, LLM_REF, LLM_REPOSITORY, LLM_SOURCE_DIRECTORY } from './liveLlmNames.mjs';
 import {
@@ -155,7 +155,8 @@ const canonicalFile = file => path.isAbsolute(file) && fs.realpathSync(file) ===
 // are rechecked by the runner on arrival, before any mutation.
 export function validatePins(value, block) {
     const spec = CONCRETE_BLOCKS[block];
-    keys(value, ['schema', 'host', 'node', 'engine', 'boxImage'], 'pins', ['ssh', 'workspaceParentRoot', 'ports', 'gpu', 'llm', 'model']);
+    keys(value, ['schema', 'host', 'node', 'engine', 'boxImage'], 'pins', ['ssh', 'workspaceParentRoot', 'ports', 'gpu', 'llm', 'model', 'allowHostProcesses']);
+    if (value.allowHostProcesses !== undefined) validateAllowHostProcesses(value.allowHostProcesses, 'pins.allowHostProcesses');
     if (spec.model) validateModelPins(value.model, block);
     else if (value.model !== undefined) throw new Error('Only model blocks accept model pins');
     if (value.schema !== 1) throw new Error('Unsupported pins schema');
@@ -283,6 +284,7 @@ export function buildConcreteManifest({ block, runId, configDigest, casesDigest,
         node: { ...pins.node },
         candidate: { path: path.join(sourceRoot, 'ploinky-box', 'bin', 'ploinky-box.mjs'), digest: digest(fs.readFileSync(candidateFile)) },
         engine: { ...pins.engine },
+        ...(pins.allowHostProcesses !== undefined ? { allowHostProcesses: [...pins.allowHostProcesses] } : {}),
         source: { root: sourceRoot, digest: candidate.digest },
         workspace: null,
         box: null,
@@ -500,7 +502,10 @@ export function plannedCommands(run) {
         { id: 'verify-absent', binary: engine, argv: ps, action: 'No owned Box, workspace, quarantine, parent or host record remains' },
         ...(profile.gpu ? [{ id: 'gpu-final-observation', binary: profile.gpu.smi.path, argv: gpuQueryArgv(profile.gpu.uuid), deadlineMs: 30000, action: 'The GPU shows none of the runner\'s registered processes; compute mode is read, never written' }] : []),
     ];
-    const result = { provision, live, cleanup };
+    // Every candidate command carries the pinned host-process allowance as outer options, so the approver reads it in the
+    // command lines and the runner adds exactly the same words (liveCommon.withHostProcessAllowance).
+    const allowed = steps => steps.map(step => (step.argv ? { ...step, argv: candidateArgvWithAllowance(profile, step.argv) } : step));
+    const result = { provision: allowed(provision), live: allowed(live), cleanup: allowed(cleanup) };
     if (run.target.remote) {
         const ssh = [run.target.remote.sshBinary, ...sshOptions(run.target.remote), run.target.remote.address];
         const root = run.target.stage.root;
@@ -743,6 +748,7 @@ export function renderSummary(run, manifestPath) {
         remote ? `| SSH route | ${run.target.remote.user}@${run.target.remote.address}, HostKeyAlias ${run.target.remote.hostKeyAlias}, known_hosts \`${run.target.remote.knownHosts}\` (${run.target.remote.knownHostsDigest}), BatchMode, strict host key, no forwarding |` : '| SSH route | none (local block) |',
         `| Engine | \`${profile.engine.path}\` ${profile.engine.digest}, service identity ${profile.engine.identityDigest} |`,
         `| Node | \`${profile.node.path}\` ${profile.node.digest} |`,
+        ...(profile.allowHostProcesses ? [`| Host-process allowance | PIDs ${profile.allowHostProcesses.join(', ')}: every candidate command below carries \`--allow-host-process PID\` for each, and the product re-verifies each process's start time; nothing else is excused${profile.cases.includes('LIVE-C5') ? '; the LIVE-C5 transition driver passes them to its own supervisor' : ''} |`] : []),
         `| Candidate | revision ${plan.revision}, source \`${profile.source.root}\` ${profile.source.digest} |`,
         remote ? `| Staged payload | \`${run.target.stage.payloadPath}\` ${run.target.stage.payloadDigest} (${run.target.stage.payloadBytes} bytes) into \`${run.target.stage.root}\` |` : '| Staged payload | none |',
         '',

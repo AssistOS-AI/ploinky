@@ -605,6 +605,32 @@ test('G1.cleanup-removes-the-recorded-grant-and-policy-records-the-run-created-d
     assert.equal(exists(path.join(workspaceOf(alone), '.ploinky-box', 'gpu-grants')), false);
 });
 
+test('G1.cleanup-never-touches-another-workspace-s-grant-and-policy-records', async t => {
+    // State is per workspace. Another workspace's `.ploinky-box` holds records of its own instance, and records
+    // named for this run's instance too: the exact record names are resolved under the run workspace only.
+    const w = gpuWorld(t);
+    const neighbour = path.join(w.root, 'neighbour-workspace', '.ploinky-box');
+    const instance = w.run.workspace.instance;
+    const records = new Map([
+        [path.join(neighbour, 'gpu-grants', 'ploinky-box-other-0123456789ab.json'), '{"mine":false}'],
+        [path.join(neighbour, 'gpu-grants', 'ploinky-box-other-0123456789ab', 'wiring.json'), '{}'],
+        [path.join(neighbour, 'gpu-grants', `${instance}.json`), '{"mine":"same-name"}'],
+        [path.join(neighbour, 'gpu-grants', instance, 'wiring.json'), '{"mine":"same-name"}'],
+        [path.join(neighbour, 'hardware-limits', instance, 'policy.json'), '{"mine":"same-name"}'],
+    ]);
+    for (const [file, bytes] of records) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, bytes); }
+    const untouched = () => { for (const [file, bytes] of records) assert.equal(fs.readFileSync(file, 'utf8'), bytes, file); };
+    const report = await w.provision();
+    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+    assert.ok(w.run.ownedPaths.filter(entry => entry.role === 'host-record').every(entry => entry.path.startsWith(`${workspaceOf(w)}/`)), 'only records under the run workspace are recorded');
+    untouched();
+    const cleaned = await w.cleanup();
+    assert.equal(cleaned.verdict, 'PASS', JSON.stringify(w.run.cleanup));
+    assert.equal(exists(workspaceOf(w)), false);
+    untouched();
+    assert.equal(exists(path.join(w.home, '.ploinky-box')), false, 'no host state is written under the home');
+});
+
 // --- LIVE-P1 -----------------------------------------------------------------------------------------
 const nothingOwned = w => {
     assert.equal(w.run.cleanup.state, 'complete', JSON.stringify(w.run.cleanup));

@@ -31,7 +31,7 @@ import {
 import {
     C5_DRIVER_NAME, newDriverReceipt, persistDriverReceipt, productEngineDigest, productTransitionIds, readC5ProductJournal, readC5Snapshot, validateC5Intent,
 } from './liveBoxTransitionCustody.mjs';
-import { ID, INSPECT, RUN_ID, absolute, assertWorkspace, engineIdentityDigest, jsonDigest, redactDiagnostic } from './liveCommon.mjs';
+import { ID, INSPECT, RUN_ID, absolute, assertWorkspace, engineIdentityDigest, jsonDigest, redactDiagnostic, validateAllowHostProcesses } from './liveCommon.mjs';
 
 export const DRIVER_SCHEMA = 1;
 export const DRIVER_MODES = Object.freeze(['transition', 'writer-first', 'destroy']);
@@ -61,6 +61,9 @@ const setup = (message, evidence = null) => new DriverAssertion('setup', message
 export function driverParams({ mode, profile, run, intent = null, receiptPath = null, expectedToken = null, expectedContainerId = null, agentRef = null, bounds = DRIVER_BOUNDS }) {
     return {
         schema: DRIVER_SCHEMA, mode, runId: run.runId, bounds: { ...bounds }, agentRef, expectedToken, expectedContainerId, intent, receiptPath,
+        // The manifest's pinned host-process allowance (empty: none), handed to the driver's own supervisor exactly as the runner
+        // hands it to the candidate commands (liveCommon.withHostProcessAllowance); the product re-verifies each start time.
+        allowHostProcesses: [...(profile.allowHostProcesses ?? [])],
         profile: {
             host: { home: profile.host.home }, workspace: profile.workspace, box: profile.box, source: { root: profile.source.root, digest: profile.source.digest },
             engine: { identityDigest: profile.engine.identityDigest }, cases: profile.cases,
@@ -72,13 +75,15 @@ export const driverArgv = (profile, params) => [path.join(profile.source.root, D
 export function validateDriverParams(value) {
     const fail = message => setup(`invalid driver parameters: ${message}`);
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw fail('not an object');
-    const allowed = ['schema', 'mode', 'runId', 'bounds', 'agentRef', 'expectedToken', 'expectedContainerId', 'intent', 'receiptPath', 'profile'];
+    const allowed = ['schema', 'mode', 'runId', 'bounds', 'agentRef', 'expectedToken', 'expectedContainerId', 'intent', 'receiptPath', 'allowHostProcesses', 'profile'];
     if (Object.keys(value).some(key => !allowed.includes(key)) || allowed.some(key => !Object.hasOwn(value, key))) throw fail('unexpected fields');
     if (value.schema !== DRIVER_SCHEMA || !DRIVER_MODES.includes(value.mode) || !RUN_ID.test(value.runId)) throw fail('schema, mode or run');
     for (const key of ['lifecycleMs', 'boundaryMs', 'adminMs', 'programMs', 'infoMs', 'destroyMs']) {
         const bound = value.bounds?.[key];
         if (!Number.isInteger(bound) || bound < 1 || bound > DRIVER_BOUNDS[key]) throw fail(`bound ${key}`);
     }
+    if (!Array.isArray(value.allowHostProcesses)) throw fail('allowHostProcesses');
+    if (value.allowHostProcesses.length) try { validateAllowHostProcesses(value.allowHostProcesses); } catch (error) { throw fail(error.message); }
     const profile = value.profile;
     if (!profile || !absolute(profile.host?.home) || !absolute(profile.workspace?.path) || !absolute(profile.source?.root) || !Array.isArray(profile.cases)
         || !ID.test(profile.box?.id) || !/^sha256:[a-f0-9]{64}$/.test(profile.engine?.identityDigest)) throw fail('profile');
@@ -338,8 +343,8 @@ export async function runDriver(rawParams, seams = {}) {
     };
 
     const out = sink(); const err = sink();
-    const makeSupervisor = seams.supervisor ?? (runner => production.createBoxSupervisor({ runner, env: process.env, launchCwd: process.cwd(), stdout: out, stderr: err }));
-    const real = makeSupervisor(decorated);
+    const makeSupervisor = seams.supervisor ?? ((runner, options) => production.createBoxSupervisor({ runner, env: process.env, launchCwd: process.cwd(), stdout: out, stderr: err, allowHostProcesses: options.allowHostProcesses }));
+    const real = makeSupervisor(decorated, { allowHostProcesses: Object.freeze([...params.allowHostProcesses]) });
     // The supervisor is frozen: a new delegating wrapper, never an assignment to its methods.
     const wrapper = Object.freeze({
         ...real,

@@ -17,7 +17,7 @@ import { assertBoxWorkspaceRoot } from '../../ploinky-box/contract/workspace-roo
 import { EXIT } from './fixtures.mjs';
 import {
     AGENT_INSPECT, BOX_CONTRACT_INSPECT, ID, IMAGE_REF, INSPECT, OWNER_MARKER, absolute, blocked, candidateEnv, checkedJson, digest,
-    HOST_RECORD_DIRECTORIES, assertNoForeignWorkspace, foreignGuardInput, hostRecordPaths, hostStateDirectory, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem,
+    HOST_RECORD_DIRECTORIES, assertNoForeignWorkspace, foreignGuardInput, hostRecordPaths, hostStateDirectory, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem, withHostProcessAllowance,
 } from './liveCommon.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
@@ -229,6 +229,7 @@ export async function provisionRun({
         if (run.state !== 'proposed' || run.operations.length || run.ownedBoxes.length || run.ownedPaths.length || run.toleratedProcesses?.length
             || run.cleanup.state !== 'not-started') throw new Error('Provisioning needs a fresh proposed manifest');
         profile = validateProfile(run, { partial: true });
+        processProvider = withHostProcessAllowance(processProvider, profile);
         if (profile.workspace || profile.box || profile.agents.length || !profile.provision) throw new Error('Provisioning needs an unprovisioned execution profile');
         validateProvisionPlan(profile.provision, run);
         // The foreign-workspace guard (plan C7): before any host, port or engine touch.

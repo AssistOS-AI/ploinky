@@ -19,6 +19,33 @@ export const OWNER_MARKER = '.ploinky-hwl-owner';
 // The only host record directories cleanup may touch, each holding at most an
 // INSTANCE.json record and an INSTANCE generation/store directory. They live in
 // the workspace's own `.ploinky-box` directory.
+// The explicit host-process allowance (`ploinky --allow-host-process PID`, an outer option before the command): a
+// pinned, exact list of process IDs the quiescence gate may excuse, for example a snap desktop helper that holds `/`
+// mounted writable on a desktop Linux host. Nothing is detected or defaulted; the product re-verifies each process's
+// start time. The list is part of the manifest, so the approval summary shows it and the authorization binding covers it.
+export const ALLOW_HOST_PROCESS_PATTERN = /^[1-9][0-9]{0,9}$/;
+export const ALLOW_HOST_PROCESS_MAX = 16;
+export function validateAllowHostProcesses(value, label = 'allowHostProcesses') {
+    if (!Array.isArray(value) || value.length < 1 || value.length > ALLOW_HOST_PROCESS_MAX
+        || value.some(pid => !Number.isSafeInteger(pid) || !ALLOW_HOST_PROCESS_PATTERN.test(String(pid))) || new Set(value).size !== value.length) {
+        throw new Error(`${label} must be a list of 1 to ${ALLOW_HOST_PROCESS_MAX} distinct positive process IDs`);
+    }
+    return value;
+}
+export const allowHostProcessArgv = pids => pids.flatMap(pid => ['--allow-host-process', String(pid)]);
+// The candidate command line with the allowance as outer options right after the candidate path.
+export function candidateArgvWithAllowance(profile, argv) {
+    const pids = profile?.allowHostProcesses;
+    if (!pids?.length || argv[0] !== profile.candidate.path || argv[1] === '--allow-host-process') return argv;
+    return [argv[0], ...allowHostProcessArgv(pids), ...argv.slice(1)];
+}
+// A process provider that forwards the pinned allowance to every candidate command and to nothing else.
+export function withHostProcessAllowance(provider, profile) {
+    if (!profile?.allowHostProcesses?.length) return provider;
+    const effectiveArgv = (binary, args) => (binary === profile.node.path ? candidateArgvWithAllowance(profile, args) : args);
+    // `effectiveArgv` lets a journal digest the command line that actually runs.
+    return Object.assign((binary, args, options) => provider(binary, effectiveArgv(binary, args), options), { effectiveArgv });
+}
 export const HOST_RECORD_DIRECTORIES = Object.freeze(['hardware-limits', 'gpu-grants', 'router-bindings']);
 export const IMAGE_REF = /^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?\/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$/;
 

@@ -593,6 +593,10 @@ export function buildRequiredCaseManifest() {
             'L1.provision-box-inspect-failure-still-records-and-cleans-the-box', 'L1.cleanup-refuses-a-box-that-does-not-match-the-recorded-identity',
             'L1.provision-port-collision-aborts',
             'L1.provision-refuses-preexisting-workspace', 'L1.provision-refuses-existing-host-record',
+            // The explicit host-process allowance pin (--allow-host-process), part of the manifest.
+            'L1.allowance-pin-is-strictly-validated-and-never-defaulted',
+            'L1.allowance-is-in-the-manifest-the-plan-the-summary-and-the-binding-digest',
+            'L1.allowance-reaches-every-candidate-command-of-provision-and-cleanup-and-nothing-else',
             'L1.provision-requires-separate-authorization', 'L1.stage-roundtrip-provision-and-cleanup',
             'L1.stage-payload-digest-mismatch-refuses', 'L1.stage-forced-settlement-preserves',
             'L1.stage-wrong-host-identity-refuses', 'L1.stage-fetched-manifest-digest-mismatch-refuses',
@@ -602,7 +606,11 @@ export function buildRequiredCaseManifest() {
             'L1.cleanup-after-interrupted-provision-without-receipts', 'L1.cleanup-removes-exact-recorded-host-records',
             'L1.cleanup-refuses-unrecorded-host-record', 'L1.cleanup-refuses-changed-host-record-identity',
             'L1.cleanup-removes-the-host-record-directory-this-run-created-when-empty',
-            'L1.cleanup-keeps-a-host-record-directory-that-existed-before-the-run',
+            // Replaces 'L1.cleanup-keeps-a-host-record-directory-that-existed-before-the-run' (host state moved from the
+            // shared ~/.ploinky-box into each workspace's own .ploinky-box): obsolete by design, because the run workspace
+            // is created by the run, so no record directory in it can pre-exist. What survives of the property is that
+            // a proposed workspace that already holds host state is refused, never adopted or recorded as the run's.
+            'L1.provision-refuses-a-proposed-workspace-that-already-holds-host-state',
             'L1.cleanup-keeps-a-run-created-host-record-directory-that-holds-something-else',
             'L1.evidence-names-use-the-configured-document-suffix', 'L1.engine-identity-requires-the-service-locality-fact',
             'L1.cleanup-final-inventory-change-fails',
@@ -843,6 +851,7 @@ export function buildRequiredCaseManifest() {
             'X5.c5-driver-passes-with-an-engine-that-reports-a-host-id-as-well-as-with-one-that-does-not',
             'X5.c5-driver-writer-first-is-refused-with-the-typed-error-before-any-lifecycle-mutation',
             'X5.c5-driver-refuses-a-lifecycle-mutation-in-the-writer-first-order-itself',
+            'X5.c5-driver-hands-the-manifest-allowance-to-its-supervisor-and-nothing-when-none-is-pinned',
             'X5.c5-driver-destroy-guards-the-exact-id-and-delegates-the-products-own-destroy-unchanged',
             'X5.c5-driver-a-production-rollback-after-an-engine-failure-keeps-the-requested-transition-failed-and-the-attempts-distinct',
             'X5.c5-driver-a-boundary-past-its-ceiling-is-a-setup-failure-never-a-kill-or-a-refusal',
@@ -965,7 +974,14 @@ export function buildRequiredCaseManifest() {
             'G1.provision-gpu-gate-busy-blocks-before-anything-is-created',
             'G1.provision-gpu-grant-failure-or-missing-wiring-is-blocked-and-cleans-up',
             'G1.provision-gpu-refuses-a-changed-nvidia-tool-or-probe-digest',
-            'G1.cleanup-removes-the-recorded-grant-and-policy-records-and-keeps-the-gpu-grants-directory',
+            // Replaces 'G1.cleanup-removes-the-recorded-grant-and-policy-records-and-keeps-the-gpu-grants-directory'
+            // (host state moved from the shared ~/.ploinky-box into each workspace's own .ploinky-box):
+            // - recorded records removed, run-created directories removed, workspace removed: the renamed test;
+            // - "a neighbour's record is never touched": another workspace's records, now the second test;
+            // - "keeps the gpu-grants directory when it existed before": obsolete by design. The run workspace is
+            //   created by the run (a pre-existing workspace is refused) and removed whole, so nothing in it pre-exists.
+            'G1.cleanup-removes-the-recorded-grant-and-policy-records-the-run-created-directories-and-the-workspace',
+            'G1.cleanup-never-touches-another-workspace-s-grant-and-policy-records',
             'G1.P1-passes-daemon-defaults-host-uid-labels-and-minimal-environment',
             'G1.P1-is-blocked-when-a-prerequisite-is-missing-and-never-passes',
             'G1.P1-fails-on-a-wrong-uid-extra-environment-tool-bind-or-readonly-pipe',
@@ -1053,15 +1069,6 @@ export function buildRequiredCaseManifest() {
             'R17.a-status-freshness-the-apply-response-does-not-state-fails-the-immediate-check',
             'R17.cancelled-forced-settlement-and-error-code-truth-reads-keep-their-error-and-are-never-trusted',
             'R17.every-poll-is-written-to-the-evidence-as-it-happens',
-            'L3B.a-slow-but-progressing-install-continues-past-the-stall-window-and-records-its-throughput',
-            'L3B.a-stalled-install-is-blocked-after-the-stall-window-and-an-install-over-the-cap-is-blocked',
-            'L3B.the-vllm-block-states-its-cap-its-stall-window-and-a-block-deadline-that-holds-them',
-            'R18-1.a-build-that-shows-no-progress-for-longer-than-the-stall-window-passes-but-a-stalled-download-still-blocks',
-            'R18-1.a-build-that-never-ends-is-cut-by-the-hard-cap',
-            'R18-1.the-operator-summary-states-the-download-stall-window-and-the-build-bound',
-            'R18-2.more-samples-than-the-old-limit-keep-the-first-and-last-download-samples-and-the-throughput-spans-the-whole-download',
-            'R18-2.the-operator-summary-states-the-sample-limit',
-            'R19.the-first-and-last-download-samples-are-kept-outside-the-head-and-the-tail-and-the-throughput-spans-them',
             'T9.the-first-artifact-write-holds-the-immediate-failure-before-any-capture-or-poll',
             'T9.a-failed-container-listing-in-both-captures-still-fails-with-the-evidence-present',
             'T9.synthetic-secrets-in-a-poll-error-a-thrown-read-and-a-failed-read-stderr-are-redacted',
@@ -1222,7 +1229,19 @@ export function buildRequiredCaseManifest() {
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveModel.test.mjs'), [
             'MODEL.apple-cpu-canonical-withdrawal-host-guard-and-cleanup',
-            'MODEL.apple-cpu-preserves-unrelated-grant-records-and-detects-changes',
+            // Replaces 'MODEL.apple-cpu-preserves-unrelated-grant-records-and-detects-changes' (the inventory is now
+            // the run workspace's own .ploinky-box/gpu-grants, empty for a new workspace):
+            // - "preserves unrelated records": another workspace's records, the never-touches test;
+            // - "detects changes": a record added to the run workspace after provision or after the case ran is not PASS;
+            // - a baseline that no longer matches is refused by standalone cleanup: the last test.
+            'MODEL.apple-cpu-grant-inventory-is-the-run-workspace-s-own',
+            'MODEL.apple-cpu-live-is-not-pass-when-the-run-workspace-s-grant-inventory-changes',
+            'MODEL.apple-cpu-never-touches-another-workspace-s-grant-records',
+            // The run's own recorded records (revoke, the start's re-save and wiring directory) are excluded from the inventory; the model Stop runs first.
+            'MODEL.apple-cpu-live-passes-with-the-products-own-records-and-refuses-a-recorded-one-that-changed-kind',
+            'MODEL.apple-cpu-a-teardown-failure-is-not-masked-by-the-grant-inventory-change',
+            'MODEL.allowance-reaches-the-candidate-commands-of-provision-live-and-cleanup',
+            'MODEL.apple-cpu-standalone-cleanup-checks-the-complete-grant-baseline-and-ownership',
             'MODEL.measurement-manifest-through-canonical-cohort-retains-receipts',
             'MODEL.measurement-runLiveCommand-consumes-frozen-authorized-manifest',
             'MODEL.measurement-abort-dispatches-normal-Stop-under-fresh-cleanup-scope',
@@ -1250,6 +1269,17 @@ export function buildRequiredCaseManifest() {
             'MEASURE.generated-routed-projection-and-error-reach-real-cancellation-consumer',
         ]),
         ...leaves(P, 'p4', unit('hardwareLimitsLiveLlm.test.mjs'), [
+            // Baseline drift correction (present at 7ff252cb): these nine tests live in hardwareLimitsLiveLlm.test.mjs
+            // and were listed under hardwareLimitsLiveGpu.test.mjs, so they could never resolve. Moved here, unchanged.
+            'L3B.a-slow-but-progressing-install-continues-past-the-stall-window-and-records-its-throughput',
+            'L3B.a-stalled-install-is-blocked-after-the-stall-window-and-an-install-over-the-cap-is-blocked',
+            'L3B.the-vllm-block-states-its-cap-its-stall-window-and-a-block-deadline-that-holds-them',
+            'R18-1.a-build-that-shows-no-progress-for-longer-than-the-stall-window-passes-but-a-stalled-download-still-blocks',
+            'R18-1.a-build-that-never-ends-is-cut-by-the-hard-cap',
+            'R18-1.the-operator-summary-states-the-download-stall-window-and-the-build-bound',
+            'R18-2.more-samples-than-the-old-limit-keep-the-first-and-last-download-samples-and-the-throughput-spans-the-whole-download',
+            'R18-2.the-operator-summary-states-the-sample-limit',
+            'R19.the-first-and-last-download-samples-are-kept-outside-the-head-and-the-tail-and-the-throughput-spans-them',
             'L3LOAD.the-vllm-model-load-is-thirty-minutes-and-the-block-is-the-runner-maximum-and-the-summary-renders-both',
             'L3LOAD.a-load-within-the-deadline-continues-and-records-each-phase-transition-and-the-total-wait',
             'L3LOAD.a-load-past-the-deadline-is-blocked-never-failed-and-a-failed-load-is-a-failure-and-both-record-their-timing',
