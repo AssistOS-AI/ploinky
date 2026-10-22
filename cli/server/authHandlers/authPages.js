@@ -309,8 +309,7 @@ function renderAuthErrorHtml({
 </html>`;
 }
 
-function renderSsoLoginHtml({ agentName, returnTo = '/', redirectUrl = '' } = {}) {
-    const safeAgent = escapeHtml(agentName || 'application');
+function renderSsoLoginHtml({ returnTo = '/', redirectUrl = '' } = {}) {
     const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
     const safeRedirectUrl = escapeHtml(redirectUrl || '#');
     return `<!doctype html>
@@ -328,7 +327,7 @@ function renderSsoLoginHtml({ agentName, returnTo = '/', redirectUrl = '' } = {}
     <section class="auth-card">
       <div class="auth-kicker">Workspace Access</div>
       <h1>Continue with Single Sign-On</h1>
-      <p>You are signing in to ${safeAgent}. Redirecting to the identity provider now.</p>
+      <p>Redirecting you to the identity provider to sign in.</p>
       <div class="auth-actions">
         <a class="auth-btn" href="${safeRedirectUrl}">Continue</a>
         <a class="auth-btn secondary" href="${safeReturnTo}">Back</a>

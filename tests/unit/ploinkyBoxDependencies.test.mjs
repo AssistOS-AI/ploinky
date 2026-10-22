@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 import {
     BOX_INSTALLED_DEPENDENCIES,
@@ -10,6 +12,7 @@ import {
     DEPENDENCY_MARKER_SCHEMA,
     prepareImageDependencies,
     validateMountedAgentLib,
+    assertExistingImageDependencies,
 } from '../../ploinky-box/entrypoint/install-dependencies.mjs';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 import { createProcessRunner } from '../../ploinky-box/process.mjs';
@@ -101,6 +104,70 @@ test('the Box marker records the supplying image identity, never a lock fingerpr
     const second = prepareImageDependencies({ ...options, token: 'second' });
     assert.equal(second.changed, false);
     assert.deepEqual(installs, []);
+});
+
+test('read-only dependency admission never repairs missing, corrupt, foreign or mismatched caches', t => {
+    for (const damage of ['none', 'missing', 'corrupt', 'image', 'forbidden', 'symlink']) {
+        const state = fixture(t);
+        prepareImageDependencies({ ...state, installLibrary: fakeInstaller([]) });
+        const marker = path.join(state.targetRoot, DEPENDENCY_MARKER_NAME);
+        if (damage === 'missing') fs.unlinkSync(marker);
+        if (damage === 'corrupt') fs.writeFileSync(marker, '{');
+        if (damage === 'image') fs.writeFileSync(marker, JSON.stringify(expectedMarker(OTHER_OUTER_IMAGE)));
+        if (damage === 'forbidden') fs.mkdirSync(path.join(state.targetRoot, 'achillesAgentLib'));
+        if (damage === 'symlink') {
+            fs.renameSync(path.join(state.targetRoot, 'mcp-sdk'), path.join(state.root, 'outside-sdk'));
+            fs.symlinkSync(path.join(state.root, 'outside-sdk'), path.join(state.targetRoot, 'mcp-sdk'));
+        }
+        const fsApi = new Proxy(fs, { get(target, key) {
+            if (['writeFileSync', 'mkdirSync', 'rmSync', 'unlinkSync', 'renameSync', 'chmodSync'].includes(key)) {
+                return () => assert.fail(`read-only check attempted ${key}`);
+            }
+            return target[key];
+        } });
+        const check = () => prepareImageDependencies({ ...state, fsApi, readOnly: true,
+            installLibrary: () => assert.fail('read-only check installed a library') });
+        const hostCheck = () => assertExistingImageDependencies({ targetRoot: state.targetRoot,
+            imageId: OUTER_IMAGE_ID_FIXTURE, fsApi });
+        if (damage === 'none') assert.equal(hostCheck().changed, false);
+        else assert.throws(hostCheck, /guarded resume refuses|forbidden Box-installed/);
+        if (damage === 'none') assert.equal(check().changed, false);
+        else assert.throws(check, /guarded resume refuses|forbidden Box-installed/);
+    }
+});
+
+test('recorded predecessor dependency preparer cannot write through guarded resume capabilities', async t => {
+    const state = fixture(t);
+    const snapshot = path.join(state.root, 'predecessor');
+    fs.mkdirSync(snapshot);
+    const archive = execFileSync('git', ['archive', '7ff252cb8ff5a50819e947b6aaeb09125dd98ab1', 'agentlib', 'ploinky-box'],
+        { cwd: new URL('../..', import.meta.url), maxBuffer: 32 * 1024 * 1024 });
+    execFileSync('tar', ['-xf', '-', '-C', snapshot], { input: archive });
+    const predecessor = await import(pathToFileURL(path.join(snapshot, 'ploinky-box/entrypoint/install-dependencies.mjs')));
+    prepareImageDependencies({ ...state, installLibrary: fakeInstaller([]) });
+    const reads = new Set(['constants', 'lstatSync', 'statSync', 'readFileSync', 'readdirSync', 'readlinkSync', 'realpathSync', 'existsSync']);
+    const attempts = [];
+    const denied = () => { attempts.push('process'); throw new Error('read-only process denied'); };
+    const fsApi = new Proxy(fs, { get(target, key) { return reads.has(key) ? target[key]
+        : () => { attempts.push(key); throw new Error('read-only write denied'); }; } });
+    const check = () => predecessor.prepareImageDependencies({ ...state, fsApi, runner: { run: denied, query: denied, stream: denied } });
+    assert.equal(check().changed, false);
+    assert.deepEqual(attempts, []);
+    const marker = path.join(state.targetRoot, DEPENDENCY_MARKER_NAME);
+    for (const damage of ['missing', 'corrupt', 'mismatch', 'forbidden']) {
+        fs.writeFileSync(marker, JSON.stringify(expectedMarker()));
+        if (damage === 'missing') fs.unlinkSync(marker);
+        if (damage === 'corrupt') fs.writeFileSync(marker, '{');
+        if (damage === 'mismatch') fs.writeFileSync(marker, JSON.stringify(expectedMarker(OTHER_OUTER_IMAGE)));
+        if (damage === 'forbidden') fs.mkdirSync(path.join(state.targetRoot, 'achillesAgentLib'));
+        const bytes = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8') : null;
+        const before = fs.readdirSync(state.targetRoot);
+        attempts.length = 0;
+        assert.throws(check, /read-only write denied|Unable to create dependency staging directory/);
+        assert.deepEqual(fs.readdirSync(state.targetRoot), before);
+        assert.equal(fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8') : null, bytes);
+        assert.deepEqual(attempts, [damage === 'forbidden' ? 'rmSync' : 'mkdirSync']);
+    }
 });
 
 test('default preparation copies the supplied package without Git, npm or reading library bytes', (t) => {

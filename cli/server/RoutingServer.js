@@ -442,8 +442,17 @@ async function processRequest(req, res) {
             res,
             routePlan.status || 404,
             { error: routePlan.code || 'route_denied' },
-            { 'Cache-Control': 'no-store', ...proofHeaders },
+            { 'Cache-Control': 'no-store', ...proofHeaders, ...(routePlan.retryAfterSeconds ? { 'Retry-After': String(routePlan.retryAfterSeconds) } : {}) },
         );
+        return;
+    }
+    if (routePlan.kind === 'mount-redirect') {
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
+        res.writeHead(302, { Location: routePlan.location, 'Cache-Control': 'no-store', 'Content-Length': 0 });
+        res.end();
         return;
     }
     const parsedUrl = routePlan.ok && routePlan.parsedUrl ? routePlan.parsedUrl : requestedUrl;

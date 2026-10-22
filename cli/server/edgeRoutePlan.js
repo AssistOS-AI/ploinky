@@ -2,12 +2,13 @@ import crypto from 'node:crypto';
 import net from 'node:net';
 import { domainToASCII } from 'node:url';
 
-import { captureEdgeRoutingLease, captureEdgeRoutingObservationLease } from '../sandbox/edgeGeneration.js';
+import { captureEdgeRoutingLease, captureEdgeRoutingObservationLease, edgeHostServiceRoutes } from '../sandbox/edgeGeneration.js';
 import { observeEdgeActivation } from './edgeActivationClock.js';
 import { selectedRouterHostPort } from '../sandbox/routerPort.js';
 import { isTrustedPublicRouterHost } from '../utils/publicRouterHosts.mjs';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import {
+    AGENT_PORT_ROUTE,
     AgentPortSelectorError,
     parseAgentPortSelector,
 } from './agentPortConvention/parseSelector.js';
@@ -37,7 +38,7 @@ const AGENT_ROOT_AUTH_SUPPORT_PATHS = new Set([
 ]);
 
 function deny(status, code, details = {}) {
-    return { matched: false, ok: false, status, code, ...details };
+    return { matched: false, ok: false, status, code, ...retryableDenial(status, code), ...details };
 }
 
 function normalizedHostName(value) {
@@ -202,10 +203,12 @@ function agentPortPlan({
     snapshot,
     lease,
     transport = 'http',
+    requestTarget = req?.url || `${parsedUrl.pathname}${parsedUrl.search}`,
+    rootMount = false,
 }) {
     let selector;
     try {
-        selector = parseAgentPortSelector(req?.url || `${parsedUrl.pathname}${parsedUrl.search}`);
+        selector = parseAgentPortSelector(requestTarget);
     } catch (error) {
         if (error instanceof AgentPortSelectorError) {
             return deny(error.status, error.code, {
@@ -250,7 +253,7 @@ function agentPortPlan({
     }
     const deniedPorts = runtime.networkMode === 'host' ? [8080, 8081] : [];
     try {
-        selector = parseAgentPortSelector(req?.url || `${parsedUrl.pathname}${parsedUrl.search}`, { deniedPorts });
+        selector = parseAgentPortSelector(requestTarget, { deniedPorts });
     } catch (error) {
         if (error instanceof AgentPortSelectorError) {
             return deny(error.status, error.code, {
@@ -292,6 +295,13 @@ function agentPortPlan({
             lease,
             hostSelection,
         });
+    }
+    // A root-mounted application owns `/admin*` only through its own explicit
+    // manifest policy; the Router's administration surface stays unreachable.
+    if (rootMount && isRouteMount(selector.suffix, '/admin')
+        && !snapshot.compiled.policy.entries.some(entry => entry.source === 'manifest'
+            && entry.routeKey === selected.routeKey && HttpRouteAccessPath.matches(selector.policyPath, entry.path))) {
+        return deny(404, 'ROUTE_SURFACE_DENIED', { matched: true, listener, lease, hostSelection });
     }
     const decision = accessPolicy.evaluate({
         pathname: selector.policyPath,
@@ -359,7 +369,7 @@ function agentPortPlan({
         port: selector.port,
         policyPath: selector.policyPath,
         convention: selector.convention,
-        forwardedPrefix: `/${selector.convention}/${selector.rawAgent}/${selector.canonicalPort}`,
+        forwardedPrefix: rootMount ? '' : `/${selector.convention}/${selector.rawAgent}/${selector.canonicalPort}`,
         unmatchedSuffix: selector.suffix,
         relay: {
             kind: 'container-control-socket',
@@ -465,6 +475,47 @@ function resolveAgentPath(pathname, routes, selectedRoot = null) {
 
 function isRouteMount(pathname, root) {
     return pathname === root || pathname.startsWith(`${root}/`);
+}
+
+// Classifies a path on a root-application host against the owner's explicit
+// mount. The first segment is percent-decoded exactly once; an undecodable
+// segment is reported as null so the caller can refuse it.
+function ownerMountSelection(pathname, ownerRouteKey) {
+    const segments = String(pathname || '/').split('/');
+    let first;
+    try {
+        first = decodeURIComponent(segments[1] || '');
+    } catch (_) {
+        return null;
+    }
+    if (!first || first !== String(ownerRouteKey || '')) return 'application';
+    return segments.length === 2 ? 'exact' : 'nested';
+}
+
+// The bare owner mount redirects to its directory form so relative owner URLs
+// resolve under the mount. Only HTTP GET/HEAD are redirected; nothing else
+// is ever answered for the bare mount.
+function ownerMountRedirectPlan({
+    req, host, listener, pathname, parsedUrl, hostSelection, snapshot, lease, transport,
+}) {
+    const method = String(req?.method || 'GET').toUpperCase();
+    if (transport !== 'http' || (method !== 'GET' && method !== 'HEAD')) {
+        return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
+    }
+    return {
+        matched: true,
+        ok: true,
+        kind: 'mount-redirect',
+        listener,
+        host,
+        hostSelection,
+        pathname,
+        canonicalPath: pathname,
+        parsedUrl,
+        location: `/${encodeURIComponent(hostSelection.record.routeKey)}/${parsedUrl.search || ''}`,
+        lease,
+        snapshot,
+    };
 }
 
 function selectedAgentMcpRoute(pathname, routeKeys) {
@@ -615,7 +666,7 @@ function agentRootPlan({
     lease,
     transport = 'http',
 }) {
-    const agent = resolveAgentPath(pathname, routes, selectedRoot);
+    const agent = resolveAgentPath(pathname, routes, selectedRoot) || (selectedRoot ? null : resolveDrainingAgentPath(pathname, routes));
     if (!agent) return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
     const policy = snapshotPolicy(snapshot);
     if (!policy) return deny(503, 'POLICY_GENERATION_INVALID', {
@@ -673,21 +724,21 @@ function agentRootPlan({
             hardwareAvailability,
         };
     }
-    const hostPort = Number(agent.route?.hostPort || 0);
+    // A draining route is resolved only to answer it after authorization with a
+    // retryable unavailable state. It never yields its predecessor's target,
+    // even when an operator drain kept the predecessor's port.
+    const draining = agent.route?.draining === true;
+    const hostPort = draining ? 0 : Number(agent.route?.hostPort || 0);
     if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+        const pendingCode = draining ? 'AGENT_ROUTE_DRAINING' : 'TARGET_INACTIVE';
         if (transport !== 'http') {
-            return deny(503, 'TARGET_INACTIVE', {
-                matched: true,
-                lease,
-                hostSelection,
-                decision,
-            });
+            return deny(503, pendingCode, { matched: true, lease, hostSelection, decision });
         }
         return {
             ...common,
             kind: 'agent-root-pending',
             target: null,
-            diagnosticCategory: 'TARGET_INACTIVE',
+            diagnosticCategory: pendingCode,
         };
     }
     return {
@@ -837,7 +888,7 @@ export function resolveEdgeRoutePlan({
         const surface = surfaceForPath(
             pathname,
             snapshot.compiled.surfaces?.[host] || [],
-            snapshot.compiled.agentMcpRoutes?.[host] || [],
+            edgeHostServiceRoutes(snapshot, host).agentMcpRoutes,
             hostSelection.record?.routeKey,
         );
         if (surface?.routerOwned) {
@@ -870,7 +921,7 @@ export function resolveEdgeRoutePlan({
             pathname,
             routes,
             hostSelection.record?.routeKey,
-            snapshot.compiled.dependencyHttpRoutes?.[host] || [],
+            edgeHostServiceRoutes(snapshot, host).dependencyHttpRoutes,
         );
         if (dependencyHttpRoute) {
             return agentRootPlan({
@@ -887,8 +938,31 @@ export function resolveEdgeRoutePlan({
                 transport,
             });
         }
-        if (isReservedRouterSurface(pathname) && !surface) {
+        const rootApplication = hostSelection.record?.rootApplication;
+        const applicationAdmin = Boolean(rootApplication) && isRouteMount(pathname, '/admin');
+        if (isReservedRouterSurface(pathname) && !surface && !applicationAdmin) {
             return deny(404, 'ROUTE_SURFACE_DENIED', { lease, hostSelection });
+        }
+        // A root application serves every path the owner does not claim. The
+        // owner stays the host's surface and authorization context and is
+        // reachable only through its explicit `/<owner>/` mount; the
+        // unqualified MCP surface (still pending above) remains the owner's.
+        if (rootApplication && !surface) {
+            const ownerMount = ownerMountSelection(pathname, hostSelection.record.routeKey);
+            if (ownerMount === null) return deny(400, 'MALFORMED_URL', { lease, hostSelection });
+            if (ownerMount === 'exact') {
+                return ownerMountRedirectPlan({
+                    req, host, listener, pathname, parsedUrl: url, hostSelection, snapshot, lease, transport,
+                });
+            }
+            if (ownerMount !== 'nested') {
+                return agentPortPlan({
+                    req, host, listener, parsedUrl: url, hostSelection, routes, snapshot, lease, transport,
+                    requestTarget: `/${AGENT_PORT_ROUTE}/${encodeURIComponent(rootApplication.routeKey)}`
+                        + `/${rootApplication.port}${req?.url || `${pathname}${url.search}`}`,
+                    rootMount: true,
+                });
+            }
         }
         return agentRootPlan({
             req,
@@ -993,3 +1067,40 @@ export default {
     normalizeExactHost,
     resolveEdgeRoutePlan,
 };
+
+// Imported here, not with the others above, so the reviewed Router reference
+// lines of this file keep their positions.
+import { EDGE_DENIAL_RETRY_AFTER_SECONDS } from './edgeRetryAfter.js';
+
+// Denials that end when the next generation activates or a drained agent's
+// replacement is committed. Clients may retry them after a short delay.
+const RETRYABLE_DENIAL_CODES = new Set([
+    'EDGE_GENERATION_INACTIVE',
+    'HOST_SELECTOR_INACTIVE',
+    'AGENT_ROUTE_DRAINING',
+]);
+
+function retryableDenial(status, code) {
+    return status === 503 && RETRYABLE_DENIAL_CODES.has(code)
+        ? { retryAfterSeconds: EDGE_DENIAL_RETRY_AFTER_SECONDS }
+        : {};
+}
+
+// The agent-root plan of a route withdrawn by a drain. Only a direct
+// `/<routeKey>/...` path resolves it; selected-root hosts already deny a
+// draining root, and relay, dependency and MCP selection keep excluding it.
+function resolveDrainingAgentPath(pathname, routes) {
+    const segments = String(pathname || '').split('/').filter(Boolean);
+    if (!segments.length) return null;
+    let routeKey = '';
+    try { routeKey = decodeURIComponent(segments[0]); } catch (_) { return null; }
+    const route = Object.hasOwn(routes || {}, routeKey) ? routes[routeKey] : null;
+    if (!route || route.disabled || route.draining !== true) return null;
+    const firstSlash = pathname.indexOf('/', 1);
+    return {
+        routeKey,
+        route,
+        canonicalPath: pathname,
+        upstreamPath: firstSlash < 0 ? '/' : pathname.slice(firstSlash) || '/',
+    };
+}

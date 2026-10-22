@@ -273,7 +273,8 @@ function webchatRouteProvenance(routing, routeKey) {
     const key = trimCommand(routeKey);
     const routes = routing?.routes && typeof routing.routes === 'object' ? routing.routes : {};
     const route = key && Object.hasOwn(routes, key) ? routes[key] : null;
-    if (!route || typeof route !== 'object' || route.disabled) return null;
+    // A drained route admits no new traffic until its runtime is replaced.
+    if (!route || typeof route !== 'object' || route.disabled || route.draining === true) return null;
     const staticAgent = trimCommand(routing?.static?.agent);
     const shortStatic = staticAgent.includes('/') ? staticAgent.split('/').pop() : staticAgent;
     const isStatic = Boolean(staticAgent) && (

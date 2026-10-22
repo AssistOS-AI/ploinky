@@ -15,7 +15,7 @@ import { collectManifestHttpRouteAccess } from '../policy/HttpRouteProviders.js'
 import { evaluateRequiredCapability } from './requiredCapability.js';
 import { isRouteMount } from '../utils/routeMounts.js';
 import { manifestWebchatDeclaration, webchatRouteProvenance } from '../webchat/commandResolver.js';
-import { edgeWebchatTargets } from '../../sandbox/edgeGeneration.js';
+import { edgeHostServiceRoutes, edgeWebchatTargets } from '../../sandbox/edgeGeneration.js';
 import { admitPublicMcpTarget } from '../mcp-proxy/sessionOwnership.mjs';
 import { isAgentRootPlan } from '../edgeRoutePlan.js';
 import { isSsoProviderUnavailable, recordSsoAdmission } from '../auth/ssoAdmission.js';
@@ -536,8 +536,8 @@ function hostBoundMutationRouteKey(parsedUrl, routePlan, snapshot) {
     const requested = requestedMutationRouteKey(parsedUrl);
     if (!requested) return '';
     const host = String(routePlan?.hostSelection?.host || routePlan?.host || '').trim();
-    const allowed = snapshot?.compiled?.agentMcpRoutes?.[host];
-    return Array.isArray(allowed) && allowed.includes(requested) ? requested : null;
+    const allowed = edgeHostServiceRoutes(snapshot, host).agentMcpRoutes;
+    return allowed.includes(requested) ? requested : null;
 }
 
 function snapshotHttpRoutePolicy(snapshot) {
@@ -589,7 +589,7 @@ function resolveGuestBrowserProofAuthContext(parsedUrl, {
         const host = String(routePlan?.hostSelection?.host || routePlan?.host || '').trim();
         const selectedRouteKey = routePlanSelectedRouteKey(routePlan);
         if (routeKey !== selectedRouteKey) {
-            const admittedDependency = snapshot?.compiled?.dependencyHttpRoutes?.[host]?.some((entry) => (
+            const admittedDependency = edgeHostServiceRoutes(snapshot, host).dependencyHttpRoutes.some((entry) => (
                 entry?.routeKey === routeKey
                 && typeof entry.path === 'string'
                 && HttpRouteAccessPath.matches(normalized.path, entry.path)

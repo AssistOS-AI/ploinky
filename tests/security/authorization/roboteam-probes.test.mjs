@@ -86,7 +86,7 @@ test('the table lists the 17 SPEC probes with a reach answer, a source and an un
         'control.open-desktop', 'control.message-task', 'control.robot-delete', 'robots.create', 'summary.session', 'webchat.logs', 'status.exempt',
     ]);
     for (const entry of roboteamProbes) {
-        assert.match(entry.source, /^AchillesCLI\/roboTeamAgent\/server\/http-server\.mjs:\d+(-\d+)?$/);
+        assert.match(entry.source, /^AchillesIDE\/roboTeamAgent\/server\/http-server\.mjs:\d+(-\d+)?$/);
         assert.ok(entry.reach && entry.reach.status, entry.name);
     }
     assert.ok(ROBOTEAM_UNPROBED.length >= 5);

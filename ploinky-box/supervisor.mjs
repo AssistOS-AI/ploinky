@@ -1226,25 +1226,40 @@ export function createBoxSupervisor({
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
+        const requiredId = options.requireExistingContainerId ?? null;
+        const authorize = (ownership) => {
+            assertMutableOwnership(ownership);
+            if (requiredId !== null && (!/^[a-f0-9]{64}$/.test(requiredId)
+                || ownership.state !== 'owned' || ownership.handles?.container?.id !== requiredId)) {
+                throw supervisorError('Required existing Box identity is absent or changed', 'PLOINKY_BOX_EXISTING_REQUIRED');
+            }
+            return ownership;
+        };
         return lockedMutation(async (identity, lock, ownership) => {
+            if (requiredId !== null) ownership = authorize(inspect(identity));
+            const existing = requiredId === null ? null
+                : observeBoxConfiguration(identity, ownership, repositoryRoot, ownership.engine);
             await assertNoUpdateRecoveryBarrier(identity, ownership);
-            const hardwareGate = selectHardwareGateForOperation(identity, 'start', lock);
-            ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'start');
-            const hardware = hardwareWiringFor(identity, hardwareGate.enabled, ownership);
+            const hardwareGate = existing ? null : selectHardwareGateForOperation(identity, 'start', lock);
+            if (!existing) ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'start');
+            const hardware = existing ? existing.hardware : hardwareWiringFor(identity, hardwareGate.enabled, ownership);
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
-            const { saved: savedBinding, desired: routerBinding } = selectSavedRouterBinding(
+            const { saved: savedBinding, desired: routerBinding } = existing
+                ? { saved: null, desired: existing.routerBinding } : selectSavedRouterBinding(
                 identity,
                 options.explicitPort,
             );
-            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled);
+            const { saved: savedGpuGrant, desired: gpu } = existing
+                ? { saved: null, desired: existing.gpu } : selectSavedGpuWiring(identity, hardwareGate.enabled);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
-                loadImageBundle: imageBundleLoader(ownership, options.imageRef || resolveBoxImageReference(env)),
+                loadImageBundle: imageBundleLoader(ownership, options.imageRef || existing?.imageRef || resolveBoxImageReference(env)),
             });
-            const prepared = await reconcileConfiguredGraph({
+            const reconcileStart = existing ? reconcileSafely : reconcileConfiguredGraph;
+            const prepared = await reconcileStart({
                 identity,
                 ownership,
                 engine: ownership.engine,
@@ -1257,7 +1272,9 @@ export function createBoxSupervisor({
                 routerBinding,
                 gpu,
                 hardware,
-                imageRef: options.imageRef || resolveBoxImageReference(env),
+                imageRef: options.imageRef || existing?.imageRef || resolveBoxImageReference(env),
+                requireExistingContainerId: requiredId,
+                allowReplacement: requiredId === null,
                 platform,
                 env,
                 stdout,
@@ -1267,8 +1284,12 @@ export function createBoxSupervisor({
             let graphMutated = false;
             let admission = null;
             try {
+                if (existing) prepared.validate?.();
                 await prepareGateOnGeneration(identity, ownership.engine, containerId, prepared.hardware);
-                await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
+                await ensureBoxDependencies(ownership.engine, containerId, runner, {
+                    workspaceRoot: identity.workspaceRoot, stdout, stderr, readOnly: Boolean(existing),
+                });
+                prepared.validate?.();
                 const edgeDesired = readEdgeDesired(identity);
                 if (edgeDesired) {
                     stageEdgeDesired({
@@ -1300,8 +1321,8 @@ export function createBoxSupervisor({
                 );
                 admission = await completeGraphAdmission({
                     identity, lock, prepared, selection, skillScopeEnv,
-                    routerBindingUpdate: savedRouterBindingUpdate(savedBinding, prepared),
-                    gpuGrantUpdate: savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
+                    routerBindingUpdate: existing ? null : savedRouterBindingUpdate(savedBinding, prepared),
+                    gpuGrantUpdate: existing ? null : savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
                     operation: 'start',
                     hardwareGate,
                 });
@@ -1313,7 +1334,7 @@ export function createBoxSupervisor({
                     containerId,
                     error,
                     stopGraph: graphMutated,
-                    restoreGraph: Boolean(prepared.previousAgentLib)
+                    restoreGraph: !existing && Boolean(prepared.previousAgentLib)
                         && Boolean(priorCoreStartArgv)
                         && (graphMutated || prepared.action === 'replaced'),
                     restoreCoreArgv: priorCoreStartArgv,
@@ -1321,12 +1342,12 @@ export function createBoxSupervisor({
                 });
             }
             reportSettled(prepared.routerBinding, admission?.warnings);
-            const gpuReapplied = await reapplyDeclaredGpu(identity, lock, prepared.gpu);
+            const gpuReapplied = existing ? null : await reapplyDeclaredGpu(identity, lock, prepared.gpu);
             return Object.freeze({
                 identity, ...prepared, containerId, agentLib: selection,
                 ...(gpuReapplied ? { gpuReapplied } : {}),
             });
-        });
+        }, authorize);
     }
 
     async function runRestartTransaction(coreArgs = ['restart'], options = {}) {
@@ -3384,8 +3405,18 @@ export function createBoxSupervisor({
         }, (ownership) => ownership);
     }
 
-    async function runStopTransaction() {
+    async function runStopTransaction(options = {}) {
+        const authorize = (ownership) => {
+            assertMutableOwnership(ownership);
+            const requiredId = options.requireExistingContainerId;
+            if (requiredId !== undefined && (!/^[a-f0-9]{64}$/.test(requiredId)
+                || ownership.state !== 'owned' || ownership.handles?.container?.id !== requiredId)) {
+                throw supervisorError('Required existing Box identity is absent or changed', 'PLOINKY_BOX_EXISTING_REQUIRED');
+            }
+            return ownership;
+        };
         return lockedMutation(async (identity, lock, ownership) => {
+            if (options.requireExistingContainerId !== undefined) ownership = authorize(inspect(identity));
             const container = ownership.handles?.container;
             if (!container) {
                 return Object.freeze({ identity, action: 'absent' });
@@ -3410,7 +3441,7 @@ export function createBoxSupervisor({
                 }
             }
             return Object.freeze({ identity, action: 'stopped', containerId: container.id });
-        });
+        }, authorize);
     }
 
     // An explicit destroy settles a pending downgrade only after the owned Box
@@ -3956,15 +3987,26 @@ export async function ensureBoxDependencies(engine, containerId, runner, {
     stdout = process.stdout,
     stderr = process.stderr,
     timeoutMs = 1_800_000,
+    readOnly = false,
 } = {}) {
+    // Also works while a retained supervisor resumes predecessor source that
+    // predates --check: its dependency preparer receives no write capability.
+    const readOnlyProgram = `import fs from 'node:fs';
+import { prepareImageDependencies } from '/opt/ploinky/ploinky-box/entrypoint/install-dependencies.mjs';
+const reads = new Set(['constants','lstatSync','statSync','readFileSync','readdirSync','readlinkSync','realpathSync','existsSync']);
+const denied = () => { throw new Error('Guarded resume refuses dependency changes'); };
+const fsApi = new Proxy(fs, {get(target,key) { return reads.has(key) ? target[key] : denied; }});
+prepareImageDependencies({readOnly:true,fsApi,runner:{run:denied,query:denied,stream:denied}});`;
     const args = [
         'container', 'exec',
         '--user', 'podman',
         ...boxWorkspaceExecOptions(workspaceRoot),
         containerId,
-        '/opt/ploinky/bin/ploinky-install-deps',
+        ...(readOnly ? ['node', '--input-type=module', '--eval', readOnlyProgram]
+            : ['/opt/ploinky/bin/ploinky-install-deps']),
     ];
-    stderr?.write?.('[ploinky] Verifying and installing Box dependencies...\n');
+    stderr?.write?.(readOnly ? '[ploinky] Verifying existing Box dependencies...\n'
+        : '[ploinky] Verifying and installing Box dependencies...\n');
     if (typeof runner.stream !== 'function') {
         runner.run(engine.name, args);
         return;

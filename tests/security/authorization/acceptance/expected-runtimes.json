@@ -6,7 +6,8 @@
     "AchillesIDE",
     "AchillesCLI",
     "copilot-agents",
-    "proxies",
+    "webmeet",
+    "legacy-agents",
     "UmamiAgent",
     "local-llms",
     "OnlyOfficeAgent",
@@ -18,10 +19,6 @@
     "disabled": 11
   },
   "enabled": [
-    {
-      "repo": "AchillesCLI",
-      "agent": "roboTeamAgent"
-    },
     {
       "repo": "AchillesIDE",
       "agent": "dpuAgent"
@@ -40,19 +37,11 @@
     },
     {
       "repo": "AchillesIDE",
-      "agent": "liveKitServerAgent"
+      "agent": "roboTeamAgent"
     },
     {
       "repo": "AchillesIDE",
-      "agent": "multimedia"
-    },
-    {
-      "repo": "AchillesIDE",
-      "agent": "soplangAgent"
-    },
-    {
-      "repo": "AchillesIDE",
-      "agent": "tasksAgent"
+      "agent": "soul-gateway"
     },
     {
       "repo": "AchillesIDE",
@@ -60,42 +49,42 @@
     },
     {
       "repo": "AchillesIDE",
-      "agent": "webAssist"
-    },
-    {
-      "repo": "AchillesIDE",
-      "agent": "webmeetAgent"
-    },
-    {
-      "repo": "AchillesIDE",
       "agent": "workspaceMonitorAgent"
+    },
+    {
+      "repo": "legacy-agents",
+      "agent": "multimedia"
+    },
+    {
+      "repo": "legacy-agents",
+      "agent": "soplangAgent"
+    },
+    {
+      "repo": "legacy-agents",
+      "agent": "tasksAgent"
+    },
+    {
+      "repo": "legacy-agents",
+      "agent": "webAssist"
     },
     {
       "repo": "local-llms",
       "agent": "local-llm"
     },
     {
-      "repo": "proxies",
-      "agent": "soul-gateway"
-    },
-    {
       "repo": "UmamiAgent",
       "agent": "umamiAgent"
+    },
+    {
+      "repo": "webmeet",
+      "agent": "liveKitServerAgent"
+    },
+    {
+      "repo": "webmeet",
+      "agent": "webmeetAgent"
     }
   ],
   "disabled": [
-    {
-      "repo": "AchillesCLI",
-      "agent": "GPTResearcher"
-    },
-    {
-      "repo": "AchillesIDE",
-      "agent": "webmeetScribeAgent"
-    },
-    {
-      "repo": "AchillesIDE",
-      "agent": "webmeetStt"
-    },
     {
       "repo": "copilot-agents",
       "agent": "browserUseAgent"
@@ -117,22 +106,34 @@
       "agent": "webSearchAgent"
     },
     {
+      "repo": "legacy-agents",
+      "agent": "GPTResearcher"
+    },
+    {
+      "repo": "legacy-agents",
+      "agent": "opencode-free"
+    },
+    {
+      "repo": "legacy-agents",
+      "agent": "searchAgent"
+    },
+    {
       "repo": "OnlyOfficeAgent",
       "agent": "onlyOffice"
     },
     {
-      "repo": "proxies",
-      "agent": "opencode-free"
+      "repo": "webmeet",
+      "agent": "webmeetScribeAgent"
     },
     {
-      "repo": "proxies",
-      "agent": "searchAgent"
+      "repo": "webmeet",
+      "agent": "webmeetStt"
     }
   ],
   "capabilities": [
     {
       "id": "D3-livekit-no-mcp",
-      "repo": "AchillesIDE",
+      "repo": "webmeet",
       "agent": "liveKitServerAgent",
       "nonApplicable": [
         "mcp-discovery:tools/list",
@@ -148,11 +149,11 @@
         "capability:liveKitServerAgent:twirp-route-deny:anonymous",
         "capability:liveKitServerAgent:mcp-absent-corroboration:admin"
       ],
-      "contractSha256": "eaef7ae82bae115ed66ef7cb45f30f3f6012eff7296ab7834468b564d30be1d0"
+      "contractSha256": "555e6ca0bd4a601e9e154699d090559ac1337e5451f1193490f9cbd11ae3839c"
     },
     {
       "id": "D4-soul-no-upstream-mcp",
-      "repo": "proxies",
+      "repo": "AchillesIDE",
       "agent": "soul-gateway",
       "nonApplicable": [
         "mcp-discovery:tools/list",
@@ -161,16 +162,16 @@
       "retainedControls": [
         "capability:soul-gateway:health:anonymous"
       ],
-      "contractSha256": "073b9f03c9d5e88f2bab4c91fba604b95554789cdd51d9b419ea35ed9fe7045b"
+      "contractSha256": "6e05c9987e95376e587ec859b769dc66d7098418d8198f840552281514b51a3e"
     }
   ],
   "guestAgents": [
     {
-      "repo": "AchillesIDE",
+      "repo": "legacy-agents",
       "agent": "webAssist"
     },
     {
-      "repo": "AchillesIDE",
+      "repo": "webmeet",
       "agent": "webmeetAgent"
     }
   ]

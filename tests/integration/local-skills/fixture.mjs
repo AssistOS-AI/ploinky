@@ -8,7 +8,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const roots = {};
-for (const name of ['achilles', 'ala', 'ploinky', 'explorer']) {
+for (const name of ['ala', 'ploinky', 'explorer']) {
     const value = process.env[`SKILLS_TEST_${name.toUpperCase()}`];
     if (!value || !path.isAbsolute(value)) throw new Error(`Set SKILLS_TEST_${name.toUpperCase()} to the absolute ${name} source directory.`);
     roots[name] = await fs.realpath(value);
@@ -16,18 +16,18 @@ for (const name of ['achilles', 'ala', 'ploinky', 'explorer']) {
 if (process.platform !== 'linux') throw new Error('Run this acceptance test on Linux. RobotStore locks require /proc process identity. See README.md.');
 
 // RoboTeam loads ALA's transcript reader from ACHILLES_ALA_COMMAND when it is imported. Point it at the ALA under test,
-// so that no checkout found next to AchillesCLI can stand in for it.
+// so that no checkout found next to AssistOSExplorer can stand in for it.
 process.env.ACHILLES_ALA_COMMAND = path.join(roots.ala, 'bin/ala.mjs');
 export const source = (repo, file) => import(pathToFileURL(path.join(roots[repo], file)).href);
-export const { RobotStore } = await source('achilles', 'roboTeamAgent/server/robot-store.mjs');
-export const { RobotSkillsets } = await source('achilles', 'roboTeamAgent/server/robot-skillsets.mjs');
-export const { RuntimeManager } = await source('achilles', 'roboTeamAgent/server/runtime-manager.mjs');
-export const { ConversationSessionStore } = await source('achilles', 'roboTeamAgent/copilot/src/lib/storage/conversationSessionStore.mjs');
-export const { createRobotSkillCatalog } = await source('achilles', 'roboTeamAgent/copilot/src/lib/skills/robotSkillCatalog.mjs');
-export const { createAlaEngine } = await source('achilles', 'roboTeamAgent/copilot/src/lib/execution/alaEngine.mjs');
-export const { ACHILLES_PRIVATE_DIRECTORY_NAME } = await source('achilles', 'roboTeamAgent/copilot/src/lib/storage/privateDataRoot.mjs');
-export const { registerProject } = await source('achilles', 'roboTeamAgent/server/project-storage.mjs');
-export const { skillCatalogRequest } = await source('achilles', 'roboTeamAgent/server/skill-catalog-api.mjs');
+export const { RobotStore } = await source('explorer', 'roboTeamAgent/server/robot-store.mjs');
+export const { RobotSkillsets } = await source('explorer', 'roboTeamAgent/server/robot-skillsets.mjs');
+export const { RuntimeManager } = await source('explorer', 'roboTeamAgent/server/runtime-manager.mjs');
+export const { ConversationSessionStore } = await source('explorer', 'roboTeamAgent/copilot/src/lib/storage/conversationSessionStore.mjs');
+export const { createRobotSkillCatalog } = await source('explorer', 'roboTeamAgent/copilot/src/lib/skills/robotSkillCatalog.mjs');
+export const { createAlaEngine } = await source('explorer', 'roboTeamAgent/copilot/src/lib/execution/alaEngine.mjs');
+export const { ACHILLES_PRIVATE_DIRECTORY_NAME } = await source('explorer', 'roboTeamAgent/copilot/src/lib/storage/privateDataRoot.mjs');
+export const { registerProject } = await source('explorer', 'roboTeamAgent/server/project-storage.mjs');
+export const { skillCatalogRequest } = await source('explorer', 'roboTeamAgent/server/skill-catalog-api.mjs');
 export const { buildHostSkillScope, buildLocalSkillScope } = await source('ploinky', 'ploinky-box/skillScope.mjs');
 export const { syncManagedSkillExports: exportPloinky } = await source('ploinky', 'cli/utils/skills/managedExports.js');
 export const { installRepositoryLinks, removeRepositoryLinks } = await source('ploinky', 'cli/utils/repositoryInstall.mjs');
@@ -35,8 +35,8 @@ export const { syncManagedSkillExports: exportExplorer } = await source('explore
 
 // RoboTeam declares the conversation-skill tools in its MCP manifest. Each manifest entry names the command serving the
 // tool, and tools/copilot-catalog.mjs passes `mutate` to skillCatalogRequest only for `--set-skill`.
-const toolDeclarations = JSON.parse(await fs.readFile(path.join(roots.achilles, 'roboTeamAgent/mcp-config.json'), 'utf8')).tools;
-const toolEntry = await fs.readFile(path.join(roots.achilles, 'roboTeamAgent/tools/copilot-catalog.mjs'), 'utf8');
+const toolDeclarations = JSON.parse(await fs.readFile(path.join(roots.explorer, 'roboTeamAgent/mcp-config.json'), 'utf8')).tools;
+const toolEntry = await fs.readFile(path.join(roots.explorer, 'roboTeamAgent/tools/copilot-catalog.mjs'), 'utf8');
 const isType = { string: (v) => typeof v === 'string', boolean: (v) => typeof v === 'boolean', number: (v) => typeof v === 'number' };
 // The process behind each tool resolves its robot store from the fixed /data volume, so it cannot be spawned against a
 // temporary directory. This caller resolves the tool as the manifest declares it, rejects any input the declared schema

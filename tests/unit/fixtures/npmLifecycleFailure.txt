@@ -1,0 +1,10 @@
+
+> x@1.0.0 preinstall
+> echo building native module; exit 3
+
+building native module
+npm error code 3
+npm error path /work/pkg
+npm error command failed
+npm error command sh -c echo building native module; exit 3
+npm error A complete log of this run can be found in: /home/user/.npm/_logs/2026-10-15T19_31_05_997Z-debug-0.log

@@ -4,7 +4,7 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { EventEmitter } from 'node:events';
 
-import { enableMarketplaceAgent } from '../../cli/server/authHandlers/marketplaceRoutes.js';
+import { enableMarketplaceAgent, __testables as marketplaceTestables } from '../../cli/server/authHandlers/marketplaceRoutes.js';
 import { MARKETPLACE_ENABLE_TIMEOUT_MS, runMarketplaceEnableWorker } from '../../cli/server/marketplaceEnableWorker.js';
 
 test('Marketplace cold activation survives a four-minute image pull and still has a finite deadline', async (t) => {
@@ -97,6 +97,7 @@ test('Marketplace enable uses the worker path and preserves normalized arguments
         ref: 'AchillesCLI/codexAgent',
         mode: 'global',
         result: { containerName: 'codex-runtime' },
+        dependencies: [],
     });
 });
 
@@ -332,4 +333,287 @@ test('a timed-out real Worker retains ownership while its spawned child still li
         if (pid) { try { process.kill(pid, 'SIGKILL'); } catch (_) {} }
         fs.rmSync(root, { recursive: true, force: true });
     }
+});
+
+// ---------------------------------------------------------------------------
+// Manifest dependencies of a Marketplace enable
+
+const noPlan = { before: [], after: [], unavailable: [] };
+const liveKit = { ref: 'webmeet/liveKitServerAgent', agentRef: 'webmeet/liveKitServerAgent', alias: '', profile: '', dependsOn: [] };
+
+test('Marketplace enable runs the root, answers, then enables the no-wait LiveKit dependency in the background', async () => {
+    const calls = [];
+    let releaseLiveKit;
+    const liveKitGate = new Promise((resolve) => { releaseLiveKit = resolve; });
+    const result = await enableMarketplaceAgent({ agentRef: 'webmeet/webmeetAgent', mode: 'global' }, {
+        runEnableWorker: async (input) => {
+            calls.push(input);
+            if (input.ifMissing) await liveKitGate;
+            return { containerName: 'runtime' };
+        },
+        planDependencies: () => ({ ...noPlan, after: [liveKit] }),
+    });
+    assert.deepEqual(result.dependencies, [{ ref: 'webmeet/liveKitServerAgent', phase: 'after', status: 'queued' }]);
+    assert.deepEqual(marketplaceTestables.marketplaceDependencyStatus.get('webmeet/liveKitServerAgent'), { status: 'queued' });
+    releaseLiveKit();
+    await marketplaceTestables.marketplaceEnableQueueIdle();
+    assert.deepEqual(calls, [
+        { agentRef: 'webmeet/webmeetAgent', mode: 'global' },
+        { agentRef: 'webmeet/liveKitServerAgent', mode: '', ifMissing: true },
+    ]);
+    assert.equal(marketplaceTestables.marketplaceDependencyStatus.has('webmeet/liveKitServerAgent'), false, 'a finished dependency leaves no pending status');
+});
+
+test('a blocking dependency runs before the root and the route lease is checked once, before any worker', async () => {
+    const log = [];
+    const result = await enableMarketplaceAgent({ agentRef: 'repo/root' }, {
+        beforeEnable: () => log.push('beforeEnable'),
+        runEnableWorker: async (input) => { log.push(input.agentRef); return input.ifMissing ? { status: 'already-enabled' } : { containerName: 'root' }; },
+        planDependencies: () => ({
+            ...noPlan,
+            before: [
+                { ref: 'repo/leaf', agentRef: 'repo/leaf', alias: '', profile: '' },
+                { ref: 'repo/mid', agentRef: 'repo/mid', alias: 'primary', profile: 'dev' },
+            ],
+        }),
+    });
+    assert.deepEqual(log, ['beforeEnable', 'repo/leaf', 'repo/mid', 'repo/root']);
+    assert.deepEqual(result.dependencies, [
+        { ref: 'repo/leaf', phase: 'before', status: 'already-enabled' },
+        { ref: 'repo/mid', phase: 'before', status: 'already-enabled' },
+    ]);
+});
+
+test('a failing no-wait dependency is recorded as failed while the root has already resolved', async () => {
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(' '));
+    try {
+        const result = await enableMarketplaceAgent({ agentRef: 'webmeet/webmeetAgent', mode: 'global' }, {
+            runEnableWorker: async (input) => {
+                if (input.ifMissing) throw Object.assign(new Error('image pull failed at /private/path'), { code: 'PLOINKY_DEPENDENCY_PULL' });
+                return { containerName: 'runtime' };
+            },
+            planDependencies: () => ({ ...noPlan, after: [liveKit] }),
+        });
+        assert.deepEqual(result.result, { containerName: 'runtime' });
+        await marketplaceTestables.marketplaceEnableQueueIdle();
+    } finally {
+        console.warn = originalWarn;
+    }
+    assert.deepEqual(marketplaceTestables.marketplaceDependencyStatus.get('webmeet/liveKitServerAgent'), { status: 'failed', code: 'PLOINKY_DEPENDENCY_PULL' });
+    assert.ok(warnings.some((line) => line.includes('webmeet/liveKitServerAgent') && line.includes('failed')));
+    marketplaceTestables.marketplaceDependencyStatus.clear();
+});
+
+test('a background dependency is skipped when a dependency of its own failed, and later enables still run', async () => {
+    const calls = [];
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+        await enableMarketplaceAgent({ agentRef: 'repo/root' }, {
+            runEnableWorker: async (input) => {
+                calls.push(input.agentRef);
+                if (input.agentRef === 'repo/second') throw new Error('boom');
+                return {};
+            },
+            planDependencies: () => ({
+                ...noPlan,
+                after: [
+                    { ref: 'repo/second', agentRef: 'repo/second', alias: '', profile: '', dependsOn: [] },
+                    { ref: 'repo/first', agentRef: 'repo/first', alias: '', profile: '', dependsOn: ['repo/second'] },
+                ],
+            }),
+        });
+        await enableMarketplaceAgent({ agentRef: 'repo/next' }, { runEnableWorker: async (input) => { calls.push(input.agentRef); return {}; }, planDependencies: () => noPlan });
+        await marketplaceTestables.marketplaceEnableQueueIdle();
+    } finally {
+        console.warn = originalWarn;
+    }
+    assert.deepEqual(calls, ['repo/root', 'repo/second', 'repo/next']);
+    assert.deepEqual(marketplaceTestables.marketplaceDependencyStatus.get('repo/first'), { status: 'failed', code: 'PLOINKY_MARKETPLACE_DEPENDENCY_SKIPPED' });
+    marketplaceTestables.marketplaceDependencyStatus.clear();
+});
+
+test('a pending no-wait dependency does not hold the next enable, whose route-lease fence still runs against the current generation', async () => {
+    // Models the exact-generation fence: a request captures the generation on arrival and
+    // beforeEnable fails if a publication happened since. Each worker publishes a new generation
+    // when it finishes, as an enable does.
+    let generation = 1;
+    const fenceFromArrival = () => {
+        const captured = generation;
+        return () => {
+            if (generation !== captured) throw Object.assign(new Error('Refresh Marketplace before retrying'), { code: 'EDGE_GENERATION_CHANGED' });
+        };
+    };
+    const calls = [];
+    const ends = [];
+    let releaseLiveKit;
+    const liveKitGate = new Promise((resolve) => { releaseLiveKit = resolve; });
+    const runEnableWorker = async (input) => {
+        calls.push(input.agentRef);
+        if (input.agentRef === 'webmeet/liveKitServerAgent') await liveKitGate;
+        generation += 1;
+        ends.push(input.agentRef);
+        return { containerName: input.agentRef };
+    };
+    const secondLiveKit = { ref: 'webmeet/second', agentRef: 'webmeet/second', alias: '', profile: '', dependsOn: [] };
+
+    const a = await enableMarketplaceAgent({ agentRef: 'webmeet/webmeetAgent', mode: 'global' }, {
+        beforeEnable: fenceFromArrival(),
+        runEnableWorker,
+        planDependencies: () => ({ ...noPlan, after: [liveKit, secondLiveKit] }),
+    });
+    assert.deepEqual(a.dependencies.map((entry) => entry.status), ['queued', 'queued']);
+    assert.deepEqual(calls, ['webmeet/webmeetAgent', 'webmeet/liveKitServerAgent']);
+
+    // The LiveKit enable is still pending. The next enable passes its fence and runs to completion.
+    const pending = Symbol('pending');
+    const b = enableMarketplaceAgent({ agentRef: 'repo/other', mode: 'global' }, {
+        beforeEnable: fenceFromArrival(),
+        runEnableWorker,
+        planDependencies: () => noPlan,
+    });
+    const settled = await Promise.race([b, new Promise((resolve) => setTimeout(() => resolve(pending), 100))]);
+    assert.notEqual(settled, pending, 'the next enable must not wait for the pending no-wait dependency');
+    assert.deepEqual(settled.result, { containerName: 'repo/other' });
+    assert.deepEqual(marketplaceTestables.marketplaceDependencyStatus.get('webmeet/liveKitServerAgent'), { status: 'queued' });
+    assert.deepEqual(marketplaceTestables.marketplaceDependencyStatus.get('webmeet/second'), { status: 'queued' });
+    assert.equal(calls.includes('webmeet/second'), false, 'a later no-wait dependency waits for the one before it');
+
+    // After the dependency publishes, the chain continues in order and records its outcomes.
+    releaseLiveKit();
+    await marketplaceTestables.marketplaceEnableQueueIdle();
+    assert.deepEqual(calls, ['webmeet/webmeetAgent', 'webmeet/liveKitServerAgent', 'repo/other', 'webmeet/second']);
+    assert.deepEqual(ends, ['webmeet/webmeetAgent', 'repo/other', 'webmeet/liveKitServerAgent', 'webmeet/second']);
+    assert.equal(marketplaceTestables.marketplaceDependencyStatus.size, 0, 'finished dependencies leave no pending status');
+
+    // The fence still rejects a request that arrived before a publication it did not see.
+    const stale = fenceFromArrival();
+    generation += 1;
+    await assert.rejects(enableMarketplaceAgent({ agentRef: 'repo/late', mode: 'global' }, {
+        beforeEnable: stale,
+        runEnableWorker,
+        planDependencies: () => noPlan,
+    }), { code: 'EDGE_GENERATION_CHANGED' });
+    assert.equal(calls.includes('repo/late'), false);
+    // And a request arriving after the last publication succeeds.
+    const c = await enableMarketplaceAgent({ agentRef: 'repo/after', mode: 'global' }, {
+        beforeEnable: fenceFromArrival(),
+        runEnableWorker,
+        planDependencies: () => noPlan,
+    });
+    assert.deepEqual(c.result, { containerName: 'repo/after' });
+});
+
+test('a failing blocking dependency rejects the request with no root call and lists what was already enabled', async () => {
+    const calls = [];
+    await assert.rejects(enableMarketplaceAgent({ agentRef: 'repo/root' }, {
+        runEnableWorker: async (input) => {
+            calls.push(input.agentRef);
+            if (input.agentRef === 'repo/bad') throw Object.assign(new Error('refused'), { code: 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED' });
+            return {};
+        },
+        planDependencies: () => ({
+            ...noPlan,
+            before: [
+                { ref: 'repo/good', agentRef: 'repo/good', alias: '', profile: '' },
+                { ref: 'repo/bad', agentRef: 'repo/bad', alias: '', profile: '' },
+            ],
+        }),
+    }), (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED'
+        && JSON.stringify(error.dependencies) === JSON.stringify([
+            { ref: 'repo/good', phase: 'before', status: 'enabled' },
+            { ref: 'repo/bad', phase: 'before', status: 'failed', error: 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED' },
+        ]));
+    assert.deepEqual(calls, ['repo/good', 'repo/bad']);
+});
+
+test('an unresolvable blocking dependency stops the request before any worker runs', async () => {
+    let workers = 0;
+    await assert.rejects(enableMarketplaceAgent({ agentRef: 'repo/root' }, {
+        runEnableWorker: async () => { workers += 1; return {}; },
+        planDependencies: () => { throw Object.assign(new Error('[manifest enable] Failed to resolve dependency'), { code: 'MARKETPLACE_DEPENDENCY_UNAVAILABLE' }); },
+    }), { code: 'MARKETPLACE_DEPENDENCY_UNAVAILABLE' });
+    assert.equal(workers, 0);
+});
+
+test('an unresolvable no-wait dependency is reported unavailable and does not fail the root', async () => {
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+        const result = await enableMarketplaceAgent({ agentRef: 'repo/root' }, {
+            runEnableWorker: async () => ({ ok: true }),
+            planDependencies: () => ({ ...noPlan, unavailable: [{ ref: 'gone/agent no-wait', error: 'missing' }] }),
+        });
+        assert.deepEqual(result.dependencies, [{ ref: 'gone/agent no-wait', phase: 'after', status: 'unavailable', error: 'MARKETPLACE_DEPENDENCY_UNAVAILABLE' }]);
+    } finally {
+        console.warn = originalWarn;
+    }
+});
+
+test('the enable worker request skips an existing dependency record and keeps the root call exact', async () => {
+    const { runMarketplaceEnableRequest } = await import('../../cli/server/marketplaceEnableWorkerThread.js');
+    const calls = [];
+    const enableAgent = async (...args) => { calls.push(args); return { containerName: 'created' }; };
+    const found = [];
+    const records = new Set();
+    const findEnabledRecord = (directive) => { found.push(directive); return records.has(directive.spec) ? { key: 'k' } : null; };
+
+    assert.deepEqual(
+        await runMarketplaceEnableRequest({ agentRef: 'webmeet/liveKitServerAgent', mode: '', ifMissing: true }, { enableAgent, findEnabledRecord }),
+        { containerName: 'created' },
+    );
+    records.add('webmeet/liveKitServerAgent');
+    assert.deepEqual(
+        await runMarketplaceEnableRequest({ agentRef: 'webmeet/liveKitServerAgent', mode: '', ifMissing: true }, { enableAgent, findEnabledRecord }),
+        { status: 'already-enabled' },
+        'a replay reports already-enabled and creates nothing',
+    );
+    assert.deepEqual(calls, [['webmeet/liveKitServerAgent', undefined, undefined]]);
+
+    // A request without ifMissing never looks for a record, and its root arguments are unchanged.
+    calls.length = 0; found.length = 0;
+    await runMarketplaceEnableRequest({ agentRef: 'webmeet/webmeetAgent', mode: 'global' }, { enableAgent, findEnabledRecord });
+    await runMarketplaceEnableRequest({ agentRef: 'repo/agent', mode: 'devel' }, { enableAgent, findEnabledRecord });
+    assert.deepEqual(calls, [['webmeet/webmeetAgent', 'global', undefined], ['repo/agent', 'devel', 'repo']]);
+    assert.deepEqual(found, []);
+
+    // A dependency carries its own alias and profile.
+    calls.length = 0;
+    await runMarketplaceEnableRequest({ agentRef: 'repo/dep', alias: 'primary', profile: 'dev', ifMissing: true }, { enableAgent, findEnabledRecord });
+    assert.deepEqual(calls, [['repo/dep', undefined, undefined, 'primary', undefined, { profile: 'dev' }]]);
+    assert.deepEqual(found.at(-1), { spec: 'repo/dep', alias: 'primary' });
+});
+
+// This models the ifMissing logic only: `underLease` is a local serializer standing in for the
+// workspace mutation lease. The real worker runs find+enable inside
+// withHeldOrAcquiredWorkspaceMutationLease (marketplaceEnableWorkerThread.js), which this test does not exercise.
+test('ifMissing creates exactly one record when concurrent dependency enables are serialized (lease modeled, not real)', async () => {
+    const { runMarketplaceEnableRequest } = await import('../../cli/server/marketplaceEnableWorkerThread.js');
+    const store = new Set();
+    let creations = 0;
+    let lease = Promise.resolve();
+    const underLease = (task) => { const run = lease.then(task); lease = run.catch(() => {}); return run; };
+    const enableAgent = async (ref) => { await new Promise((resolve) => setImmediate(resolve)); creations += 1; store.add(ref); return {}; };
+    const findEnabledRecord = ({ spec }) => (store.has(spec) ? { key: spec } : null);
+    const request = () => underLease(() => runMarketplaceEnableRequest({ agentRef: 'webmeet/liveKitServerAgent', ifMissing: true }, { enableAgent, findEnabledRecord }));
+    const results = await Promise.all([request(), request(), request()]);
+    assert.equal(creations, 1);
+    assert.deepEqual(results.map((entry) => entry.status), [undefined, 'already-enabled', 'already-enabled']);
+});
+
+test('the worker forwards alias, profile and ifMissing in its worker data', async () => {
+    let received;
+    class CapturingWorker extends EventEmitter {
+        constructor(_url, options) { super(); received = options.workerData; queueMicrotask(() => this.emit('message', { ok: true, result: {} })); }
+        terminate() { return Promise.resolve(0); }
+    }
+    await runMarketplaceEnableWorker({ agentRef: 'repo/dep', mode: '', alias: 'primary', profile: 'dev', ifMissing: true }, { WorkerClass: CapturingWorker });
+    assert.equal(received.alias, 'primary');
+    assert.equal(received.profile, 'dev');
+    assert.equal(received.ifMissing, true);
+    await runMarketplaceEnableWorker({ agentRef: 'repo/root', mode: 'global' }, { WorkerClass: CapturingWorker });
+    assert.equal(received.alias, '');
+    assert.equal(received.ifMissing, false);
 });

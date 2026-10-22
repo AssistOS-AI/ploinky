@@ -107,6 +107,7 @@ import {
   commitAdditiveEdgeRoutingGeneration,
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
+  isActiveBoundPreparationLease,
   prepareHostModeCapabilityForInactiveGeneration,
   readEdgeRoutingPreparationOwner,
   readEdgeRoutingSelection,
@@ -2136,7 +2137,10 @@ function ensureGraphNodesEnabled(graph, reg, {
   const retainedDrainingPlans = [];
   for (const plan of replacementCandidates) {
     try {
-      dockerSvc.assertAgentServiceNotDraining(plan.existing.key, { loadRouting: () => drainingRouting });
+      dockerSvc.assertAgentServiceNotDraining(plan.existing.key, {
+        loadRouting: () => drainingRouting,
+        expectedPredecessor: registeredRuntimeTuple(plan.registryRecord),
+      });
     } catch (error) {
       if (error?.code !== 'PLOINKY_AGENT_DRAINING') throw error;
       // The displayed reason can hide independent supersession or MPS facts.
@@ -2709,6 +2713,11 @@ async function activatePreparedRuntimeAfterReadiness({
       };
       if (!result.hostPort) delete cfg.routes[routeKey].hostPort;
       delete cfg.routes[routeKey].hardwareAvailability;
+      // A withdrawn replacement completes the automatic drain of its route.
+      if (cfg.routes[routeKey].drainOwner) {
+        delete cfg.routes[routeKey].draining;
+        delete cfg.routes[routeKey].drainOwner;
+      }
       return cfg;
     }, {
       reason: 'runtime-replacement-ready',
@@ -2771,7 +2780,9 @@ export function cleanupFailedPreparedRuntime(
     }
   }
   if (!failedResult.preparationLease) return;
-  if (failedResult.preparationLease.mode !== 'additive') {
+  // An additive or withdrawn preparation keeps its active predecessor
+  // selected; aborting it is enough, and a withdrawn route stays drained.
+  if (!isActiveBoundPreparationLease(failedResult.preparationLease)) {
     try {
       inactivate(reason, { preserveSelectedGeneration: true });
     } catch (cleanupError) {

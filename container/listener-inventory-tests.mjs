@@ -747,11 +747,11 @@ test('collector fails closed when its rootless owner cannot enter a nested netwo
 
 test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expected graph', () => {
     const profile = loadListenerProfile(FULL_PROFILE);
-    assert.equal(profile.requiredContainers.length, 18);
+    assert.equal(profile.requiredContainers.length, 17);
     const livekitContainer = profile.requiredContainers.find(entry => entry.id === 'livekit');
-    const livekitName = 'ploinky_AchillesIDE_liveKitServerAgent_fixture';
+    const livekitName = 'ploinky_webmeet_liveKitServerAgent_fixture';
     const retiredName = 'ploinky_webmeetInfra_liveKitServerAgent_fixture';
-    assert.equal(livekitContainer.effectiveInstance, 'agent:AchillesIDE/liveKitServerAgent');
+    assert.equal(livekitContainer.effectiveInstance, 'agent:webmeet/liveKitServerAgent');
     assert.equal(livekitContainer.namePattern.test(livekitName), true);
     assert.equal(livekitContainer.namePattern.test(retiredName), false);
     assert.equal(livekitContainer.networkModePattern.test('host'), true);
@@ -764,15 +764,15 @@ test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expe
     assert.equal(media.exclusiveSocket, true);
     assert.ok(media.ownerContainerPattern);
     for (const rule of profile.rules.filter(entry => entry.id.startsWith('livekit-'))) {
-        assert.equal(rule.effectiveInstance, 'agent:AchillesIDE/liveKitServerAgent');
+        assert.equal(rule.effectiveInstance, 'agent:webmeet/liveKitServerAgent');
         assert.equal(rule.ownerContainerPattern.test(livekitName), true);
         assert.equal(rule.ownerContainerPattern.test(retiredName), false);
     }
     const privateRouter = profile.rules.find(rule => rule.id === 'router-private');
     assert.equal(privateRouter.dynamicBindSet, 'loopback-and-managed-gateways');
     assert.deepEqual(privateRouter.bindAddresses, []);
-    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').minMatches, 15);
-    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').maxMatches, 15);
+    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').minMatches, 14);
+    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').maxMatches, 14);
     assert.equal(profile.controlPorts.includes(7681), false);
     assert.equal(profile.requiredContainers.some(entry => (
         entry.id === 'webtty'
@@ -811,8 +811,8 @@ test('full Explorer profile no longer requires the retired default-local-llm con
     )), false);
     const standard = profile.rules.find(rule => rule.id === 'standard-agentserver');
     assert.equal(standard.containerPattern.test(retiredName), false);
-    assert.equal(standard.containerPattern.test('ploinky_proxies_soul-gateway_fixture'), true);
-    assert.equal(standard.containerPattern.test('ploinky_proxies_searchAgent_fixture'), true);
+    assert.equal(standard.containerPattern.test('ploinky_AchillesIDE_soul-gateway_fixture'), true);
+    assert.equal(standard.containerPattern.test('ploinky_legacy-agents_searchAgent_fixture'), true);
     const standardMatches = profile.requiredContainers.filter(entry => (
         standard.containerPattern.test(`${entry.namePattern.source.replace(/^\^/, '')}fixture`)
     ));
@@ -848,7 +848,7 @@ test('full Explorer LiveKit rules accept the migrated owner and reject media bou
         rules: fullProfile.rules.filter(rule => rule.id.startsWith('livekit-')),
     };
     const livekit = container({
-        name: 'ploinky_AchillesIDE_liveKitServerAgent_fixture',
+        name: 'ploinky_webmeet_liveKitServerAgent_fixture',
         networkMode: 'host',
         pids: [200, 201, 202, 203],
     });
@@ -868,7 +868,7 @@ test('full Explorer LiveKit rules accept the migrated owner and reject media bou
     assert.equal(accepted.ok, true, accepted.errors.join('\n'));
     assert.equal(accepted.listeners.length, 6);
     assert.ok(accepted.listeners.every(entry => (
-        entry.effectiveInstance === 'agent:AchillesIDE/liveKitServerAgent'
+        entry.effectiveInstance === 'agent:webmeet/liveKitServerAgent'
     )));
 
     const retired = container({

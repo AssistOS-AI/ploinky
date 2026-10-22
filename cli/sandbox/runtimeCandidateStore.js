@@ -45,7 +45,7 @@ function normalize(candidate) {
     const lease = candidate.preparationLease;
     const leaseFields = ['transactionId', 'preparedGeneration', 'lifecycleBindingDigest', 'selectorActivationId', 'selectorDigest', 'mode', 'predecessorGeneration'];
     if (lease && (leaseFields.some(field => typeof lease[field] !== 'string')
-        || !['replacement', 'additive'].includes(lease.mode))) {
+        || !['replacement', 'additive', 'withdrawn'].includes(lease.mode))) {
         throw candidateError('has an invalid preparation lease');
     }
     return {

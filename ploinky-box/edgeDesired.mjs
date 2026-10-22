@@ -101,6 +101,34 @@ function exactDigest(result) {
     return String(result.stdout || '').trim().split(/\s+/)[0];
 }
 
+// The caller journals both versions before entering its mutation coordination.
+// The same writer is usable through the confined Box channel for subuid-owned anchors.
+export function replaceWorkspaceEdgeDesired(identity, { expectedDigest, bytes, assertHeld, fsApi = fs } = {}) {
+    if (typeof assertHeld !== 'function') throw desiredError('Edge authority replacement requires mutation coordination');
+    assertHeld();
+    const text = Buffer.from(bytes || '');
+    if (text.length > BOX_EDGE_DESIRED_MAX_BYTES) throw desiredError('Edge authority replacement is too large');
+    validateCandidateDocument(text, BOX_EDGE_DESIRED_FILE);
+    if (!/^[a-f0-9]{64}$/.test(String(expectedDigest || ''))) throw desiredError('Expected edge authority digest is required');
+    const current = readWorkspaceEdgeDesired(identity, { fsApi });
+    if (!current || current.digest !== expectedDigest) throw desiredError('Edge authority changed before replacement');
+    const temporary = `${current.path}.${crypto.randomUUID()}.tmp`;
+    try {
+        const fd = fsApi.openSync(temporary, 'wx', 0o600);
+        try { fsApi.writeFileSync(fd, text); fsApi.fsyncSync(fd); } finally { fsApi.closeSync(fd); }
+        assertHeld();
+        if (readWorkspaceEdgeDesired(identity, { fsApi })?.digest !== expectedDigest) {
+            throw desiredError('Edge authority changed during replacement');
+        }
+        fsApi.renameSync(temporary, current.path);
+        const directory = fsApi.openSync(identity.anchorPath, 'r');
+        try { fsApi.fsyncSync(directory); } finally { fsApi.closeSync(directory); }
+    } finally {
+        try { fsApi.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    return readWorkspaceEdgeDesired(identity, { fsApi });
+}
+
 export function stageWorkspaceEdgeDesired({
     candidate,
     engine,

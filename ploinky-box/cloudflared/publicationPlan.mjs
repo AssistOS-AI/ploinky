@@ -179,6 +179,12 @@ function normalizeHosts(value) {
             });
         }
         const selector = cloneJsonValue(rawSelector, `Cloudflare host '${hostname}'`);
+        if (selector.dnsManagement !== undefined
+            && !['managed', 'external'].includes(selector.dnsManagement)) {
+            fail(`Cloudflare host '${hostname}' has invalid DNS management`, {
+                code: 'CLOUDFLARE_HOST_INVALID', operation: 'validate',
+            });
+        }
         if (!String(selector.agent || '').trim()) {
             fail(`Cloudflare host '${hostname}' is missing its validated agent selector`, {
                 code: 'CLOUDFLARE_HOST_INVALID',
@@ -313,6 +319,12 @@ export function normalizeCloudflarePublicationDesired({
     const normalizedHosts = normalizeHosts(hosts);
     const classified = normalizeCloudflareTuple(cloudflare);
     const { management, tunnelManagement, tuple } = classified;
+    if (management === 'connector-only'
+        && normalizedHosts.some(({ selector }) => selector.dnsManagement === 'external')) {
+        fail('External DNS admission requires an API-managed existing publication', {
+            code: 'CLOUDFLARE_CONFIGURATION_INVALID', operation: 'validate',
+        });
+    }
     if (!management && normalizedHosts.length) {
         fail('Cloudflare hostnames require Cloudflare publication configuration', {
             code: 'CLOUDFLARE_CONFIGURATION_PARTIAL',
@@ -390,7 +402,7 @@ export function normalizeCloudflarePublicationDesired({
         ...normalizedHosts.map(({ hostname }) => ({ hostname, service: CLOUDFLARE_ORIGIN })),
         { service: CLOUDFLARE_TERMINAL_SERVICE },
     ];
-    const dns = scope ? normalizedHosts.map(({ hostname }) => ({
+    const dns = scope ? normalizedHosts.filter(isManagedPublicationHost).map(({ hostname }) => ({
         hostname,
         type: 'CNAME',
         content: `${scope.tunnelId}.cfargotunnel.com`,
@@ -421,6 +433,52 @@ export function normalizeCloudflarePublicationDesired({
     });
 }
 
+const SEMANTIC_PLACEHOLDER_GENERATION = `sha256:${'0'.repeat(64)}`;
+
+function normalizeHostRouteKeys(value) {
+    if (value === undefined || value === null) return {};
+    if (!isPlainObject(value)) {
+        fail('Cloudflare host route keys must be an object keyed by exact hostname', {
+            code: 'CLOUDFLARE_CONFIGURATION_INVALID',
+            operation: 'validate',
+        });
+    }
+    return Object.fromEntries(Object.entries(value)
+        .map(([hostname, routeKey]) => [normalizePublicHostname(hostname), String(routeKey || '')])
+        .sort(([left], [right]) => left.localeCompare(right)));
+}
+
+/**
+ * The publication semantics one ready proof covers: everything the plan digest
+ * binds except the configuration generation, plus the secret handles and each
+ * public host's compiled route key. A generation that changes only agent routes
+ * keeps this digest, so its predecessor's ready proof still describes the path
+ * from every hostname through this connector to this Router. The CLI and the
+ * cloudflared controller both use this one function.
+ */
+export function publicationSemanticDigest({ cloudflare, hosts, hostRouteKeys } = {}) {
+    const plan = normalizeCloudflarePublicationDesired({
+        configurationGeneration: SEMANTIC_PLACEHOLDER_GENERATION,
+        cloudflare,
+        hosts,
+    });
+    const { configurationGeneration: _generation, desiredDigest: _digest, ...semantic } = plan;
+    return publicationDigest({
+        ...semantic,
+        hostRouteKeys: normalizeHostRouteKeys(hostRouteKeys),
+    });
+}
+
+/** The semantic publication inputs of one verified edge routing generation. */
+export function edgeGenerationPublicationSemantics(generation) {
+    return {
+        cloudflare: generation?.desired?.cloudflare,
+        hosts: generation?.desired?.hosts,
+        hostRouteKeys: Object.fromEntries(Object.entries(generation?.compiled?.hosts || {})
+            .map(([hostname, record]) => [hostname, String(record?.routeKey || '')])),
+    };
+}
+
 export function materializeManagedCloudflarePublicationPlan(plan, tunnelId) {
     if (plan?.management !== 'api-managed' || plan?.tunnelManagement !== 'ploinky-managed') {
         return plan;
@@ -442,7 +500,7 @@ export function materializeManagedCloudflarePublicationPlan(plan, tunnelId) {
         scope,
     };
     if (plan.mode === 'cloudflare') {
-        materialized.dns = plan.hosts.map(({ hostname }) => ({
+        materialized.dns = plan.hosts.filter(isManagedPublicationHost).map(({ hostname }) => ({
             hostname,
             type: 'CNAME',
             content: `${normalizedTunnelId}.cfargotunnel.com`,
@@ -451,6 +509,10 @@ export function materializeManagedCloudflarePublicationPlan(plan, tunnelId) {
         }));
     }
     return deepFreeze(materialized);
+}
+
+export function isManagedPublicationHost(host) {
+    return host?.selector?.dnsManagement !== 'external';
 }
 
 export function publicPlanSummary(plan) {

@@ -2068,6 +2068,123 @@
     "cli/server/RoutingServer.js": {
       "baseline": "d79de70162e698f12723a2dacc2327f3a62b8a066a77de6c3d433356ef9da93c",
       "blobs": {
+        "8622881c05a9ba60f05812d836d0892b372e575c9c5423160a1413afc4944140": {
+          "root.get": {
+            "line": 800,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "root-index.get": {
+            "line": 800,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "health.get": {
+            "line": 673,
+            "anchor": null,
+            "statement": "if (pathname === '/health') {"
+          },
+          "agent-card.get": {
+            "line": 760,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-card-slash.get": {
+            "line": 760,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "mcp-browser-client.get": {
+            "line": 495,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 495,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 761,
+            "anchor": null,
+            "statement": "} else if (agentName && isActiveAgentRootPlan(routePlan)) {"
+          },
+          "agent-mcp.post": {
+            "line": 770,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.get": {
+            "line": 770,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.delete": {
+            "line": 770,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-task-status.get": {
+            "line": 633,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-status-alias.get": {
+            "line": 633,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-cancel.post": {
+            "line": 574,
+            "anchor": null,
+            "statement": "} else if (isDelegatedAgentTaskCancelRoute) {"
+          },
+          "agent-openai.post": {
+            "line": 777,
+            "anchor": null,
+            "statement": "return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath, {"
+          },
+          "agent-root-websocket.get": {
+            "line": 1060,
+            "anchor": null,
+            "statement": "const handled = await handleAgentRootUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 1022,
+            "anchor": null,
+            "statement": "if (routePlan.kind === 'agent-port') {"
+          },
+          "internal-agent-control.*": {
+            "line": 510,
+            "anchor": null,
+            "statement": "if (hasInternalAgentSegment(pathname)) {"
+          },
+          "reserved--metrics.*": {
+            "line": 812,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--health-internal.*": {
+            "line": 812,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin.*": {
+            "line": 812,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin-*.*": {
+            "line": 812,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "unix-health.get": {
+            "line": 973,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          }
+        },
         "d336f2281752d95be3245607838fa0bf9370a694153d66c95667698044925dd9": {
           "root.get": {
             "line": 791,
@@ -2535,6 +2652,123 @@
             "anchor": null,
             "statement": "return {"
           }
+        },
+        "fd33e338ea590103d4b238ec29538103292c7b52baa3986d1dce9b1d2a1de93d": {
+          "root.get": {
+            "line": 771,
+            "anchor": null,
+            "statement": "}"
+          },
+          "root-index.get": {
+            "line": 771,
+            "anchor": null,
+            "statement": "}"
+          },
+          "health.get": {
+            "line": 644,
+            "anchor": null,
+            "statement": "Number.isInteger(error?.status) ? error.status : 502,"
+          },
+          "agent-card.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (!staticAgent) return null;"
+          },
+          "agent-card-slash.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (!staticAgent) return null;"
+          },
+          "mcp-browser-client.get": {
+            "line": 477,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 477,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 433,
+            "anchor": null,
+            "statement": "res,"
+          },
+          "agent-mcp.post": {
+            "line": 742,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-mcp.delete": {
+            "line": 742,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-mcp.get": {
+            "line": 742,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-task-status.get": {
+            "line": 604,
+            "anchor": null,
+            "statement": "// One authorization path for transparent agent routes and agent-port relays."
+          },
+          "agent-task-status-alias.get": {
+            "line": 604,
+            "anchor": null,
+            "statement": "// One authorization path for transparent agent routes and agent-port relays."
+          },
+          "agent-task-cancel.post": {
+            "line": 546,
+            "anchor": null,
+            "statement": "});"
+          },
+          "agent-openai.post": {
+            "line": 589,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 401, {"
+          },
+          "agent-root-websocket.get": {
+            "line": 955,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 986,
+            "anchor": null,
+            "statement": "return;"
+          },
+          "internal-agent-control.*": {
+            "line": 481,
+            "anchor": null,
+            "statement": ""
+          },
+          "reserved--metrics.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--health-internal.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--admin.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--admin-*.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "unix-health.get": {
+            "line": 926,
+            "anchor": null,
+            "statement": "return {"
+          }
         }
       },
       "candidate": "27fb848deaa7824177c9fb16cc265da2b9bb9cc919021fcaacb18580026596a9"
@@ -2829,6 +3063,102 @@
             "anchor": "action === 'disable_agent'",
             "statement": "} else if (action === 'disable_agent') {"
           }
+        },
+        "bd129d53eb7ff82f9a50aa78e246fb53cab729d868f647c02a139f2c05999a70": {
+          "marketplace-repos-read.get": {
+            "line": 914,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 884,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 987,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 987,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 1013,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 1015,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
+        },
+        "58e75450ab4992052efced604c0fd6dee7e4f3311c924aa5ae562578bf0b7e13": {
+          "marketplace-repos-read.get": {
+            "line": 923,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 893,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 996,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 996,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 1022,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 1024,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
+        },
+        "be248349a1ae2a63f125fd54cee347e85624cad53ef218f1b19c8beb177b337a": {
+          "marketplace-repos-read.get": {
+            "line": 927,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 897,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 1000,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 1000,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 1026,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 1028,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
         }
       },
       "candidate": "8c99918602620aa560b8dc0cf08d99c1aa69902c6e2c8a5606dc13a9965480f1"
@@ -3072,6 +3402,38 @@
           },
           "agent-static.head": {
             "line": 919,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          }
+        },
+        "4c1d5fc99dfa25c44a52383d3b6c2813bfd7c2f21a5d6073e8600ff232ab0d9d": {
+          "web-libs.get": {
+            "line": 827,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "web-libs.head": {
+            "line": 827,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "workspace-file-read.get": {
+            "line": 791,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "workspace-file-read.head": {
+            "line": 791,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "agent-static.get": {
+            "line": 946,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          },
+          "agent-static.head": {
+            "line": 946,
             "anchor": "async function serveAgentStaticRequest(req, res, {",
             "statement": "async function serveAgentStaticRequest(req, res, {"
           }
@@ -3741,6 +4103,66 @@
         }
       },
       "candidate": "894d28dbcd19dc51b2393a7f34b0a06d9c4e40804cb4a81460ff65f5131ed17f"
+    },
+    "cli/server/edgeRoutePlan.js": {
+      "baseline": "ca3a2b27e4bf09a7812725c5d23e68764b49b2dc78c34dc08162699207c9d4d8",
+      "candidate": "ca3a2b27e4bf09a7812725c5d23e68764b49b2dc78c34dc08162699207c9d4d8",
+      "blobs": {
+        "ca3a2b27e4bf09a7812725c5d23e68764b49b2dc78c34dc08162699207c9d4d8": {
+          "agent-additional-http.*": {
+            "line": 195,
+            "anchor": "function agentPortPlan({",
+            "statement": "function agentPortPlan({"
+          },
+          "private-workspace-logs.post": {
+            "line": 757,
+            "anchor": "pathname === '/api/edge/workspace-logs'",
+            "statement": "if (pathname === '/api/edge/workspace-logs') {"
+          },
+          "private-workspace-metrics.get": {
+            "line": 775,
+            "anchor": "pathname === '/api/edge/workspace-metrics'",
+            "statement": "if (pathname === '/api/edge/workspace-metrics') {"
+          },
+          "private-runtime-origins.get": {
+            "line": 793,
+            "anchor": "pathname === '/api/edge/runtime-origins'",
+            "statement": "if (pathname === '/api/edge/runtime-origins') {"
+          },
+          "private-turn-credentials.post": {
+            "line": 814,
+            "anchor": "pathname === '/api/edge/turn-credentials'",
+            "statement": "if (pathname === '/api/edge/turn-credentials') {"
+          }
+        },
+        "ec1bdbc2950ba777748c2ec46808832e408a0c20357bd78fff86b2124798adb7": {
+          "agent-additional-http.*": {
+            "line": 196,
+            "anchor": "function agentPortPlan({",
+            "statement": "function agentPortPlan({"
+          },
+          "private-workspace-logs.post": {
+            "line": 808,
+            "anchor": "pathname === '/api/edge/workspace-logs'",
+            "statement": "if (pathname === '/api/edge/workspace-logs') {"
+          },
+          "private-workspace-metrics.get": {
+            "line": 826,
+            "anchor": "pathname === '/api/edge/workspace-metrics'",
+            "statement": "if (pathname === '/api/edge/workspace-metrics') {"
+          },
+          "private-runtime-origins.get": {
+            "line": 844,
+            "anchor": "pathname === '/api/edge/runtime-origins'",
+            "statement": "if (pathname === '/api/edge/runtime-origins') {"
+          },
+          "private-turn-credentials.post": {
+            "line": 865,
+            "anchor": "pathname === '/api/edge/turn-credentials'",
+            "statement": "if (pathname === '/api/edge/turn-credentials') {"
+          }
+        }
+      }
     }
   }
 }

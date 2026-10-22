@@ -59,7 +59,7 @@ function graphNode(overrides = {}) {
 // was refused, and records every revocation, rotation and removal.
 function runGraphOverDrainingRoute({
     node = graphNode(), additionalNodes = [], noWait = false, hardwareUnavailable = false,
-    supersededRun = false, running = false, runtimeReason = '', observeReason, draining = true,
+    supersededRun = false, running = false, runtimeReason = '', observeReason, draining = true, drainOwner,
 } = {}) {
     const nodes = [node, ...additionalNodes];
     const registry = Object.fromEntries(nodes.map((entry) => [`${entry.shortAgentName}_container`, {
@@ -104,7 +104,7 @@ function runGraphOverDrainingRoute({
         loadRouting() {
             return { routes: Object.fromEntries(nodes.map((entry) => [entry.alias || entry.shortAgentName, {
                 container: `${entry.shortAgentName}_container`, repo: entry.repoName, agent: entry.shortAgentName,
-                draining, hostPort: 41001,
+                draining, hostPort: 41001, ...(drainOwner ? { drainOwner } : {}),
             }])) };
         },
         saveRouting(routing) { events.push('save-routing'); saved.push(structuredClone(routing)); },
@@ -128,6 +128,27 @@ test('workspace start refuses to replace the stopped predecessor of a refused ta
     assert.deepEqual(graph.events, [], 'no line, revocation, rotation, receipt or removal');
     assert.deepEqual(graph.registry.worker_container, graph.record, 'the predecessor keeps its exact runtime identity');
 });
+
+test('workspace graph recovers an automatic drain owned by its exact registered predecessor', () => {
+    const graph = runGraphOverDrainingRoute({ runtimeReason: 'runtimeStopped', drainOwner: {
+        containerName: 'worker_container', instanceId: 'retained-worker-instance', enableGeneration: 'retained-worker-generation',
+    } });
+    assert.deepEqual(graph.run().changedContainers, ['worker_container']);
+    assert.ok(graph.events.includes('remove'));
+    assert.ok(graph.events.includes('write-predecessor'));
+    assert.notEqual(graph.registry.worker_container.instanceId, graph.record.instanceId);
+});
+
+for (const field of ['containerName', 'instanceId', 'enableGeneration', 'manual']) {
+    test(`workspace graph rejects ${field === 'manual' ? 'ownerless manual' : `mismatched ${field} automatic`} drain before mutation`, () => {
+        const drainOwner = field === 'manual' ? undefined : {
+            containerName: 'worker_container', instanceId: 'retained-worker-instance', enableGeneration: 'retained-worker-generation',
+            [field]: 'another-owner',
+        };
+        const graph = runGraphOverDrainingRoute({ runtimeReason: 'runtimeStopped', drainOwner });
+        assertRefusedWithoutEffects(graph);
+    });
+}
 
 test('workspace start keeps the refused-drain predecessor of a no-wait or hardware-refused node and lets the graph continue', () => {
     for (const scenario of [

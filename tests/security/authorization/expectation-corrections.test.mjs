@@ -331,6 +331,6 @@ test('guestAgents are derived from enabled guest-authentication manifests only a
     manifests['S/guesty'] = { guest: true, ploinky: 'sso enable' };
     assert.throws(() => deriveExpectedRuntimes({ policy: { rootAgent: 'R/root', profile: 'default', inventoryRepositories: [{ name: 'R' }, { name: 'S' }] }, source }), /cannot be combined with guest/);
     const { expectedRuntimes } = loadAcceptanceInputs();
-    assert.deepEqual(expectedRuntimes.guestAgents, [{ repo: 'AchillesIDE', agent: 'webAssist' }, { repo: 'AchillesIDE', agent: 'webmeetAgent' }]);
+    assert.deepEqual(expectedRuntimes.guestAgents, [{ repo: 'legacy-agents', agent: 'webAssist' }, { repo: 'webmeet', agent: 'webmeetAgent' }]);
     assert.ok(expectedRuntimes.guestAgents.every(g => expectedRuntimes.enabled.some(e => e.repo === g.repo && e.agent === g.agent)));
 });

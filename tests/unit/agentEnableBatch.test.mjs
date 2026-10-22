@@ -265,7 +265,7 @@ test('a later batch validation failure cannot mutate the active generation', () 
     );
 });
 
-test('same-name retirement failure occurs after inactivation but before candidate source persistence', () => {
+test('same-name retirement failure occurs before any routing change or candidate source persistence', () => {
     const initialized = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
     const registryBefore = fs.readFileSync(initialized.paths.agentsFile, 'utf8');
     const routingBefore = fs.readFileSync(initialized.paths.routingFile, 'utf8');
@@ -291,15 +291,16 @@ test('same-name retirement failure occurs after inactivation but before candidat
     assert.equal(fs.readFileSync(initialized.paths.agentsFile, 'utf8'), registryBefore);
     assert.equal(fs.readFileSync(initialized.paths.routingFile, 'utf8'), routingBefore);
     const selector = JSON.parse(fs.readFileSync(initialized.paths.activeSelectorFile, 'utf8'));
-    assert.equal(selector.state, 'inactive');
+    assert.equal(selector.state, 'active', 'a refused retirement neither withdraws nor inactivates anything');
 
     // Restore the unchanged predecessor sources as the active baseline so the
     // following successful replacement test begins from a valid generation.
     coordinated.applyEdgeRoutingGeneration({ reason: 'test-retirement-failure-baseline-restore' });
 });
 
-test('same-name re-enable uses fail-closed replacement instead of an additive shadow', () => {
+test('same-name re-enable replaces only the runtime identity beside its drained active predecessor', () => {
     let retirementEntries = null;
+    const before = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
     const prepared = agents.prepareAgentEnableBatch([
         { agentName: 'demo/nonHostDependency', mode: 'global' },
     ], {
@@ -310,23 +311,68 @@ test('same-name re-enable uses fail-closed replacement instead of an additive sh
         },
     });
 
-    assert.equal(prepared.availabilityMode, 'replacement');
-    assert.equal(prepared.preparedGeneration.preparationLease.mode, 'replacement');
-    assert.equal(prepared.preparedGeneration.selector.state, 'inactive');
-    assert.throws(
-        () => edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }),
-        { code: 'EDGE_GENERATION_INACTIVE' },
-    );
+    const [plan] = prepared.plans;
+    assert.equal(prepared.availabilityMode, 'withdrawn');
+    assert.equal(prepared.preparedGeneration.preparationLease.mode, 'withdrawn');
+    assert.equal(prepared.preparedGeneration.selector.state, 'active');
+    const active = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    const predecessor = before.generation.agents[plan.containerName];
+    const drained = active.generation.routing.routes[plan.routeKey];
+    assert.equal(drained.draining, true, 'only the replaced runtime is withdrawn');
+    assert.equal(drained.hostPort, undefined);
+    assert.deepEqual(drained.drainOwner, {
+        containerName: plan.containerName,
+        instanceId: predecessor.instanceId,
+        enableGeneration: predecessor.enableGeneration,
+        reason: 'replacement',
+    });
+    for (const [routeKey, route] of Object.entries(before.generation.routing.routes)) {
+        if (routeKey !== plan.routeKey) assert.deepEqual(active.generation.routing.routes[routeKey], route);
+    }
+    assert.equal(active.generation.agents[plan.containerName].instanceId, predecessor.instanceId,
+        'the predecessor identity stays registered until the replacement commits');
+    assert.equal(prepared.preparedGeneration.generation.agents[plan.containerName].instanceId, plan.instanceId);
     assert.equal(retirementEntries.length, 1);
-    assert.equal(retirementEntries[0].containerName, prepared.plans[0].containerName);
+    assert.equal(retirementEntries[0].containerName, plan.containerName);
     assert.notEqual(
         retirementEntries[0].record.enableGeneration,
-        prepared.plans[0].enableGeneration,
+        plan.enableGeneration,
         'the retired marker constraint must name the predecessor generation',
     );
     edge.abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease, {
         reason: 'test-same-name-replacement-complete',
     });
+    assert.equal(edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }).selector.state, 'active');
+});
+
+test('same-name re-enable that changes more than the identity uses fail-closed replacement', () => {
+    const manifestPath = path.join(workspace, '.ploinky', 'repos', 'demo', 'nonHostDependency', 'manifest.json');
+    const manifestBefore = fs.readFileSync(manifestPath, 'utf8');
+    writeManifest('demo', 'nonHostDependency', {
+        container: 'node:20-alpine',
+        network: { mode: 'default' },
+        about: 'changed manifest bytes',
+    });
+    let prepared;
+    try {
+        prepared = agents.prepareAgentEnableBatch([
+            { agentName: 'demo/nonHostDependency', mode: 'global' },
+        ], { reason: 'test-same-name-fallback-replacement', retireNoWaitMarkers: () => [] });
+        assert.equal(prepared.availabilityMode, 'replacement');
+        assert.equal(prepared.preparedGeneration.preparationLease.mode, 'replacement');
+        assert.equal(prepared.preparedGeneration.selector.state, 'inactive');
+        assert.throws(
+            () => edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }),
+            { code: 'EDGE_GENERATION_INACTIVE' },
+        );
+    } finally {
+        if (prepared) {
+            edge.abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease, {
+                reason: 'test-same-name-fallback-replacement-complete',
+            });
+        }
+        fs.writeFileSync(manifestPath, manifestBefore);
+    }
 });
 
 for (const requests of [[], [{ agentName: 'demo/staticRoot' }]]) {

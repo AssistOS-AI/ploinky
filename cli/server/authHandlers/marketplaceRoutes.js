@@ -49,6 +49,7 @@ import { localSessionAllowedForRoutePlan } from './authContext.js';
 import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
 import { handleHardwareLimitsRoutes } from './hardwareLimitsRoutes.mjs';
 import { readEdgeRoutingSelection } from '../../sandbox/edgeGeneration.js';
+import { planManifestDependencyEnables } from '../../utils/workspaceDependencyGraph.js';
 
 export const MARKETPLACE_PATH = '/api/marketplace';
 export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
@@ -70,6 +71,7 @@ const SAFE_LIFECYCLE_ERRORS = new Map([
     ['PLOINKY_MARKETPLACE_ENABLE_TIMEOUT', { status: 504, message: 'Agent activation timed out.' }],
     ['PLOINKY_AGENT_ENABLE_MODE_UNSUPPORTED', { status: 422, message: 'The agent does not support the selected run mode.' }],
     ['PLOINKY_MANIFEST_ENABLE_MODES_INVALID', { status: 422, message: 'The agent manifest declares invalid enable modes.' }],
+    ['MARKETPLACE_DEPENDENCY_UNAVAILABLE', { status: 422, message: 'A required manifest dependency of the agent is unavailable.' }],
 ]);
 // The agent listing reads the container engine (two child processes). At most this many inventories run at once; every other request waits for
 // a slot and then collects for itself, so no inventory result is ever shared between requests.
@@ -167,12 +169,18 @@ function sendMarketplaceError(res, status, code, message = '', details = {}) {
         error: code,
         ...(message ? { message } : {}),
         ...(details.cause ? { cause: details.cause } : {}),
+        ...(details.dependencies ? { dependencies: details.dependencies } : {}),
     });
 }
 
 function safeLifecycleCause(error) {
     const code = String(error?.cause?.code || '');
     return SAFE_LIFECYCLE_ERRORS.has(code) ? { code } : null;
+}
+
+// The dependencies a failed enable had already enabled, as bounded entries.
+function dependencyDetail(error) {
+    return Array.isArray(error?.dependencies) && error.dependencies.length ? { dependencies: error.dependencies } : {};
 }
 
 function sendLifecycleError(res, error) {
@@ -185,6 +193,7 @@ function sendLifecycleError(res, error) {
             error: hardwareOutcome.code,
             message: formatHardwareOutcome(hardwareOutcome),
             hardwareOutcome,
+            ...dependencyDetail(error),
         });
         return true;
     }
@@ -193,6 +202,7 @@ function sendLifecycleError(res, error) {
     if (!contract) return false;
     sendMarketplaceError(res, contract.status, code, contract.message, {
         cause: safeLifecycleCause(error),
+        ...dependencyDetail(error),
     });
     return true;
 }
@@ -322,12 +332,12 @@ function normalizeMarketplaceEnableMode(value) {
     return mode;
 }
 
-function enqueueMarketplaceEnable(agentRef, mode, runEnableWorker) {
+function enqueueMarketplaceEnable(agentRef, mode, job) {
     const key = `${agentRef}\u0000${mode}`;
     const existing = marketplaceEnableFlights.get(key);
     if (existing) return existing;
 
-    const scheduled = marketplaceEnableQueue.then(() => runEnableWorker({ agentRef, mode }));
+    const scheduled = marketplaceEnableQueue.then(job);
     marketplaceEnableQueue = scheduled.catch(() => {});
     const tracked = scheduled.finally(() => {
         if (marketplaceEnableFlights.get(key) === tracked) marketplaceEnableFlights.delete(key);
@@ -336,21 +346,125 @@ function enqueueMarketplaceEnable(agentRef, mode, runEnableWorker) {
     return tracked;
 }
 
+// What the inventory shows for a dependency whose background enable has not
+// succeeded: a bounded code only, never an error message, which can embed paths.
+const MARKETPLACE_DEPENDENCY_STATUS_LIMIT = 64;
+const marketplaceDependencyStatus = new Map();
+
+function recordMarketplaceDependencyStatus(ref, status, code = '') {
+    marketplaceDependencyStatus.delete(ref);
+    if (status === 'queued' || status === 'failed') {
+        marketplaceDependencyStatus.set(ref, { status, ...(code ? { code } : {}) });
+    }
+    while (marketplaceDependencyStatus.size > MARKETPLACE_DEPENDENCY_STATUS_LIMIT) {
+        marketplaceDependencyStatus.delete(marketplaceDependencyStatus.keys().next().value);
+    }
+}
+
+function dependencyErrorCode(error) {
+    return String(error?.code || 'PLOINKY_MARKETPLACE_DEPENDENCY_FAILED').slice(0, 128);
+}
+
+function dependencyWork(item) {
+    return {
+        agentRef: item.agentRef,
+        mode: '',
+        ifMissing: true,
+        ...(item.alias ? { alias: item.alias } : {}),
+        ...(item.profile ? { profile: item.profile } : {}),
+    };
+}
+
+const dependencyStatusOf = (outcome) => (outcome?.status === 'already-enabled' ? 'already-enabled' : 'enabled');
+
+// No-wait dependencies run after the request returned, in order, on their own
+// chain. They must not share marketplaceEnableQueue: each enable commits the
+// route lease against the exact active generation, and a task queued ahead of
+// the next enable publishes a newer generation first, so that enable would fail
+// EDGE_GENERATION_CHANGED. The worker's workspace mutation lease serializes
+// them against every other mutation instead; a later enable's worker waits for
+// it up to the lease wait (ten minutes by default) and then fails with
+// workspace_mutation_lock_timeout, which is the price of not blocking the
+// request. They never take the route lease and no outcome can fail the root;
+// every outcome is logged and recorded.
+let marketplaceAfterQueue = Promise.resolve();
+
+function queueAfterDependencies(rootRef, items, runEnableWorker) {
+    for (const item of items) recordMarketplaceDependencyStatus(item.ref, 'queued');
+    marketplaceAfterQueue = marketplaceAfterQueue.then(async () => {
+        const failed = new Set();
+        for (const item of items) {
+            if ((item.dependsOn || []).some((ref) => failed.has(ref))) {
+                failed.add(item.ref);
+                recordMarketplaceDependencyStatus(item.ref, 'failed', 'PLOINKY_MARKETPLACE_DEPENDENCY_SKIPPED');
+                console.warn(`[marketplace] ${rootRef}: dependency ${item.ref} skipped because one of its own dependencies failed`);
+                continue;
+            }
+            try {
+                const status = dependencyStatusOf(await runEnableWorker(dependencyWork(item)));
+                recordMarketplaceDependencyStatus(item.ref, status);
+                console.log(`[marketplace] ${rootRef}: dependency ${item.ref} ${status}`);
+            } catch (error) {
+                failed.add(item.ref);
+                recordMarketplaceDependencyStatus(item.ref, 'failed', dependencyErrorCode(error));
+                console.warn(`[marketplace] ${rootRef}: dependency ${item.ref} failed: ${String(error?.message || error).slice(0, 512)}`);
+            }
+        }
+    }).catch(() => {});
+}
+
+// The whole enable is one queue slot: the route-lease check once, the blocking
+// dependencies deepest first, the root, then the queuing of the no-wait ones.
+// Each enable publishes its own generation, so the lease is never committed
+// again after the first worker. A failed blocking dependency stops the request
+// before the root runs; the dependencies enabled so far stay enabled and ride
+// on the error.
+async function enableWithDependencies(ref, mode, { runEnableWorker, beforeEnable, planDependencies }) {
+    beforeEnable();
+    const plan = await planDependencies(ref);
+    const dependencies = [];
+    try {
+        for (const item of plan.before) {
+            try {
+                dependencies.push({ ref: item.ref, phase: 'before', status: dependencyStatusOf(await runEnableWorker(dependencyWork(item))) });
+            } catch (error) {
+                dependencies.push({ ref: item.ref, phase: 'before', status: 'failed', error: dependencyErrorCode(error) });
+                throw error;
+            }
+        }
+        const result = await runEnableWorker({ agentRef: ref, mode });
+        for (const entry of plan.unavailable) {
+            console.warn(`[marketplace] ${ref}: no-wait dependency ${entry.ref} is unavailable and was not enabled`);
+            dependencies.push({ ref: entry.ref, phase: 'after', status: 'unavailable', error: 'MARKETPLACE_DEPENDENCY_UNAVAILABLE' });
+        }
+        if (plan.after.length) {
+            for (const item of plan.after) dependencies.push({ ref: item.ref, phase: 'after', status: 'queued' });
+            queueAfterDependencies(ref, plan.after, runEnableWorker);
+        }
+        return { result, dependencies };
+    } catch (error) {
+        if (dependencies.length && error && typeof error === 'object') error.dependencies = dependencies;
+        throw error;
+    }
+}
+
 export async function enableMarketplaceAgent(body, {
     enable,
     runEnableWorker = runMarketplaceEnableWorker,
     beforeEnable = () => {},
+    planDependencies = (ref) => planManifestDependencyEnables(ref, { loadRegistry: () => workspaceSvc.loadAgents() }),
 } = {}) {
     const ref = normalizeMarketplaceAgentRef(body?.agentRef);
     const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
     const repoName = ref.split('/')[0];
-    const result = typeof enable === 'function'
-        ? await enable(ref, mode || undefined, mode === 'devel' ? repoName : undefined)
-        : await enqueueMarketplaceEnable(ref, mode, async (options) => {
-            beforeEnable();
-            return runEnableWorker(options);
-        });
-    return { ref, mode, result };
+    if (typeof enable === 'function') {
+        const result = await enable(ref, mode || undefined, mode === 'devel' ? repoName : undefined);
+        return { ref, mode, result, dependencies: [] };
+    }
+    const { result, dependencies } = await enqueueMarketplaceEnable(ref, mode, () => (
+        enableWithDependencies(ref, mode, { runEnableWorker, beforeEnable, planDependencies })
+    ));
+    return { ref, mode, result, dependencies };
 }
 
 // A repository uninstall is one workspace mutation under a lease this request
@@ -584,7 +698,8 @@ function buildMarketplaceAgents(user = null, options = {}) {
                 running: runtimeState?.running || false,
                 pid: runtimeState?.pid || null,
                 containerName: runtimeState?.containerName || enabledRecord?.containerName || '',
-                manifestPath: agent.manifestPath || ''
+                manifestPath: agent.manifestPath || '',
+                ...(marketplaceDependencyStatus.has(ref) ? { dependencyStatus: { ...marketplaceDependencyStatus.get(ref) } } : {})
             });
         }
     }
@@ -874,6 +989,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         let mutationWatch;
         try {
             let result;
+            let dependencies;
             if (action === 'install') {
                 result = await withWorkspaceMutationLease({ operation: 'repositories-install' }, () => {
                     const repositories = new Map(reposSvc.listRepositorySources().filter(repo => repo.origin !== 'remote').map(repo => [repo.name, repo]));
@@ -908,7 +1024,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                     ));
                 } else result = await uninstallRepositoryAction(body);
             } else if (action === 'enable_agent') {
-                ({ result } = await enableAgentAction(body));
+                ({ result, dependencies } = await enableAgentAction(body));
             } else if (action === 'disable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
                 result = await disableAgentAction(ref);
@@ -916,11 +1032,13 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                     sendMarketplaceError(res, 409, 'agent_disable_blocked', result.status);
                     return true;
                 }
+                // A disabled agent no longer owes a background dependency outcome: the next enable starts clean.
+                marketplaceDependencyStatus.delete(ref);
             }
             if (mutationWatch?.isClosed()) return true;
             const marketplace = await marketplacePayload();
             if (marketplace === MARKETPLACE_REQUEST_CLOSED) return true;
-            sendJson(res, 200, { ok: true, action, result, marketplace });
+            sendJson(res, 200, { ok: true, action, result, ...(Array.isArray(dependencies) ? { dependencies } : {}), marketplace });
             return true;
         } catch (error) {
             if (mutationWatch?.isClosed()) return true;
@@ -929,7 +1047,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 return true;
             }
             if (sendLifecycleError(res, error)) return true;
-            sendMarketplaceError(res, 400, 'marketplace_action_failed', error?.message || 'Marketplace action failed.');
+            sendMarketplaceError(res, 400, 'marketplace_action_failed', error?.message || 'Marketplace action failed.', dependencyDetail(error));
             return true;
         } finally {
             mutationWatch?.stop();
@@ -942,6 +1060,17 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
 }
 export const __testables = {
     createInventoryLimiter,
+    marketplaceDependencyStatus,
+    // Resolves once every enable queued so far, including background dependencies, has finished.
+    marketplaceEnableQueueIdle: async () => {
+        let enableTail;
+        let afterTail;
+        do {
+            enableTail = marketplaceEnableQueue;
+            afterTail = marketplaceAfterQueue;
+            await Promise.all([enableTail, afterTail]);
+        } while (enableTail !== marketplaceEnableQueue || afterTail !== marketplaceAfterQueue);
+    },
     MARKETPLACE_INVENTORY_SKIPPED,
     buildMarketplaceState,
     collectMarketplaceNoWaitStates,

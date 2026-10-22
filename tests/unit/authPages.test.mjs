@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import { renderLogoutConfirmationHtml, renderSsoLoginHtml } from '../../cli/server/authHandlers/authPages.js';
 
 test('logout confirmation keeps Cancel separate from the post-logout destination', () => {
@@ -18,6 +19,41 @@ test('router login sends users to the provider without a password form', () => {
     const html = renderSsoLoginHtml({ agentName: 'app', redirectUrl: '/identity/login', returnTo: '/files' });
     assert.match(html, /href="\/identity\/login"/);
     assert.doesNotMatch(html, /type="password"|action="\/auth\/login"/);
+});
+
+test('shared SSO copy is application-neutral even when the authentication context names another app', () => {
+    const options = {
+        returnTo: '/base-agent-additional-server/bizanso/8787/app/projects',
+        redirectUrl: '/identity/login?requestId=fixture&state=fixture-state',
+    };
+    const neutral = renderSsoLoginHtml(options);
+    for (const agentName of ['explorer', 'bizanso', 'another-app', '<b>untrusted-name</b>']) {
+        const html = renderSsoLoginHtml({ ...options, agentName });
+        assert.equal(html, neutral);
+        assert.match(html, /<h1>Continue with Single Sign-On<\/h1>/);
+        assert.match(html, /<p>Redirecting you to the identity provider to sign in\.<\/p>/);
+        assert.doesNotMatch(html, /You are signing in to|untrusted-name/);
+    }
+});
+
+test('neutral SSO page preserves the provider redirect and normalized return navigation', () => {
+    const returnTo = '/base-agent-additional-server/sample-app/8787/app/projects?view=saved&sort=new';
+    const redirectUrl = '/identity/login?requestId=fixture&state=fixture-state';
+    const html = renderSsoLoginHtml({ agentName: 'different-auth-context', returnTo, redirectUrl });
+    const links = [...html.matchAll(/<a class="auth-btn[^\"]*" href="([^\"]+)">([^<]+)<\/a>/g)]
+        .map(([, href, label]) => [label, href.replaceAll('&amp;', '&')]);
+    assert.deepEqual(links, [['Continue', redirectUrl], ['Back', returnTo]]);
+    const timers = [];
+    const redirects = [];
+    vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
+        window: { setTimeout: (callback, delay) => timers.push({ callback, delay }),
+            location: { replace: url => redirects.push(url) } },
+    });
+    assert.equal(timers.length, 1);
+    assert.equal(timers[0].delay, 120);
+    timers[0].callback();
+    assert.deepEqual(redirects, [redirectUrl]);
+    assert.match(renderSsoLoginHtml({ returnTo: '//outside.example/path' }), /href="\/">Back/);
 });
 
 test('sign-in error pages render fixed escaped text and only normalized retry links', async () => {

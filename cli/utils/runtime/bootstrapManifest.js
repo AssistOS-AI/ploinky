@@ -288,7 +288,7 @@ function readManifestTarget(agentNameOrPath) {
     return { manifest, manifestPath, repoName };
 }
 
-function findEnabledDirectiveRecord(parsedDirective) {
+export function findEnabledDirectiveRecord(parsedDirective) {
     const agentRef = agentRefFromEnableSpec(parsedDirective?.spec);
     if (!agentRef) return null;
     let resolved;

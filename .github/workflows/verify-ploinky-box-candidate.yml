@@ -48,7 +48,7 @@ jobs:
       SMOKE_GRAPH_ARGS_JSON: '["start","AchillesIDE/explorer","19090"]'
       SMOKE_GRAPH_REVISIONS_JSON: ${{ inputs.smoke_graph_revisions_json }}
       SMOKE_GRAPH_REPOSITORIES_JSON: >-
-        {"AssistOSExplorer":"${{ github.workspace }}/candidate-repositories/AssistOSExplorer","UmamiAgent":"${{ github.workspace }}/candidate-repositories/UmamiAgent","AchillesCLI":"${{ github.workspace }}/candidate-repositories/AchillesCLI","proxies":"${{ github.workspace }}/candidate-repositories/proxies"}
+        {"AssistOSExplorer":"${{ github.workspace }}/candidate-repositories/AssistOSExplorer","UmamiAgent":"${{ github.workspace }}/candidate-repositories/UmamiAgent","AchillesCLI":"${{ github.workspace }}/candidate-repositories/AchillesCLI","legacy-agents":"${{ github.workspace }}/candidate-repositories/legacy-agents","webmeet":"${{ github.workspace }}/candidate-repositories/webmeet"}
     steps:
       - name: Set candidate artifact paths
         shell: bash
@@ -94,12 +94,21 @@ jobs:
           token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
           persist-credentials: false
 
-      - name: Check out proxies
+      - name: Check out legacy-agents
         uses: actions/checkout@v4
         with:
-          repository: AssistOS-AI/proxies
-          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).proxies }}
-          path: candidate-repositories/proxies
+          repository: AssistOS-AI/legacy-agents
+          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).legacy-agents }}
+          path: candidate-repositories/legacy-agents
+          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
+          persist-credentials: false
+
+      - name: Check out webmeet
+        uses: actions/checkout@v4
+        with:
+          repository: AssistOS-AI/webmeet
+          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).webmeet }}
+          path: candidate-repositories/webmeet
           token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
           persist-credentials: false
 

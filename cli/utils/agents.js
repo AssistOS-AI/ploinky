@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'url';
 import { loadAgents, saveAgents } from './workspace.js';
 import { readAgentRegistrySnapshot } from './agentRegistrySnapshot.js';
@@ -49,10 +50,16 @@ import {
     initializeFreshEdgeRoutingSources,
     abortEdgeRoutingPreparation,
     commitAdditiveEdgeRoutingGeneration,
+    commitWithdrawalEdgeRoutingGeneration,
+    edgePreparationOwnerStopped,
+    edgeWithdrawalRefusalDisposition,
     inactivateEdgeRoutingGeneration,
+    loadActiveEdgeRoutingGeneration,
     prepareAdditiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
     prepareHostModeCapabilityForInactiveGeneration,
+    prepareWithdrawnReplacementEdgeRoutingGeneration,
+    readEdgeRoutingPreparationOwner,
     readEdgeRoutingSelection,
     resolveEdgeGenerationPaths,
     withEdgeGenerationApplyLock,
@@ -643,6 +650,47 @@ function bootstrapPreparedMcpToolPolicy(routes) {
     return store.read().document;
 }
 
+function withoutRuntimeLocator(route) {
+    const next = { ...(route || {}) };
+    for (const field of ['hostPort', 'serviceTargets', 'draining', 'drainOwner']) delete next[field];
+    return next;
+}
+
+// A same-name re-enable that changes nothing but the runtime identity of one
+// registered agent can replace it beside its drained active predecessor
+// instead of inactivating the whole edge (D4, W2). Any other difference (its
+// manifest bytes, policy, routing or another agent) takes the inactive
+// replacement staging.
+function withdrawnReplacementEligible(plans, previousAgents, routing, policy) {
+    if (plans.length !== 1) return null;
+    const [plan] = plans;
+    const predecessor = previousAgents?.[plan.containerName];
+    if (predecessor?.type !== 'agent' || !predecessor.instanceId || !predecessor.enableGeneration) return null;
+    let active;
+    try { active = loadActiveEdgeRoutingGeneration(); } catch (_) { return null; }
+    const activeRouting = active.generation.routing || {};
+    if (!isDeepStrictEqual(active.generation.agents?.[plan.containerName], predecessor)
+        || !isDeepStrictEqual(JSON.parse(JSON.stringify(active.generation.policy)), JSON.parse(JSON.stringify(policy)))) return null;
+    const activeManifest = active.generation.sourceDigests?.manifests?.[plan.routeKey];
+    const routeKeys = new Set([...Object.keys(activeRouting.routes || {}), ...Object.keys(routing.routes || {})]);
+    for (const routeKey of routeKeys) {
+        const before = activeRouting.routes?.[routeKey];
+        const after = routing.routes?.[routeKey];
+        if (routeKey === plan.routeKey) {
+            if (!before || before.container !== plan.containerName
+                || !isDeepStrictEqual(withoutRuntimeLocator(before), withoutRuntimeLocator(after))) return null;
+        } else if (!isDeepStrictEqual(before, after)) {
+            return null;
+        }
+    }
+    const { routes: _activeRoutes, ...activeRest } = activeRouting;
+    const { routes: _routes, ...rest } = routing;
+    if (!isDeepStrictEqual(JSON.parse(JSON.stringify(activeRest)), JSON.parse(JSON.stringify(rest)))) return null;
+    const manifestDigest = `sha256:${createHash('sha256').update(plan.manifestBytes).digest('hex')}`;
+    if (!activeManifest || activeManifest !== manifestDigest) return null;
+    return { plan, predecessor };
+}
+
 /**
  * Stage exact identities and target-less routes for a set of agents, then
  * compile one immutable generation before any of their processes start.
@@ -731,9 +779,46 @@ export function prepareAgentEnableBatch(requests, {
             const manifestBytes = Object.fromEntries(
                 plans.map((plan) => [plan.routeKey, plan.manifestBytes]),
             );
-            if (effectiveAvailabilityMode === 'replacement') {
-                inactivateEdgeRoutingGeneration(`${reason}:source-stage`, { applyLockCapability });
+            const withdrawn = effectiveAvailabilityMode === 'replacement'
+                ? withdrawnReplacementEligible(plans, previousAgents, routing, policy)
+                : null;
+            let markersRetired = false;
+            if (withdrawn) {
                 retireNoWaitMarkers(supersededNoWaitRecords);
+                markersRetired = true;
+                try {
+                    commitWithdrawalEdgeRoutingGeneration({
+                        withdraw: [{
+                            containerName: withdrawn.plan.containerName,
+                            mode: 'drain',
+                            drainOwner: {
+                                containerName: withdrawn.plan.containerName,
+                                instanceId: String(withdrawn.predecessor.instanceId),
+                                enableGeneration: String(withdrawn.predecessor.enableGeneration),
+                                reason: 'replacement',
+                            },
+                        }],
+                        reason: `${reason}:withdraw`,
+                        applyLockCapability,
+                    });
+                    preparedGeneration = prepareWithdrawnReplacementEdgeRoutingGeneration({
+                        containerName: withdrawn.plan.containerName,
+                        agents: map,
+                        reason,
+                        applyLockCapability,
+                    });
+                } catch (error) {
+                    // A drain that succeeded leaves the route drained; the
+                    // inactive replacement below stages the plan's undrained
+                    // route, so it may still take over.
+                    if (preparedGeneration || edgeWithdrawalRefusalDisposition(error) === 'defer') throw error;
+                }
+            }
+            if (preparedGeneration) {
+                // Prepared beside the drained active predecessor.
+            } else if (effectiveAvailabilityMode === 'replacement') {
+                inactivateEdgeRoutingGeneration(`${reason}:source-stage`, { applyLockCapability });
+                if (!markersRetired) retireNoWaitMarkers(supersededNoWaitRecords);
                 saveAgents(map, { coordinate: false, applyLockCapability });
                 writeRoutingConfig(routing, { coordinate: false });
                 const policyFile = path.join(
@@ -920,7 +1005,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 || prepared.preparedGeneration?.preparationLease;
             await mps.verifyMpsRuntimeReady(started);
             withEdgeGenerationApplyLock((applyLockCapability) => {
-                if (finalLease?.mode === 'additive') {
+                // Additive and withdrawn leases keep their active predecessor
+                // selected until this commit publishes the ready runtime.
+                if (finalLease?.mode === 'additive' || finalLease?.mode === 'withdrawn') {
                     commitAdditiveEdgeRoutingGeneration(finalLease, {
                         routing: finalRouting,
                         agents: finalAgents,
@@ -1023,6 +1110,39 @@ function withAgentDisableLocks(operation, dependencies, callback) {
     ));
 }
 
+const DISABLE_BUSY_WAIT_MS = 10 * 60 * 1000;
+const DISABLE_BUSY_RETRY_MS = 250;
+
+// A disable withdraws its routes only while no lifecycle preparation is
+// outstanding and the edge lock is free. Both refusals happen before any
+// mutation, so the disable releases its locks (the preparation owner needs
+// them to finish) and retries until the workspace mutation lease wait elapses.
+// A preparation whose owner process stopped can never finish, so the disable
+// refuses at once instead of waiting (a caller reusing a held workspace lease
+// would otherwise hold it for the whole wait).
+async function withAgentDisableRetry(operation, dependencies, callback) {
+    const waitMs = Math.max(0, Number(dependencies.workspaceLeaseWaitMs ?? DISABLE_BUSY_WAIT_MS) || 0);
+    const retryMs = Math.max(1, Number(dependencies.disableBusyRetryMs ?? DISABLE_BUSY_RETRY_MS) || DISABLE_BUSY_RETRY_MS);
+    const ownerStopped = dependencies.preparationOwnerStopped || edgePreparationOwnerStopped;
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+        try {
+            return await withAgentDisableLocks(operation, dependencies, callback);
+        } catch (error) {
+            if (edgeWithdrawalRefusalDisposition(error) !== 'defer' || Date.now() + retryMs > deadline) throw error;
+            if (error?.code === 'EDGE_PREPARATION_BUSY') {
+                const owner = error.preparationOwner;
+                if (owner && ownerStopped(owner)) {
+                    error.message += `; its owner pid ${owner.pid} stopped, so waiting cannot clear it`;
+                    error.preparationOwnerStopped = true;
+                    throw error;
+                }
+            }
+        }
+        await new Promise((resolve) => setTimeout(resolve, retryMs));
+    }
+}
+
 // The edge generation digest covers the raw registry and routing bytes, so a
 // rollback restores exactly what was read; re-serialized objects could select
 // a different generation than the one this disable inactivated.
@@ -1073,20 +1193,37 @@ function rollBackRefusedAgentDisable(prepared, snapshot, refusal, {
     let outcome;
     try {
         withApplyLock((applyLockCapability) => {
-            abortPreparation(prepared?.preparationLease, { reason, applyLockCapability });
+            if (prepared?.preparationLease) {
+                abortPreparation(prepared.preparationLease, { reason, applyLockCapability });
+            }
             restoreSourcesImpl(snapshot);
             restored = true;
         }, { preparationLease: prepared?.preparationLease });
         const prior = snapshot?.selector;
         if (prior?.state === 'active' && prior.generation) {
-            applyGeneration({ reason, expectedGeneration: prior.generation });
+            // A withdrawal left its own active generation selected; the prior
+            // one publishes the same semantics and keeps its readiness.
+            let publicationPredecessor;
+            if (!prepared?.preparationLease) {
+                try {
+                    const { selector } = readEdgeRoutingSelection();
+                    if (selector?.state === 'active') publicationPredecessor = selector;
+                } catch (_) {}
+            }
+            applyGeneration({
+                reason,
+                expectedGeneration: prior.generation,
+                ...(publicationPredecessor ? { publicationPredecessor } : {}),
+            });
             outcome = 'its registration and routing were restored';
         } else {
             outcome = 'its registration and routing were restored; the routing generation was not active before this disable and stays inactive';
         }
     } catch (restoreError) {
         try { inactivateGeneration(`${reason}-failed`, { preserveSelectedGeneration: true }); } catch (_) {}
-        try { abortPreparation(prepared?.preparationLease, { reason: `${reason}-failed` }); } catch (_) {}
+        if (prepared?.preparationLease) {
+            try { abortPreparation(prepared.preparationLease, { reason: `${reason}-failed` }); } catch (_) {}
+        }
         outcome = restored
             ? `its registration and routing were restored, but the prior routing generation could not be reactivated (${restoreError?.message || restoreError}); routing stays inactive`
             : `restoring its prior registration failed (${restoreError?.message || restoreError}); routing stays inactive`;
@@ -1097,6 +1234,10 @@ function rollBackRefusedAgentDisable(prepared, snapshot, refusal, {
     return error;
 }
 
+// Withdraw the disabled runtimes' routes and registry records from the active
+// generation before any runtime is touched (D3). Only a withdrawal that cannot
+// be proven a strict subset falls back to the inactive route-removal staging
+// committed after physical removal; contention is left to the caller's retry.
 function stageAgentDisableGeneration(map, disabledRecords, {
     reason,
     inactivateGeneration = inactivateEdgeRoutingGeneration,
@@ -1106,15 +1247,39 @@ function stageAgentDisableGeneration(map, disabledRecords, {
     prepareGeneration = prepareEdgeRoutingGeneration,
     withApplyLock = withEdgeGenerationApplyLock,
     retireNoWaitMarkersImpl = retireNoWaitRunMarkers,
+    commitWithdrawal = commitWithdrawalEdgeRoutingGeneration,
+    readPreparationOwner = readEdgeRoutingPreparationOwner,
 } = {}) {
     return withApplyLock((applyLockCapability) => {
-        inactivateGeneration(reason, { applyLockCapability });
+        const preparationOwner = readPreparationOwner();
+        if (preparationOwner) {
+            const busy = new Error('disable agent: an edge lifecycle preparation is outstanding');
+            busy.code = 'EDGE_PREPARATION_BUSY';
+            busy.preparationOwner = preparationOwner;
+            throw busy;
+        }
         retireNoWaitMarkersImpl(disabledRecords.map(({ containerName, record }) => (
             record?.type === 'agent'
                 ? { containerName, record }
                 : containerName
         )));
         const routing = removeDisabledRoutes(readRoutingImpl(), disabledRecords);
+        try {
+            const withdrawn = commitWithdrawal({
+                withdraw: disabledRecords.map(({ containerName }) => ({ containerName, mode: 'remove' })),
+                routing,
+                agents: map,
+                reason: `${reason}:withdraw`,
+                applyLockCapability,
+            });
+            if (withdrawn?.selector?.state !== 'active') {
+                throw new Error('disable agent: route withdrawal did not keep an active generation');
+            }
+            return { withdrawn };
+        } catch (error) {
+            if (edgeWithdrawalRefusalDisposition(error) === 'defer') throw error;
+        }
+        inactivateGeneration(reason, { applyLockCapability });
         saveAgentsImpl(map, { coordinate: false, applyLockCapability });
         writeRoutingImpl(routing, { coordinate: false, applyLockCapability });
         const prepared = prepareGeneration({ reason, applyLockCapability });
@@ -1149,6 +1314,24 @@ function commitAgentDisableGeneration(prepared, {
         } catch (_) {}
         throw error;
     }
+}
+
+// The routes were already withdrawn from an active generation, so nothing can
+// reach the runtime any more. It may still exist; report it for cleanup.
+function orphanedDisableRuntimeError(message, disabledRecords, cause) {
+    const error = new Error(`${message}: ${cause?.message || cause}; its routes and registration stay withdrawn and the runtime may still exist`);
+    error.code = 'PLOINKY_AGENT_DISABLE_RUNTIME_ORPHANED';
+    error.cause = cause;
+    error.cleanupReceipt = Object.freeze({
+        reason: 'agent-disable-runtime-removal-failed',
+        runtimes: Object.freeze(disabledRecords.map(({ containerName, record }) => Object.freeze({
+            containerName,
+            ...(record?.containerId ? { containerId: String(record.containerId) } : {}),
+            ...(record?.instanceId ? { instanceId: String(record.instanceId) } : {}),
+            ...(record?.enableGeneration ? { enableGeneration: String(record.enableGeneration) } : {}),
+        }))),
+    });
+    return error;
 }
 
 function removeDisabledRuntimes(disabledRecords, {
@@ -1347,7 +1530,7 @@ export async function disableAgent(agentRef, dependencies = {}) {
         [targetRepo, targetAgent] = parts;
     }
 
-    return withAgentDisableLocks('agent-disable', dependencies, () => disableAgentLocked(
+    return withAgentDisableRetry('agent-disable', dependencies, () => disableAgentLocked(
         { input, hasNamespace, targetRepo, targetAgent },
         dependencies,
     ));
@@ -1456,6 +1639,13 @@ function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, de
                         reason: 'agent-disable-static-runtime-removal-refused',
                     });
                 }
+                if (prepared.withdrawn) {
+                    throw orphanedDisableRuntimeError(
+                        `disable agent: failed to stop and remove static runtime '${staticContainer}'`,
+                        disabledStaticRecords,
+                        error,
+                    );
+                }
                 try {
                     inactivateGeneration('agent-disable-static-runtime-removal-failed', {
                         preserveSelectedGeneration: true,
@@ -1468,12 +1658,14 @@ function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, de
                 } catch (_) {}
                 throw new Error(`disable agent: failed to stop and remove static runtime '${staticContainer}': ${error?.message || error}`);
             }
-            commitAgentDisableGeneration(prepared, {
-                reason: 'agent-disable-static-commit',
-                applyGeneration,
-                inactivateGeneration,
-                abortPreparation,
-            });
+            if (!prepared.withdrawn) {
+                commitAgentDisableGeneration(prepared, {
+                    reason: 'agent-disable-static-commit',
+                    applyGeneration,
+                    inactivateGeneration,
+                    abortPreparation,
+                });
+            }
             return {
                 status: 'static-removed',
                 requested: input
@@ -1524,6 +1716,13 @@ function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, de
                 reason: 'agent-disable-runtime-removal-refused',
             });
         }
+        if (prepared.withdrawn) {
+            throw orphanedDisableRuntimeError(
+                `disable agent: failed to stop and remove container '${containerName}'`,
+                disabledRecords,
+                error,
+            );
+        }
         try {
             inactivateGeneration('agent-disable-runtime-removal-failed', {
                 preserveSelectedGeneration: true,
@@ -1532,12 +1731,14 @@ function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, de
         try { abortPreparation(prepared.preparationLease, { reason: 'agent-disable-runtime-removal-failed' }); } catch (_) {}
         throw new Error(`disable agent: failed to stop and remove container '${containerName}': ${error?.message || error}`);
     }
-    commitAgentDisableGeneration(prepared, {
-        reason: 'agent-disable-commit',
-        applyGeneration,
-        inactivateGeneration,
-        abortPreparation,
-    });
+    if (!prepared.withdrawn) {
+        commitAgentDisableGeneration(prepared, {
+            reason: 'agent-disable-commit',
+            applyGeneration,
+            inactivateGeneration,
+            abortPreparation,
+        });
+    }
 
     // Remove workspace structure for the agent
     try {
@@ -1564,7 +1765,7 @@ export async function disableAgentContainers(containerNames = [], dependencies =
         .filter(Boolean)));
     if (!targets.length) return [];
 
-    return withAgentDisableLocks('agent-disable-batch', dependencies, () => disableAgentContainersLocked(
+    return withAgentDisableRetry('agent-disable-batch', dependencies, () => disableAgentContainersLocked(
         targets,
         dependencies,
     ));
@@ -1656,6 +1857,9 @@ function disableAgentContainersLocked(targets, dependencies) {
                 reason: 'agent-disable-batch-runtime-removal-refused',
             });
         }
+        if (prepared.withdrawn) {
+            throw orphanedDisableRuntimeError('disable agents: failed to stop and remove containers', disabledRecords, error);
+        }
         try {
             inactivateGeneration('agent-disable-batch-runtime-removal-failed', {
                 preserveSelectedGeneration: true,
@@ -1664,12 +1868,14 @@ function disableAgentContainersLocked(targets, dependencies) {
         try { abortPreparation(prepared.preparationLease, { reason: 'agent-disable-batch-runtime-removal-failed' }); } catch (_) {}
         throw new Error(`disable agents: failed to stop and remove containers: ${error?.message || error}`);
     }
-    commitAgentDisableGeneration(prepared, {
-        reason: 'agent-disable-batch-commit',
-        applyGeneration,
-        inactivateGeneration,
-        abortPreparation,
-    });
+    if (!prepared.withdrawn) {
+        commitAgentDisableGeneration(prepared, {
+            reason: 'agent-disable-batch-commit',
+            applyGeneration,
+            inactivateGeneration,
+            abortPreparation,
+        });
+    }
 
     for (const item of disabledRuntimeRecords) {
         try {

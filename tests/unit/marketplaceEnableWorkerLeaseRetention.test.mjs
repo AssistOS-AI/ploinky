@@ -76,3 +76,49 @@ test('a real Worker that exits abnormally while holding a real workspace lease l
         fs.rmSync(scratch, { recursive: true, force: true });
     }
 });
+
+// The no-wait dependency chain runs outside the enable queue, so two real
+// enable workers of one Router process can overlap. The workspace mutation
+// lease, a lock file created exclusively, is what must keep them apart.
+test('two real enable workers of one process hold the real workspace lease one at a time', () => {
+    const scratch = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-marketplace-lease-')));
+    try {
+        const workspaceRoot = path.join(scratch, 'workspace');
+        const home = path.join(scratch, 'home');
+        fs.mkdirSync(path.join(workspaceRoot, '.ploinky'), { recursive: true });
+        fs.mkdirSync(home, { recursive: true });
+        const intervalLog = path.join(scratch, 'intervals.jsonl');
+        const script = String.raw`
+            const { runMarketplaceEnableWorker } = await import(${JSON.stringify(moduleUrl('cli/server/marketplaceEnableWorker.js'))});
+            const run = (agentRef) => runMarketplaceEnableWorker({ agentRef, mode: 'global' }, {
+                workerUrl: new URL(${JSON.stringify(moduleUrl('tests/fixtures/marketplace-enable-lease-hold-worker.mjs'))}),
+                timeoutMs: 30000,
+            });
+            const results = await Promise.all([run('repo/first'), run('repo/second'), run('repo/third')]);
+            process.stdout.write('RESULT:' + JSON.stringify(results.map((entry) => entry.agent)) + '\n');
+        `;
+        const env = { ...process.env, HOME: home, PLOINKY_WORKSPACE_ROOT: workspaceRoot, PLOINKY_TEST_LEASE_LOG: intervalLog };
+        delete env.PLOINKY_ROOT;
+        const driver = path.join(scratch, 'driver.mjs');
+        fs.writeFileSync(driver, script);
+        const output = execFileSync(process.execPath, [driver], {
+            cwd: workspaceRoot, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000,
+        });
+        const line = output.split('\n').find(entry => entry.startsWith('RESULT:'));
+        assert.ok(line, output);
+        assert.deepEqual(JSON.parse(line.slice('RESULT:'.length)).sort(), ['repo/first', 'repo/second', 'repo/third']);
+
+        const events = fs.readFileSync(intervalLog, 'utf8').trim().split('\n').map((entry) => JSON.parse(entry));
+        assert.equal(events.length, 6);
+        // Strict alternation in append order: every enter is followed by its own exit before the next enter.
+        events.forEach((event, index) => {
+            assert.equal(event.event, index % 2 === 0 ? 'enter' : 'exit', JSON.stringify(events));
+            if (index % 2 === 1) assert.equal(event.agent, events[index - 1].agent, JSON.stringify(events));
+        });
+        for (let index = 2; index < events.length; index += 2) {
+            assert.ok(events[index].at >= events[index - 1].at, 'the next worker entered only after the previous one exited');
+        }
+    } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+    }
+});

@@ -259,7 +259,7 @@ workspace therefore performs no MCP SDK Git or npm operation and needs no
 GitHub credentials. Ploinky compares the SDK with no expected revision and
 hashes none of its files.
 
-Automatic repository bootstrap prepares `AchillesIDE`, `AchillesCLI`, and `copilot-agents`, reusing matching workspace checkouts before cloning missing repositories into `.ploinky/repos`. Explorer's manifest declares its additional repositories and uses `AchillesIDE/liveKitServerAgent` for LiveKit. The `basic` repository is optional: install it explicitly with `ploinky install repo basic` when needed.
+Automatic repository bootstrap prepares `AchillesIDE`, `AchillesCLI`, and `copilot-agents`, reusing matching workspace checkouts before cloning missing repositories into `.ploinky/repos`. Explorer's manifest declares its additional repositories and uses `webmeet/liveKitServerAgent` for LiveKit (the WebMeet agents live in the `webmeet` repository; `multimedia`, `soplangAgent`, `tasksAgent` and `webAssist` live in `legacy-agents`; `soul-gateway` and `roboTeamAgent` live in `AchillesIDE`). The `basic` repository is optional: install it explicitly with `ploinky install repo basic` when needed.
 
 ### Agent repositories in the workspace
 
@@ -520,6 +520,32 @@ connector origin is always in-box `http://127.0.0.1:8080`.
 Managed names are 1-48 characters; Ploinky appends a unique ownership suffix.
 Changing the requested name retains the previous tunnel until that name is
 selected with an explicit empty-host teardown.
+
+A desired host may name a `rootApplication`, `{ "agent": "<repo>/<agent>",
+"port": <1-65535> }`, next to its owner `agent`. The owner remains the host's
+selected route: Router surfaces, browser authentication, the CSRF host binding
+and user administration keep the owner's context and capability checks. The
+root application serves every other path at the host root through its
+`/base-agent-additional-server/<agent>/<port>` relay with an empty
+`X-Forwarded-Prefix`, under its own manifest route policy; `/admin*` reaches it
+only through an explicit manifest route. The owner stays reachable under
+`/<owner>/`, and a bare `/<owner>` GET or HEAD returns `302` to `/<owner>/`
+with `Cache-Control: no-store`. The unqualified `/mcp` surface stays the
+owner's, while `/<route>/mcp` and declared dependency routes admit the union of
+both agents' `enable` closures. The root application must name exactly one
+installed route other than the owner's. When it is disabled or draining it
+answers `404 AGENT_OWNER_INACTIVE`, and when its record has no running
+container `503 AGENT_RUNTIME_INACTIVE`, while the owner keeps serving.
+
+A host may also set `dnsManagement: "external"` when another operator owns its
+DNS record; this requires an API-managed tunnel. The Box then manages that
+host's tunnel ingress, probes and readiness like any other host, but never
+reads, creates, updates or deletes its DNS record. A host whose DNS record the
+Box still owns cannot become external: publication refuses with
+`CLOUDFLARE_EXTERNAL_DNS_TRANSFER_REFUSED` before any ingress or DNS change.
+Coordinators that replace the desired state can first compile the candidate
+bytes against the current sources with `validateEdgeDesiredCandidate`, which
+writes nothing.
 
 Ordinary agent images intentionally contain neither Podman nor Docker. Every
 Ploinky-managed agent and helper container runs through nested Podman inside the

@@ -316,6 +316,18 @@ function createHarness({
             routes.active = false;
             routes.hosts = {};
         },
+        adopts: [],
+        failAdoptOnce: null,
+        async adopt(input) {
+            events.push({ event: 'routes.adopt', input: structuredClone(input) });
+            if (routes.failAdoptOnce) {
+                const error = routes.failAdoptOnce;
+                routes.failAdoptOnce = null;
+                throw error;
+            }
+            routes.adopts.push(structuredClone(input));
+            return { selector: { generation: input.configurationGeneration } };
+        },
         async inactivateForStop(input) {
             events.push({ event: 'routes.inactivateForStop', input: structuredClone(input) });
             if (!routes.active) return null;
@@ -1400,4 +1412,486 @@ test('unexpected connector exits use bounded exact-state restart and stop after 
     assert.equal(harness.connector.starts, 2);
     assert.equal(harness.routes.active, false);
     assert.equal(harness.controller.getStatus().state, 'error');
+});
+
+// A1 to A3: a generation that changes only agent routes keeps the publication
+// semantics its predecessor's ready proof covered, so the controller adopts it
+// without replacing the running connector. These tests use only the
+// controller's public entry points and the harness.
+function eventCount(harness, name) {
+    return harness.events.filter((entry) => entry.event === name).length;
+}
+
+const ROUTE_ONLY_CASES = [
+    ['api-managed', (generationCharacter, hostnames = ['office.example.test']) => (
+        desired(hostnames, generationCharacter)
+    )],
+    ['connector-only', (generationCharacter, hostnames = ['office.example.test']) => (
+        connectorDesired(hostnames, generationCharacter)
+    )],
+];
+
+for (const [label, build] of ROUTE_ONLY_CASES) {
+    test(`A1 a route-only generation change adopts the ready ${label} publication without stopping the connector`, async () => {
+        const harness = createHarness();
+        const first = build('a');
+        const second = { ...build('b'), selectedPublicationState: 'ready' };
+        await harness.controller.reconcile(first, { reason: 'selected-edge-generation' });
+        assert.equal(harness.controller.getStatus().state, 'ready');
+        const stops = eventCount(harness, 'connector.stop');
+        const inactivations = eventCount(harness, 'routes.inactivate');
+        const commits = harness.routes.commits.length;
+        const publishedBefore = harness.states.length;
+
+        const status = await harness.controller.reconcile(second, { reason: 'selected-edge-generation' });
+
+        assert.equal(eventCount(harness, 'connector.stop') - stops, 0, 'the connector must not stop');
+        assert.equal(eventCount(harness, 'routes.inactivate') - inactivations, 0, 'no selector inactivation');
+        assert.equal(harness.connector.starts, 1, 'the connector must not start again');
+        assert.equal(status.state, 'ready');
+        assert.equal(status.connectorState, 'running');
+        assert.equal(status.configurationGeneration, second.configurationGeneration);
+        assert.equal(harness.controller.getStatus().configurationGeneration, second.configurationGeneration);
+        assert.equal(harness.routes.adopts.length, 1);
+        assert.equal(harness.routes.adopts[0].configurationGeneration, second.configurationGeneration);
+        assert.match(harness.routes.adopts[0].semanticDigest, /^sha256:[a-f0-9]{64}$/);
+        assert.equal(harness.routes.commits.length, commits, 'the CLI already committed ready');
+        assert.equal(harness.events.some((entry) => entry.event === 'routes.inactivateForStop'), false);
+        assert.ok(harness.states.length > publishedBefore, 'the adopted generation must be published');
+        assert.equal(harness.states.at(-1).configurationGeneration, second.configurationGeneration);
+        assert.equal(harness.states.at(-1).state, 'ready');
+        assert.equal(
+            harness.audits.filter((entry) => entry.event === 'cloudflare-reconcile-adopted-ready'
+                && entry.value.semantic === true
+                && entry.value.configurationGeneration === second.configurationGeneration).length,
+            1,
+        );
+    });
+
+    test(`A1 a route-only ${label} generation that is still reconciling commits ready once and keeps the connector`, async () => {
+        const harness = createHarness();
+        const first = build('a');
+        const second = { ...build('b'), selectedPublicationState: 'reconciling' };
+        await harness.controller.reconcile(first, { reason: 'selected-edge-generation' });
+        const stops = eventCount(harness, 'connector.stop');
+        const inactivations = eventCount(harness, 'routes.inactivate');
+        const commits = harness.routes.commits.length;
+
+        const status = await harness.controller.reconcile(second, { reason: 'selected-edge-generation-retry' });
+
+        assert.equal(eventCount(harness, 'connector.stop') - stops, 0);
+        assert.equal(eventCount(harness, 'routes.inactivate') - inactivations, 0);
+        assert.equal(harness.connector.starts, 1);
+        assert.equal(status.state, 'ready');
+        assert.equal(status.configurationGeneration, second.configurationGeneration);
+        assert.equal(harness.routes.adopts.length, 1);
+        assert.equal(harness.routes.commits.length, commits + 1);
+        assert.equal(harness.routes.commits.at(-1).publicationState, 'ready');
+        assert.equal(harness.routes.commits.at(-1).configurationGeneration, second.configurationGeneration);
+        assert.equal(harness.routes.active, true);
+    });
+}
+
+test('A1 concurrent identical route-only generation requests share one adoption', async () => {
+    const harness = createHarness();
+    await harness.controller.reconcile(desired(['office.example.test'], 'a'), { reason: 'selected-edge-generation' });
+    const second = { ...desired(['office.example.test'], 'b'), selectedPublicationState: 'ready' };
+    const adopted = harness.controller.reconcile(second, { reason: 'selected-edge-generation' });
+    const coalesced = harness.controller.reconcile(second, { reason: 'selected-edge-generation-retry' });
+    assert.equal(coalesced, adopted);
+    await adopted;
+    assert.equal(harness.routes.adopts.length, 1);
+    assert.equal(eventCount(harness, 'connector.stop'), 1);
+});
+
+test('A1 control: a coordinator without adopt() keeps the full reconcile for a route-only generation', async () => {
+    const harness = createHarness();
+    await harness.controller.reconcile(desired(['office.example.test'], 'a'), { reason: 'selected-edge-generation' });
+    harness.routes.adopt = undefined;
+    await harness.controller.reconcile(
+        { ...desired(['office.example.test'], 'b'), selectedPublicationState: 'ready' },
+        { reason: 'selected-edge-generation' },
+    );
+    assert.equal(eventCount(harness, 'connector.stop'), 2);
+    assert.equal(harness.connector.starts, 2);
+});
+
+test('A1 a failed adoption takes the full reconcile on retry instead of adopting again', async () => {
+    const harness = createHarness();
+    await harness.controller.reconcile(desired(['office.example.test'], 'a'), { reason: 'selected-edge-generation' });
+    const second = { ...desired(['office.example.test'], 'b'), selectedPublicationState: 'ready' };
+    const refusal = Object.assign(new Error('semantics changed'), {
+        code: 'CLOUDFLARE_ADOPTION_SEMANTICS_CHANGED',
+    });
+    harness.routes.failAdoptOnce = refusal;
+    await assert.rejects(
+        harness.controller.reconcile(second, { reason: 'selected-edge-generation' }),
+        (error) => error === refusal,
+    );
+    assert.equal(eventCount(harness, 'connector.stop'), 1, 'the failed adoption itself must not stop the connector');
+    assert.equal(harness.controller.getStatus().configurationGeneration, desired([], 'a').configurationGeneration);
+
+    const status = await harness.controller.reconcile(second, { reason: 'selected-edge-generation-retry' });
+
+    assert.equal(harness.routes.adopts.length, 0, 'the retry must not trust the ready proof again');
+    assert.equal(eventCount(harness, 'connector.stop'), 2);
+    assert.equal(harness.connector.starts, 2);
+    assert.equal(status.state, 'ready');
+    assert.equal(status.configurationGeneration, second.configurationGeneration);
+});
+
+test('A1 connector exit during a route-only adoption commit cannot leave the adopted selector active', async () => {
+    const harness = createHarness({ restartPolicy: { maximumRestarts: 0 } });
+    await harness.controller.reconcile(desired(['office.example.test'], 'a'), { reason: 'selected-edge-generation' });
+    const second = { ...desired(['office.example.test'], 'b'), selectedPublicationState: 'reconciling' };
+    harness.routes.onCommitOnce = () => harness.connector.exit({ code: 7 });
+    await assert.rejects(
+        harness.controller.reconcile(second, { reason: 'selected-edge-generation' }),
+        (error) => error.code === 'CLOUDFLARED_NOT_RUNNING' && error.operation === 'adopt-ready-route',
+    );
+    await waitFor(() => harness.controller.getStatus().state === 'error');
+    assert.equal(harness.routes.active, false);
+    assert.ok(harness.events.some((entry) => entry.event === 'routes.inactivate'
+        && entry.input.reason === 'cloudflared-exit-during-route-adoption'
+        && entry.input.configurationGeneration === second.configurationGeneration));
+});
+
+test('A1 control: a route-only generation after a connector exit never adopts a stale ready proof', async () => {
+    const harness = createHarness({ restartPolicy: { maximumRestarts: 0 } });
+    await harness.controller.reconcile(desired(['office.example.test'], 'a'), { reason: 'selected-edge-generation' });
+    harness.connector.exit({ code: 1 });
+    await waitFor(() => harness.controller.getStatus().state === 'error');
+    const status = await harness.controller.reconcile(
+        { ...desired(['office.example.test'], 'b'), selectedPublicationState: 'ready' },
+        { reason: 'selected-edge-generation' },
+    );
+    assert.equal(harness.routes.adopts.length, 0);
+    assert.equal(harness.connector.starts, 2);
+    assert.equal(status.state, 'ready');
+});
+
+const SEMANTIC_CHANGE_CASES = [
+    ['a different host', () => ({
+        first: desired(['office.example.test'], 'a'),
+        second: desired(['office.example.test', 'meet.example.test'], 'b'),
+        secrets: undefined,
+    })],
+    ['a different secret handle', () => ({
+        first: desired(['office.example.test'], 'a'),
+        second: desired(['office.example.test'], 'b', { apiTokenSecret: 'publication/cloudflare-api-next' }),
+        secrets: {
+            'publication/cloudflare-connector': CONNECTOR_TOKEN,
+            'publication/cloudflare-api': API_TOKEN,
+            'publication/cloudflare-api-next': 'api-secret-next-value',
+        },
+    })],
+    ['a different tunnel', () => ({
+        first: desired(['office.example.test'], 'a'),
+        second: desired(['office.example.test'], 'b', { tunnelId: 'tunnel_456' }),
+        secrets: undefined,
+    })],
+    ['a different host route key', () => ({
+        first: { ...desired(['office.example.test'], 'a'), hostRouteKeys: { 'office.example.test': 'route-one' } },
+        second: { ...desired(['office.example.test'], 'b'), hostRouteKeys: { 'office.example.test': 'route-two' } },
+        secrets: undefined,
+    })],
+];
+
+for (const [label, build] of SEMANTIC_CHANGE_CASES) {
+    test(`A2 control: ${label} still stops the connector, inactivates and re-proves`, async () => {
+        const { first, second, secrets } = build();
+        const harness = createHarness(secrets ? { secrets } : {});
+        await harness.controller.reconcile(first, { reason: 'selected-edge-generation' });
+        const stops = eventCount(harness, 'connector.stop');
+        const inactivations = eventCount(harness, 'routes.inactivate');
+        const probes = eventCount(harness, 'probe.hostname');
+
+        const status = await harness.controller.reconcile(
+            { ...second, selectedPublicationState: 'ready' },
+            { reason: 'selected-edge-generation' },
+        );
+
+        assert.equal(eventCount(harness, 'connector.stop') - stops, 1);
+        assert.equal(eventCount(harness, 'routes.inactivate') - inactivations, 1);
+        assert.ok(eventCount(harness, 'probe.hostname') > probes, 'the new publication must be proven again');
+        assert.equal(harness.connector.starts, 2);
+        assert.equal(harness.routes.adopts.length, 0);
+        assert.equal(status.state, 'ready');
+        assert.equal(status.configurationGeneration, second.configurationGeneration);
+    });
+}
+
+function createEdgeFixture() {
+    const generations = new Map();
+    const selectorState = { selector: null, activations: 0, inactivations: 0 };
+    const inactivations = [];
+    const applies = [];
+    const stopped = [];
+    const registered = (input) => ({
+        desired: {
+            cloudflare: structuredClone(input.cloudflare),
+            hosts: structuredClone(input.hosts),
+        },
+        compiled: {
+            hosts: Object.fromEntries(Object.keys(input.hosts).map((hostname) => [
+                hostname,
+                { routeKey: String(input.hostRouteKeys?.[hostname] || `route-${hostname}`) },
+            ])),
+        },
+    });
+    const fixture = {
+        inactivations,
+        applies,
+        stopped,
+        failApplyOnce: null,
+        get selector() { return structuredClone(selectorState.selector); },
+        // Stands in for the CLI committing a generation.
+        activate(input, publicationState) {
+            generations.set(input.configurationGeneration, registered(input));
+            selectorState.activations += 1;
+            selectorState.selector = {
+                state: 'active',
+                generation: input.configurationGeneration,
+                activationId: `activation-${selectorState.activations}`,
+                publicationState,
+            };
+        },
+        edgeOps: {
+            load() {
+                if (selectorState.selector?.state !== 'active') {
+                    throw Object.assign(new Error('edge generation inactive'), {
+                        code: 'EDGE_GENERATION_INACTIVE',
+                    });
+                }
+                return {
+                    selector: structuredClone(selectorState.selector),
+                    generation: structuredClone(generations.get(selectorState.selector.generation)),
+                };
+            },
+            selection() { return { selector: structuredClone(selectorState.selector) }; },
+            inactivate(reason, options = {}) {
+                const current = selectorState.selector;
+                if (options.expectedActiveSelector
+                    && (current?.state !== 'active'
+                        || current.generation !== options.expectedActiveSelector.generation
+                        || current.activationId !== options.expectedActiveSelector.activationId)) {
+                    throw Object.assign(new Error('selector changed'), { code: 'EDGE_SELECTOR_CHANGED' });
+                }
+                inactivations.push({ reason, options: structuredClone(options) });
+                selectorState.inactivations += 1;
+                selectorState.selector = {
+                    state: 'inactive',
+                    reason,
+                    previousGeneration: current?.generation,
+                    activationId: `inactive-${selectorState.inactivations}`,
+                };
+                return structuredClone(selectorState.selector);
+            },
+            apply({ publicationState, expectedGeneration }) {
+                if (fixture.failApplyOnce?.publicationState === publicationState) {
+                    const { error } = fixture.failApplyOnce;
+                    fixture.failApplyOnce = null;
+                    throw error;
+                }
+                applies.push({ publicationState, expectedGeneration });
+                selectorState.activations += 1;
+                selectorState.selector = {
+                    state: 'active',
+                    generation: expectedGeneration,
+                    activationId: `activation-${selectorState.activations}`,
+                    publicationState,
+                };
+                return {
+                    selector: structuredClone(selectorState.selector),
+                    generation: structuredClone(generations.get(expectedGeneration)),
+                };
+            },
+        },
+    };
+    return fixture;
+}
+
+// Builds the controller input the runtime derives from an active generation.
+function edgeInput(base) {
+    return {
+        ...base,
+        hostRouteKeys: Object.fromEntries(Object.keys(base.hosts).map((hostname) => [
+            hostname,
+            `route-${hostname}`,
+        ])),
+    };
+}
+
+async function createReadyEdgeHarness(build, options = {}) {
+    const fixture = createEdgeFixture();
+    const routeCoordinator = createEdgePublicationRouteCoordinator({
+        workspaceRoot: '/fixture',
+        edgeOps: fixture.edgeOps,
+        onStopInactivation: (record) => fixture.stopped.push(record),
+        sleep: async () => {},
+    });
+    const harness = createHarness({
+        routeCoordinator,
+        restartPolicy: options.restartPolicy || { maximumRestarts: 0 },
+    });
+    const first = edgeInput(build('a'));
+    fixture.activate(first, 'reconciling');
+    await harness.controller.reconcile(
+        { ...first, selectedPublicationState: 'reconciling' },
+        { reason: 'selected-edge-generation' },
+    );
+    assert.equal(harness.controller.getStatus().state, 'ready');
+    assert.equal(fixture.selector.publicationState, 'ready');
+    return { fixture, harness, first };
+}
+
+test('A3 exit after adopting a route-only generation inactivates the adopted selector (api-managed)', async () => {
+    const { fixture, harness } = await createReadyEdgeHarness((character) => desired(['office.example.test'], character));
+    const second = edgeInput(desired(['office.example.test'], 'b'));
+    fixture.activate(second, 'ready');
+    const inactivationsBefore = fixture.inactivations.length;
+    const stopsBefore = eventCount(harness, 'connector.stop');
+
+    const status = await harness.controller.reconcile(
+        { ...second, selectedPublicationState: 'ready' },
+        { reason: 'selected-edge-generation' },
+    );
+    assert.equal(status.configurationGeneration, second.configurationGeneration);
+    assert.equal(fixture.inactivations.length, inactivationsBefore, 'adoption must not inactivate');
+    assert.equal(eventCount(harness, 'connector.stop'), stopsBefore, 'adoption must not stop the connector');
+    assert.equal(fixture.selector.state, 'active');
+
+    harness.connector.exit({ code: 9 });
+    await waitFor(() => harness.controller.getStatus().state === 'error');
+
+    assert.equal(fixture.selector.state, 'inactive');
+    assert.equal(fixture.selector.reason, 'cloudflared-exit');
+    assert.equal(fixture.selector.previousGeneration, second.configurationGeneration);
+    assert.equal(fixture.inactivations.length, inactivationsBefore + 1);
+});
+
+test('A3 exit after adopting a route-only generation commits error on the adopted generation (connector-only)', async () => {
+    const { fixture, harness } = await createReadyEdgeHarness((character) => connectorDesired(['office.example.test'], character));
+    const second = edgeInput(connectorDesired(['office.example.test'], 'b'));
+    fixture.activate(second, 'ready');
+    await harness.controller.reconcile(
+        { ...second, selectedPublicationState: 'ready' },
+        { reason: 'selected-edge-generation' },
+    );
+    assert.equal(eventCount(harness, 'connector.stop'), 1);
+
+    harness.connector.exit({ code: 9 });
+    await waitFor(() => harness.controller.getStatus().state === 'error');
+
+    assert.equal(fixture.inactivations.at(-1).reason, 'cloudflared-exit');
+    assert.deepEqual(fixture.applies.at(-1), {
+        publicationState: 'error',
+        expectedGeneration: second.configurationGeneration,
+    });
+    assert.equal(fixture.selector.state, 'active');
+    assert.equal(fixture.selector.publicationState, 'error');
+});
+
+test('A3 exit inactivates a same-semantics generation the CLI activated before the controller adopted it', async () => {
+    const { fixture, harness } = await createReadyEdgeHarness((character) => desired(['office.example.test'], character));
+    const unadopted = edgeInput(desired(['office.example.test'], 'c'));
+    fixture.activate(unadopted, 'ready');
+    const unadoptedActivationId = fixture.selector.activationId;
+
+    harness.connector.exit({ code: 9 });
+    await waitFor(() => harness.controller.getStatus().state === 'error');
+
+    assert.equal(fixture.selector.state, 'inactive');
+    assert.equal(fixture.selector.previousGeneration, unadopted.configurationGeneration);
+    const exitInactivation = fixture.inactivations.find((entry) => entry.reason === 'cloudflared-exit');
+    assert.ok(exitInactivation, 'the exit path must inactivate the selector');
+    assert.deepEqual(exitInactivation.options.expectedActiveSelector, {
+        generation: unadopted.configurationGeneration,
+        activationId: unadoptedActivationId,
+    });
+});
+
+test('A3 control: exit does not inactivate a newer generation whose publication semantics differ', async () => {
+    const { fixture, harness } = await createReadyEdgeHarness((character) => desired(['office.example.test'], character));
+    const different = edgeInput(desired(['office.example.test', 'meet.example.test'], 'd'));
+    fixture.activate(different, 'reconciling');
+    const inactivationsBefore = fixture.inactivations.length;
+
+    harness.connector.exit({ code: 9 });
+    await waitFor(() => harness.controller.getStatus().state === 'error');
+
+    assert.equal(fixture.inactivations.length, inactivationsBefore);
+    assert.equal(fixture.selector.state, 'active');
+    assert.equal(fixture.selector.generation, different.configurationGeneration);
+});
+
+test('A3 the bounded restart after an exit on an unadopted generation recovers on that generation', async () => {
+    const { fixture, harness } = await createReadyEdgeHarness(
+        (character) => desired(['office.example.test'], character),
+        { restartPolicy: { maximumRestarts: 3, initialBackoffMs: 0 } },
+    );
+    const unadopted = edgeInput(desired(['office.example.test'], 'c'));
+    fixture.activate(unadopted, 'ready');
+
+    harness.connector.exit({ code: 9 });
+    await waitFor(() => harness.controller.getStatus().state === 'ready'
+        && harness.connector.starts === 2);
+
+    assert.equal(harness.controller.getStatus().configurationGeneration, unadopted.configurationGeneration);
+    assert.equal(fixture.selector.state, 'active');
+    assert.equal(fixture.selector.generation, unadopted.configurationGeneration);
+    assert.equal(fixture.selector.publicationState, 'ready');
+});
+
+test('A1 guard: a failed adoption commit that inactivated the selector recovers through the full reconcile', async () => {
+    const { fixture, harness } = await createReadyEdgeHarness((character) => desired(['office.example.test'], character));
+    const second = edgeInput(desired(['office.example.test'], 'b'));
+    fixture.activate(second, 'reconciling');
+    const failure = new Error('edge sources changed');
+    fixture.failApplyOnce = { publicationState: 'ready', error: failure };
+
+    await assert.rejects(
+        harness.controller.reconcile(
+            { ...second, selectedPublicationState: 'reconciling' },
+            { reason: 'selected-edge-generation' },
+        ),
+        (error) => error === failure,
+    );
+    assert.equal(fixture.selector.state, 'inactive');
+    assert.equal(fixture.selector.reason, 'publication-commit-failed');
+
+    const status = await harness.controller.reconcile(
+        { ...second, selectedPublicationState: 'reconciling' },
+        { reason: 'selected-edge-generation-retry' },
+    );
+
+    assert.equal(status.state, 'ready');
+    assert.equal(status.configurationGeneration, second.configurationGeneration);
+    assert.equal(fixture.selector.state, 'active');
+    assert.equal(fixture.selector.publicationState, 'ready');
+    assert.equal(harness.connector.starts, 2);
+});
+
+test('A3 controller stop withdraws a same-semantics generation it has not adopted yet', async () => {
+    const { fixture, harness } = await createReadyEdgeHarness((character) => desired(['office.example.test'], character));
+    const unadopted = edgeInput(desired(['office.example.test'], 'c'));
+    fixture.activate(unadopted, 'ready');
+
+    await harness.controller.stop();
+
+    assert.equal(fixture.selector.state, 'inactive');
+    assert.equal(fixture.selector.reason, 'cloudflare-controller-stop');
+    assert.equal(fixture.stopped.length, 1);
+    assert.equal(fixture.stopped[0].generation, unadopted.configurationGeneration);
+});
+
+test('A3 control: controller stop leaves a newer generation with different semantics selected', async () => {
+    const { fixture, harness } = await createReadyEdgeHarness((character) => desired(['office.example.test'], character));
+    const different = edgeInput(desired(['meet.example.test'], 'd'));
+    fixture.activate(different, 'reconciling');
+
+    await harness.controller.stop();
+
+    assert.equal(fixture.selector.state, 'active');
+    assert.equal(fixture.stopped.length, 0);
 });

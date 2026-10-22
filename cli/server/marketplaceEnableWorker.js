@@ -36,7 +36,7 @@ export function deserializeWorkerError(payload, depth = 0) {
     return error;
 }
 
-export function runMarketplaceEnableWorker({ agentRef, mode }, {
+export function runMarketplaceEnableWorker({ agentRef, mode, alias, profile, ifMissing }, {
     WorkerClass = Worker,
     workerUrl = MARKETPLACE_ENABLE_WORKER_URL,
     timeoutMs = MARKETPLACE_ENABLE_TIMEOUT_MS,
@@ -67,6 +67,9 @@ export function runMarketplaceEnableWorker({ agentRef, mode }, {
             workerData: {
                 agentRef: String(agentRef || ''),
                 mode: String(mode || ''),
+                alias: String(alias || ''),
+                profile: String(profile || ''),
+                ifMissing: ifMissing === true,
                 operationId,
             },
             stdout: true,

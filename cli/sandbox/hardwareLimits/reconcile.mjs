@@ -18,6 +18,7 @@ import { admitManifestRuntimeCapabilities, hardwareLimitsHashOf } from '../runti
 import { waitForManifestReadiness, activatePreparedRuntimeAfterReadiness, cleanupFailedPreparedRuntime, admitWorkspaceGraphRuntimeCapabilities } from '../../commands/workspaceUtil.js';
 import { prepareTargetedAgentRestart, commitTargetedAgentRestart, cleanupFailedTargetedAgentRestart } from '../../commands/targetedAgentRestart.js';
 import { readRoutingConfig, mergeRoutingConfig } from '../../server/routingFile.js';
+import { commitWithdrawalEdgeRoutingGeneration, withEdgeGenerationApplyLock } from '../edgeGeneration.js';
 import { buildAvailabilityProjection, markRouteHardwareUnavailable } from '../../server/hardwareAvailability.mjs';
 import { findHardwareOutcome, assertRepresentableIdentity, HardwareLimitsError } from './errors.mjs';
 import { blockingEdgesFromGraph, classifyAvailability } from './outcomes.mjs';
@@ -168,6 +169,16 @@ export function hardwareApplyIsUnchanged(captured, plan, {
         && readLabel(captured.key, 'ploinky.limitshash') === hash);
 }
 
+// Mark a refused instance's routes unavailable in the active generation
+// without an inactive window (W9, D3 'unavailable').
+function withdrawUnavailableRuntime({ containerName, projection }) {
+    return withEdgeGenerationApplyLock((applyLockCapability) => commitWithdrawalEdgeRoutingGeneration({
+        withdraw: [{ containerName, mode: 'unavailable', projection }],
+        reason: `hardware-apply-refused:${containerName}`,
+        applyLockCapability,
+    }));
+}
+
 export async function reconcileExactHardwareInstance(captured, {
     origin = 'cli', expectedToken = undefined, networkLifecycleCapability = null,
     deadline = Date.now() + 15 * 60 * 1000,
@@ -180,6 +191,7 @@ export async function reconcileExactHardwareInstance(captured, {
     commit = commitTargetedAgentRestart, activate = activatePreparedRuntimeAfterReadiness,
     cleanupTargeted = cleanupFailedTargetedAgentRestart, cleanupPrepared = cleanupFailedPreparedRuntime,
     loadRouting = readRoutingConfig, publishUnavailable = mergeRoutingConfig,
+    withdrawUnavailable = withdrawUnavailableRuntime,
     retireUnavailable = retireExactAgentRuntimePredecessor,
 } = {}) {
     // Only an operator's CLI restart may accept a refused drain; Apply and the
@@ -274,7 +286,9 @@ export async function reconcileExactHardwareInstance(captured, {
                 const current = loadRegistry()[captured.key];
                 if (current?.instanceId && current?.enableGeneration) {
                     const projection = buildAvailabilityProjection({ outcome: problem, instanceId: current.instanceId, enableGeneration: current.enableGeneration });
-                    await publishUnavailable((routing) => {
+                    let withdrawn = false;
+                    try { withdrawn = (await withdrawUnavailable({ containerName: captured.key, projection }))?.selector?.state === 'active'; } catch (_) {}
+                    if (!withdrawn) await publishUnavailable((routing) => {
                         for (const [routeKey, route] of Object.entries(routing.routes || {})) if (route?.container === captured.key) routing.routes[routeKey] = markRouteHardwareUnavailable(route, projection);
                         return routing;
                     }, { reason: 'hardware-apply-refused', networkLifecycleCapability: capability });

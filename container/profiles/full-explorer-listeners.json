@@ -52,33 +52,33 @@
     },
     {
       "id": "explorer-soplang",
-      "namePattern": "^ploinky_AssistOSExplorer_soplangAgent_",
+      "namePattern": "^ploinky_legacy-agents_soplangAgent_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:AssistOSExplorer/soplangAgent"
+      "effectiveInstance": "agent:legacy-agents/soplangAgent"
     },
     {
       "id": "explorer-tasks",
-      "namePattern": "^ploinky_AssistOSExplorer_tasksAgent_",
+      "namePattern": "^ploinky_legacy-agents_tasksAgent_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:AssistOSExplorer/tasksAgent"
+      "effectiveInstance": "agent:legacy-agents/tasksAgent"
     },
     {
       "id": "explorer-webmeet",
-      "namePattern": "^ploinky_AssistOSExplorer_webmeetAgent_",
+      "namePattern": "^ploinky_webmeet_webmeetAgent_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:AssistOSExplorer/webmeetAgent"
+      "effectiveInstance": "agent:webmeet/webmeetAgent"
     },
     {
       "id": "explorer-stt",
-      "namePattern": "^ploinky_AssistOSExplorer_webmeetStt_",
+      "namePattern": "^ploinky_webmeet_webmeetStt_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:AssistOSExplorer/webmeetStt"
+      "effectiveInstance": "agent:webmeet/webmeetStt"
     },
     {
       "id": "explorer-multimedia",
-      "namePattern": "^ploinky_AssistOSExplorer_multimedia_",
+      "namePattern": "^ploinky_legacy-agents_multimedia_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:AssistOSExplorer/multimedia"
+      "effectiveInstance": "agent:legacy-agents/multimedia"
     },
     {
       "id": "explorer-onlyoffice",
@@ -88,9 +88,9 @@
     },
     {
       "id": "explorer-webassist",
-      "namePattern": "^ploinky_AssistOSExplorer_webAssist_",
+      "namePattern": "^ploinky_legacy-agents_webAssist_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:AssistOSExplorer/webAssist"
+      "effectiveInstance": "agent:legacy-agents/webAssist"
     },
     {
       "id": "achilles-cli",
@@ -118,33 +118,27 @@
     },
     {
       "id": "achilles-gpt-researcher",
-      "namePattern": "^ploinky_AchillesCLI_GPTResearcher_",
+      "namePattern": "^ploinky_legacy-agents_GPTResearcher_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:AchillesCLI/GPTResearcher"
+      "effectiveInstance": "agent:legacy-agents/GPTResearcher"
     },
     {
       "id": "livekit",
-      "namePattern": "^ploinky_AchillesIDE_liveKitServerAgent_",
+      "namePattern": "^ploinky_webmeet_liveKitServerAgent_",
       "networkModePattern": "^host$",
-      "effectiveInstance": "agent:AchillesIDE/liveKitServerAgent"
+      "effectiveInstance": "agent:webmeet/liveKitServerAgent"
     },
     {
       "id": "soul-gateway",
-      "namePattern": "^ploinky_proxies_soul-gateway_",
+      "namePattern": "^ploinky_AchillesIDE_soul-gateway_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:proxies/soul-gateway"
+      "effectiveInstance": "agent:AchillesIDE/soul-gateway"
     },
     {
       "id": "search-agent",
-      "namePattern": "^ploinky_proxies_searchAgent_",
+      "namePattern": "^ploinky_legacy-agents_searchAgent_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:proxies/searchAgent"
-    },
-    {
-      "id": "umami",
-      "namePattern": "^ploinky_UmamiAgent_umamiAgent_",
-      "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:UmamiAgent/umamiAgent"
+      "effectiveInstance": "agent:legacy-agents/searchAgent"
     }
   ],
   "forbiddenSockets": [
@@ -222,8 +216,8 @@
       "ports": [7880],
       "bindAddresses": ["127.0.0.1"],
       "exactOwners": ["livekit-server"],
-      "ownerContainerPattern": "^ploinky_AchillesIDE_liveKitServerAgent_",
-      "effectiveInstance": "agent:AchillesIDE/liveKitServerAgent",
+      "ownerContainerPattern": "^ploinky_webmeet_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeet/liveKitServerAgent",
       "reviewedSensitive": true,
       "minMatches": 1,
       "maxMatches": 1,
@@ -236,8 +230,8 @@
       "ports": [7882],
       "bindAddresses": ["0.0.0.0"],
       "exactOwners": ["livekit-server"],
-      "ownerContainerPattern": "^ploinky_AchillesIDE_liveKitServerAgent_",
-      "effectiveInstance": "agent:AchillesIDE/liveKitServerAgent",
+      "ownerContainerPattern": "^ploinky_webmeet_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeet/liveKitServerAgent",
       "reviewedSensitive": true,
       "exclusiveSocket": true,
       "minMatches": 1,
@@ -251,8 +245,8 @@
       "ports": [6379],
       "bindAddresses": ["127.0.0.1"],
       "ownerPattern": "^redis-server$",
-      "ownerContainerPattern": "^ploinky_AchillesIDE_liveKitServerAgent_",
-      "effectiveInstance": "agent:AchillesIDE/liveKitServerAgent",
+      "ownerContainerPattern": "^ploinky_webmeet_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeet/liveKitServerAgent",
       "reviewedSensitive": true,
       "minMatches": 1,
       "maxMatches": 1,
@@ -265,8 +259,8 @@
       "ports": [7980],
       "bindAddresses": ["127.0.0.1"],
       "ownerPattern": "^egress$",
-      "ownerContainerPattern": "^ploinky_AchillesIDE_liveKitServerAgent_",
-      "effectiveInstance": "agent:AchillesIDE/liveKitServerAgent",
+      "ownerContainerPattern": "^ploinky_webmeet_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeet/liveKitServerAgent",
       "reviewedSensitive": true,
       "minMatches": 1,
       "maxMatches": 1,
@@ -279,8 +273,8 @@
       "ports": [7981],
       "bindAddresses": ["127.0.0.1"],
       "ownerPattern": "^egress$",
-      "ownerContainerPattern": "^ploinky_AchillesIDE_liveKitServerAgent_",
-      "effectiveInstance": "agent:AchillesIDE/liveKitServerAgent",
+      "ownerContainerPattern": "^ploinky_webmeet_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeet/liveKitServerAgent",
       "reviewedSensitive": true,
       "minMatches": 1,
       "maxMatches": 1,
@@ -293,8 +287,8 @@
       "ports": [17000],
       "bindAddresses": ["127.0.0.1"],
       "exactOwners": ["node"],
-      "ownerContainerPattern": "^ploinky_AchillesIDE_liveKitServerAgent_",
-      "effectiveInstance": "agent:AchillesIDE/liveKitServerAgent",
+      "ownerContainerPattern": "^ploinky_webmeet_liveKitServerAgent_",
+      "effectiveInstance": "agent:webmeet/liveKitServerAgent",
       "reviewedSensitive": true,
       "minMatches": 1,
       "maxMatches": 1,
@@ -303,20 +297,20 @@
     {
       "id": "standard-agentserver",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_(?:AssistOSExplorer_(?:gitAgent|dpuAgent|soplangAgent|tasksAgent|webmeetAgent|multimedia|webAssist)|AchillesCLI_(?:achilles-cli|opencodeAgent|piAgent|codexAgent|GPTResearcher)|proxies_(?:soul-gateway|searchAgent)|UmamiAgent_umamiAgent)_",
+      "containerPattern": "^ploinky_(?:AssistOSExplorer_(?:gitAgent|dpuAgent)|legacy-agents_(?:soplangAgent|tasksAgent|multimedia|webAssist|GPTResearcher|searchAgent)|webmeet_webmeetAgent|AchillesCLI_(?:achilles-cli|opencodeAgent|piAgent|codexAgent)|AchillesIDE_soul-gateway)_",
       "protocols": ["tcp"],
       "ports": [7000],
       "bindClasses": ["wildcard"],
       "exactOwners": ["node"],
       "reviewedSensitive": true,
-      "minMatches": 15,
-      "maxMatches": 15,
+      "minMatches": 14,
+      "maxMatches": 14,
       "rationale": "One standard AgentServer endpoint per routed Explorer dependency, isolated inside that dependency's managed namespace."
     },
     {
       "id": "webmeet-stt",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_webmeetStt_",
+      "containerPattern": "^ploinky_webmeet_webmeetStt_",
       "protocols": ["tcp"],
       "ports": [9000],
       "bindClasses": ["wildcard"],
@@ -457,61 +451,9 @@
       "rationale": "The pinned DocumentServer AdminPanel support process, when present, must remain process-loopback-only and is never a Router target."
     },
     {
-      "id": "umami-dashboard",
-      "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_UmamiAgent_umamiAgent_",
-      "protocols": ["tcp"],
-      "ports": [3000],
-      "bindClasses": ["wildcard"],
-      "exactOwners": ["node"],
-      "reviewedSensitive": true,
-      "minMatches": 1,
-      "maxMatches": 1,
-      "rationale": "Umami dashboard is an authenticated Router target inside its isolated managed namespace."
-    },
-    {
-      "id": "umami-telemetry",
-      "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_UmamiAgent_umamiAgent_",
-      "protocols": ["tcp"],
-      "ports": [3001],
-      "bindClasses": ["wildcard"],
-      "exactOwners": ["node"],
-      "reviewedSensitive": true,
-      "minMatches": 1,
-      "maxMatches": 1,
-      "rationale": "Umami telemetry is the dedicated narrow guest Router target inside its isolated managed namespace."
-    },
-    {
-      "id": "umami-mcp",
-      "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_UmamiAgent_umamiAgent_",
-      "protocols": ["tcp"],
-      "ports": [7301],
-      "bindClasses": ["loopback"],
-      "ownerPattern": "^(bun|node)$",
-      "reviewedSensitive": true,
-      "minMatches": 1,
-      "maxMatches": 1,
-      "rationale": "Umami MCP upstream is process-loopback-only and is called only by the routed AgentServer adapter."
-    },
-    {
-      "id": "umami-postgres",
-      "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_UmamiAgent_umamiAgent_",
-      "protocols": ["tcp"],
-      "ports": [5432],
-      "bindClasses": ["loopback"],
-      "ownerPattern": "^postgres$",
-      "reviewedSensitive": true,
-      "minMatches": 1,
-      "maxMatches": 2,
-      "rationale": "Umami Postgres is process-loopback-only inside the composite agent container."
-    },
-    {
       "id": "gpt-researcher-ui",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AchillesCLI_GPTResearcher_",
+      "containerPattern": "^ploinky_legacy-agents_GPTResearcher_",
       "protocols": ["tcp"],
       "ports": [8000],
       "bindClasses": ["wildcard"],
@@ -524,7 +466,7 @@
     {
       "id": "search-searxng",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_proxies_searchAgent_",
+      "containerPattern": "^ploinky_legacy-agents_searchAgent_",
       "protocols": ["tcp"],
       "ports": [8888],
       "bindClasses": ["loopback"],
@@ -537,7 +479,7 @@
     {
       "id": "search-browser-pool",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_proxies_searchAgent_",
+      "containerPattern": "^ploinky_legacy-agents_searchAgent_",
       "protocols": ["tcp"],
       "ports": [8890],
       "bindClasses": ["loopback"],

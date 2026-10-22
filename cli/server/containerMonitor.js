@@ -49,7 +49,10 @@ import { readRuntimePredecessor } from '../sandbox/runtimePredecessorStore.js';
 import {
     abortEdgeRoutingPreparation,
     commitAdditiveEdgeRoutingGeneration,
+    commitWithdrawalEdgeRoutingGeneration,
+    edgeWithdrawalRefusalDisposition,
     inactivateEdgeRoutingGeneration,
+    isActiveBoundPreparationLease,
     readEdgeRoutingSelection,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
@@ -454,6 +457,117 @@ function activeProbeWorkerCount(monitor) {
     return count;
 }
 
+// Withdraw only the failing runtime's routes from the active generation (D6).
+// Its drain owner admits the restart scheduled next; its identity stays valid
+// until that replacement commits. Contention defers the drain to a later tick
+// (RF-N3); only a withdrawal that cannot be proven falls back to global
+// inactivation (D7).
+function withdrawFailedRuntime(monitor, target) {
+    const owner = target.instanceId && target.enableGeneration
+        ? Object.freeze({
+            containerName: target.containerName,
+            instanceId: String(target.instanceId),
+            enableGeneration: String(target.enableGeneration),
+            reason: 'probe-failure',
+        })
+        : null;
+    if (owner) {
+        const commitWithdrawal = monitor.commitWithdrawalEdgeRoutingGeneration || commitWithdrawalEdgeRoutingGeneration;
+        const withApplyLock = monitor.withEdgeGenerationApplyLock || withEdgeGenerationApplyLock;
+        try {
+            withApplyLock((applyLockCapability) => commitWithdrawal({
+                withdraw: [{ containerName: target.containerName, mode: 'drain', drainOwner: owner }],
+                reason: `continuous-runtime-probe-failed:${target.containerName}`,
+                applyLockCapability,
+            }));
+            target.pendingScopedDrain = null;
+            logEvent(monitor, 'warn', 'container_probe_routes_withdrawn', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+            });
+            return 'drained';
+        } catch (error) {
+            if (edgeWithdrawalRefusalDisposition(error) === 'defer') {
+                target.pendingScopedDrain = owner;
+                logEvent(monitor, 'info', 'container_probe_withdrawal_deferred', {
+                    container: target.containerName,
+                    agent: target.agentName,
+                    repo: target.repoName,
+                    code: error?.code || null,
+                });
+                return 'deferred';
+            }
+            logEvent(monitor, 'error', 'container_probe_withdrawal_refused', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                code: error?.code || null,
+                error: error?.message || error,
+            });
+        }
+    }
+    target.pendingScopedDrain = null;
+    const inactivate = monitor.inactivateEdgeRoutingGeneration || inactivateEdgeRoutingGeneration;
+    try {
+        inactivate(`continuous-runtime-probe-failed:${target.containerName}`);
+    } catch (error) {
+        logEvent(monitor, 'error', 'container_probe_inactivation_failed', {
+            container: target.containerName,
+            agent: target.agentName,
+            repo: target.repoName,
+            error: error?.message || error,
+        });
+    }
+    return 'inactivated';
+}
+
+const DRAIN_OWNER_RETRY_LIMIT = 3;
+
+// A deferred probe-failure drain is retried while its runtime identity is
+// unchanged. A route an automatic owner drained for this exact runtime is
+// restarted from that durable owner, at most DRAIN_OWNER_RETRY_LIMIT times;
+// afterwards the drain stays and the exhaustion is logged for the operator.
+function retryAutomaticDrain(monitor, target, routing) {
+    const pending = target.pendingScopedDrain;
+    if (pending) {
+        if (pending.instanceId !== String(target.instanceId || '')
+            || pending.enableGeneration !== String(target.enableGeneration || '')) {
+            target.pendingScopedDrain = null;
+        } else if (withdrawFailedRuntime(monitor, target) === 'deferred') {
+            return true;
+        }
+    }
+    const drained = Object.values(routing?.routes || {}).filter((route) => (
+        route?.container === target.containerName && route.draining === true
+    ));
+    const ownedBy = (route) => route.drainOwner?.containerName === target.containerName
+        && route.drainOwner.instanceId === String(target.instanceId || '')
+        && route.drainOwner.enableGeneration === String(target.enableGeneration || '');
+    if (drained.length === 0 || !drained.every(ownedBy)) return false;
+    const ownerKey = digestValue(drained[0].drainOwner);
+    if (target.drainOwnerRetry?.ownerKey !== ownerKey) {
+        target.drainOwnerRetry = { ownerKey, attempts: 0, exhaustedLogged: false };
+    }
+    if (target.drainOwnerRetry.attempts >= DRAIN_OWNER_RETRY_LIMIT) {
+        if (!target.drainOwnerRetry.exhaustedLogged) {
+            target.drainOwnerRetry.exhaustedLogged = true;
+            logEvent(monitor, 'fatal', 'container_drain_retry_exhausted', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                drainOwner: drained[0].drainOwner,
+                attempts: target.drainOwnerRetry.attempts,
+            });
+        }
+        return false;
+    }
+    target.drainOwnerRetry.attempts += 1;
+    stopProbeWorker(target);
+    scheduleContainerRestart(monitor, target, 'drain_owner_retry');
+    return true;
+}
+
 function handleProbeFailure(monitor, target, message, { runtimeHealth = false } = {}) {
     if (!monitor || !target) return;
     // A manually managed replacement may be running before its declared
@@ -472,17 +586,7 @@ function handleProbeFailure(monitor, target, message, { runtimeHealth = false } 
         failures: target.probeFailures
     });
     if (runtimeHealth) {
-        const inactivate = monitor.inactivateEdgeRoutingGeneration || inactivateEdgeRoutingGeneration;
-        try {
-            inactivate(`continuous-runtime-probe-failed:${target.containerName}`);
-        } catch (error) {
-            logEvent(monitor, 'error', 'container_probe_inactivation_failed', {
-                container: target.containerName,
-                agent: target.agentName,
-                repo: target.repoName,
-                error: error?.message || error,
-            });
-        }
+        withdrawFailedRuntime(monitor, target);
         scheduleContainerRestart(monitor, target, 'semantic_probe_failed');
     }
 }
@@ -1503,7 +1607,9 @@ function assertRestartPreparationResult(target, result) {
 }
 
 function preActivationRegistryRecord(result, attempt = null) {
-    if (result?.preparationLease?.mode === 'additive') {
+    // Additive and withdrawn preparations keep the active predecessor's
+    // registry record until their commit.
+    if (isActiveBoundPreparationLease(result?.preparationLease)) {
         return attempt?.snapshot?.registryRecord || null;
     }
     return result?.requiresEdgeActivation === true
@@ -1513,7 +1619,7 @@ function preActivationRegistryRecord(result, attempt = null) {
 
 function rekeyOwnedRestartTarget(monitor, target, attempt, result, expectedRegistryRecord) {
     if (!attempt || result?.requiresEdgeActivation !== true
-        || !result.preparationLease || result.preparationLease.mode === 'additive') return false;
+        || !result.preparationLease || isActiveBoundPreparationLease(result.preparationLease)) return false;
     const predecessorName = attempt.snapshot.info.containerName;
     const prepared = assertRestartPreparationResult({ ...target, containerName: predecessorName }, result);
     const candidateName = prepared.containerName;
@@ -1862,6 +1968,43 @@ async function activateRestartedContainerRoute(monitor, target, agentDir, result
             : withEdgeGenerationApplyLock);
     const retirePredecessor = monitor.retireExactAgentRuntimePredecessor
         || retireExactAgentRuntimePredecessor;
+    if (result.preparationLease?.mode === 'withdrawn') {
+        // The drained predecessor generation stays active until this commit
+        // publishes the ready replacement under the same name and reopens its
+        // routes; the launch already removed the exact predecessor runtime.
+        const readRouting = monitor.readRoutingConfig || readRoutingConfig;
+        const commitAdditive = monitor.commitAdditiveEdgeRoutingGeneration
+            || commitAdditiveEdgeRoutingGeneration;
+        await runWithApplyLock(async (applyLockCapability) => {
+            assertCurrent('withdrawn-route-registry-commit', null);
+            const agents = loadAgents();
+            const predecessor = agents?.[prepared.containerName];
+            const routing = readRouting();
+            routing.routes = routing.routes || {};
+            const owner = routing.routes[routeKey]?.drainOwner;
+            if (!predecessor || predecessor.type !== 'agent'
+                || routing.routes[routeKey]?.draining !== true
+                || owner?.containerName !== prepared.containerName
+                || owner.instanceId !== String(predecessor.instanceId || '')
+                || owner.enableGeneration !== String(predecessor.enableGeneration || '')) {
+                throw new Error(`watchdog withdrawn replacement lost its drained predecessor identity for '${prepared.containerName}'`);
+            }
+            agents[prepared.containerName] = structuredClone(prepared.record);
+            routing.routes[routeKey] = mergeRuntimeRoute(
+                routing.routes[routeKey],
+                route,
+                { hostPort: route.hostPort },
+            );
+            await Promise.resolve(commitAdditive(result.preparationLease, {
+                agents,
+                routing,
+                applyLockCapability,
+            }));
+            onRegistryCommitted();
+            onCommitted();
+        }, { preparationLease: result.preparationLease });
+        return true;
+    }
     if (result.preparationLease?.mode === 'additive') {
         const readRouting = monitor.readRoutingConfig || readRoutingConfig;
         const commitAdditive = monitor.commitAdditiveEdgeRoutingGeneration
@@ -2200,7 +2343,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         }));
         assertRestartAttemptCurrent(monitor, target, attempt, 'post-physical-ensure', {
             expectedRegistryRecord: preActivationRegistryRecord(result, attempt),
-            expectedContainerName: result?.preparationLease?.mode === 'additive'
+            expectedContainerName: isActiveBoundPreparationLease(result?.preparationLease)
                 ? target.containerName
                 : result?.containerName,
         });
@@ -2236,14 +2379,14 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         );
         assertRestartAttemptCurrent(monitor, target, attempt, 'post-readiness', {
             expectedRegistryRecord: preActivationRegistryRecord(result, attempt),
-            expectedContainerName: result?.preparationLease?.mode === 'additive'
+            expectedContainerName: isActiveBoundPreparationLease(result?.preparationLease)
                 ? target.containerName
                 : result?.containerName,
         });
         assertManifestUnchanged();
         assertRestartAttemptCurrent(monitor, target, attempt, 'pre-route-activation', {
             expectedRegistryRecord: preActivationRegistryRecord(result, attempt),
-            expectedContainerName: result?.preparationLease?.mode === 'additive'
+            expectedContainerName: isActiveBoundPreparationLease(result?.preparationLease)
                 ? target.containerName
                 : result?.containerName,
         });
@@ -2259,7 +2402,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                 assertCurrent(checkpoint, expectedRegistryRecord) {
                     assertRestartAttemptCurrent(monitor, target, attempt, checkpoint, {
                         expectedRegistryRecord,
-                        expectedContainerName: result?.preparationLease?.mode === 'additive'
+                        expectedContainerName: isActiveBoundPreparationLease(result?.preparationLease)
                             ? target.containerName
                             : result?.containerName,
                     });
@@ -2331,7 +2474,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         const expectedRegistryRecord = registryCandidateCommitted
             ? failedResult?.registryRecord || null
             : preActivationRegistryRecord(failedResult, attempt);
-        const expectedContainerName = failedResult?.preparationLease?.mode === 'additive'
+        const expectedContainerName = isActiveBoundPreparationLease(failedResult?.preparationLease)
             && !registryCandidateCommitted
             ? target.containerName
             : failedResult?.containerName;
@@ -2366,7 +2509,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         const recoveryCandidate = surfacedError?.ploinkyRestartCandidate;
         if (!activationCommitted && !retryingPreparation && attempt
             && (recoveryCandidate?.preparationAbortFailed || recoveryCandidate?.candidateCleanupFailed)
-            && (ownedCandidate || (failedResult?.preparationLease?.mode === 'additive'
+            && (ownedCandidate || (isActiveBoundPreparationLease(failedResult?.preparationLease)
                 && assertRestartPreparationResult(target, failedResult)))) {
             retainFailedRestartPreparation(monitor, target, recoveryCandidate, surfacedError);
         }
@@ -2564,6 +2707,10 @@ export function monitorTick(monitor) {
     monitor.runtimeSnapshotProbeDeferred = false;
 
     const runningContainerNames = snapshotRunningContainerNames(monitor);
+    let drainRouting = null;
+    try {
+        drainRouting = (monitor.readRoutingConfig || readRoutingConfig)();
+    } catch (_) {}
 
     for (const target of monitor.targets.values()) {
         if (!target || target.circuitBreakerTripped) continue;
@@ -2668,6 +2815,7 @@ export function monitorTick(monitor) {
                 scheduleContainerRestart(monitor, target, 'mps_generation_changed');
                 continue;
             }
+            if (retryAutomaticDrain(monitor, target, drainRouting)) continue;
             const continuousProbeIntervalMs = positiveInteger(
                 monitor?.config?.CONTINUOUS_PROBE_INTERVAL_MS
                     ?? process.env.PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS,

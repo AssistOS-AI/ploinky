@@ -138,7 +138,7 @@ export function validateRouterAllowedResponse(probe, response) {
  * `endpoints.agent-card` answers 404 with exactly {"error":"agent-card not configured"}
  * (Agent/server/AgentServer.mjs, AGENT_CARD_PATH branch); the Soul Gateway is not an
  * AgentServer and answers its generic unknown-route 404
- * (proxies soul-gateway/src/core/http-server.mjs:41-43). Such an entry is a
+ * (soul-gateway/src/core/http-server.mjs:41-43). Such an entry is a
  * declared absence, not an incomplete fan-out, but only when the catalog confirms the
  * agent is an enabled runtime that declares no card and every field is exactly the
  * reviewed answer. Anything else (a timeout, a 5xx, a different body, an unknown name,

@@ -286,6 +286,23 @@ function installationMatches({
     return true;
 }
 
+// Host admission before starting an existing Box. Its image entrypoint runs
+// the ordinary installer, so prove that installer can only take its no-op
+// branch while the Box is stopped and the host owns the lifecycle lock.
+export function assertExistingImageDependencies({ targetRoot, imageId, fsApi = fs } = {}) {
+    const root = path.resolve(targetRoot);
+    assertRealDirectory(root, fsApi);
+    try {
+        fsApi.lstatSync(path.join(root, 'achillesAgentLib'));
+        throw dependencyError('Guarded resume refuses a forbidden Box-installed AgentLib');
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const expected = markerFor(assertSupplyingImageId(imageId));
+    if (!installationMatches({ targetRoot: root, expected, fsApi, installedPackageUsable: defaultInstalledPackageUsable })) {
+        throw dependencyError('Existing Box dependencies require repair; guarded resume refuses before container start');
+    }
+    return Object.freeze({ changed: false, marker: expected });
+}
+
 function safeRemoveWithin(targetRoot, target, fsApi) {
     const relative = path.relative(targetRoot, target);
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
@@ -314,6 +331,7 @@ function prepareDirectoryForBackup(directory, stat, fsApi) {
  * never reusable.
  */
 export function prepareImageDependencies({
+    readOnly = false,
     targetRoot = '/opt/ploinky/node_modules',
     markerPath = '/etc/ploinky-box',
     fsApi = fs,
@@ -339,11 +357,17 @@ export function prepareImageDependencies({
     } catch (error) {
         throw dependencyError('The ploinky-box image has no usable bundled MCP SDK', error);
     }
-    removeForbiddenBoxAgentLib({ root, fsApi });
+    if (readOnly) {
+        try {
+            fsApi.lstatSync(path.join(root, 'achillesAgentLib'));
+            throw dependencyError('Read-only dependency check refuses a forbidden Box-installed AgentLib');
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    } else removeForbiddenBoxAgentLib({ root, fsApi });
     const expected = markerFor(supplyingImageId);
     if (installationMatches({ targetRoot: root, expected, fsApi, installedPackageUsable })) {
         return Object.freeze({ changed: false, marker: expected });
     }
+    if (readOnly) throw dependencyError('Existing Box dependencies require repair; guarded resume refuses changes');
 
     const transactionRoot = path.join(root, `.ploinky-box-deps-stage-${token}`);
     try {
@@ -450,7 +474,9 @@ export function prepareImageDependencies({
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
 if (invokedPath === fileURLToPath(import.meta.url)) {
     try {
-        prepareImageDependencies();
+        const args = process.argv.slice(2);
+        if (args.length && (args.length !== 1 || args[0] !== '--check')) throw dependencyError('Expected only --check');
+        prepareImageDependencies({ readOnly: args[0] === '--check' });
     } catch (error) {
         process.stderr.write(`ploinky-box dependency installation failed: ${error.message}\n`);
         process.exitCode = 1;

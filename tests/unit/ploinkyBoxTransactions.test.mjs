@@ -37,6 +37,8 @@ import {
     waitForReadyLine,
 } from '../../ploinky-box/lifecycle/container.mjs';
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
+import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
+import { assertExistingImageDependencies, DEPENDENCY_MARKER_NAME } from '../../ploinky-box/entrypoint/install-dependencies.mjs';
 import { hardwareStorePaths, initializeStore, readStoreSnapshot, setAgentLimits, assertGateOffStoreEmpty } from '../../cli/sandbox/hardwareLimits/store.mjs';
 import {
     agentLibFixture,
@@ -2133,6 +2135,99 @@ test('a Box that needs replacement is refused before any mutation when replaceme
     assert.equal(h.current().runtime.running, true);
     for (const forbidden of ['preflight', 'stop-ploinky-local', 'container rm', 'container create', 'container stop', ' pull']) {
         assert.equal(h.calls.some(call => call.join(' ').includes(forbidden)), false, forbidden);
+    }
+});
+
+test('required existing identity rejects absent, substituted and changed wiring before mutations', async t => {
+    for (const scenario of ['absent', 'substituted', 'publication', 'image']) {
+        const state = fixture(t);
+        const current = containerHandle({ identity: state.identity, agentLib: state.agentLib,
+            repositoryRoot: state.root, imageId: 'd'.repeat(64), imageRef: BOX_IMAGE_REFERENCE,
+            hostPort: 8080, id: 'e'.repeat(64) });
+        const h = harness(state, { initial: scenario === 'absent' ? null : current });
+        const discover = h.seams.discover;
+        h.seams.discover = () => ({ ...discover(), engine: { name: 'podman', identity: 'engine' } });
+        const options = { identity: state.identity, agentLib: state.agentLib,
+            ownership: { state: scenario === 'absent' ? 'absent' : 'owned', handles: { container: current } },
+            engine: { name: 'podman', identity: 'engine' }, runner: h.runner, lock: state.lock,
+            repositoryRoot: state.root, requireExistingContainerId: 'e'.repeat(64) };
+        if (scenario === 'substituted') options.requireExistingContainerId = 'f'.repeat(64);
+        if (scenario === 'publication') options.explicitPort = 19090;
+        if (scenario === 'image') options.imageRef = 'other-image';
+        await assert.rejects(reconcileBoxContainer(options, h.seams), scenario === 'publication' || scenario === 'image'
+            ? { code: 'PLOINKY_BOX_REPLACEMENT_REFUSED' } : /Required existing Box identity/);
+        for (const forbidden of ['preflight', 'stop-ploinky-local', 'container rm', 'container create', 'container stop', 'pull']) {
+            assert.equal(h.calls.some(call => call.join(' ').includes(forbidden)), false, `${scenario}: ${forbidden}`);
+        }
+    }
+});
+
+test('guarded native start reuses the same stopped Box and validates dependencies without follow-on rewiring', async t => {
+    const state = fixture(t);
+    const current = containerHandle({ identity: state.identity, agentLib: state.agentLib,
+        repositoryRoot: state.root, imageId: 'd'.repeat(64), imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080, id: 'e'.repeat(64), running: false });
+    const h = harness(state, { initial: current });
+    const discover = () => ({ ...h.seams.discover(), engine: { name: 'podman', identity: 'engine' } });
+    let dependencyChecks = 0;
+    h.seams.verifyExistingDependencies = () => { dependencyChecks++; };
+    h.seams.discover = (() => { const original = h.seams.discover; return () => ({ ...original(), engine: { name: 'podman', identity: 'engine' } }); })();
+    let starts = 0;
+    const supervisor = createBoxSupervisor({ repositoryRoot: state.root, launchCwd: state.identity.workspaceRoot,
+        env: {}, platform: 'linux', resolveIdentity: () => state.identity, discover,
+        lockManager: { async acquire() { return { ...state.lock, release() {} }; } }, runner: h.runner,
+        updateHostState: { read() { return null; }, write() {}, remove() {} },
+        selectAgentLib: async () => ({ selection: state.agentLib }),
+        reconcile: options => reconcileBoxContainer(options, h.seams),
+        readEdgeDesired: () => null, resolveHostReachableIpv4: async () => '', captureCoreStartArgv: () => null,
+        startCore: async () => { starts++; }, healthCheck: async () => {},
+        revalidateAgentLibSource() {}, commitAgentLibSelection() {},
+        scanGpuAgents() { assert.fail('guarded resume must not discover new GPU declarations'); },
+    });
+    const result = await supervisor.runStartTransaction(['start'], { requireExistingContainerId: current.id });
+    assert.equal(result.containerId, current.id);
+    assert.equal(starts, 1);
+    assert.equal(dependencyChecks, 2);
+    assert.equal(h.calls.some(call => call.some(value => String(value).includes('prepareImageDependencies({readOnly:true'))), true);
+    for (const forbidden of ['container create', 'container rm', 'pull']) {
+        assert.equal(h.calls.some(call => call.join(' ').includes(forbidden)), false, forbidden);
+    }
+});
+
+test('guarded stopped reuse refuses dependency repair before any container start, including a last-moment cache change', async t => {
+    for (const fault of ['missing', 'corrupt', 'forbidden', 'late-change']) {
+        const state = fixture(t);
+        const root = state.identity.dataPaths.dependencies;
+        fs.mkdirSync(path.join(root, 'mcp-sdk'), { recursive: true });
+        fs.writeFileSync(path.join(root, 'mcp-sdk/package.json'), JSON.stringify({ name: '@modelcontextprotocol/sdk',
+            version: '1.0.0', exports: { '.': './index.mjs' } }));
+        fs.writeFileSync(path.join(root, 'mcp-sdk/index.mjs'), 'export {};');
+        const marker = path.join(root, DEPENDENCY_MARKER_NAME);
+        fs.writeFileSync(marker, JSON.stringify({ schema: 'ploinky.box.dependencies/v2',
+            providedLibraries: { 'mcp-sdk': { kind: 'image', library: 'mcp-sdk', supplyingImageId: `sha256:${'d'.repeat(64)}` } } }));
+        if (fault === 'missing') fs.unlinkSync(marker);
+        if (fault === 'corrupt') fs.writeFileSync(marker, '{');
+        if (fault === 'forbidden') fs.mkdirSync(path.join(root, 'achillesAgentLib'));
+        const current = containerHandle({ identity: state.identity, agentLib: state.agentLib,
+            repositoryRoot: state.root, imageId: 'd'.repeat(64), imageRef: BOX_IMAGE_REFERENCE,
+            hostPort: 8080, id: 'e'.repeat(64), running: false });
+        const h = harness(state, { initial: current });
+        const discover = h.seams.discover;
+        h.seams.discover = () => ({ ...discover(), engine: { name: 'podman', identity: 'engine' } });
+        if (fault === 'late-change') {
+            let checks = 0;
+            h.seams.verifyExistingDependencies = options => {
+                if (++checks === 2) fs.writeFileSync(marker, '{');
+                return assertExistingImageDependencies(options);
+            };
+        }
+        await assert.rejects(reconcileBoxContainer({ identity: state.identity, agentLib: state.agentLib,
+            ownership: { state: 'owned', handles: { container: current } }, engine: { name: 'podman', identity: 'engine' },
+            runner: h.runner, lock: state.lock, repositoryRoot: state.root, requireExistingContainerId: current.id,
+        }, h.seams), /dependencies require repair|forbidden Box-installed/);
+        assert.equal(current.runtime.running, false);
+        assert.equal(h.calls.some(call => call.join(' ').includes('container start')), false);
+        assert.equal(h.calls.some(call => call[0] === 'run' || call[0] === 'stream'), false);
     }
 });
 

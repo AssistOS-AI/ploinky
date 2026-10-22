@@ -13,7 +13,8 @@ export const SMOKE_GRAPH_REPOSITORIES = Object.freeze([
     'AssistOSExplorer',
     'UmamiAgent',
     'AchillesCLI',
-    'proxies',
+    'legacy-agents',
+    'webmeet',
 ]);
 
 const SMOKE_GRAPH_DESTINATIONS = Object.freeze({

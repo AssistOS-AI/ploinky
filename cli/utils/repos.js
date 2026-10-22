@@ -167,7 +167,11 @@ export function getSkillRepositoryRecommendations(options = {}) {
         const preset = PREDEFINED_REPOS[name] || {};
         const registered = sources[name] || {};
         const declared = preset.kind || registered.kind;
-        const kind = local.has(name) ? (['agents', 'mixed'].includes(declared) ? 'mixed' : 'skills') : declared || classifyRepoKind(name);
+        // A workspace checkout without a declared kind is classified from its contents, so one that also holds
+        // agents is mixed and consumers read only its skills/ folder.
+        const kind = local.has(name)
+            ? (['agents', 'mixed'].includes(declared || classifyRepoPath(local.get(name).source)) ? 'mixed' : 'skills')
+            : declared || classifyRepoKind(name);
         if (!['skills', 'mixed'].includes(kind)) return [];
         const url = preset.url || registered.url || local.get(name)?.source || '';
         if (!url) return [];
@@ -181,8 +185,12 @@ export function classifyRepoKind(repoName) {
     if (declared) return declared;
 
     const preferred = resolveSkillRepositorySource(repoName, '');
-    const repoPath = preferred.origin === 'workspace' ? preferred.source : resolveAgentRepositoryPath(repoName);
-    if (!fs.existsSync(repoPath)) return 'unknown';
+    return classifyRepoPath(preferred.origin === 'workspace' ? preferred.source : resolveAgentRepositoryPath(repoName));
+}
+
+// skills: a skills/ folder with at least one SKILL.md folder; agents: a top-level folder with a manifest.json.
+export function classifyRepoPath(repoPath) {
+    if (!repoPath || !fs.existsSync(repoPath)) return 'unknown';
 
     let hasSkills = false;
     const skillsDir = path.join(repoPath, 'skills');

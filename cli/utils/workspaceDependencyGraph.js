@@ -143,6 +143,11 @@ function resolveWorkspaceDependencyGraph({
     rootProfile = '',
     rootAlias = '',
     onCycle = null,
+    // Opt-in: called for a no-wait dependency that cannot be resolved. The
+    // dependency and everything only it reached leave the graph and the
+    // parent still resolves. Without it every unresolvable dependency fails
+    // the whole graph, as `start` requires.
+    onUnresolvedNoWait = null,
 } = {}) {
     if (!staticAgentRef || typeof staticAgentRef !== 'string') {
         throw new Error('Missing static agent reference.');
@@ -267,6 +272,7 @@ function resolveWorkspaceDependencyGraph({
         const nextStack = [...stack, nodeId];
         const enableList = manifestEnableEntries(node.manifest, node.profile);
         for (const rawDependency of enableList) {
+            const knownNodeIds = typeof onUnresolvedNoWait === 'function' ? new Set(nodes.keys()) : null;
             try {
                 const parsedDependency = parseEnableDirective(rawDependency);
                 if (!parsedDependency) continue;
@@ -314,6 +320,23 @@ function resolveWorkspaceDependencyGraph({
                     const warning = `[manifest enable] Failed to resolve dependency '${rawDependency}' for '${node.agentRef}': ${message}`;
                     if (typeof onCycle === 'function') onCycle(warning);
                     else console.error(warning);
+                    continue;
+                }
+                let tolerated = false;
+                if (knownNodeIds) {
+                    try { tolerated = parseEnableDirective(rawDependency)?.noWait === true; } catch (_) { /* malformed entries stay blocking */ }
+                }
+                if (tolerated) {
+                    // Drop what the failed subtree added so a half-visited node is never mistaken for a cycle later.
+                    const dropped = [...nodes.keys()].filter((nodeKey) => !knownNodeIds.has(nodeKey));
+                    for (const nodeKey of dropped) {
+                        nodes.delete(nodeKey);
+                        state.delete(nodeKey);
+                    }
+                    for (const remaining of nodes.values()) {
+                        for (const nodeKey of dropped) remaining.dependents.delete(nodeKey);
+                    }
+                    onUnresolvedNoWait({ rawDependency, parentRef: node.agentRef, message });
                     continue;
                 }
                 throw new Error(`[manifest enable] Failed to resolve dependency '${rawDependency}' for '${node.agentRef}': ${message}`);
@@ -420,11 +443,86 @@ function topologicallyGroupDependencyGraph(graph) {
     return waves;
 }
 
+// The agent reference of a dependency directive, without its no-wait and alias
+// tokens, so an object directive is reported by its agent rather than as text.
+function unavailableDependencyRef(rawDependency, parentRef) {
+    try {
+        const parsed = parseEnableDirective(rawDependency);
+        const qualified = qualifyEnableSpecForRepo(parsed?.spec, String(parentRef || '').split('/')[0]);
+        return (parseManifestDependencyRef(qualified) || 'unknown').slice(0, 256);
+    } catch (_) {
+        return 'unknown';
+    }
+}
+
+// The manifest dependencies a Marketplace enable of `agentRef` must also enable,
+// resolved by the same graph `start` uses (record-aware SSO gate, a blocking
+// edge winning over a duplicate no-wait edge, fail-closed resolution). Blocking
+// dependencies come first, deepest first, and run before the root; no-wait
+// dependencies run after it. The one divergence from `start`: a no-wait
+// dependency that cannot be resolved is reported as unavailable instead of
+// failing the root. Read-only; it enables nothing.
+function planManifestDependencyEnables(agentRef, {
+    loadRegistry = () => ({}),
+    alias = '',
+    profile = '',
+    onCycle = () => {},
+} = {}) {
+    const plan = { before: [], after: [], unavailable: [] };
+    try {
+        findAgent(agentRef);
+    } catch (_) {
+        // The root itself is unknown; its own enable reports that.
+        return plan;
+    }
+    let graph;
+    try {
+        graph = resolveWorkspaceDependencyGraph({
+            staticAgentRef: agentRef,
+            registry: loadRegistry(),
+            rootAlias: alias,
+            rootProfile: profile,
+            onCycle,
+            onUnresolvedNoWait: ({ rawDependency, parentRef, message }) => {
+                plan.unavailable.push({ ref: unavailableDependencyRef(rawDependency, parentRef), error: message.slice(0, 512) });
+            },
+        });
+    } catch (error) {
+        const message = String(error?.message || error);
+        if (!message.startsWith('[manifest enable]')) throw error;
+        throw Object.assign(new Error(message.slice(0, 512)), { code: 'MARKETPLACE_DEPENDENCY_UNAVAILABLE', cause: error });
+    }
+    const reachable = new Set();
+    const pending = [graph.staticNodeId];
+    while (pending.length) {
+        const nodeId = pending.pop();
+        if (reachable.has(nodeId)) continue;
+        reachable.add(nodeId);
+        pending.push(...(graph.nodes.get(nodeId)?.dependencies || []));
+    }
+    const { blocking } = classifyDependencyGraphWaitMode(graph);
+    for (const wave of topologicallyGroupDependencyGraph(graph)) {
+        for (const nodeId of wave) {
+            if (nodeId === graph.staticNodeId || !reachable.has(nodeId)) continue;
+            const node = graph.nodes.get(nodeId);
+            (blocking.has(nodeId) ? plan.before : plan.after).push({
+                ref: node.agentRef,
+                agentRef: node.enableSpec,
+                alias: node.alias,
+                profile: node.profileExplicit ? node.profile : '',
+                dependsOn: [...node.dependencies].map((dependencyId) => graph.nodes.get(dependencyId)?.agentRef).filter(Boolean),
+            });
+        }
+    }
+    return plan;
+}
+
 export {
     classifyDependencyGraphWaitMode,
     createGraphNodeId,
     effectiveInstanceKey,
     parseManifestDependencyRef,
+    planManifestDependencyEnables,
     resolveEnabledAgentRegistryRecord,
     resolveWorkspaceDependencyGraph,
     topologicallyGroupDependencyGraph
