@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 
+import { hasHostStateComponent } from '../../../ploinky-box/hostState/paths.mjs';
+
 export const AGENT_DATA_POLICY_CODE = 'PLOINKY_AGENT_DATA_POLICY_VIOLATION';
 
 function resolvePolicyWorkspaceRoot(workspaceRoot) {
@@ -287,19 +289,6 @@ function canonicalProtectedPath(root) {
     }
 }
 
-// `foldWorkspaceName` of cli/server/utils/protectedWorkspacePaths.js: the
-// workspace may sit on a filesystem that matches names regardless of case or
-// Unicode form, where `.PLOINKY-BOX` opens `.ploinky-box`.
-function foldPathName(name) {
-    return String(name).normalize('NFKC').toLowerCase().replace(/[. ]+$/, '');
-}
-
-const HOST_STATE_DIRECTORY = '.ploinky-box';
-
-function namesHostState(target) {
-    return String(target).split(/[\\/]+/).some((segment) => segment && foldPathName(segment) === HOST_STATE_DIRECTORY);
-}
-
 export function assertManifestVolumeStoragePolicy(source, {
     workspaceRoot,
 } = {}) {
@@ -309,7 +298,7 @@ export function assertManifestVolumeStoragePolicy(source, {
         : path.resolve(root, String(source));
     // The Box host state directory (`<workspace>/.ploinky-box`, of this or any
     // other workspace) is host-only: no agent volume may resolve into it.
-    if (namesHostState(resolvedSource) || namesHostState(projectedCanonicalPath(resolvedSource))) {
+    if (hasHostStateComponent(resolvedSource) || hasHostStateComponent(projectedCanonicalPath(resolvedSource))) {
         throw policyError(`manifest volume source '${source}' targets the protected Box host state directory`, {
             source: String(source),
             resolvedSource,

@@ -60,7 +60,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; retain the Box and workspace-backed caches |
 | `ploinky destroy` | Stop nested agents and remove the exact outer container, then this workspace's host GPU-grant and hardware-limits records; retain workspace-backed caches and the saved Router binding |
-| `ploinky destroy --delete-cache` | Remove the outer container and those records, then delete only the dependency and image cache directories |
+| `ploinky destroy --delete-cache` | Remove the outer container and those records, then delete the dependency and image cache directories and, when no Box existed as destroy started, the Ploinky-managed AgentLib state `.ploinky/agentlib` |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 `cli/index.js` initializes the core environment and dispatches a command inside the outer runtime. With no command arguments, it starts the interactive shell backed by `.ploinky/ploinky_history`. Commands entered there stay at core workspace/router/agent scope; they do not control the containing outer runtime. Before a core `start` command is handled, `cli/index.js` parses static-agent, port, profile, and branch policy flags and bootstraps the requested agent.
@@ -526,9 +526,11 @@ Nested container records no longer survive their box. The inner Podman graphroot
 | Nested container records and writable layers | Yes | No |
 | Inner Podman named volumes | Yes | No |
 | Transient runtime metadata under `/tmp/storage-run-1000` | No; `/tmp` is fresh each boot | No |
-| Saved Router binding `~/.ploinky-box/router-bindings/<box-instance>.json` | Yes | Yes |
-| GPU grant record and generations `~/.ploinky-box/gpu-grants/<box-instance>{.json,/}` | Yes | No; removed after the box is gone |
-| Hardware-limits gate, store, journals and markers `~/.ploinky-box/hardware-limits/<box-instance>{.json,/}` | Yes | No; removed after the box is gone |
+| Saved Router binding `<workspace>/.ploinky-box/router-bindings/<box-instance>.json` | Yes | Yes |
+| GPU grant record and generations `<workspace>/.ploinky-box/gpu-grants/<box-instance>{.json,/}` | Yes | No; removed after the box is gone |
+| Hardware-limits gate, store, journals and markers `<workspace>/.ploinky-box/hardware-limits/<box-instance>{.json,/}` | Yes | No; removed after the box is gone |
+
+`<workspace>/.ploinky-box` holds all Box host state (the three records above, update records, the workspace lock, `quarantine/` and `tmp/`); nothing is stored in `~/.ploinky-box`, and an older Box fails the compatibility check and must be recreated with `ploinky destroy` and `ploinky start` (never by deleting `.data/`, `.ploinky/data/` or `.env`). Every Box and agent runtime masks that directory as empty and read-only, except the hardware-limits store bind of a gate-on Box. Box creation, recreation and data-path creation first pass a quiescence check under the workspace lock (Linux mount-table scan with Podman's own infrastructure exempt; macOS launch records plus `ps`), `ploinky --allow-host-process PID` excuses one verified process, and `ploinky unlock` recovers locks a stopped command left behind.
 
 Those records, layers, networks, and inner named volumes are discarded with the outer box, so persistent agent data must use explicit workspace binds. Destroy first stops nested agents through the in-box helper; if that stop fails the outer box is halted but nothing is removed, leaving a stopped box and its cache data for inspection and retry. A retained managed record at startup now indicates that storage isolation failed rather than ordinary leftovers.
 

@@ -528,3 +528,19 @@ test('a resolved host state target is checked again when its mask is planned', (
         assert.deepEqual(mounts.map(mount => [mount.target, mount.readOnly]), [[hostState, true]]);
     } finally { cleanup(); }
 });
+
+test('the Box host-state name fold has one implementation, shared by the volume policy and the capability check', async () => {
+    for (const file of ['cli/utils/runtime/agentDataPathPolicy.js', 'cli/sandbox/runtimeCapabilities.js']) {
+        const source = fs.readFileSync(path.resolve(file), 'utf8');
+        // The shared function is imported from its one module and called.
+        assert.match(source, /^import \{[^}]*\bhasHostStateComponent\b[^}]*\} from '(?:\.\.\/)+ploinky-box\/hostState\/paths\.mjs';$/m, file);
+        assert.match(source, /^(?!\s*\/\/).*\bhasHostStateComponent\(/m, file);
+        assert.doesNotMatch(source, /NFKC/, `${file} keeps its own copy of the name fold`);
+    }
+    // Behavior parity at the shared function: both consumers refuse the folded forms.
+    const { hasHostStateComponent } = await import('../../ploinky-box/hostState/paths.mjs');
+    for (const name of ['.PLOINKY-BOX', '.ploinky-box.', 'Keep/.ploinky-box', 'a/.Ploinky-Box /b']) {
+        assert.equal(hasHostStateComponent(name), true, name);
+    }
+    assert.equal(hasHostStateComponent('.ploinky-boxes'), false);
+});

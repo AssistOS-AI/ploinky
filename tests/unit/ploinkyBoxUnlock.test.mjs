@@ -292,7 +292,8 @@ test('a store lock whose holder cannot be proven dead needs its exact PID@HOST; 
     let report = await unlock(identity, fakeLiveness());
     assert.equal(report.exitCode, 1);
     assert.match(report.items[2].reason, /not this host/);
-    assert.match(formatUnlockReport(report), /ploinky unlock --force-holder 77@other-host/);
+    // The Box writes this record: the pasteable value is validated and quoted.
+    assert.match(formatUnlockReport(report), /ploinky unlock --force-holder '77@other-host'/);
     report = await unlock(identity, fakeLiveness(), { forceHolder: '78@other-host' });
     assert.equal(report.items[2].state, 'kept');
     assert.equal(fs.existsSync(storeLock), true);
@@ -507,4 +508,43 @@ test('the store lock refusal text carries no control characters from the Box-wri
         assert.doesNotMatch(error.message, /[\u0000-\u001f\u007f-\u009f]/, JSON.stringify(error.message));
         assert.match(error.message, /op\?\[8m \(pid 77 on host h\?\]52;c;eA==\?\?\?X\)/);
     }
+});
+
+// Paths and manual steps are locations, not secrets: a workspace directory
+// whose name contains `token:` must print as it is, with controls still inert.
+test('the unlock report prints a path containing token: verbatim and still strips controls', () => {
+    const lockPath = '/srv/ws-token:1/.ploinky-box/locks/workspace.lock';
+    const text = formatUnlockReport({
+        exitCode: 1,
+        items: [
+            { kind: 'workspace-lock', path: lockPath, state: 'kept', reason: 'it has no owner record but is not empty', steps: [`Inspect ${lockPath}; remove it by hand: rm -r -- '${lockPath}'`] },
+            { kind: 'reclaim-guard', path: `${lockPath}.reclaim\u001b[2K`, state: 'absent' },
+        ],
+    });
+    assert.ok(text.includes(`Workspace lock ${lockPath}: kept:`), text);
+    assert.ok(text.includes(`Next: Inspect ${lockPath}; remove it by hand: rm -r -- '${lockPath}'`), text);
+    assert.doesNotMatch(text, /REDACTED/);
+    assert.ok(text.includes('workspace.lock.reclaim?[2K: not present.'), text);
+});
+
+// The real flow, in a workspace whose directory name looks like a secret
+// assignment: every reason, step and path composed from it prints verbatim.
+test('a real unlock in a workspace named ws-token:1 prints every composed path without redaction', async (t) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-unlock-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const workspace = path.join(root, 'ws-token:1');
+    fs.mkdirSync(workspace);
+    const identity = buildWorkspaceIdentity(workspace);
+
+    plantDirectory(lockPathOf(workspace), owner({ pid: 160 }), ['journal.json']);
+    plantStoreLock(identity, storeOwner());
+    let text = formatUnlockReport(await unlock(identity, fakeLiveness({ dead: [160] })));
+    assert.ok(text.includes(`Workspace lock ${lockPathOf(workspace)}: kept:`), text);
+    assert.ok(text.includes(`rm -r -- '${lockPathOf(workspace)}'`), text);
+
+    fs.rmSync(lockPathOf(workspace), { recursive: true });
+    text = formatUnlockReport(await unlock(identity, fakeLiveness()));
+    assert.ok(text.includes(`Hardware store lock ${storeLockPathOf(identity)}: removed`), text);
+    assert.ok(text.includes(`moved aside to ${path.dirname(storeLockPathOf(identity))}`), text);
+    assert.doesNotMatch(text, /REDACTED/, text);
 });

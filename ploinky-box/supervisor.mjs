@@ -3415,9 +3415,11 @@ export function createBoxSupervisor({
     /**
      * `ploinky unlock`: removes the workspace lock, its reclaim guard and the
      * hardware store lock only when their holders are proven gone or exactly
-     * named by `forceHolder`. It never waits for the workspace lock it is
-     * recovering and never creates the skeleton; the store lock step takes a
-     * free workspace lock through the bounded acquisition. See unlock.mjs.
+     * named by `forceHolder`. Unlock commands for one workspace run one at a
+     * time under their own lock (`locks/unlock.lock`). It never waits for the
+     * lock it is recovering and never creates the skeleton; the store lock
+     * step takes a free workspace lock through the bounded acquisition. See
+     * unlock.mjs.
      */
     async function runUnlock({ forceHolder = null } = {}) {
         return unlockWorkspace({ identity: resolveIdentity(), lockManager, observeBoxState, forceHolder });

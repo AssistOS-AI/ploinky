@@ -11,6 +11,7 @@ import {
     BOX_GPU_MARKER_PATH,
     BOX_MARKER_PATH,
 } from '../../ploinky-box/constants.mjs';
+import { hasHostStateComponent } from '../../ploinky-box/hostState/paths.mjs';
 import { NESTED_PODMAN_SECCOMP_BOX_PATH } from '../../ploinky-box/seccomp.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import {
@@ -380,11 +381,6 @@ export function validateManifestRuntimeCapabilities(manifest, {
     });
 }
 
-// Mirrors `foldWorkspaceName` (cli/server/utils/protectedWorkspacePaths.js).
-function foldsToHostStateDirectory(segment) {
-    return String(segment).normalize('NFKC').toLowerCase().replace(/[. ]+$/, '') === '.ploinky-box';
-}
-
 export function isManagedManifestVolumeSource(source, {
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
@@ -394,7 +390,7 @@ export function isManagedManifestVolumeSource(source, {
     const relative = path.relative(root, resolved);
     if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
     // The Box host state directory is never a managed volume source.
-    if (relative.split(path.sep).some(foldsToHostStateDirectory)) return false;
+    if (hasHostStateComponent(relative)) return false;
     let cursor = root;
     for (const segment of relative.split(path.sep).filter(Boolean)) {
         cursor = path.join(cursor, segment);
@@ -411,7 +407,7 @@ export function isManagedManifestVolumeSource(source, {
         while (!fs.existsSync(existing) && existing !== root) existing = path.dirname(existing);
         const realExisting = fs.realpathSync.native(existing);
         const realRelative = path.relative(realRoot, realExisting);
-        if (realRelative.split(path.sep).some(foldsToHostStateDirectory)) return false;
+        if (hasHostStateComponent(realRelative)) return false;
         return realRelative !== '..'
             && !realRelative.startsWith(`..${path.sep}`)
             && !path.isAbsolute(realRelative);

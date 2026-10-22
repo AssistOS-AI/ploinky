@@ -77,6 +77,18 @@ function getPidFile(runtimeKey) {
 const DEFAULT_PROCESS_OPS = Object.freeze({
     kill: (pid, signal) => process.kill(pid, signal),
     readProcStat: (pid) => fs.readFileSync(`/proc/${pid}/stat`, 'utf8'),
+    // States of every task (thread) of a process; throws ENOENT where there is
+    // no /proc task list (macOS), which `probeSandboxPid` reads as no threads.
+    readTaskStates: (pid) => fs.readdirSync(`/proc/${pid}/task`)
+        .filter((entry) => /^[1-9][0-9]*$/.test(entry))
+        .map((task) => {
+            try {
+                return parseProcStat(fs.readFileSync(`/proc/${pid}/task/${task}/stat`, 'utf8'))?.state || '';
+            } catch (error) {
+                if (error?.code === 'ENOENT' || error?.code === 'ESRCH') return 'X';
+                throw error;
+            }
+        }),
     runPs: (pid) => execFileSync('ps', ['-p', String(pid), '-o', 'stat=', '-o', 'lstart='], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
@@ -134,6 +146,16 @@ function probeSandboxPid(pid, ops) {
             : { state: 'unknown', reason: 'identity-probe-failed' };
     }
     if (/^[ZX]/.test(parsed.state)) {
+        // A zombie thread-group leader can outlive the other threads' code: the
+        // process has exited only when every task is Z or X (the quiescence
+        // gate's rule). An unreadable task list is never taken as exited.
+        let states = [];
+        try {
+            states = ops.readTaskStates(pid);
+        } catch (error) {
+            if (error?.code !== 'ENOENT' && error?.code !== 'ESRCH') return { state: 'unknown', reason: 'task-probe-failed' };
+        }
+        if (states.some((state) => !/^[ZX]/.test(state))) return { state: 'alive', identity: parsed.identity };
         return { state: 'absent', reason: 'zombie', identity: parsed.identity };
     }
     return { state: 'alive', identity: parsed.identity };

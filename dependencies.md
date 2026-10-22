@@ -127,7 +127,7 @@ service. It uses Node.js built-ins (`node:crypto`, `node:dgram`, `node:fs`,
 `node:net`, `node:os`, and `node:path`), repository-owned modules, and the
 existing rootless Podman `--publish`, `--env`, and `--label` options; there is
 no separate host forwarding daemon. The saved binding is host-only state under
-`~/.ploinky-box/router-bindings`. Regression tests use the Node.js test runner,
+`<workspace>/.ploinky-box/router-bindings`. Regression tests use the Node.js test runner,
 temporary directories, fake Podman runners, and fake network interfaces. Native
 verification uses the already present validated Box image and the installed
 Podman without pulling images or changing firewall, DNS, or tunnel settings.

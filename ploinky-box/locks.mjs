@@ -192,6 +192,10 @@ export function createMutationLockManager({
         return lockError(`Timed out waiting for the ${label} lock ${lockPath}. ${holder} ${hint}`, {
             lockBusy: true,
             holder: owner ? Object.freeze({ ...owner }) : null,
+            // What the last attempt saw, for callers that explain the wait.
+            observedKind: observed?.kind ?? null,
+            verdict: verdict ? Object.freeze({ ...verdict }) : null,
+            contendedGuard: contendedGuard ?? null,
         });
     }
 
@@ -458,8 +462,8 @@ export function createMutationLockManager({
         return { sleep: true };
     }
 
-    async function drive(state) {
-        const progress = { deadline: clock() + timeoutMs, immediate: 0 };
+    async function drive(state, limitMs = timeoutMs) {
+        const progress = { deadline: clock() + limitMs, immediate: 0 };
         try {
             while (true) {
                 const step = nextStep(state, progress);
@@ -494,7 +498,10 @@ export function createMutationLockManager({
         // For synchronous host-runtime launch paths. It blocks the calling
         // thread while it waits, for at most `timeoutMs`.
         acquireSync: (instance, options) => driveSync(workspaceState(instance, options)),
-        acquireAt: async (lockPath, label) => drive(pathState(lockPath, label)),
+        // `timeoutMs` shortens the wait for this one acquisition (`ploinky
+        // unlock` refuses quickly instead of queueing behind another unlock).
+        acquireAt: async (lockPath, label, { timeoutMs: limitMs } = {}) => drive(pathState(lockPath, label),
+            Number.isFinite(limitMs) && limitMs >= 0 ? limitMs : timeoutMs),
         lockPathFor: (workspaceRoot) => hostStatePaths(workspaceRoot).workspaceLock,
     });
 }

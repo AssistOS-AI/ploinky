@@ -1417,6 +1417,12 @@ test('public help documents non-interactive destroy and explicit cache deletion'
     assert.match(output.value(), /destroy\s+Remove the outer Box without prompting/);
     assert.match(output.value(), /GPU grants and hardware-limits records/);
     assert.match(output.value(), /until ploinky destroy removes it/);
+    assert.match(output.value(), /ploinky unlock \[--force-holder PID@MACHINE\]/);
+    assert.match(output.value(), /\[--allow-host-process PID\]/);
+    assert.match(output.value(), /<workspace>\/\.ploinky-box/);
+    assert.match(output.value(), /never means deleting \.data\/, \.ploinky\/data\/ or \.env/);
+    assert.match(output.value(), /remove the directory\s+<workspace>\/\.ploinky-box/);
+    assert.doesNotMatch(output.value(), /saved outside the\s+workspace/);
     assert.doesNotMatch(output.value(), /only clears the saved (grant)|saved gate and stored limits (are) kept/);
     assert.match(output.value(), /docker\.io\/assistos\/ploinky-box:latest/);
     assert.match(output.value(), /PLOINKY_BOX_IMAGE/);

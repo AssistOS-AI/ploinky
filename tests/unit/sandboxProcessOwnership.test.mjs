@@ -343,3 +343,26 @@ test('a PID slot that cannot be verified is never cleared or replaced, while a s
         assert.equal(fs.existsSync(file), false, 'the stale record was removed by compare-and-delete');
     `);
 });
+
+test('a zombie thread-group leader with a live thread is alive; only an all-Z/X task list is absent', () => {
+    runFleet(`
+        const key = 'ploinky_repo_agent_zombie_leader_workspace_deadbeef';
+        const identity = { instanceId: 'i', enableGeneration: 'g' };
+        const pid = child();
+        fleet.saveBwrapPid(key, pid, identity);
+        const recorded = JSON.parse(fs.readFileSync(fleet.BWRAP_PIDS_DIR + '/' + key + '.pid', 'utf8')).processIdentity;
+        // The leader reads as Z with the recorded start identity, on either platform.
+        const leaderZ = recorded.startsWith('linux-proc:')
+            ? { readProcStat: () => '1 (x) Z ' + Array.from({ length: 18 }, () => '0').join(' ') + ' ' + recorded.slice('linux-proc:'.length) + ' 0' }
+            : { readProcStat: () => { throw new Error('no procfs'); }, runPs: () => 'Z ' + recorded.slice('ps-lstart:'.length) };
+        const observe = (readTaskStates) => fleet.observeSandboxRuntime(key, { expectedIdentity: identity, ops: { ...leaderZ, readTaskStates } });
+
+        assert.equal(observe(() => ['Z', 'S']).state, 'live-exact', 'a live thread keeps the process alive');
+        assert.equal(observe(() => ['Z', '']).state, 'live-exact', 'an unparsable task state is never exited');
+        assert.equal(observe(() => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); }).state, 'unknown');
+        const exited = observe(() => ['Z', 'X', 'Z']);
+        assert.equal(exited.state, 'absent');
+        assert.equal(exited.reason, 'stale-record-zombie');
+        assert.equal(observe(() => { throw Object.assign(new Error('none'), { code: 'ENOENT' }); }).state, 'absent', 'no task list (macOS): the leader state decides');
+    `);
+});
