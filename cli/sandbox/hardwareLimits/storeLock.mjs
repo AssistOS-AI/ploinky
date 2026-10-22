@@ -20,6 +20,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { sanitizeControlDiagnosticText } from '../../utils/diagnosticText.js';
+
 export const STORE_LOCK_NAME = 'write.lock';
 export const STORE_LOCK_DEADLINE_MS = 10_000;
 export const STORE_BUSY_MESSAGE = 'Hardware policy store is locked. Stop this workspace on the host, then run '
@@ -196,6 +198,15 @@ export function withStoreLock(options, callback) {
     return result;
 }
 
+/**
+ * The exact `PID@HOST` value `ploinky unlock --force-holder` must repeat to
+ * take over a store lock whose host-domain holder cannot be proven dead. The
+ * store owner record names a hostname, not a machine identity.
+ */
+export function storeLockHolderToken(owner) {
+    return `${owner?.pid}@${owner?.hostname}`;
+}
+
 function processIsProvenDead(pid, kill) {
     try {
         kill(pid, 0);
@@ -215,6 +226,10 @@ function processIsProvenDead(pid, kill) {
  *     died with the stopped Box.
  * An ownerless or malformed lock is never proof of death: it is preserved
  * and reported. The stale lock is quarantined (renamed), never deleted.
+ * `forceHolder` (`ploinky unlock --force-holder PID@HOST`) stands in for the
+ * host-domain death proof only when it names exactly this holder, which has
+ * a valid PID, and only under the two preconditions every recovery keeps:
+ * the workspace lock (D4) is held and the Box is observed stopped or absent.
  */
 export function recoverStaleStoreLock({
     storeRoot,
@@ -225,6 +240,7 @@ export function recoverStaleStoreLock({
     kill = (pid, signal) => process.kill(pid, signal),
     fsApi = fs,
     now = () => Date.now(),
+    forceHolder = null,
 } = {}) {
     const current = readStoreLockOwner(storeRoot, { fsApi });
     if (!current) return { recovered: false, reason: 'no lock' };
@@ -243,15 +259,27 @@ export function recoverStaleStoreLock({
         );
     }
     const owner = current.owner;
-    const holder = `${String(owner.operation || 'an unnamed operation').slice(0, 128)} (pid ${String(owner.pid).slice(0, 32)} `
-        + `on host ${String(owner.hostname || 'unknown').slice(0, 255)})`;
+    // The Box writes this record: none of its fields reaches a terminal raw.
+    const field = (value, limit) => sanitizeControlDiagnosticText(String(value), { limit });
+    const holder = `${field(owner.operation || 'an unnamed operation', 128)} (pid ${field(owner.pid, 32)} `
+        + `on host ${field(owner.hostname || 'unknown', 255)})`;
     // An explicit repair needs operator-established quiescence of every
     // writer of this store (§6.3 line 441); it is never automatic.
     const repair = `make sure no Ploinky process on that host uses this store, then remove ${lockPath} and retry. `
         + 'No policy was changed.';
     if (owner.domain !== 'box') {
         const pid = Number(owner.pid);
-        if (owner.hostname !== hostname) {
+        const validPid = Number.isSafeInteger(pid) && pid > 0;
+        // A value naming another holder is not an error here: the usual
+        // death proof below still applies to this one.
+        const forced = forceHolder !== null && validPid && forceHolder === storeLockHolderToken(owner);
+        if (forced) {
+            // The operator's word stands in for the death proof only here: the
+            // workspace lock is held (asserted above) and the Box must still be
+            // observed stopped or absent (below). The record has no start token,
+            // so a same-host PID that is alive cannot be told from a reused one;
+            // naming it exactly takes the lock over under those preconditions.
+        } else if (owner.hostname !== hostname) {
             // Another host's PID cannot be checked from here.
             throw new StoreLockError(
                 `Hardware policy store lock ${lockPath} is held by ${holder}, which is not this host (${hostname}), so `
@@ -260,16 +288,14 @@ export function recoverStaleStoreLock({
                 'store_busy',
                 409,
             );
-        }
-        if (!Number.isSafeInteger(pid) || pid <= 0) {
+        } else if (!validPid) {
             throw new StoreLockError(
                 `Hardware policy store lock ${lockPath} is held by ${holder}, whose owner record names no valid process, `
                 + `so it is never taken over. Stop this workspace on the host, ${repair}`,
                 'store_busy',
                 409,
             );
-        }
-        if (!processIsProvenDead(pid, kill)) {
+        } else if (!processIsProvenDead(pid, kill)) {
             throw new StoreLockError(
                 `Hardware policy store lock ${lockPath} is held by ${holder}, and that process is still running on this `
                 + 'host, so the lock is never taken over. Wait for that operation to finish and retry. If that PID is not a '

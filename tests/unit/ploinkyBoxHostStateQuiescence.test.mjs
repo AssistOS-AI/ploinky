@@ -32,6 +32,9 @@ function realWorkspace(t) {
 }
 
 // A fake /proc: `processes` maps PID to { uids, mountinfo | error, cmdline }.
+// `tasks` maps TID to { state, mountinfo | error } for /proc/<pid>/task/*;
+// without it the only task is the leader itself. `taskError` makes the task
+// list unreadable.
 // The workspace path seen by the scan is fixed to /home/dev/ws through a
 // realpath override, while the real directory backs identity resolution.
 // `pause` describes rootless Podman's pause file under the fake runtime
@@ -66,6 +69,13 @@ function procFs(workspace, processes, { own = OWN_MOUNTINFO, pause = null } = {}
         },
         readdirSync(target) {
             if (target === '/proc') return ['self', ...Object.keys(processes), 'sys'];
+            const tasks = /^\/proc\/(\d+)\/task$/.exec(target);
+            if (tasks) {
+                const entry = processes[tasks[1]];
+                if (!entry) throw denied('ENOENT');
+                if (entry.taskError) throw denied(entry.taskError);
+                return Object.keys(entry.tasks || { [tasks[1]]: {} });
+            }
             return fs.readdirSync(target);
         },
         readFileSync(target, encoding) {
@@ -73,6 +83,18 @@ function procFs(workspace, processes, { own = OWN_MOUNTINFO, pause = null } = {}
             if (target === PAUSE_FILE) {
                 if (!pause) throw denied('ENOENT');
                 return `${pause.pid}\n`;
+            }
+            const taskFile = /^\/proc\/(\d+)\/task\/(\d+)\/(status|mountinfo)$/.exec(target);
+            if (taskFile) {
+                const entry = processes[taskFile[1]];
+                const task = entry?.tasks ? entry.tasks[taskFile[2]] : (taskFile[1] === taskFile[2] ? entry : null);
+                if (!task) throw denied('ENOENT');
+                if (taskFile[3] === 'status') {
+                    if (task.statusError) throw denied(task.statusError);
+                    return `Name:\tx\nState:\t${task.state || 'S (sleeping)'}\nUid:\t1000\n`;
+                }
+                if (task.error) throw Object.assign(new Error(task.error), { code: task.error });
+                return task.mountinfo;
             }
             const match = /^\/proc\/(\d+)\/(status|mountinfo|cmdline|cgroup)$/.exec(target);
             if (!match) return fs.readFileSync(target, encoding);
@@ -227,7 +249,7 @@ function darwinGate(workspace, { processes = [], records = {}, alive = new Set()
 test('macOS: launch records of running agents, invalid records and command lines naming the workspace block', (t) => {
     const { workspace } = realWorkspace(t);
     const identity = buildWorkspaceIdentity(workspace);
-    const record = (pid) => JSON.stringify({ pid, runtimeKey: 'agent' });
+    const record = (pid) => JSON.stringify({ schemaVersion: 3, hostStateMasked: true, pid, runtimeKey: 'agent' });
     assert.throws(() => darwinGate(workspace, { records: { 'a.pid': record(700) }, alive: new Set([700]) }).assert(identity),
         /process 700: its launch record .*a\.pid names a running process/);
     assert.doesNotThrow(() => darwinGate(workspace, { records: { 'a.pid': record(700) } }).assert(identity),
@@ -372,4 +394,92 @@ test('the scan before a replacement stops the old Box ignores exactly that Box a
     const other = { ...view[0], id: 'f'.repeat(64), name: 'other', pid: 600 };
     assert.throws(() => gate({ 500: boxInit }).assert(identity, { view: [...view, other], excludeContainerIds: [boxId] }),
         /container other/);
+});
+
+// Steps 4–5 review minor (A): a zombie thread-group leader can still have live
+// threads that run with the workspace mounted. Its own mountinfo then fails
+// with EINVAL, so the decision must come from /proc/<pid>/task.
+test('Linux: a zombie leader with a live thread still blocks; only all-exited tasks are skipped', (t) => {
+    const { workspace } = realWorkspace(t);
+    const identity = buildWorkspaceIdentity(workspace);
+    const uids = [1000, 1000, 1000, 1000];
+    const leaderZombie = (tasks, extra = {}) => ({ uids, state: 'Z (zombie)', error: 'EINVAL', tasks, ...extra });
+    // A live thread that has the workspace mounted read-write blocks, and the
+    // mount line comes from that thread's own table.
+    const withLiveThread = leaderZombie({
+        500: { state: 'Z (zombie)', error: 'EINVAL' },
+        501: { state: 'S (sleeping)', mountinfo: BWRAP_WITH_WORKSPACE },
+    });
+    assert.throws(() => linuxGate(procFs(workspace, { 500: withLiveThread })).assert(identity), (error) => {
+        assert.deepEqual(error.blockers.map((entry) => entry.pid), [500]);
+        assert.match(error.message, /process 500 .*has the workspace mounted read-write; mount: 901 900 0:50 \/dev\/ws/);
+        return true;
+    });
+    // A live thread whose own table cannot be read blocks too (fail closed).
+    const unreadable = leaderZombie({ 600: { state: 'Z (zombie)' }, 601: { state: 'R (running)', error: 'EACCES' } });
+    assert.throws(() => linuxGate(procFs(workspace, { 600: unreadable })).assert(identity), /process 600 .*cannot be read \(EACCES\)/);
+    // A task list or a task status that cannot be read is not proof of exit.
+    assert.throws(() => linuxGate(procFs(workspace, { 700: leaderZombie(undefined, { taskError: 'EACCES' }) })).assert(identity),
+        /process 700 .*cannot be read \(EINVAL\)/);
+    const statusDenied = leaderZombie({ 800: { state: 'Z (zombie)' }, 801: { statusError: 'EACCES' } });
+    assert.throws(() => linuxGate(procFs(workspace, { 800: statusDenied })).assert(identity), /process 800 /);
+    // Every task Z or X, or vanished meanwhile: exited, never a blocker.
+    const allExited = leaderZombie({ 900: { state: 'Z (zombie)' }, 901: { state: 'X (dead)' } });
+    const vanished = leaderZombie(undefined, { taskError: 'ENOENT' });
+    assert.doesNotThrow(() => linuxGate(procFs(workspace, { 900: allExited, 1000: vanished })).assert(identity));
+});
+
+// Steps 4–5 review minor (B): after a package upgrade the running Podman
+// helpers' /proc/<pid>/exe ends in " (deleted)". They stay exempt, the pause
+// proof still holds, and the exemption still requires Podman's namespace.
+test('Linux: upgraded Podman helpers (" (deleted)" executables) stay exempt only in the proven Podman namespace', (t) => {
+    const { workspace } = realWorkspace(t);
+    const identity = buildWorkspaceIdentity(workspace);
+    const deleted = (exe, extra = {}) => infraProcess(exe, { exe: `/usr/bin/${exe} (deleted)`, ...extra });
+    const processes = { 6469: deleted('catatonit'), 1464: deleted('conmon'), 1466: deleted('pasta') };
+    const result = linuxGate(procFs(workspace, processes, { pause: { pid: 6469 } })).assert(identity);
+    assert.deepEqual(result.podmanInfra.map((entry) => entry.pid).sort(), [1464, 1466, 6469]);
+    assert.deepEqual(result.podmanInfra.map((entry) => entry.executable).sort(), ['catatonit', 'conmon', 'pasta']);
+    assert.equal(podmanInfraNamespace({ fsApi: procFs(workspace, processes, { pause: { pid: 6469 } }), env: RUNTIME_ENV, uid: 1000 })?.pid, 6469);
+    // The same upgraded helper in another namespace with / read-write blocks.
+    const elsewhere = deleted('conmon', { ns: 'mnt:[4026539999]' });
+    assert.throws(() => linuxGate(procFs(workspace, { ...processes, 88: elsewhere }, { pause: { pid: 6469 } })).assert(identity),
+        (error) => error.blockers.map((entry) => entry.pid).join() === '88');
+    // Only the exact suffix is stripped: another name is still not Podman's.
+    const lookalike = infraProcess('conmon', { exe: '/usr/bin/conmon (deleted) (deleted)' });
+    assert.throws(() => linuxGate(procFs(workspace, { ...processes, 89: lookalike }, { pause: { pid: 6469 } })).assert(identity),
+        (error) => error.blockers.map((entry) => entry.pid).join() === '89');
+});
+
+// Plan D3 with schema 3 launch records: on macOS a running agent whose record
+// is not a masked schema 3 record (an older Ploinky's schema 2 record) blocks
+// and cannot be excused; a masked agent's record blocks but can be excused.
+test('macOS: a running unmasked (schema 2) agent blocks and cannot be excused; a masked one can', (t) => {
+    const { workspace } = realWorkspace(t);
+    const identity = buildWorkspaceIdentity(workspace);
+    const v2 = JSON.stringify({ schemaVersion: 2, pid: 700, runtimeKey: 'old' });
+    const v3 = JSON.stringify({ schemaVersion: 3, hostStateMasked: true, pid: 701, runtimeKey: 'new' });
+    const forged = JSON.stringify({ schemaVersion: 2, hostStateMasked: true, pid: 702, runtimeKey: 'forged' });
+    const allowing = (records, pids) => {
+        const directory = path.join(workspace, '.ploinky', 'bwrap-pids');
+        fs.mkdirSync(directory, { recursive: true });
+        for (const [name, body] of Object.entries(records)) fs.writeFileSync(path.join(directory, name), body);
+        const built = createQuiescenceGate({
+            platform: 'darwin', uid: 501, selfPid: 600, execFile: () => '', allowHostProcesses: pids,
+            kill: (pid) => { if (![700, 701, 702].includes(pid)) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); },
+            liveness: { processStart: () => 'darwin:1' },
+        });
+        return { assert: () => { try { return built.assert(identity); } finally { fs.rmSync(path.join(workspace, '.ploinky'), { recursive: true, force: true }); } } };
+    };
+    assert.throws(() => allowing({ 'old.pid': v2 }, []).assert(), (error) => {
+        assert.match(error.message, /process 700: its launch record .*old\.pid \(schema 2\) names a running agent that an older Ploinky started without the host state mask/);
+        assert.doesNotMatch(error.message, /--allow-host-process/);
+        return true;
+    });
+    assert.throws(() => allowing({ 'old.pid': v2 }, [700]).assert(), /process 700: .*without the host state mask/,
+        'an unmasked agent is never excused');
+    assert.throws(() => allowing({ 'forged.pid': forged }, [702]).assert(), /process 702: .*schema 2/,
+        'only a schema 3 record counts as masked');
+    assert.throws(() => allowing({ 'new.pid': v3 }, []).assert(), /process 701: its launch record .*new\.pid names a running process.*--allow-host-process 701/s);
+    assert.doesNotThrow(() => allowing({ 'new.pid': v3 }, [701]).assert(), 'a masked agent can be excused');
 });

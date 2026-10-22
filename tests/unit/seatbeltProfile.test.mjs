@@ -598,3 +598,53 @@ test('generated profile denies reads of the master key and encrypted stores but 
         fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
+
+// Plan D3: seatbelt has no mount namespace, so `.ploinky-box` is denied by path
+// for reads and writes, in both spellings, while the workspace stays writable.
+test('buildSeatbeltProfile denies reading and writing the Box host state directory', () => {
+    const profile = buildSeatbeltProfile({
+        agentLibGrant: seatbeltGrantFor('/Users/alice/workspace'),
+        agentCodePath: '/Users/alice/workspace/.ploinky/repos/repo/agent',
+        agentLibPath: '/Users/alice/workspace/.ploinky/seatbelt-runtime/agent/Agent-1',
+        nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/store/node_modules',
+        agentWorkDir: '/Users/alice/workspace/.data/agent',
+        sharedDir: '/Users/alice/workspace/.data/shared',
+        cwd: '/Users/alice/workspace',
+        skillsPath: null,
+        codeReadOnly: false,
+        skillsReadOnly: true,
+        volumes: { '.': '/workspace' },
+        workspaceRoot: '/Users/alice/workspace',
+    });
+    const readDeny = profile.slice(profile.indexOf('; Protected controller state is opaque'));
+    assert.ok(readDeny.includes('(subpath "/Users/alice/workspace/.ploinky-box")'), readDeny);
+    const writeDeny = profile.slice(profile.indexOf('; Protected runtime paths'), profile.indexOf('; Protected controller state is opaque'));
+    assert.ok(writeDeny.includes('(subpath "/Users/alice/workspace/.ploinky-box")'), writeDeny);
+});
+
+test('generated profile keeps .ploinky-box opaque and unrenamable through a writable workspace volume', { skip: process.platform !== 'darwin' }, () => {
+    requireSandboxExec();
+    const { workspace, at, run } = seatbeltControllerFixture();
+    try {
+        fs.mkdirSync(at('.ploinky-box', 'locks'), { recursive: true });
+        fs.writeFileSync(at('.ploinky-box', 'workspace.json'), 'HOST-STATE');
+        // Positive control: the workspace volume itself stays writable.
+        const projectWrite = run('printf more >> "$1" && mkdir "$2"', at('project-file'), at('new-dir'));
+        assert.equal(projectWrite.status, 0, projectWrite.stderr);
+        const spellings = [at('.ploinky-box')];
+        // A case-insensitive volume opens the same directory under another spelling.
+        if (fs.existsSync(at('.PLOINKY-BOX'))) spellings.push(at('.PLOINKY-BOX'));
+        for (const spelling of spellings) {
+            assertSandboxDenied(run('ls -A "$1"', spelling), `list ${spelling}`);
+            assertSandboxDenied(run('cat "$1"', path.join(spelling, 'workspace.json')), `read ${spelling}`);
+            assertSandboxDenied(run('printf X > "$1"', path.join(spelling, 'planted')), `create in ${spelling}`);
+            assertSandboxDenied(run('rmdir "$1"', path.join(spelling, 'locks')), `remove in ${spelling}`);
+            assertSandboxDenied(run(RENAME_SCRIPT, spelling, at('moved')), `rename ${spelling}`);
+        }
+        assert.deepEqual(fs.readdirSync(at('.ploinky-box')).sort(), ['locks', 'workspace.json']);
+        assert.equal(fs.readFileSync(at('.ploinky-box', 'workspace.json'), 'utf8'), 'HOST-STATE');
+        assert.equal(fs.existsSync(at('moved')), false);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});

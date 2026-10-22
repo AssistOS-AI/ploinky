@@ -74,9 +74,9 @@ export function ancestorDirectoryIdentities(target, fsApi = fs) {
 // The workspace may sit on a filesystem that matches names regardless of case
 // or Unicode form (APFS, also through the Box's virtiofs mount), where
 // `.PLOINKY-BOX` or `.ploinKy-box` (Kelvin sign) open the host-state
-// directory. This is the fold of `foldWorkspaceName` in
-// `cli/server/utils/protectedWorkspacePaths.js`, kept here so the Box host
-// code does not load the Router's configuration module.
+// directory. This is the one implementation of that fold: the Router's
+// `foldWorkspaceName` (`cli/server/utils/protectedWorkspacePaths.js`) is this
+// function, so this module must keep loading nothing from the Router.
 export function foldPathName(name) {
     return String(name).normalize('NFKC').toLowerCase().replace(/[. ]+$/, '');
 }

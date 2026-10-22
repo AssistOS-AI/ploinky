@@ -34,6 +34,7 @@ import {
 import { isInsideBox } from '../lib/boxMarker.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
 import { TARGETED_UPDATE_OPERATION, formatLimitsStatus } from '../hardwareLimitsGate.mjs';
+import { formatUnlockReport } from '../unlock.mjs';
 
 function formatLimitsClearResult(result) {
     if (result.absent) return 'No hardware limits are stored for this workspace; nothing was changed.\n';
@@ -82,6 +83,12 @@ Commands:
                                   list remaining manual or administrator actions
   ploinky --dry-run repair        Show the repair plan without applying fixes
   ploinky stop                    Stop core services and the outer Box
+  ploinky unlock [--force-holder PID@MACHINE]
+                                  Remove a workspace or hardware store lock left by a
+                                  command that is no longer running; a holder that
+                                  cannot be checked needs the exact --force-holder
+                                  value from the busy error. Locks with leftover
+                                  contents are listed, never removed
   ploinky update [PATH]           Verified fast-forward update of repos and skills
   ploinky update all [PATH]       (Ploinky only when its checkout is within PATH)
   ploinky update repos|repo NAME  Update registered repositories; activation is pending
@@ -136,7 +143,7 @@ If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/
 function outerDebug(parsed, route, stdout) {
     if (!parsed.debug.enabled) return;
     if (['help', 'status', 'stop', 'destroy', 'bash', 'dry-run', 'bind', 'bind-dry-run',
-        'gpu-status', 'gpu-grant', 'gpu-revoke', 'limits-status', 'limits-clear'].includes(route.kind)) {
+        'gpu-status', 'gpu-grant', 'gpu-revoke', 'limits-status', 'limits-clear', 'unlock'].includes(route.kind)) {
         stdout.write('[INFO] Debug mode enabled.\n');
     }
 }
@@ -198,7 +205,9 @@ export async function runOuterCli(argv, options = {}) {
         // core-only options that the outer argument parser does not accept.
         let command = '';
         try { command = parseOuterArguments(argv).command; } catch (_) {}
-        if (command === 'diagnose' || command === 'repair') {
+        // Host-only commands: lock recovery included, since the Box masks the
+        // host state that holds the locks.
+        if (command === 'diagnose' || command === 'repair' || command === 'unlock') {
             errorOutput.write(`ploinky ${command} must run on the physical host, outside the Box. Exit this shell and run ploinky ${command} from the host workspace.\n`);
             return 1;
         }
@@ -392,6 +401,11 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     if (route.kind === 'limits-status') {
         output.write(formatLimitsStatus(selectedSupervisor.inspectLimitsStatus()));
         return 0;
+    }
+    if (route.kind === 'unlock') {
+        const report = await selectedSupervisor.runUnlock({ forceHolder: route.forceHolder });
+        output.write(formatUnlockReport(report));
+        return report.exitCode;
     }
     if (route.kind === 'limits-clear') {
         const result = await selectedSupervisor.runLimitsClearTransaction({ agentRef: route.agentRef, all: route.all });

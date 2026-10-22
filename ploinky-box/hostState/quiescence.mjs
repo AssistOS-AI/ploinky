@@ -92,11 +92,44 @@ export function exposingMount(mounts, location) {
         && (containsPath(mount.root, location.path) || containsPath(location.path, mount.root))) || null;
 }
 
-// A zombie (Z) or dead (X) process has exited: it runs no code and has no
-// mount table left (reading it fails with EINVAL), so it cannot write anything.
-function processExited(statusText) {
+// A zombie (Z) or dead (X) task has exited: it runs no code.
+function taskExited(statusText) {
     const line = String(statusText || '').split('\n').find((entry) => entry.startsWith('State:'));
     return Boolean(line) && /^[ZX]\b/.test(line.slice(6).trim());
+}
+
+const GONE = new Set(['ENOENT', 'ESRCH']);
+
+/**
+ * Whether a process has exited, and where to read the mount table of a part
+ * of it that still runs. A zombie thread-group leader can outlive its other
+ * threads' code: those threads keep running with the same mount table, which
+ * the leader's own `/proc/<pid>/mountinfo` no longer shows (EINVAL). So the
+ * process counts as exited only when every task under `/proc/<pid>/task` is
+ * Z or X; otherwise the mount table of a live task is read. A task list or a
+ * task status that cannot be read is never taken as exited (fail closed).
+ */
+function processActivity(pid, statusText, fsApi) {
+    const leader = `/proc/${pid}/mountinfo`;
+    if (!taskExited(statusText)) return { exited: false, mountinfo: leader };
+    let tasks;
+    try {
+        tasks = fsApi.readdirSync(`/proc/${pid}/task`).filter((entry) => /^[1-9][0-9]*$/.test(entry));
+    } catch (error) {
+        if (GONE.has(error?.code)) return { exited: true };
+        return { exited: false, mountinfo: leader };
+    }
+    for (const task of tasks) {
+        let status;
+        try {
+            status = fsApi.readFileSync(`/proc/${pid}/task/${task}/status`, 'utf8');
+        } catch (error) {
+            if (GONE.has(error?.code)) continue;
+            return { exited: false, mountinfo: leader };
+        }
+        if (!taskExited(status)) return { exited: false, mountinfo: `/proc/${pid}/task/${task}/mountinfo` };
+    }
+    return { exited: true };
 }
 
 function processUids(statusText) {
@@ -120,9 +153,13 @@ export const PODMAN_INFRA_EXECUTABLES = Object.freeze([
 ]);
 const PODMAN_PAUSE_EXECUTABLES = Object.freeze(['catatonit', 'podman']);
 
+// The kernel appends ` (deleted)` to the link of an executable whose file was
+// replaced after the process started, as a package upgrade of Podman does to
+// its running helpers. The name is still the one that was executed. The name
+// alone never exempts anything: the namespace must match as well.
 function executableName(pid, fsApi) {
     try {
-        return path.posix.basename(fsApi.readlinkSync(`/proc/${pid}/exe`));
+        return path.posix.basename(fsApi.readlinkSync(`/proc/${pid}/exe`)).replace(/ \(deleted\)$/, '');
     } catch (_) {
         return null;
     }
@@ -210,11 +247,12 @@ function linuxBlockers({ workspaceReal, uid, selfPid, fsApi, infra = null, exemp
             continue;
         }
         if (uid !== null && !processUids(status).includes(uid)) continue;
-        if (processExited(status)) continue;
+        const activity = processActivity(pid, status, fsApi);
+        if (activity.exited) continue;
         if (insideScopes(pid, excludedScopes, fsApi)) continue;
         let mounts;
         try {
-            mounts = parseMountinfo(fsApi.readFileSync(`/proc/${pid}/mountinfo`, 'utf8'));
+            mounts = parseMountinfo(fsApi.readFileSync(activity.mountinfo, 'utf8'));
         } catch (error) {
             if (error?.code === 'ENOENT' || error?.code === 'ESRCH') continue;
             blockers.push({ kind: 'process', pid, reason: `its mount table cannot be read (${error?.code || error?.message})` });
@@ -274,7 +312,10 @@ function readLaunchRecords(workspaceRoot, fsApi) {
         try {
             const record = JSON.parse(fsApi.readFileSync(file, 'utf8'));
             if (!Number.isSafeInteger(record?.pid) || record.pid <= 0) return { file, error: 'invalid' };
-            return { file, pid: record.pid, runtimeKey: String(record.runtimeKey || name) };
+            // Schema 3 records a launch with the host state mask; an older
+            // record names an agent of older code that runs without it.
+            const masked = record.schemaVersion === 3 && record.hostStateMasked === true;
+            return { file, pid: record.pid, runtimeKey: String(record.runtimeKey || name), masked, schemaVersion: record.schemaVersion };
         } catch (error) {
             return { file, error: error instanceof SyntaxError ? 'unparseable' : (error?.code || 'unreadable') };
         }
@@ -293,7 +334,17 @@ function darwinBlockers({ identity, workspaceReal, uid, selfPid, fsApi, execFile
         } catch (error) {
             if (error?.code === 'ESRCH') continue;
         }
-        blockers.push({ kind: 'process', pid: record.pid, reason: `its launch record ${record.file} names a running process` });
+        if (record.masked) {
+            blockers.push({ kind: 'process', pid: record.pid, reason: `its launch record ${record.file} names a running process` });
+            continue;
+        }
+        // An agent that runs without the mask can write `.ploinky-box`; it is
+        // never excused, only stopped.
+        blockers.push({
+            kind: 'process', pid: record.pid, excusable: false,
+            reason: `its launch record ${record.file} (schema ${record.schemaVersion ?? 'unknown'}) names a running agent that an `
+                + 'older Ploinky started without the host state mask; stop that agent (it cannot be excused)',
+        });
     }
     const processes = darwinProcesses(execFile);
     const ancestors = new Set([selfPid]);
@@ -396,7 +447,7 @@ export function createQuiescenceGate({
         const blocking = [];
         const excused = [];
         for (const blocker of found) {
-            if (blocker.kind === 'process' && allowed.has(blocker.pid)) {
+            if (blocker.kind === 'process' && blocker.excusable !== false && allowed.has(blocker.pid)) {
                 const start = liveness.processStart(blocker.pid);
                 if (start) {
                     excused.push({ ...blocker, start });
@@ -417,7 +468,8 @@ export function createQuiescenceGate({
         for (const blocker of blocking) {
             if (blocker.kind === 'process' && !blocker.command && platform === 'linux') blocker.command = linuxCommand(blocker.pid, fsApi);
         }
-        const pids = blocking.filter((blocker) => blocker.kind === 'process').map((blocker) => blocker.pid);
+        const pids = blocking.filter((blocker) => blocker.kind === 'process' && blocker.excusable !== false)
+            .map((blocker) => blocker.pid);
         throw activeError(
             `Something other than this command can write the workspace ${identity.workspaceRoot}, so the Box cannot be `
             + `created, recreated or adopted now:\n${blocking.map((blocker) => `  - ${describe(blocker)}`).join('\n')}\n`

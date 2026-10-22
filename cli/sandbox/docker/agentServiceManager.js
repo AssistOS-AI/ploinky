@@ -1064,6 +1064,9 @@ function appendControllerStateGuards(args, runtime, {
     workspaceRoot,
     canonicalRuntimeWorkspaceGuards = isPloinkyBoxRuntime(),
 } = {}) {
+    // The guards always mask `.ploinky-box`, so its skeleton exists before
+    // they are planned; a launch that cannot create it fails here.
+    ensureHostLaunchSkeleton(workspaceRoot || PLOINKY_WORKSPACE_ROOT);
     const bindings = expectedBindMountsFromArgs(args).map(mount => ({
         hostPath: mount.source,
         runtimePath: mount.destination,

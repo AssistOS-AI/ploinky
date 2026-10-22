@@ -68,6 +68,19 @@ export function serializeOwner(owner) {
     return Buffer.from(`${JSON.stringify(Object.fromEntries(OWNER_KEYS.map((key) => [key, owner[key]])))}\n`);
 }
 
+// The form of a `--force-holder` value: a PID, `@`, and one machine identity
+// or hostname. It admits no whitespace or control characters.
+export const FORCE_HOLDER_PATTERN = /^[1-9][0-9]{0,9}@[^\s@/\\\p{Cc}]{1,256}$/u;
+
+/**
+ * The exact `PID@MACHINE` value that `ploinky unlock --force-holder` must
+ * repeat to remove a lock whose holder cannot be classified: the holder's PID
+ * and its machine identity (its hostname when no machine identity was read).
+ */
+export function lockHolderToken(owner) {
+    return `${owner.pid}@${owner.machineId ?? owner.hostname}`;
+}
+
 export function describeHolder(owner) {
     return `pid ${owner.pid} on ${owner.hostname} (machine ${owner.machineId ?? 'unknown'}, `
         + `boot ${owner.bootId ?? 'unknown'}, process started ${owner.processStart ?? 'unknown'}, `

@@ -515,6 +515,9 @@ function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, 
 }
 
 function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
+    // The guards always mask `.ploinky-box`, so its skeleton exists before
+    // they are planned; a launch that cannot create it fails here.
+    ensureHostLaunchSkeleton(workspaceRoot);
     const bindings = [];
     const remainder = [];
     let insertionIndex = 0;

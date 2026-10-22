@@ -13,6 +13,7 @@ import {
     OWNER_FILE,
     describeHolder,
     discardDirectory,
+    lockHolderToken,
     publishLock,
     readOwnerRecord,
     retireLock,
@@ -22,7 +23,7 @@ import {
 } from './lockFiles.mjs';
 import { createLockLiveness, LIVENESS } from './lockLiveness.mjs';
 
-export { LOCK_OWNER_SCHEMA, LOCK_OWNER_VERSION, parseLockOwner } from './lockFiles.mjs';
+export { LOCK_OWNER_SCHEMA, LOCK_OWNER_VERSION, lockHolderToken, parseLockOwner } from './lockFiles.mjs';
 
 // The workspace mutation lock lives in `<workspace>/.ploinky-box/locks/` and
 // so follows the workspace directory: every spelling of one directory shares
@@ -30,7 +31,7 @@ export { LOCK_OWNER_SCHEMA, LOCK_OWNER_VERSION, parseLockOwner } from './lockFil
 // publish and retire, crash debris) is in lockFiles.mjs.
 export const WORKSPACE_LOCK_LABEL = 'workspace';
 
-const RECLAIM_SUFFIX = '.reclaim';
+export const RECLAIM_SUFFIX = '.reclaim';
 const MAX_IMMEDIATE_RETRIES = 8;
 const PROCESS_STARTED_AT_MS = Date.now() - process.uptime() * 1000;
 
@@ -119,7 +120,11 @@ export function createMutationLockManager({
     }
 
     function residueError(lockPath, label, residue, reason) {
-        const hint = label === WORKSPACE_LOCK_LABEL ? 'Run `ploinky unlock` in the workspace after inspecting it.'
+        // `ploinky unlock` never removes a lock with leftovers; it lists them
+        // with the manual steps.
+        const hint = label === WORKSPACE_LOCK_LABEL
+            ? 'Inspect it (`ploinky unlock` in the workspace lists it with the manual steps) and remove it by hand '
+                + 'once nothing in it is needed.'
             : 'Inspect and remove it once you are sure no command is using it.';
         return lockError(
             `The ${label} lock ${lockPath} belongs to a command that is no longer running (${reason}), but it `
@@ -133,7 +138,10 @@ export function createMutationLockManager({
     // owner could interleave so that the second removes the lock a third
     // command acquired after the first reclaim. Under the guard the lock
     // directory can change only through its holder, which is proven gone.
-    function reclaimStale(lockPath, observed) {
+    // `accept(owner, verdict)` is re-decided under the guard: by default only a
+    // stale holder; `ploinky unlock --force-holder` also accepts the exact named
+    // holder that cannot be classified, never a live one.
+    function reclaimStale(lockPath, observed, accept = (_owner, verdict) => verdict.state === LIVENESS.stale) {
         const guard = `${lockPath}${RECLAIM_SUFFIX}`;
         try {
             fsApi.mkdirSync(guard, { recursive: false, mode: 0o700 });
@@ -153,7 +161,7 @@ export function createMutationLockManager({
                 return { outcome: 'retry' };
             }
             const verdict = liveness.classify(current.owner);
-            if (verdict.state !== LIVENESS.stale) return { outcome: 'retry' };
+            if (!accept(current.owner, verdict)) return { outcome: 'retry' };
             const residue = residueOf(lockPath);
             if (residue.length) return { outcome: 'residue', residue, reason: verdict.reason };
             retireLock(fsApi, lockPath);
@@ -178,16 +186,30 @@ export function createMutationLockManager({
         }
         if (contendedGuard) holder += ` Another command is reclaiming it (${contendedGuard}).`;
         const owner = observed?.kind === 'owner' ? observed.owner : null;
-        const forced = owner ? ` (or \`ploinky unlock --force-holder ${owner.pid}@${owner.machineId ?? owner.hostname}\`)` : '';
-        const hint = label === WORKSPACE_LOCK_LABEL
-            ? 'Run the command again after that command finishes. If it is no longer running, run `ploinky unlock` '
-                + `in the workspace${forced}.`
+        const hint = label === WORKSPACE_LOCK_LABEL ? workspaceLockHint(owner, verdict)
             : 'Run the command again after that command finishes. If it is no longer running, '
                 + 'inspect and remove the lock.';
         return lockError(`Timed out waiting for the ${label} lock ${lockPath}. ${holder} ${hint}`, {
             lockBusy: true,
             holder: owner ? Object.freeze({ ...owner }) : null,
         });
+    }
+
+    // The busy hint names exactly what `ploinky unlock` will do for this holder.
+    function workspaceLockHint(owner, verdict) {
+        if (owner && verdict?.state === LIVENESS.live) {
+            return 'Run the command again after that command finishes; `ploinky unlock` never removes a lock whose '
+                + 'holder is running.';
+        }
+        if (owner && verdict?.state === LIVENESS.undetermined) {
+            return 'Run the command again after that command finishes. If it is no longer running, run '
+                + `\`ploinky unlock --force-holder ${lockHolderToken(owner)}\` in the workspace.`;
+        }
+        if (owner && verdict?.state === LIVENESS.stale) {
+            return 'Its holder is gone; if the command stays busy, run `ploinky unlock` in the workspace.';
+        }
+        return 'Run the command again after that command finishes. If the lock stays, `ploinky unlock` in the '
+            + 'workspace shows what it holds and how to remove it by hand.';
     }
 
     // One acquisition attempt, shared by the asynchronous and synchronous
@@ -463,6 +485,11 @@ export function createMutationLockManager({
     }
 
     return Object.freeze({
+        // Recovery primitives for `ploinky unlock` (unlock.mjs): the same
+        // inspection, classification and guarded reclaim that acquisition uses.
+        inspectLock: (lockPath) => inspectLockDirectory(lockPath),
+        classifyHolder: (owner) => liveness.classify(owner),
+        reclaimLock: (lockPath, observed, accept) => reclaimStale(lockPath, observed, accept),
         acquire: async (instance, options) => drive(workspaceState(instance, options)),
         // For synchronous host-runtime launch paths. It blocks the calling
         // thread while it waits, for at most `timeoutMs`.

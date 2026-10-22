@@ -5,8 +5,15 @@ import { PLOINKY_DIR } from '../../utils/config.js';
 import { debugLog } from '../../utils/utils.js';
 
 const BWRAP_PIDS_DIR = path.join(PLOINKY_DIR, 'bwrap-pids');
-const BWRAP_PID_SCHEMA_VERSION = 2;
-const BWRAP_PID_RECORD_KEYS = Object.freeze([
+// Schema 3 records a launch that masks `<workspace>/.ploinky-box` (plan D3,
+// `hostStateMasked: true`). Schema 2 records come from an older Ploinky whose
+// agent ran without that mask. They stay readable as valid but unmasked, so
+// this version can still stop and restart such an agent (replacing it with a
+// masked one); the quiescence gate refuses Box adoption or creation while one
+// of them is still running. Anything older or malformed is invalid.
+const BWRAP_PID_SCHEMA_VERSION = 3;
+const BWRAP_PID_OLDEST_READABLE_SCHEMA = 2;
+const BWRAP_PID_V2_RECORD_KEYS = Object.freeze([
     'enableGeneration',
     'instanceId',
     'pid',
@@ -14,6 +21,7 @@ const BWRAP_PID_RECORD_KEYS = Object.freeze([
     'runtimeKey',
     'schemaVersion',
 ]);
+const BWRAP_PID_RECORD_KEYS = Object.freeze([...BWRAP_PID_V2_RECORD_KEYS, 'hostStateMasked'].sort());
 const SANDBOX_POLL_INTERVAL_MS = 50;
 const SANDBOX_KILL_WAIT_MS = 3000;
 const SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
@@ -144,13 +152,21 @@ function readProcessIdentity(pid, ops = DEFAULT_PROCESS_OPS) {
     }
 }
 
+function validSchemaFields(parsed) {
+    const keys = JSON.stringify(Object.keys(parsed).sort());
+    if (parsed.schemaVersion === BWRAP_PID_SCHEMA_VERSION) {
+        return keys === JSON.stringify(BWRAP_PID_RECORD_KEYS) && parsed.hostStateMasked === true;
+    }
+    return parsed.schemaVersion === BWRAP_PID_OLDEST_READABLE_SCHEMA
+        && keys === JSON.stringify(BWRAP_PID_V2_RECORD_KEYS);
+}
+
 function validPidRecord(parsed, normalized) {
     const pid = Number(parsed?.pid);
     return Boolean(parsed)
         && typeof parsed === 'object'
         && !Array.isArray(parsed)
-        && JSON.stringify(Object.keys(parsed).sort()) === JSON.stringify(BWRAP_PID_RECORD_KEYS)
-        && parsed.schemaVersion === BWRAP_PID_SCHEMA_VERSION
+        && validSchemaFields(parsed)
         && parsed.runtimeKey === normalized
         && typeof parsed.pid === 'number'
         && Number.isSafeInteger(pid)
@@ -209,6 +225,9 @@ function inspectPidRecord(runtimeKey) {
             processIdentity: parsed.processIdentity,
             instanceId: parsed.instanceId,
             enableGeneration: parsed.enableGeneration,
+            schemaVersion: parsed.schemaVersion,
+            // A schema 2 record names an agent launched without the mask.
+            hostStateMasked: parsed.hostStateMasked === true,
         }),
     };
 }
@@ -236,7 +255,9 @@ function samePidRecord(left, right) {
         && left.pid === right.pid
         && left.processIdentity === right.processIdentity
         && left.instanceId === right.instanceId
-        && left.enableGeneration === right.enableGeneration;
+        && left.enableGeneration === right.enableGeneration
+        && left.schemaVersion === right.schemaVersion
+        && left.hostStateMasked === right.hostStateMasked;
 }
 
 function clearBwrapPid(runtimeKey) {
@@ -314,7 +335,7 @@ function assertBwrapPidSlotAvailable(runtimeKey) {
         if (observed.reason === 'invalid-record') {
             throw slotError(
                 normalized,
-                `has an invalid or pre-v${BWRAP_PID_SCHEMA_VERSION} PID record; remove it only after confirming no sandbox process still owns the runtime`,
+                `has an invalid or pre-v${BWRAP_PID_OLDEST_READABLE_SCHEMA} PID record; remove it only after confirming no sandbox process still owns the runtime`,
                 'PLOINKY_SANDBOX_PID_RECORD_INVALID',
             );
         }
@@ -346,7 +367,7 @@ function saveBwrapPid(runtimeKey, pid, runtimeIdentity) {
             throw observed.reason === 'invalid-record'
                 ? slotError(
                     normalized,
-                    `has an invalid or pre-v${BWRAP_PID_SCHEMA_VERSION} PID record; refusing to replace it`,
+                    `has an invalid or pre-v${BWRAP_PID_OLDEST_READABLE_SCHEMA} PID record; refusing to replace it`,
                     'PLOINKY_SANDBOX_PID_RECORD_INVALID',
                 )
                 : slotError(
@@ -382,6 +403,10 @@ function saveBwrapPid(runtimeKey, pid, runtimeIdentity) {
         processIdentity,
         instanceId: identity.instanceId,
         enableGeneration: identity.enableGeneration,
+        // Every launch of this version masks the host state directory: the
+        // guards (cli/utils/runtime/controllerStateGuards.js) refuse to plan
+        // a launch without the mask.
+        hostStateMasked: true,
     })}\n`;
     try {
         fs.writeFileSync(tempFile, payload, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
@@ -661,7 +686,7 @@ function resolveSandboxSlotForStart(runtimeKey, { successor, expectedPredecessor
         throw observed.reason === 'invalid-record'
             ? slotError(
                 key,
-                `has an invalid or pre-v${BWRAP_PID_SCHEMA_VERSION} PID record; remove it only after confirming no sandbox process still owns the runtime`,
+                `has an invalid or pre-v${BWRAP_PID_OLDEST_READABLE_SCHEMA} PID record; remove it only after confirming no sandbox process still owns the runtime`,
                 'PLOINKY_SANDBOX_PID_RECORD_INVALID',
             )
             : slotError(
@@ -699,6 +724,7 @@ function stopExactSandboxOrThrow(runtimeKey, expectedIdentity, options = {}) {
 export {
     BWRAP_PIDS_DIR,
     BWRAP_PID_SCHEMA_VERSION,
+    BWRAP_PID_OLDEST_READABLE_SCHEMA,
     normalizeBwrapRuntimeKey,
     normalizeSandboxRuntimeIdentity,
     normalizeExpectedPredecessor,

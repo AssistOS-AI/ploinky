@@ -44,7 +44,7 @@ import {
     agentLibGrantEnv,
 } from '../agentLibGrant.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
-import { withHostLaunchExclusion } from '../hostLaunchExclusion.js';
+import { ensureHostLaunchSkeleton, withHostLaunchExclusion } from '../hostLaunchExclusion.js';
 import { HardwareLimitsError } from '../hardwareLimits/errors.mjs';
 import { captureHardwareContext, interactiveHardwareRefusal } from '../hardwareLimits/requestedLimits.mjs';
 
@@ -62,6 +62,9 @@ function joinShellCommandParts(parts) {
 }
 
 function controllerGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
+    // The guards mask the host state directory, so its skeleton must exist
+    // before they are planned (a no-op inside a Box, where it is masked).
+    ensureHostLaunchSkeleton(workspaceRoot || PLOINKY_WORKSPACE_ROOT);
     const targets = controllerGuardTargets(bindings, { workspaceRoot });
     const mounts = bindings.map(binding => ({
         ...binding,

@@ -186,8 +186,9 @@ test('A6/N12: a stale holder is reclaimed only on positive evidence and never wi
     assert.match(busy.message, /boot 11111111-1111-4111-8111-111111111111/);
     assert.match(busy.message, /process started linux:77/);
     assert.match(busy.message, /it is held on another machine/);
-    assert.match(busy.message, /`ploinky unlock`/);
-    assert.match(busy.message, new RegExp(`ploinky unlock --force-holder 123@${'f'.repeat(32)}`));
+    // An unclassified holder: the hint is the exact force command unlock accepts.
+    assert.match(busy.message, new RegExp(`If it is no longer running, run \`ploinky unlock --force-holder 123@${'f'.repeat(32)}\` in the workspace`));
+    assert.doesNotMatch(busy.message, /`ploinky unlock`/);
     assert.equal(ownerOf(workspace).pid, 123, 'an undetermined holder keeps the lock');
     fs.rmSync(lockPathOf(workspace), { recursive: true });
 
@@ -196,7 +197,7 @@ test('A6/N12: a stale holder is reclaimed only on positive evidence and never wi
     const residue = await manager.acquire(identity.instance, { workspaceRoot: workspace }).then(() => null, (error) => error);
     assert.equal(residue?.lockResidue, true);
     assert.deepEqual(residue.residue, ['candidate-0123456789abcdef.cid']);
-    assert.match(residue.message, /`ploinky unlock`/);
+    assert.match(residue.message, /`ploinky unlock` in the workspace lists it with the manual steps\) and remove it by hand/);
     assert.deepEqual(fs.readdirSync(lockPath).sort(), ['candidate-0123456789abcdef.cid', 'owner.json'], 'the lock was left in place');
 });
 

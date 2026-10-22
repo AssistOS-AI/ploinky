@@ -1,5 +1,6 @@
 import { BOX_ROUTER_CONTAINER_PORT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { FORCE_HOLDER_PATTERN } from '../lockFiles.mjs';
 import { defaultGpuVendor, normalizeGpuVendor } from '../gpuGrant.mjs';
 import { parseHostPort } from '../ports.mjs';
 import { parseRouterBindingMapping } from '../routerBinding.mjs';
@@ -112,6 +113,30 @@ function analyzeLimits(tokens, commandToken) {
     }
     if (all === (agentRef !== null)) throw argumentError(`limits clear needs exactly one of --agent REPO/AGENT or --all; ${LIMITS_USAGE}`);
     return Object.freeze({ action: 'clear', agentRef, all });
+}
+
+const UNLOCK_USAGE = 'use: ploinky unlock [--force-holder PID@MACHINE]';
+
+// Lock recovery is host-owned and never forwarded into the Box.
+function analyzeUnlock(tokens, commandToken) {
+    const tail = tokens.filter((token) => token.rawIndex > commandToken.rawIndex).map((token) => token.text);
+    let forceHolder = null;
+    // `ploinky unlock --help` shows the help, like `ploinky --help unlock`.
+    if (tail.some((text) => text === '--help' || text === '-h')) return Object.freeze({ forceHolder: null, help: true });
+    for (let index = 0; index < tail.length; index += 1) {
+        const text = tail[index];
+        if (text !== '--force-holder') {
+            throw argumentError(`unlock: unexpected argument '${text}'; ${UNLOCK_USAGE}`);
+        }
+        if (forceHolder !== null) throw argumentError(`--force-holder was supplied more than once; ${UNLOCK_USAGE}`);
+        const value = tail[index + 1];
+        if (!value || !FORCE_HOLDER_PATTERN.test(value)) {
+            throw argumentError(`--force-holder requires PID@MACHINE exactly as the busy lock error prints it; ${UNLOCK_USAGE}`);
+        }
+        forceHolder = value;
+        index += 1;
+    }
+    return Object.freeze({ forceHolder, help: false });
 }
 
 const GPU_USAGE = 'use: ploinky gpu status | ploinky gpu grant [--agent REPO/AGENT...] [--vendor VENDOR] '
@@ -295,6 +320,7 @@ export function parseOuterArguments(argv) {
     const bind = command === 'bind' && !help ? analyzeBind(tokens, commandToken) : null;
     const gpu = command === 'gpu' && !help ? analyzeGpu(tokens, commandToken) : null;
     const limits = command === 'limits' && !help ? analyzeLimits(tokens, commandToken) : null;
+    const unlock = command === 'unlock' && !help ? analyzeUnlock(tokens, commandToken) : null;
     return Object.freeze({
         rawArgv: Object.freeze(raw),
         classificationArgv: Object.freeze(classificationArgv),
@@ -316,5 +342,6 @@ export function parseOuterArguments(argv) {
         bind,
         gpu,
         limits,
+        unlock,
     });
 }

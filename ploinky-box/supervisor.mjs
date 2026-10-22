@@ -111,6 +111,7 @@ import {
 import { withStaleStoreLockRecovery } from '../cli/sandbox/hardwareLimits/storeLock.mjs';
 import { retireDestroyedBoxNoWaitMarkers } from './noWaitCleanup.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
+import { unlockWorkspace } from './unlock.mjs';
 import { createHostStateGuard, HOST_STATE_POLICY } from './hostState/guard.mjs';
 import { parseHostPort } from './ports.mjs';
 import { stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
@@ -3411,6 +3412,17 @@ export function createBoxSupervisor({
         });
     }
 
+    /**
+     * `ploinky unlock`: removes the workspace lock, its reclaim guard and the
+     * hardware store lock only when their holders are proven gone or exactly
+     * named by `forceHolder`. It never waits for the workspace lock it is
+     * recovering and never creates the skeleton; the store lock step takes a
+     * free workspace lock through the bounded acquisition. See unlock.mjs.
+     */
+    async function runUnlock({ forceHolder = null } = {}) {
+        return unlockWorkspace({ identity: resolveIdentity(), lockManager, observeBoxState, forceHolder });
+    }
+
     async function runStopTransaction() {
         return lockedMutation(async (identity, lock, ownership) => {
             const container = ownership.handles?.container;
@@ -3912,6 +3924,7 @@ export function createBoxSupervisor({
         inspectLimitsStatus,
         preflightHardwareGate,
         runLimitsClearTransaction,
+        runUnlock,
         runStopTransaction,
         runDestroyTransaction,
         inspectBoxStatus,
