@@ -152,12 +152,14 @@ workspace exists. Every create and recreate emits exactly:
 
 ```text
 127.0.0.1:<selected-host-port>:8080/tcp
-0.0.0.0:<selected-media-host-port>:7882/udp
+0.0.0.0:<selected-media-host-port>:<selected-media-host-port>/udp
 ```
 
 `--port` changes only `<selected-host-port>` and `--udp-port` changes only
 `<selected-media-host-port>`; they default to `8080` and `7882`, respectively.
-The in-Box Router and LiveKit targets remain fixed. Outer `--publish`, `--expose`, and
+The in-Box Router target remains fixed at `8080`. The in-Box media listener equals
+`<selected-media-host-port>`, so the default stays `7882:7882`, and a non-default
+port is also exported to in-Box processes as `PLOINKY_BOX_MEDIA_PORT`. Outer `--publish`, `--expose`, and
 `--listen-lan` fail before engine discovery. No workspace, graph, profile,
 manifest, readiness result, environment value, label, CLI escape hatch, or
 persisted state can add a third physical-host mapping. A pre-existing owner of
@@ -167,8 +169,8 @@ Ploinky never auto-remaps it.
 After core starts, physical loopback reaches Router public/control `8080`.
 Cloudflared inside the box also uses fixed origin `http://127.0.0.1:8080`,
 regardless of the selected physical port. Router private `8081` is never an outer
-publication. LiveKit is the sole capability-approved in-box owner of UDP
-`7882`; the fixed mapping remains idle when LiveKit is absent.
+publication. LiveKit is the sole capability-approved in-box owner of the media UDP
+port (default `7882`); the mapping remains idle when LiveKit is absent.
 
 The Box image includes a pinned multi-architecture `cloudflared` binary
 supervised by Ploinky core. Complete credential absence is the explicit
@@ -182,7 +184,7 @@ out of argv, ordinary process environment, logs, status, and diagnostics.
 Graph ports stay private. Additional HTTP listeners are reached only through
 `/base-agent-additional-server/<agent>/<port>/` and the confined runtime relay;
 they receive no host port mapping. A bridged `openPorts` claim overlapping
-Router TCP `8080`/`8081` or reserved UDP `7882` is rejected. Redis, Postgres,
+Router TCP `8080`/`8081` or the reserved media UDP port (default `7882`) is rejected. Redis, Postgres,
 Egress, OnlyOffice, Umami, health, storage, AgentServer, and other support
 listeners may exist inside private namespaces but never appear in outer
 PortBindings.
