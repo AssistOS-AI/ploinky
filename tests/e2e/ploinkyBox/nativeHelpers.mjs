@@ -10,6 +10,9 @@ import { createMutationLockManager, withWorkspaceMutationLock } from '../../../p
 import { allowHostProcessesFromEnv } from '../../helpers/allowHostProcesses.mjs';
 import { createBoxSupervisor } from '../../../ploinky-box/supervisor.mjs';
 import { discoverBoxOwnership } from '../../../ploinky-box/engine/discovery.mjs';
+import { BOX_TMPFS } from '../../../ploinky-box/constants.mjs';
+import { checkoutShadowMount } from '../../../ploinky-box/contract/checkoutAlias.mjs';
+import { hostStateMaskMount } from '../../../ploinky-box/hostState/root.mjs';
 import { writeCandidatePodmanProxy } from './candidatePodmanProxy.mjs';
 
 const ABSENT_RESOURCE = /(?:no such|not found|does not exist)/i;
@@ -237,6 +240,48 @@ export function createPodmanHarness(t, candidateReference, {
         resolveIdentity,
         cleanup,
     };
+}
+
+function byDestination(left, right) {
+    return left.destination.localeCompare(right.destination);
+}
+
+/**
+ * The binds every Box carries over its workspace bind, derived from the
+ * product's own functions: the read-only host-state mask and, only when the
+ * checkout lies inside the workspace, its read-only shadow plus the
+ * read-write self-binds of the directories above it.
+ */
+export function expectedHostStateMounts(workspaceRoot, repositoryRoot) {
+    const mask = hostStateMaskMount(workspaceRoot);
+    const shadow = checkoutShadowMount(workspaceRoot, repositoryRoot);
+    return [
+        { type: 'bind', source: mask.source, destination: mask.destination, rw: false },
+        ...(shadow ? [
+            ...shadow.parents.map((parent) => ({
+                type: 'bind', source: parent.source, destination: parent.destination, rw: true,
+            })),
+            { type: 'bind', source: shadow.source, destination: shadow.destination, rw: false },
+        ] : []),
+    ];
+}
+
+/** The engine-reported mounts of a Box inspect record, except the /tmp tmpfs, sorted by destination. */
+export function observedOuterMounts(record) {
+    return (record.Mounts || [])
+        .filter((mount) => String(mount.Destination || '') !== BOX_TMPFS.destination)
+        .map((mount) => ({
+            type: String(mount.Type || '').toLowerCase(),
+            source: String(mount.Source || ''),
+            destination: String(mount.Destination || ''),
+            rw: mount.RW === true,
+        }))
+        .sort(byDestination);
+}
+
+/** The complete expected outer mount set: `baseMounts` plus the host-state binds, sorted by destination. */
+export function expectedOuterMounts(workspaceRoot, repositoryRoot, baseMounts) {
+    return [...baseMounts, ...expectedHostStateMounts(workspaceRoot, repositoryRoot)].sort(byDestination);
 }
 
 // Commands run from the Box working directory, which Box creation sets to the
