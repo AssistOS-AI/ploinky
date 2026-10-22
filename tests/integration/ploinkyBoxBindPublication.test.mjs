@@ -14,6 +14,7 @@ import { BOX_LABELS, BOX_MEDIA_PORT, BOX_USERNS } from '../../ploinky-box/consta
 import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
 import { normalizeImageId } from '../../ploinky-box/contract/image-id.mjs';
 import { discoverBoxOwnership } from '../../ploinky-box/engine/discovery.mjs';
+import { createHostStateGuard } from '../../ploinky-box/hostState/guard.mjs';
 import { selectHostReachableIpv4 } from '../../ploinky-box/hostNetwork.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { probeImageAgentLib } from '../../ploinky-box/image-agentlib.mjs';
@@ -27,12 +28,21 @@ import {
     parseRouterBindingMapping,
 } from '../../ploinky-box/routerBinding.mjs';
 import { inspectWorkspaceDataPaths } from '../../ploinky-box/workspace-data.mjs';
+import { ALLOW_HOST_PROCESSES_ENV, allowHostProcessesFromEnv } from '../helpers/allowHostProcesses.mjs';
 
 // Opt in with an immutable ID already present in native rootless Podman:
 // PLOINKY_BIND_PUBLICATION_TEST_IMAGE=sha256:... node --test <this file>
 // This exercises real Box reconciliation and publication with a tiny HTTP/UDP
 // fixture. It does not start an agent graph or claim full Router/Explorer E2E.
+// Each Box creation passes the real quiescence gate. On a desktop host whose
+// helpers hold `/` mounted writable (for example snapd-desktop-integration),
+// name those processes explicitly after checking they do not write the test
+// workspace: PLOINKY_TEST_ALLOW_HOST_PROCESSES=<pid>[,<pid>...] (positive
+// integers, no spaces; anything else fails the setup). They are forwarded as
+// `ploinky --allow-host-process PID` would forward them, and the gate still
+// re-verifies each process's start time. Unset means no allowance.
 const imageInput = process.env.PLOINKY_BIND_PUBLICATION_TEST_IMAGE;
+const allowHostProcesses = allowHostProcessesFromEnv();
 const repositoryRoot = path.resolve(import.meta.dirname, '../..');
 
 async function unusedTcpPort() {
@@ -192,6 +202,10 @@ test('native Box Router publications preserve the public-only boundary across bi
     engine = initial.engine;
     assert.equal(engine.hostKind, 'native-linux');
     lock = await createMutationLockManager().acquire(identity.instance, { workspaceRoot: identity.workspaceRoot });
+    // The supervisor's own gate wiring (reconcileSafely), with the explicit
+    // allowance the CLI would pass.
+    const guard = createHostStateGuard({ runner, platform: process.platform, repositoryRoot, allowHostProcesses });
+    if (allowHostProcesses.length) t.diagnostic(`${ALLOW_HOST_PROCESSES_ENV}: excusing ${allowHostProcesses.join(', ')}`);
     const imageBundle = probeImageAgentLib(engine.name, imageId, runner);
     const agentLib = buildImageSelection({
         workspaceRoot: workspace,
@@ -208,6 +222,7 @@ test('native Box Router publications preserve the public-only boundary across bi
             identity, ownership: discoverBoxOwnership(identity, { runner }), engine, runner, lock,
             repositoryRoot, agentLib, explicitPort: hostPort, explicitMediaPort: mediaHostPort,
             routerBinding: binding, imageRef: imageId, imagePolicy: 'preserve',
+            quiescence: (context) => guard.quiescence(context),
         });
         const handle = result.ownership.handles.container;
         assert.notEqual(handle.id, previousId, 'each address change must replace the outer Box');

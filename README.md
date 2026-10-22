@@ -408,7 +408,7 @@ rm -r -- "<workspace>/.ploinky-box"
 
 This never means deleting `.data/`, `.ploinky/data/` or `.env`, and it is not `.ploinky/` or `.ploinky/box`. Those hold user data and keys (agent homes, `master-key`, provider keys), and both `ploinky destroy` and `ploinky destroy --delete-cache` keep them. State in the old `~/.ploinky-box` is not read, so after the Box is recreated re-apply `ploinky bind`, `ploinky gpu grant` or `ploinky gpu revoke`, and any hardware limits.
 
-If `.ploinky-box` already holds anything other than its own skeleton when the first command that configures the workspace (for example `start`, `restart`, `update`, `bind`, `gpu grant` or `gpu revoke`) adopts it (it has no `.ploinky-box/workspace.json` yet), that content is not trusted: it is moved to `.ploinky-box/quarantine/<UTC time>-<random>/`, and `workspace.json` records the adoption. Nothing is deleted. `stop`, `destroy`, `limits clear` and `unlock` never adopt.
+If `.ploinky-box` already holds anything other than its own skeleton when the first command that configures the workspace (for example `start`, `restart`, `update`, `bind`, `gpu grant` or `gpu revoke`) adopts it (it has no `.ploinky-box/workspace.json` yet), that content is not trusted: it is moved to `.ploinky-box/quarantine/<UTC time>-<random>/`, and `workspace.json` records the adoption. Nothing is deleted. The same adoption removes the group and other permission bits of a `.ploinky-box` you own that an earlier version left readable (for example 0755); a link, a non-directory or a directory owned by someone else is refused instead. `stop`, `destroy`, `limits clear` and `unlock` never adopt.
 
 ### Refusals that protect host state
 

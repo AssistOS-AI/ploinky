@@ -57,7 +57,8 @@ export function createUpdateHostState({ identity, fsApi = fs } = {}) {
             throw stateError(`Update state directory is not owned by the current user: ${target}`);
         }
         if ((stat.mode & 0o077) !== 0) {
-            throw stateError(`Update state directory must be private to the current user: ${target}`);
+            throw stateError(`Update state directory must be private to the current user: ${target}. After checking `
+                + `that it and its contents belong to you, run \`chmod 700 ${target}\`.`);
         }
     }
 

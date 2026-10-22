@@ -13,7 +13,7 @@ import {
 } from '../privateStateFiles.mjs';
 import { HOST_STAGING_LABEL } from './staging.mjs';
 import { containsPath, realpathOfNearestExisting } from './paths.mjs';
-import { hostStatePaths, identityHostStateRoot } from './root.mjs';
+import { hostStatePaths, identityHostStateRoot, tightenHostStateRoot } from './root.mjs';
 
 // First-use quarantine (r3 trust). Host state is trusted because only the host
 // can write `.ploinky-box`: every Box masks it and every agent runtime guards
@@ -170,8 +170,9 @@ export function quarantineHostStateEntries(identity, lock, {
 
 /**
  * Adopts the workspace under its lock. With a valid record nothing happens.
- * Otherwise `assertQuiescent()` must pass first; then every non-skeleton entry
- * moves into one new quarantine directory and the record is written.
+ * Otherwise `assertQuiescent()` must pass first; then the root is made
+ * private (`tightenHostStateRoot`), every non-skeleton entry moves into one
+ * new quarantine directory and the record is written.
  *
  * @returns {{ adopted: boolean, quarantine: string|null, moved: string[] }}
  */
@@ -190,6 +191,10 @@ export function adoptWorkspaceHostState(identity, lock, {
         throw adoptionError('Adopting the workspace host state requires the quiescence gate');
     }
     assertQuiescent();
+    // The skeleton accepts a root without group or other write bits; the
+    // stores require it private. Only here, behind the gate and before any
+    // pre-existing entry moves, is an existing root of this user tightened.
+    tightenHostStateRoot(identity.workspaceRoot, { fsApi, uid });
     const paths = hostStatePaths(identity.workspaceRoot);
     const { quarantine, moved: candidates } = quarantineHostStateEntries(identity, lock, { view, fsApi, now, random });
     const remaining = fsApi.readdirSync(paths.root).filter((name) => !HOST_STATE_SKELETON_NAMES.includes(name));

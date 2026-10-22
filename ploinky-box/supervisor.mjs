@@ -817,12 +817,14 @@ export function createBoxSupervisor({
             resolveIdentity,
             lockManager,
             // The lock lives inside the workspace: an unmountable path, a
-            // workspace inside the Ploinky checkout and a nested Box workspace
-            // are refused before the lock writes anything there.
+            // workspace inside the Ploinky checkout, an owned Box without the
+            // host state mask and a nested Box workspace are refused before
+            // the lock writes anything there.
             beforeLock(identity) {
                 assertBoxWorkspaceRoot(identity.workspaceRoot);
                 if (policy === HOST_STATE_POLICY.restrict) return;
-                guard.beforeLock(identity, { policy, engine: inspect(identity)?.engine || null });
+                const ownership = inspect(identity);
+                guard.beforeLock(identity, { policy, engine: ownership?.engine || null, ownership });
             },
             beforeAnchor(identity, lock) {
                 // The selected path is also the Box mount and working directory;

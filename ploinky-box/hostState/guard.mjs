@@ -17,11 +17,13 @@ import { hostStateMaskMount } from './root.mjs';
 
 // The host-state checks every locked Box transaction runs (plan D3, D6, D7,
 // r3 trust), in the order the lock requires:
-// - before the lock, which creates `.ploinky-box`: the workspace is not the
-//   invoking checkout and does not lie inside it, and no Box workspace
-//   contains this one or lies inside it;
-// - under the lock: the nested check again, first-use adoption behind the
-//   quiescence gate, and the sweep of stale host staging directories;
+// - before the lock, which creates `.ploinky-box`, and read-only: the
+//   workspace is not the invoking checkout and does not lie inside it, an
+//   owned Box carries the host state mask, and no Box workspace contains this
+//   one or lies inside it;
+// - under the lock: the mask and nested checks again, first-use adoption
+//   behind the quiescence gate, and the sweep of stale host staging
+//   directories;
 // - inside the Box reconciliation: the quiescence gate before any data path
 //   or Box is created (`quiescence`).
 // `configure` is the policy of every transaction that may write host state or
@@ -32,8 +34,13 @@ export const HOST_STATE_POLICY = Object.freeze({ configure: 'configure', restric
 
 // An owned Box without the read-only host state mask was created by a Ploinky
 // that kept host state elsewhere. It is never adopted: configuring commands get
-// the contract's own destroy-and-recreate guidance before anything is written
-// into `.ploinky-box`. Stop and destroy still work on it.
+// the contract's own destroy-and-recreate guidance before the lock, so a
+// refused command writes nothing into `.ploinky-box`, and again under the
+// lock. Stop and destroy still work on it. Such a Box can still write
+// `.ploinky-box` itself while it runs; `retireUnmaskedHostState` quarantines
+// what it left once it has stopped, and every lock acquisition refuses a
+// skeleton it made unsafe (a non-empty or writable `empty/`, links, foreign
+// owners; root.mjs).
 export function ownedBoxIsMasked(identity, container) {
     const mask = hostStateMaskMount(identity.workspaceRoot);
     const mounts = Array.isArray(container?.runtime?.mounts) ? container.runtime.mounts : [];
@@ -77,9 +84,12 @@ export function createHostStateGuard({
         return view;
     }
 
-    function beforeLock(identity, { policy = HOST_STATE_POLICY.configure, engine = null } = {}) {
+    function beforeLock(identity, { policy = HOST_STATE_POLICY.configure, engine = null, ownership = null } = {}) {
         if (assertPolicy(policy) === HOST_STATE_POLICY.restrict) return;
         assertCheckoutPlacement(identity.workspaceRoot, repositoryRoot, { fsApi });
+        // Only an owned Box is judged here; any other ownership state is
+        // refused under the lock by the transaction's own authorization.
+        if (ownership?.state === 'owned') assertOwnedBoxMasked(identity, ownership);
         if (engine) assertNotNestedWorkspace(identity, observeEngine(engine), { fsApi });
     }
 

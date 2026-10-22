@@ -126,8 +126,11 @@ function assertWorkspaceRootDirectory(workspaceRoot, fsApi) {
 
 // Every component below the workspace root must be a real directory owned by
 // the invoking user that nobody else can write. Existing directories are only
-// validated, never re-moded, so earlier untrusted state is not hidden.
-function validateComponent(directory, { uid, readOnly = false, mustBeEmpty = false }, fsApi) {
+// validated here, never re-moded; the one exception is the root's group and
+// other bits, removed by `tightenHostStateRoot` during first-use adoption,
+// behind the quiescence gate and before every pre-existing entry is
+// quarantined, so no earlier untrusted state is hidden by it.
+function validateComponent(directory, { uid, mode, readOnly = false, mustBeEmpty = false }, fsApi) {
     const stat = fsApi.lstatSync(directory);
     const fix = `Inspect ${directory}; it must be a private directory owned by you`;
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
@@ -137,7 +140,8 @@ function validateComponent(directory, { uid, readOnly = false, mustBeEmpty = fal
         throw hostStateError(`Host state directory is not owned by the current user: ${directory}. ${fix}.`);
     }
     if ((stat.mode & (readOnly ? 0o222 : 0o022)) !== 0) {
-        throw hostStateError(`Host state directory has unsafe write permissions: ${directory}. ${fix}.`);
+        throw hostStateError(`Host state directory has unsafe write permissions: ${directory}. After checking that `
+            + `its contents belong to you, run \`chmod ${mode.toString(8)} ${directory}\`.`);
     }
     if (mustBeEmpty && fsApi.readdirSync(directory).length !== 0) {
         throw hostStateError(`Host state mask source must be empty: ${directory}. ${fix}, then empty it.`);
@@ -179,12 +183,13 @@ export function ensureHostStateSkeleton(workspaceRoot, {
             'PLOINKY_BOX_HOST_STATE_NOT_NEW',
         );
     }
-    validateComponent(paths.root, { uid }, fsApi);
+    validateComponent(paths.root, { uid, mode: HOST_STATE_ROOT_MODE }, fsApi);
     for (const entry of HOST_STATE_SKELETON) {
         const directory = path.join(paths.root, entry.name);
         makeComponent(directory, entry.mode, fsApi);
         validateComponent(directory, {
             uid,
+            mode: entry.mode,
             readOnly: entry.mode === 0o555,
             mustBeEmpty: entry.name === 'empty',
         }, fsApi);
@@ -205,13 +210,14 @@ export function inspectHostStateSkeleton(workspaceRoot, { fsApi = fs, uid = curr
         if (error?.code === 'ENOENT') return Object.freeze({ ...paths, present: false, complete: false });
         throw error;
     }
-    validateComponent(paths.root, { uid }, fsApi);
+    validateComponent(paths.root, { uid, mode: HOST_STATE_ROOT_MODE }, fsApi);
     let complete = true;
     for (const entry of HOST_STATE_SKELETON) {
         const directory = path.join(paths.root, entry.name);
         try {
             validateComponent(directory, {
                 uid,
+                mode: entry.mode,
                 readOnly: entry.mode === 0o555,
                 mustBeEmpty: entry.name === 'empty',
             }, fsApi);
@@ -221,4 +227,53 @@ export function inspectHostStateSkeleton(workspaceRoot, { fsApi = fs, uid = curr
         }
     }
     return Object.freeze({ ...paths, present: true, complete });
+}
+
+/**
+ * Removes the group and other bits of an existing `.ploinky-box` that this
+ * user owns, so that the private update records below it can be kept there.
+ * The skeleton accepts a root that only lacks group and other write bits (an
+ * earlier Ploinky could leave it 0755); the stores require it private. Only
+ * first-use adoption calls this, under the held workspace lock and after the
+ * quiescence gate passed, so nothing else can swap the directory meanwhile.
+ * The mode is changed through a descriptor opened without following links,
+ * and only when that descriptor is the directory `lstat` saw: a symlink, a
+ * non-directory or a directory owned by anyone else is refused unchanged.
+ *
+ * @returns {boolean} whether the mode was changed
+ */
+export function tightenHostStateRoot(workspaceRoot, { fsApi = fs, uid = currentUid() } = {}) {
+    const { root } = hostStatePaths(workspaceRoot);
+    const fix = `Inspect ${root}; it must be a private directory owned by you`;
+    const expect = (stat, label) => {
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+            throw hostStateError(`Host state path is not a real directory${label}: ${root}. ${fix}.`);
+        }
+        if (uid !== null && stat.uid !== uid) {
+            throw hostStateError(`Host state directory is not owned by the current user${label}: ${root}. ${fix}.`);
+        }
+    };
+    const seen = fsApi.lstatSync(root);
+    expect(seen, '');
+    if ((seen.mode & 0o077) === 0) return false;
+    const same = (stat) => stat.dev === seen.dev && stat.ino === seen.ino;
+    const descriptor = fsApi.openSync(root,
+        fsApi.constants.O_RDONLY | fsApi.constants.O_DIRECTORY | fsApi.constants.O_NOFOLLOW);
+    try {
+        const opened = fsApi.fstatSync(descriptor);
+        expect(opened, ' when opened');
+        if (!same(opened)) throw hostStateError(`Host state directory changed while it was opened: ${root}. ${fix}.`);
+        fsApi.fchmodSync(descriptor, opened.mode & 0o7777 & ~0o077);
+        if ((fsApi.fstatSync(descriptor).mode & 0o077) !== 0) {
+            throw hostStateError(`Host state directory could not be made private: ${root}. ${fix}.`);
+        }
+    } finally {
+        fsApi.closeSync(descriptor);
+    }
+    const after = fsApi.lstatSync(root);
+    expect(after, ' after its mode was changed');
+    if (!same(after) || (after.mode & 0o077) !== 0) {
+        throw hostStateError(`Host state directory changed while its mode was changed: ${root}. ${fix}.`);
+    }
+    return true;
 }
