@@ -6,6 +6,7 @@ const INITIAL_ROUTER_PORT = 8080;
 const INITIAL_MEDIA_HOST_PORT = 7882;
 const ROUTER_HOST_PORT_ENV = 'PLOINKY_ROUTER_HOST_PORT';
 const MEDIA_HOST_PORT_ENV = 'PLOINKY_MEDIA_HOST_PORT';
+const BOX_MEDIA_PORT_ENV = 'PLOINKY_BOX_MEDIA_PORT';
 const ROUTER_ENV_NAMES = Object.freeze([
     'PLOINKY_ROUTER_HOST',
     'PLOINKY_ROUTER_PORT',
@@ -69,6 +70,15 @@ function selectedMediaHostPort(env = process.env) {
     return value === undefined
         ? INITIAL_MEDIA_HOST_PORT
         : parseMediaHostPort(value, { source: MEDIA_HOST_PORT_ENV });
+}
+
+// The in-Box media listener port. The Box exports it only when it differs from
+// the default, so an absent variable means the default listener.
+function selectedBoxMediaPort(env = process.env) {
+    const value = env?.[BOX_MEDIA_PORT_ENV];
+    return value === undefined
+        ? INITIAL_MEDIA_HOST_PORT
+        : parseMediaHostPort(value, { source: BOX_MEDIA_PORT_ENV });
 }
 
 function readPersistedRouterPortValue(routingFile) {
@@ -198,6 +208,7 @@ function resolveRouterEndpoint(networkMode, { explicitPort, routingFile = ROUTIN
 }
 
 export {
+    BOX_MEDIA_PORT_ENV,
     INITIAL_MEDIA_HOST_PORT,
     INITIAL_ROUTER_PORT,
     MEDIA_HOST_PORT_ENV,
@@ -213,4 +224,5 @@ export {
     resolveRouterEndpoint,
     selectedRouterHostPort,
     selectedMediaHostPort,
+    selectedBoxMediaPort,
 };

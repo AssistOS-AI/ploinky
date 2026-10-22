@@ -17,6 +17,7 @@ import { debugLog } from '../../utils/utils.js';
 import { isHostSandboxDisabled } from '../../utils/runtime/sandboxRuntime.js';
 import { intervalsOverlap, parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
+import { selectedBoxMediaPort } from '../routerPort.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -581,7 +582,7 @@ function parseManifestPorts(manifest, profileConfig = null, options = {}) {
                 { port: 8080, owner: 'public/control Router' },
                 { port: 8081, owner: 'box-private Router' },
             ]
-            : [{ port: 7882, owner: 'fixed media UDP mux capability' }];
+            : [{ port: selectedBoxMediaPort(), owner: 'fixed media UDP mux capability' }];
         const conflict = reserved.find(({ port }) => intervalsOverlap(
             parsed.boxSide,
             { start: port, end: port },

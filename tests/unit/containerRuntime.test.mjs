@@ -1130,3 +1130,88 @@ test('resetPreinstallRunInProcess clears the in-process dedup set', () => {
     assert.equal(hasPreinstallRunInProcess(agentName, 'repo-one', 'dev'), false);
     assert.equal(hasPreinstallRunInProcess(agentName, 'repo-two', 'dev'), false);
 });
+
+test('openPorts reserves the Box media UDP port the Box exports, and 7882 only by default', () => {
+    const workspaceDir = tempDir();
+    try {
+        const run = (env) => {
+            const result = runModuleSnippet(
+                `const { parseManifestPorts } = await import(${JSON.stringify(dockerCommonUrl)});
+const results = [];
+for (const spec of ['127.0.0.1:7893:7893/udp', '127.0.0.1:7882:7882/udp', '127.0.0.1:7890-7895:9000-9005/udp', '127.0.0.1:7893:7893']) {
+  try {
+    parseManifestPorts({}, { openPorts: [spec] });
+    results.push({ spec, accepted: true });
+  } catch (error) {
+    results.push({ spec, code: error.code, message: error.message });
+  }
+}
+process.stdout.write(JSON.stringify(results));`,
+                env,
+                { cwd: workspaceDir },
+            );
+            assert.equal(result.status, 0, result.stderr);
+            return Object.fromEntries(JSON.parse(result.stdout).map((record) => [record.spec, record]));
+        };
+
+        const selected = run({ PLOINKY_BOX_MEDIA_PORT: '7893' });
+        assert.equal(selected['127.0.0.1:7893:7893/udp'].code, 'PLOINKY_RESERVED_BOX_PORT');
+        assert.match(selected['127.0.0.1:7893:7893/udp'].message, /overlaps reserved port 7893/);
+        assert.equal(selected['127.0.0.1:7890-7895:9000-9005/udp'].code, 'PLOINKY_RESERVED_BOX_PORT');
+        assert.equal(selected['127.0.0.1:7882:7882/udp'].accepted, true);
+        // The reservation never applies to TCP.
+        assert.equal(selected['127.0.0.1:7893:7893'].accepted, true);
+
+        const unset = run({});
+        assert.equal(unset['127.0.0.1:7882:7882/udp'].code, 'PLOINKY_RESERVED_BOX_PORT');
+        assert.match(unset['127.0.0.1:7882:7882/udp'].message, /overlaps reserved port 7882/);
+        assert.equal(unset['127.0.0.1:7893:7893/udp'].accepted, true);
+
+        // A malformed exported value fails closed instead of reserving nothing.
+        const malformed = run({ PLOINKY_BOX_MEDIA_PORT: '0' });
+        assert.equal(malformed['127.0.0.1:7893:7893/udp'].code, 'PLOINKY_MEDIA_HOST_PORT_INVALID');
+        assert.equal(malformed['127.0.0.1:7893:7893'].accepted, true);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});
+
+test('computeEnvHash: a manifest-declared PLOINKY_BOX_MEDIA_PORT reaches the agent env and leaves the default hash unchanged', () => {
+    const workspaceDir = tempDir();
+    try {
+        const run = (env) => {
+            const result = runModuleSnippet(
+                `const { computeEnvHash } = await import(${JSON.stringify(dockerCommonUrl)});
+const { buildEnvMap } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/utils/security/secretVars.js')).href)});
+const plain = { env: [{ name: 'DEMO_VALUE', default: 'one' }] };
+const declaring = { env: [{ name: 'DEMO_VALUE', default: 'one' }, { name: 'PLOINKY_BOX_MEDIA_PORT', required: false }] };
+process.stdout.write(JSON.stringify({
+    plainHash: computeEnvHash(plain, null),
+    declaringHash: computeEnvHash(declaring, null),
+    declaringValue: buildEnvMap(declaring, null).PLOINKY_BOX_MEDIA_PORT ?? null,
+    plainValue: buildEnvMap(plain, null).PLOINKY_BOX_MEDIA_PORT ?? null,
+}));`,
+                env,
+                { cwd: workspaceDir },
+            );
+            assert.equal(result.status, 0, result.stderr);
+            return JSON.parse(result.stdout);
+        };
+
+        // Default Box: the variable is absent, so it is not hashed and the
+        // manifest that declares it hashes exactly like the one that does not.
+        const absent = run({});
+        assert.equal(absent.declaringValue, null);
+        assert.equal(absent.declaringHash, absent.plainHash);
+        assert.notEqual(absent.plainHash, '');
+
+        // Non-default Box: the agent receives the port and its env hash changes.
+        const exported = run({ PLOINKY_BOX_MEDIA_PORT: '7893' });
+        assert.equal(exported.declaringValue, '7893');
+        assert.equal(exported.plainValue, null);
+        assert.equal(exported.plainHash, absent.plainHash);
+        assert.notEqual(exported.declaringHash, absent.declaringHash);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+});

@@ -15,6 +15,7 @@ import {
     resolveRouterEndpoint,
     selectedRouterHostPort,
     selectedMediaHostPort,
+    selectedBoxMediaPort,
 } from '../../cli/sandbox/routerPort.js';
 
 function tempRouting(contents) {
@@ -51,6 +52,20 @@ test('selected physical media host port validates the supervisor environment and
         assert.throws(() => selectedMediaHostPort({ PLOINKY_MEDIA_HOST_PORT: value }), {
             code: 'PLOINKY_MEDIA_HOST_PORT_INVALID',
         });
+    }
+});
+
+test('selected Box media port defaults to 7882 and reads only the exported in-Box variable', () => {
+    assert.equal(selectedBoxMediaPort({}), 7882);
+    assert.equal(selectedBoxMediaPort({ PLOINKY_BOX_MEDIA_PORT: '7893' }), 7893);
+    assert.equal(selectedBoxMediaPort({ PLOINKY_BOX_MEDIA_PORT: '1' }), 1);
+    assert.equal(selectedBoxMediaPort({ PLOINKY_BOX_MEDIA_PORT: '65535' }), 65535);
+    // The host-side variable describes the physical port, never the in-Box listener.
+    assert.equal(selectedBoxMediaPort({ PLOINKY_MEDIA_HOST_PORT: '17891' }), 7882);
+    for (const value of ['0', '65536', '-1', '07893', '7893.0', '1e4', 'abc', ' 7893', '7893 ', '', '٧٨٩٣']) {
+        assert.throws(() => selectedBoxMediaPort({ PLOINKY_BOX_MEDIA_PORT: value }), {
+            code: 'PLOINKY_MEDIA_HOST_PORT_INVALID',
+        }, JSON.stringify(value));
     }
 });
 
