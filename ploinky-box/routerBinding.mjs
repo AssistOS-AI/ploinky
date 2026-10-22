@@ -9,8 +9,8 @@
 // writable workspace bind, and the Box user namespace maps their writes to the
 // host user, so ownership checks cannot distinguish an agent-written
 // `.ploinky` file. The record therefore lives in the workspace's host-owned
-// `.ploinky-box` directory, which the Box contract masks read-only (the mask
-// is a later step; until then only the host writes it by convention).
+// `.ploinky-box` directory, which every Box masks with a read-only empty
+// directory (the Box contract requires that mask).
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -25,6 +25,12 @@ import {
     ROUTER_BINDING_STATE_DIRECTORY,
 } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
+import {
+    ancestorDirectoryIdentities,
+    containsPath,
+    directoryIdentity,
+    realpathOfNearestExisting,
+} from './hostState/paths.mjs';
 import { ensureStoreDirectories, inspectStoreDirectories } from './hostState/stores.mjs';
 import { isContainerInterface, isUsableHostIpv4 } from './hostNetwork.mjs';
 import {
@@ -327,56 +333,6 @@ function exactIdentity(identity) {
         throw stateError('Router binding state requires the exact workspace identity');
     }
     return identity;
-}
-
-function realpathOfNearestExisting(target, fsApi) {
-    const missing = [];
-    let current = target;
-    while (true) {
-        try {
-            return path.join(fsApi.realpathSync(current), ...missing);
-        } catch (error) {
-            const parent = path.dirname(current);
-            if (error?.code !== 'ENOENT' || parent === current) throw error;
-            // Resolve a dangling directory alias too: its host-only target may
-            // be created later, after the Box has already mounted its parent.
-            try {
-                if (fsApi.lstatSync(current).isSymbolicLink()) {
-                    const destination = path.resolve(parent, fsApi.readlinkSync(current));
-                    return path.join(realpathOfNearestExisting(destination, fsApi), ...missing);
-                }
-            } catch (linkError) {
-                if (linkError?.code !== 'ENOENT') throw linkError;
-            }
-            missing.unshift(path.basename(current));
-            current = parent;
-        }
-    }
-}
-
-function containsPath(parent, child) {
-    const relative = path.relative(parent, child);
-    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`)
-        && !path.isAbsolute(relative));
-}
-
-function directoryIdentity(target, fsApi) {
-    try {
-        const stat = fsApi.statSync(target);
-        return stat.isDirectory() ? `${stat.dev}:${stat.ino}` : null;
-    } catch (error) {
-        if (error?.code === 'ENOENT') return null;
-        throw error;
-    }
-}
-
-function ancestorDirectoryIdentities(target, fsApi) {
-    const identities = new Set();
-    for (let current = target; ; current = path.dirname(current)) {
-        const identity = directoryIdentity(current, fsApi);
-        if (identity) identities.add(identity);
-        if (path.dirname(current) === current) return identities;
-    }
 }
 
 /**

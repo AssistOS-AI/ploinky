@@ -64,6 +64,7 @@ const hostScript = `
     const { createMutationLockManager } = await import(${JSON.stringify(moduleUrl('ploinky-box/locks.mjs'))});
     const { createUpdateHostState } = await import(${JSON.stringify(moduleUrl('ploinky-box/update/hostState.mjs'))});
     const { agentLibFixture } = await import(${JSON.stringify(moduleUrl('tests/helpers/agentlibFixture.mjs'))});
+    const { PERMISSIVE_HOST_STATE_GUARD } = await import(${JSON.stringify(moduleUrl('tests/helpers/hostStateFixture.mjs'))});
     const writerScript = ${JSON.stringify(writerScript)};
     const root = process.env.FIXTURE_ROOT;
     const identity = buildWorkspaceIdentity(process.env.FIXTURE_WORKSPACE, { markerFound: true });
@@ -81,6 +82,7 @@ const hostScript = `
     const writers = [];
     const liveWriters = () => writers.filter(pid => { try { process.kill(-pid, 0); return true; } catch (_) { return false; } });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: createMutationLockManager(),

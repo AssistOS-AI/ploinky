@@ -26,10 +26,8 @@ export { LOCK_OWNER_SCHEMA, LOCK_OWNER_VERSION, parseLockOwner } from './lockFil
 
 // The workspace mutation lock lives in `<workspace>/.ploinky-box/locks/` and
 // so follows the workspace directory: every spelling of one directory shares
-// it, and a renamed workspace carries it along. QA tooling feature-detects
-// this generation through MUTATION_LOCK_LOCATION. The on-disk protocol (atomic
+// it, and a renamed workspace carries it along. The on-disk protocol (atomic
 // publish and retire, crash debris) is in lockFiles.mjs.
-export const MUTATION_LOCK_LOCATION = 'workspace';
 export const WORKSPACE_LOCK_LABEL = 'workspace';
 
 const RECLAIM_SUFFIX = '.reclaim';

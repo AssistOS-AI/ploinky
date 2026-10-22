@@ -183,6 +183,7 @@ export function parseOuterArguments(argv) {
     const removedRawIndexes = new Set();
     let explicitPort = null;
     let explicitMediaPort = null;
+    const allowHostProcesses = [];
     let dryRun = false;
     let help = false;
     let commandToken = null;
@@ -221,6 +222,22 @@ export function parseOuterArguments(argv) {
         }
         if (token.text.startsWith('--udp-port=')) {
             throw argumentError('--udp-port=PORT is unsupported; use --udp-port PORT before start');
+        }
+        // Excuses one exact host process from the quiescence gate (plan D3);
+        // the gate re-verifies its start time in the same transaction.
+        if (token.text === '--allow-host-process') {
+            const value = consumeValue(tokens, index, '--allow-host-process');
+            if (!/^[1-9][0-9]{0,9}$/.test(value.text) || !Number.isSafeInteger(Number(value.text))) {
+                throw argumentError('--allow-host-process requires a process ID');
+            }
+            allowHostProcesses.push(Number(value.text));
+            removedRawIndexes.add(token.rawIndex);
+            removedRawIndexes.add(value.rawIndex);
+            index += 1;
+            continue;
+        }
+        if (token.text.startsWith('--allow-host-process=')) {
+            throw argumentError('--allow-host-process=PID is unsupported; use --allow-host-process PID before the command');
         }
         if (token.text === '--dry-run') {
             if (dryRun) throw argumentError('--dry-run was supplied more than once');
@@ -294,6 +311,7 @@ export function parseOuterArguments(argv) {
         terminated,
         explicitPort,
         explicitMediaPort,
+        allowHostProcesses: Object.freeze([...new Set(allowHostProcesses)]),
         start,
         bind,
         gpu,

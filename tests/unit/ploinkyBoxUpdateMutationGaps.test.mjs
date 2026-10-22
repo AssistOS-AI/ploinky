@@ -15,6 +15,7 @@ import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
 import { createUpdateBoxScenario, SCENARIO_CONTAINER_ID, scenarioCoreCalls } from '../helpers/updateBoxScenario.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 // Mutation-gap regressions for the Box update transaction:
 // - the supervisor wired to the production bounded update runner probes for
@@ -197,6 +198,7 @@ test('a failed start admission restores the prior saved Router binding bytes exa
         handles: { container: { id: SCENARIO_CONTAINER_ID, runtime: { running: true } } },
     };
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         platform: 'linux',

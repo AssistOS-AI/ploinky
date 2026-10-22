@@ -111,6 +111,7 @@ import {
 import { withStaleStoreLockRecovery } from '../cli/sandbox/hardwareLimits/storeLock.mjs';
 import { retireDestroyedBoxNoWaitMarkers } from './noWaitCleanup.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
+import { createHostStateGuard, HOST_STATE_POLICY } from './hostState/guard.mjs';
 import { parseHostPort } from './ports.mjs';
 import { stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
@@ -400,7 +401,15 @@ export function createBoxSupervisor({
     readHostname = () => os.hostname(),
     stdout = process.stdout,
     stderr = process.stderr,
+    // Host processes excused from the quiescence gate (`--allow-host-process`).
+    allowHostProcesses = [],
+    // The host-state checks of every locked transaction (hostState/guard.mjs).
+    hostStateGuard = null,
 } = {}) {
+    const guard = hostStateGuard || createHostStateGuard({
+        runner, platform, repositoryRoot, allowHostProcesses, stderr,
+    });
+
     function inspect(identity) {
         return discover(identity, runner, platform, env);
     }
@@ -795,20 +804,32 @@ export function createBoxSupervisor({
         });
     }
 
-    async function lockedMutation(execute, authorize = assertMutableOwnership) {
+    // `policy` selects the host-state checks (hostState/guard.mjs). Every
+    // transaction that may write host state or create a Box uses `configure`,
+    // the default; only stop and destroy pass `restrict`.
+    async function lockedMutation(execute, options = {}) {
+        if (typeof options !== 'object' || options === null) {
+            throw new TypeError('lockedMutation takes { authorize, policy } options, not a positional authorizer');
+        }
+        const { authorize = assertMutableOwnership, policy = HOST_STATE_POLICY.configure } = options;
         return withWorkspaceMutationLock({
             resolveIdentity,
             lockManager,
-            // The lock lives inside the workspace: an unmountable path is
-            // refused before the lock writes anything there.
+            // The lock lives inside the workspace: an unmountable path, a
+            // workspace inside the Ploinky checkout and a nested Box workspace
+            // are refused before the lock writes anything there.
             beforeLock(identity) {
                 assertBoxWorkspaceRoot(identity.workspaceRoot);
+                if (policy === HOST_STATE_POLICY.restrict) return;
+                guard.beforeLock(identity, { policy, engine: inspect(identity)?.engine || null });
             },
-            beforeAnchor(identity) {
+            beforeAnchor(identity, lock) {
                 // The selected path is also the Box mount and working directory;
                 // an unmountable path fails before the workspace is anchored.
                 assertBoxWorkspaceRoot(identity.workspaceRoot);
-                return authorize(inspect(identity));
+                const ownership = authorize(inspect(identity));
+                guard.underLock(identity, lock, ownership, { policy });
+                return ownership;
             },
             execute,
         });
@@ -816,6 +837,7 @@ export function createBoxSupervisor({
 
     async function reconcileSafely(options) {
         return reconcile({
+            quiescence: (context) => guard.quiescence(context),
             ...options,
             assertGateOffRestore: () => {
                 const { identity, lock } = options;
@@ -1360,6 +1382,9 @@ export function createBoxSupervisor({
                 gpu,
                 hardware,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
+                // Restart is the command that recreates a Box whose data
+                // directory went missing while it ran (N1).
+                recoverDataPaths: true,
                 platform,
                 env,
                 stdout,
@@ -3376,7 +3401,14 @@ export function createBoxSupervisor({
                 inspectBox: () => observeBoxState(identity),
             });
             return Object.freeze({ identity, agentRef, all, ...result });
-        }, (ownership) => ownership);
+        }, {
+            // A recovery command: it must run whatever the engine reports, as
+            // before. Its store writes stay inside the Box-writable store and
+            // are single-component safe, so it neither adopts the workspace
+            // nor needs the quiescence gate.
+            authorize: (ownership) => ownership,
+            policy: HOST_STATE_POLICY.restrict,
+        });
     }
 
     async function runStopTransaction() {
@@ -3404,8 +3436,11 @@ export function createBoxSupervisor({
                     );
                 }
             }
-            return Object.freeze({ identity, action: 'stopped', containerId: container.id });
-        });
+            const hostStateQuarantine = guard.retireUnmaskedHostState?.(identity, lock, {
+                container, engine: ownership.engine, observe: () => inspect(identity),
+            }) ?? null;
+            return Object.freeze({ identity, action: 'stopped', containerId: container.id, hostStateQuarantine });
+        }, { policy: HOST_STATE_POLICY.restrict });
     }
 
     // An explicit destroy settles a pending downgrade only after the owned Box
@@ -3638,6 +3673,11 @@ export function createBoxSupervisor({
                 }
                 removeContainerById(ownership.engine, container.id, runner);
             }
+            // Before the records are settled: an old Box's entries are
+            // quarantined, never trusted or deleted.
+            const hostStateQuarantine = container ? (guard.retireUnmaskedHostState?.(identity, lock, {
+                container, engine: ownership.engine, observe: () => inspect(identity),
+            }) ?? null) : null;
             const { removedRecords, deletedPaths, deletedAgentLibPaths } = finishDestroy(identity, lock, {
                 boxProvenGone: container ? true : absentProven, deleteCache, container,
             });
@@ -3649,8 +3689,9 @@ export function createBoxSupervisor({
                 deletedPaths,
                 deletedAgentLibPaths,
                 removedRecords,
+                hostStateQuarantine,
             });
-        });
+        }, { policy: HOST_STATE_POLICY.restrict });
     }
 
     function inspectBoxStatus() {

@@ -7,6 +7,7 @@ import { assertGateOffStoreEmpty, hardwareStorePaths, readStoreSnapshot } from '
 import {
     BOX_DATA_FINGERPRINT_LABELS,
     BOX_DATA_KEYS,
+    BOX_DATA_MOUNTS,
     BOX_IMAGE_REFERENCE,
     BOX_LABELS,
 } from '../constants.mjs';
@@ -23,8 +24,15 @@ import {
     inspectAndValidateExistingImage,
     inspectAndValidateImage,
 } from '../contract/image.mjs';
-import { discoverBoxOwnership } from '../engine/discovery.mjs';
+import { checkoutShadowMount } from '../contract/checkoutAlias.mjs';
+import { discoverBoxOwnership, discoverEngineView } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import {
+    assertCreateArgsConfined,
+    assertRecordedDataSourcesConfined,
+    resolveBoxDataSources,
+} from '../hostState/confinement.mjs';
+import { createQuiescenceGate } from '../hostState/quiescence.mjs';
 import {
     createGpuGrantStore,
     observeContainerGpuWiring,
@@ -185,6 +193,9 @@ async function createAndStart({
     retireEdgePreparation,
     beforeCreate = () => {},
     restoring = false,
+    // The engine view of the quiescence gate (or the fixture's own view), for
+    // the confinement check immediately before `container create`.
+    view = [],
     revalidateDataPaths,
     readCidfile,
     fsApi,
@@ -194,6 +205,7 @@ async function createAndStart({
 }) {
     lock.assertHeld(identity.instance);
     const dataState = revalidateDataPaths({ identity, lock, fsApi });
+    const { sources: dataSources } = resolveBoxDataSources(identity, { fsApi, repositoryRoot, view });
     const observed = discover(identity, { runner });
     if (observed?.state !== 'absent' || observed.handles?.container
         || (observed.engine && (observed.engine.name !== engine.name || observed.engine.identity !== engine.identity))) {
@@ -208,9 +220,10 @@ async function createAndStart({
         throw transactionError('A local AchillesAgentLib source appeared after image selection; run the command again');
     }
     beforeCreate();
-    runner.run(engine.name, containerCreateArgs({
+    const createArgs = containerCreateArgs({
         identity,
         dataFingerprints: dataState.fingerprints,
+        dataSources,
         agentLib,
         imageId: image.immutableId,
         imageRef,
@@ -223,7 +236,12 @@ async function createAndStart({
         networkMode,
         gpu,
         hardware,
-    }));
+    });
+    // D1: again immediately before create, every writable bind is confined
+    // and the data sources still resolve as they did when prepared.
+    assertCreateArgsConfined(identity, createArgs, { fsApi, repositoryRoot, view, dataSources });
+    lock.assertHeld(identity.instance);
+    runner.run(engine.name, createArgs);
     let containerId;
     try {
         containerId = readCidfile(cidfile, { fsApi });
@@ -255,6 +273,7 @@ async function createAndStart({
         hostKind: engine.hostKind,
         networkMode,
         dataFingerprints: dataState.fingerprints,
+        dataSources,
         agentLib,
     });
     if (handle.id !== containerId) {
@@ -340,6 +359,14 @@ export async function reconcileBoxContainer({
     imageRef = BOX_IMAGE_REFERENCE,
     imagePolicy = 'pull',
     allowReplacement = true,
+    // The quiescence gate (plan D3): undefined runs the real gate; a function
+    // `({ identity, engine, runner }) => engineView` replaces it; false exempts
+    // the `ploinky diagnose` fixture, whose throwaway workspace no one else
+    // knows (it still gets the D1 confinement checks).
+    quiescence = undefined,
+    // A missing or changed data path while the Box runs is refused unless the
+    // command recreates the Box through a quiescent replacement (restart).
+    recoverDataPaths = false,
     platform = process.platform,
     env = process.env,
     stdout = process.stdout,
@@ -379,6 +406,8 @@ export async function reconcileBoxContainer({
                 .materialize(selectedIdentity, wiring, selectedLock);
         }),
         fsApi: seams.fsApi || fs,
+        quiescence: seams.quiescence ?? quiescence,
+        observeEngine: seams.observeEngine || ((selectedEngine) => discoverEngineView(selectedEngine, runner)),
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
         assertGateOffRestore: assertGateOffRestore || (({ identity: selectedIdentity, lock: selectedLock }) => {
             selectedLock.assertHeld(selectedIdentity.instance);
@@ -390,6 +419,26 @@ export async function reconcileBoxContainer({
             return assertGateOffStoreEmpty({ paths, identity: selectedIdentity });
         }),
     };
+    // Runs under the workspace lock, after any old Box stopped and before any
+    // data path is created or any Box created or started. Returns the engine
+    // view the confinement checks use.
+    // `excludeContainerIds` selects the advisory scan before the old Box is
+    // stopped: it ignores that Box, so a refusal leaves it running.
+    async function assertQuiescent({ excludeContainerIds = [] } = {}) {
+        lock.assertHeld(identity.instance);
+        let view;
+        if (dependencies.quiescence === false) {
+            view = dependencies.observeEngine(engine);
+        } else if (typeof dependencies.quiescence === 'function') {
+            view = (await dependencies.quiescence({ identity, engine, runner, excludeContainerIds })) || [];
+        } else {
+            view = dependencies.observeEngine(engine);
+            createQuiescenceGate({ platform }).assert(identity, { view, excludeContainerIds });
+        }
+        // The lock must still be this command's after any wait in the gate.
+        lock.assertHeld(identity.instance);
+        return view;
+    }
     function validateFinalOwnership(containerId, desired) {
         lock.assertHeld(identity.instance);
         const observed = dependencies.discover(identity, { runner });
@@ -404,6 +453,9 @@ export async function reconcileBoxContainer({
     if (!agentLib) {
         throw transactionError('Box reconciliation requires a selected achillesAgentLib source');
     }
+    // D6: refuse a workspace that is or lies inside the invoking checkout
+    // before any Box is touched.
+    checkoutShadowMount(identity.workspaceRoot, repositoryRoot, { fsApi: dependencies.fsApi });
     const desiredAgentLib = normalizeBoxAgentLib(agentLib);
     if (desiredAgentLib.mode === 'image'
         && localCandidateExists(localCandidatePath(identity.workspaceRoot), dependencies.fsApi)) {
@@ -448,6 +500,16 @@ export async function reconcileBoxContainer({
         !currentDataState
         || !isDeepStrictEqual(currentDataState.fingerprints, old.dataFingerprints)
     );
+    // N1: a data path is created only while no Box of this workspace runs.
+    // With the Box running, a missing or replaced one is never recreated in
+    // place; only a quiescent replacement may.
+    if (old && old.running && dataPathsChanged && recoverDataPaths !== true) {
+        throw new PloinkyBoxError(
+            `A Box data directory under ${identity.boxDataRoot} is missing or was replaced while the Box runs; `
+            + 'nothing was changed. Run `ploinky restart` to recreate the Box with fresh data directories.',
+            { code: 'PLOINKY_BOX_DATA_PATH_MISSING' },
+        );
+    }
     const requiresReplacement = Boolean(old) && (
         old.networkMode !== selectedBoxNetworkMode(engine)
         || old.hostPort !== portPlan.hostPort
@@ -493,6 +555,12 @@ export async function reconcileBoxContainer({
                     throw transactionError('Box identity or stopped state changed before workspace lifecycle cleanup');
                 }
                 validateContainerConfiguration(handle, old);
+                // Starting re-resolves the recorded bind sources: the same
+                // quiescence and confinement as a create.
+                const view = await assertQuiescent();
+                assertRecordedDataSourcesConfined(identity, handle, {
+                    fsApi: dependencies.fsApi, repositoryRoot, view, dataDestinations: Object.values(BOX_DATA_MOUNTS),
+                });
                 dependencies.retireStartLock({ identity, lock });
                 dependencies.retireEdgePreparation({ identity, lock });
                 writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
@@ -596,10 +664,12 @@ export async function reconcileBoxContainer({
         // Package availability only: the supplying image ID just verified is the identity.
         dependencies.probeAgentLib(engine.name, image.immutableId, runner);
     }
+    // D1: refuse an escaping or overlapping data path before the old Box is
+    // touched (read-only; checked again after the gate and before create).
     try {
-        dependencies.ensureDataPaths({ identity, lock, fsApi: dependencies.fsApi });
+        resolveBoxDataSources(identity, { fsApi: dependencies.fsApi, repositoryRoot });
     } catch (error) {
-        throw transactionError('Workspace Box data preparation failed', error);
+        throw transactionError('Workspace Box data paths are not confined', error);
     }
     // The spec and marker the GPU binds name must exist before the old Box is
     // touched: a new wiring is written, and a kept (observed) wiring is proven
@@ -620,6 +690,11 @@ export async function reconcileBoxContainer({
             && localCandidateExists(localCandidatePath(identity.workspaceRoot), dependencies.fsApi)) {
             throw transactionError('A local AchillesAgentLib source appeared after image selection; run the command again');
         }
+        if (old && currentContainer.runtime.running) {
+            // I5: refuse while the old Box still runs when something else can
+            // already write the workspace, instead of stopping it first.
+            await assertQuiescent({ excludeContainerIds: [currentContainer.id] });
+        }
         if (old) {
             if (currentContainer.runtime.running) {
                 oldStopAttempted = true;
@@ -628,11 +703,23 @@ export async function reconcileBoxContainer({
                 });
                 runner.run(engine.name, ['container', 'stop', '--time', '30', currentContainer.id]);
             }
+        }
+        // D3: with the old Box stopped, nothing but this command may be able
+        // to write the workspace before its data paths and the new Box are
+        // created. A refusal here leaves the stopped old Box in place.
+        const view = await assertQuiescent();
+        if (old) {
             dependencies.removeContainer(engine, currentContainer.id, runner);
             oldRemoved = true;
             // A probe excused by the old listener is proven only after that
             // listener is gone. Anything still holding the port is foreign.
             await dependencies.recheckReleased(preflight);
+        }
+        resolveBoxDataSources(identity, { fsApi: dependencies.fsApi, repositoryRoot, view });
+        try {
+            dependencies.ensureDataPaths({ identity, lock, fsApi: dependencies.fsApi });
+        } catch (error) {
+            throw transactionError('Workspace Box data preparation failed', error);
         }
         const created = await createAndStart({
             engine,
@@ -653,6 +740,7 @@ export async function reconcileBoxContainer({
             retireStartLock: dependencies.retireStartLock,
             retireEdgePreparation: dependencies.retireEdgePreparation,
             beforeCreate: () => { candidateAttempted = true; },
+            view,
             revalidateDataPaths: dependencies.revalidateDataPaths,
             readCidfile: dependencies.readCidfile,
             fsApi: dependencies.fsApi,

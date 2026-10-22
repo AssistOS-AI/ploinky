@@ -62,6 +62,8 @@ import {
 import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 import { discoverVulkanRenderNode } from '../../ploinky-box/gpuVulkan.mjs';
 import { makeTree } from './fixtures/render-query/make-trees.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
+import { hostStateFixtureMounts } from '../helpers/hostStateFixture.mjs';
 
 test('contract: container device set accepts the render-node wiring', (t) => {
     const state = boxFixture(t);
@@ -235,9 +237,12 @@ function useFakeHostFiles(t, host) {
 }
 
 function workspaceFixture(t, name = 'workspace') {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-gpu-grant-'));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const workspace = path.join(root, name);
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-gpu-grant-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    // The checkout (`root`) is a sibling of the workspace (D6).
+    const root = path.join(base, 'checkout');
+    fs.mkdirSync(root);
+    const workspace = path.join(base, name);
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
@@ -1055,6 +1060,7 @@ function containerHandle(state, { id = OLD_ID, imageId = OLD_IMAGE, hostPort = 8
                 { type: 'bind', name: '', source: state.root, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: state.identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: state.identity.workspaceRoot, destination: state.identity.workspaceRoot, rw: true },
+                ...hostStateFixtureMounts(state.identity.workspaceRoot, state.root),
                 ...agentLibFixtureMounts(state.agentLib, state.identity.workspaceRoot),
                 ...(gpu ? gpu.mounts.map((mount) => ({ type: 'bind', name: '', source: mount.source, destination: mount.destination, rw: false })) : []),
             ].sort((left, right) => left.destination.localeCompare(right.destination)),
@@ -1181,6 +1187,7 @@ function harness(state, { initial = null, failCandidateReady = false } = {}) {
             if (wiring) materialized.push(wiring.fingerprint);
         },
         token: (kind) => (kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24)),
+        quiescence: () => [],
     };
     return { runner, seams, calls, materialized, current: () => current };
 }
@@ -1355,6 +1362,7 @@ function graphBox(t, { gpu = null, running = true } = {}) {
 
 function gpuSupervisor(box, events, overrides = {}) {
     return createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {},
         platform: 'linux',
         resolveIdentity: () => box.identity,

@@ -40,6 +40,8 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
+import { hostStateFixtureMounts } from '../helpers/hostStateFixture.mjs';
 
 const DATA_FINGERPRINTS = Object.freeze({ dependencies: 'd'.repeat(64), images: 'f'.repeat(64) });
 const TMPFS_CREATE_ARGUMENT = `${BOX_TMPFS.destination}:${BOX_TMPFS.options.join(',')}`;
@@ -62,9 +64,12 @@ function wildcard(hostPort = 8083, hosts = LAN_HOSTS) {
 }
 
 function fixture(t) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-bind-'));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const workspace = path.join(root, 'workspace');
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-bind-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    // The checkout (`root`) is a sibling of the workspace (D6).
+    const root = path.join(base, 'checkout');
+    fs.mkdirSync(root);
+    const workspace = path.join(base, 'workspace');
     const lockPath = path.join(root, 'lock');
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     fs.mkdirSync(lockPath);
@@ -153,6 +158,7 @@ function containerHandle(state, {
                 { type: 'bind', name: '', source: state.root, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: state.identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: state.identity.workspaceRoot, destination: state.identity.workspaceRoot, rw: true },
+                ...hostStateFixtureMounts(state.identity.workspaceRoot, state.root),
                 ...agentLibFixtureMounts(state.agentLib, state.identity.workspaceRoot),
             ],
         },
@@ -266,6 +272,7 @@ function harness(state, {
         retireStartLock() {},
         retireEdgePreparation() {},
         token: (kind) => (kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24)),
+        quiescence: () => [],
     };
     return { runner, seams, calls, current: () => current };
 }
@@ -658,6 +665,7 @@ function boxWorkspace(t, { running = true, routerBinding = null, hostPort = 8083
 
 function bindSupervisor(box, events, overrides = {}) {
     return createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         checkHostPrerequisites: () => {},
         env: {},
         platform: 'linux',

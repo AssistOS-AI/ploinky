@@ -38,6 +38,7 @@ import {
 } from '../hardware-limits/transitionWorld.mjs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 const INSTALLED = new Set(['demo/agent']);
 const CAPABILITIES = { gate: 'on', controllers: ['cpu', 'memory', 'pids'] };
@@ -336,6 +337,7 @@ test('T.stop-with-broken-store', async (t) => {
     const { createBoxSupervisor } = await import('../../ploinky-box/supervisor.mjs');
     const events = [];
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {},
         resolveIdentity: () => ({ ...w.identity, markerFound: true, anchorPath: path.join(w.identity.workspaceRoot, '.ploinky') }),
         lockManager: createMutationLockManager(),

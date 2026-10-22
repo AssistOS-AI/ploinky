@@ -283,7 +283,9 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     handoffNow,
     onUpdateResult,
 } = {}) {
-    const selectedSupervisor = supervisor || createBoxSupervisor({ env, launchCwd: launchDirectory });
+    const selectedSupervisor = supervisor || createBoxSupervisor({
+        env, launchCwd: launchDirectory, allowHostProcesses: parsed.allowHostProcesses,
+    });
     const engineEnv = buildEngineProcessEnvironment(env);
     outerDebug(parsed, route, output);
 

@@ -12,6 +12,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 import { fakeUpdateCore, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 const BUILD_COMMIT = 'a'.repeat(40);
 
@@ -40,6 +41,7 @@ function fixture(t, {
     let selections = [];
     let lockNumber = 0;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         checkHostPrerequisites: () => {}, env, platform: 'darwin',
         gpuGrantStore: createGpuGrantStore(),
         hardwareGateStore: createHardwareGateStore(),

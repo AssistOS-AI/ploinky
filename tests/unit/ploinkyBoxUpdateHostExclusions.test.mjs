@@ -19,6 +19,7 @@ import {
 import { createMemoryUpdateHostState, createUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore, verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 // Never read the global, system or XDG Git policy of the machine running this.
 const isolation = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-host-exclusions-env-')));
@@ -224,6 +225,7 @@ function supervisorFor(t, w, { folders, refresh = undefined, store = createMemor
     });
     let lockHeld = false;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => w.identity,
         launchCwd: w.identity.workspaceRoot,
         lockManager: {

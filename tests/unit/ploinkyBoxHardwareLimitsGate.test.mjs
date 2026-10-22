@@ -91,6 +91,7 @@ function startSupervisor(state, { env = {}, events = [] } = {}) {
     const ownership = owned(state.identity);
     const agentLib = agentLibFixture(state.identity.workspaceRoot);
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env,
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
@@ -268,6 +269,7 @@ test('G.status-production-observed', (t) => {
     const queries = [];
     const runs = [];
     const supervisor = (boxRuntime) => createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {},
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
@@ -324,12 +326,15 @@ import {
     nestedPodmanSeccompProfileContract,
     nestedPodmanSeccompProfilePath,
 } from '../../ploinky-box/seccomp.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
+import { hostStateFixtureMounts } from '../helpers/hostStateFixture.mjs';
 
 const INBOX_READY = JSON.stringify({ state: 'running', initialized: true, routingConfigured: true, trackedAgents: 1, runningAgents: 1, warnings: [] });
 
 function genericSupervisor(state, { running = true, initialized = true, absent = false, events = [] } = {}) {
     const ownership = absent ? { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} } : owned(state.identity, { running });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {},
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
@@ -431,8 +436,15 @@ test('G.off-byte-identical', async (t) => {
     // merge; the 8d8c4b77 golden is kept as the record of the earlier baseline.
     const golden = JSON.parse(fs.readFileSync(new URL('../fixtures/hardware-limits/gate-off-create-args-4dae3a99.json', import.meta.url), 'utf8'));
     const repository = path.resolve(import.meta.dirname, '../..');
-    assert.deepEqual(await normalizedGateOffCreateArgs(repository), golden, 'default (no hardware argument) matches the baseline bytes');
-    assert.deepEqual(await normalizedGateOffCreateArgs(repository, { extra: { hardware: null } }), golden, 'gate off matches the baseline bytes');
+    // The one change since that baseline is the Box contract's read-only mask
+    // over the host state directory, right after the workspace bind.
+    const bind = golden.indexOf('<SCRATCH>/workspace:<SCRATCH>/workspace');
+    assert.equal(golden[bind - 1], '--volume');
+    const expected = [...golden.slice(0, bind + 1),
+        '--volume', '<SCRATCH>/workspace/.ploinky-box/empty:<SCRATCH>/workspace/.ploinky-box:ro',
+        ...golden.slice(bind + 1)];
+    assert.deepEqual(await normalizedGateOffCreateArgs(repository), expected, 'default (no hardware argument) matches the baseline bytes');
+    assert.deepEqual(await normalizedGateOffCreateArgs(repository, { extra: { hardware: null } }), expected, 'gate off matches the baseline bytes');
     const baseline = createArgsFor(state);
     assert.deepEqual(createArgsFor(state, { hardware: null }), baseline, 'gate off adds nothing');
     assert.equal(baseline.some((arg) => String(arg).startsWith(`${BOX_LABELS.hardwareLimits}=`)
@@ -549,6 +561,7 @@ function completeHandle(box, hardware) {
                 { type: 'bind', name: '', source: box.root, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: box.identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: box.identity.workspaceRoot, destination: box.identity.workspaceRoot, rw: true },
+                ...hostStateFixtureMounts(box.identity.workspaceRoot, box.root),
                 ...agentLibFixtureMounts(box.agentLib, box.identity.workspaceRoot),
                 ...(hardware ? hardware.mounts.map((mount) => ({ type: 'bind', name: '', source: mount.source, destination: mount.destination, rw: mount.rw })) : []),
             ].sort((left, right) => left.destination.localeCompare(right.destination)),
@@ -596,6 +609,7 @@ test('G.targeted-gate-change', async (t) => {
     const ownership = owned(state.identity);
     let reconciledHardware;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
@@ -641,6 +655,7 @@ test('G.every-final-generation', async (t) => {
     writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
     const graphEvents = new Set(['graph', 'start-core']);
     const supervisorFor = (events, { ownership = owned(state.identity), env = { PLOINKY_BOX_HARDWARE_LIMITS: 'on' }, reconcile } = {}) => createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env,
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
@@ -701,6 +716,7 @@ test('G.every-final-generation', async (t) => {
     // before its graph is restored.
     const rollbackEvents = [];
     const failing = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
@@ -765,6 +781,7 @@ test('G.every-final-generation', async (t) => {
     ]) {
         const events = [];
         const supervisor = createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
             env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
             resolveIdentity: () => state.identity,
             launchCwd: state.identity.workspaceRoot,
@@ -828,6 +845,7 @@ function sink() {
 
 function realSupervisor(state, { env = {}, events = [], ownership = owned(state.identity), reconciled = owned(state.identity) } = {}) {
     return createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env,
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
@@ -1024,6 +1042,7 @@ function downgradeWorld(t, { boxRunning, graphRunning }) {
         },
     };
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: { PLOINKY_BOX_HARDWARE_LIMITS: 'off' },
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
@@ -1163,18 +1182,24 @@ function preservedRecoveryWorld(t, { removalFailures = 1 } = {}) {
         async startAndWaitReady(selectedEngine, id, selectedRunner) { selectedRunner.run(selectedEngine.name, ['container', 'start', id]); },
         discover: () => ownership(),
         ensureDataPaths: () => ({ paths: state.identity.dataPaths, fingerprints: DATA, created: [] }),
-        // The first observation differs, so the first transaction replaces the Box.
+        // The data paths are unchanged: with the Box running, a changed one is
+        // refused rather than replaced (N1). The first transaction replaces
+        // the Box because it selects another image reference (below).
         inspectDataPaths: () => {
             inspections += 1;
-            return { paths: state.identity.dataPaths, fingerprints: inspections === 1 ? { ...DATA, images: 'e'.repeat(64) } : DATA };
+            return { paths: state.identity.dataPaths, fingerprints: DATA };
         },
         revalidateDataPaths: () => ({ paths: state.identity.dataPaths, fingerprints: DATA }),
         retireStartLock() {},
         retireEdgePreparation() {},
         token: (kind) => (kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24)),
+        quiescence: () => [],
     };
     const supervisor = createBoxSupervisor({
-        env: {},
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        // Another image reference than the running Box's, so the transaction
+        // replaces it; the recovery brings the Box back with its own label.
+        env: { PLOINKY_BOX_IMAGE: 'docker.io/assistos/ploinky-box:replacement' },
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
         repositoryRoot: box.root,
@@ -1580,6 +1605,7 @@ test('G.update-recovers-stale-lock', async (t) => {
     const absent = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} };
     const events = [];
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {},
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
@@ -1720,6 +1746,7 @@ function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null,
         restore: (identity, previous, lock) => { events.push('gate-restore'); return state.gateStore.restore(identity, previous, lock); },
     });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env,
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,

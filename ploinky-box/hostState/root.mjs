@@ -32,16 +32,31 @@ export const HOST_STATE_STORE_DIRECTORIES = Object.freeze({
 export const HOST_STATE_UPDATE_KINDS = Object.freeze([
     'update-journals', 'update-pending', 'update-handoffs', 'update-recovery', 'update-exclusions',
 ]);
-// Names a hygiene scan must never quarantine by name: the skeleton, the live
-// store directories, the host staging directory (`tmp/`) and the trust latch
-// marker (`latch.json`).
+// Every name the host itself writes directly under `.ploinky-box`: the
+// skeleton, the store directories, the host staging directory (`tmp/`) and the
+// adoption record. This is an inventory, not a trust list: first-use
+// quarantine (adoption.mjs) keeps only the skeleton and `tmp/`.
 export const HOST_STATE_KNOWN_NAMES = Object.freeze([
     ...HOST_STATE_SKELETON.map((entry) => entry.name),
     ...Object.values(HOST_STATE_STORE_DIRECTORIES),
     ...HOST_STATE_UPDATE_KINDS,
     'tmp',
-    'latch.json',
+    'workspace.json',
 ]);
+
+/**
+ * The read-only mask every Box carries over its workspace's `.ploinky-box`:
+ * the empty skeleton directory bound on top of it, after the workspace bind.
+ */
+export function hostStateMaskMount(workspaceRoot) {
+    const paths = hostStatePaths(workspaceRoot);
+    return Object.freeze({ source: paths.empty, destination: paths.root, rw: false });
+}
+
+export function hostStateMaskArgs(workspaceRoot) {
+    const mask = hostStateMaskMount(workspaceRoot);
+    return ['--volume', `${mask.source}:${mask.destination}:ro`];
+}
 
 export function hostStateError(message, code = 'PLOINKY_BOX_HOST_STATE_INVALID', cause) {
     return new PloinkyBoxError(message, { code, cause });
@@ -65,7 +80,7 @@ export function hostStatePaths(workspaceRoot) {
         quarantine: path.join(root, 'quarantine'),
         empty: path.join(root, 'empty'),
         tmp: path.join(root, 'tmp'),
-        latch: path.join(root, 'latch.json'),
+        workspaceRecord: path.join(root, 'workspace.json'),
         workspaceLock: path.join(locks, WORKSPACE_LOCK_NAME),
         routerBindings: path.join(root, HOST_STATE_STORE_DIRECTORIES.routerBindings),
         gpuGrants: path.join(root, HOST_STATE_STORE_DIRECTORIES.gpuGrants),

@@ -17,6 +17,7 @@ import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore, verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
 import { createOperationRecord } from '../../cli/commands/updateOutcome.js';
 import { createUpdateCancellation } from '../../cli/commands/updateCancellation.js';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 const CONTAINER_ID = 'a'.repeat(64);
 
@@ -107,6 +108,7 @@ function harness(t, {
         if (faults.restart && argv[0] === 'restart') throw new Error('in-Box restart failed');
     }
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: path.join(identity.workspaceRoot, launchRelative),
         lockManager,
@@ -457,6 +459,7 @@ test('the production supervisor selects durable private workspace host state for
     const probe = harness(t, { graph: { running: true, configured: true }, lockManager });
     // Rebuild the supervisor without an injected store so the default is used.
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => probe.identity,
         launchCwd: probe.identity.workspaceRoot,
         lockManager,
@@ -508,6 +511,7 @@ test('a reporting failure after a settled restart never stops or restores the gr
         write() { if (settled) throw new Error(`${name} closed`); },
     });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => fixture.identity,
         launchCwd: fixture.identity.workspaceRoot,
         lockManager: {

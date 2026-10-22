@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 // Step 0 spike of BOX_STATE_IN_WORKSPACE_PLAN_R2: can in-Box processes and nested agents
 // reach or change what a read-only empty-directory mask hides at `<ws>/.ploinky-box`?
-// Probes N3, N4, N4b, N4c, N11, N21, plus P1 (pre-existing: today's `.ploinky/data` guard).
+// Probes N3, N4, N4b, N4c, N11, N21 (with N21c, the rename of the checkout's parent), plus P1
+// (pre-existing: today's `.ploinky/data` guard).
 //
-// Fidelity: the Box `create` argv comes from this checkout's own `containerCreateArgs`; the
-// probe injects only the mask volume, the N21 checkout shadow, `--timeout`, a probe label and
-// free host ports. AgentLib is rendered in image mode so the workspace bind has no other
+// Fidelity: the Box `create` argv comes from this checkout's own `containerCreateArgs`, which
+// renders the mask itself; a target is exactly that argv, and a control is the same argv with
+// only the mask removed. The probe injects only the N21 checkout shadow (rendered by the
+// product's own shadow helper, since this run's checkout lies outside the scratch workspace),
+// the HS store bind, `--timeout`, a probe label and free host ports. AgentLib is rendered in image mode so the workspace bind has no other
 // submount (a local-mode alias shadow would make non-recursive binds fail on the control too).
 // The Box starts through the real `startContainerAndWaitReady`, so its self-checks passed.
 //
@@ -65,6 +68,8 @@ import {
     readContainerIdFromCidfile,
     startContainerAndWaitReady,
 } from '../../../ploinky-box/lifecycle/container.mjs';
+import { checkoutShadowArgs, checkoutShadowMount } from '../../../ploinky-box/contract/checkoutAlias.mjs';
+import { hostStateMaskArgs } from '../../../ploinky-box/hostState/root.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from '../../../ploinky-box/process.mjs';
 import { NESTED_PODMAN_SECCOMP_BOX_PATH } from '../../../ploinky-box/seccomp.mjs';
 import { inspectWorkspaceDataPaths } from '../../../ploinky-box/workspace-data.mjs';
@@ -385,6 +390,11 @@ function execInBox(ctx, box, script, timeoutSeconds) {
     };
 }
 
+// The index of `group` as a contiguous run in `argv`, or -1.
+function groupIndex(argv, group) {
+    return argv.findIndex((_, index) => group.every((value, offset) => argv[index + offset] === value));
+}
+
 function renderArgv(ctx, variant, cidfile, ports) {
     const { mask, shadow, hs } = ctx.variants[variant];
     const rendered = containerCreateArgs({
@@ -401,24 +411,45 @@ function renderArgv(ctx, variant, cidfile, ports) {
         hostKind: ctx.engine.hostKind,
         networkMode: selectedBoxNetworkMode(ctx.engine),
     });
-    const groups = [['--timeout', String(BOX_TIMEOUT_SECONDS)], ['--label', `${PROBE_LABEL}=${ctx.runId}`]];
-    const argv = [...rendered];
-    argv.splice(2, 0, ...groups.flat());
     const workspaceBind = boxWorkspaceVolume(ctx.W);
-    const bind = argv.findIndex((arg, index) => arg === '--volume' && argv[index + 1] === workspaceBind);
-    if (bind < 0 || argv.filter((arg) => arg === workspaceBind).length !== 1) {
+    const maskGroup = hostStateMaskArgs(ctx.W);
+    const bindAt = rendered.findIndex((arg, index) => arg === '--volume' && rendered[index + 1] === workspaceBind);
+    if (bindAt < 0 || rendered.filter((arg) => arg === workspaceBind).length !== 1) {
         throw new HarnessError('workspace bind not found exactly once in the rendered argv');
     }
-    const volumes = [];
-    if (mask) volumes.push(['--volume', `${ctx.paths.host}/empty:${ctx.paths.host}:ro`]);
-    if (shadow) volumes.push(['--volume', `${ctx.paths.checkout}:${boxWorkspacePath(ctx.W, '.runtime/ploinky')}:ro`]);
-    if (hs) volumes.push(['--volume', `${hs === 'store' ? ctx.paths.store : ctx.paths.host}:${HS_DESTINATION}`]);
-    argv.splice(bind + 2, 0, ...volumes.flat());
-    groups.push(...volumes);
-    if (JSON.stringify(withoutInjections(argv, groups)) !== JSON.stringify(rendered)) {
-        throw new HarnessError('variant argv differs from the rendered argv beyond the injections');
+    // The product renders the mask itself, once, right after the workspace bind.
+    if (groupIndex(rendered, maskGroup) !== bindAt + 2 || rendered.filter((arg) => arg === maskGroup[1]).length !== 1) {
+        throw new HarnessError('the rendered argv does not carry the mask exactly once after the workspace bind');
     }
-    ctx.argv[variant] = { argv, injected: groups.map((group) => group.join(' ')) };
+    // The real argv has no checkout shadow: this run's checkout is outside the workspace.
+    if (rendered.some((arg) => arg.startsWith(`${ctx.paths.checkout}:`))) {
+        throw new HarnessError('the rendered argv already shadows the probe checkout');
+    }
+    const argv = [...rendered];
+    const removed = [];
+    if (!mask) {
+        argv.splice(groupIndex(argv, maskGroup), maskGroup.length);
+        removed.push(maskGroup);
+    }
+    const groups = [['--timeout', String(BOX_TIMEOUT_SECONDS)], ['--label', `${PROBE_LABEL}=${ctx.runId}`]];
+    argv.splice(2, 0, ...groups.flat());
+    const volumes = [];
+    if (shadow) volumes.push(checkoutShadowArgs(checkoutShadowMount(ctx.W, ctx.paths.checkout)));
+    if (hs) volumes.push(['--volume', `${hs === 'store' ? ctx.paths.store : ctx.paths.host}:${HS_DESTINATION}`]);
+    // Read-only overlays go after the workspace bind and its mask, as the product renders them.
+    const bind = argv.findIndex((arg, index) => arg === '--volume' && argv[index + 1] === workspaceBind);
+    argv.splice(bind + 2 + (mask ? maskGroup.length : 0), 0, ...volumes.flat());
+    groups.push(...volumes);
+    const expected = [...rendered];
+    for (const group of removed) expected.splice(groupIndex(expected, group), group.length);
+    if (JSON.stringify(withoutInjections(argv, groups)) !== JSON.stringify(expected)) {
+        throw new HarnessError('variant argv differs from the rendered argv beyond the injections and the removed mask');
+    }
+    ctx.argv[variant] = {
+        argv,
+        injected: groups.map((group) => group.join(' ')),
+        removed: removed.map((group) => group.join(' ')),
+    };
     return argv;
 }
 
@@ -552,13 +583,13 @@ function buildRows(ctx) {
         });
     }
     const aliases = [
-        ['1', `${W}/.PLOINKY-HOST`, 'ls -A'],
-        ['2', `${W}/.ploin${KELVIN}y-host`, 'ls -A'],
-        ['3', `${W}/.Ploinky-Host`, 'touch'],
+        ['1', `${W}/.PLOINKY-BOX`, 'ls -A'],
+        ['2', `${W}/.ploin${KELVIN}y-box`, 'ls -A'],
+        ['3', `${W}/.Ploinky-Box`, 'touch'],
     ];
     for (const [id, alias, verb] of aliases) {
         const named = path.basename(alias).replace(KELVIN, '<U+212A>');
-        const plan = verb === 'touch' ? 'touch $W/.Ploinky-Host/f' : `ls -A $W/${named}`;
+        const plan = verb === 'touch' ? 'touch $W/.Ploinky-Box/f' : `ls -A $W/${named}`;
         for (const where of ['box', 'nested']) {
             // A fresh file name per row (plan: `f`): a guest cache of a name the host just
             // deleted can fake success.
@@ -581,6 +612,13 @@ function buildRows(ctx) {
     });
     add('N21', '2', 'touch $W/.runtime/ploinky/.git/x', {
         attack: `touch ${checkout}/.git/x`, back: `ls -A ${checkout}/.git`, expect: 'EROFS', box: shadowBoxes,
+    });
+    // N21c: renaming the checkout's parent would carry the shadow away and free the host path
+    // for a planted tree; the parent is bound onto itself, so the rename must fail (EBUSY). The
+    // oracle is the host tree: on the control (no shadow, no self-bind) the checkout path moves.
+    add('N21', 'c', 'mv $W/.runtime $W/.runtime.x && mkdir -p $W/.runtime/ploinky (plant at the checkout path)', {
+        attack: `mv ${W}/.runtime ${W}/.runtime.x && mkdir -p ${checkout} && touch ${checkout}/planted`,
+        back: `ls -A ${W} ${checkout}`, expect: 'EBUSY', box: shadowBoxes,
     });
     // HS: the read-write store bind lives under `.ploinky-box/`; nothing reachable through it may
     // reach the sentinel one to three levels above its source.
@@ -745,9 +783,10 @@ const oracleCell = (r) => {
 function printReport(ctx, results) {
     const out = ['## Environment', '', '| item | value |', '| --- | --- |'];
     for (const [key, value] of ctx.environment) out.push(`| ${key} | ${cell(value)} |`);
-    out.push('', '## Rendered argv (containerCreateArgs of this checkout plus the listed injections only)', '');
-    for (const [variant, { argv, injected }] of Object.entries(ctx.argv)) {
-        out.push(`${variant} injections: ${injected.join(' | ')}`, `${variant} argv: ${JSON.stringify(argv)}`, '');
+    out.push('', '## Rendered argv (containerCreateArgs of this checkout, minus the listed removals, plus the listed injections only)', '');
+    for (const [variant, { argv, injected, removed }] of Object.entries(ctx.argv)) {
+        out.push(`${variant} removed: ${removed.join(' | ') || 'none'}`, `${variant} injections: ${injected.join(' | ')}`,
+            `${variant} argv: ${JSON.stringify(argv)}`, '');
     }
     out.push(
         '## Results', '',

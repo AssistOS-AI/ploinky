@@ -356,3 +356,35 @@ for (const frameworkAlias of [false, true]) {
         } finally { cleanup(); }
     });
 }
+
+test('manifest volumes may not resolve into the Box host state directory of any workspace', async () => {
+    const { isManagedManifestVolumeSource } = await import('../../cli/sandbox/runtimeCapabilities.js');
+    const { root, cleanup } = fixture();
+    try {
+        fs.mkdirSync(path.join(root, '.ploinky-box', 'hardware-limits'), { recursive: true });
+        fs.mkdirSync(path.join(root, 'other', '.ploinky-box'), { recursive: true });
+        fs.mkdirSync(path.join(root, 'models'));
+        fs.symlinkSync(path.join(root, '.ploinky-box'), path.join(root, 'state-alias'));
+        for (const source of [
+            '.ploinky-box',
+            '.ploinky-box/hardware-limits',
+            '.PLOINKY-BOX/hardware-limits',
+            '.ploinKy-box',
+            '.ploinky-box./x',
+            'other/.ploinky-box',
+            'state-alias',
+            'state-alias/hardware-limits',
+            path.join(root, '.ploinky-box'),
+        ]) {
+            policyFailure(() => assertManifestVolumeStoragePolicy(source, { workspaceRoot: root }));
+            if (!path.isAbsolute(source)) {
+                assert.equal(isManagedManifestVolumeSource(source, { workspaceRoot: root }), false, source);
+            }
+        }
+        assert.equal(assertManifestVolumeStoragePolicy('models', { workspaceRoot: root }), path.join(root, 'models'));
+        assert.equal(isManagedManifestVolumeSource('models', { workspaceRoot: root }), true);
+        assert.equal(isManagedManifestVolumeSource('.ploinky-boxes', { workspaceRoot: root }), true, 'only the exact folded name');
+    } finally {
+        cleanup();
+    }
+});

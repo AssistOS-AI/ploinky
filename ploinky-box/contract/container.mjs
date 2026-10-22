@@ -13,6 +13,8 @@ import {
     INCOMPATIBLE_BOX_GUIDANCE,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { hasHostStateComponent, strictlyInside } from '../hostState/paths.mjs';
+import { hostStateMaskMount } from '../hostState/root.mjs';
 import {
     PUBLIC_ROUTER_HOSTS_ENV,
     parsePublicRouterHosts,
@@ -37,6 +39,7 @@ import {
     expectedAgentLibMounts,
     normalizeBoxAgentLib,
 } from './agentlib.mjs';
+import { checkoutShadowMount } from './checkoutAlias.mjs';
 import { IMAGE_CONTRACT } from './image.mjs';
 import { normalizeImageId } from './image-id.mjs';
 import { assertBoxNetworkMode } from './network.mjs';
@@ -180,6 +183,17 @@ export function normalizeContainerRuntime(record) {
             })).sort((left, right) => left.destination.localeCompare(right.destination))
             : null,
     });
+}
+
+// A data source an observed Box may carry: a clean absolute path strictly
+// inside the workspace, outside the host state directory and the checkout.
+function observedDataSource(workspaceRoot, source, shadow) {
+    return typeof source === 'string'
+        && path.isAbsolute(source)
+        && path.normalize(source) === source
+        && strictlyInside(workspaceRoot, source)
+        && !hasHostStateComponent(path.relative(workspaceRoot, source))
+        && !(shadow && (source === shadow.destination || strictlyInside(shadow.destination, source)));
 }
 
 function publicationError(message) {
@@ -339,6 +353,11 @@ export function validateContainerConfiguration(containerHandle, {
     repositoryRoot,
     hostKind = 'native-linux',
     networkMode,
+    // The confined data-path sources the Box was created with. A created
+    // Box is checked against them exactly; an observed Box (undefined) may
+    // carry any clean source strictly inside the workspace, because the data
+    // fingerprint labels, not the spelling, identify its directories.
+    dataSources = undefined,
     // undefined: trust the wiring the Box records (status, diagnose, reuse
     // of an observed Box); null: no GPU grant; otherwise the exact wiring.
     gpu = undefined,
@@ -513,18 +532,33 @@ export function validateContainerConfiguration(containerHandle, {
             `Owned Box tmpfs set is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`,
         );
     }
-    // Local AgentLib sources add two read-only binds to the four workspace
-    // binds. Image bundles require neither source nor alias binds. The one
-    // writable workspace bind is the selected root at its own absolute path.
+    // Local AgentLib sources add two read-only binds to the workspace binds
+    // (source, workspace, host state mask, checkout shadow when it applies,
+    // and the two data directories). Image bundles require neither source nor
+    // alias binds. The one writable workspace bind is the selected root at its
+    // own absolute path.
     // Podman currently reports the /tmp tmpfs through
     // HostConfig.Tmpfs and may additionally expose the same mount in Mounts; no
     // named, anonymous, or unrelated mount is accepted.
     const workspaceMount = boxWorkspaceMount(workspaceRoot);
+    // Every Box masks its host state directory and shadows the invoking
+    // checkout when that lies inside the workspace; a Box without them was
+    // created by an incompatible version and is replaced, never adopted.
+    const mask = hostStateMaskMount(workspaceRoot);
+    const shadow = checkoutShadowMount(workspaceRoot, repositoryRoot);
+    const accepts = (source) => observedDataSource(workspaceRoot, source, shadow);
+    const dataMount = (key) => (dataSources
+        ? { source: dataSources[key], rw: true }
+        : { source: identity.dataPaths[key], rw: true, accepts });
     const expectedMounts = {
         '/opt/ploinky': { source: repositoryRoot, rw: false },
         [workspaceMount.destination]: { source: workspaceMount.source, rw: workspaceMount.rw },
-        [BOX_DATA_MOUNTS.dependencies]: { source: identity.dataPaths.dependencies, rw: true },
-        [BOX_DATA_MOUNTS.images]: { source: identity.dataPaths.images, rw: true },
+        [mask.destination]: { source: mask.source, rw: false },
+        ...(shadow ? { [shadow.destination]: { source: shadow.source, rw: false } } : {}),
+        // The checkout's parent directories, each bound onto itself.
+        ...Object.fromEntries((shadow?.parents || []).map((parent) => [parent.destination, { source: parent.source, rw: true }])),
+        [BOX_DATA_MOUNTS.dependencies]: dataMount('dependencies'),
+        [BOX_DATA_MOUNTS.images]: dataMount('images'),
         ...expectedAgentLibMounts(agentLibContract, workspaceRoot),
         // GPU grant driver, tool, CDI spec and marker binds: read-only and exact.
         ...Object.fromEntries((gpuWiring?.mounts || []).map((mount) => [
@@ -557,7 +591,7 @@ export function validateContainerConfiguration(containerHandle, {
         if (!observed
             || observed.type !== 'bind'
             || observed.rw !== expected.rw
-            || observed.source !== expected.source) {
+            || (observed.source !== expected.source && !expected.accepts?.(observed.source))) {
             throw publicationError(
                 `Owned Box mount ${destination} is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`,
             );

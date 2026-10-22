@@ -12,6 +12,7 @@ import { runUpdateExec } from '../../ploinky-box/update/coreRunner.mjs';
 import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 // A signal that reaches the host while it proves that an in-Box writer
 // stopped. The real update runner handed its SIGINT/SIGTERM listeners back
@@ -125,6 +126,7 @@ function scenario(t, {
         };
     };
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: {

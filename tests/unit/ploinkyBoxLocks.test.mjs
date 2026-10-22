@@ -9,8 +9,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { LIVENESS } from '../../ploinky-box/lockLiveness.mjs';
+import * as locksModule from '../../ploinky-box/locks.mjs';
 import {
-    MUTATION_LOCK_LOCATION,
     createMutationLockManager,
     parseLockOwner,
     withWorkspaceMutationLock,
@@ -68,8 +68,9 @@ function v2Owner(overrides = {}) {
     };
 }
 
-test('the lock module declares the workspace generation and lives in the workspace skeleton', async (t) => {
-    assert.equal(MUTATION_LOCK_LOCATION, 'workspace');
+test('the lock module lives in the workspace skeleton and exports no generation marker', async (t) => {
+    // QA tooling no longer feature-detects the lock generation.
+    assert.equal(Object.hasOwn(locksModule, 'MUTATION_LOCK_LOCATION'), false);
     const root = fixture(t);
     const { workspace, identity } = workspaceIn(root);
     // An empty private home: a lock manager must neither read nor create anything in it.

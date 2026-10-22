@@ -13,6 +13,7 @@ import { buildEngineProcessEnvironment } from '../../ploinky-box/process.mjs';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { makeTree } from './fixtures/render-query/make-trees.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 const DRIVER = '595.91.07';
 // Each fixture host names its architecture, so discovery never depends on the
@@ -304,6 +305,7 @@ test('render-node diagnostics reach host status and preserve singleton grant byt
     tree.addNode({ name: 'renderD130', vramBytes: '4294967296' });
     const discovery = discoverVulkanRenderNode(linux(tree));
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => IDENTITY,
         discover: () => ({ state: 'absent' }),
         discoverGpuDevices: () => discovery,
@@ -508,7 +510,7 @@ test('darwin: supervisor default discovery and grant store receive the superviso
     Object.defineProperty(process, 'platform', { value: 'darwin' });
     t.after(() => Object.defineProperty(process, 'platform', descriptor));
     const fixture = mac();
-    const supervisor = createBoxSupervisor({ runner: fixture.runner, resolveIdentity: () => identity,
+    const supervisor = createBoxSupervisor({ hostStateGuard: PERMISSIVE_HOST_STATE_GUARD, runner: fixture.runner, resolveIdentity: () => identity,
         discover: () => ({ state: 'absent' }), scanGpuAgents: () => [AGENT], hardwareGateStore: { read: () => null } });
     const status = supervisor.inspectGpuGrant();
     assert.equal(status.host.vendor, 'vulkan');

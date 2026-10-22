@@ -13,6 +13,7 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 // Imports only modules that exist before and after the structured-outcome
 // change, and writes the report envelope inline, so it demonstrates on the
@@ -72,6 +73,7 @@ test('a preserved dirty required repository makes update exit nonzero without a 
         },
     });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership(),

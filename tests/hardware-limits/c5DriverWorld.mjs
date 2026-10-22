@@ -39,6 +39,7 @@ import { C5_INTENT_KIND, createC5Intent, exactContainerHandle, productEngineDige
 import { DRIVER_BOUNDS, driverParams, runDriver } from './liveStoreTransition.mjs';
 import { describeMutation } from './c5Mutation.mjs';
 import { INSPECT, OWNER_MARKER, engineIdentityDigest, jsonDigest, liveSourceDigest } from './liveCommon.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD, hostStateFixtureMounts } from '../helpers/hostStateFixture.mjs';
 
 export const REPOSITORY = fs.realpathSync(new URL('../..', import.meta.url).pathname);
 const AGENT_REF = `${FIXTURE_REPOSITORY}/s`;
@@ -101,6 +102,7 @@ export function completeHandle(box, hardware, { id = 'e'.repeat(64), imageId = '
                 { type: 'bind', name: '', source: box.root, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: box.identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: box.identity.workspaceRoot, destination: box.identity.workspaceRoot, rw: true },
+                ...hostStateFixtureMounts(box.identity.workspaceRoot, box.root),
                 ...agentLibFixtureMounts(box.agentLib, box.identity.workspaceRoot),
                 ...(hardware ? hardware.mounts.map(mount => ({ type: 'bind', name: '', source: mount.source, destination: mount.destination, rw: mount.rw })) : []),
             ].sort((left, right) => left.destination.localeCompare(right.destination)),
@@ -312,6 +314,7 @@ export function createDowngradeWorld({
     // The real supervisor over the stub runner it is given (the driver passes its decorated production runner).
     function makeSupervisor(decorated) {
         return createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
             env: { PLOINKY_BOX_HARDWARE_LIMITS: 'off' }, resolveIdentity: () => identity, launchCwd: identity.workspaceRoot, repositoryRoot: box.root,
             lockManager: lockManager(), discover: () => ownership(), runner: decorated,
             selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),

@@ -18,11 +18,9 @@ import { ensureStoreDirectories } from './stores.mjs';
 // the Box contract masks from the Box, instead of the shared `os.tmpdir()`, and
 // holds an owner record in the lock owner format (D4 v2: machine, boot, PID
 // namespace, PID and process start) so a later locked transaction can classify
-// a leftover directory by liveness instead of by age.
-//
-// TODO(step 4): nothing sweeps `tmp/` yet. The quiescence-gated locked
-// transaction removes entries whose owner record classifies as stale (never by
-// time); until then a directory left by a crashed host process stays in place.
+// a leftover directory by liveness instead of by age: the locked
+// transactions of an adopted workspace remove entries whose owner is proven
+// gone (`sweepStaleHostStaging` in adoption.mjs), never by time.
 
 export const HOST_STAGING_DIRECTORY = 'tmp';
 export const HOST_STAGING_LABEL = 'host-staging';

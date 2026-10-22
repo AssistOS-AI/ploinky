@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 const here = path.dirname(new URL(import.meta.url).pathname);
 const repoRoot = path.resolve(here, '../..');
@@ -246,6 +247,7 @@ test('destroy --delete-cache removes managed AgentLib state but never a local ch
     const identity = { workspaceRoot: workspace, instance: 'ploinky-box-test' };
     let removed = null;
     const supervisor = supervisorMod.createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         discover: () => ({ state: 'absent', engine: { name: 'podman' }, handles: {} }),

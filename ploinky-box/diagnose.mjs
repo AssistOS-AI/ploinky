@@ -384,6 +384,10 @@ export async function collectRuntimeDiagnostics({ identity, repositoryRoot, env,
                 }),
                 explicitPort: await unusedPort(), explicitMediaPort: await unusedPort(true),
                 imageRef: imageId, imagePolicy: 'preserve', stdout: silent, stderr: silent,
+                // The throwaway fixture workspace is exempt from the
+                // quiescence gate: the workspace that holds it may have a
+                // running Box, which binds the fixture's ancestor.
+                quiescence: false,
             });
             ownedId = result.ownership.handles.container.id;
             result.finalize();
