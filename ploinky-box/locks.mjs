@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -25,7 +24,7 @@ import { createLockLiveness, LIVENESS } from './lockLiveness.mjs';
 
 export { LOCK_OWNER_SCHEMA, LOCK_OWNER_VERSION, parseLockOwner } from './lockFiles.mjs';
 
-// The workspace mutation lock lives in `<workspace>/.ploinky-host/locks/` and
+// The workspace mutation lock lives in `<workspace>/.ploinky-box/locks/` and
 // so follows the workspace directory: every spelling of one directory shares
 // it, and a renamed workspace carries it along. QA tooling feature-detects
 // this generation through MUTATION_LOCK_LOCATION. The on-disk protocol (atomic
@@ -58,9 +57,6 @@ function defaultSleepSync(milliseconds) {
 }
 
 export function createMutationLockManager({
-    // Selects only the update host-state store (`stateRoot`) until that store
-    // moves into the workspace; no lock lives under it.
-    homeDirectory = os.homedir(),
     fsApi = fs,
     liveness = defaultLiveness(),
     now = () => new Date(),
@@ -70,8 +66,6 @@ export function createMutationLockManager({
     sleepSync = defaultSleepSync,
     uid = currentUid(),
 } = {}) {
-    const stateRoot = path.join(homeDirectory, '.ploinky-box');
-
     function ownerRecord({ label, instance, workspaceRoot }) {
         const self = liveness.selfFields();
         return {
@@ -477,7 +471,6 @@ export function createMutationLockManager({
         acquireSync: (instance, options) => driveSync(workspaceState(instance, options)),
         acquireAt: async (lockPath, label) => drive(pathState(lockPath, label)),
         lockPathFor: (workspaceRoot) => hostStatePaths(workspaceRoot).workspaceLock,
-        stateRoot,
     });
 }
 

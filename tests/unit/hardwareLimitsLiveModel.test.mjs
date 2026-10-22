@@ -26,7 +26,7 @@ import { canonicalDigest } from '../../cli/utils/dependencies/store/canonical.mj
 import { hashInstalledTree } from '../../cli/utils/dependencies/store/treeHash.mjs';
 import { buildResolutionManifest } from '../../cli/utils/dependencies/store/resolution.mjs';
 import { generationIdFor } from '../../cli/utils/dependencies/store/objectStore.mjs';
-import { assertModelHostSample, parseModelHostSample, createModelHostGuard, observeAppleMachine } from '../hardware-limits/liveModelHostGuard.mjs';
+import { assertModelHostSample, parseModelHostSample, createModelHostGuard, observeAppleMachine, modelGrantInventory } from '../hardware-limits/liveModelHostGuard.mjs';
 import { MODEL_PROCESS_FACTS, LLM_TOOL_CALL } from '../hardware-limits/liveLlmCommands.mjs';
 import { APPLE_DEVICE_INSPECT, APPLE_RENDER_FACTS } from '../hardware-limits/liveModelDevices.mjs';
 import { requiredArtifacts, llmCleanupProofProblem, modelInferenceProofProblem, modelProvisionOnlyCleanupProven, judgeArtifacts, writeUstar } from '../hardware-limits/liveStage.mjs';
@@ -905,17 +905,21 @@ test('MODEL.apple-cpu-canonical-withdrawal-host-guard-and-cleanup', async t => {
     assert.equal(w.calls.some(call => call.args.includes('grant')), false);
 });
 
-test('MODEL.apple-cpu-preserves-unrelated-grant-records-and-detects-changes', async t => {
+test('MODEL.apple-cpu-grant-inventory-is-the-run-workspace-s-own', async t => {
+    // The inventory is the run workspace's own `.ploinky-box/gpu-grants`, which cleanup removes with the workspace:
+    // the baseline of a new workspace is empty and so is the inventory after cleanup. The standalone-cleanup test
+    // below proves that a baseline which no longer matches is still refused.
     const w = world(t, 'apple-cpu');
-    const directory = path.join(w.pins.host.home, '.ploinky-box', 'gpu-grants'); fs.mkdirSync(directory, { recursive: true });
-    const sentinel = path.join(directory, 'unrelated.json'); fs.writeFileSync(sentinel, '{"grant":"unrelated"}');
+    const workspacePath = w.run.target.execution.provision.workspace.path;
+    assert.equal(fs.existsSync(workspacePath), false, 'the workspace is only proposed');
     assert.equal((await w.provision()).verdict, 'PASS');
-    assert.equal((await w.live()).verdict, 'PASS');
-    assert.equal(fs.readFileSync(sentinel, 'utf8'), '{"grant":"unrelated"}');
-    const changed = world(t, 'apple-cpu'); const grants = path.join(changed.pins.host.home, '.ploinky-box', 'gpu-grants');
-    fs.mkdirSync(grants, { recursive: true }); fs.writeFileSync(path.join(grants, 'other.json'), 'original');
-    assert.equal((await changed.provision()).verdict, 'PASS'); fs.writeFileSync(path.join(grants, 'other.json'), 'changed');
-    assert.notEqual((await changed.live()).verdict, 'PASS');
+    assert.deepEqual(w.run.preInventory.gpuGrants, [], 'a new workspace holds no grant');
+    assert.equal(fs.existsSync(path.join(workspacePath, '.ploinky-box', 'gpu-grants')), false, 'no grant directory exists before a grant');
+    const livePass = await w.live();
+    assert.equal(livePass.verdict, 'PASS', JSON.stringify(livePass));
+    assert.deepEqual(w.artifacts.get('model-grants-before'), { runId: w.run.runId, entries: [] });
+    assert.deepEqual(w.artifacts.get('model-grants-after'), { runId: w.run.runId, entries: [] });
+    assert.equal(fs.existsSync(workspacePath), false, 'the host state went with the workspace');
 });
 
 test('MODEL.completed-live-run-allows-repeated-standalone-cleanup', async t => {
@@ -939,23 +943,24 @@ test('MODEL.completed-live-run-allows-repeated-standalone-cleanup', async t => {
     }
 });
 
-test('MODEL.apple-cpu-standalone-cleanup-retains-complete-grant-and-ownership-checks', async t => {
+test('MODEL.apple-cpu-standalone-cleanup-checks-the-complete-grant-baseline-and-ownership', async t => {
+    // The workspace owns its `.ploinky-box/gpu-grants`, so the baseline of a new workspace is empty and the
+    // cleanup that removes the workspace ends with the same empty inventory.
     const w = world(t, 'apple-cpu');
-    const grants = path.join(w.pins.host.home, '.ploinky-box', 'gpu-grants');
-    const directory = path.join(grants, 'unrelated'); fs.mkdirSync(directory, { recursive: true });
-    const sentinel = path.join(directory, 'grant.json'); const bytes = '{"grant":"unrelated"}'; fs.writeFileSync(sentinel, bytes);
     assert.equal((await w.provision()).verdict, 'PASS');
+    assert.deepEqual(w.run.preInventory.gpuGrants, []);
+    const workspacePath = w.run.target.execution.provision.workspace.path;
+    const grants = path.join(workspacePath, '.ploinky-box', 'gpu-grants');
     assert.equal((await w.live()).verdict, 'PASS');
     const cleanup = run => executeCleanupRun({ ...w.options(), run });
     const result = await w.cleanup(); assert.equal(result.verdict, 'PASS', JSON.stringify(result));
     assert.deepEqual(w.artifacts.get('model-grants-after').entries, w.run.preInventory.gpuGrants);
-    assert.equal(fs.readFileSync(sentinel, 'utf8'), bytes);
+    assert.equal(fs.existsSync(workspacePath), false, 'the workspace and its host state are gone');
     for (const mutate of [
         run => { delete run.preInventory.gpuGrants; },
         run => { run.preInventory.gpuGrants = null; },
-        run => { run.preInventory.gpuGrants.pop(); },
-        run => { run.preInventory.gpuGrants[1].sha256 = '0'.repeat(64); },
-        run => { run.preInventory.gpuGrants[1].path = '../foreign.json'; },
+        run => { run.preInventory.gpuGrants = [{ path: 'unrelated', type: 'directory' }]; },
+        run => { run.preInventory.gpuGrants = [{ path: 'unrelated.json', type: 'file', sha256: '0'.repeat(64) }]; },
     ]) {
         const bad = clone(w.run); mutate(bad);
         const failed = await cleanup(bad); assert.equal(failed.verdict, 'FAIL');
@@ -970,10 +975,6 @@ test('MODEL.apple-cpu-standalone-cleanup-retains-complete-grant-and-ownership-ch
         assert.equal((await cleanup(bad)).verdict, 'BLOCKED');
         assert.equal(w.calls.length, before, 'invalid inventory or ownership must refuse before commands');
     }
-    fs.writeFileSync(sentinel, 'changed');
-    const changed = await cleanup(clone(w.run)); assert.equal(changed.verdict, 'FAIL');
-    assert.ok(changed.cleanup.failures.includes('Unrelated GPU grant inventory changed'));
-    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'changed');
 });
 
 test('MODEL.measurement-manifest-through-canonical-cohort-retains-receipts', async t => {

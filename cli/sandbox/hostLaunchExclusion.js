@@ -15,7 +15,7 @@ import { heldHostLaunchExclusion, setHeldHostLaunchExclusion } from './hostLaunc
 // creation, so no host agent can start in between. A host launch takes it
 // after the workspace start lease that its caller already holds, and only
 // around the spawn or engine create/start, until the launch is observable.
-// In-Box launches never take it: the Box masks `.ploinky-host` from them.
+// In-Box launches never take it: the Box masks `.ploinky-box` from them.
 
 let defaultManager = null;
 

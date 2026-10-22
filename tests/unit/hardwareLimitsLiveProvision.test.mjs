@@ -123,7 +123,7 @@ function assertNothingOwned(w) {
     assert.deepEqual(Object.keys(state.boxes), []);
     const plan = w.run.target.execution.provision;
     for (const target of [plan.workspace.path, quarantinePath(plan.workspace.path, w.runId), ...(plan.workspace.parentMode === 'create' ? [plan.workspace.parent] : []),
-        ...hostRecordPaths(w.home, w.run.workspace.instance)]) assert.equal(exists(target), false, target);
+        ...hostRecordPaths(plan.workspace.path, w.run.workspace.instance)]) assert.equal(exists(target), false, target);
 }
 
 test('L1.provision-mac-c1-c2-success', async t => {
@@ -155,7 +155,7 @@ test('L1.provision-mac-c1-c2-success', async t => {
     assert.ok(start.path.startsWith(`${path.dirname(w.engine)}:`));
     // Host records the start created are recorded exactly.
     assert.deepEqual(w.run.ownedPaths.filter(entry => entry.role === 'host-record').map(entry => entry.path).sort(),
-        hostRecordPaths(w.home, profile.box.instance).filter(target => exists(target)).sort());
+        hostRecordPaths(plan.workspace.path, profile.box.instance).filter(target => exists(target)).sort());
     // Every receipt was persisted before later work depended on it.
     const index = predicate => writes.findIndex(predicate);
     const receipt = index(run => run.target.execution.workspace !== null);
@@ -398,12 +398,16 @@ test('L1.provision-refuses-preexisting-workspace', async t => {
 
 test('L1.provision-refuses-existing-host-record', async t => {
     const w = world(t);
-    const record = hostRecordPaths(w.home, w.run.workspace.instance)[2];
+    const record = hostRecordPaths(w.run.target.execution.provision.workspace.path, w.run.workspace.instance)[2];
     fs.mkdirSync(path.dirname(record), { recursive: true }); fs.writeFileSync(record, '{"foreign":true}');
     const report = await provision(w);
     assert.equal(report.verdict, 'BLOCKED'); assert.match(report.limitations[0], /not task-owned/);
     assert.equal(fs.readFileSync(record, 'utf8'), '{"foreign":true}');
-    assert.equal(exists(w.run.target.execution.provision.workspace.parent), false);
+    // The foreign record's own directories are all that exists: provisioning created nothing beside them.
+    const plan = w.run.target.execution.provision;
+    assert.deepEqual(fs.readdirSync(plan.workspace.parent), [path.basename(plan.workspace.path)]);
+    assert.deepEqual(fs.readdirSync(plan.workspace.path), ['.ploinky-box']);
+    assert.deepEqual(fs.readdirSync(path.join(plan.workspace.path, '.ploinky-box')), [path.basename(path.dirname(record))]);
     assert.deepEqual(worldState(w.statePath).calls.map(call => call.kind), ['info']);
 });
 
@@ -618,28 +622,47 @@ test('L1.cleanup-after-interrupted-provision-without-receipts', async t => {
     }
 });
 
+// Samples the world once, right after the cleanup's host-records step is persisted as complete,
+// which is the moment the record step's own effect (and nothing from the workspace removal) is visible.
+function sampleWhenHostRecordsComplete(w, sample) {
+    const samples = [];
+    const persist = () => {
+        w.persist();
+        if (samples.length === 0 && w.run.cleanup?.steps?.some(entry => entry.id === 'host-records' && entry.state === 'complete')) samples.push(sample());
+    };
+    return { samples, persist };
+}
+
 test('L1.cleanup-removes-exact-recorded-host-records', async t => {
     const w = await provisioned(t);
     const instance = w.run.workspace.instance;
+    const stateDirectory = path.join(w.run.target.execution.provision.workspace.path, '.ploinky-box');
     const recorded = w.run.ownedPaths.filter(entry => entry.role === 'host-record').map(entry => entry.path).sort();
-    assert.deepEqual(recorded, [path.join(w.home, '.ploinky-box', 'hardware-limits', instance), path.join(w.home, '.ploinky-box', 'hardware-limits', `${instance}.json`)]);
-    // Similar names and another instance's records are not ours.
-    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    assert.deepEqual(recorded, [path.join(stateDirectory, 'hardware-limits', instance), path.join(stateDirectory, 'hardware-limits', `${instance}.json`)]);
+    // Similar names and another instance's records are not ours: the record step leaves them in place.
+    const directory = path.join(stateDirectory, 'hardware-limits');
     const neighbours = [`${instance}.json.bak`, `${instance}-copy`, 'ploinky-box-workspace-000000000000.json'].map(name => path.join(directory, name));
     for (const target of neighbours) fs.writeFileSync(target, 'keep');
-    const report = await cleanup(w);
+    const kept = sampleWhenHostRecordsComplete(w, () => neighbours.map(target => exists(target)));
+    const report = await executeCleanupRun({ run: w.run, persist: kept.persist, processProvider: w.engineProvider, hostIdentity: w.hostIdentity, remoteArrival: w.remote });
     assert.equal(report.verdict, 'PASS', JSON.stringify(w.run.cleanup));
     for (const target of recorded) assert.equal(exists(target), false);
-    for (const target of neighbours) assert.equal(fs.readFileSync(target, 'utf8'), 'keep');
+    // The record step removed only the exact recorded names: its neighbours were still there when it completed.
+    assert.deepEqual(kept.samples, [[true, true, true]], 'sampled once, when the host-records step completed');
+    // The workspace removal took the rest afterwards.
+    for (const target of neighbours) assert.equal(exists(target), false, 'removed with the workspace, not by the record step');
+    assert.equal(exists(w.run.target.execution.provision.workspace.path), false);
 });
 
-// O11: a shared host-record directory the run created is removed once empty;
-// one that existed before the run, or that holds anything else, is kept.
+// O11: a host-record directory the run created (inside its own new workspace)
+// is removed once empty; one that holds anything else is kept until the
+// workspace goes.
 test('L1.cleanup-removes-the-host-record-directory-this-run-created-when-empty', async t => {
     const w = world(t);
-    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    const plan = w.run.target.execution.provision;
+    const directory = path.join(plan.workspace.path, '.ploinky-box', 'hardware-limits');
     assert.equal(exists(directory), false, 'the directory is absent before the run');
-    assert.equal(exists(path.join(w.home, '.ploinky-box')), false);
+    assert.equal(exists(plan.workspace.path), false, 'so is the proposed workspace');
     const report = await provision(w);
     assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
     assert.equal(exists(directory), true, 'the start created it');
@@ -650,35 +673,35 @@ test('L1.cleanup-removes-the-host-record-directory-this-run-created-when-empty',
     const result = await cleanup(w);
     assert.equal(result.verdict, 'PASS', JSON.stringify(w.run.cleanup));
     assert.equal(exists(directory), false, 'the run-created, now empty directory is removed');
-    assert.equal(exists(path.join(w.home, '.ploinky-box')), true, 'the shared parent is never removed');
+    assert.equal(exists(path.join(plan.workspace.path, '.ploinky-box')), false, 'the host-state directory left with the workspace');
 });
 
-test('L1.cleanup-keeps-a-host-record-directory-that-existed-before-the-run', async t => {
+test('L1.provision-refuses-a-proposed-workspace-that-already-holds-host-state', async t => {
     const w = world(t);
-    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    const plan = w.run.target.execution.provision;
+    const directory = path.join(plan.workspace.path, '.ploinky-box', 'hardware-limits');
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const report = await provision(w);
-    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
-    assert.deepEqual(w.run.operations.filter(op => op.kind === 'host-directory-preflight').map(op => [op.directory, op.existed]), [['hardware-limits', true], ['gpu-grants', false], ['router-bindings', false]]);
-    assert.equal(w.run.ownedPaths.some(entry => entry.role === 'host-created-directory'), false);
-    const result = await cleanup(w);
-    assert.equal(result.verdict, 'PASS', JSON.stringify(w.run.cleanup));
-    assert.equal(exists(directory), true, 'a pre-existing directory is kept even though it is empty');
+    assert.notEqual(report.verdict, 'PASS', 'a workspace that is not new is never adopted');
+    assert.equal(exists(directory), true, 'what was already there is left untouched');
     assert.deepEqual(fs.readdirSync(directory), []);
+    assert.equal(w.run.ownedPaths.some(entry => entry.role === 'host-created-directory'), false, 'nothing pre-existing is recorded as ours');
 });
 
 test('L1.cleanup-keeps-a-run-created-host-record-directory-that-holds-something-else', async t => {
     const w = await provisioned(t);
-    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    const directory = path.join(w.run.target.execution.provision.workspace.path, '.ploinky-box', 'hardware-limits');
     fs.writeFileSync(path.join(directory, 'someone-elses.json'), 'keep');
-    const result = await cleanup(w);
+    const kept = sampleWhenHostRecordsComplete(w, () => fs.readFileSync(path.join(directory, 'someone-elses.json'), 'utf8'));
+    const result = await executeCleanupRun({ run: w.run, persist: kept.persist, processProvider: w.engineProvider, hostIdentity: w.hostIdentity, remoteArrival: w.remote });
     assert.equal(result.verdict, 'PASS', JSON.stringify(w.run.cleanup));
-    assert.equal(fs.readFileSync(path.join(directory, 'someone-elses.json'), 'utf8'), 'keep');
+    assert.deepEqual(kept.samples, ['keep'], 'the record step left the directory and its foreign file in place');
+    assert.equal(exists(directory), false, 'the workspace removal took it');
 });
 
 test('L1.cleanup-refuses-unrecorded-host-record', async t => {
     const w = await provisioned(t);
-    const unrecorded = hostRecordPaths(w.home, w.run.workspace.instance).find(target => target.includes('/router-bindings/') && target.endsWith('.json'));
+    const unrecorded = hostRecordPaths(w.run.target.execution.provision.workspace.path, w.run.workspace.instance).find(target => target.includes('/router-bindings/') && target.endsWith('.json'));
     fs.mkdirSync(path.dirname(unrecorded), { recursive: true }); fs.writeFileSync(unrecorded, '{}');
     const recorded = w.run.ownedPaths.filter(entry => entry.role === 'host-record').map(entry => entry.path);
     const report = await cleanup(w);
@@ -687,7 +710,7 @@ test('L1.cleanup-refuses-unrecorded-host-record', async t => {
     for (const target of recorded) assert.equal(exists(target), true, 'nothing is removed when one record is unrecorded');
     assert.equal(exists(w.run.target.execution.workspace.path), true);
     // A manifest that names a non-exact record is refused outright.
-    w.run.ownedPaths.push({ path: path.join(w.home, '.ploinky-box', 'hardware-limits', 'other.json'), role: 'host-record', type: 'file', uid: 1, dev: '1', ino: '1' });
+    w.run.ownedPaths.push({ path: path.join(w.run.target.execution.provision.workspace.path, '.ploinky-box', 'hardware-limits', 'other.json'), role: 'host-record', type: 'file', uid: 1, dev: '1', ino: '1' });
     assert.throws(() => validateProfile(w.run, { partial: true }), /non-exact host record/);
 });
 
@@ -924,7 +947,7 @@ test('G1.prepare-live-apparatus-mps-concrete-manifest-and-summary', async t => {
         '## GPU idle gate', 'compute mode is Default', 'a bare PID, UID or name never excludes', 'the runner never changes the compute mode and never signals a foreign process', f.gpuPins.uuid,
         '## GPU operations', 'P1-apply', 'P2-probe-bypass', 'P3-apply-default-change', 'P3-kill-owned-daemon', 'P3-restart-agent', 'P4-control-rw-widen-sm', 'gpu-final-observation',
         '## Images, tools and digests', IMAGE, BOX_IMAGE, f.gpuPins.smi.digest, f.gpuPins.mpsControl.digest, f.gpuPins.mpsServer.digest, profile.gpu.probe.digest,
-        '## Grant and policy records', `~/.ploinky-box/gpu-grants/${run.workspace.instance}.json`, `~/.ploinky-box/hardware-limits/${run.workspace.instance}/`, 'already exists and stays',
+        '## Grant and policy records', `${profile.provision.workspace.path}/.ploinky-box/gpu-grants/${run.workspace.instance}.json`, `${profile.provision.workspace.path}/.ploinky-box/hardware-limits/${run.workspace.instance}/`, 'created inside this run\'s own workspace',
         'Order: gpu-stop-owned-helpers, revalidate-identity, destroy-box, host-records, workspace-removal, verify-absent, gpu-final-observation', 'No case is unsupported on this target.',
     ]) assert.ok(summary.includes(text), text);
     assert.equal(fs.statSync(runPath).mode & 0o077, 0);

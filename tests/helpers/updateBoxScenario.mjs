@@ -77,7 +77,7 @@ export function createUpdateBoxScenario({
         stdout: quiet(),
         stderr: quiet(),
         updateHostState: store,
-        routerBindingStore: createRouterBindingStore({ homeDirectory: path.join(root, 'home') }),
+        routerBindingStore: createRouterBindingStore(),
         runner: runner || {
             run() {},
             query: () => ({ ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: graph.configured }) }),

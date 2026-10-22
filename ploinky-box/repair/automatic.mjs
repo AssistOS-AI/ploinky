@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 
@@ -100,9 +99,9 @@ export function inspectSelectedMachine({ runner, platform = process.platform, en
 
 export function collectRepairAssessments({
     identity, host, runner, env = process.env, platform = process.platform,
-    homeDirectory = os.homedir(), fsApi = fs, uid = process.getuid?.(),
+    fsApi = fs, uid = process.getuid?.(),
 } = {}) {
-    const checks = inspectBindingPermissions({ identity, homeDirectory, fsApi, uid });
+    const checks = inspectBindingPermissions({ identity, fsApi, uid });
     const hostChecks = host?.checks || [];
     if (platform === 'darwin' && hostChecks.find((check) => check.id === 'host.podman.version')?.status === 'pass'
         && hostChecks.some((check) => check.id === 'host.machine.state' && check.status === 'fail')) {

@@ -11,27 +11,25 @@ import { inspectBindingPermissions, repairBindingPermissions } from '../../ploin
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-binding-repair-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const homeDirectory = path.join(root, 'home');
     const workspaceRoot = path.join(root, 'workspace');
-    fs.mkdirSync(homeDirectory, { mode: 0o700 });
     fs.mkdirSync(workspaceRoot, { mode: 0o700 });
     const identity = buildWorkspaceIdentity(workspaceRoot);
-    const store = createRouterBindingStore({ homeDirectory });
+    const store = createRouterBindingStore();
     const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
-    const options = { identity, homeDirectory, lock };
+    const options = { identity, lock };
     const target = store.pathFor(identity);
     const write = (mode = 0o600) => {
         store.write(identity, { address: '127.0.0.1', hostPort: 8080 }, lock);
         fs.chmodSync(target, mode);
         return fs.readFileSync(target);
     };
-    return { root, options, target, store, write };
+    return { root, options, target, store, write, directory: store.directoryFor(identity) };
 }
 
 test('permission repair tightens only a valid selected binding, preserving its bytes and owner access', (t) => {
-    const { options, target, write, store } = fixture(t);
+    const { options, target, write, directory } = fixture(t);
     const bytes = write(0o644);
-    const sibling = path.join(store.directory, 'unrelated.json');
+    const sibling = path.join(directory, 'unrelated.json');
     fs.writeFileSync(sibling, 'untouched', { mode: 0o644 });
     const [check] = inspectBindingPermissions(options);
     assert.equal(check.code, 'BINDING_SHARED_READ');
@@ -54,10 +52,11 @@ test('owner-read-only binding repair never grants owner write permission', (t) =
 });
 
 test('private and absent binding records need no repair or new state', (t) => {
-    const { options, target, write, store } = fixture(t);
+    const { options, target, write, directory } = fixture(t);
     assert.equal(inspectBindingPermissions(options)[0].status, 'skip');
     assert.equal(repairBindingPermissions(options).status, 'skipped');
-    assert.equal(fs.existsSync(store.directory), false);
+    assert.equal(path.basename(directory), 'router-bindings', 'the directory under test is the real store directory');
+    assert.equal(fs.existsSync(directory), false, 'inspecting or repairing an absent record creates no store directory');
     const bytes = write();
     const before = fs.statSync(target);
     assert.equal(repairBindingPermissions(options).status, 'skipped');
@@ -93,26 +92,26 @@ test('symlink and hardlinked records are never repaired', (t) => {
 });
 
 test('unsafe parent directories and directory aliases block repair without chmod', (t) => {
-    const { options, target, write, store } = fixture(t);
+    const { options, target, write, directory: stateDirectory } = fixture(t);
     write(0o644);
-    for (const directory of [options.homeDirectory, path.dirname(store.directory), store.directory]) {
+    for (const directory of [options.identity.hostStateRoot, stateDirectory]) {
         fs.chmodSync(directory, 0o722);
         assert.equal(inspectBindingPermissions(options)[0].code, 'BINDING_UNSAFE_PATH');
         assert.throws(() => repairBindingPermissions(options), { code: 'BINDING_UNSAFE_PATH' });
         assert.equal(fs.statSync(directory).mode & 0o777, 0o722);
         fs.chmodSync(directory, 0o700);
     }
-    fs.renameSync(store.directory, `${store.directory}.other`);
-    fs.symlinkSync(`${store.directory}.other`, store.directory);
+    fs.renameSync(stateDirectory, `${stateDirectory}.other`);
+    fs.symlinkSync(`${stateDirectory}.other`, stateDirectory);
     assert.equal(inspectBindingPermissions(options)[0].code, 'BINDING_UNSAFE_PATH');
     assert.equal(fs.statSync(target).mode & 0o777, 0o644);
 });
 
 test('binding state exposed through a writable workspace alias is rejected', (t) => {
-    const { options, write, store } = fixture(t);
+    const { options, write, directory } = fixture(t);
     write(0o644);
     const alias = path.join(options.identity.workspaceRoot, 'cache-alias');
-    fs.symlinkSync(store.directory, alias);
+    fs.symlinkSync(directory, alias);
     const changed = { ...options, identity: { ...options.identity, dataPaths: { unsafe: alias } } };
     assert.equal(inspectBindingPermissions(changed)[0].code, 'BINDING_UNSAFE_PATH');
     assert.throws(() => repairBindingPermissions(changed), { code: 'BINDING_UNSAFE_PATH' });

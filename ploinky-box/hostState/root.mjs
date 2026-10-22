@@ -1,28 +1,47 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { HOST_STATE_DIRECTORY_NAME } from '../constants.mjs';
+import {
+    GPU_GRANT_STATE_DIRECTORY,
+    HARDWARE_LIMITS_STATE_DIRECTORY,
+    HOST_STATE_DIRECTORY_NAME,
+    ROUTER_BINDING_STATE_DIRECTORY,
+} from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 
-// Layout of `<workspace>/.ploinky-host`, the host-owned Box state directory.
+// Layout of `<workspace>/.ploinky-box`, the host-owned Box state directory.
 // The skeleton is created non-recursively, tolerates concurrent creators, and
-// is never removed by code: a masked Box keeps `.ploinky-host` and `empty/` as
+// is never removed by code: a masked Box keeps `.ploinky-box` and `empty/` as
 // mount points, so the host must never rename or remove them.
 export const HOST_STATE_ROOT_MODE = 0o700;
 export const HOST_STATE_SKELETON = Object.freeze([
     Object.freeze({ name: 'locks', mode: 0o700 }),
     Object.freeze({ name: 'quarantine', mode: 0o700 }),
-    // The read-only mask source bound over `.ploinky-host` in every Box.
+    // The read-only mask source bound over `.ploinky-box` in every Box.
     Object.freeze({ name: 'empty', mode: 0o555 }),
 ]);
-// Names a hygiene scan must never quarantine by name: the skeleton, the host
-// staging directory (`tmp/`) and the trust latch marker (`latch.json`).
+export const WORKSPACE_LOCK_NAME = 'workspace.lock';
+// Store directories created lazily, non-recursively, under the skeleton by the
+// stores that own them.
+export const HOST_STATE_STORE_DIRECTORIES = Object.freeze({
+    routerBindings: ROUTER_BINDING_STATE_DIRECTORY,
+    gpuGrants: GPU_GRANT_STATE_DIRECTORY,
+    hardwareLimits: HARDWARE_LIMITS_STATE_DIRECTORY,
+});
+// One directory per update record kind (`update-journals/<name>.json`, ...).
+export const HOST_STATE_UPDATE_KINDS = Object.freeze([
+    'update-journals', 'update-pending', 'update-handoffs', 'update-recovery', 'update-exclusions',
+]);
+// Names a hygiene scan must never quarantine by name: the skeleton, the live
+// store directories, the host staging directory (`tmp/`) and the trust latch
+// marker (`latch.json`).
 export const HOST_STATE_KNOWN_NAMES = Object.freeze([
     ...HOST_STATE_SKELETON.map((entry) => entry.name),
+    ...Object.values(HOST_STATE_STORE_DIRECTORIES),
+    ...HOST_STATE_UPDATE_KINDS,
     'tmp',
     'latch.json',
 ]);
-export const WORKSPACE_LOCK_NAME = 'workspace.lock';
 
 export function hostStateError(message, code = 'PLOINKY_BOX_HOST_STATE_INVALID', cause) {
     return new PloinkyBoxError(message, { code, cause });
@@ -48,7 +67,23 @@ export function hostStatePaths(workspaceRoot) {
         tmp: path.join(root, 'tmp'),
         latch: path.join(root, 'latch.json'),
         workspaceLock: path.join(locks, WORKSPACE_LOCK_NAME),
+        routerBindings: path.join(root, HOST_STATE_STORE_DIRECTORIES.routerBindings),
+        gpuGrants: path.join(root, HOST_STATE_STORE_DIRECTORIES.gpuGrants),
+        hardwareLimits: path.join(root, HOST_STATE_STORE_DIRECTORIES.hardwareLimits),
     });
+}
+
+/**
+ * The host-state root that belongs to one exact workspace identity. Stores are
+ * built from the identity, never from a home directory or a caller-supplied
+ * root, so a hand-built or tampered identity cannot redirect them.
+ */
+export function identityHostStateRoot(identity, makeError = hostStateError) {
+    const workspaceRoot = String(identity?.workspaceRoot || '');
+    if (!path.isAbsolute(workspaceRoot) || identity?.hostStateRoot !== hostStateRootPath(workspaceRoot)) {
+        throw makeError('Host state requires the exact workspace identity');
+    }
+    return identity.hostStateRoot;
 }
 
 function currentUid() {
@@ -56,7 +91,7 @@ function currentUid() {
 }
 
 // The workspace root itself may be reached through an alias symlink: every
-// spelling of one directory must find the same `.ploinky-host`.
+// spelling of one directory must find the same `.ploinky-box`.
 function assertWorkspaceRootDirectory(workspaceRoot, fsApi) {
     let stat;
     try {
@@ -111,7 +146,7 @@ function makeComponent(directory, mode, fsApi) {
 /**
  * Creates any missing skeleton directory and validates every one. The parent
  * workspace root must already exist. `requireNew` refuses a pre-existing
- * `.ploinky-host` (a recreated workspace must start from a fresh skeleton).
+ * `.ploinky-box` (a recreated workspace must start from a fresh skeleton).
  * An ENOENT raised while creating a child means a concurrent removal; it is
  * passed through so that callers can retry.
  */
@@ -144,7 +179,7 @@ export function ensureHostStateSkeleton(workspaceRoot, {
 
 /**
  * Read-only validation of an existing skeleton. Returns `{ present: false }`
- * when `.ploinky-host` is absent and throws when anything present is invalid.
+ * when `.ploinky-box` is absent and throws when anything present is invalid.
  */
 export function inspectHostStateSkeleton(workspaceRoot, { fsApi = fs, uid = currentUid() } = {}) {
     const paths = hostStatePaths(workspaceRoot);

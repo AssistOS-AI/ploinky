@@ -307,6 +307,7 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         instance: 'ploinky-box-workspace-123456789abc',
         pathHash: '123456789abc',
         workspaceRoot: '/private/workspace',
+        hostStateRoot: '/private/workspace/.ploinky-box',
         anchorPath: '/private/workspace/.ploinky',
         boxDataRoot: '/private/workspace/.ploinky/box',
         dataPaths: Object.freeze({

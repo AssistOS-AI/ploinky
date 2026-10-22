@@ -57,7 +57,7 @@ function scratch(t) {
 // One fake apparatus: a candidate source holding the real CUDA probe file, pinned
 // NVIDIA tools, a staged remote root and the concrete apparatus-mps manifest
 // built by the real builder.
-function gpuWorld(t, { faults = {}, suffix = 'claude', existingGrantDirectory = true, gpuOverrides = {} } = {}) {
+function gpuWorld(t, { faults = {}, suffix = 'claude', gpuOverrides = {} } = {}) {
     const root = scratch(t);
     const directory = name => { const target = path.join(root, name); fs.mkdirSync(target, { recursive: true, mode: 0o700 }); return target; };
     const home = directory('home');
@@ -75,7 +75,6 @@ function gpuWorld(t, { faults = {}, suffix = 'claude', existingGrantDirectory = 
     const knownHosts = path.join(root, 'known_hosts'); fs.writeFileSync(knownHosts, '192.168.1.63 ssh-ed25519 AAAAfixture\n');
     const evidence = directory('evidence');
     const node = fs.realpathSync(process.execPath);
-    if (existingGrantDirectory) fs.mkdirSync(path.join(home, '.ploinky-box', 'gpu-grants'), { recursive: true, mode: 0o700 });
     const hostIdentity = { hostname: 'apparatus', platform: 'linux', home };
     const gpu = { uuid: GPU_UUID, name: 'NVIDIA GeForce RTX 3060 Laptop GPU', driverVersion: '595.91.07', memoryMiB: 6144, smCount: 30, smi: tools['nvidia-smi'], mpsControl: tools['nvidia-cuda-mps-control'], mpsServer: tools['nvidia-cuda-mps-server'], ...gpuOverrides };
     const pins = {
@@ -127,6 +126,7 @@ async function provisioned(t, options) {
     assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
     return w;
 }
+const workspaceOf = w => w.run.target.execution.provision.workspace.path;
 const caseOf = (report, id) => report.cases.find(entry => entry.id === id);
 // Run the selected cases on a provisioned world and return the report.
 async function liveCases(w, ids, options = {}) {
@@ -529,12 +529,13 @@ test('G1.provision-gpu-grants-before-the-first-start-and-records-the-host-record
     assert.equal(w.artifacts.get('gpu-initial-gate').baseline.uuid, GPU_UUID);
     const ops = w.run.operations.map(op => op.kind);
     assert.ok(ops.indexOf('gpu-initial-gate') < ops.indexOf('workspace-create') && ops.indexOf('gpu-grant') < ops.indexOf('fixture-start'), ops.join(','));
-    // Every host record the grant and the start created is recorded exactly; gpu-grants existed before and is not.
+    // Every host record the grant and the start created is recorded exactly. The run's workspace is new, so the
+    // `.ploinky-box` directories the grant created in it were absent before the run and are recorded as run-created.
     const recorded = w.run.ownedPaths.filter(entry => entry.role === 'host-record').map(entry => entry.path).sort();
-    assert.deepEqual(recorded, hostRecordPaths(w.home, profile.box.instance).filter(target => exists(target)).sort());
+    assert.deepEqual(recorded, hostRecordPaths(workspaceOf(w), profile.box.instance).filter(target => exists(target)).sort());
     assert.ok(recorded.some(target => target.includes('/gpu-grants/')));
-    assert.equal(w.run.ownedPaths.some(entry => entry.role === 'host-created-directory' && entry.path.endsWith('gpu-grants')), false);
-    assert.equal(exists(path.join(w.home, '.ploinky-box', 'gpu-grants')), true);
+    assert.ok(w.run.ownedPaths.some(entry => entry.role === 'host-created-directory' && entry.path === path.join(workspaceOf(w), '.ploinky-box', 'gpu-grants')));
+    assert.equal(exists(path.join(workspaceOf(w), '.ploinky-box', 'gpu-grants')), true);
 });
 
 test('G1.provision-gpu-gate-busy-blocks-before-anything-is-created', async t => {
@@ -548,7 +549,7 @@ test('G1.provision-gpu-gate-busy-blocks-before-anything-is-created', async t => 
         const state = worldState(w.statePath);
         assert.deepEqual([state.startCalls, state.destroyCalls, Object.keys(state.boxes).length], [0, 0, 0], `${label}: the engine saw no mutation`);
         assert.equal(w.fake.model.grantCalls.length, 0, label);
-        assert.equal(exists(path.join(w.home, '.ploinky-box', 'gpu-grants')), true);
+        assert.equal(exists(path.join(workspaceOf(w), '.ploinky-box')), false, `${label}: no host state is created`);
     }
 });
 
@@ -559,8 +560,8 @@ test('G1.provision-gpu-grant-failure-or-missing-wiring-is-blocked-and-cleans-up'
         assert.equal(report.verdict, 'BLOCKED', `${label}: ${JSON.stringify(report.limitations)}`);
         assert.equal(w.run.cleanup.state, 'complete', `${label}: ${JSON.stringify(w.run.cleanup.failures)}`);
         assert.equal(exists(path.join(w.remoteRoot, 'workspace')), false, label);
-        assert.deepEqual(hostRecordPaths(w.home, w.run.workspace.instance).filter(target => exists(target)), [], `${label}: no host record remains`);
-        assert.equal(exists(path.join(w.home, '.ploinky-box', 'gpu-grants')), true, `${label}: the existing parent stays`);
+        assert.deepEqual(hostRecordPaths(workspaceOf(w), w.run.workspace.instance).filter(target => exists(target)), [], `${label}: no host record remains`);
+        assert.equal(exists(path.join(workspaceOf(w), '.ploinky-box')), false, `${label}: the host state went with the workspace`);
         assert.equal(Object.keys(worldState(w.statePath).boxes).length, 0, label);
     }
 });
@@ -577,29 +578,31 @@ test('G1.provision-gpu-refuses-a-changed-nvidia-tool-or-probe-digest', async t =
     assert.notEqual(refused.verdict, 'PASS'); assert.equal(exists(path.join(second.remoteRoot, 'workspace', '.ploinky', 'repos', 'hwlfixture', 'probe', 'mpsprobe.py')), false);
 });
 
-test('G1.cleanup-removes-the-recorded-grant-and-policy-records-and-keeps-the-gpu-grants-directory', async t => {
-    for (const existing of [true, false]) {
-        const w = await provisioned(t, { existingGrantDirectory: existing });
+test('G1.cleanup-removes-the-recorded-grant-and-policy-records-the-run-created-directories-and-the-workspace', async t => {
+    for (const withNeighbour of [false, true]) {
+        const w = await provisioned(t);
         const instance = w.run.workspace.instance;
-        const grantRecord = path.join(w.home, '.ploinky-box', 'gpu-grants', `${instance}.json`);
-        const policyDirectory = path.join(w.home, '.ploinky-box', 'hardware-limits', instance);
+        const stateDirectory = path.join(workspaceOf(w), '.ploinky-box');
+        const grantRecord = path.join(stateDirectory, 'gpu-grants', `${instance}.json`);
+        const policyDirectory = path.join(stateDirectory, 'hardware-limits', instance);
         assert.equal(exists(grantRecord), true); assert.equal(exists(policyDirectory), true);
-        // A neighbour's record in the same shared directory is never touched.
-        const neighbour = path.join(w.home, '.ploinky-box', 'gpu-grants', 'ploinky-box-other-0123456789ab.json');
-        fs.mkdirSync(path.dirname(neighbour), { recursive: true }); fs.writeFileSync(neighbour, '{"mine":false}');
+        // A record of another instance in the same directory is not one of the exact recorded names: only the
+        // workspace removal that follows takes it, never the record step.
+        const neighbour = path.join(stateDirectory, 'gpu-grants', 'ploinky-box-other-0123456789ab.json');
+        if (withNeighbour) fs.writeFileSync(neighbour, '{"mine":false}');
         const report = await w.cleanup();
         assert.equal(report.verdict, 'PASS', JSON.stringify(w.run.cleanup));
-        assert.deepEqual(hostRecordPaths(w.home, instance).filter(target => exists(target)), [], 'exactly the recorded grant and policy records are gone');
-        assert.equal(fs.readFileSync(neighbour, 'utf8'), '{"mine":false}');
-        assert.equal(exists(path.join(w.home, '.ploinky-box', 'gpu-grants')), true, `the gpu-grants directory stays (existed before: ${existing})`);
+        assert.deepEqual(hostRecordPaths(workspaceOf(w), instance).filter(target => exists(target)), [], 'exactly the recorded grant and policy records are gone');
+        assert.equal(exists(neighbour), false, 'the foreign file left with the workspace');
+        assert.equal(exists(workspaceOf(w)), false);
         assert.equal(exists(path.join(w.remoteRoot, 'workspace')), false);
     }
-    // When this run created the shared parent and nothing else lives in it, it goes.
-    const alone = await provisioned(t, { existingGrantDirectory: false });
+    // The run created `gpu-grants` inside its own new workspace, so it is recorded for removal once empty.
+    const alone = await provisioned(t);
     const created = alone.run.ownedPaths.filter(entry => entry.role === 'host-created-directory').map(entry => path.basename(entry.path));
     assert.ok(created.includes('gpu-grants'));
     assert.equal((await alone.cleanup()).verdict, 'PASS');
-    assert.equal(exists(path.join(alone.home, '.ploinky-box', 'gpu-grants')), false);
+    assert.equal(exists(path.join(workspaceOf(alone), '.ploinky-box', 'gpu-grants')), false);
 });
 
 // --- LIVE-P1 -----------------------------------------------------------------------------------------
@@ -607,7 +610,7 @@ const nothingOwned = w => {
     assert.equal(w.run.cleanup.state, 'complete', JSON.stringify(w.run.cleanup));
     assert.equal(exists(path.join(w.remoteRoot, 'workspace')), false);
     assert.deepEqual(Object.keys(worldState(w.statePath).boxes), []);
-    assert.deepEqual(hostRecordPaths(w.home, w.run.workspace.instance).filter(target => exists(target)), []);
+    assert.deepEqual(hostRecordPaths(workspaceOf(w), w.run.workspace.instance).filter(target => exists(target)), []);
 };
 const probeCalls = w => w.fake.model.calls.filter(call => call.args.includes('/code/mpsprobe.py'));
 

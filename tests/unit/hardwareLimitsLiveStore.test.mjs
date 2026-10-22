@@ -84,7 +84,7 @@ test('X5.c5-manifest-and-summary-name-the-spec-row-the-writers-the-program-every
     const summary = renderSummary(w.run, w.runPath);
     const sha = crypto.createHash('sha256').update(STORE_PROGRAM).digest('hex');
     for (const text of ['| LIVE-C5 | spec 15.4 LIVE-C5 (:1326', '## Store fixture', '## Foreign-workspace guard', 'limits clear --agent hwlfixture/s', "the Router's administrator route", sha, 'STORE_PROGRAM in tests/hardware-limits/liveStoreCommands.mjs',
-        BOX_STORE_ROOT, BOX_PRODUCT_ROOT, hostStoreRoot(w.run.target.execution.host.home, w.run.workspace.instance), `${STORE_BOUNDS.holdMs} ms`, `${STORE_BOUNDS.staleHoldMs} ms`,
+        BOX_STORE_ROOT, BOX_PRODUCT_ROOT, hostStoreRoot(w.run.target.execution.provision.workspace.path, w.run.workspace.instance), `${STORE_BOUNDS.holdMs} ms`, `${STORE_BOUNDS.staleHoldMs} ms`,
         `${STORE_BOUNDS.raceRounds} race rounds`, 'STOPPED by `ploinky stop`', 'exact-ID destroy', 'destroy --delete-cache', 'keep-id mapping', 'never deleted by the runner', 'C5-hold-host', 'C5-hold-box', 'C5-abandon-host-lock',
         'C5-barrier-begin', 'C5-gate-off-check', 'C5-stop', '<STORE_PROGRAM>', 'One conflicting mutation wins and the other conflicts', 'No lost clear', 'No live lock theft', 'a gate-off start is refused stored_limits_present']) {
         assert.ok(summary.includes(text), text);
@@ -116,7 +116,7 @@ function realStore(t) {
     const home = path.join(root, 'home'); fs.mkdirSync(home, { mode: 0o700 });
     const workspace = path.join(root, 'ws'); fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     const identity = buildWorkspaceIdentity(fs.realpathSync(workspace));
-    const paths = hardwareStorePaths({ identity, homeDirectory: home });
+    const paths = hardwareStorePaths({ identity });
     initializeStore({ paths, identity });
     const profile = { host: { home }, source: { root: REPOSITORY } };
     const run = (mode, extra = {}, domain = 'host') => new Promise(resolve => {
@@ -131,10 +131,11 @@ function realStore(t) {
 
 test('X5.c5-params-and-argv-use-the-products-own-roots-and-the-box-exec-runs-as-the-box-user', () => {
     assert.equal(BOX_STORE_ROOT, PRODUCT_BOX_STORE_ROOT); assert.equal(BOX_STORE_ROOT, '/run/ploinky/hardware-limits'); assert.equal(BOX_PRODUCT_ROOT, '/opt/ploinky');
-    const identity = { instance: 'ploinky-box-ws-abcdef012345', pathHash: 'abcdef012345', workspaceRoot: '/work/ws' };
+    const identity = { instance: 'ploinky-box-ws-abcdef012345', pathHash: 'abcdef012345', workspaceRoot: '/work/ws', hostStateRoot: '/work/ws/.ploinky-box' };
     const profile = { host: { home: '/home/x' }, source: { root: '/staged/source' } };
     const host = storeProgramParams({ profile, identity, domain: 'host', mode: 'inspect' });
-    assert.equal(host.storeRoot, hardwareStorePaths({ identity, homeDirectory: '/home/x' }).storeRoot); assert.equal(host.root, '/staged/source'); assert.equal(host.home, '/home/x');
+    assert.equal(host.storeRoot, '/work/ws/.ploinky-box/hardware-limits/ploinky-box-ws-abcdef012345/store');
+    assert.equal(host.storeRoot, hardwareStorePaths({ identity }).storeRoot); assert.equal(host.root, '/staged/source'); assert.equal(host.home, undefined);
     const box = storeProgramParams({ profile, identity, domain: 'box', mode: 'hold', holdMs: 7 });
     assert.equal(box.storeRoot, BOX_STORE_ROOT); assert.equal(box.root, BOX_PRODUCT_ROOT); assert.equal(box.home, undefined); assert.equal(box.holdMs, 7);
     assert.deepEqual(boxProgramWords('b'.repeat(64), box).slice(0, 7), ['container', 'exec', '--user', 'podman', 'b'.repeat(64), 'node', '--input-type=module']);
@@ -362,8 +363,7 @@ test('X5.c5-is-blocked-when-the-box-is-not-running-and-fails-when-a-lock-or-a-ba
     const locked = await liveWorld(t);
     locked.fake.ensureStore();
     const { hostPaths } = locked.fake.context();
-    fs.mkdirSync(path.join(hostPaths.storeRoot, 'write.lock'), { mode: 0o700 });
-    fs.writeFileSync(path.join(hostPaths.storeRoot, 'write.lock', 'owner.json'), `${JSON.stringify({ token: 'e'.repeat(32), pid: 1, hostname: 'x', domain: 'host', operation: 'x', acquiredAt: new Date().toISOString() })}\n`, { mode: 0o600 });
+    fs.writeFileSync(path.join(hostPaths.storeRoot, 'write.lock'), `${JSON.stringify({ token: 'e'.repeat(32), pid: 1, hostname: 'x', domain: 'host', operation: 'x', acquiredAt: new Date().toISOString() })}\n`, { mode: 0o600 });
     const withLock = await liveRun(locked);
     assert.equal(withLock.case.result, 'fail'); assert.match(withLock.case.reason, /baseline: a store lock is present/);
     const barred = await liveWorld(t);

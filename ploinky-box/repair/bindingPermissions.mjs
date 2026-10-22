@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -40,9 +39,9 @@ function assertRecordFile(stat, uid) {
     }
 }
 
-function inspectDirectories({ homeDirectory, directory, fsApi, uid }) {
+function inspectDirectories({ stateRoot, directory, fsApi, uid }) {
     const snapshots = [];
-    for (const target of [path.resolve(homeDirectory), path.dirname(directory), directory]) {
+    for (const target of [stateRoot, directory]) {
         let stat;
         try { stat = fsApi.lstatSync(target); } catch (error) {
             if (error?.code === 'ENOENT') return { snapshots, missing: true };
@@ -94,19 +93,21 @@ function validateBytes({ identity, store, descriptor, stat, fsApi }) {
 // This snapshot is intentionally stricter than permission repair: files that
 // other users could modify must never become trusted merely by removing bits.
 function inspect(options) {
-    const { identity, homeDirectory, fsApi, uid } = options;
+    const { identity, fsApi, uid } = options;
     if (!Number.isSafeInteger(uid) || uid < 0) {
         throw failure('BINDING_UNREADABLE', 'Cannot establish the current user identity for a safe permission repair.');
     }
-    const store = createRouterBindingStore({ homeDirectory, fsApi });
+    const store = createRouterBindingStore({ fsApi });
     let target;
+    let directory;
     try {
         target = store.pathFor(identity);
-        assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
+        directory = store.directoryFor(identity);
+        assertRouterBindingStateConfined(identity, { fsApi });
     } catch {
         throw failure('BINDING_UNSAFE_PATH', 'Binding state identity is invalid or overlaps a writable workspace/cache path.');
     }
-    const directories = inspectDirectories({ homeDirectory, directory: store.directory, fsApi, uid });
+    const directories = inspectDirectories({ stateRoot: identity.hostStateRoot, directory, fsApi, uid });
     if (directories.missing) return { target, missing: true };
     let before;
     try { before = fsApi.lstatSync(target); } catch (error) {
@@ -129,8 +130,8 @@ function inspect(options) {
     } finally { fsApi.closeSync(descriptor); }
 }
 
-function optionsWithDefaults({ identity, homeDirectory = os.homedir(), fsApi = fs, uid = process.getuid?.() } = {}) {
-    return { identity, homeDirectory, fsApi, uid };
+function optionsWithDefaults({ identity, fsApi = fs, uid = process.getuid?.() } = {}) {
+    return { identity, fsApi, uid };
 }
 
 /** Inspect only this workspace's host-only binding record without mutation. */
@@ -159,7 +160,7 @@ export function inspectBindingPermissions(options = {}) {
 export function repairBindingPermissions(options = {}) {
     const { lock } = options;
     const resolved = optionsWithDefaults(options);
-    const { identity, homeDirectory, fsApi, uid } = resolved;
+    const { identity, fsApi, uid } = resolved;
     if (typeof lock?.assertHeld !== 'function') {
         throw failure('BINDING_LOCK_REQUIRED', 'Binding permission repair requires the workspace mutation lock.');
     }
@@ -177,7 +178,7 @@ export function repairBindingPermissions(options = {}) {
         const bytes = validateBytes({ identity, store: snapshot.store, descriptor, stat: before, fsApi });
         if (!bytes.equals(snapshot.bytes)) throw failure('BINDING_UNSAFE_PATH', 'The binding contents changed before permission repair.');
         lock.assertHeld(identity.instance);
-        assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
+        assertRouterBindingStateConfined(identity, { fsApi });
         assertDirectoriesUnchanged(snapshot.directories, fsApi);
         if (!unchangedFile(before, fsApi.lstatSync(snapshot.target))) {
             throw failure('BINDING_UNSAFE_PATH', 'The binding path changed before permission repair.');
@@ -190,7 +191,7 @@ export function repairBindingPermissions(options = {}) {
         const current = fsApi.lstatSync(snapshot.target);
         assertRecordFile(after, uid);
         assertDirectoriesUnchanged(snapshot.directories, fsApi);
-        assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
+        assertRouterBindingStateConfined(identity, { fsApi });
         if (!sameFile(before, after) || !sameFile(after, current) || current.isSymbolicLink()
             || !unchangedFile(after, verified) || !unchangedFile(verified, current)
             || after.mode !== current.mode || (after.mode & 0o7777) !== mode

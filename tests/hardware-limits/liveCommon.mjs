@@ -17,7 +17,8 @@ export const HASH = /^sha256:[a-f0-9]{64}$/;
 export const RUN_ID = /^[a-f0-9]{32}$/;
 export const OWNER_MARKER = '.ploinky-hwl-owner';
 // The only host record directories cleanup may touch, each holding at most an
-// INSTANCE.json record and an INSTANCE generation/store directory.
+// INSTANCE.json record and an INSTANCE generation/store directory. They live in
+// the workspace's own `.ploinky-box` directory.
 export const HOST_RECORD_DIRECTORIES = Object.freeze(['hardware-limits', 'gpu-grants', 'router-bindings']);
 export const IMAGE_REF = /^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?\/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$/;
 
@@ -55,11 +56,14 @@ export function quarantinePath(workspacePath, runId) {
     return path.join(path.dirname(workspacePath), `.hwl-removing-${runId}`);
 }
 
+// The workspace's host-state directory, which holds every host record of its Box.
+export const hostStateDirectory = workspaceRoot => path.join(workspaceRoot, '.ploinky-box');
+
 // The exact task-owned host record paths for one workspace instance. Cleanup
 // never globs or matches substrings; it considers only these six names.
-export function hostRecordPaths(home, instance) {
-    if (!absolute(home) || !/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(String(instance))) throw new Error('Invalid host record identity');
-    const root = path.join(home, '.ploinky-box');
+export function hostRecordPaths(workspaceRoot, instance) {
+    if (!absolute(workspaceRoot) || !/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(String(instance))) throw new Error('Invalid host record identity');
+    const root = hostStateDirectory(workspaceRoot);
     return HOST_RECORD_DIRECTORIES.flatMap(directory => [path.join(root, directory, `${instance}.json`), path.join(root, directory, instance)]);
 }
 

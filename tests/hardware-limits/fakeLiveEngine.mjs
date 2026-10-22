@@ -226,8 +226,8 @@ export function createFakeWorld({ statePath, node, engine, host, unrelated = [],
                     }
                 }
                 // Production saves the gate and initializes the hardware store
-                // under the host home, outside the workspace.
-                const records = path.join(options.env.HOME, '.ploinky-box', 'hardware-limits');
+                // in the workspace's host-owned `.ploinky-box` directory.
+                const records = path.join(identity.hostStateRoot, 'hardware-limits');
                 fs.mkdirSync(path.join(records, identity.instance, 'store'), { recursive: true, mode: 0o700 });
                 fs.writeFileSync(path.join(records, identity.instance, 'store', 'identity.json'), '{}');
                 const record = path.join(records, `${identity.instance}.json`);

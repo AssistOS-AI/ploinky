@@ -161,7 +161,7 @@ export function readDriverReceipt(target, intent, profile) {
 
 // The product's transition directory of this instance, proved a real private directory of this user before anything in it is read.
 export function productDirectory(profile) {
-    const directory = path.join(profile.host.home, '.ploinky-box', 'hardware-limits', profile.box.instance, 'transitions');
+    const directory = path.join(profile.workspace.path, '.ploinky-box', 'hardware-limits', profile.box.instance, 'transitions');
     assertRealDirectories(path.join(directory, 'probe'));
     let stat;
     try { stat = fs.lstatSync(directory); } catch (error) { if (error.code === 'ENOENT') return directory; throw error; }

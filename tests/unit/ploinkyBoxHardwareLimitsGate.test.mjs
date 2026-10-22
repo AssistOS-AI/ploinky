@@ -39,7 +39,7 @@ function fixture(t) {
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     fs.mkdirSync(home);
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
-    return { root, workspace, home, identity, gateStore: createHardwareGateStore({ homeDirectory: home }) };
+    return { root, workspace, home, identity, gateStore: createHardwareGateStore() };
 }
 
 function fakeLockManager(root, events) {
@@ -116,7 +116,7 @@ function startSupervisor(state, { env = {}, events = [] } = {}) {
 }
 
 function storePaths(state) {
-    return hardwareStorePaths({ identity: state.identity, homeDirectory: state.home });
+    return hardwareStorePaths({ identity: state.identity });
 }
 
 function storeWithEntry(state) {
@@ -400,7 +400,7 @@ test('G.generic-nonempty-inspect', async (t) => {
 
 test('G.generic-unknown-refuses', async (t) => {
     const state = fixture(t);
-    fs.mkdirSync(state.gateStore.root, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(state.gateStore.rootFor(state.identity), { recursive: true, mode: 0o700 });
     fs.writeFileSync(state.gateStore.recordPath(state.identity), '{corrupt', { mode: 0o600 });
     const { supervisor, events } = genericSupervisor(state, { absent: true });
     await assert.rejects(supervisor.prepareBoxForCommand(), (error) => error.code === 'PLOINKY_BOX_HARDWARE_INSPECT_ONLY'
@@ -437,7 +437,7 @@ test('G.off-byte-identical', async (t) => {
     assert.deepEqual(createArgsFor(state, { hardware: null }), baseline, 'gate off adds nothing');
     assert.equal(baseline.some((arg) => String(arg).startsWith(`${BOX_LABELS.hardwareLimits}=`)
         || String(arg).includes(BOX_HARDWARE_MARKER_PATH) || String(arg).includes(BOX_HARDWARE_STORE_PATH)), false);
-    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, initializeStore });
     const enabled = createArgsFor(state, { hardware: wiring });
     assert.equal(enabled.length - baseline.length, 6, 'exactly one label and two binds');
     assert.ok(enabled.includes(`${wiring.markerPath}:${BOX_HARDWARE_MARKER_PATH}:ro`));
@@ -456,8 +456,8 @@ function handleWith(state, wiring, { markerRw = false, storeRw = true, label = t
 
 test('G.bind-contract', (t) => {
     const state = fixture(t);
-    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
-    const observed = observeContainerHardwareWiring(handleWith(state, wiring), { identity: state.identity, homeDirectory: state.home });
+    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, initializeStore });
+    const observed = observeContainerHardwareWiring(handleWith(state, wiring), { identity: state.identity });
     assert.equal(observed.fingerprint, wiring.fingerprint);
     assert.equal(observeContainerHardwareWiring({ labels: {}, runtime: { mounts: [] } }), null, 'gate off has no wiring');
     for (const [description, handle] of [
@@ -466,7 +466,7 @@ test('G.bind-contract', (t) => {
         ['label without binds', handleWith(state, wiring, { mounts: false })],
         ['binds without label', handleWith(state, wiring, { label: false })],
     ]) {
-        assert.throws(() => observeContainerHardwareWiring(handle, { identity: state.identity, homeDirectory: state.home }),
+        assert.throws(() => observeContainerHardwareWiring(handle, { identity: state.identity }),
             { code: 'PLOINKY_BOX_PUBLICATION_INCOMPATIBLE' }, description);
     }
     // The complete Box contract accepts exactly the wiring and rejects it,
@@ -572,21 +572,21 @@ function boxDesired(box, hardware) {
 
 test('G.store-directory-replaced', (t) => {
     const state = fixture(t);
-    const first = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
-    const again = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    const first = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, initializeStore });
+    const again = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, initializeStore });
     assert.equal(sameHardwareWiring(first, again), true, 'an unchanged store keeps the wiring and the Box');
     // Atomic replacement of limits.json inside the same directory is normal.
     const paths = storePaths(state);
     const document = fs.readFileSync(paths.policyPath, 'utf8');
     fs.writeFileSync(`${paths.policyPath}.tmp`, document, { mode: 0o600 });
     fs.renameSync(`${paths.policyPath}.tmp`, paths.policyPath);
-    assert.equal(resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore }).fingerprint, first.fingerprint);
+    assert.equal(resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, initializeStore }).fingerprint, first.fingerprint);
     // Replacing the directory itself is a Box replacement reason.
     const moved = `${paths.storeRoot}.old`;
     fs.renameSync(paths.storeRoot, moved);
     fs.cpSync(moved, paths.storeRoot, { recursive: true });
     fs.chmodSync(paths.storeRoot, 0o700);
-    const replaced = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    const replaced = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, initializeStore });
     assert.equal(sameHardwareWiring(first, replaced), false);
 });
 
@@ -757,7 +757,7 @@ test('G.every-final-generation', async (t) => {
     // The restored branch: the failed replacement itself restored the old
     // gate-on Box (boxRollback action 'restored'); that generation is
     // prepared before its graph is restored, through start, restart and update.
-    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, initializeStore });
     for (const [operation, invoke] of [
         ['start', (supervisor) => supervisor.runStartTransaction(['start', 'explorer'])],
         ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
@@ -849,7 +849,7 @@ function realSupervisor(state, { env = {}, events = [], ownership = owned(state.
         validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
         validateContainer: () => {},
         hardwareGateStore: state.gateStore,
-        gpuGrantStore: createGpuGrantStore({ homeDirectory: state.home }),
+        gpuGrantStore: createGpuGrantStore(),
         prepareHardwareGeneration: async () => { events.push('prepare'); return { structurallyPrepared: true }; },
         stderr: { write: (text) => events.push(`stderr:${text.trim()}`) },
     });
@@ -894,11 +894,10 @@ async function pendingDowngrade(state) {
         oldWasRunning: true,
         oldGraphRunning: true,
         hostRecords: [{ name: 'gate', old: true, next: false }],
-        homeDirectory: state.home,
         effects: { engineIdentity: 'engine', hostKind: 'native-linux', inspectBox: () => null, stopGraph() {}, stopBox() {} },
         faults: { 'outer-stop.after': 'process-death' },
     }), SimulatedProcessDeath);
-    const pending = createTransitionStore({ identity: state.identity, homeDirectory: state.home }).listPending();
+    const pending = createTransitionStore({ identity: state.identity }).listPending();
     assert.equal(pending.length, 1);
     return pending[0];
 }
@@ -919,7 +918,7 @@ test('G.pending-downgrade-blocks-bind-grant-revoke', async (t) => {
             return true;
         });
         assert.deepEqual(events.filter((event) => event === 'reconcile' || event.startsWith('run:')), [], `${label}: no Box created or changed`);
-        assert.equal(createTransitionStore({ identity: state.identity, homeDirectory: state.home }).listPending().length, 1, 'the journal is kept for recovery');
+        assert.equal(createTransitionStore({ identity: state.identity }).listPending().length, 1, 'the journal is kept for recovery');
     }
 });
 
@@ -928,8 +927,7 @@ test('G.u9-stale-store-lock', async (t) => {
     // holder is dead while the Box is absent; a running Box keeps it.
     const deadLock = (state) => {
         const directory = path.join(storePaths(state).storeRoot, 'write.lock');
-        fs.mkdirSync(directory, { mode: 0o700 });
-        fs.writeFileSync(path.join(directory, 'owner.json'), `${JSON.stringify({
+        fs.writeFileSync(directory, `${JSON.stringify({
             token: 'd'.repeat(32), pid: spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid, hostname: os.hostname(),
             domain: 'host', operation: 'crashed-writer', acquiredAt: new Date().toISOString(),
         })}\n`, { mode: 0o600 });
@@ -966,7 +964,7 @@ function downgradeWorld(t, { boxRunning, graphRunning }) {
     process.env.HOME = state.home;
     t.after(() => { process.env.HOME = previousHome; });
     state.gateStore.write(state.identity, true, lockFor(state.identity));
-    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, initializeStore });
     const box = completeBoxFixture(state);
     // The prior start's saved launch scope, as start records it.
     writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
@@ -1079,7 +1077,7 @@ test('G.downgrade-running-graph-restored', async (t) => {
     assert.ok(world.events.indexOf('graph-stop') >= 0 && world.events.indexOf('graph-stop') < create, world.events.join('\n'));
     assert.ok(restore > create, 'the prior graph is restored on the gate-off Box');
     assert.equal(world.state.gateStore.read(world.state.identity).enabled, false);
-    const [journal] = createTransitionStore({ identity: world.state.identity, homeDirectory: world.state.home }).listPending();
+    const [journal] = createTransitionStore({ identity: world.state.identity }).listPending();
     assert.equal(journal, undefined, 'the downgrade committed');
 });
 
@@ -1110,7 +1108,7 @@ function preservedRecoveryWorld(t, { removalFailures = 1 } = {}) {
     process.env.HOME = state.home;
     t.after(() => { process.env.HOME = previousHome; });
     state.gateStore.write(state.identity, true, lockFor(state.identity));
-    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, homeDirectory: state.home, initializeStore });
+    const wiring = resolveDesiredHardwareWiring({ identity: state.identity, enabled: true, initializeStore });
     storeWithEntry(state);
     writeGraphSkillScope(state.identity, buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot), lockFor(state.identity));
     const box = completeBoxFixture(state);
@@ -1258,7 +1256,7 @@ test('G.recovery-blocked-advice', async (t) => {
         const state = fixture(t);
         state.gateStore.write(state.identity, true, lockFor(state.identity));
         const pending = await pendingDowngrade(state);
-        createTransitionStore({ identity: state.identity, homeDirectory: state.home }).writeJournal({
+        createTransitionStore({ identity: state.identity }).writeJournal({
             ...pending, phase: 'recovery-blocked', lastProblem: { code: 'TARGET_MISSING', message: 'the decided gate-off Box is not present', action: 'roll-forward' },
         });
         const events = [];
@@ -1276,7 +1274,7 @@ test('G.recovery-blocked-advice', async (t) => {
     const state = fixture(t);
     state.gateStore.write(state.identity, true, lockFor(state.identity));
     const pending = await pendingDowngrade(state);
-    const store = createTransitionStore({ identity: state.identity, homeDirectory: state.home });
+    const store = createTransitionStore({ identity: state.identity });
     store.writeJournal({ ...pending, phase: 'recovery-blocked' });
     const journalPath = path.join(store.directory, `${pending.operationId}.json`);
     assert.ok(fs.existsSync(journalPath) && fs.existsSync(storePaths(state).barrierPath));
@@ -1286,15 +1284,14 @@ test('G.recovery-blocked-advice', async (t) => {
     assert.deepEqual(store.listPending(), []);
     assert.equal(fs.existsSync(storePaths(state).barrierPath), false);
     assert.equal(state.gateStore.read(state.identity), null, 'the saved gate is gone');
-    const instanceDir = path.join(state.gateStore.root, state.identity.instance);
+    const instanceDir = path.join(state.gateStore.rootFor(state.identity), state.identity.instance);
     assert.equal(fs.existsSync(instanceDir), false, 'the instance state is gone');
     assert.deepEqual(result.removedRecords, [state.gateStore.recordPath(state.identity), instanceDir]);
 });
 
 function storeLockOwnedBy(state, owner) {
     const directory = path.join(storePaths(state).storeRoot, 'write.lock');
-    fs.mkdirSync(directory, { mode: 0o700 });
-    fs.writeFileSync(path.join(directory, 'owner.json'), `${JSON.stringify({
+    fs.writeFileSync(directory, `${JSON.stringify({
         token: 'c'.repeat(32), domain: 'host', operation: 'policy-write', acquiredAt: new Date().toISOString(), ...owner,
     })}\n`, { mode: 0o600 });
     return directory;
@@ -1308,7 +1305,7 @@ function storeLockOwnedBy(state, owner) {
 function seedInstanceState(state) {
     state.gateStore.write(state.identity, true, lockFor(state.identity));
     const paths = storeWithEntry(state);
-    const instanceDir = path.join(state.gateStore.root, state.identity.instance);
+    const instanceDir = path.join(state.gateStore.rootFor(state.identity), state.identity.instance);
     fs.mkdirSync(path.join(instanceDir, 'transitions'), { mode: 0o700 });
     fs.writeFileSync(path.join(instanceDir, 'transitions', `sha256-${'1'.repeat(64)}.json`), '{}\n', { mode: 0o600 });
     const marker = path.join(instanceDir, 'f'.repeat(64), 'marker.json');
@@ -1329,7 +1326,7 @@ test('G.destroy-teardown-plan-is-read-only-exact-and-ordered', (t) => {
     const freshStore = teardownStore(fresh);
     const plan = freshStore.planInstanceTeardown(fresh.identity, lockFor(fresh.identity));
     assert.deepEqual([plan.recordPath, plan.instanceDir, plan.entries], [null, null, []]);
-    assert.equal(fs.existsSync(path.join(fresh.home, '.ploinky-box')), false, 'the preflight never creates state');
+    assert.equal(fs.existsSync(fresh.identity.hostStateRoot), false, 'the preflight never creates state');
     assert.throws(() => freshStore.planInstanceTeardown(fresh.identity, null), /requires the workspace mutation lock/);
 
     const state = fixture(t);
@@ -1355,20 +1352,20 @@ test('G.destroy-teardown-removes-half-deleted-empty-and-dangling-state', (t) => 
     // A store a crash left with only limits.json: contents are never parsed.
     const half = fixture(t);
     const store = teardownStore(half);
-    const instanceDir = path.join(half.gateStore.root, half.identity.instance);
+    const instanceDir = path.join(half.gateStore.rootFor(half.identity), half.identity.instance);
     fs.mkdirSync(path.join(instanceDir, 'store'), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(instanceDir, 'store', 'limits.json'), '{"half":', { mode: 0o600 });
     store.removeInstanceState(store.planInstanceTeardown(half.identity, lockFor(half.identity)), lockFor(half.identity));
     assert.equal(fs.existsSync(instanceDir), false);
     // An empty INSTANCE directory.
     const empty = fixture(t);
-    const emptyDir = path.join(empty.gateStore.root, empty.identity.instance);
+    const emptyDir = path.join(empty.gateStore.rootFor(empty.identity), empty.identity.instance);
     fs.mkdirSync(emptyDir, { recursive: true, mode: 0o700 });
     assert.deepEqual(empty.gateStore.removeInstanceState(empty.gateStore.planInstanceTeardown(empty.identity, lockFor(empty.identity)), lockFor(empty.identity)), [emptyDir]);
     assert.equal(fs.existsSync(emptyDir), false);
     // A dangling symlink record: only the link is unlinked.
     const dangling = fixture(t);
-    fs.mkdirSync(dangling.gateStore.root, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(dangling.gateStore.rootFor(dangling.identity), { recursive: true, mode: 0o700 });
     const missing = path.join(dangling.root, 'missing-target');
     fs.symlinkSync(missing, dangling.gateStore.recordPath(dangling.identity));
     dangling.gateStore.removeInstanceState(dangling.gateStore.planInstanceTeardown(dangling.identity, lockFor(dangling.identity)), lockFor(dangling.identity));
@@ -1388,7 +1385,7 @@ test('G.destroy-teardown-store-lock-recovery-needs-proof-and-never-takes-a-live-
         assert.match(error.message, /that process is still running on this host/);
         return true;
     });
-    assert.ok(fs.existsSync(path.join(lockDir, 'owner.json')));
+    assert.ok(fs.existsSync(lockDir));
     for (const target of [seeded.record, seeded.paths.policyPath, seeded.marker]) assert.ok(fs.existsSync(target), target);
     // A dead holder: kept without a Box proof, recovered (quarantined in the tree) with it.
     const dead = fixture(t);
@@ -1411,7 +1408,7 @@ test('G.destroy-teardown-refuses-symlinked-foreign-and-unexpected-state', (t) =>
     const outside = path.join(linked.root, 'outside');
     fs.mkdirSync(path.join(outside, 'store'), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(outside, 'store', 'keep'), 'outside data', { mode: 0o600 });
-    fs.symlinkSync(outside, path.join(linked.gateStore.root, linked.identity.instance));
+    fs.symlinkSync(outside, path.join(linked.gateStore.rootFor(linked.identity), linked.identity.instance));
     assert.throws(() => store.planInstanceTeardown(linked.identity, lockFor(linked.identity)), /is not a real directory/);
     assert.equal(fs.readFileSync(path.join(outside, 'store', 'keep'), 'utf8'), 'outside data');
     assert.equal(linked.gateStore.read(linked.identity).enabled, true, 'the gate record is kept');
@@ -1424,7 +1421,7 @@ test('G.destroy-teardown-refuses-symlinked-foreign-and-unexpected-state', (t) =>
     ]) {
         const state = fixture(t);
         state.gateStore.write(state.identity, true, lockFor(state.identity));
-        const instanceDir = path.join(state.gateStore.root, state.identity.instance);
+        const instanceDir = path.join(state.gateStore.rootFor(state.identity), state.identity.instance);
         fs.mkdirSync(path.join(instanceDir, 'transitions'), { recursive: true, mode: 0o700 });
         make(path.join(instanceDir, name), state);
         assert.throws(() => state.gateStore.planInstanceTeardown(state.identity, lockFor(state.identity)),
@@ -1467,7 +1464,7 @@ for (const [label, owner] of [
             const result = await realSupervisor(state, { events, ownership: boxPresent ? box : absent })
                 .runDestroyTransaction(boxPresent ? box.handles.container.id : null);
             assert.ok(Date.now() - started < 5000, 'the stale lock was recovered, not waited out');
-            const instanceDir = path.join(state.gateStore.root, state.identity.instance);
+            const instanceDir = path.join(state.gateStore.rootFor(state.identity), state.identity.instance);
             assert.equal(fs.existsSync(lockDir), false);
             assert.equal(fs.existsSync(instanceDir), false);
             assert.equal(state.gateStore.read(state.identity), null);
@@ -1484,10 +1481,10 @@ test('G.destroy-keeps-records-for-a-live-ownerless-or-foreign-store-lock-with-re
         ['live pid', (state) => storeLockOwnedBy(state, { pid: process.pid, hostname: os.hostname() }), /Wait for that operation to finish and retry/],
         ['foreign host', (state) => storeLockOwnedBy(state, { pid: deadPid, hostname: 'other-host.example' }), /Stop this workspace on every host that uses this store/],
         ['ownerless', (state) => {
-            const directory = path.join(storePaths(state).storeRoot, 'write.lock');
-            fs.mkdirSync(directory, { mode: 0o700 });
-            return directory;
-        }, /an ownerless lock is never removed automatically.*then remove that directory and retry/],
+            const lockFile = path.join(storePaths(state).storeRoot, 'write.lock');
+            fs.writeFileSync(lockFile, '', { mode: 0o600 });
+            return lockFile;
+        }, /an ownerless lock is never removed automatically.*then remove that file and retry/],
     ]) {
         const state = fixture(t);
         state.gateStore.write(state.identity, true, lockFor(state.identity));
@@ -1505,7 +1502,7 @@ test('G.destroy-keeps-records-for-a-live-ownerless-or-foreign-store-lock-with-re
         assert.ok(events.includes('run:container rm'), `${label}: the Box was removed first`);
         assert.ok(fs.existsSync(lockDir), `${label}: the lock is kept`);
         assert.equal(state.gateStore.read(state.identity).enabled, true, `${label}: the gate is kept`);
-        const journal = createTransitionStore({ identity: state.identity, homeDirectory: state.home }).readJournal(pending.operationId);
+        const journal = createTransitionStore({ identity: state.identity }).readJournal(pending.operationId);
         assert.notEqual(journal.phase, 'aborted-by-destroy', `${label}: the journal is untouched`);
         assert.ok(fs.existsSync(storePaths(state).barrierPath), `${label}: the barrier is kept`);
     }
@@ -1568,7 +1565,7 @@ test('G.stale-lock-never-stolen-messages', async (t) => {
             assert.ok(error.message.includes(directory), `${label}: names the lock path`);
             return true;
         });
-        assert.ok(fs.existsSync(path.join(directory, 'owner.json')), `${label}: never stolen`);
+        assert.ok(fs.existsSync(directory), `${label}: never stolen`);
         assert.equal(events.includes('reconcile'), false, label);
     }
 });
@@ -1607,7 +1604,7 @@ test('G.update-recovers-stale-lock', async (t) => {
     });
     // The preflight is read-only: it neither takes nor recovers the lock.
     assert.deepEqual(supervisor.preflightHardwareGate('update'), { enabled: false, source: 'default' });
-    assert.ok(fs.existsSync(path.join(directory, 'owner.json')), 'the preflight leaves the lock alone');
+    assert.ok(fs.existsSync(directory), 'the preflight leaves the lock alone');
     const hostUpdates = [];
     const code = await runOuterCli(['update'], {
         env: {}, input: {}, output: sink(), errorOutput: sink(), cwd: () => state.identity.workspaceRoot,
@@ -1632,7 +1629,7 @@ test('G.status-transition', async (t) => {
     for (const phase of ['prepared', 'old-stopped', 'old-absent', 'candidate-created', 'recovery-blocked']) {
         const state = fixture(t);
         const pending = await pendingDowngrade(state);
-        const store = createTransitionStore({ identity: state.identity, homeDirectory: state.home });
+        const store = createTransitionStore({ identity: state.identity });
         store.writeJournal({
             ...pending,
             phase,
@@ -1683,7 +1680,7 @@ for (const mismatch of ['engineIdentity', 'hostKind']) {
             (error) => error.code === 'PLOINKY_BOX_HARDWARE_RECOVERY_BLOCKED');
         assert.equal(events.some((event) => event.startsWith('run:') || ['core', 'prepare', 'reconcile', 'start-core'].includes(event)), false);
         assert.ok(fs.existsSync(storePaths(state).barrierPath));
-        const journal = createTransitionStore({ identity: state.identity, homeDirectory: state.home }).listPending()[0];
+        const journal = createTransitionStore({ identity: state.identity }).listPending()[0];
         assert.equal(journal.phase, 'recovery-blocked');
         assert.equal(journal.lastProblem.code, 'ENGINE_IDENTITY_CHANGED');
     });
@@ -1711,8 +1708,7 @@ function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null,
     const priorAgentLib = agentLibFixture(state.identity.workspaceRoot);
     let settled = false;
     const gate = Object.freeze({
-        homeDirectory: state.gateStore.homeDirectory,
-        root: state.gateStore.root,
+        rootFor: state.gateStore.rootFor,
         recordPath: state.gateStore.recordPath,
         read: (identity) => state.gateStore.read(identity),
         write: (identity, enabled, lock, options) => {
@@ -1998,7 +1994,7 @@ test('G.full-update-scope-failure-under-the-lock-settles-no-downgrade', async (t
     for (const effect of ['graph-stop', 'box-stop', 'box-remove', 'box-start']) assert.equal(world.events.includes(effect), false, `${effect} did not run: ${world.events.join(' ')}`);
     assert.equal(world.events.some((event) => event.startsWith('box-create')), false, world.events.join(' '));
     assert.equal(world.state.gateStore.read(world.state.identity).enabled, true, 'the saved gate is still on');
-    assert.deepEqual(createTransitionStore({ identity: world.state.identity, homeDirectory: world.state.home }).listPending(), [], 'no downgrade journal was written');
+    assert.deepEqual(createTransitionStore({ identity: world.state.identity }).listPending(), [], 'no downgrade journal was written');
 });
 
 // ---------------------------------------------------------------------------

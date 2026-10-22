@@ -377,7 +377,7 @@ export function plannedCommands(run) {
     const provision = [
         { id: 'engine-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], deadlineMs: run.deadlines.coreMs, note: 'Stable facts only: host arch/os/hostname/kernel, engine version, store graphRoot/runRoot and the service socket; a remote client adds its one default connection (name and URI). A missing fact refuses the run.' },
         { id: 'engine-connection', binary: engine, argv: [...ENGINE_CONNECTIONS_ARGV], deadlineMs: run.deadlines.coreMs, note: 'Only when the service is remote.' },
-        { id: 'host-records-absent', action: `Refuse unless ${HOST_RECORD_DIRECTORIES.map(name => `~/.ploinky-box/${name}/${run.workspace.instance}{,.json}`).join(', ')} are all absent` },
+        { id: 'host-records-absent', action: `Refuse unless ${HOST_RECORD_DIRECTORIES.map(name => `${workspace}/.ploinky-box/${name}/${run.workspace.instance}{,.json}`).join(', ')} are all absent` },
         ...(profile.gpu ? [{ id: 'gpu-initial-gate', binary: profile.gpu.smi.path, argv: gpuQueryArgv(profile.gpu.uuid), deadlineMs: run.deadlines.coreMs, note: 'The initial GPU idle gate, before anything is created: success, strict XML, the pinned UUID and memory, compute mode Default, a supported activity inventory and an empty process list, except for at most ONE recorded graphics-only (type G) display process of at most 64 MiB, present at this first check with a proven host identity (amendment A5), which is recorded in toleratedProcesses of the run manifest. Nothing else runs if it is not met.' }] : []),
         ...(plan.workspace.parentMode === 'create'
             ? [{ id: 'workspace-parent-create', action: `mkdir ${plan.workspace.parent} (0700, refuse if it exists) and write ${OWNER_MARKER}=${run.runId}` }]
@@ -392,7 +392,7 @@ export function plannedCommands(run) {
         ...(plan.gpu ? [
             ...(profile.gpu?.probe ? [{ id: 'fixture-write-probe-file', action: `Copy ${profile.gpu.probe.sourcePath} (${profile.gpu.probe.digest}) to ${workspace}/.ploinky/repos/${FIXTURE_REPOSITORY}/${GPU_PROBE_TARGET}; the nested engine stages it at /code/${PROBE_FILE}` }] : []),
             { id: 'gpu-grant', binary: node, argv: [profile.candidate.path, 'gpu', 'grant', ...plan.gpu.grantAgents.flatMap(ref => ['--agent', ref])], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs,
-                note: 'The supported product path: records the grant under ~/.ploinky-box/gpu-grants and discovers the host driver. No Box exists yet, so the next start applies it.' },
+                note: 'The supported product path: records the grant under .ploinky-box/gpu-grants in the workspace and discovers the host driver. No Box exists yet, so the next start applies it.' },
         ] : []),
         ...(['cpu', 'apple-cpu', 'amd-apu-cpu'].includes(profile.model?.profile) ? [{ id: 'gpu-withdraw', binary: node, argv: [profile.candidate.path, 'gpu', 'revoke'], cwd: workspace, env: {}, deadlineMs: run.deadlines.coreMs }] : []),
         ...(isApuModel(profile.model) ? [{ id: 'apu-manifest-default', action: `Before first start, verify the exact manifest-default rewrite ${JSON.stringify(profile.model.env)} and its pinned digest; no post-start var operation is permitted.` }] : []),
@@ -494,7 +494,7 @@ export function plannedCommands(run) {
         ...(profile.gpu ? [{ id: 'gpu-stop-owned-helpers', action: 'Remove the control helpers by exact recorded identity (name and run label re-proved first). The probes and the holder end with their commands or with the Box; nothing foreign is ever signalled.' }] : []),
         { id: 'revalidate-identity', binary: engine, argv: [...ENGINE_INFO_ARGV], action: 'Recheck engine identity (with its default connection when remote), workspace receipt and marker, or the run-derived quarantine' },
         { id: 'destroy-box', binary: node, argv: profile.cases.includes('LIVE-C5') ? [`${profile.source.root}/${DRIVER_FILE}`, '<DRIVER_PARAMS mode=destroy expectedContainerId=<PROVEN_GENERATION_ID>>'] : [profile.candidate.path, 'destroy', '--delete-cache'], cwd: workspace, deadlineMs: run.deadlines.destroyMs, action: (profile.cases.includes('LIVE-C5') ? `For LIVE-C5 with a recorded downgrade invocation the destroy is the product's own exact-ID destroy run through ${DRIVER_FILE} for the ONE generation of the chain the product's durable records prove (the bound journal, its attempt records, snapshots and CID files, each full-ID inspected), after proof that the driver settled; every ID of the chain is then proved absent. ` : '') + 'Only when the recorded Box exists, or, when its receipt was never persisted, the one container found by the name and path-hash label recorded at fixture-start (`container ps --all --filter label=<path-hash label>=<hash> --format "{{.ID}} {{.Names}}"`) that also proves the Box role and a mount of exactly this workspace; then prove it absent and compare the unrelated inventory' },
-        { id: 'host-records', action: `Remove only recorded ~/.ploinky-box/{${HOST_RECORD_DIRECTORIES.join(',')}}/${run.workspace.instance}[.json]; any unrecorded one refuses the step` },
+        { id: 'host-records', action: `Remove only recorded ${workspace}/.ploinky-box/{${HOST_RECORD_DIRECTORIES.join(',')}}/${run.workspace.instance}[.json]; any unrecorded one refuses the step` },
         { id: 'workspace-removal', action: `Prove no container mounts ${workspace}; rename it to ${path.join(path.dirname(workspace), `.hwl-removing-${run.runId}`)}; reprove uid/dev/ino and marker; remove (marker last)` },
         ...(plan.workspace.parentMode === 'create' ? [{ id: 'workspace-parent-removal', action: `Remove ${plan.workspace.parent} only while it holds nothing but its marker` }] : []),
         { id: 'verify-absent', binary: engine, argv: ps, action: 'No owned Box, workspace, quarantine, parent or host record remains' },
@@ -779,7 +779,7 @@ export function renderSummary(run, manifestPath) {
         '',
         line('Cleanup runs in a finally block after `live`, after any provisioning failure, and as the standalone `cleanup` action. It is journaled in the manifest and resumes from it after a crash. Order: ',
             run.target.plan.cleanup.map(entry => entry.id).join(', '), '. '),
-        `It destroys only the recorded Box with \`${path.basename(profile.candidate.path)} destroy --delete-cache\` from the workspace, proves it absent, removes only the recorded host records ${list(HOST_RECORD_DIRECTORIES.map(name => `~/.ploinky-box/${name}/${run.workspace.instance}[.json]`))}, then quarantines and removes the workspace after reproving its uid/dev/ino and marker. A failed destroy or identity proof preserves everything for a later \`cleanup\`. Unrelated containers are compared with the recorded inventory and never changed.`,
+        `It destroys only the recorded Box with \`${path.basename(profile.candidate.path)} destroy --delete-cache\` from the workspace, proves it absent, removes only the recorded host records ${list(HOST_RECORD_DIRECTORIES.map(name => `${plan.workspace.path}/.ploinky-box/${name}/${run.workspace.instance}[.json]`))}, then quarantines and removes the workspace after reproving its uid/dev/ino and marker. A failed destroy or identity proof preserves everything for a later \`cleanup\`. Unrelated containers are compared with the recorded inventory and never changed.`,
         remote ? `The remote staging root \`${run.target.stage.root}\` is removed only after a fetched remote cleanup PASS (or when no remote run was ever dispatched).` : null,
         '',
         '## Not covered',
@@ -838,7 +838,7 @@ function storeSummary(run) {
     const instance = run.workspace.instance;
     const rows = [
         ['Writers', 'Host: the candidate\'s `limits clear --agent hwlfixture/s` (the only host writer the product has). In the Box: the Router\'s administrator route (set_agent_limits and clear_agent_limits) with the product\'s local operator session. Neither is replaced or modified by the runner.'],
-        ['Shared store', `Host \`${hostStoreRoot(profile.host.home, instance)}\`, in the Box \`${BOX_STORE_ROOT}\` (the read-write private bind of the gate-on Box): one directory seen from both sides. Entries written: only the stored override of hwlfixture/s (memoryPercent ${OVERRIDES.low.memoryPercent} or ${OVERRIDES.high.memoryPercent}); every case ends with that entry cleared.`],
+        ['Shared store', `Host \`${hostStoreRoot(profile.provision.workspace.path, instance)}\`, in the Box \`${BOX_STORE_ROOT}\` (the read-write private bind of the gate-on Box): one directory seen from both sides. Entries written: only the stored override of hwlfixture/s (memoryPercent ${OVERRIDES.low.memoryPercent} or ${OVERRIDES.high.memoryPercent}); every case ends with that entry cleared.`],
         ['Reviewed program', `STORE_PROGRAM in tests/hardware-limits/liveStoreCommands.mjs (sha256 ${crypto.createHash('sha256').update(STORE_PROGRAM).digest('hex')}), run as \`node --input-type=module -e\` on the host with the staged product root \`${profile.source.root}\` and inside the Box as the Box user with \`${BOX_PRODUCT_ROOT}\`. It imports only Node built-ins and the product's store.mjs and storeLock.mjs and uses their own functions: readStoreSnapshot, readStoreLockOwner, readBarrier, acquireStoreLock, beginDowngradeBarrier, removeDowngradeBarrier, assertGateOffStoreEmpty. Its modes: inspect (read-only), hold, stale, barrier-begin, barrier-remove, gate-off-check. The parameters are one JSON argv; no value reaches it as source text.`],
         ['Locks', `A holder keeps the store lock ${STORE_BOUNDS.holdMs} ms (longer than the product's own wait); the stale-Box holder is bounded at ${STORE_BOUNDS.staleHoldMs} ms and is ended by the Box stop. Every holder is settled before the case returns; a lock a holder leaves is the stale lock under test and is quarantined by the product's own recovery, never deleted by the runner. A holder's own release verifies its owner token and directory identity: a stolen lock fails it.`],
         ['Barrier', 'Step 6 installs the downgrade barrier ITSELF, through the product\'s own beginDowngradeBarrier over the empty store (never by writing the file), and removes it in a finally block: it is a DIAGNOSTIC of the store barrier and earns no credit for the actual lifecycle. The actual gate-off lifecycle (steps 9 and 10) installs and removes NO barrier itself: the barrier under test is the one the PRODUCT\'s own forward transition installs, observed (never replaced) by the driver. C4, the complete stored-policy fixture matrix, remains unsupported and is not completed by this block.'],
@@ -860,6 +860,7 @@ function gpuSummary(run) {
     const gpu = profile.gpu;
     const { operations, gateChecks } = profile.llm ? llmPlan(run) : gpuPlan(run);
     const instance = run.workspace.instance;
+    const hostState = `${profile.provision.workspace.path}/.ploinky-box`;
     const cell = value => String(value).replaceAll('|', '\\|');
     const text = entry => (entry.argv ? `\`${[entry.binary, ...entry.argv].map(word => (word === profile.engine.path ? '$ENGINE' : word)).join(' ').replaceAll('|', '\\|')}\`` : cell(entry.action || ''));
     return [
@@ -897,10 +898,10 @@ function gpuSummary(run) {
         '',
         '| Record | Created by | Removed by cleanup |',
         '| --- | --- | --- |',
-        `| \`~/.ploinky-box/gpu-grants/${instance}.json\` and \`~/.ploinky-box/gpu-grants/${instance}/\` | \`gpu grant\` and the Box start | yes, only when recorded |`,
-        `| \`~/.ploinky-box/hardware-limits/${instance}.json\` and \`~/.ploinky-box/hardware-limits/${instance}/\` (the gate record and the policy store holding the saved shares) | the start and the Apply path | yes, only when recorded |`,
-        `| \`~/.ploinky-box/router-bindings/${instance}[.json]\` | the start | yes, only when recorded |`,
-        '| the parent directories of the three | pre-existing on the host (\`gpu-grants\` already exists and stays) | only a parent this run created, and only while empty |',
+        `| \`${hostState}/gpu-grants/${instance}.json\` and \`${hostState}/gpu-grants/${instance}/\` | \`gpu grant\` and the Box start | yes, only when recorded |`,
+        `| \`${hostState}/hardware-limits/${instance}.json\` and \`${hostState}/hardware-limits/${instance}/\` (the gate record and the policy store holding the saved shares) | the start and the Apply path | yes, only when recorded |`,
+        `| \`${hostState}/router-bindings/${instance}[.json]\` | the start | yes, only when recorded |`,
+        '| the parent directories of the three | created inside this run\'s own workspace (\`.ploinky-box\`), which no other run shares | only a parent this run created, and only while empty |',
         '',
         ...(profile.llm ? llmDataSection(run) : []),
     ];

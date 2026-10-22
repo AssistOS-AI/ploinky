@@ -523,7 +523,7 @@ export function createModelCases(ctx) {
     async function afterCleanup() {
         if (apu) await apu.afterCleanup();
         assertModelGrantInventory(run, profile);
-        if (profile.model.profile === 'apple-cpu') write('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.host.home) });
+        if (profile.model.profile === 'apple-cpu') write('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.workspace.path) });
         if (profile.gpu) await gpuCleanupProof({ run, profile, processProvider, signal: ctx.cleanupSignal, hostProc: host, artifacts: write });
         llmCleanupProof({ workspace: profile.workspace.path, runId: run.runId, action: 'live', write });
     }

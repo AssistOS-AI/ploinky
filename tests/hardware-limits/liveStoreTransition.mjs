@@ -153,12 +153,11 @@ export async function runDriver(rawParams, seams = {}) {
     const base = seams.baseRunner ?? production.createProcessRunner({ env: production.buildEngineProcessEnvironment(process.env) });
     const cli = seams.runCli ?? production.runOuterCli;
     const now = seams.now ?? (() => Date.now());
-    const homeDirectory = profile.host.home;
     const startedAt = now();
     const events = [];
     const state = { boundary: null, bound: null, failures: [], mutations: [], runCalls: 0, queryCalls: 0, operationId: null, receipt: null, intent: null, stage: 'pre', engine: null };
     const identity = () => assertWorkspace(profile);
-    const paths = () => hardwareStorePaths({ identity: identity(), homeDirectory });
+    const paths = () => hardwareStorePaths({ identity: identity() });
     // `onStep` is a test seam only: a named point of the driver, so a crash test can end the process exactly there.
     const step = name => seams.onStep?.(name);
     const record = (kind, data = {}) => {
@@ -238,7 +237,7 @@ export async function runDriver(rawParams, seams = {}) {
             return domain === 'host' && seams.programRoot ? { ...params, root: seams.programRoot } : params;
         };
         const hostView = () => {
-            const hostResult = spawnSync(process.execPath, hostProgramWords(programParams('host')), { env: { PATH: process.env.PATH, HOME: homeDirectory }, encoding: 'utf8', timeout: Math.min(bounds.programMs, remaining()) });
+            const hostResult = spawnSync(process.execPath, hostProgramWords(programParams('host')), { env: { PATH: process.env.PATH, HOME: profile.host.home }, encoding: 'utf8', timeout: Math.min(bounds.programMs, remaining()) });
             const lines = hostResult.status === 0 ? parseProgramLines(hostResult.stdout) : null;
             if (!lines) throw setup('the host store program did not answer');
             return assertValidStore(lines[0], 'host view');

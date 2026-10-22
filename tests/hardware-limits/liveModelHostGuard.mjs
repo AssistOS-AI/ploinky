@@ -6,8 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export function modelGrantInventory(home) {
-    const root = path.join(home, '.ploinky-box', 'gpu-grants'); const entries = [];
+export function modelGrantInventory(workspaceRoot) {
+    const root = path.join(workspaceRoot, '.ploinky-box', 'gpu-grants'); const entries = [];
     const visit = directory => {
         const stat = fs.lstatSync(directory);
         if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('GPU grant inventory directory changed');
@@ -34,7 +34,7 @@ export function modelGrantInventory(home) {
 export function assertModelGrantInventory(run, profile) {
     if (profile.model?.profile !== 'apple-cpu') return;
     if (!Array.isArray(run.preInventory.gpuGrants)
-        || JSON.stringify(modelGrantInventory(profile.host.home)) !== JSON.stringify(run.preInventory.gpuGrants)) throw new Error('Unrelated GPU grant inventory changed');
+        || JSON.stringify(modelGrantInventory(profile.workspace.path)) !== JSON.stringify(run.preInventory.gpuGrants)) throw new Error('Unrelated GPU grant inventory changed');
 }
 
 export const MODEL_HOST_LIMITS = Object.freeze({ memoryLevel: 20, pressure: 2, swapGrowthMiB: 1024, krunkitRssMiB: 9216 });

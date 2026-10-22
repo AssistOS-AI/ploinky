@@ -122,8 +122,7 @@ async function recoverFromFile(statePath) {
     try {
         results = await recoverHardwareDowngrades({
             identity: world.identity,
-            homeDirectory: world.home,
-            transitionStore: createTransitionStore({ identity: world.identity, homeDirectory: world.home }),
+            transitionStore: createTransitionStore({ identity: world.identity }),
             effects: effectsFor(world),
         });
     } catch (error) {

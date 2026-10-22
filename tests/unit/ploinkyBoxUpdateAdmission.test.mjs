@@ -9,9 +9,17 @@ import {
     listUnresolvedAdmissions,
     runJournaledAdmission,
 } from '../../ploinky-box/update/admission.mjs';
+import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createMemoryUpdateHostState, createUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 
 const identity = Object.freeze({ instance: 'ploinky-box-workspace-123456789abc', workspaceRoot: '/workspace' });
+
+// A real workspace for the durable store, whose root is `<workspace>/.ploinky-box`.
+function workspaceIdentityIn(root) {
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(workspace);
+    return buildWorkspaceIdentity(workspace);
+}
 
 // One metadata cell with read/write/restore adapters and injectable faults.
 function cell(name, prior, candidate, faults, events) {
@@ -206,8 +214,9 @@ test('an unreadable prior value stops admission before the journal or any write'
 test('the durable journal holds prior absence and the observed candidate until settlement', async (t) => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-admission-journal-'));
     t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-    const store = createUpdateHostState({ stateRoot: path.join(home, '.ploinky-box') });
-    const directory = path.join(home, '.ploinky-box', ADMISSION_JOURNAL_KIND);
+    const stateIdentity = workspaceIdentityIn(home);
+    const store = createUpdateHostState({ identity: stateIdentity });
+    const directory = path.join(stateIdentity.hostStateRoot, ADMISSION_JOURNAL_KIND);
     const values = { a: null };
     let observed;
     await runJournaledAdmission({
@@ -237,9 +246,10 @@ test('the durable journal holds prior absence and the observed candidate until s
 test('the durable host state store refuses linked, shared or foreign-mode records', async (t) => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-state-'));
     t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-    const store = createUpdateHostState({ stateRoot: path.join(home, '.ploinky-box') });
+    const stateIdentity = workspaceIdentityIn(home);
+    const store = createUpdateHostState({ identity: stateIdentity });
     store.write('update-pending', 'ploinky-box-a-123456789abc', { ok: true });
-    const file = path.join(home, '.ploinky-box', 'update-pending', 'ploinky-box-a-123456789abc.json');
+    const file = path.join(stateIdentity.hostStateRoot, 'update-pending', 'ploinky-box-a-123456789abc.json');
     assert.deepEqual(store.read('update-pending', 'ploinky-box-a-123456789abc'), { ok: true });
     fs.chmodSync(file, 0o644);
     assert.throws(() => store.read('update-pending', 'ploinky-box-a-123456789abc'), { code: 'PLOINKY_BOX_UPDATE_STATE_INVALID' });

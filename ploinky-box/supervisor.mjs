@@ -131,7 +131,7 @@ import {
     runHardwareDowngrade,
 } from './hardwareLimitsTransition.mjs';
 import { listUnresolvedAdmissions, runJournaledAdmission } from './update/admission.mjs';
-import { updateHostStateForLockManager } from './update/hostState.mjs';
+import { createUpdateHostState } from './update/hostState.mjs';
 import { IN_BOX_NONCE_PROBE_SCRIPT, IN_BOX_OPERATION_WRITERS_PROBE_SCRIPT, runUpdateExec } from './update/coreRunner.mjs';
 import {
     HOST_EXCLUSIONS_INTENT_KIND,
@@ -375,7 +375,9 @@ export function createBoxSupervisor({
     inspectBoxData = inspectWorkspaceDataPaths,
     captureCoreStartArgv = captureConfiguredCoreStartArgv,
     routerBindingStore = createRouterBindingStore(),
-    updateHostState = updateHostStateForLockManager(lockManager),
+    // Fixtures inject a process-local store; otherwise each call builds the
+    // durable store of that call's identity (`<workspace>/.ploinky-box`).
+    updateHostState = null,
     gpuGrantStore = createGpuGrantStore({ engineRunner: runner }),
     hardwareGateStore = createHardwareGateStore(),
     // Bounded, idempotent preparation of each created/restored/restarted
@@ -401,6 +403,10 @@ export function createBoxSupervisor({
 } = {}) {
     function inspect(identity) {
         return discover(identity, runner, platform, env);
+    }
+
+    function updateStore(identity) {
+        return updateHostState || createUpdateHostState({ identity });
     }
 
     // Creating a missing Box pulls its reference, so select the supplying image
@@ -476,8 +482,7 @@ export function createBoxSupervisor({
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,
             ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
-            homeDirectory: gpuGrantStore.homeDirectory,
-                mpsEnabled,
+            mpsEnabled,
         });
         if (desired?.state === 'stale') {
             stderr?.write?.(
@@ -505,7 +510,7 @@ export function createBoxSupervisor({
         const gate = selectHardwareGate({ identity, gateStore: hardwareGateStore, env, operation });
         if (gate.note) stderr?.write?.(`[ploinky] Note: ${gate.note}\n`);
         if (!gate.enabled) {
-            const paths = hardwareStorePaths({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+            const paths = hardwareStorePaths({ identity });
             try {
                 // A stale store lock is recovered only with its holder proven
                 // dead and this Box observed stopped or absent (§5.2).
@@ -519,11 +524,7 @@ export function createBoxSupervisor({
                     : error.code === 'store_busy' ? 'PLOINKY_BOX_HARDWARE_STORE_BUSY' : 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
             }
         } else {
-            assertHardwareStateConfined({
-                workspaceRoot: identity.workspaceRoot,
-                dataPaths: identity.dataPaths,
-                homeDirectory: hardwareGateStore.homeDirectory,
-            });
+            assertHardwareStateConfined({ identity });
         }
         return gate;
     }
@@ -535,7 +536,6 @@ export function createBoxSupervisor({
             identity,
             enabled,
             hostKind: ownership?.engine?.hostKind || 'native-linux',
-            homeDirectory: hardwareGateStore.homeDirectory,
             initializeStore: initializeHardwareStore,
         });
     }
@@ -562,7 +562,7 @@ export function createBoxSupervisor({
     // bind and GPU grant/revoke refuse instead of mutating (§6.3 line 420).
     // The advice follows the journal's real phase.
     function assertNoPendingHardwareTransition(identity, operation) {
-        const pending = createTransitionStore({ identity, homeDirectory: hardwareGateStore.homeDirectory }).listPending();
+        const pending = createTransitionStore({ identity }).listPending();
         if (!pending.length) return;
         const [journal] = pending;
         const advice = journal.phase === 'recovery-blocked'
@@ -586,7 +586,7 @@ export function createBoxSupervisor({
 
     function observedHardwareWiring(identity, ownership) {
         const container = ownership?.handles?.container || null;
-        return container ? observeContainerHardwareWiring(container, { identity, homeDirectory: hardwareGateStore.homeDirectory }) : null;
+        return container ? observeContainerHardwareWiring(container, { identity }) : null;
     }
 
     // Saved-state wiring for bind and GPU grant/revoke, which never apply an
@@ -688,11 +688,10 @@ export function createBoxSupervisor({
     // Recover any pending downgrade first, then journal an actual gate-on to
     // gate-off downgrade. First enable and on-to-on use no barrier.
     async function settleHardwareTransitions(identity, lock, ownership, gate, operation) {
-        const homeDirectory = hardwareGateStore.homeDirectory;
-        const store = createTransitionStore({ identity, homeDirectory });
+        const store = createTransitionStore({ identity });
         if (store.listPending().length) {
             const engine = ownership.engine;
-            const results = await recoverHardwareDowngrades({ identity, homeDirectory, transitionStore: store, effects: downgradeEffects(identity, lock, engine) });
+            const results = await recoverHardwareDowngrades({ identity, transitionStore: store, effects: downgradeEffects(identity, lock, engine) });
             const blocked = results.find((result) => result.phase === 'recovery-blocked');
             if (blocked) {
                 throw supervisorError(`A gate-on to gate-off transition needs manual recovery (${blocked.operationId}): ${blocked.error || 'recovery-blocked'}. `
@@ -731,7 +730,6 @@ export function createBoxSupervisor({
             oldWasRunning,
             oldGraphRunning,
             hostRecords: [{ name: 'gate', old: true, next: false }],
-            homeDirectory,
             effects: downgradeEffects(identity, lock, engine),
         });
         return inspect(identity);
@@ -826,7 +824,7 @@ export function createBoxSupervisor({
                 if (state.state !== 'absent') {
                     throw supervisorError('Cannot restore gate-off wiring until candidate Box writers are proven absent. Run PLOINKY_BOX_HARDWARE_LIMITS=on ploinky restart.', 'PLOINKY_BOX_HARDWARE_ROLLBACK_BLOCKED');
                 }
-                const paths = hardwareStorePaths({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+                const paths = hardwareStorePaths({ identity });
                 return withStaleStoreLockRecovery(() => assertGateOffStoreEmpty({ paths, identity }), {
                     storeRoot: paths.storeRoot, hostLock: lock, instance: identity.instance,
                     inspectBox: () => observeBoxState(identity),
@@ -851,7 +849,7 @@ export function createBoxSupervisor({
                 stderr?.write?.(`[ploinky] Note: ${HARDWARE_GATE_ENV} is set; only start, restart and update apply it\n`);
             }
             const hardwareState = readHardwareStateClass({
-                identity, gateStore: hardwareGateStore, homeDirectory: hardwareGateStore.homeDirectory,
+                identity, gateStore: hardwareGateStore,
             });
             if (hardwareState.hasHardwareState) {
                 return inspectOnlyGenericBox(identity, ownership, hardwareState);
@@ -1167,7 +1165,7 @@ export function createBoxSupervisor({
         if (hardwareGate?.persist) items.push(hardwareGateItem(identity, lock, hardwareGate));
         const admitted = await runJournaledAdmission({
             identity,
-            store: updateHostState,
+            store: updateStore(identity),
             operation,
             source: {
                 containerId: prepared.ownership.handles.container.id,
@@ -1191,7 +1189,7 @@ export function createBoxSupervisor({
         // Only an actual whole-graph activation satisfies a pending one.
         if (activated) {
             try {
-                updateHostState.remove('update-pending', identity.instance);
+                updateStore(identity).remove('update-pending', identity.instance);
             } catch (error) {
                 warnings.push(`the pending activation record could not be cleared: ${error.message}`);
             }
@@ -1615,7 +1613,7 @@ export function createBoxSupervisor({
     }
 
     function recordPendingActivation(identity, { request, coreArgv, reason, blockedBy = [] }) {
-        const previous = updateHostState.read('update-pending', identity.instance);
+        const previous = updateStore(identity).read('update-pending', identity.instance);
         const entries = Array.isArray(previous?.entries) ? previous.entries.slice(-19) : [];
         entries.push({
             request,
@@ -1632,7 +1630,7 @@ export function createBoxSupervisor({
             reason,
             entries,
         };
-        updateHostState.write('update-pending', identity.instance, record);
+        updateStore(identity).write('update-pending', identity.instance, record);
         return record;
     }
 
@@ -1657,7 +1655,7 @@ export function createBoxSupervisor({
 
     function recordRecoveryBarrier(identity, { operation, containerId, nonce, marker, cause, detail, reportPath = null }) {
         try {
-            updateHostState.write('update-recovery', identity.instance, {
+            updateStore(identity).write('update-recovery', identity.instance, {
                 schema: 'ploinky-update-recovery',
                 version: 1,
                 operation,
@@ -1747,14 +1745,14 @@ export function createBoxSupervisor({
     }
 
     async function assertNoUpdateRecoveryBarrier(identity, ownership) {
-        const barrier = updateHostState.read('update-recovery', identity.instance);
+        const barrier = updateStore(identity).read('update-recovery', identity.instance);
         if (!barrier) return [];
         if (!isRecoveryBarrier(barrier, identity)) {
             // A record this writer did not produce cannot name the writer to
             // probe. Only a stopped or absent Box proves no in-Box writer runs.
             const container = ownership?.handles?.container || null;
             if (!container || container.runtime?.running === false) {
-                updateHostState.remove('update-recovery', identity.instance);
+                updateStore(identity).remove('update-recovery', identity.instance);
                 return ['a malformed update recovery record was cleared because the Box is stopped'];
             }
             const error = new PloinkyBoxError(
@@ -1779,7 +1777,7 @@ export function createBoxSupervisor({
         }
         const earlier = barrier.operation === 'restart' ? 'graph restart' : 'update';
         if (observed?.ok === true && !(observed.pids || []).length) {
-            updateHostState.remove('update-recovery', identity.instance);
+            updateStore(identity).remove('update-recovery', identity.instance);
             return [`an earlier ${earlier} (${String(barrier.nonce).slice(0, 8)}) that could not be proven stopped `
                 + 'is now confirmed stopped by the engine; its recovery record was cleared'];
         }
@@ -1803,9 +1801,9 @@ export function createBoxSupervisor({
     // of this workspace may hold.
     function exclusionsIntent(identity) {
         return {
-            read: () => updateHostState.read(HOST_EXCLUSIONS_INTENT_KIND, identity.instance),
-            write: record => updateHostState.write(HOST_EXCLUSIONS_INTENT_KIND, identity.instance, record),
-            remove: () => updateHostState.remove(HOST_EXCLUSIONS_INTENT_KIND, identity.instance),
+            read: () => updateStore(identity).read(HOST_EXCLUSIONS_INTENT_KIND, identity.instance),
+            write: record => updateStore(identity).write(HOST_EXCLUSIONS_INTENT_KIND, identity.instance, record),
+            remove: () => updateStore(identity).remove(HOST_EXCLUSIONS_INTENT_KIND, identity.instance),
         };
     }
 
@@ -2102,7 +2100,7 @@ export function createBoxSupervisor({
             const coreArgv = updateCoreArgv(plan, scope);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const activity = sampleGraphActivity(identity, ownership);
-            const unresolvedAdmissions = listUnresolvedAdmissions(updateHostState, identity);
+            const unresolvedAdmissions = listUnresolvedAdmissions(updateStore(identity), identity);
             const context = { identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity, hardwareGate };
             // Locks that an interrupted host exclusion refresh left are
             // released, when provably its own, before the in-Box step meets them.
@@ -2294,7 +2292,7 @@ export function createBoxSupervisor({
                     // gate-only journaled admission whose settlement is the Box's own, so nothing after settlement can restore anything.
                     const settled = await runJournaledAdmission({
                         identity,
-                        store: updateHostState,
+                        store: updateStore(identity),
                         operation: 'update',
                         source: { containerId: prepared.ownership.handles.container.id, boxAction: prepared.action || null, deferred: true },
                         items: [hardwareGateItem(identity, lock, hardwareGate)],
@@ -3192,7 +3190,6 @@ export function createBoxSupervisor({
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
                 ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
-                homeDirectory: gpuGrantStore.homeDirectory,
                 mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
                 strict: true,
             });
@@ -3228,7 +3225,6 @@ export function createBoxSupervisor({
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
                 ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
-                homeDirectory: gpuGrantStore.homeDirectory,
                 mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
             });
             // A per-agent revoke must not strip GPU wiring that a lost record
@@ -3241,7 +3237,6 @@ export function createBoxSupervisor({
                     return resolveDesiredGpuWiring(identity, null, declared, {
                         discover: discoverGpuDevices,
                         ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
-                        homeDirectory: gpuGrantStore.homeDirectory,
                 mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
                     });
                 } catch {
@@ -3299,7 +3294,6 @@ export function createBoxSupervisor({
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,
             ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
-            homeDirectory: gpuGrantStore.homeDirectory,
                 mpsEnabled: hardwareGateStore.read(identity)?.enabled === true,
         });
         return Object.freeze({
@@ -3329,7 +3323,7 @@ export function createBoxSupervisor({
         const identity = resolveIdentity();
         const gate = selectHardwareGate({ identity, gateStore: hardwareGateStore, env, operation });
         if (!gate.enabled) {
-            const paths = hardwareStorePaths({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+            const paths = hardwareStorePaths({ identity });
             try {
                 peekGateOffStoreEmpty({ paths, identity });
             } catch (error) {
@@ -3338,11 +3332,7 @@ export function createBoxSupervisor({
                     : 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
             }
         } else {
-            assertHardwareStateConfined({
-                workspaceRoot: identity.workspaceRoot,
-                dataPaths: identity.dataPaths,
-                homeDirectory: hardwareGateStore.homeDirectory,
-            });
+            assertHardwareStateConfined({ identity });
         }
         return Object.freeze({ enabled: gate.enabled, source: gate.source });
     }
@@ -3382,7 +3372,7 @@ export function createBoxSupervisor({
     async function runLimitsClearTransaction({ agentRef = null, all = false } = {}) {
         return lockedMutation(async (identity, lock) => {
             const result = runLimitsClear({
-                identity, lock, agentRef, all, homeDirectory: hardwareGateStore.homeDirectory,
+                identity, lock, agentRef, all,
                 inspectBox: () => observeBoxState(identity),
             });
             return Object.freeze({ identity, agentRef, all, ...result });
@@ -3424,7 +3414,7 @@ export function createBoxSupervisor({
     // with the rest of this workspace's hardware-limits state.
     function closePendingDowngradesAfterDestroy(identity) {
         try {
-            const aborted = abortHardwareDowngradesForDestroy({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+            const aborted = abortHardwareDowngradesForDestroy({ identity });
             return Object.freeze({ ok: true, aborted });
         } catch (error) {
             return Object.freeze({ ok: false, error });
@@ -3451,9 +3441,9 @@ export function createBoxSupervisor({
         const reason = error?.message || String(error);
         if (error?.code === 'PLOINKY_BOX_ROUTER_BINDING_STATE_INVALID' || error?.code === 'identity_changed') {
             return destroyRecordsError(identity, {
-                reason: `${reason.replace(/\.+$/, '')}. This workspace or one of its cache paths overlaps ~/.ploinky-box, so destroy never `
-                    + `deletes there. Remove ~/.ploinky-box/gpu-grants/${identity.instance}.json, ~/.ploinky-box/gpu-grants/${identity.instance}, `
-                    + `~/.ploinky-box/hardware-limits/${identity.instance}.json and ~/.ploinky-box/hardware-limits/${identity.instance} `
+                reason: `${reason.replace(/\.+$/, '')}. This workspace or one of its cache paths overlaps the host-state directory ${identity.hostStateRoot}, so destroy never `
+                    + `deletes there. Remove ${path.join(identity.hostStateRoot, 'gpu-grants', `${identity.instance}.json`)}, ${path.join(identity.hostStateRoot, 'gpu-grants', identity.instance)}, `
+                    + `${path.join(identity.hostStateRoot, 'hardware-limits', `${identity.instance}.json`)} and ${path.join(identity.hostStateRoot, 'hardware-limits', identity.instance)} `
                     + 'by hand once no Ploinky process uses them',
                 step: null,
                 partial,
@@ -3462,8 +3452,8 @@ export function createBoxSupervisor({
         const step = error?.code === 'store_busy'
             ? 'Resolve that store lock as described'
             : error?.code === 'PLOINKY_BOX_HARDWARE_STORE_BUSY'
-                ? 'Make sure no Ploinky process uses this workspace\'s hardware policy store and remove that lock directory'
-                : 'Inspect the named path and repair it, or move it out of ~/.ploinky-box once no Ploinky process uses it';
+                ? 'Make sure no Ploinky process uses this workspace\'s hardware policy store and remove that lock file'
+                : `Inspect the named path and repair it, or move it out of ${identity.hostStateRoot} once no Ploinky process uses it`;
         return destroyRecordsError(identity, { reason, step, partial });
     }
 
@@ -3502,7 +3492,7 @@ export function createBoxSupervisor({
         } catch (error) {
             throw refuse(error);
         }
-        const transitions = createTransitionStore({ identity, homeDirectory: hardwareGateStore.homeDirectory });
+        const transitions = createTransitionStore({ identity });
         const closed = closePendingDowngradesAfterDestroy(identity);
         if (!closed.ok) {
             if (closed.error?.code === 'store_busy') throw refuse(closed.error);
@@ -3833,7 +3823,7 @@ export function createBoxSupervisor({
     function inspectUpdateState(identity = resolveIdentity()) {
         const read = (kind) => {
             try {
-                return { record: updateHostState.read(kind, identity.instance), error: null };
+                return { record: updateStore(identity).read(kind, identity.instance), error: null };
             } catch (error) {
                 return { record: null, error: error.message };
             }

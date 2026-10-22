@@ -466,8 +466,8 @@ export async function diagnoseWorkspace({
     discover = discoverBoxOwnership, checkPublications = preflightPublications,
     bindingStore = createRouterBindingStore(), admitCurrentBox = validateCurrentBox,
     inspectionOnly = false, repairAssessments = collectRepairAssessments,
-    homeDirectory, fsApi = fs, uid = process.getuid?.(),
-    hardwareGateStore = createHardwareGateStore(homeDirectory ? { homeDirectory } : {}),
+    fsApi = fs, uid = process.getuid?.(),
+    hardwareGateStore = createHardwareGateStore(),
 } = {}) {
     const checks = [], commands = [];
     const runner = createDiagnosticRunner(suppliedRunner || createProcessRunner({ env: buildEngineProcessEnvironment(env) }), commands, { progress });
@@ -581,7 +581,7 @@ export async function diagnoseWorkspace({
     }
     if (identity) {
         try {
-            checks.push(...await repairAssessments({ identity, host, runner, env, platform, homeDirectory, fsApi, uid }));
+            checks.push(...await repairAssessments({ identity, host, runner, env, platform, fsApi, uid }));
         } catch (error) {
             checks.push({ id: 'repair.assessment', label: 'Assess automatic user repairs', status: 'fail',
                 detail: failureDetail(error), next: 'Inspect this assessment failure before attempting any automatic repair.' });

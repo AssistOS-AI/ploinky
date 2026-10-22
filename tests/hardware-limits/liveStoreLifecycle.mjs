@@ -57,7 +57,7 @@ export function assertWriterFirstRefusal(result, summary) {
 
 export function createLifecycle({ profile, run, command, engine, inspectBox, persist, artifactPath, http, sleep, polling, routerPolling = polling, fail, adminState, setLimits, hostClear, view, agentRef }) {
     const identity = () => assertWorkspace(profile);
-    const gateEnabled = () => createHardwareGateStore({ homeDirectory: profile.host.home }).read(identity())?.enabled ?? null;
+    const gateEnabled = () => createHardwareGateStore().read(identity())?.enabled ?? null;
     const startDeadline = () => (Number.isInteger(run.deadlines?.startMs) ? run.deadlines.startMs : 1200000);
     const preInventory = () => (run.preInventory?.containers || []).map(value => value.id);
 

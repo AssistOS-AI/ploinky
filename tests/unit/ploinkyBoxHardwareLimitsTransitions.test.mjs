@@ -55,8 +55,8 @@ function world(t, { oldRunning = true, graphRunning = true, reapply = false } = 
     t.after(() => fs.rmSync(home, { recursive: true, force: true }));
     const workspaceRoot = path.join(home, 'workspace');
     fs.mkdirSync(workspaceRoot);
-    const identity = Object.freeze({ instance: 'ploinky-box-demo-0123456789ab', pathHash: '0123456789ab', workspaceRoot, dataPaths: {} });
-    const paths = hardwareStorePaths({ identity, homeDirectory: home });
+    const identity = Object.freeze({ instance: 'ploinky-box-demo-0123456789ab', pathHash: '0123456789ab', workspaceRoot, dataPaths: {}, hostStateRoot: path.join(workspaceRoot, '.ploinky-box') });
+    const paths = hardwareStorePaths({ identity });
     initializeStore({ paths, identity });
     const engine = new Engine();
     const oldId = engine.add(OLD_CONFIG, { running: oldRunning, graphRunning: oldRunning && graphRunning });
@@ -91,7 +91,6 @@ function downgradeArgs(w, faults = {}) {
             { name: 'router', old: 'router-binding-1', next: 'router-binding-1' },
         ],
         reapplyConfiguration: w.reapply ? REAPPLY_CONFIG : null,
-        homeDirectory: w.home,
         effects: effectsFor(w),
         faults,
     };
@@ -127,7 +126,7 @@ async function runThenRecover(w, faults) {
 }
 
 function journals(w) {
-    const directory = createTransitionStore({ identity: w.identity, homeDirectory: w.home }).directory;
+    const directory = createTransitionStore({ identity: w.identity }).directory;
     let names = [];
     try { names = fs.readdirSync(directory).filter((name) => /^[0-9a-f]{32}\.json$/.test(name)); } catch (_) { return []; }
     return names.map((name) => JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8')));
@@ -161,7 +160,7 @@ function assertRolledBack(w) {
 test('T.first-on-no-barrier', async (t) => {
     const w = world(t);
     // First enable: no observed gate-on Box, so no journal or barrier.
-    const gateStore = createHardwareGateStore({ homeDirectory: w.home });
+    const gateStore = createHardwareGateStore();
     assert.equal(gateStore.read(w.identity), null);
     assert.equal(readBarrier({ paths: w.paths }), null);
     assert.deepEqual(journals(w), []);
@@ -209,7 +208,7 @@ test('T.reads-and-watchdog-during-barrier', async (t) => {
     assert.equal(readStoreSnapshot({ paths: w.paths, identity: w.identity }).status, 'valid');
     const boxPaths = hardwareStorePaths({ identity: w.identity, context: 'box', boxRoot: w.paths.storeRoot });
     assert.equal(readStoreSnapshot({ paths: boxPaths, identity: w.identity }).status, 'valid', 'in-Box admission reads the store');
-    const status = readLimitsStatus({ identity: w.identity, gateStore: createHardwareGateStore({ homeDirectory: w.home }), env: {} });
+    const status = readLimitsStatus({ identity: w.identity, gateStore: createHardwareGateStore(), env: {} });
     assert.equal(status.transition.barrier.operationId, '2'.repeat(32));
 });
 
@@ -237,7 +236,7 @@ test('T.optional-cold-child-pending-at-commit', async (t) => {
     await runHardwareDowngrade(downgradeArgs(w));
     assertCommitted(w);
     const [journal] = journals(w);
-    const store = createTransitionStore({ identity: w.identity, homeDirectory: w.home });
+    const store = createTransitionStore({ identity: w.identity });
     const graphResult = store.readSnapshot(journal.commitIntent.graphResultRef);
     assert.equal(graphResult.state, 'starting');
     assert.equal(graphResult.optionalPendingCount, 1);
@@ -291,7 +290,7 @@ test('T.ownerless-host-lock', async (t) => {
 
 test('T.cid-outside-lock', async (t) => {
     const w = world(t);
-    const store = createTransitionStore({ identity: w.identity, homeDirectory: w.home });
+    const store = createTransitionStore({ identity: w.identity });
     const receipt = store.receiptPath('4'.repeat(32));
     const locksRoot = path.dirname(createMutationLockManager().lockPathFor(w.identity.workspaceRoot));
     assert.equal(receipt.startsWith(`${locksRoot}${path.sep}`), false);
@@ -322,7 +321,7 @@ test('T.foreign-id-blocked', async (t) => {
         assert.ok(error instanceof SimulatedProcessDeath);
     }
     const foreign = w.engine.add({ image: 'someone-else' });
-    const results = await recoverHardwareDowngrades({ identity: w.identity, homeDirectory: w.home, effects: effectsFor(w) });
+    const results = await recoverHardwareDowngrades({ identity: w.identity, effects: effectsFor(w) });
     assert.equal(results[0].phase, 'recovery-blocked');
     assert.ok(w.engine.boxes.has(foreign), 'a foreign Box is never removed');
     assert.ok(readBarrier({ paths: w.paths }), 'the barrier is preserved as evidence');
@@ -332,17 +331,17 @@ test('T.foreign-id-blocked', async (t) => {
 test('T.stop-with-broken-store', async (t) => {
     const w = world(t);
     // Stop needs neither the policy store nor its lock.
-    fs.mkdirSync(path.join(w.paths.storeRoot, 'write.lock'), { mode: 0o700 });
+    fs.writeFileSync(path.join(w.paths.storeRoot, 'write.lock'), '', { mode: 0o600 });
     fs.writeFileSync(w.paths.policyPath, '{broken', { mode: 0o600 });
     const { createBoxSupervisor } = await import('../../ploinky-box/supervisor.mjs');
     const events = [];
     const supervisor = createBoxSupervisor({
         env: {},
         resolveIdentity: () => ({ ...w.identity, markerFound: true, anchorPath: path.join(w.identity.workspaceRoot, '.ploinky') }),
-        lockManager: createMutationLockManager({ homeDirectory: w.home }),
+        lockManager: createMutationLockManager(),
         discover: () => ({ state: 'owned', engine: { name: 'podman', identity: 'engine-1' }, handles: { container: { id: w.oldId, runtime: { running: true } } } }),
         runner: { run(_command, args) { events.push(args.slice(0, 2).join(' ')); } },
-        hardwareGateStore: createHardwareGateStore({ homeDirectory: w.home }),
+        hardwareGateStore: createHardwareGateStore(),
     });
     fs.mkdirSync(path.join(w.identity.workspaceRoot, '.ploinky'), { recursive: true });
     const result = await supervisor.runStopTransaction();
@@ -358,7 +357,7 @@ test('T.destroy-receipt', async (t) => {
         assert.ok(error instanceof SimulatedProcessDeath);
     }
     assert.ok(readBarrier({ paths: w.paths }));
-    const aborted = abortHardwareDowngradesForDestroy({ identity: w.identity, homeDirectory: w.home });
+    const aborted = abortHardwareDowngradesForDestroy({ identity: w.identity });
     assert.equal(aborted.length, 1);
     assert.equal(readBarrier({ paths: w.paths }), null);
     assert.equal(journals(w)[0].phase, 'aborted-by-destroy');
@@ -443,7 +442,7 @@ for (const mismatch of ['engineIdentity', 'hostKind']) {
             for (const [name, value] of Object.entries(effects)) if (typeof value === 'function') {
                 effects[name] = () => { effectsRun++; throw new Error('unexpected effect ' + name); };
             }
-            const results = await recoverHardwareDowngrades({ identity: w.identity, homeDirectory: w.home, effects });
+            const results = await recoverHardwareDowngrades({ identity: w.identity, effects });
             console.log(JSON.stringify({ results, effectsRun }));
         `, statePath], { encoding: 'utf8' });
         assert.equal(child.status, 0, child.stderr);
@@ -451,7 +450,7 @@ for (const mismatch of ['engineIdentity', 'hostKind']) {
         assert.equal(result.effectsRun, 0);
         assert.equal(result.results[0].phase, 'recovery-blocked');
         assert.ok(readBarrier({ paths: w.paths }));
-        assert.equal(createTransitionStore({ identity: w.identity, homeDirectory: w.home }).listPending()[0].lastProblem.code,
+        assert.equal(createTransitionStore({ identity: w.identity }).listPending()[0].lastProblem.code,
             'ENGINE_IDENTITY_CHANGED');
     });
 }

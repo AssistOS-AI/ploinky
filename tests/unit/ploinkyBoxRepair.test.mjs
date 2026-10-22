@@ -11,27 +11,26 @@ import { inspectSelectedMachine } from '../../ploinky-box/repair/automatic.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-user-repair-'));
-    const home = path.join(root, 'home');
     const workspace = path.join(root, 'workspace');
-    fs.mkdirSync(home, { mode: 0o700 }); fs.mkdirSync(workspace, { mode: 0o700 });
-    const directory = path.join(home, '.ploinky-box', 'router-bindings');
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(workspace, { mode: 0o700 });
     const identity = buildWorkspaceIdentity(workspace);
+    const directory = path.join(identity.hostStateRoot, 'router-bindings');
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const target = path.join(directory, identity.instance + '.json');
     const data = JSON.stringify({ version: 1, instance: identity.instance, pathHash: identity.pathHash,
         workspaceRoot: workspace, address: '127.0.0.1', hostPort: 8080, containerPort: 8080 });
     fs.writeFileSync(target, data, { mode: 0o600 }); fs.chmodSync(target, 0o644);
     const modes = [];
     const admin = { id: 'host.device.fuse', label: '/dev/fuse', status: 'fail', detail: 'Device is unavailable.' };
-    const options = { cwd: workspace, env: {}, platform: 'linux', homeDirectory: home,
+    const options = { cwd: workspace, env: {}, platform: 'linux',
         runner: { query() { assert.fail('No external command expected for binding permission repair'); } },
         diagnose: async ({ inspectionOnly }) => {
             modes.push(inspectionOnly);
-            const checks = [...inspectBindingPermissions({ identity, homeDirectory: home }), admin];
+            const checks = [...inspectBindingPermissions({ identity }), admin];
             return { version: 1, workspace, platform: 'linux', inspectionOnly, exitCode: 1, checks, commands: [] };
         } };
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    return { root, home, workspace, identity, target, data, modes, options };
+    return { root, workspace, identity, target, data, modes, options };
 }
 
 test('repair tightens only the binding record and reports administrator work after rechecking', { skip: process.getuid?.() === 0 }, async (t) => {
@@ -59,7 +58,7 @@ test('dry-run plans automatic actions without locks, writes, executors or full r
     assert.deepEqual(state.modes, [true]);
     assert.equal(report.outcomes[0].status, 'planned');
     assert.equal(fs.statSync(state.target).mode & 0o777, 0o644);
-    assert.equal(fs.existsSync(path.join(state.home, '.ploinky-box', 'locks')), false);
+    assert.equal(fs.existsSync(path.join(state.identity.hostStateRoot, 'locks')), false);
     assert.match(formatRepairReport(report), /Preview only/);
 });
 
@@ -117,12 +116,12 @@ test('optional administrator inspection does not become a required sudo deployme
 
 test('an independent image repair cannot silently tighten shared-writable control-state directories', { skip: process.getuid?.() === 0 }, async (t) => {
     const state = fixture(t);
-    // The workspace lock lives in `<workspace>/.ploinky-host/locks`.
-    const control = path.join(state.workspace, '.ploinky-host');
+    // The workspace lock lives in `<workspace>/.ploinky-box/locks`.
+    const control = path.join(state.workspace, '.ploinky-box');
     fs.mkdirSync(control, { recursive: true }); fs.chmodSync(control, 0o777);
     const report = await repairWorkspace({ ...state.options,
         diagnose: async () => ({ version: 1, workspace: state.workspace, platform: 'linux', exitCode: 1, commands: [], checks: [
-            ...inspectBindingPermissions({ identity: state.identity, homeDirectory: state.home }),
+            ...inspectBindingPermissions({ identity: state.identity }),
             { id: 'repair.image.cache', label: 'Image cache', status: 'warn', detail: 'Missing', code: 'IMAGE_CACHE_MISSING', repairEligible: true },
         ] }),
         lockManager: { acquire() { assert.fail('Unsafe directories must be detected before the lock manager can chmod them'); } },
@@ -166,7 +165,7 @@ test('a failed repair lock remains actionable even when fresh deployment diagnos
     const state = fixture(t);
     const report = await repairWorkspace({ ...state.options,
         diagnose: async ({ inspectionOnly }) => ({ version: 1, platform: 'linux', workspace: state.workspace,
-            exitCode: 0, checks: inspectionOnly ? inspectBindingPermissions({ identity: state.identity, homeDirectory: state.home }) : [], commands: [] }),
+            exitCode: 0, checks: inspectionOnly ? inspectBindingPermissions({ identity: state.identity }) : [], commands: [] }),
         lockManager: { async acquire() { throw new Error('Repair lock is still held by another process'); } },
     });
     assert.equal(report.after.exitCode, 0);
@@ -182,7 +181,7 @@ test('repair text preserves failed action and verification commands, exits and n
     const report = await repairWorkspace({ ...state.options,
         diagnose: async ({ inspectionOnly }) => ({ version: 1, platform: 'linux', workspace: state.workspace,
             exitCode: 1, commands: [], checks: inspectionOnly
-                ? inspectBindingPermissions({ identity: state.identity, homeDirectory: state.home })
+                ? inspectBindingPermissions({ identity: state.identity })
                 : [{ id: 'inner.agent-start', label: 'Inner start', status: 'fail', detail: 'Operation denied',
                     command: { file: 'podman', args: ['container', 'start', 'diagnostic-container'] }, exitCode: 125,
                     next: 'Inspect the matching host audit denial.' }] }),

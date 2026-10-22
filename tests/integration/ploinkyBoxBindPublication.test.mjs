@@ -134,13 +134,11 @@ test('native Box Router publications preserve the public-only boundary across bi
     assert.ok(address, 'this publication test requires an assigned non-loopback host IPv4 address');
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-bind-publication-')));
     const workspace = path.join(root, 'workspace');
-    const stateHome = path.join(root, 'host-state');
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
-    fs.mkdirSync(stateHome, { mode: 0o700 });
     const token = crypto.randomUUID();
     fs.writeFileSync(path.join(workspace, 'bind-publication-fixture.mjs'), fixtureServer(token), { mode: 0o600 });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
-    const store = createRouterBindingStore({ homeDirectory: stateHome });
+    const store = createRouterBindingStore();
     const native = createProcessRunner();
     const createdIds = new Set();
     const guardedArgs = (args) => {
@@ -193,7 +191,7 @@ test('native Box Router publications preserve the public-only boundary across bi
     assert.equal(initial.state, 'absent', initial.message);
     engine = initial.engine;
     assert.equal(engine.hostKind, 'native-linux');
-    lock = await createMutationLockManager({ homeDirectory: stateHome }).acquire(identity.instance, { workspaceRoot: identity.workspaceRoot });
+    lock = await createMutationLockManager().acquire(identity.instance, { workspaceRoot: identity.workspaceRoot });
     const imageBundle = probeImageAgentLib(engine.name, imageId, runner);
     const agentLib = buildImageSelection({
         workspaceRoot: workspace,

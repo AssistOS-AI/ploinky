@@ -171,12 +171,10 @@ test('a failed start admission restores the prior saved Router binding bytes exa
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const selection = agentLibFixture(identity.workspaceRoot);
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
-    const bindingStore = createRouterBindingStore({ homeDirectory: home });
+    const bindingStore = createRouterBindingStore();
     const heldLock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
     bindingStore.write(identity, { address: '127.0.0.1', hostPort: 8083 }, heldLock);
-    const stateDir = path.join(home, '.ploinky-box');
+    const stateDir = identity.hostStateRoot;
     const bindingFiles = () => {
         const files = {};
         const visit = (dir) => {
@@ -304,15 +302,13 @@ test('two overlapping update transactions on one real mutation lock never interl
     const root = scratch(t, 'ploinky-update-overlap-');
     fs.mkdirSync(path.join(root, 'first'), { recursive: true });
     fs.mkdirSync(path.join(root, 'second'), { recursive: true });
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
     const timeline = [];
     const gate = deferred();
     const first = gatedScenario(root, 'first', {
-        lockManager: createMutationLockManager({ homeDirectory: home, retryMs: 10, timeoutMs: 10_000 }), timeline, gate,
+        lockManager: createMutationLockManager({ retryMs: 10, timeoutMs: 10_000 }), timeline, gate,
     });
     const second = gatedScenario(root, 'second', {
-        lockManager: createMutationLockManager({ homeDirectory: home, retryMs: 10, timeoutMs: 10_000 }), timeline,
+        lockManager: createMutationLockManager({ retryMs: 10, timeoutMs: 10_000 }), timeline,
     });
     assert.equal(first.identity.instance, second.identity.instance, 'both transactions target one workspace');
 
@@ -332,15 +328,13 @@ test('an overlapping update that cannot get the real mutation lock in time is re
     const root = scratch(t, 'ploinky-update-overlap-refused-');
     fs.mkdirSync(path.join(root, 'first'), { recursive: true });
     fs.mkdirSync(path.join(root, 'second'), { recursive: true });
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
     const timeline = [];
     const gate = deferred();
     const first = gatedScenario(root, 'first', {
-        lockManager: createMutationLockManager({ homeDirectory: home, retryMs: 10, timeoutMs: 10_000 }), timeline, gate,
+        lockManager: createMutationLockManager({ retryMs: 10, timeoutMs: 10_000 }), timeline, gate,
     });
     const second = gatedScenario(root, 'second', {
-        lockManager: createMutationLockManager({ homeDirectory: home, retryMs: 10, timeoutMs: 250 }), timeline,
+        lockManager: createMutationLockManager({ retryMs: 10, timeoutMs: 250 }), timeline,
     });
     const running = first.supervisor.runUpdateTransaction(['update']);
     try {

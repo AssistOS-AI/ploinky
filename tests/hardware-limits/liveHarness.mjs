@@ -11,7 +11,7 @@ import { createOwnershipClient, PROCESS_OWNER_ENV } from './liveProcessOwnership
 import { assertRemoteArrival } from './liveRemote.mjs';
 import {
     HASH, HOST_RECORD_DIRECTORIES, ID, INSPECT, MAX_NESTED_LISTED, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, absolute, artifactPathFor, assertWorkspace,
-    blocked, bounded, candidateEnv, checkedJson, commandTails, digest, hostRecordPaths, jsonDigest, keys, liveSourceDigest, nestedContainerEvidence,
+    blocked, bounded, candidateEnv, checkedJson, commandTails, digest, hostRecordPaths, hostStateDirectory, jsonDigest, keys, liveSourceDigest, nestedContainerEvidence,
     observeEngineIdentity, receipt, foreignGuardInput, foreignWorkspaceProblem,
 } from './liveCommon.mjs';
 import { recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
@@ -190,8 +190,10 @@ export function validateExecutionProfile(run) {
 // cannot be cleaned and refuses the manifest.
 function validateOwnedPaths(run, profile) {
     const instance = profile.box?.instance || run.workspace?.instance;
-    const allowedRecords = instance && /^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance) ? hostRecordPaths(profile.host.home, instance) : [];
-    const allowedDirectories = HOST_RECORD_DIRECTORIES.map(directory => path.join(profile.host.home, '.ploinky-box', directory));
+    // The records live in the run's own workspace, whether it exists yet or is only proposed.
+    const workspaceRoot = profile.workspace?.path || profile.provision?.workspace?.path || null;
+    const allowedRecords = workspaceRoot && instance && /^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance) ? hostRecordPaths(workspaceRoot, instance) : [];
+    const allowedDirectories = workspaceRoot ? HOST_RECORD_DIRECTORIES.map(directory => path.join(hostStateDirectory(workspaceRoot), directory)) : [];
     const seen = new Set();
     for (const entry of run.ownedPaths) {
         if (!entry || seen.has(entry.path)) throw new Error('This executor cannot clean extra recorded processes or paths');
@@ -692,7 +694,7 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
             llmCleanupProof({ workspace: workspacePath, runId: run.runId, action: 'cleanup', write: artifacts });
         }
         assertModelGrantInventory(run, profile);
-        if (profile.model?.profile === 'apple-cpu') artifacts('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.host.home) });
+        if (profile.model?.profile === 'apple-cpu') artifacts('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.workspace.path) });
         run.cleanup.state = 'complete'; run.state = 'complete';
     } catch (error) { run.cleanup.state = 'failed'; run.cleanup.failures.push(error.message); }
     finally { clearTimeout(timer); }

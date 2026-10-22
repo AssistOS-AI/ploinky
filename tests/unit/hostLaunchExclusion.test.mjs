@@ -20,7 +20,7 @@ const { createMutationLockManager } = await import('../../ploinky-box/locks.mjs'
 const { withHostLaunchExclusion, acquireHostLaunchExclusion, runHostInteractiveSession } = await import('../../cli/sandbox/hostLaunchExclusion.js');
 const { createWorkspaceMutationLease, releaseWorkspaceMutationLease } = await import('../../cli/utils/runtime/maintenanceLocks.js');
 
-const lockPath = path.join(workspace, '.ploinky-host', 'locks', 'workspace.lock');
+const lockPath = path.join(workspace, '.ploinky-box', 'locks', 'workspace.lock');
 const lockOwnerPid = () => JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')).pid;
 const notInBox = () => false;
 
@@ -117,13 +117,13 @@ test('an in-Box launch creates no skeleton and takes no lock', () => {
     const inner = path.join(scratch, 'in-box');
     fs.mkdirSync(inner);
     assert.equal(withHostLaunchExclusion(() => 'ok', { workspaceRoot: inner, insideBox: () => true }), 'ok');
-    assert.equal(fs.existsSync(path.join(inner, '.ploinky-host')), false);
+    assert.equal(fs.existsSync(path.join(inner, '.ploinky-box')), false);
 });
 
 test('a host launch whose skeleton cannot be created fails before launching', () => {
     const broken = path.join(scratch, 'broken');
     fs.mkdirSync(broken);
-    fs.writeFileSync(path.join(broken, '.ploinky-host'), 'not a directory');
+    fs.writeFileSync(path.join(broken, '.ploinky-box'), 'not a directory');
     let launched = false;
     assert.throws(() => withHostLaunchExclusion(() => { launched = true; }, { workspaceRoot: broken, insideBox: notInBox }),
         (error) => error.code === 'PLOINKY_BOX_HOST_STATE_INVALID' && /Host-runtime launch refused/.test(error.message));
@@ -171,7 +171,7 @@ test('a nested launch for another workspace is refused while this process holds 
     { code: 'PLOINKY_BOX_LOCK_ORDER' });
     assert.equal(nested, false);
     assert.equal(fs.existsSync(lockPath), false);
-    assert.equal(fs.existsSync(path.join(other, '.ploinky-host', 'locks', 'workspace.lock')), false);
+    assert.equal(fs.existsSync(path.join(other, '.ploinky-box', 'locks', 'workspace.lock')), false);
 });
 
 test('an interactive session waits for D4 held by another holder and releases it before the session ends', async () => {

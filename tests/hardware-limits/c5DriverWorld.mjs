@@ -160,10 +160,10 @@ export function createDowngradeWorld({
     const identity = givenIdentity ?? buildWorkspaceIdentity(workspace.path);
     const previousHome = process.env.HOME;
     process.env.HOME = home;
-    const gateStore = createHardwareGateStore({ homeDirectory: home });
+    const gateStore = createHardwareGateStore();
     const lockFor = { assertHeld: instance => { if (instance !== identity.instance) throw new Error('lock instance'); } };
     if (!reuseState) gateStore.write(identity, true, lockFor);
-    const wiring = resolveDesiredHardwareWiring({ identity, enabled: true, homeDirectory: home, initializeStore });
+    const wiring = resolveDesiredHardwareWiring({ identity, enabled: true, initializeStore });
     const boxRoot = repositoryRoot ?? path.join(root, 'repository');
     fs.mkdirSync(boxRoot, { recursive: true });
     const box = completeBoxFixture({ root: boxRoot, identity, linkProduct });
@@ -188,7 +188,7 @@ export function createDowngradeWorld({
     }));
     const die = () => { persistState(); process.kill(process.pid, 'SIGKILL'); };
     const onStep = name => { if (killAt === `step:${name}`) die(); };
-    const paths = hardwareStorePaths({ identity, homeDirectory: home });
+    const paths = hardwareStorePaths({ identity });
     const adminCalls = [];
     let createFailed = false;
 
@@ -323,7 +323,7 @@ export function createDowngradeWorld({
             runUpdateCore: fakeUpdateCore({ onCall: () => {} }),
             startCore: async () => { events.push('start-core'); }, healthCheck: async () => {}, revalidateAgentLibSource: () => {}, commitAgentLibSelection: () => {},
             validateExistingImage: () => ({ immutableId: `sha256:${'d'.repeat(64)}` }), validateContainer: () => {},
-            hardwareGateStore: gateStore, gpuGrantStore: createGpuGrantStore({ homeDirectory: home }),
+            hardwareGateStore: gateStore, gpuGrantStore: createGpuGrantStore(),
             prepareHardwareGeneration: async () => { events.push('prepare'); return { structurallyPrepared: true }; },
             stdout: { write() { return true; } }, stderr: { write: text => { events.push(`stderr:${String(text).trim().slice(0, 120)}`); return true; } },
         });
@@ -334,7 +334,7 @@ export function createDowngradeWorld({
         // The product resolves host state from HOME; an in-process caller sets it only while the world runs.
         async withHome(fn) { const before = process.env.HOME; process.env.HOME = home; try { return await fn(); } finally { process.env.HOME = before; } },
         engineIdentityDigest: engineIdentityDigest(info, null), oldHandle: old, onStep, persistState,
-        transitionIds: () => createTransitionStore({ identity, homeDirectory: home }).listPending().map(journal => journal.operationId),
+        transitionIds: () => createTransitionStore({ identity }).listPending().map(journal => journal.operationId),
     };
 }
 
@@ -422,7 +422,7 @@ export async function runScenario(name, options = {}) {
         scenario: name, exitCode: result.exitCode, summary: result.summary, receipt, root: context.root, boxId: world.boxId,
         engineEvents: world.events, containers: [...world.containers.entries()].map(([id, entry]) => ({ id, running: entry.handle.runtime.running, gateOn: Boolean(entry.handle.labels[BOX_LABELS.hardwareLimits]) })),
         gate: world.gateStore.read(world.identity)?.enabled ?? null, store: { token: after.token, count: after.agents.size, barrier: readBarrier({ paths: world.paths }) },
-        before, adminCalls: world.adminCalls, transitions: createTransitionStore({ identity: world.identity, homeDirectory: world.home }).listPending().map(journal => ({ id: journal.operationId, phase: journal.phase })),
+        before, adminCalls: world.adminCalls, transitions: createTransitionStore({ identity: world.identity }).listPending().map(journal => ({ id: journal.operationId, phase: journal.phase })),
         intentKind: C5_INTENT_KIND,
         mutation: process.env.C5_MUTATION ? describeMutation(JSON.parse(process.env.C5_MUTATION)) : null,
     };

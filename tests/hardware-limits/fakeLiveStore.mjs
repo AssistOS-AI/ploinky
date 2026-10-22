@@ -48,7 +48,7 @@ export function createFakeStore({ base, workspace, home, faults = {}, lifecycle 
     const context = () => {
         if (derived) return derived;
         const identity = buildWorkspaceIdentity(workspace);
-        const hostPaths = hardwareStorePaths({ identity, context: 'host', homeDirectory: home });
+        const hostPaths = hardwareStorePaths({ identity, context: 'host' });
         const boxPaths = Object.freeze({ ...hardwareStorePaths({ identity, context: 'box', boxRoot: hostPaths.storeRoot }), ...(faults.ignoreBarrier ? { barrierPath: path.join(hostPaths.storeRoot, 'no-barrier-here.json') } : {}) });
         derived = { identity, hostPaths, boxPaths };
         return derived;
@@ -93,7 +93,7 @@ export function createFakeStore({ base, workspace, home, faults = {}, lifecycle 
         try {
             // The route checks the barrier before it does anything else.
             if (!faults.ignoreBarrier) assertPolicyWritesAllowed({ paths: boxPaths });
-            if (faults.stealLock) fs.rmSync(path.join(boxPaths.storeRoot, 'write.lock'), { recursive: true, force: true });
+            if (faults.stealLock) fs.rmSync(path.join(boxPaths.storeRoot, 'write.lock'), { force: true });
             model.posts += 1;
             if (faults.rejectPost === model.posts) return { status: 422, text: JSON.stringify({ ok: false, error: 'invalid_limits', message: 'rejected by the model' }) };
             const expectedToken = faults.lostUpdate || (faults.lostUpdateFrom && model.posts >= faults.lostUpdateFrom) ? undefined : body.expectedToken;
@@ -131,7 +131,7 @@ export function createFakeStore({ base, workspace, home, faults = {}, lifecycle 
                 storeRoot: hostPaths.storeRoot, hostLock: { assertHeld() {} }, instance: identity.instance, inspectBox: observeBox,
                 ...(faults.liveHostRecovered ? { kill: () => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); } } : {}),
             });
-            if (faults.deleteQuarantine || (faults.deleteQuarantineFrom && model.clears >= faults.deleteQuarantineFrom)) for (const name of fs.readdirSync(hostPaths.storeRoot)) if (name.startsWith('write.lock.stale-')) fs.rmSync(path.join(hostPaths.storeRoot, name), { recursive: true, force: true });
+            if (faults.deleteQuarantine || (faults.deleteQuarantineFrom && model.clears >= faults.deleteQuarantineFrom)) for (const name of fs.readdirSync(hostPaths.storeRoot)) if (name.startsWith('write.lock.stale-')) fs.rmSync(path.join(hostPaths.storeRoot, name), { force: true });
             return ok(`Cleared the stored hardware limits of ${ref}.\n`);
         } catch (error) { return failed(`${String(error?.message || error)}\n`); }
     }

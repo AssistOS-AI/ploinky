@@ -138,6 +138,7 @@ export function createPodmanHarness(t, candidateReference, {
     });
     const workspace = path.join(root, workspaceName);
     const child = path.join(workspace, 'child');
+    // A private HOME for the CLI child processes the tests start; host state is kept in the workspace.
     const lockHome = path.join(root, 'lock-home');
     fs.mkdirSync(child, { recursive: true });
     fs.mkdirSync(lockHome);
@@ -163,9 +164,9 @@ export function createPodmanHarness(t, candidateReference, {
         ...process.env,
         PATH: `${candidateProxy.directory}${path.delimiter}${process.env.PATH}`,
     };
-    // Lock state has its own explicit homeDirectory below. Keep the engine's
-    // actual home: changing it silently selects a different rootless image
-    // store and makes the already-built immutable candidate disappear.
+    // Host state lives in the workspace. Keep the engine's actual home:
+    // changing it silently selects a different rootless image store and
+    // makes the already-built immutable candidate disappear.
     if (process.platform === 'darwin') {
         environmentInput.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME
             || path.join(os.homedir(), '.config');
@@ -182,7 +183,7 @@ export function createPodmanHarness(t, candidateReference, {
         cwd: () => launchDirectory,
     });
     const output = { bytes: '', write(chunk) { this.bytes += String(chunk); } };
-    const lockManager = createMutationLockManager({ homeDirectory: lockHome });
+    const lockManager = createMutationLockManager();
     const supervisorOptions = {
         runner,
         lockManager,

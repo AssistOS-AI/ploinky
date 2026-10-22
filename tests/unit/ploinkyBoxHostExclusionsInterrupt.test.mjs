@@ -83,10 +83,10 @@ const hostScript = `
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
-        lockManager: createMutationLockManager({ homeDirectory: root }),
+        lockManager: createMutationLockManager(),
         discover: () => ownership(),
         env: process.env,
-        updateHostState: createUpdateHostState({ stateRoot: path.join(root, '.ploinky-box') }),
+        updateHostState: createUpdateHostState({ identity }),
         runner: {
             run() {},
             query: (_command, args) => (args[0] === 'ps'
@@ -284,7 +284,7 @@ function leftovers(folder) {
 const SETTLED = { configLock: null, exportLock: null, journal: null, staging: [], quarantine: false, gitLocks: [] };
 
 const intentFolders = ws => {
-    const directory = path.join(ws.root, '.ploinky-box', 'update-exclusions');
+    const directory = path.join(ws.workspace, '.ploinky-box', 'update-exclusions');
     return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(name => readJson(path.join(directory, name)).folders) : [];
 };
 const hostRecords = result => result.records.filter(record => record.id.startsWith('exclusions'))

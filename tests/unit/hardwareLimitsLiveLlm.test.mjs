@@ -115,7 +115,6 @@ function llmWorld(t, { block = 'apparatus-local-llm', faults = {}, vllm = null, 
     const knownHosts = path.join(root, 'known_hosts'); fs.writeFileSync(knownHosts, '192.168.1.63 ssh-ed25519 AAAAfixture\n');
     const evidence = directory('evidence');
     const node = fs.realpathSync(process.execPath);
-    fs.mkdirSync(path.join(home, '.ploinky-box', 'gpu-grants'), { recursive: true, mode: 0o700 });
     const hostIdentity = { hostname: 'apparatus', platform: 'linux', home };
     const gpu = { uuid: GPU_UUID, name: 'NVIDIA GeForce RTX 3060 Laptop GPU', driverVersion: '595.91.07', memoryMiB: 6144, smCount: 30, smi: tools['nvidia-smi'], mpsControl: tools['nvidia-cuda-mps-control'], mpsServer: tools['nvidia-cuda-mps-server'] };
     const isVllm = block === 'apparatus-vllm';
@@ -169,7 +168,7 @@ const nothingOwned = w => {
     const state = worldState(w.statePath);
     assert.deepEqual(Object.keys(state.boxes), []);
     const plan = w.run.target.execution.provision;
-    for (const target of [plan.workspace.path, path.join(path.dirname(plan.workspace.path), `.hwl-removing-${w.runId}`), ...hostRecordPaths(w.home, w.run.workspace.instance)]) assert.equal(exists(target), false, target);
+    for (const target of [plan.workspace.path, path.join(path.dirname(plan.workspace.path), `.hwl-removing-${w.runId}`), ...hostRecordPaths(plan.workspace.path, w.run.workspace.instance)]) assert.equal(exists(target), false, target);
 };
 const toolCalls = (w, name) => w.fake.llm.toolLog.filter(entry => entry.name === name);
 const stepNames = (w, id) => w.artifacts.get(`gpu-${id}`)?.steps.map(step => step.name) ?? [];

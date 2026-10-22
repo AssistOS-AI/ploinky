@@ -31,7 +31,7 @@ function workspaceIn(root, name = 'workspace') {
     return { workspace, identity: buildWorkspaceIdentity(workspace) };
 }
 
-const lockPathOf = (workspace) => path.join(workspace, '.ploinky-host', 'locks', 'workspace.lock');
+const lockPathOf = (workspace) => path.join(workspace, '.ploinky-box', 'locks', 'workspace.lock');
 const ownerOf = (workspace) => JSON.parse(fs.readFileSync(path.join(lockPathOf(workspace), 'owner.json'), 'utf8'));
 const mode = (target) => fs.statSync(target).mode & 0o777;
 
@@ -72,14 +72,22 @@ test('the lock module declares the workspace generation and lives in the workspa
     assert.equal(MUTATION_LOCK_LOCATION, 'workspace');
     const root = fixture(t);
     const { workspace, identity } = workspaceIn(root);
-    const manager = createMutationLockManager({ homeDirectory: path.join(root, 'home') });
+    // An empty private home: a lock manager must neither read nor create anything in it.
+    const home = path.join(root, 'home');
+    fs.mkdirSync(home, { mode: 0o700 });
+    const savedHome = process.env.HOME;
+    process.env.HOME = home;
+    t.after(() => { if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome; });
+    assert.equal(os.homedir(), home);
+    const manager = createMutationLockManager();
+    assert.equal('stateRoot' in manager, false, 'the lock manager keeps no home-derived state root');
     const lock = await manager.acquire(identity.instance, { workspaceRoot: workspace });
     assert.equal(lock.path, lockPathOf(workspace));
-    assert.equal(mode(path.join(workspace, '.ploinky-host')), 0o700);
-    assert.equal(mode(path.join(workspace, '.ploinky-host', 'locks')), 0o700);
-    assert.equal(mode(path.join(workspace, '.ploinky-host', 'quarantine')), 0o700);
-    assert.equal(mode(path.join(workspace, '.ploinky-host', 'empty')), 0o555);
-    assert.deepEqual(fs.readdirSync(path.join(workspace, '.ploinky-host', 'empty')), []);
+    assert.equal(mode(path.join(workspace, '.ploinky-box')), 0o700);
+    assert.equal(mode(path.join(workspace, '.ploinky-box', 'locks')), 0o700);
+    assert.equal(mode(path.join(workspace, '.ploinky-box', 'quarantine')), 0o700);
+    assert.equal(mode(path.join(workspace, '.ploinky-box', 'empty')), 0o555);
+    assert.deepEqual(fs.readdirSync(path.join(workspace, '.ploinky-box', 'empty')), []);
     assert.equal(mode(lock.path), 0o700);
     assert.equal(fs.statSync(path.join(lock.path, 'owner.json')).mode & 0o777, 0o600);
     const owner = ownerOf(workspace);
@@ -93,9 +101,9 @@ test('the lock module declares the workspace generation and lives in the workspa
     assert.equal(owner.pid, process.pid);
     lock.release();
     assert.equal(fs.existsSync(lock.path), false);
-    assert.equal(fs.existsSync(path.join(root, 'home')), false, 'nothing is written under the home directory');
+    assert.deepEqual(fs.readdirSync(home), [], 'nothing is written under the home directory');
     // The skeleton is never removed by code.
-    assert.deepEqual(fs.readdirSync(path.join(workspace, '.ploinky-host')).sort(), ['empty', 'locks', 'quarantine']);
+    assert.deepEqual(fs.readdirSync(path.join(workspace, '.ploinky-box')).sort(), ['empty', 'locks', 'quarantine']);
 });
 
 test('acquire requires an existing absolute workspace root', async (t) => {
@@ -113,7 +121,7 @@ test('acquire requires an existing absolute workspace root', async (t) => {
     assert.equal(fs.existsSync(path.join(root, 'missing')), false, 'an absent workspace is never created');
 });
 
-test('requireNewSkeleton refuses a pre-existing .ploinky-host and accepts a fresh workspace', async (t) => {
+test('requireNewSkeleton refuses a pre-existing .ploinky-box and accepts a fresh workspace', async (t) => {
     const root = fixture(t);
     const { workspace, identity } = workspaceIn(root);
     const manager = createMutationLockManager();
@@ -132,32 +140,32 @@ test('skeleton components must be private real directories and the mask source m
     const linked = workspaceIn(root, 'linked');
     const evil = path.join(root, 'evil');
     fs.mkdirSync(evil);
-    fs.symlinkSync(evil, path.join(linked.workspace, '.ploinky-host'), 'dir');
+    fs.symlinkSync(evil, path.join(linked.workspace, '.ploinky-box'), 'dir');
     await assert.rejects(() => manager.acquire(linked.identity.instance, { workspaceRoot: linked.workspace }),
         { code: 'PLOINKY_BOX_HOST_STATE_INVALID' });
     assert.deepEqual(fs.readdirSync(evil), [], 'nothing is created through a symlinked skeleton');
 
     const filled = workspaceIn(root, 'filled');
-    fs.mkdirSync(path.join(filled.workspace, '.ploinky-host', 'empty'), { recursive: true, mode: 0o755 });
-    fs.writeFileSync(path.join(filled.workspace, '.ploinky-host', 'empty', 'planted'), 'x');
-    fs.chmodSync(path.join(filled.workspace, '.ploinky-host', 'empty'), 0o555);
+    fs.mkdirSync(path.join(filled.workspace, '.ploinky-box', 'empty'), { recursive: true, mode: 0o755 });
+    fs.writeFileSync(path.join(filled.workspace, '.ploinky-box', 'empty', 'planted'), 'x');
+    fs.chmodSync(path.join(filled.workspace, '.ploinky-box', 'empty'), 0o555);
     await assert.rejects(() => manager.acquire(filled.identity.instance, { workspaceRoot: filled.workspace }),
         { code: 'PLOINKY_BOX_HOST_STATE_INVALID' });
-    fs.chmodSync(path.join(filled.workspace, '.ploinky-host', 'empty'), 0o755);
+    fs.chmodSync(path.join(filled.workspace, '.ploinky-box', 'empty'), 0o755);
 
     const shared = workspaceIn(root, 'shared');
-    fs.mkdirSync(path.join(shared.workspace, '.ploinky-host', 'locks'), { recursive: true });
-    fs.chmodSync(path.join(shared.workspace, '.ploinky-host'), 0o700);
-    fs.chmodSync(path.join(shared.workspace, '.ploinky-host', 'locks'), 0o777);
+    fs.mkdirSync(path.join(shared.workspace, '.ploinky-box', 'locks'), { recursive: true });
+    fs.chmodSync(path.join(shared.workspace, '.ploinky-box'), 0o700);
+    fs.chmodSync(path.join(shared.workspace, '.ploinky-box', 'locks'), 0o777);
     await assert.rejects(() => manager.acquire(shared.identity.instance, { workspaceRoot: shared.workspace }),
         { code: 'PLOINKY_BOX_HOST_STATE_INVALID' });
-    assert.equal(mode(path.join(shared.workspace, '.ploinky-host', 'locks')), 0o777, 'existing modes are not rewritten');
+    assert.equal(mode(path.join(shared.workspace, '.ploinky-box', 'locks')), 0o777, 'existing modes are not rewritten');
 });
 
 test('A6/N12: a stale holder is reclaimed only on positive evidence and never with residue', async (t) => {
     const root = fixture(t);
     const { workspace, identity } = workspaceIn(root);
-    fs.mkdirSync(path.join(workspace, '.ploinky-host'), { mode: 0o700 });
+    fs.mkdirSync(path.join(workspace, '.ploinky-box'), { mode: 0o700 });
     const dead = 999999;
     const liveness = fakeLiveness({ dead: [dead], undetermined: [123] });
     const manager = createMutationLockManager({ liveness, retryMs: 1, timeoutMs: 30 });
@@ -194,7 +202,7 @@ test('A6/N12: a stale holder is reclaimed only on positive evidence and never wi
 test('ownerless and non-v2 locks are busy, never reclaimed', async (t) => {
     const root = fixture(t);
     const { workspace, identity } = workspaceIn(root);
-    fs.mkdirSync(path.join(workspace, '.ploinky-host'), { mode: 0o700 });
+    fs.mkdirSync(path.join(workspace, '.ploinky-box'), { mode: 0o700 });
     const manager = createMutationLockManager({ liveness: fakeLiveness({ dead: [999999] }), retryMs: 1, timeoutMs: 25 });
 
     // An empty directory at the lock name holds nothing: the atomic publish
@@ -223,7 +231,7 @@ test('ownerless and non-v2 locks are busy, never reclaimed', async (t) => {
 test('reclaimers are serialized: a second reclaimer never removes the lock the first one acquired', async (t) => {
     const root = fixture(t);
     const { workspace, identity } = workspaceIn(root);
-    fs.mkdirSync(path.join(workspace, '.ploinky-host'), { mode: 0o700 });
+    fs.mkdirSync(path.join(workspace, '.ploinky-box'), { mode: 0o700 });
     const dead = 999999;
     plantLock(workspace, v2Owner({ pid: dead }));
     const first = createMutationLockManager({ liveness: fakeLiveness({ pid: 111, dead: [dead] }), retryMs: 1, timeoutMs: 1000 });
@@ -302,9 +310,9 @@ test('N13b: a waiter re-creates a deleted skeleton and acquires', async (t) => {
     await delay(30);
     // Released and deleted in one synchronous step: the waiter never sees the gap.
     held.release();
-    fs.rmSync(path.join(workspace, '.ploinky-host'), { recursive: true, force: true });
+    fs.rmSync(path.join(workspace, '.ploinky-box'), { recursive: true, force: true });
     const acquired = await waiting;
-    assert.equal(fs.existsSync(path.join(workspace, '.ploinky-host', 'empty')), true, 'the skeleton was re-created');
+    assert.equal(fs.existsSync(path.join(workspace, '.ploinky-box', 'empty')), true, 'the skeleton was re-created');
     acquired.assertHeld(identity.instance);
     acquired.release();
 });
@@ -396,7 +404,7 @@ test('lock before anchor: the identity hand-off releases the provisional lock an
         },
         beforeLock(identity) {
             events.push(`beforeLock:${identity.instance}`);
-            assert.equal(fs.existsSync(path.join(identity.workspaceRoot, '.ploinky-host')), false, 'beforeLock runs before any write');
+            assert.equal(fs.existsSync(path.join(identity.workspaceRoot, '.ploinky-box')), false, 'beforeLock runs before any write');
         },
         beforeAnchor(identity, lock) {
             lock.assertHeld(identity.instance);
@@ -435,7 +443,7 @@ test('a refused workspace is never written: beforeLock runs before the skeleton 
     }).then(() => null, (failure) => failure);
     assert.equal(error?.code, 'PLOINKY_BOX_WORKSPACE_ROOT_INVALID');
     assert.equal(error.workspaceTransactionStarted, false);
-    assert.equal(fs.existsSync(path.join(workspace, '.ploinky-host')), false);
+    assert.equal(fs.existsSync(path.join(workspace, '.ploinky-box')), false);
 });
 
 test('release refuses while the lock still holds residue and keeps the owner for recovery', async (t) => {
@@ -468,7 +476,7 @@ test('a held lock whose owner record was rewritten in place is no longer held', 
 test('a reclaim that observed one owner record never removes a lock whose record has changed', async (t) => {
     const root = fixture(t);
     const { workspace, identity } = workspaceIn(root);
-    fs.mkdirSync(path.join(workspace, '.ploinky-host'), { mode: 0o700 });
+    fs.mkdirSync(path.join(workspace, '.ploinky-box'), { mode: 0o700 });
     const lockPath = plantLock(workspace, v2Owner({ pid: 999999 }));
     const guards = [];
     const rewriting = {
@@ -528,7 +536,7 @@ test('a crash at any point of the lock protocol never leaves a lock that cannot 
         const { workspace, identity } = workspaceIn(root, point);
         const run = await runNode(crashScript({ workspaceRoot: workspace, instance: identity.instance, point }));
         assert.equal(run.code, 0, `${point}: ${run.stderr}`);
-        const locks = path.join(workspace, '.ploinky-host', 'locks');
+        const locks = path.join(workspace, '.ploinky-box', 'locks');
         const left = fs.readdirSync(locks);
         const lockPath = lockPathOf(workspace);
         if (point === 'held') {
@@ -556,8 +564,8 @@ test('a crash at any point of the lock protocol never leaves a lock that cannot 
 test('crash debris whose owner is live or undetermined, or that holds anything else, stays inert', async (t) => {
     const root = fixture(t);
     const { workspace, identity } = workspaceIn(root);
-    fs.mkdirSync(path.join(workspace, '.ploinky-host', 'locks'), { recursive: true, mode: 0o700 });
-    const locks = path.join(workspace, '.ploinky-host', 'locks');
+    fs.mkdirSync(path.join(workspace, '.ploinky-box', 'locks'), { recursive: true, mode: 0o700 });
+    const locks = path.join(workspace, '.ploinky-box', 'locks');
     const plant = (name, owner, extra) => {
         const directory = path.join(locks, name);
         fs.mkdirSync(directory, { mode: 0o700 });

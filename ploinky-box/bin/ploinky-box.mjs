@@ -662,7 +662,7 @@ async function runHostUpdate({
         : null;
     let store = updateHostState || null;
     const hostState = () => {
-        store ||= createUpdateHostState();
+        store ||= createUpdateHostState({ identity });
         return store;
     };
     const summary = {

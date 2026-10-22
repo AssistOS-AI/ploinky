@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Step 0 spike of BOX_STATE_IN_WORKSPACE_PLAN_R2: can in-Box processes and nested agents
-// reach or change what a read-only empty-directory mask hides at `<ws>/.ploinky-host`?
+// reach or change what a read-only empty-directory mask hides at `<ws>/.ploinky-box`?
 // Probes N3, N4, N4b, N4c, N11, N21, plus P1 (pre-existing: today's `.ploinky/data` guard).
 //
 // Fidelity: the Box `create` argv comes from this checkout's own `containerCreateArgs`; the
@@ -10,7 +10,7 @@
 // The Box starts through the real `startContainerAndWaitReady`, so its self-checks passed.
 //
 // Oracle, judged on the host and never by errno alone: a sentinel file with a random name and
-// content sits in the real `.ploinky-host/` (and `.ploinky/data/`) before the Box exists. A row
+// content sits in the real `.ploinky-box/` (and `.ploinky/data/`) before the Box exists. A row
 // is FORGEABLE when the name or token shows up in any output, or when the real tree (lstat walk
 // plus sha256) differs before/after. Every attack is followed by a read of the sentinel through
 // the attacked view, so the control (same argv without the mask) proves the oracle can see it.
@@ -27,9 +27,9 @@
 // NOT_APPLICABLE only for the case-alias rows (N11.*, P1.2, P1.3), and only when the host and
 // every probed Box prove the upper-case and U+212A spellings of a marker file give ENOENT; the
 // rows still run, so a leak stays FORGEABLE. A resolving or unclear probe runs them as usual.
-// HS: a read-write bind whose source is under `.ploinky-host/` (plan D1's hardware store), injected
-// because the base hardware wiring writes ~/.ploinky-box; its control widens the bind source to
-// `.ploinky-host/` itself so the oracle can see the sentinel through that path.
+// HS: a read-write bind whose source is under `.ploinky-box/` (plan D1's hardware store, which the
+// product's hardware wiring binds the same way); its control widens the bind source to
+// `.ploinky-box/` itself so the oracle can see the sentinel through that path.
 // A masked target row that leaves drift in the real tree is FORGEABLE: nothing is restored, the
 // remaining rows are skipped, the scratch workspace is kept, and the run exits 1.
 // Exit: 0 all DENIED, DENIED_LOCK or NOT_APPLICABLE, 1 any FORGEABLE, 2 any INCONCLUSIVE,
@@ -239,7 +239,7 @@ function diffMaps(before, after, label, ignoreIdentity) {
 function diffSnapshots(before, after, ignoreIdentity = false) {
     return [
         ...diffMaps(before.top, after.top, 'ws'),
-        ...diffMaps(before.host, after.host, '.ploinky-host', ignoreIdentity),
+        ...diffMaps(before.host, after.host, '.ploinky-box', ignoreIdentity),
         ...diffMaps(before.data, after.data, '.ploinky/data'),
         ...diffMaps(before.checkout, after.checkout, 'checkout'),
     ];
@@ -271,7 +271,7 @@ function keepOnly(dir, keep) {
 }
 
 // Puts the real trees back to the seeded state after a row. While a masked Box
-// runs, `.ploinky-host` and `empty/` are never renamed or removed (plan D1), and
+// runs, `.ploinky-box` and `empty/` are never renamed or removed (plan D1), and
 // the checkout directory (a bind source in the shadow Box) keeps its inode.
 function restore(ctx, masked) {
     const drift = diffSnapshots(ctx.baseline, snapshot(ctx));
@@ -279,7 +279,7 @@ function restore(ctx, masked) {
     const { host, data, checkout } = ctx.paths;
     keepOnly(ctx.W, [...ctx.baseline.top.keys()]);
     if (!fs.existsSync(host)) {
-        if (masked) throw new HarnessError('masked .ploinky-host vanished; no restore under a live mask');
+        if (masked) throw new HarnessError('masked .ploinky-box vanished; no restore under a live mask');
         fs.mkdirSync(path.join(host, 'empty'), { recursive: true });
         fs.chmodSync(host, 0o700);
         fs.chmodSync(path.join(host, 'empty'), 0o555);
@@ -427,7 +427,7 @@ function checkMounts(ctx, variant, mounts) {
     const expected = [
         [ctx.paths.host, mask, false, '/empty'],
         [boxWorkspacePath(ctx.W, '.runtime/ploinky'), shadow, false, '/.runtime/ploinky'],
-        [HS_DESTINATION, Boolean(hs), true, hs === 'store' ? '.ploinky-host/hardware-limits/x/store' : '.ploinky-host'],
+        [HS_DESTINATION, Boolean(hs), true, hs === 'store' ? '.ploinky-box/hardware-limits/x/store' : '.ploinky-box'],
     ];
     for (const [destination, wanted, rw, sourceEnd] of expected) {
         const mount = mounts.find((entry) => entry.Destination === destination);
@@ -482,7 +482,7 @@ const innerScript = (attack, back) => (
 
 function buildRows(ctx) {
     const { W } = ctx;
-    const H = `${W}/.ploinky-host`;
+    const H = `${W}/.ploinky-box`;
     const look = (dir) => `ls -A ${dir}; cat ${dir}/sentinel-*`;
     const lookAll = (dir, tag) => `${look(dir)}; touch ${dir}/pwn-${tag}; ls -A ${dir}; ls -A /mnt`;
     const rows = [];
@@ -490,20 +490,20 @@ function buildRows(ctx) {
         step, id: `${step}.${id}`, plan, expect: '', box: { target: 'target', control: 'control' }, ...spec,
     });
     const n3 = [
-        ['1', 'mv $W/.ploinky-host $W/x', `mv ${H} ${W}/x`, `${look(H)}; ls -A ${W}/x`, 'EBUSY'],
-        ['2', 'rmdir $W/.ploinky-host', `rmdir ${H}`, look(H), 'EBUSY', { verb: 'rmdir', errnos: ['EBUSY'] }],
-        ['3', 'touch $W/.ploinky-host/f', `touch ${H}/f`, look(H), 'EROFS'],
-        ['4', 'mkdir $W/.ploinky-host/d', `mkdir ${H}/d`, look(H), 'EROFS'],
-        ['5', 'ls -A $W/.ploinky-host', `ls -A ${H}`, look(H), 'empty'],
+        ['1', 'mv $W/.ploinky-box $W/x', `mv ${H} ${W}/x`, `${look(H)}; ls -A ${W}/x`, 'EBUSY'],
+        ['2', 'rmdir $W/.ploinky-box', `rmdir ${H}`, look(H), 'EBUSY', { verb: 'rmdir', errnos: ['EBUSY'] }],
+        ['3', 'touch $W/.ploinky-box/f', `touch ${H}/f`, look(H), 'EROFS'],
+        ['4', 'mkdir $W/.ploinky-box/d', `mkdir ${H}/d`, look(H), 'EROFS'],
+        ['5', 'ls -A $W/.ploinky-box', `ls -A ${H}`, look(H), 'empty'],
         ['6', 'mv $W $W.x', `mv ${W} ${W}.x`, look(H), 'EBUSY', { verb: 'mv', errnos: ['EBUSY', 'EACCES'] }],
     ];
     const n4b = [
-        ['1', 'umount $W/.ploinky-host', `umount ${H}`, 'EINVAL', { verb: 'umount', errnos: ['EINVAL', 'EPERM'] }],
-        ['2', 'umount -l $W/.ploinky-host', `umount -l ${H}`, 'EINVAL',
+        ['1', 'umount $W/.ploinky-box', `umount ${H}`, 'EINVAL', { verb: 'umount', errnos: ['EINVAL', 'EPERM'] }],
+        ['2', 'umount -l $W/.ploinky-box', `umount -l ${H}`, 'EINVAL',
             { verb: 'umount -l', errnos: ['EINVAL', 'EPERM'] }],
-        ['3', 'mount --move $W/.ploinky-host /mnt', `mount --move ${H} /mnt`, 'EINVAL',
+        ['3', 'mount --move $W/.ploinky-box /mnt', `mount --move ${H} /mnt`, 'EINVAL',
             { verb: 'mount --move', errnos: ['EINVAL', 'EPERM'] }],
-        ['4', 'mount -o remount,rw,bind $W/.ploinky-host', `mount -o remount,rw,bind ${H}`, 'EPERM',
+        ['4', 'mount -o remount,rw,bind $W/.ploinky-box', `mount -o remount,rw,bind ${H}`, 'EPERM',
             { verb: 'remount', errnos: ['EPERM', 'EACCES', 'EINVAL'] }],
     ];
     const volume = `-v ${W}:${W}`;
@@ -512,24 +512,24 @@ function buildRows(ctx) {
     for (const [id, plan, attack, back, expect, lock] of n3) {
         add('N3', id, plan, { attack, back, expect, ...lockOf(lock, 'box') });
     }
-    add('N4', '1', 'podman run -v $W:$W alpine ls -A $W/.ploinky-host', {
+    add('N4', '1', 'podman run -v $W:$W alpine ls -A $W/.ploinky-box', {
         nested: { volume }, attack: `ls -A ${H}`, back: look(H), expect: 'empty',
     });
     add('N4', '2', 'podman run --mount type=bind,src=$W,dst=/w,bind-nonrecursive=true alpine true', {
         nested: { volume: `--mount type=bind,src=${W},dst=/w,bind-nonrecursive=true` },
         attack: 'true',
-        back: look('/w/.ploinky-host'),
+        back: look('/w/.ploinky-box'),
         expect: 'create fails (named errno)',
         // A pull or load failure in the nested engine must not count as the expected refusal.
         createFail: /invalid argument|operation not permitted|permission denied/i,
     });
     add('N4', '3', 'unshare -Urm sh -c "mount --bind $W /mnt"', {
-        unshare: true, attack: `mount --bind ${W} /mnt`, back: look('/mnt/.ploinky-host'), expect: 'EINVAL',
+        unshare: true, attack: `mount --bind ${W} /mnt`, back: look('/mnt/.ploinky-box'), expect: 'EINVAL',
     });
-    add('N4', '4', 'unshare -Urm sh -c "mount --rbind $W /mnt && ls -A /mnt/.ploinky-host"', {
+    add('N4', '4', 'unshare -Urm sh -c "mount --rbind $W /mnt && ls -A /mnt/.ploinky-box"', {
         unshare: true,
-        attack: `mount --rbind ${W} /mnt && ls -A /mnt/.ploinky-host`,
-        back: look('/mnt/.ploinky-host'),
+        attack: `mount --rbind ${W} /mnt && ls -A /mnt/.ploinky-box`,
+        back: look('/mnt/.ploinky-box'),
         expect: 'empty',
     });
     for (const [id, plan, attack, expect, lock] of n4b) {
@@ -571,7 +571,7 @@ function buildRows(ctx) {
     }
     // The alias lookups above can rename the mount point's dentry (mountinfo then shows the alias
     // spelling); a canonical write afterwards proves the mask still covers the real name.
-    add('N11', 'post', 'touch $W/.ploinky-host/f (canonical name, after the alias lookups)', {
+    add('N11', 'post', 'touch $W/.ploinky-box/f (canonical name, after the alias lookups)', {
         attack: `touch ${H}/f-post`, back: look(H), expect: 'EROFS',
     });
     const checkout = `${W}/.runtime/ploinky`;
@@ -582,7 +582,7 @@ function buildRows(ctx) {
     add('N21', '2', 'touch $W/.runtime/ploinky/.git/x', {
         attack: `touch ${checkout}/.git/x`, back: `ls -A ${checkout}/.git`, expect: 'EROFS', box: shadowBoxes,
     });
-    // HS: the read-write store bind lives under `.ploinky-host/`; nothing reachable through it may
+    // HS: the read-write store bind lives under `.ploinky-box/`; nothing reachable through it may
     // reach the sentinel one to three levels above its source.
     const store = HS_DESTINATION;
     const hsBoxes = { target: 'targetHS', control: 'controlHS' };
@@ -817,8 +817,8 @@ function newContext(options) {
             controlHS: { mask: false, shadow: false, hs: 'widened' },
         },
         paths: {
-            host: path.join(W, '.ploinky-host'),
-            store: path.join(W, '.ploinky-host', 'hardware-limits', 'x', 'store'),
+            host: path.join(W, '.ploinky-box'),
+            store: path.join(W, '.ploinky-box', 'hardware-limits', 'x', 'store'),
             data: path.join(W, '.ploinky', 'data'),
             checkout: path.join(W, '.runtime', 'ploinky'),
         },

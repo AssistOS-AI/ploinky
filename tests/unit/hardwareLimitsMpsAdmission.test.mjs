@@ -21,9 +21,9 @@ function fixture(t) {
     const mapped = new Map(Object.values(mps).map((tool) => [tool.destination, tool.source]));
     const fsApi = new Proxy(fs, { get(target, key) { const value = target[key]; if (typeof value !== 'function') return value; return (...args) => value.call(target, typeof args[0] === 'string' ? mapped.get(args[0]) || args[0] : args[0], ...args.slice(1)); } });
     const pathHash = crypto.createHash('sha256').update(root).digest('hex').slice(0, 12);
-    const identity = { workspaceRoot: root, pathHash, instance: `ploinky-box-fixture-${pathHash}` };
+    const identity = { workspaceRoot: root, pathHash, instance: `ploinky-box-fixture-${pathHash}`, hostStateRoot: path.join(root, '.ploinky-box') };
     const discovery = { vendor: 'nvidia', driverVersion: '550.1', devices: [{ path: '/dev/nvidia0', major: 195, minor: 0 }], libraries: [{ soname: 'libcuda.so.1', source: '/usr/lib/libcuda.so.550.1', size: 100, mtimeMs: 1 }], tools: [{ name: 'nvidia-smi', source: '/usr/bin/nvidia-smi', size: 100, mtimeMs: 1 }] };
-    const wiring = buildGpuWiring({ identity, grant: { vendor: 'nvidia', agents: ['demo/worker'] }, discovery, homeDirectory: root, mps });
+    const wiring = buildGpuWiring({ identity, grant: { vendor: 'nvidia', agents: ['demo/worker'] }, discovery, mps });
     const specPath = path.join(root, 'cdi.json'), markerPath = path.join(root, 'grant.json'), boxMarker = path.join(root, 'box');
     fs.writeFileSync(specPath, wiring.files[0].content); fs.writeFileSync(markerPath, wiring.files.at(-1).content); fs.writeFileSync(boxMarker, BOX_MARKER_CONTENT);
     const gpuGrantOptions = { specPath, markerPath, fsApi };

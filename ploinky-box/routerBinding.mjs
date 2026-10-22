@@ -8,16 +8,24 @@
 // The saved preference is authoritative host state. Nested agents receive the
 // writable workspace bind, and the Box user namespace maps their writes to the
 // host user, so ownership checks cannot distinguish an agent-written
-// `.ploinky` file. The record therefore lives in the host-only `~/.ploinky-box`
-// state root, which is never mounted into the Box.
+// `.ploinky` file. The record therefore lives in the workspace's host-owned
+// `.ploinky-box` directory, which the Box contract masks read-only (the mask
+// is a later step; until then only the host writes it by convention).
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { BOX_ROUTER_CONTAINER_PORT, GPU_GRANT_STATE_DIRECTORY, HARDWARE_LIMITS_STATE_DIRECTORY } from './constants.mjs';
+import {
+    BOX_ROUTER_CONTAINER_PORT,
+    GPU_GRANT_STATE_DIRECTORY,
+    HARDWARE_LIMITS_STATE_DIRECTORY,
+    HOST_STATE_DIRECTORY_NAME,
+    ROUTER_BINDING_STATE_DIRECTORY,
+} from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
+import { ensureStoreDirectories, inspectStoreDirectories } from './hostState/stores.mjs';
 import { isContainerInterface, isUsableHostIpv4 } from './hostNetwork.mjs';
 import {
     PUBLIC_ROUTER_HOSTS_MAX_ENTRIES,
@@ -29,7 +37,7 @@ import {
 export const ROUTER_BIND_LOOPBACK = '127.0.0.1';
 export const ROUTER_BIND_WILDCARD = '0.0.0.0';
 export const ROUTER_PRIVATE_CONTAINER_PORT = 8081;
-export const ROUTER_BINDING_STATE_DIRECTORY = 'router-bindings';
+export { ROUTER_BINDING_STATE_DIRECTORY };
 export const ROUTER_BINDING_STATE_VERSION = 1;
 export const ROUTER_BINDING_STATE_MAX_BYTES = 4096;
 
@@ -314,7 +322,8 @@ function exactIdentity(identity) {
     const instance = String(identity?.instance || '');
     if (!/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance)
         || !/^[a-f0-9]{12}$/.test(String(identity?.pathHash || ''))
-        || !path.isAbsolute(String(identity?.workspaceRoot || ''))) {
+        || !path.isAbsolute(String(identity?.workspaceRoot || ''))
+        || identity?.hostStateRoot !== path.join(identity.workspaceRoot, HOST_STATE_DIRECTORY_NAME)) {
         throw stateError('Router binding state requires the exact workspace identity');
     }
     return identity;
@@ -371,16 +380,20 @@ function ancestorDirectoryIdentities(target, fsApi) {
 }
 
 /**
- * Keep host control state outside every writable Box mount, including cache
- * directory symlinks and bind-mount aliases that realpath cannot distinguish.
+ * Keep the host control state out of every writable Box source that is not the
+ * workspace bind itself, including cache directory symlinks and bind-mount
+ * aliases that realpath cannot distinguish. The state directory lives inside
+ * the workspace root, so the root necessarily contains it: the root is only
+ * checked for being the state directory or lying inside it, and for the state
+ * directory resolving inside it. The mask over `.ploinky-box` that protects
+ * the directory from in-Box writers is enforced where the Box is created.
  * Check the reserved paths even before the first binding or GPU grant exists.
  */
 export function assertRouterBindingStateConfined(identity, {
-    homeDirectory = os.homedir(),
     fsApi = fs,
 } = {}) {
     exactIdentity(identity);
-    const stateRoot = path.join(path.resolve(homeDirectory), '.ploinky-box');
+    const stateRoot = identity.hostStateRoot;
     const protectedPaths = [
         stateRoot,
         path.join(stateRoot, ROUTER_BINDING_STATE_DIRECTORY),
@@ -389,87 +402,62 @@ export function assertRouterBindingStateConfined(identity, {
     ].map((target) => realpathOfNearestExisting(target, fsApi));
     const protectedAncestors = protectedPaths.map((target) => ancestorDirectoryIdentities(target, fsApi));
     const protectedIdentities = protectedPaths.map((target) => directoryIdentity(target, fsApi)).filter(Boolean);
-    for (const source of [identity.workspaceRoot, ...Object.values(identity.dataPaths || {})]) {
+    const overlap = (source, { workspace }) => {
         const writable = realpathOfNearestExisting(source, fsApi);
         const writableIdentity = directoryIdentity(writable, fsApi);
         const writableAncestors = ancestorDirectoryIdentities(writable, fsApi);
-        if (protectedPaths.some((target) => containsPath(writable, target) || containsPath(target, writable))
-            || (writableIdentity && protectedAncestors.some((ancestors) => ancestors.has(writableIdentity)))
-            || protectedIdentities.some((entry) => writableAncestors.has(entry))) {
-            throw stateError(
-                `Router binding state ${stateRoot} overlaps writable Box source ${source}, where agents can write it; `
-                + 'choose a workspace and cache paths outside the host control-state directory',
-            );
-        }
+        // A writable source inside the protected tree always overlaps. One that
+        // contains it overlaps too, except the workspace root, which contains
+        // `.ploinky-box` by design.
+        return protectedPaths.some((target) => containsPath(target, writable)
+                || (!workspace && containsPath(writable, target)))
+            || protectedIdentities.some((entry) => writableAncestors.has(entry))
+            || (!workspace && writableIdentity && protectedAncestors.some((ancestors) => ancestors.has(writableIdentity)));
+    };
+    const refuse = (source) => stateError(
+        `Router binding state ${stateRoot} overlaps writable Box source ${source}, where agents can write it; `
+        + 'choose a workspace and cache paths outside the host control-state directory',
+    );
+    for (const source of Object.values(identity.dataPaths || {})) {
+        if (overlap(source, { workspace: false })) throw refuse(source);
+    }
+    if (overlap(identity.workspaceRoot, { workspace: true })) throw refuse(identity.workspaceRoot);
+    // `.ploinky-box` must be a directory of this workspace, not a link out of it.
+    const workspaceReal = realpathOfNearestExisting(identity.workspaceRoot, fsApi);
+    if (!containsPath(workspaceReal, protectedPaths[0]) || workspaceReal === protectedPaths[0]) {
+        throw stateError(`Host state ${stateRoot} does not resolve inside its workspace ${identity.workspaceRoot}`);
     }
 }
 
+const STATE_FILES = Object.freeze({ subject: 'Router binding state', stateError });
+
 /**
- * Host-only, per-workspace saved Router binding.
+ * Host-only, per-workspace saved Router binding. Every path is derived from
+ * the identity passed to each call.
  *
- * @param {{ homeDirectory?: string, fsApi?: typeof fs }} [options]
+ * @param {{ fsApi?: typeof fs }} [options]
  */
 export function createRouterBindingStore({
-    homeDirectory = os.homedir(),
     fsApi = fs,
 } = {}) {
-    const stateRoot = path.join(path.resolve(homeDirectory), '.ploinky-box');
-    const directory = path.join(stateRoot, ROUTER_BINDING_STATE_DIRECTORY);
+    function directoryFor(identity) {
+        return path.join(exactIdentity(identity).hostStateRoot, ROUTER_BINDING_STATE_DIRECTORY);
+    }
 
     function targetFor(identity) {
-        return path.join(directory, `${exactIdentity(identity).instance}.json`);
+        return path.join(directoryFor(identity), `${exactIdentity(identity).instance}.json`);
     }
 
-    function assertPrivateDirectory(target, stat) {
-        if (stat.isSymbolicLink() || !stat.isDirectory()) {
-            throw stateError(`Router binding state path is not a real directory: ${target}`);
-        }
-        const uid = currentUid();
-        if (uid !== null && stat.uid !== uid) {
-            throw stateError(`Router binding state directory is not owned by the current user: ${target}`);
-        }
-        if ((stat.mode & 0o022) !== 0) {
-            throw stateError(`Router binding state directory must not be group- or world-writable: ${target}`);
-        }
+    function existingDirectories(identity) {
+        return inspectStoreDirectories(identity, [ROUTER_BINDING_STATE_DIRECTORY], { fsApi, ...STATE_FILES });
     }
 
-    function existingDirectories() {
-        for (const target of [stateRoot, directory]) {
-            let stat;
-            try {
-                stat = fsApi.lstatSync(target);
-            } catch (error) {
-                if (error?.code === 'ENOENT') return false;
-                throw stateError(`Unable to inspect Router binding state directory: ${target}`, error);
-            }
-            assertPrivateDirectory(target, stat);
-        }
-        return true;
-    }
-
-    function ensureDirectories() {
-        for (const target of [stateRoot, directory]) {
-            try {
-                fsApi.mkdirSync(target, { mode: 0o700 });
-            } catch (error) {
-                if (error?.code !== 'EEXIST') {
-                    throw stateError(`Unable to create Router binding state directory: ${target}`, error);
-                }
-            }
-            const stat = fsApi.lstatSync(target);
-            if (stat.isSymbolicLink() || !stat.isDirectory()) {
-                throw stateError(`Router binding state path is not a real directory: ${target}`);
-            }
-            const uid = currentUid();
-            if (uid !== null && stat.uid !== uid) {
-                throw stateError(`Router binding state directory is not owned by the current user: ${target}`);
-            }
-            fsApi.chmodSync(target, 0o700);
-        }
+    function ensureDirectories(identity) {
+        ensureStoreDirectories(identity, [ROUTER_BINDING_STATE_DIRECTORY], { fsApi, ...STATE_FILES });
     }
 
     function assertConfined(identity) {
-        return assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
+        return assertRouterBindingStateConfined(identity, { fsApi });
     }
 
     function normalizeRecord(identity, record) {
@@ -503,7 +491,7 @@ export function createRouterBindingStore({
     function read(identity) {
         const target = targetFor(identity);
         assertConfined(identity);
-        if (!existingDirectories()) return null;
+        if (!existingDirectories(identity)) return null;
         let descriptor;
         try {
             descriptor = fsApi.openSync(
@@ -559,7 +547,7 @@ export function createRouterBindingStore({
         assertLock(identity, lock);
         const normalized = normalizeRouterBinding(binding);
         assertConfined(identity);
-        ensureDirectories();
+        ensureDirectories(identity);
         assertConfined(identity);
         const target = targetFor(identity);
         try {
@@ -579,7 +567,7 @@ export function createRouterBindingStore({
             hostPort: normalized.hostPort,
             containerPort: BOX_ROUTER_CONTAINER_PORT,
         };
-        const temporary = path.join(directory, `.${identity.instance}.${crypto.randomUUID()}.tmp`);
+        const temporary = path.join(directoryFor(identity), `.${identity.instance}.${crypto.randomUUID()}.tmp`);
         let descriptor;
         try {
             descriptor = fsApi.openSync(
@@ -608,7 +596,7 @@ export function createRouterBindingStore({
         exactIdentity(identity);
         assertLock(identity, lock);
         assertConfined(identity);
-        if (!existingDirectories()) return false;
+        if (!existingDirectories(identity)) return false;
         const target = targetFor(identity);
         let stat;
         try {
@@ -630,5 +618,5 @@ export function createRouterBindingStore({
         else clear(identity, lock);
     }
 
-    return Object.freeze({ directory, pathFor: targetFor, assertConfined, validateRecord: normalizeRecord, read, write, clear, restore });
+    return Object.freeze({ directoryFor, pathFor: targetFor, assertConfined, validateRecord: normalizeRecord, read, write, clear, restore });
 }

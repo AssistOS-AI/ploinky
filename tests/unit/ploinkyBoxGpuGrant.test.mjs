@@ -237,17 +237,16 @@ function useFakeHostFiles(t, host) {
 function workspaceFixture(t, name = 'workspace') {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-gpu-grant-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
     const workspace = path.join(root, name);
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
-    return { root, home, identity, lock, store: createGpuGrantStore({ homeDirectory: home }) };
+    const store = createGpuGrantStore();
+    return { root, identity, lock, store, directory: store.directoryFor(identity) };
 }
 
-function activeWiring(identity, { grant = GRANT, host = fakeHost(), homeDirectory = os.homedir() } = {}) {
-    return buildGpuWiring({ identity, grant, discovery: host.discover(), homeDirectory });
+function activeWiring(identity, { grant = GRANT, host = fakeHost() } = {}) {
+    return buildGpuWiring({ identity, grant, discovery: host.discover() });
 }
 
 // ---------------------------------------------------------------------------
@@ -271,15 +270,15 @@ test('discovery on a fixture sysroot yields a deterministic device, bind and Box
         [`libnvidia-gpucomp.so.${DRIVER}`, `${LIB}/libnvidia-gpucomp.so.${DRIVER}`],
     ]);
 
-    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery, homeDirectory: state.home });
-    const again = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery, homeDirectory: state.home });
+    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery });
+    const again = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery });
     assert.equal(wiring.fingerprint, again.fingerprint);
     assert.match(wiring.fingerprint, /^[a-f0-9]{64}$/);
     assert.equal(wiring.state, 'active');
     // /dev/nvidia-uvm-tools is deliberately not part of the minimal set.
     assert.deepEqual(wiring.devices, ['/dev/nvidia0', '/dev/nvidiactl', '/dev/nvidia-uvm']);
-    const generation = gpuGenerationDirectory(state.identity, wiring.fingerprint, state.home);
-    assert.equal(generation, path.join(state.home, '.ploinky-box', 'gpu-grants', state.identity.instance, wiring.fingerprint));
+    const generation = gpuGenerationDirectory(state.identity, wiring.fingerprint);
+    assert.equal(generation, path.join(state.identity.hostStateRoot, 'gpu-grants', state.identity.instance, wiring.fingerprint));
     assert.deepEqual(wiring.mounts, [
         { source: path.join(generation, 'box.json'), destination: BOX_GPU_CDI_SPEC_PATH },
         { source: path.join(generation, 'marker.json'), destination: BOX_GPU_MARKER_PATH },
@@ -312,14 +311,12 @@ test('discovery on a fixture sysroot yields a deterministic device, bind and Box
         identity: state.identity,
         grant: { vendor: 'nvidia', agents: [AGENT, 'lab/other'] },
         discovery,
-        homeDirectory: state.home,
     });
     assert.notEqual(otherAgents.fingerprint, wiring.fingerprint);
     const updated = buildGpuWiring({
         identity: state.identity,
         grant: GRANT,
         discovery: fakeHost({ kernel: '600.10', library: '600.10' }).discover(),
-        homeDirectory: state.home,
     });
     assert.notEqual(updated.fingerprint, wiring.fingerprint);
 });
@@ -329,7 +326,7 @@ test('Box create arguments add only the grant devices, read-only binds and label
     const seccomp = nestedPodmanSeccompProfilePath(state.root);
     fs.mkdirSync(path.dirname(seccomp), { recursive: true });
     fs.copyFileSync(new URL('../../ploinky-box/seccomp/podman-nested-pid-fallback.json', import.meta.url), seccomp);
-    const wiring = activeWiring(state.identity, { homeDirectory: state.home });
+    const wiring = activeWiring(state.identity, {});
     const base = {
         identity: state.identity,
         dataFingerprints: DATA_FINGERPRINTS,
@@ -389,8 +386,8 @@ test('arm64 discovery binds the AArch64 driver libraries and wires the Box exact
         [`libnvidia-gpucomp.so.${DRIVER}`, `${armLib}/libnvidia-gpucomp.so.${DRIVER}`],
     ]);
 
-    const armWiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: arm, homeDirectory: state.home });
-    const x64Wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: x64, homeDirectory: state.home });
+    const armWiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: arm });
+    const x64Wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: x64 });
     // The host sources differ, so the fingerprint does; nothing inside the Box does.
     assert.notEqual(armWiring.fingerprint, x64Wiring.fingerprint);
     assert.equal(armWiring.state, 'active');
@@ -440,7 +437,7 @@ test('arm64 discovery binds the AArch64 driver libraries and wires the Box exact
 
     // A Box created with the arm64 wiring reads back as that same wiring.
     const observed = observeContainerGpuWiring(containerHandle(state, { gpu: armWiring }),
-        { identity: state.identity, homeDirectory: state.home });
+        { identity: state.identity });
     assert.equal(observed.state, 'active');
     assert.equal(observed.fingerprint, armWiring.fingerprint);
 });
@@ -528,7 +525,6 @@ test('discovery refuses an unsupported host architecture, which leaves only a st
     );
     const stale = resolveGpuWiring(state.identity, GRANT, {
         discover: () => discoverNvidiaGpu({ arch: 'ppc64', fsApi: host.fsApi, readLdconfig: host.readLdconfig }),
-        homeDirectory: state.home,
     });
     assert.equal(stale.state, 'stale');
     assert.match(stale.reason, /does not support the "ppc64" host architecture/);
@@ -559,7 +555,7 @@ test('NVVM 7.0 is bound when present, under its unversioned real name only', (t)
             'libnvidia-nvvm70.so.4',
             `libnvidia-gpucomp.so.${DRIVER}`,
         ]);
-        const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery, homeDirectory: state.home });
+        const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery });
         assert.deepEqual(
             wiring.mounts.filter((mount) => mount.destination.endsWith('/libnvidia-nvvm70.so.4')),
             [{ source: `${lib}/libnvidia-nvvm70.so.4`, destination: '/usr/local/nvidia/lib64/libnvidia-nvvm70.so.4' }],
@@ -586,7 +582,6 @@ test('a failed discovery wires only a stale-grant marker (D12)', (t) => {
     const state = workspaceFixture(t);
     const stale = resolveGpuWiring(state.identity, GRANT, {
         discover: () => fakeHost({ kernel: '595.91.07', library: '600.10' }).discover(),
-        homeDirectory: state.home,
     });
     assert.equal(stale.state, 'stale');
     assert.match(stale.reason, /version mismatch/);
@@ -612,9 +607,9 @@ test('the grant record is private host state for one exact workspace', (t) => {
     assert.equal(state.store.read(state.identity), null);
     state.store.write(state.identity, GRANT, state.lock, { admitted: null });
     const target = state.store.pathFor(state.identity);
-    assert.equal(path.dirname(target), path.join(state.home, '.ploinky-box', 'gpu-grants'));
+    assert.equal(path.dirname(target), path.join(state.identity.hostStateRoot, 'gpu-grants'));
     assert.equal(fs.statSync(target).mode & 0o777, 0o600);
-    assert.equal(fs.statSync(state.store.directory).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(state.directory).mode & 0o777, 0o700);
     // D14 adds denies to the decision; a record without them keeps its bytes.
     assert.deepEqual(state.store.read(state.identity),
         { vendor: 'nvidia', agents: [AGENT], denied: [], workspaceDenied: false, admitted: null });
@@ -655,20 +650,31 @@ test('the grant record is private host state for one exact workspace', (t) => {
     assert.throws(() => state.store.write(state.identity, GRANT, null), /workspace mutation lock/);
 });
 
-test('the grant state refuses workspaces or caches that alias the host control-state directory', (t) => {
+test('the grant state refuses caches that alias the host control-state directory', (t) => {
     const state = workspaceFixture(t);
-    const inside = path.join(state.home, '.ploinky-box', 'gpu-grants', 'ws');
-    fs.mkdirSync(path.join(inside, '.ploinky'), { recursive: true });
-    const aliased = buildWorkspaceIdentity(inside, { markerFound: true });
-    assert.throws(
-        () => state.store.read(aliased),
-        (error) => error.code === 'PLOINKY_BOX_ROUTER_BINDING_STATE_INVALID' && /overlaps writable Box source/.test(error.message),
-    );
+    fs.mkdirSync(state.identity.boxDataRoot);
+    for (const key of ['dependencies', 'images']) {
+        for (const destination of [state.identity.hostStateRoot, state.directory]) {
+            // These targets do not exist yet; a first grant must not create
+            // host authority under an existing cache alias.
+            fs.symlinkSync(destination, state.identity.dataPaths[key]);
+            assert.throws(
+                () => state.store.read(state.identity),
+                (error) => error.code === 'PLOINKY_BOX_ROUTER_BINDING_STATE_INVALID' && /overlaps writable Box source/.test(error.message),
+            );
+            assert.throws(
+                () => state.store.write(state.identity, GRANT, state.lock),
+                (error) => error.code === 'PLOINKY_BOX_ROUTER_BINDING_STATE_INVALID' && /overlaps writable Box source/.test(error.message),
+            );
+            assert.equal(fs.existsSync(state.directory), false);
+            fs.unlinkSync(state.identity.dataPaths[key]);
+        }
+    }
 });
 
 test('the grant state refuses a workspace that is a bind-mount alias of the gpu-grants directory', (t) => {
     const state = workspaceFixture(t);
-    const grants = path.join(state.home, '.ploinky-box', 'gpu-grants');
+    const grants = path.join(state.identity.hostStateRoot, 'gpu-grants');
     fs.mkdirSync(grants, { recursive: true, mode: 0o700 });
     const grantsStat = fs.statSync(grants);
     const workspace = state.identity.workspaceRoot;
@@ -682,9 +688,24 @@ test('the grant state refuses a workspace that is a bind-mount alias of the gpu-
             return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { dev: grantsStat.dev, ino: grantsStat.ino });
         },
     };
-    assert.doesNotThrow(() => assertRouterBindingStateConfined(state.identity, { homeDirectory: state.home }));
+    assert.doesNotThrow(() => assertRouterBindingStateConfined(state.identity, {}));
     assert.throws(
-        () => assertRouterBindingStateConfined(state.identity, { homeDirectory: state.home, fsApi }),
+        () => assertRouterBindingStateConfined(state.identity, { fsApi }),
+        /overlaps writable Box source/,
+    );
+    // The same alias on a cache path, which no mask will ever cover, is refused too.
+    const cache = state.identity.dataPaths.images;
+    fs.mkdirSync(cache, { recursive: true });
+    const cacheApi = {
+        ...fs,
+        statSync(target, options) {
+            const stat = fs.statSync(target, options);
+            if (path.resolve(target) !== cache) return stat;
+            return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { dev: grantsStat.dev, ino: grantsStat.ino });
+        },
+    };
+    assert.throws(
+        () => assertRouterBindingStateConfined(state.identity, { fsApi: cacheApi }),
         /overlaps writable Box source/,
     );
 });
@@ -725,12 +746,12 @@ test('an observed wiring must bind its own generation files, and a stale one not
 test('D14 an observed marker-only Box is revoked when its own generation marker says so, and stale otherwise', (t) => {
     const state = boxFixture(t);
     const observe = (wiring) => observeContainerGpuWiring(containerHandle(state, { gpu: wiring }),
-        { identity: state.identity, homeDirectory: state.home });
+        { identity: state.identity });
     const revokedWiring = (denials) => buildGpuWiring({
-        identity: state.identity, grant: { vendor: 'nvidia' }, revoked: true, ...denials, homeDirectory: state.home,
+        identity: state.identity, grant: { vendor: 'nvidia' }, revoked: true, ...denials,
     });
     const stale = buildGpuWiring({ identity: state.identity, grant: GRANT,
-        failure: new Error('Unable to read the NVIDIA kernel module version'), homeDirectory: state.home });
+        failure: new Error('Unable to read the NVIDIA kernel module version') });
     state.store.materialize(state.identity, stale, state.lock);
     assert.equal(observe(stale).state, 'stale');
     const workspaceRevoked = revokedWiring({ workspaceDenied: true });
@@ -741,14 +762,14 @@ test('D14 an observed marker-only Box is revoked when its own generation marker 
     const observed = observe(agentRevoked);
     assert.deepEqual([observed.fingerprint, observed.state], [agentRevoked.fingerprint, 'revoked']);
     // Without its generation marker (pruned or unreadable) a marker-only Box reads as stale.
-    fs.rmSync(path.join(gpuGenerationDirectory(state.identity, agentRevoked.fingerprint, state.home), 'marker.json'));
+    fs.rmSync(path.join(gpuGenerationDirectory(state.identity, agentRevoked.fingerprint), 'marker.json'));
     assert.equal(observe(agentRevoked).state, 'stale');
 });
 
 test('generation files are content addressed, private and pruned only by name', (t) => {
     const state = workspaceFixture(t);
-    const first = activeWiring(state.identity, { homeDirectory: state.home });
-    const second = activeWiring(state.identity, { homeDirectory: state.home, host: fakeHost({ mtimeMs: 1 }) });
+    const first = activeWiring(state.identity, {});
+    const second = activeWiring(state.identity, { host: fakeHost({ mtimeMs: 1 }) });
     state.store.materialize(state.identity, first, state.lock);
     state.store.materialize(state.identity, first, state.lock);
     state.store.materialize(state.identity, second, state.lock);
@@ -761,7 +782,7 @@ test('generation files are content addressed, private and pruned only by name', 
     assert.deepEqual(state.store.prune(state.identity, [second.fingerprint], state.lock), [first.fingerprint]);
     assert.equal(fs.existsSync(path.dirname(second.files[0].path)), true);
     assert.deepEqual(state.store.prune(state.identity, [], state.lock), [second.fingerprint]);
-    assert.equal(fs.existsSync(path.join(state.store.directory, state.identity.instance)), false);
+    assert.equal(fs.existsSync(path.join(state.directory, state.identity.instance)), false);
 });
 
 test('destroy teardown preflight is read-only and refuses symlinked, foreign or unexpected GPU state', (t) => {
@@ -769,15 +790,15 @@ test('destroy teardown preflight is read-only and refuses symlinked, foreign or 
     const fresh = workspaceFixture(t, 'fresh');
     assert.equal(typeof fresh.store.planTeardown, 'function', 'the GPU store has a destroy preflight');
     assert.deepEqual(fresh.store.planTeardown(fresh.identity, fresh.lock), { recordPath: null, instanceDir: null, entries: [] });
-    assert.equal(fs.existsSync(path.join(fresh.home, '.ploinky-box')), false, 'the preflight never creates state directories');
+    assert.equal(fs.existsSync(fresh.identity.hostStateRoot), false, 'the preflight never creates state directories');
     assert.throws(() => fresh.store.planTeardown(fresh.identity, null), /requires the workspace mutation lock/);
 
     // A complete record plus generation: planned exactly, nothing deleted.
     const state = workspaceFixture(t);
     state.store.write(state.identity, GRANT, state.lock);
-    const wiring = activeWiring(state.identity, { homeDirectory: state.home });
+    const wiring = activeWiring(state.identity, {});
     state.store.materialize(state.identity, wiring, state.lock);
-    const instanceDir = path.join(state.store.directory, state.identity.instance);
+    const instanceDir = path.join(state.directory, state.identity.instance);
     const generation = path.join(instanceDir, wiring.fingerprint);
     assert.deepEqual(state.store.planTeardown(state.identity, state.lock), {
         recordPath: state.store.pathFor(state.identity), instanceDir, entries: [generation],
@@ -811,7 +832,7 @@ test('destroy teardown preflight is read-only and refuses symlinked, foreign or 
     const outside = path.join(linked.root, 'outside');
     fs.mkdirSync(path.join(outside, 'a'.repeat(64)), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(outside, 'a'.repeat(64), 'keep'), 'outside data', { mode: 0o600 });
-    fs.symlinkSync(outside, path.join(linked.store.directory, linked.identity.instance));
+    fs.symlinkSync(outside, path.join(linked.directory, linked.identity.instance));
     assert.throws(() => linked.store.planTeardown(linked.identity, linked.lock), /is not a real directory/);
     assert.equal(fs.readFileSync(path.join(outside, 'a'.repeat(64), 'keep'), 'utf8'), 'outside data');
     assert.equal(fs.existsSync(linked.store.pathFor(linked.identity)), true, 'the record is kept too');
@@ -825,8 +846,8 @@ test('two workspaces keep separate grants and generations', (t) => {
     const rightLock = { assertHeld(instance) { assert.equal(instance, right.instance); } };
     left.store.write(left.identity, GRANT, left.lock);
     assert.equal(left.store.read(right), null);
-    const leftWiring = activeWiring(left.identity, { homeDirectory: left.home });
-    const rightWiring = activeWiring(right, { homeDirectory: left.home });
+    const leftWiring = activeWiring(left.identity);
+    const rightWiring = activeWiring(right);
     assert.notEqual(leftWiring.fingerprint, rightWiring.fingerprint);
     left.store.materialize(left.identity, leftWiring, left.lock);
     left.store.materialize(right, rightWiring, rightLock);
@@ -844,9 +865,8 @@ function boxMarkerFixture(t, { grant = GRANT, stale = false } = {}) {
     const wiring = stale
         ? resolveGpuWiring(state.identity, grant, {
             discover: () => fakeHost({ library: '600.10' }).discover(),
-            homeDirectory: state.home,
         })
-        : activeWiring(state.identity, { grant, homeDirectory: state.home });
+        : activeWiring(state.identity, { grant });
     state.store.materialize(state.identity, wiring, state.lock);
     const byDestination = Object.fromEntries(wiring.mounts.map((mount) => [mount.destination, mount.source]));
     const boxMarker = path.join(state.root, 'ploinky-box');
@@ -1239,11 +1259,11 @@ test('a failed replacement restores the old Box with its own GPU wiring', async 
 test('MPS enabled Box wiring is observed exactly and preserves both tools during rollback', async (t) => {
     const state = boxFixture(t);
     const host = fakeHost(); useFakeHostFiles(t, host);
-    t.mock.method(os, 'homedir', () => state.home);
+    useTempHome(t, state.root);
     const toolsRoot = path.join(state.root, 'tools'); fs.mkdirSync(toolsRoot);
     for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const mps = discoverMpsTools({ directories: [toolsRoot] });
-    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: host.discover(), mps, homeDirectory: state.home });
+    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: host.discover(), mps });
     state.store.materialize(state.identity, wiring, state.lock);
     const old = containerHandle(state, { gpu: wiring });
     assert.doesNotThrow(() => validateContainerConfiguration(old, desiredFor(state, undefined)));
@@ -1290,7 +1310,6 @@ function fakeLockManager(root, events) {
 function memoryGpuStore(events, initial = null) {
     let value = initial;
     return {
-        homeDirectory: os.homedir(),
         get value() { return value; },
         read() { return value; },
         write(identity, grant, lock, { admitted = null } = {}) {
@@ -1849,7 +1868,7 @@ test('a kept wiring whose driver files were removed refuses before the old Box i
 
 test('a kept wiring whose device node disappeared refuses with restart guidance', (t) => {
     const fixture = workspaceFixture(t);
-    const wiring = activeWiring(fixture.identity, { homeDirectory: fixture.home });
+    const wiring = activeWiring(fixture.identity);
     fixture.store.materialize(fixture.identity, wiring, fixture.lock);
     const kept = { ...wiring, files: undefined };
     useFakeHostFiles(t, fakeHost());
@@ -2086,7 +2105,7 @@ test('D14 golden: agents without the field, operator grants and their wiring kee
     const gpu = await import(GPU_MODULE);
     assert.equal(typeof gpu.resolveDesiredGpuWiring, 'function');
     // Values computed with the pre-D14 code (69bfdb4c) for these fixed inputs.
-    const identity = { instance: 'ploinky-box-golden-0123456789ab', pathHash: '0123456789ab', workspaceRoot: '/golden/ws' };
+    const identity = { instance: 'ploinky-box-golden-0123456789ab', pathHash: '0123456789ab', workspaceRoot: '/golden/ws', hostStateRoot: '/golden/ws/.ploinky-box' };
     const discovery = {
         vendor: 'nvidia', driverVersion: '595.91.07',
         devices: [
@@ -2103,18 +2122,18 @@ test('D14 golden: agents without the field, operator grants and their wiring kee
     const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
     const marker = (wiring) => wiring.files.find((file) => file.path.endsWith('marker.json')).content;
     const grant = { vendor: 'nvidia', agents: [AGENT] };
-    const active = gpu.buildGpuWiring({ identity, grant, discovery, homeDirectory: '/golden/home' });
+    const active = gpu.buildGpuWiring({ identity, grant, discovery });
     assert.equal(active.fingerprint, '0fead200bc4847bb01b08c9b6abebb9a8b01008aacec983bff4fd9daa3fff60f');
     assert.equal(sha(marker(active)), '68006b1850309910a3153befe931d63f7b321477e9dff4102c12cdc0d1e3bb53');
-    const stale = gpu.buildGpuWiring({ identity, grant, failure: new Error('Unable to read the NVIDIA kernel module version'), homeDirectory: '/golden/home' });
+    const stale = gpu.buildGpuWiring({ identity, grant, failure: new Error('Unable to read the NVIDIA kernel module version') });
     assert.equal(stale.fingerprint, 'ebf1f08471ebd3facf4e93a3b40b2a3d2cde3f3b335f5f167a67568e00d7d25d');
     assert.equal(sha(marker(stale)), 'd487cbeba75577d3fa31b92536452411b0069a8cf3ea6ea9893b3d23a55857e9');
     // The same effective set reached through a manifest, or with a deny that
     // hides no declared agent, keeps the operator grant's fingerprint.
     const discover = () => discovery;
-    const viaManifest = gpu.resolveDesiredGpuWiring(identity, null, [AGENT], { discover, homeDirectory: '/golden/home' });
+    const viaManifest = gpu.resolveDesiredGpuWiring(identity, null, [AGENT], { discover });
     const withIneffectiveDeny = gpu.resolveDesiredGpuWiring(identity, { agents: [AGENT], denied: ['lab/cpu'] }, [],
-        { discover, homeDirectory: '/golden/home' });
+        { discover });
     assert.equal(viaManifest.fingerprint, active.fingerprint);
     assert.equal(withIneffectiveDeny.fingerprint, active.fingerprint);
     const digest = (manifest, agentId) => runtimeCapabilityDigest(resolveEffectiveRuntimeCapabilities(manifest, {
@@ -2205,7 +2224,7 @@ function gpuEnv(args) {
 test('D14 admission: a declaring agent gets the device when wired, and otherwise starts without it and is told why', async (t) => {
     const gpu = await import(GPU_MODULE);
     const desired = (decision, declared) => (state) => gpu.resolveDesiredGpuWiring(state.identity, decision, declared, {
-        discover: () => fakeHost().discover(), homeDirectory: state.home,
+        discover: () => fakeHost().discover(),
     });
     const args = (admission) => renderRuntimePolicyArgs(admission.descriptor, { runtime: 'podman' });
     // Attached: the active wiring names it because its manifest declares the GPU.
@@ -2260,11 +2279,11 @@ test('D14 GPU-less host: a declared agent starts without the device, and its Box
     const noGpu = () => { throw Object.assign(new Error('Unable to read the NVIDIA kernel module version from /proc/driver/nvidia/version'), { code: 'PLOINKY_BOX_GPU_DISCOVERY_FAILED' }); };
     const state = workspaceFixture(t);
     // Manifest only: no wiring at all, exactly today's Box.
-    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu, homeDirectory: state.home }), null);
+    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu }), null);
     // An operator grant keeps today's stale marker.
-    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, { agents: [AGENT] }, [AGENT], { discover: noGpu, homeDirectory: state.home }).state, 'stale');
+    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, { agents: [AGENT] }, [AGENT], { discover: noGpu }).state, 'stale');
     // gpu grant insists on a working GPU.
-    assert.throws(() => gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu, homeDirectory: state.home, strict: true }),
+    assert.throws(() => gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu, strict: true }),
         /NVIDIA kernel module version/);
     // Start on that host: the Box is created without GPU wiring, the note names
     // the declaring agents, and the agent is refused with the guidance.
@@ -2298,7 +2317,7 @@ test('D14 no declarations and no record: no GPU wiring, as before', async (t) =>
     const gpu = await import(GPU_MODULE);
     const state = workspaceFixture(t);
     assert.equal(gpu.resolveDesiredGpuWiring(state.identity, null, [], {
-        discover: () => assert.fail('no discovery without a GPU agent'), homeDirectory: state.home,
+        discover: () => assert.fail('no discovery without a GPU agent'),
     }), null);
     const box = graphBox(t);
     const events = [];
@@ -2527,9 +2546,9 @@ test('G.every-final-generation-gpu', async (t) => {
     const { initializeStore } = await import('../../cli/sandbox/hardwareLimits/store.mjs');
     const scenario = async (label, { gpu = null, overrides = {}, invoke, generations }) => {
         const box = graphBox(t, { gpu });
-        const gateStore = createHardwareGateStore({ homeDirectory: home });
+        const gateStore = createHardwareGateStore();
         gateStore.write(box.identity, true, box.lock);
-        const wiring = resolveDesiredHardwareWiring({ identity: box.identity, enabled: true, homeDirectory: home, initializeStore });
+        const wiring = resolveDesiredHardwareWiring({ identity: box.identity, enabled: true, initializeStore });
         const events = [];
         let replacements = 0;
         const supervisor = gpuSupervisor(box, events, {
@@ -2598,7 +2617,7 @@ for (const [operation, invoke] of [
         const home = useTempHome(t, box.root);
         useFakeHostFiles(t, fakeHost());
         const { createHardwareGateStore } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
-        const gateStore = createHardwareGateStore({ homeDirectory: home });
+        const gateStore = createHardwareGateStore();
         gateStore.write(box.identity, false, box.lock);
         const toolsRoot = path.join(box.root, 'mps-tools'); fs.mkdirSync(toolsRoot);
         for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
@@ -2647,7 +2666,7 @@ async function restartedMarker(t, discoverGpuMpsTools, { toolsRoot = null } = {}
     const home = useTempHome(t, box.root);
     useFakeHostFiles(t, fakeHost());
     const { createHardwareGateStore } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
-    const gateStore = createHardwareGateStore({ homeDirectory: home });
+    const gateStore = createHardwareGateStore();
     gateStore.write(box.identity, false, box.lock);
     const events = [];
     const requested = [];

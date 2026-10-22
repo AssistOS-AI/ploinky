@@ -488,7 +488,7 @@ function assertNoEngineVolumeCommand(calls) {
 for (const [name, failDuringReconcile] of [['G.first-enable-rollback-policy', false], ['G.first-enable-reconcile-failure-policy', true]]) {
     test(name, async (t) => {
         const state = fixture(t);
-        const paths = hardwareStorePaths({ identity: state.identity, homeDirectory: path.join(state.root, 'private-home') });
+        const paths = hardwareStorePaths({ identity: state.identity });
         initializeStore({ paths, identity: state.identity });
         const installPolicy = () => setAgentLimits({
             paths, identity: state.identity, expectedToken: readStoreSnapshot({ paths, identity: state.identity }).token,

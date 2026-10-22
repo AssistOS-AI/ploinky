@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { createOperationRecord } from '../../cli/commands/updateOutcome.js';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
+import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
 import { createUpdateBoxScenario } from '../helpers/updateBoxScenario.mjs';
@@ -15,7 +16,7 @@ import { createUpdateBoxScenario } from '../helpers/updateBoxScenario.mjs';
 
 const root = process.env.FIXTURE_ROOT;
 const workspace = process.env.FIXTURE_WORKSPACE;
-const store = createUpdateHostState({ stateRoot: process.env.FIXTURE_STATE_ROOT });
+const store = createUpdateHostState({ identity: buildWorkspaceIdentity(workspace) });
 const dirty = process.env.FIXTURE_CHILD_OUTCOME === 'dirty';
 const scenario = createUpdateBoxScenario({
     root: path.join(root, 'child'),

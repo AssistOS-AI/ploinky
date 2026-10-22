@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
@@ -22,7 +21,7 @@ const AUTOMATIC_REPAIRS = Object.freeze({
     'start-podman-machine': startSelectedMachine,
 });
 
-// The workspace lock lives in `<workspace>/.ploinky-host/locks`. The lock
+// The workspace lock lives in `<workspace>/.ploinky-box/locks`. The lock
 // manager only validates existing skeleton directories, but a repair checks
 // them before taking the lock so that it never builds on untrusted state.
 function assertSafeLockParents(workspaceRoot, fsApi, uid) {
@@ -99,7 +98,7 @@ export function formatRepairReport(report) {
 /** Apply only named, locally implemented user repairs; diagnostic prose is never executable. */
 export async function repairWorkspace({
     env = process.env, cwd = process.cwd(), repositoryRoot = path.resolve(import.meta.dirname, '..'),
-    platform = process.platform, uid = process.getuid?.(), homeDirectory = os.homedir(), fsApi = fs,
+    platform = process.platform, uid = process.getuid?.(), fsApi = fs,
     explicitPort, explicitMediaPort, dryRun = false, progress = () => {},
     runner = createProcessRunner({ env: buildEngineProcessEnvironment(env) }),
     diagnose = diagnoseWorkspace, lockManager = createMutationLockManager({ fsApi }),
@@ -114,7 +113,7 @@ export async function repairWorkspace({
         ], commands: [] }, { context });
         return resultReport({ before: report, outcomes: [], dryRun });
     }
-    const options = { env, cwd, repositoryRoot, platform, uid, homeDirectory, fsApi,
+    const options = { env, cwd, repositoryRoot, platform, uid, fsApi,
         explicitPort, explicitMediaPort, runner, progress };
     progress('Inspecting user-repair preconditions');
     const before = annotateRemediations(await diagnose({ ...options, inspectionOnly: true }), { context });
@@ -130,7 +129,7 @@ export async function repairWorkspace({
         try {
             const resolveIdentity = () => resolveWorkspaceIdentity({ env, cwd: () => typeof cwd === 'function' ? cwd() : cwd });
             const identity = resolveIdentity();
-            assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
+            assertRouterBindingStateConfined(identity, { fsApi });
             // A repair must not build on previously untrusted lock state.
             assertSafeLockParents(identity.workspaceRoot, fsApi, uid);
             lock = await lockManager.acquire(identity.instance, { workspaceRoot: identity.workspaceRoot });

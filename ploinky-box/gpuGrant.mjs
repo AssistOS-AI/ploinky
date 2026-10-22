@@ -3,10 +3,11 @@
 // Agents get the GPU through their manifest (`containerSecurity.gpu: true`,
 // D14) or through `ploinky gpu grant --agent REPO/AGENT`; `ploinky gpu revoke`
 // denies agents or turns manifest defaults off. The operator's decision lives
-// in the host-only `~/.ploinky-box/gpu-grants/<instance>.json`, never in the
-// workspace, because agents can write the workspace bind. Host discovery then
-// derives the exact wiring for the outer Box: explicit `--device` nodes, one
-// read-only bind per driver library (under its soname in
+// in the host-owned `<workspace>/.ploinky-box/gpu-grants/<instance>.json`,
+// which the Box contract masks read-only (a later step) because agents can
+// write the rest of the workspace bind. Host discovery then derives the exact
+// wiring for the outer Box: explicit `--device` nodes, one read-only bind per
+// driver library (under its soname in
 // `/usr/local/nvidia/lib64`), a read-only `nvidia-smi`, a hookless CDI spec at
 // `/etc/cdi/ploinky-gpu.json` for the nested Podman, and a read-only grant
 // marker that in-Box admission checks. The wiring is content addressed: its
@@ -19,7 +20,6 @@
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -31,9 +31,11 @@ import {
     BOX_GPU_MARKER_PATH,
     BOX_LABELS,
     GPU_GRANT_STATE_DIRECTORY,
+    HOST_STATE_DIRECTORY_NAME,
 } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import { discoverVulkanRenderNode, nvidiaAbsent, revalidateRenderNode, RENDER_DEVICE_PATH_RE } from './gpuVulkan.mjs';
+import { ensureStoreDirectories, inspectStoreDirectories } from './hostState/stores.mjs';
 import { assertRouterBindingStateConfined } from './routerBinding.mjs';
 import { discoverMpsTools, validateMpsTools, revalidateMpsTools, MPS_TOOL_PATHS } from './lib/mpsTools.mjs';
 import {
@@ -42,8 +44,6 @@ import {
     normalizeGpuAgentSelector,
 } from './lib/gpuGrantMarker.mjs';
 import {
-    assertPrivateDirectoryIfPresent as assertSharedPrivateDirectoryIfPresent,
-    ensurePrivateDirectory as ensureSharedPrivateDirectory,
     readPrivateFile as readSharedPrivateFile,
     writePrivateFileAtomically as writeSharedPrivateFileAtomically,
 } from './privateStateFiles.mjs';
@@ -128,7 +128,8 @@ function exactIdentity(identity) {
     const instance = String(identity?.instance || '');
     if (!/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance)
         || !/^[a-f0-9]{12}$/.test(String(identity?.pathHash || ''))
-        || !path.isAbsolute(String(identity?.workspaceRoot || ''))) {
+        || !path.isAbsolute(String(identity?.workspaceRoot || ''))
+        || identity?.hostStateRoot !== path.join(identity.workspaceRoot, HOST_STATE_DIRECTORY_NAME)) {
         throw stateError('GPU grant state requires the exact workspace identity');
     }
     return identity;
@@ -423,18 +424,14 @@ export function discoverGpu(vendor, options = {}) {
 // Wiring
 // ---------------------------------------------------------------------------
 
-function stateRootFor(homeDirectory) {
-    return path.join(path.resolve(homeDirectory), '.ploinky-box');
+export function gpuGrantDirectory(identity) {
+    return path.join(exactIdentity(identity).hostStateRoot, GPU_GRANT_STATE_DIRECTORY);
 }
 
-export function gpuGrantDirectory(homeDirectory = os.homedir()) {
-    return path.join(stateRootFor(homeDirectory), GPU_GRANT_STATE_DIRECTORY);
-}
-
-export function gpuGenerationDirectory(identity, fingerprint, homeDirectory = os.homedir()) {
+export function gpuGenerationDirectory(identity, fingerprint) {
     exactIdentity(identity);
     if (!FINGERPRINT_RE.test(String(fingerprint))) throw stateError('GPU wiring fingerprint is invalid');
-    return path.join(gpuGrantDirectory(homeDirectory), identity.instance, fingerprint);
+    return path.join(gpuGrantDirectory(identity), identity.instance, fingerprint);
 }
 
 function singleLine(text, limit = 300) {
@@ -480,7 +477,6 @@ export function buildGpuWiring({
     workspaceDenied = false,
     mps = null,
     mpsFailure = null,
-    homeDirectory = os.homedir(),
 }) {
     exactIdentity(identity);
     let normalizedGrant;
@@ -533,7 +529,7 @@ export function buildGpuWiring({
         ...(mps ? { mps } : {}),
         ...(mpsProblem ? { mpsProblem } : {}),
     }));
-    const generation = gpuGenerationDirectory(identity, fingerprint, homeDirectory);
+    const generation = gpuGenerationDirectory(identity, fingerprint);
     const specText = discovery ? renderBoxCdiSpec(discovery) : null;
     const markerText = `${JSON.stringify({
         version: GPU_GRANT_MARKER_VERSION,
@@ -592,7 +588,6 @@ export function buildGpuWiring({
 /** The operator grant plus a fresh discovery; discovery failure means stale. */
 export function resolveGpuWiring(identity, grant, {
     discover = discoverGpu,
-    homeDirectory = os.homedir(),
 } = {}) {
     const normalizedGrant = normalizeGpuGrant(grant);
     if (!normalizedGrant) return null;
@@ -601,11 +596,10 @@ export function resolveGpuWiring(identity, grant, {
             identity,
             grant: normalizedGrant,
             discovery: discover(normalizedGrant.vendor),
-            homeDirectory,
         });
     } catch (error) {
         if (error?.code !== 'PLOINKY_BOX_GPU_DISCOVERY_FAILED') throw error;
-        return buildGpuWiring({ identity, grant: normalizedGrant, failure: error, homeDirectory });
+        return buildGpuWiring({ identity, grant: normalizedGrant, failure: error });
     }
 }
 
@@ -618,7 +612,6 @@ export function resolveGpuWiring(identity, grant, {
  */
 export function resolveDesiredGpuWiring(identity, decision, declared = [], {
     discover = discoverGpu,
-    homeDirectory = os.homedir(),
     strict = false,
     mpsEnabled = false,
     discoverMps = discoverMpsTools,
@@ -633,7 +626,7 @@ export function resolveDesiredGpuWiring(identity, decision, declared = [], {
         } catch (error) {
             if (strict || error?.code !== 'PLOINKY_BOX_GPU_DISCOVERY_FAILED') throw error;
             if (!access.operatorAgents.length) return null;
-            return buildGpuWiring({ identity, grant, failure: error, ...denials, homeDirectory });
+            return buildGpuWiring({ identity, grant, failure: error, ...denials });
         }
         let mps = null;
         let mpsFailure = null;
@@ -643,10 +636,10 @@ export function resolveDesiredGpuWiring(identity, decision, declared = [], {
             try { mps = discoverMps(); validateMpsTools(mps); }
             catch (error) { mps = null; mpsFailure = String(error?.message || error || 'MPS tool discovery failed'); }
         }
-        return buildGpuWiring({ identity, grant, discovery, ...denials, mps, ...(mpsFailure ? { mpsFailure } : {}), homeDirectory });
+        return buildGpuWiring({ identity, grant, discovery, ...denials, mps, ...(mpsFailure ? { mpsFailure } : {}) });
     }
     if (access.denied.length || access.workspaceDenied) {
-        return buildGpuWiring({ identity, grant: { vendor: access.vendor }, revoked: true, ...denials, homeDirectory });
+        return buildGpuWiring({ identity, grant: { vendor: access.vendor }, revoked: true, ...denials });
     }
     return null;
 }
@@ -824,7 +817,7 @@ function wiringObservationError(message) {
  *
  * @returns {Readonly<object>|null} null for a Box without a GPU grant label
  */
-export function observeContainerGpuWiring(containerHandle, { homeDirectory = os.homedir(), identity = null } = {}) {
+export function observeContainerGpuWiring(containerHandle, { identity = null } = {}) {
     const labels = containerHandle?.labels || {};
     const runtime = containerHandle?.runtime || {};
     if (!Object.hasOwn(labels, BOX_LABELS.gpuGrant)) return null;
@@ -842,7 +835,7 @@ export function observeContainerGpuWiring(containerHandle, { homeDirectory = os.
     const instance = identity?.instance
         || (typeof containerHandle?.name === 'string' ? containerHandle.name : '');
     const generation = identity
-        ? gpuGenerationDirectory(identity, fingerprint, homeDirectory)
+        ? gpuGenerationDirectory(identity, fingerprint)
         : null;
     const mounts = gpuMounts.map((mount) => {
         const destination = String(mount.destination);
@@ -920,14 +913,6 @@ function assertLock(identity, lock) {
 
 const GPU_STATE_FILES = Object.freeze({ subject: 'GPU grant state', stateError });
 
-function ensurePrivateDirectory(fsApi, target) {
-    return ensureSharedPrivateDirectory(fsApi, target, GPU_STATE_FILES);
-}
-
-function assertPrivateDirectoryIfPresent(fsApi, target) {
-    return assertSharedPrivateDirectoryIfPresent(fsApi, target, GPU_STATE_FILES);
-}
-
 function readPrivateFile(fsApi, target, maxBytes, label) {
     return readSharedPrivateFile(fsApi, target, maxBytes, label, GPU_STATE_FILES);
 }
@@ -939,28 +924,40 @@ function writePrivateFileAtomically(fsApi, directory, target, content, beforeRen
 /**
  * Host-only, per-workspace GPU grant record and generation files.
  *
- * @param {{ homeDirectory?: string, fsApi?: typeof fs }} [options]
+ * Every path is derived from the identity passed to each call.
+ *
+ * @param {{ fsApi?: typeof fs }} [options]
  */
 export function createGpuGrantStore({
-    homeDirectory = os.homedir(),
     fsApi = fs,
     platform = process.platform,
     engineRunner,
     renderOptions = {},
 } = {}) {
-    const stateRoot = stateRootFor(homeDirectory);
-    const directory = gpuGrantDirectory(homeDirectory);
+    function directoryFor(identity) {
+        return gpuGrantDirectory(identity);
+    }
 
     function targetFor(identity) {
-        return path.join(directory, `${exactIdentity(identity).instance}.json`);
+        return path.join(directoryFor(identity), `${exactIdentity(identity).instance}.json`);
     }
 
     function instanceDirectory(identity) {
-        return path.join(directory, exactIdentity(identity).instance);
+        return path.join(directoryFor(identity), exactIdentity(identity).instance);
+    }
+
+    // The `.ploinky-box` root, the grants directory and, when asked for, the
+    // instance directory: false when one of them does not exist yet.
+    function chainPresent(identity, { instance = false } = {}) {
+        return inspectStoreDirectories(
+            identity,
+            instance ? [GPU_GRANT_STATE_DIRECTORY, identity.instance] : [GPU_GRANT_STATE_DIRECTORY],
+            { fsApi, ...GPU_STATE_FILES },
+        );
     }
 
     function assertConfined(identity) {
-        return assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
+        return assertRouterBindingStateConfined(identity, { fsApi });
     }
 
     function normalizeAdmitted(value) {
@@ -1015,8 +1012,7 @@ export function createGpuGrantStore({
     function read(identity) {
         const target = targetFor(identity);
         assertConfined(identity);
-        if (!assertPrivateDirectoryIfPresent(fsApi, stateRoot)
-            || !assertPrivateDirectoryIfPresent(fsApi, directory)) return null;
+        if (!chainPresent(identity)) return null;
         const bytes = readPrivateFile(fsApi, target, GPU_GRANT_STATE_MAX_BYTES, 'Saved GPU grant');
         if (!bytes) return null;
         let record;
@@ -1035,8 +1031,7 @@ export function createGpuGrantStore({
         if (!normalized) throw stateError('Saving a GPU grant requires a grant, a deny or a workspace deny');
         const admittedValue = normalizeAdmitted(admitted);
         assertConfined(identity);
-        ensurePrivateDirectory(fsApi, stateRoot);
-        ensurePrivateDirectory(fsApi, directory);
+        ensureStoreDirectories(identity, [GPU_GRANT_STATE_DIRECTORY], { fsApi, ...GPU_STATE_FILES });
         assertConfined(identity);
         const record = {
             version: GPU_GRANT_STATE_VERSION,
@@ -1049,7 +1044,7 @@ export function createGpuGrantStore({
             ...(normalized.denied.length ? { denied: normalized.denied } : {}),
             ...(normalized.workspaceDenied ? { workspaceDenied: true } : {}),
         };
-        writePrivateFileAtomically(fsApi, directory, targetFor(identity), `${JSON.stringify(record)}\n`, () => {
+        writePrivateFileAtomically(fsApi, directoryFor(identity), targetFor(identity), `${JSON.stringify(record)}\n`, () => {
             lock.assertHeld(identity.instance);
             assertConfined(identity);
         });
@@ -1060,8 +1055,7 @@ export function createGpuGrantStore({
         exactIdentity(identity);
         assertLock(identity, lock);
         assertConfined(identity);
-        if (!assertPrivateDirectoryIfPresent(fsApi, stateRoot)
-            || !assertPrivateDirectoryIfPresent(fsApi, directory)) return false;
+        if (!chainPresent(identity)) return false;
         const target = targetFor(identity);
         let stat;
         try {
@@ -1137,7 +1131,7 @@ export function createGpuGrantStore({
         assertLock(identity, lock);
         assertConfined(identity);
         if (wiring.mps) assertKeptHostSources(wiring);
-        const generation = gpuGenerationDirectory(identity, wiring.fingerprint, homeDirectory);
+        const generation = gpuGenerationDirectory(identity, wiring.fingerprint);
         if (!Array.isArray(wiring.files)) {
             for (const mount of wiring.mounts) {
                 if (mount.destination !== BOX_GPU_MARKER_PATH && mount.destination !== BOX_GPU_CDI_SPEC_PATH) continue;
@@ -1154,9 +1148,7 @@ export function createGpuGrantStore({
             assertKeptHostSources(wiring);
             return;
         }
-        for (const target of [stateRoot, directory, instanceDirectory(identity), generation]) {
-            ensurePrivateDirectory(fsApi, target);
-        }
+        ensureStoreDirectories(identity, [GPU_GRANT_STATE_DIRECTORY, identity.instance, wiring.fingerprint], { fsApi, ...GPU_STATE_FILES });
         assertConfined(identity);
         for (const file of wiring.files) {
             if (path.dirname(file.path) !== generation) {
@@ -1182,9 +1174,7 @@ export function createGpuGrantStore({
         assertLock(identity, lock);
         assertConfined(identity);
         const root = instanceDirectory(identity);
-        if (!assertPrivateDirectoryIfPresent(fsApi, stateRoot)
-            || !assertPrivateDirectoryIfPresent(fsApi, directory)
-            || !assertPrivateDirectoryIfPresent(fsApi, root)) return [];
+        if (!chainPresent(identity, { instance: true })) return [];
         const kept = new Set([...keep].filter(Boolean));
         const removed = [];
         for (const entry of fsApi.readdirSync(root)) {
@@ -1214,8 +1204,7 @@ export function createGpuGrantStore({
         const recordPath = targetFor(identity);
         const root = instanceDirectory(identity);
         const empty = Object.freeze({ recordPath: null, instanceDir: null, entries: Object.freeze([]) });
-        if (!assertPrivateDirectoryIfPresent(fsApi, stateRoot)
-            || !assertPrivateDirectoryIfPresent(fsApi, directory)) return empty;
+        if (!chainPresent(identity)) return empty;
         let record = null;
         try {
             const stat = fsApi.lstatSync(recordPath);
@@ -1229,7 +1218,7 @@ export function createGpuGrantStore({
                 throw stateError(`Unable to inspect saved GPU grant: ${recordPath}`, error);
             }
         }
-        if (!assertPrivateDirectoryIfPresent(fsApi, root)) {
+        if (!chainPresent(identity, { instance: true })) {
             return Object.freeze({ recordPath: record, instanceDir: null, entries: Object.freeze([]) });
         }
         const entries = [];
@@ -1245,8 +1234,7 @@ export function createGpuGrantStore({
     }
 
     return Object.freeze({
-        homeDirectory: path.resolve(homeDirectory),
-        directory,
+        directoryFor,
         pathFor: targetFor,
         assertConfined,
         validateRecord: normalizeRecord,

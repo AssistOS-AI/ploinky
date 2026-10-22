@@ -452,10 +452,8 @@ test('unresolved journals of other transactions are reported and retained', asyn
     assert.deepEqual(store.list(ADMISSION_JOURNAL_KIND), [name]);
 });
 
-test('production lock managers select durable private host state for pending activation', async (t) => {
-    const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-home-')));
-    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-    const lockManager = createMutationLockManager({ homeDirectory: home });
+test('the production supervisor selects durable private workspace host state for pending activation', async (t) => {
+    const lockManager = createMutationLockManager();
     const probe = harness(t, { graph: { running: true, configured: true }, lockManager });
     // Rebuild the supervisor without an injected store so the default is used.
     const supervisor = createBoxSupervisor({
@@ -489,7 +487,7 @@ test('production lock managers select durable private host state for pending act
     });
     const result = await supervisor.runUpdateTransaction(['update', 'repos'], { request: { kind: 'repos' } });
     assert.equal(result.activation.outcome, 'deferred');
-    const file = path.join(home, '.ploinky-box', 'update-pending', `${probe.identity.instance}.json`);
+    const file = path.join(probe.identity.hostStateRoot, 'update-pending', `${probe.identity.instance}.json`);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).instance, probe.identity.instance);
 });
