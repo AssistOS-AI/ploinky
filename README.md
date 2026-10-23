@@ -1009,7 +1009,10 @@ may just have installed a repo whose manifest declares the GPU; the Box is then
 replaced once more, restarting the graph once). That replacement first waits for
 the start's no-wait launches, which may still be pulling images, to finish, for
 at most 31 minutes; if they are still running then, the workspace keeps running
-without that wiring and a later `ploinky start` applies it. A driver update or a changed
+without that wiring and a later `ploinky start` applies it. If the replacement
+fails and its rollback brings the previous Box and graph back, the workspace
+also keeps running without that wiring; if the rollback cannot, the command
+fails. A driver update or a changed
 set of GPU agents changes the wiring fingerprint (the Box label
 `io.assistos.ploinky-box.gpu-grant`), so the Box is recreated with regenerated
 wiring. If discovery fails, the Box starts without GPU devices: an operator

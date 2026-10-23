@@ -21,6 +21,7 @@ import {
 } from '../../ploinky-box/constants.mjs';
 import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
+import { PloinkyBoxError } from '../../ploinky-box/errors.mjs';
 import {
     buildGpuWiring,
     createGpuGrantStore,
@@ -2403,6 +2404,18 @@ test('D14 revoke pre-check: a manifest-declared agent does not block a revoke, s
         (error) => error.code !== 'PLOINKY_BOX_GPU_AGENTS_ENABLED' && /reached reconcile/.test(error.message));
 });
 
+// D14 reapplication: a start, whole restart or activating update whose
+// in-Box run installed a declaring repo replaces the Box once more, and its
+// result must then name the Box that exists. Each generation has its own
+// container ID, so a result that still names the removed Box is told apart.
+const REPLACEMENT_ID = 'c'.repeat(64);
+const RESTORED_ID = '7'.repeat(64);
+const STRAY_ID = '9'.repeat(64);
+
+function boxGeneration(box, id, gpu = null) {
+    return { state: 'owned', engine: box.ownership.engine, handles: { container: containerHandle(box, { id, gpu }) } };
+}
+
 test('D14 first start: a start that installs a declaring repo replaces the Box once, and only then', async (t) => {
     const probe = boxFixture(t);
     useTempHome(t, probe.root);
@@ -2412,17 +2425,21 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
         const events = [];
         const seen = [];
         let scans = 0;
+        let current = box.ownership;
         // The start returns while its no-wait launches (image pulls) still run.
         const workers = [2, 1, 0];
         const supervisor = gpuSupervisor(box, events, {
             gpuGrantStore: memoryGpuStore(events),
+            discover: () => current,
             // Nothing is installed when the host prepares the Box; the in-Box
             // start then clones the repo.
             scanGpuAgents: () => (scans++ === 0 ? [] : declaredAfterStart),
             async reconcile(options) {
                 seen.push(options.gpu);
                 events.push('reconcile');
-                return prepared(box, seen.length === 1 ? 'reused' : 'replaced', options.gpu, events);
+                if (seen.length === 1) return prepared(box, 'reused', options.gpu, events);
+                current = boxGeneration(box, REPLACEMENT_ID, options.gpu);
+                return { ...prepared(box, 'replaced', options.gpu, events), ownership: current };
             },
             async startCore() { events.push('start-core'); },
             async healthCheck() { events.push('health'); },
@@ -2442,11 +2459,13 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
         if (declaredAfterStart.length) {
             assert.deepEqual(seen[1].agents, [AGENT]);
             assert.equal(result.gpuReapplied.action, 'replaced');
+            assert.equal(result.containerId, REPLACEMENT_ID);
             assert.equal(events.filter((event) => event === 'start-core').length, 2);
             // The Box is replaced only once no no-wait launch is left.
             assert.deepEqual(noWait, ['reconcile', 'no-wait:2', 'no-wait:1', 'no-wait:0', 'reconcile']);
         } else {
             assert.equal(result.gpuReapplied, undefined);
+            assert.equal(result.containerId, OLD_ID);
             assert.equal(events.filter((event) => event === 'start-core').length, 1);
             // No change to apply: the start never waits for its no-wait launches.
             assert.deepEqual(noWait, ['reconcile']);
@@ -2464,12 +2483,16 @@ test('D14 first start: by default the no-wait launches are counted with pgrep in
     const counts = [{ ok: true, status: 0, stdout: '2\n' }, { ok: false, status: 1, stdout: '0\n' }];
     const pgrepCalls = [];
     let scans = 0;
+    let current = box.ownership;
     const supervisor = gpuSupervisor(box, events, {
         gpuGrantStore: memoryGpuStore(events),
+        discover: () => current,
         scanGpuAgents: () => (scans++ === 0 ? [] : [AGENT]),
         async reconcile(options) {
             seen.push(options.gpu);
-            return prepared(box, seen.length === 1 ? 'reused' : 'replaced', options.gpu, events);
+            if (seen.length === 1) return prepared(box, 'reused', options.gpu, events);
+            current = boxGeneration(box, REPLACEMENT_ID, options.gpu);
+            return { ...prepared(box, 'replaced', options.gpu, events), ownership: current };
         },
         async startCore() { events.push('start-core'); },
         async healthCheck() { events.push('health'); },
@@ -2542,6 +2565,300 @@ test('D14 first start: no-wait launches that outlast the bound, or cannot be cou
     }
 });
 
+const REAPPLY_OPERATIONS = Object.freeze([
+    ['start', (supervisor) => supervisor.runStartTransaction(['start', 'explorer', '8080'])],
+    ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
+    ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
+]);
+
+/**
+ * The transaction's own reconcile reuses generation A (OLD_ID); the in-Box
+ * core then installs a declaring repo, and the reapplication's reconcile
+ * replaces A with B (REPLACEMENT_ID). `discover` always answers with the Box
+ * the latest reconcile or rollback left, as the engine would.
+ */
+function reapplySupervisor(t, {
+    declares = true,
+    failReplacementHealth = false,
+    replacementRollback = null,
+    afterReplacement = null,
+    replacementReconcile = null,
+    overrides = {},
+} = {}) {
+    const box = graphBox(t);
+    const events = [];
+    const output = [];
+    const store = memoryGpuStore(events);
+    let current = box.ownership;
+    let installed = false;
+    let reconciles = 0;
+    const setCurrent = (next) => { current = next; };
+    const install = (event) => { events.push(event); installed = true; };
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: store,
+        discover: () => current,
+        scanGpuAgents: () => (declares && installed ? [AGENT] : []),
+        async reconcile(options) {
+            reconciles += 1;
+            events.push('reconcile');
+            if (reconciles === 1) return { ...prepared(box, 'reused', options.gpu, events), ownership: current };
+            if (replacementReconcile) return replacementReconcile(setCurrent, options);
+            const replacement = boxGeneration(box, REPLACEMENT_ID, options.gpu);
+            current = replacement;
+            return {
+                ...prepared(box, 'replaced', options.gpu, events),
+                ownership: replacement,
+                finalize() {
+                    events.push('finalize');
+                    afterReplacement?.(setCurrent, options.gpu);
+                },
+                async rollback() {
+                    events.push('outer-rollback');
+                    return replacementRollback(setCurrent);
+                },
+            };
+        },
+        async startCore() { install('start-core'); },
+        async healthCheck() {
+            events.push('health');
+            if (failReplacementHealth && current.handles?.container?.id === REPLACEMENT_ID) {
+                throw new Error('the replacement Box failed its health check');
+            }
+        },
+        selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
+        updateAgentLib: async () => ({ selection: box.agentLib, changed: false, previous: null }),
+        updateWorkspacePloinky: async () => ({ found: false }),
+        commitAgentLibSelection: () => {},
+        revalidateAgentLibSource: () => {},
+        captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+        runCoreCommand: async () => { install('core'); },
+        runRestartCore: fakeRestartCore(async () => { install('restart-core'); }),
+        runUpdateCore: fakeUpdateCore({ onCall: () => { install('update-core'); } }),
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        countNoWaitWorkers: () => 0,
+        waitDelay: async () => {},
+        stderr: { write(text) { output.push(String(text)); } },
+        ...overrides,
+    });
+    return { box, events, output, store, supervisor, current: () => current };
+}
+
+// The previous Box comes back as a new container: replacement rollback
+// recreates it (restoreOldContainer → createAndStart).
+function restoredRollback(box) {
+    return (setCurrent) => {
+        const restored = boxGeneration(box, RESTORED_ID, null);
+        setCurrent(restored);
+        return {
+            action: 'restored',
+            ownership: restored,
+            containerId: RESTORED_ID,
+            hostPort: 8090,
+            mediaHostPort: 7882,
+            routerBinding: { address: '127.0.0.1', hostPort: 8090, hosts: null },
+            gpu: null,
+            hardware: null,
+            agentLib: box.agentLib,
+        };
+    };
+}
+
+function assertNamesExistingBox(result, scenario, label) {
+    const container = scenario.current().handles.container;
+    assert.equal(result.containerId, container.id, `${label}: containerId names the Box that exists`);
+    assert.equal(result.ownership.handles.container.id, container.id, `${label}: ownership names the Box that exists`);
+    assert.equal(result.gpu?.fingerprint ?? null, container.labels[BOX_LABELS.gpuGrant] ?? null,
+        `${label}: the GPU wiring is the Box's own`);
+}
+
+for (const [operation, invoke] of REAPPLY_OPERATIONS) {
+    test(`D14 ${operation}: the result names the replacement Box after the GPU reapplication`, async (t) => {
+        const probe = boxFixture(t);
+        useTempHome(t, probe.root);
+        useFakeHostFiles(t, fakeHost());
+        const scenario = reapplySupervisor(t);
+        const result = await invoke(scenario.supervisor);
+        assert.equal(result.gpuReapplied?.action, 'replaced', scenario.events.join(' '));
+        assert.equal(result.gpuReapplied.containerId, REPLACEMENT_ID);
+        assert.equal(scenario.current().handles.container.id, REPLACEMENT_ID);
+        assertNamesExistingBox(result, scenario, operation);
+        assert.deepEqual(result.gpu.agents, [AGENT]);
+        assert.equal(result.gpu.fingerprint, result.gpuReapplied.gpu.fingerprint);
+        // The first phase's action stays; the replacement keeps the publication.
+        assert.equal(result.action, 'reused');
+        assert.equal(result.hostPort, 8090);
+        assert.equal(result.mediaHostPort, 7882);
+        assert.deepEqual(result.routerBinding, { address: '127.0.0.1', hostPort: 8090, hosts: null });
+        if (operation === 'update') assert.equal(result.activation.outcome, 'restarted');
+    });
+
+    test(`D14 ${operation}: without a GPU change the result names the Box the transaction prepared`, async (t) => {
+        const probe = boxFixture(t);
+        useTempHome(t, probe.root);
+        useFakeHostFiles(t, fakeHost());
+        const scenario = reapplySupervisor(t, { declares: false });
+        const result = await invoke(scenario.supervisor);
+        assert.equal(result.gpuReapplied, undefined);
+        assert.equal(scenario.events.filter((event) => event === 'reconcile').length, 1);
+        assert.equal(result.containerId, OLD_ID);
+        assertNamesExistingBox(result, scenario, operation);
+        assert.equal(result.gpu, null);
+    });
+
+    test(`D14 ${operation}: a failed GPU reapplication names the restored previous Box`, async (t) => {
+        const probe = boxFixture(t);
+        useTempHome(t, probe.root);
+        useFakeHostFiles(t, fakeHost());
+        let scenario;
+        scenario = reapplySupervisor(t, {
+            failReplacementHealth: true,
+            replacementRollback: (setCurrent) => restoredRollback(scenario.box)(setCurrent),
+        });
+        const result = await invoke(scenario.supervisor);
+        assert.equal(result.gpuReapplied, undefined);
+        assert.ok(scenario.events.includes('outer-rollback'), scenario.events.join(' '));
+        assert.equal(scenario.current().handles.container.id, RESTORED_ID);
+        assertNamesExistingBox(result, scenario, operation);
+        assert.equal(result.gpu, null);
+        assert.match(scenario.output.join(''), /the workspace keeps running without that GPU wiring/);
+        assert.equal(scenario.store.value, null, 'the GPU grant record is restored');
+    });
+
+    test(`D14 ${operation}: a GPU reapplication whose rollback failed fails the operation`, async (t) => {
+        const probe = boxFixture(t);
+        useTempHome(t, probe.root);
+        useFakeHostFiles(t, fakeHost());
+        let scenario;
+        scenario = reapplySupervisor(t, {
+            failReplacementHealth: true,
+            replacementRollback: (setCurrent) => {
+                setCurrent({ state: 'absent', engine: scenario.box.ownership.engine, handles: {} });
+                throw new Error('old Box restoration: the engine refused to create it');
+            },
+        });
+        await assert.rejects(() => invoke(scenario.supervisor),
+            (error) => error.code === 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED'
+                && /applying the GPU agents after start did not complete/.test(error.message)
+                // An admitted update keeps its verified input outcomes in the failure.
+                && (operation !== 'update' || error.updateRecords?.some((record) => record.id === 'fixture-repo')));
+        assert.ok(scenario.events.includes('outer-rollback'), scenario.events.join(' '));
+        assert.doesNotMatch(scenario.output.join(''), /keeps running/);
+    });
+}
+
+test('D14 first start: launches that outlast the bound, or cannot be counted, keep the prepared Box in the result', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    for (const count of [() => 1, () => null]) {
+        let clock = 0;
+        const scenario = reapplySupervisor(t, {
+            overrides: {
+                countNoWaitWorkers: count,
+                now: () => clock,
+                waitDelay: async (milliseconds) => { clock += milliseconds; },
+            },
+        });
+        const result = await scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']);
+        assert.equal(result.gpuReapplied, undefined);
+        assert.equal(scenario.events.filter((event) => event === 'reconcile').length, 1);
+        assert.equal(result.containerId, OLD_ID);
+        assertNamesExistingBox(result, scenario, 'timeout');
+        assert.match(scenario.output.join(''), /the workspace keeps running without that GPU wiring/);
+    }
+});
+
+test('D14 first start: each failed rollback of the GPU reapplication fails the start on its own', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    // The replacement's own rollback restored the previous Box but could not
+    // remove the candidate: the code alone says the state is uncertain.
+    let scenario = reapplySupervisor(t, {
+        replacementReconcile: (setCurrent) => {
+            const restored = restoredRollback(scenario.box)(setCurrent);
+            const error = new PloinkyBoxError('Box container transaction failed; rollback failures: candidate removal: busy',
+                { code: 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED' });
+            error.boxRollback = Object.freeze({ ...restored, oldStopAttempted: true });
+            throw error;
+        },
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']),
+        (error) => error.code === 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED' && error.activation?.outcome === 'restored');
+    assert.doesNotMatch(scenario.output.join(''), /keeps running/);
+    // The previous Box was restored, but its graph had no running agent when
+    // the reapplication began, so no graph is rebuilt on it: the activation
+    // outcome alone says the replacement's graph start left it disrupted.
+    const idleInbox = { ok: true, status: 0, stdout: JSON.stringify({
+        state: 'running', initialized: true, routingConfigured: true, trackedAgents: 1, runningAgents: 0, warnings: [],
+    }) };
+    scenario = reapplySupervisor(t, {
+        failReplacementHealth: true,
+        replacementRollback: (setCurrent) => restoredRollback(scenario.box)(setCurrent),
+        overrides: {
+            runner: {
+                run() {},
+                async stream() { return { ok: true, status: 0 }; },
+                query: () => idleInbox,
+            },
+        },
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']),
+        (error) => !['PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED', 'PLOINKY_BOX_GPU_REAPPLY_CHANGED'].includes(error.code)
+            && error.activation?.outcome === 'recovery-required');
+    assert.doesNotMatch(scenario.output.join(''), /keeps running/);
+});
+
+test('D14 first start: a Box that differs from the reapplication outcome fails closed', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    const changed = (error) => error.code === 'PLOINKY_BOX_GPU_REAPPLY_CHANGED';
+    // A different Box, with the same wiring, after a successful replacement.
+    let scenario = reapplySupervisor(t, {
+        afterReplacement: (setCurrent, gpu) => setCurrent(boxGeneration(scenario.box, STRAY_ID, gpu)),
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']), changed);
+    // No Box after a successful replacement.
+    scenario = reapplySupervisor(t, {
+        afterReplacement: (setCurrent) => setCurrent({ state: 'absent', engine: scenario.box.ownership.engine, handles: {} }),
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']), changed);
+    // An engine that cannot be inspected after the replacement.
+    scenario = reapplySupervisor(t, {
+        afterReplacement: (setCurrent) => setCurrent(null),
+        overrides: {
+            discover: () => {
+                const current = scenario.current();
+                if (!current) throw new Error('podman inspect failed');
+                return current;
+            },
+        },
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']),
+        (error) => changed(error) && /could not be observed \(podman inspect failed\)/.test(error.message));
+    // The replacement's ID, reported by another engine.
+    scenario = reapplySupervisor(t, {
+        afterReplacement: (setCurrent) => setCurrent({
+            ...scenario.current(), engine: { name: 'podman', identity: 'other-engine' },
+        }),
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']), changed);
+    // A restored Box whose GPU wiring is not the prepared one.
+    scenario = reapplySupervisor(t, {
+        failReplacementHealth: true,
+        replacementRollback: (setCurrent) => {
+            const result = restoredRollback(scenario.box)(setCurrent);
+            const wired = boxGeneration(scenario.box, RESTORED_ID, activeWiring(scenario.box.identity));
+            setCurrent(wired);
+            return { ...result, ownership: wired };
+        },
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']), changed);
+    assert.doesNotMatch(scenario.output.join(''), /keeps running/);
+});
+
 // ---------------------------------------------------------------------------
 // Hardware limits: every gate-on generation a GPU grant, revoke or internal
 // GPU reapply creates or replaces is prepared before its graph (U11, §6.5).
@@ -2559,14 +2876,19 @@ test('G.every-final-generation-gpu', async (t) => {
         const wiring = resolveDesiredHardwareWiring({ identity: box.identity, enabled: true, initializeStore });
         const events = [];
         let replacements = 0;
+        let current = box.ownership;
         const supervisor = gpuSupervisor(box, events, {
             gpuGrantStore: memoryGpuStore(events),
             hardwareGateStore: gateStore,
+            discover: () => current,
             async reconcile(options) {
                 events.push('reconcile');
                 replacements += 1;
+                const action = replacements === 1 && label === 'reapply' ? 'reused' : 'replaced';
+                // A replacement is a new generation, carrying the requested GPU wiring.
+                if (action === 'replaced') current = boxGeneration(box, `${replacements}`.repeat(64), options.gpu);
                 // An existing Box keeps its observed hardware wiring.
-                return { ...prepared(box, replacements === 1 && label === 'reapply' ? 'reused' : 'replaced', options.gpu, events), hardware: options.hardware ?? wiring };
+                return { ...prepared(box, action, options.gpu, events), ownership: current, hardware: options.hardware ?? wiring };
             },
             async startCore() { events.push('start-core'); },
             async healthCheck() { events.push('health'); },

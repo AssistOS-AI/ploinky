@@ -693,6 +693,11 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         explicitMediaPort: startRoute.mediaHostPort,
         imageRef: candidateReference,
     });
+    // The result names the Box that exists, also when the graph declares GPU
+    // access and a GPU host replaced the Box once more after the start (D14).
+    t.diagnostic(`start: container ${started.containerId}, GPU reapplication ${started.gpuReapplied?.action || 'none'}`);
+    assert.equal(started.ownership.handles.container.id, started.containerId);
+    assert.equal(harness.supervisor.inspectBoxStatus().ownership.handles.container.id, started.containerId);
     await checkBoxHealth(startRoute.hostPort);
     assert.match(harness.output.bytes,
         new RegExp(`Router: http://127\\.0\\.0\\.1:${startRoute.hostPort}`));

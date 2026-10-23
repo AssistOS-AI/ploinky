@@ -1349,10 +1349,13 @@ export function createBoxSupervisor({
                 });
             }
             reportSettled(prepared.routerBinding, admission?.warnings);
-            const gpuReapplied = await reapplyDeclaredGpu(identity, lock, prepared.gpu);
+            // A GPU reapplication may have replaced the Box: the result names
+            // the generation that exists.
+            const reapplied = await reapplyDeclaredGpu(identity, lock, prepared);
             return Object.freeze({
                 identity, ...prepared, containerId, agentLib: selection,
-                ...(gpuReapplied ? { gpuReapplied } : {}),
+                ...reapplied.generation,
+                ...(reapplied.gpuReapplied ? { gpuReapplied: reapplied.gpuReapplied } : {}),
             });
         });
     }
@@ -1433,10 +1436,13 @@ export function createBoxSupervisor({
                 });
             }
             reportSettled(prepared.routerBinding, admission?.warnings);
-            const gpuReapplied = await reapplyDeclaredGpu(identity, lock, prepared.gpu);
+            // A GPU reapplication may have replaced the Box: the result names
+            // the generation that exists.
+            const reapplied = await reapplyDeclaredGpu(identity, lock, prepared);
             return Object.freeze({
                 identity, ...prepared, containerId, agentLib: selection,
-                ...(gpuReapplied ? { gpuReapplied } : {}),
+                ...reapplied.generation,
+                ...(reapplied.gpuReapplied ? { gpuReapplied: reapplied.gpuReapplied } : {}),
             });
         });
     }
@@ -2386,7 +2392,19 @@ export function createBoxSupervisor({
             });
         }
         if (restart) reportSettled(prepared.routerBinding);
-        const gpuReapplied = restart ? await reapplyDeclaredGpu(identity, lock, prepared.gpu) : null;
+        let reapplied = null;
+        if (restart) {
+            try {
+                reapplied = await reapplyDeclaredGpu(identity, lock, prepared);
+            } catch (error) {
+                // The update was admitted before the GPU reapplication failed;
+                // keep its verified input outcomes in the host's failure result.
+                if (error && typeof error === 'object' && !error.updateRecords) {
+                    error.updateRecords = Object.freeze(inputRecords.slice(plan.hostRecords.length));
+                }
+                throw error;
+            }
+        }
         warnings.push(...(admission?.warnings || []));
         if (outcome === 'deferred' || !decision.activationAllowed) {
             pendingActivation(identity, {
@@ -2403,8 +2421,10 @@ export function createBoxSupervisor({
             : `blocked by ${decision.blockedBy.map(entry => `${entry.phase} ${entry.id}`).join(', ')}`;
         return {
             identity, ...prepared, containerId, agentLib: selection,
+            // The generation a GPU reapplication left, when it touched the Box.
+            ...reapplied?.generation,
             changed, previous, workspacePloinky,
-            ...(gpuReapplied ? { gpuReapplied } : {}),
+            ...(reapplied?.gpuReapplied ? { gpuReapplied: reapplied.gpuReapplied } : {}),
             report: core.report,
             reportContext: core.reportContext,
             run: core.run,
@@ -2958,30 +2978,38 @@ export function createBoxSupervisor({
      * Box. When the effective set now differs from the wiring the Box was
      * prepared with, replace the Box once through the grant transaction, after
      * the start's no-wait launches have finished (their image pulls, and the
-     * edge-generation lock the graph stop also needs). A failure, or launches
-     * that outlast the bound, are reported and leave the workspace running
-     * without it.
+     * edge-generation lock the graph stop also needs). A failure whose
+     * rollback brought the previous Box and graph back, or launches that
+     * outlast the bound, are reported and leave the workspace running without
+     * it; a failure that left no such Box fails the command.
+     *
+     * `generation` is the Box the caller's result must name instead of its
+     * own prepared one: null when the Box was not touched, otherwise the Box
+     * re-observed here (the replacement, or the previous Box that its rollback
+     * created again under a new ID).
      */
-    async function reapplyDeclaredGpu(identity, lock, preparedGpu) {
+    async function reapplyDeclaredGpu(identity, lock, prepared) {
+        const untouched = Object.freeze({ gpuReapplied: null, generation: null });
         let selected;
         try {
             selected = selectSavedGpuWiring(identity);
         } catch (error) {
             stderr?.write?.(`[ploinky] Could not re-check the GPU agents: ${error.message}\n`);
-            return null;
+            return untouched;
         }
-        if (sameGpuWiring(selected.desired, preparedGpu)) return null;
+        if (sameGpuWiring(selected.desired, prepared.gpu)) return untouched;
         const launches = await waitForNoWaitLaunches(identity);
         if (!launches.settled) {
             stderr?.write?.(
                 `[ploinky] The installed manifests change the GPU agents, but ${launches.reason}; the workspace keeps `
                 + 'running without that GPU wiring; run `ploinky start` again once they finish.\n',
             );
-            return null;
+            return untouched;
         }
         stderr?.write?.('[ploinky] The installed manifests change the GPU agents; replacing the Box once to apply them...\n');
+        let gpuReapplied;
         try {
-            return await applyGpuGrantChange({
+            gpuReapplied = await applyGpuGrantChange({
                 identity,
                 lock,
                 ownership: inspect(identity),
@@ -2992,12 +3020,63 @@ export function createBoxSupervisor({
                 declared: selected.declared,
             });
         } catch (error) {
+            // Without the previous Box and graph back, the workspace is not
+            // running as before, so the command must not report success.
+            if (error?.code === 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED'
+                || error?.activation?.outcome === 'recovery-required') {
+                throw error;
+            }
+            const generation = reappliedGeneration(identity, prepared, { gpu: prepared.gpu, failure: error });
             stderr?.write?.(
                 `[ploinky] ${error.message}; the workspace keeps running without that GPU wiring. `
                 + 'Run `ploinky start` again to retry.\n',
             );
-            return null;
+            return Object.freeze({ gpuReapplied: null, generation });
         }
+        return Object.freeze({
+            gpuReapplied,
+            generation: reappliedGeneration(identity, prepared, {
+                gpu: gpuReapplied.gpu,
+                containerId: gpuReapplied.containerId,
+            }),
+        });
+    }
+
+    // The owned Box a GPU reapplication left, re-observed under the lock. It
+    // must be on the same engine, be the expected container when one is
+    // known, and carry the GPU wiring the result reports.
+    function reappliedGeneration(identity, prepared, { gpu, containerId = null, failure = null }) {
+        let ownership = null;
+        let inspectError = null;
+        try {
+            ownership = inspect(identity);
+        } catch (error) {
+            // An unobservable Box is not a confirmed one.
+            inspectError = error;
+        }
+        const container = ownership?.state === 'owned' ? ownership.handles?.container : null;
+        let consistent = Boolean(container)
+            && ownership.engine?.identity === prepared.ownership.engine?.identity
+            && (!containerId || container.id === containerId);
+        if (consistent) {
+            try {
+                consistent = sameGpuWiring(observeContainerGpuWiring(container, { identity }), gpu);
+            } catch {
+                consistent = false;
+            }
+        }
+        if (!consistent) {
+            const error = supervisorError(
+                `${failure ? `${failure.message}; and the` : 'The'} outer Box changed or could not be observed `
+                + `${inspectError ? `(${inspectError.message}) ` : ''}`
+                + 'during the GPU reapplication, so the workspace state could not be confirmed; recover it from '
+                + 'this workspace with `ploinky stop`, then `ploinky start`',
+                'PLOINKY_BOX_GPU_REAPPLY_CHANGED',
+            );
+            error.activation = Object.freeze({ outcome: 'recovery-required', graphMutated: true, boxRollback: null });
+            throw error;
+        }
+        return Object.freeze({ ownership, containerId: container.id, gpu });
     }
 
     /**
