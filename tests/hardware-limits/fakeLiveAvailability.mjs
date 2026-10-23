@@ -176,7 +176,7 @@ export function createFakeAvailability({ base, workspace, root, faults = {} }) {
     async function http({ port, path: requestPath, headers = {} }) {
         ensure();
         model.httpCalls.push({ port, path: requestPath, headers });
-        if (requestPath === '/auth/login') return { status: faults.loginStatus ?? 200, contentType: 'text/html', body: '<html>login</html>', truncated: false };
+        if (requestPath === '/auth/login') return { status: faults.loginStatus ?? 303, contentType: 'text/html', body: '<html>login</html>', truncated: false };
         if (requestPath === '/') {
             const entry = model.status.get(rootName());
             if (faults.staticAnswer === 'startup-page') return { status: 200, contentType: 'text/html', body: '<html>Starting...</html>', truncated: false };

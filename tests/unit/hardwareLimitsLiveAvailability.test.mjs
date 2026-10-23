@@ -266,7 +266,7 @@ test('X4.c3v-passes-in-a-dedicated-workspace-with-its-own-ports-and-the-box-is-d
     assert.equal(result.report.verdict, 'PASS'); assert.equal(result.report.cleanup.state, 'complete');
     const evidence = result.case.evidence;
     assert.deepEqual([evidence.ports, evidence['static-route'].status, evidence['static-route'].error, evidence['static-route'].code, evidence['auth-login'].status, evidence['admin-api'].status, evidence['admin-api'].availability],
-        [{ tcp: 18090, udp: 17892 }, 503, 'AGENT_HARDWARE_UNAVAILABLE', 'hardware_refused', 200, 200, 'refused']);
+        [{ tcp: 18090, udp: 17892 }, 503, 'AGENT_HARDWARE_UNAVAILABLE', 'hardware_refused', 303, 200, 'refused']);
     assert.deepEqual([evidence['limits-status'], evidence['limits-clear']], [{ status: 0 }, { status: 0 }]);
     // The probes went to the dedicated pair, the host commands ran in the workspace with the exact argv, and the override is gone.
     assert.ok(fake.model.httpCalls.every(call => call.port === 18090));
@@ -283,7 +283,7 @@ test('X4.c3v-passes-in-a-dedicated-workspace-with-its-own-ports-and-the-box-is-d
 const c3vFailures = [
     ['the static route is a startup page', { staticAnswer: 'startup-page' }, /did not answer a terminal 503 JSON \(HTTP 200/],
     ['the static route does not answer', { staticAnswer: 'unreachable' }, /did not answer a terminal 503 JSON \(HTTP null/],
-    ['the login page does not answer 200', { loginStatus: 302 }, /\/auth\/login answered HTTP 302, not 200/],
+    ['the login page does not answer 303', { loginStatus: 200 }, /\/auth\/login answered HTTP 200, not 303/],
     ['the host limits status fails', { limitsStatusExit: 2 }, /`ploinky limits status` did not exit 0/],
     ['the host limits clear fails', { limitsClearExit: 1 }, /`ploinky limits clear --agent` did not exit 0/],
     ['the host clear leaves the override', { clearKeepsOverride: true }, /The host clear left the stored override/],

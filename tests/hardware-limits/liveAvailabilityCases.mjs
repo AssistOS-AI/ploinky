@@ -7,7 +7,7 @@
 // Variant iii (an independently explicit status waiter) has no live producer in this revision: it is declared infeasible, never passed.
 //
 // C3V: in a dedicated workspace and Box, the STATIC agent is the refused fixture. The Router keeps its own controls: the static route answers the
-// terminal unavailable response, /auth/login answers 200, the administrator API answers 200, and the host `limits status` and `limits clear` exit 0.
+// terminal unavailable response, /auth/login answers 303, the administrator API answers 200, and the host `limits status` and `limits clear` exit 0.
 // The Box is then destroyed and proven absent by the cleanup action (AC-S7-3).
 
 import fs from 'node:fs';
@@ -245,7 +245,7 @@ export function createAvailabilityCases({ profile, run, command, engine, core, n
         try { terminal = assertStaticTerminal(staticReply); } catch (error) { throw fail(error.message, { static: { status: staticReply?.status ?? null, contentType: staticReply?.contentType ?? null, body: String(staticReply?.body ?? '').slice(0, 300), error: staticReply?.error ?? null } }); }
         record('static-route', terminal);
         const login = await http({ port: run.ports.tcp, path: '/auth/login', headers: { accept: 'text/html' } });
-        try { record('auth-login', assertRouterControl('/auth/login', login)); } catch (error) { throw fail(error.message, { login: { status: login?.status ?? null, contentType: login?.contentType ?? null, error: login?.error ?? null } }); }
+        try { record('auth-login', assertRouterControl('/auth/login', login, { status: 303 })); } catch (error) { throw fail(error.message, { login: { status: login?.status ?? null, contentType: login?.contentType ?? null, error: login?.error ?? null } }); }
         const adminReply = await adminCall('availability-admin-get', 'GET');
         try { record('admin-api', assertAdminListsRefused(adminReply, { ref, key })); } catch (error) { throw fail(error.message, { admin: { status: adminReply.status, body: adminReply.text.slice(0, 300) } }); }
         const status = await command('availability-limits-status', profile.node.path, [profile.candidate.path, 'limits', 'status'], { deadlineMs: 120000, tolerate: true, capture: 'availability-limits-status' });

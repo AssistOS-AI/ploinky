@@ -815,7 +815,8 @@ test('real bridge and browser routes reject copied callbacks and issue a session
         return res;
     };
     const login = await request('/auth/login?returnTo=%2Fexplorer%2F');
-    assert.equal(login.statusCode, 200, login.body);
+    assert.equal(login.statusCode, 303, login.body);
+    assert.equal(login.body, '');
     const loginCookie = String(login.getHeader('set-cookie'));
     assert.match(loginCookie, /^ploinky_sso_login_[A-Za-z0-9_-]{22}=/);
     assert.match(loginCookie, /Path=\/; HttpOnly; SameSite=Lax; Max-Age=60/);
@@ -847,7 +848,7 @@ test('real bridge and browser routes reject copied callbacks and issue a session
     routePlan.hostSelection = { kind: 'agent-root', host: 'explorer.example.test', record: { routeKey: 'explorer' } };
     routePlan.forwarding = { protocol: 'https', authority: 'explorer.example.test' };
     const secureLogin = await request('/auth/login');
-    assert.equal(secureLogin.statusCode, 200, secureLogin.body);
+    assert.equal(secureLogin.statusCode, 303, secureLogin.body);
     const secureCookie = String(secureLogin.getHeader('set-cookie'));
     assert.match(secureCookie, /^__Host-ploinky_sso_login_/);
     assert.match(secureCookie, /; Secure;/);
@@ -904,8 +905,9 @@ test('Router login restarts on the canonical origin before creating a fresh cook
     assert.deepEqual(Object.fromEntries(canonicalUrl.searchParams), { returnTo, prompt: 'select_account', agent: 'explorer' });
 
     const login = await request(canonicalUrl.href);
-    assert.equal(login.statusCode, 200, login.body);
-    assert.equal(login.getHeader('location'), undefined);
+    // The canonical login goes to the provider, not to another Router login.
+    assert.equal(login.statusCode, 303, login.body);
+    assert.notEqual(new URL(login.getHeader('location'), canonicalOrigin).pathname, '/auth/login');
     const cookie = String(login.getHeader('set-cookie'));
     assert.match(cookie, /^ploinky_sso_login_[A-Za-z0-9_-]{22}=/);
     assert.match(cookie, /Path=\/; HttpOnly; SameSite=Lax; Max-Age=60/);

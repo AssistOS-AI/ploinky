@@ -228,7 +228,7 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
         if (wrong.length) throw fail(`The replacement Box ${String(current.id).slice(0, 12)} is not the gate-off generation the transition committed (${wrong.join(', ')})`, { checks, labels: Object.keys(labels).sort(), destinations });
         // The Router of the replacement answers as a browser's address would reach it.
         const login = await http({ port: run.ports.tcp, path: LOGIN.path, headers: LOGIN.headers });
-        if (login?.status !== 200) throw fail('The replacement Box\'s Router does not answer /auth/login with HTTP 200', { status: login?.status ?? null, error: login?.error ?? null });
+        if (login?.status !== 303) throw fail('The replacement Box\'s Router does not answer /auth/login with HTTP 303', { status: login?.status ?? null, error: login?.error ?? null });
         const host = await view(identity(), 'host', 'after the committed transition');
         if (host.count !== 0 || host.barrier || host.lock) throw fail('The store is not empty and free after the committed transition', { count: host.count, barrier: host.barrier, lock: host.lock });
         if (tokenKey(host.token) !== tokenKey(token)) throw fail('The host store is not at the stamp T after the committed transition', { stamp: token, now: host.token });
