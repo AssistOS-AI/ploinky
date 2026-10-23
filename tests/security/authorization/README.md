@@ -94,7 +94,7 @@ RoboTeam family controls (`agent-probes.mjs` `roboteamProbes`, `runRoboteamProbe
 
 `roboteam-real-handler.test.mjs` drives the RoboFlow and RoboTeam probes against the real RoboTeam server (AssistOSExplorer `roboTeamAgent/`) (`createRoboTeamServer`, the real family gate and the real RoboFlow service on a temporary SQLite database) at the reviewed 3cd94b10 tree, with requests signed by this checkout's real HTTP-route minter and verified by its real Agent helper. It needs an AssistOSExplorer checkout at `AUTHZ_ROBOTEAM_DIR` (default: the sibling D13 lane) whose `roboTeamAgent/` subtree is exactly the one at AchillesCLI 3cd94b10 (`git rev-parse 3cd94b10:roboTeamAgent`) and which has no tracked changes; otherwise it is skipped, like the DPU tests. Only the robot store (the real one reads `/proc`, so an in-memory store with the same interface stands in), the runtime manager (it must never start anything) and Explorer's file tools (real file operations confined to the temporary workspace) are stubs. All RoboFlow and RoboTeam checks pass there, no runtime start/stop/message/task is reached, and no schedule, workflow or folder remains.
 
-The inventories contain 128 Router rows and 889 agent rows across 27 manifests, including the 16 runtimes enabled by the reviewed manifest graph and 336 declared MCP tools. Rows include unresolved wildcard/image-owned families; they are not a count of all concrete endpoints. Tools/list contact never counts as a tools/call assertion. Even a row with recorded assertions does not imply complete role, resource, argument, alias or protocol coverage.
+The inventories contain 133 Router rows (the 128 historical rows plus five Live Sessions rows: the shell list, attach tokens, attachments, close policy and close intents) and 889 agent rows across 27 manifests, including the 16 runtimes enabled by the reviewed manifest graph and 336 declared MCP tools. Rows include unresolved wildcard/image-owned families; they are not a count of all concrete endpoints. Tools/list contact never counts as a tools/call assertion. Even a row with recorded assertions does not imply complete role, resource, argument, alias or protocol coverage.
 
 Generate the complete matrix without contacting the deployment:
 
@@ -104,7 +104,7 @@ npm run authorization:inventory -- --out /Users/danielsava/work/deployment-evide
 
 Use a new export directory if those output files already exist; exports refuse to overwrite prior evidence or follow output-file symlinks.
 
-The written per-row review of the 2026-10-08 router source reference additions is [router-reference-review-2026-10-08.md](router-reference-review-2026-10-08.md).
+The written per-row review of the 2026-10-08 router source reference additions is [router-reference-review-2026-10-08.md](router-reference-review-2026-10-08.md). The 2026-10-22 additions for WebTTY home profiles, server views and close policy are reviewed in [router-reference-review-2026-10-22.md](router-reference-review-2026-10-22.md).
 
 See [inventory-notes.md](inventory-notes.md) for repository totals, source regeneration and detailed unresolved families. The checked [Router inventory](router-inventory.mjs) records dispatch order, top-level administrative APIs, proxy paths, static serving, callbacks, SSE/WS and private listener boundaries. The [agent inventory](agent-inventory.mjs) records manifests, actual dispatch references, tool arguments, disabled agents and custom additional servers. Live registry and tools/resources/prompts discovery are reconciled separately.
 

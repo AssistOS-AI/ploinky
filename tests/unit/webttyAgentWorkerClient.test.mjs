@@ -346,3 +346,43 @@ test('controlled close does not misclassify IPC disconnect before process exit',
     assert.deepEqual(failures, []);
     assert.equal(await h.client.waitForExit(), true);
 });
+
+test('prepared evidence must carry exactly the profile and translated HOME the Router sent', async () => {
+    const profile = { provider: 'provider', id: 'p-1', label: 'Profile One' };
+    const fields = {
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
+        targetUser: '1000:1000',
+        translatedCwd: '/workspace/demo',
+        marker: 'marker_abcdefghijklmnopqrstuvwx',
+        cols: 80,
+        rows: 24,
+    };
+    for (const [name, sent, evidence, accepted] of [
+        ['profile echoed', { translatedHome: '/data/home', profile }, { translatedHome: '/data/home', profile }, true],
+        ['no profile', {}, {}, true],
+        ['profile dropped', { translatedHome: '/data/home', profile }, {}, false],
+        ['profile added', {}, { translatedHome: '/data/home', profile }, false],
+        ['home changed', { translatedHome: '/data/home', profile }, { translatedHome: '/data/other', profile }, false],
+        ['label changed', { translatedHome: '/data/home', profile }, {
+            translatedHome: '/data/home', profile: { ...profile, label: 'Other' },
+        }, false],
+    ]) {
+        const h = harness();
+        await h.client.spawn();
+        const failures = [];
+        h.client.on('error-category', (message) => failures.push(message.category));
+        const prepared = h.client.prepare({ ...fields, ...sent });
+        await new Promise((resolve) => setImmediate(resolve));
+        h.child.emit('message', agentWorkerMessage('prepared', TERMINAL_ID, {
+            startupEvidence: startupEvidence(evidence),
+        }));
+        if (accepted) {
+            assert.deepEqual((await prepared).startupEvidence.profile, evidence.profile, name);
+            assert.deepEqual(failures, [], name);
+        } else {
+            assert.deepEqual(failures, ['protocol_error'], name);
+            prepared.catch(() => {});
+        }
+    }
+});

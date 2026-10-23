@@ -37,6 +37,15 @@ function exactWorkerIdentity(observed, expected, workerPath, executablePath) {
         && observed.cmdline?.[2] === WEBTTY_AGENT_WORKER_INVOCATION);
 }
 
+// Startup evidence must carry exactly the profile the Router sent, or none.
+function sameProfileEvidence(initSpec, evidence) {
+    const expected = Object.hasOwn(initSpec, 'translatedHome');
+    if (expected !== Object.hasOwn(evidence, 'translatedHome')) return false;
+    if (!expected) return !Object.hasOwn(evidence, 'profile');
+    return evidence.translatedHome === initSpec.translatedHome
+        && ['provider', 'id', 'label'].every((field) => evidence.profile?.[field] === initSpec.profile[field]);
+}
+
 export class AgentWebttyWorkerClient extends EventEmitter {
     constructor({
         terminalId,
@@ -186,7 +195,8 @@ export class AgentWebttyWorkerClient extends EventEmitter {
                     ['targetUser', evidence.targetUser],
                     ['translatedCwd', evidence.translatedCwd],
                     ['marker', evidence.marker],
-                ].some(([field, observed]) => this.initSpec[field] !== observed)) {
+                ].some(([field, observed]) => this.initSpec[field] !== observed)
+                    || !sameProfileEvidence(this.initSpec, evidence)) {
                     throw new Error('prepared evidence does not match init');
                 }
                 this.preparedMessage = message;
@@ -320,6 +330,10 @@ export class AgentWebttyWorkerClient extends EventEmitter {
             targetUser: fields.targetUser,
             translatedCwd: fields.translatedCwd,
             marker: fields.marker,
+            ...(Object.hasOwn(fields, 'translatedHome') ? {
+                translatedHome: fields.translatedHome,
+                profile: Object.freeze({ ...fields.profile }),
+            } : {}),
         });
         await this.send('init-agent', fields);
         return this.waitForMessage('prepared', this.preparedMessage, 'prepare_timeout');

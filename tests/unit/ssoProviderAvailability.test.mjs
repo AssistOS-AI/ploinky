@@ -429,7 +429,9 @@ async function clockedTerminal(sessionId, clock) {
     terminal.createdAt = clock.now;
     terminal.lastActivityAt = clock.now;
     const viewerRes = new MockResponse();
-    assert.equal(manager.attachStream(terminal, owner.req, viewerRes, '', routePlan), true);
+    // Every stream binds to a server-issued view of its own principal.
+    const view = manager.createView(terminal, terminal.owner.principal);
+    assert.equal(manager.attachStream(terminal, owner.req, viewerRes, '', routePlan, view.id), true);
     terminal.lastActivityAt = clock.now;
     const closed = [];
     manager.closeSession = async (session, reason) => { closed.push(reason); session.closed = true; manager.sessions.delete(session.id); return true; };

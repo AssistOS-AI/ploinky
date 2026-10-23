@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    PROFILE_SHELL_ENVIRONMENT_KEYS,
     SHELL_ENVIRONMENT_KEYS,
+    SHELL_PROFILE_ENVIRONMENT_KEYS,
     WEBTTY_SHELL_PROMPT,
     WORKER_ENVIRONMENT_KEYS,
     assertExactShellEnvironment,
@@ -78,6 +80,82 @@ test('the worker rejects additions, omissions, and altered fixed values', () => 
     for (const workspaceRoot of ['/other/host/path', undefined, 'relative']) {
         assert.throws(
             () => assertExactShellEnvironment(shell, { workspaceRoot }),
+            (error) => error.code === 'WEBTTY_ENVIRONMENT_INVALID',
+        );
+    }
+});
+
+const PROFILE = Object.freeze({
+    home: `${WORKSPACE_ROOT}/.data/provider/profiles/p-1/home`,
+    provider: 'provider',
+    id: 'p-1',
+    label: 'Profile One',
+});
+
+test('a profile changes only the shell HOME and adds INPUTRC and three profile variables', () => {
+    const options = { workspaceRoot: WORKSPACE_ROOT };
+    const plain = buildShellEnvironment(inheritedSecrets, options);
+    const profiled = buildShellEnvironment(inheritedSecrets, { ...options, profile: PROFILE });
+    assert.deepEqual(Object.keys(profiled).sort(), PROFILE_SHELL_ENVIRONMENT_KEYS);
+    assert.deepEqual(PROFILE_SHELL_ENVIRONMENT_KEYS, [...SHELL_ENVIRONMENT_KEYS, ...SHELL_PROFILE_ENVIRONMENT_KEYS].sort());
+    assert.deepEqual(profiled, {
+        ...plain,
+        HOME: PROFILE.home,
+        INPUTRC: '/etc/inputrc',
+        PLOINKY_WEBTTY_PROFILE_PROVIDER: 'provider',
+        PLOINKY_WEBTTY_PROFILE_ID: 'p-1',
+        PLOINKY_WEBTTY_PROFILE_LABEL: 'Profile One',
+    });
+    // PATH, the shell and the worker environment are untouched.
+    assert.equal(profiled.PATH, plain.PATH);
+    assert.equal(profiled.SHELL, '/bin/bash');
+    assert.deepEqual(buildWorkerEnvironment(inheritedSecrets, options), buildWorkerEnvironment({}, options));
+    assert.equal(buildWorkerEnvironment({}, options).HOME, '/home/podman');
+    // Without a profile the shell environment is exactly the fixed allowlist.
+    assert.deepEqual(Object.keys(plain).sort(), SHELL_ENVIRONMENT_KEYS);
+    assert.equal(plain.HOME, '/home/podman');
+    assert.equal('INPUTRC' in plain, false);
+    assert.equal('INPUTRC' in buildWorkerEnvironment({}, options), false);
+    for (const profile of [
+        { ...PROFILE, home: 'relative/home' },
+        { ...PROFILE, home: `${PROFILE.home}/` },
+        { ...PROFILE, home: '/' },
+        { ...PROFILE, home: `${WORKSPACE_ROOT}/../escape` },
+        { ...PROFILE, provider: '../provider' },
+        { ...PROFILE, id: 'p/1' },
+        { ...PROFILE, label: '' },
+        { ...PROFILE, label: 'bad\u001blabel' },
+        { ...PROFILE, label: 'x'.repeat(129) },
+    ]) {
+        assert.throws(
+            () => buildShellEnvironment({}, { ...options, profile }),
+            (error) => error.code === 'WEBTTY_ENVIRONMENT_INVALID',
+            JSON.stringify(profile).slice(0, 80),
+        );
+    }
+});
+
+test('the worker accepts profile keys only against its own revalidated HOME', () => {
+    const options = { workspaceRoot: WORKSPACE_ROOT };
+    const plain = buildShellEnvironment({}, options);
+    const profiled = buildShellEnvironment({}, { ...options, profile: PROFILE });
+    assert.deepEqual(assertExactShellEnvironment(profiled, { ...options, home: PROFILE.home }), profiled);
+    for (const [environment, home] of [
+        [profiled, undefined],
+        [plain, PROFILE.home],
+        [profiled, `${WORKSPACE_ROOT}/.data/provider/profiles/p-2/home`],
+        [{ ...profiled, HOME: '/root' }, PROFILE.home],
+        [{ ...profiled, PLOINKY_WEBTTY_PROFILE_LABEL: 'bad\nlabel' }, PROFILE.home],
+        [{ ...profiled, PLOINKY_WEBTTY_PROFILE_ID: '../x' }, PROFILE.home],
+        [{ ...profiled, NPM_TOKEN: 'secret' }, PROFILE.home],
+        [{ ...profiled, INPUTRC: `${PROFILE.home}/.inputrc` }, PROFILE.home],
+        [Object.fromEntries(Object.entries(profiled).filter(([key]) => key !== 'INPUTRC')), PROFILE.home],
+        [{ ...plain, INPUTRC: '/etc/inputrc' }, undefined],
+        [{ ...profiled, PATH: `${profiled.PATH}:${PROFILE.home}/bin` }, PROFILE.home],
+        [Object.fromEntries(Object.entries(profiled).filter(([key]) => key !== 'PLOINKY_WEBTTY_PROFILE_ID')), PROFILE.home],
+    ]) {
+        assert.throws(
+            () => assertExactShellEnvironment(environment, { ...options, home }),
             (error) => error.code === 'WEBTTY_ENVIRONMENT_INVALID',
         );
     }

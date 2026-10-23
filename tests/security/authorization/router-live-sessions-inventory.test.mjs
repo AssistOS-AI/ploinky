@@ -6,11 +6,12 @@ import { buildLiveSessionsRouterInventory, assertLiveSessionsRouterInventory } f
 
 const bytes = fs.readFileSync(new URL('../../../cli/server/handlers/webtty.js', import.meta.url));
 
-test('current Live Sessions inventory preserves historical checks and explicitly adds three administrator routes', () => {
+test('current Live Sessions inventory preserves historical checks and explicitly adds five administrator routes', () => {
     assert.equal(routerInventoryHistorical.length, 128);
-    assert.equal(routerInventory.length, 131);
+    assert.equal(routerInventory.length, 133);
     assert.equal(assertLiveSessionsRouterInventory(routerInventory, routerInventoryHistorical, bytes), true);
-    for (const id of ['webtty-live-sessions.get', 'webtty-attach-token.post', 'webtty-attachment.post']) {
+    for (const id of ['webtty-live-sessions.get', 'webtty-attach-token.post', 'webtty-attachment.post',
+        'webtty-close-policy.post', 'webtty-close-intents.post']) {
         const row = routerInventory.find(row => row.id === id);
         assert.ok(row);
         const line = Number(row.source.split(':')[1]);
@@ -22,7 +23,7 @@ test('current Live Sessions inventory preserves historical checks and explicitly
     }
     assert.throws(() => buildLiveSessionsRouterInventory(routerInventoryHistorical.slice(1), bytes), /MISSING_ROUTER_OBLIGATION/);
     assert.throws(() => buildLiveSessionsRouterInventory(routerInventoryHistorical, Buffer.concat([bytes, Buffer.from('\n')])), /UNREVIEWED_LIVE_SESSIONS_SOURCE/);
-    for (const id of ['webtty-stream.get', 'webtty-input.post', 'webtty-resize.post', 'webtty-delete.delete']) {
+    for (const id of ['webtty-create.post', 'webtty-stream.get', 'webtty-input.post', 'webtty-resize.post', 'webtty-delete.delete']) {
         assert.throws(() => assertLiveSessionsRouterInventory(routerInventory.map(row => row.id === id ? { ...row, notes: 'weakened' } : row),
             routerInventoryHistorical, bytes), /LIVE_SESSIONS_CONTRACT_DRIFT/);
     }

@@ -618,6 +618,14 @@ export class AgentTerminalWorker {
             expectedTerminalId: this.terminalId,
         });
         this.initialized = true;
+        const profile = Object.hasOwn(message, 'translatedHome') ? {
+            translatedHome: message.translatedHome,
+            profile: Object.freeze({
+                provider: message.profile.provider,
+                id: message.profile.id,
+                label: message.profile.label,
+            }),
+        } : {};
         this.spec = Object.freeze({
             runtime: message.runtime,
             containerId: message.containerId,
@@ -626,6 +634,7 @@ export class AgentTerminalWorker {
             marker: message.marker,
             cols: message.cols,
             rows: message.rows,
+            ...profile,
         });
         try {
             const before = this.inspectTarget(message.containerId);
@@ -648,6 +657,7 @@ export class AgentTerminalWorker {
                     startToken: containerInit.startToken,
                     pidNamespace: containerInit.pidNamespace,
                 }),
+                ...profile,
             });
             this.preparedSent = this.send('prepared', {
                 startupEvidence: this.startupEvidence,

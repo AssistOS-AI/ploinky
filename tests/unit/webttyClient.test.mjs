@@ -29,6 +29,8 @@ function createHarness({
     requestHandler = null,
     confirm = true,
     embedded = false,
+    storage = undefined,
+    viewOverride = undefined,
 } = {}) {
     const requests = [];
     const sources = [];
@@ -50,9 +52,11 @@ function createHarness({
             className: '',
             hidden: true,
             disabled: true,
+            value: '',
             listeners: new Map(),
             addEventListener(type, callback) { this.listeners.set(type, callback); },
             click() { this.listeners.get('click')?.(); },
+            change(value) { this.value = value; this.listeners.get('change')?.(); },
         };
         Object.defineProperty(value, 'innerHTML', {
             set() { assert.fail(`client must not write requested data through innerHTML (${id})`); },
@@ -60,7 +64,7 @@ function createHarness({
         elements.set(id, value);
         return value;
     }
-    for (const id of ['directory', 'target', 'access', 'status', 'status-dot', 'dimensions', 'message', 'terminal', 'role', 'kill']) element(id);
+    for (const id of ['directory', 'target', 'access', 'status', 'status-dot', 'dimensions', 'message', 'terminal', 'role', 'profile', 'close-policy', 'kill']) element(id);
 
     class FakeTerminal {
         constructor(options) {
@@ -114,7 +118,22 @@ function createHarness({
         confirm() { return confirm; },
         addEventListener(type, listener) { windowListeners.set(type, listener); },
     };
+    windowRef.location.origin = 'https://app.example.test';
+    const posted = [];
+    windowRef.parent = embedded ? { postMessage(message, targetOrigin) { posted.push({ message, targetOrigin }); } } : windowRef;
     windowRef.top = embedded ? {} : windowRef;
+    // A Map-backed sessionStorage; `storage: 'throws'` makes every access fail.
+    const stored = new Map(Object.entries(storage && storage !== 'throws' ? storage : {}));
+    Object.defineProperty(windowRef, 'sessionStorage', {
+        get() {
+            if (storage === 'throws') throw new Error('storage disabled');
+            return {
+                getItem: (key) => (stored.has(key) ? stored.get(key) : null),
+                setItem: (key, value) => { stored.set(key, String(value)); },
+                removeItem: (key) => { stored.delete(key); },
+            };
+        },
+    });
     const bodyClasses = new Set();
     const documentRef = {
         body: { classList: { add(value) { bodyClasses.add(value); } } },
@@ -138,8 +157,12 @@ function createHarness({
                             target: {
                                 kind: 'agent', label: '<agent>', detail: 'repo/agent', access: 'ro', cwdDisplay: '/code/<folder>',
                             },
+                            closePolicy: JSON.parse(options.body || '{}').closePolicy || 'keep',
+                            pendingStopUntil: null,
+                            profileLabel: null,
                             ...sessionOverride,
                         },
+                        view: viewOverride === undefined ? { id: `view-${'v'.repeat(26)}${requests.length}` } : viewOverride,
                     };
                 },
             };
@@ -177,6 +200,8 @@ function createHarness({
         },
         advanceClock(ms) { clock += ms; },
         historyCalls,
+        posted,
+        stored,
         requests,
         sources,
         terminal: FakeTerminal.instance,
@@ -194,8 +219,12 @@ function createHarness({
                             target: {
                                 kind: 'agent', label: '<agent>', detail: 'repo/agent', access: 'ro', cwdDisplay: '/code/<folder>',
                             },
+                            closePolicy: 'keep',
+                            pendingStopUntil: null,
+                            profileLabel: null,
                             ...sessionOverride,
                         },
+                        view: { id: 'v'.repeat(32) },
                     };
                 },
             });
@@ -215,6 +244,7 @@ test('fragment launch is stripped immediately, sent only in JSON, and POST compl
         launch,
         cols: 80,
         rows: 24,
+        closePolicy: 'keep',
     });
     assert.equal(harness.sources.length, 0);
 
@@ -224,7 +254,7 @@ test('fragment launch is stripped immediately, sent only in JSON, and POST compl
     assert.equal(harness.elements.get('access').textContent, 'Read only folder mapping');
     assert.equal(harness.elements.get('directory').textContent, '/code/<folder>');
     assert.equal(harness.sources.length, 1);
-    assert.equal(harness.sources[0].url, '/webtty/sessions/terminal-abcdefghijklmnop/stream');
+    assert.equal(harness.sources[0].url, `/webtty/sessions/terminal-abcdefghijklmnop/stream?view=${'v'.repeat(32)}`);
 });
 
 test('pagehide before deferred creation never deletes or attaches the learned session', async () => {
@@ -299,6 +329,7 @@ test('initial and resized terminal dimensions are clamped to protocol bounds', a
         launch: 'abcdefghijklmnopqrstuvwxyzABCDEF',
         cols: 1024,
         rows: 512,
+        closePolicy: 'keep',
     });
     harness.terminal.cols = -10;
     harness.terminal.rows = 1;
@@ -402,7 +433,10 @@ test('reset, detached and pagehide dispose locally without DELETE or later input
         await flushTasks();
         assert.equal(deletions(harness).length, 0, trigger);
         assert.equal(harness.sources[0].closed, true, trigger);
-        assert.equal(harness.requests.length, 1, trigger);
+        // Only a top-level owner pagehide adds its one close signal (plan r3 3.5).
+        const intents = harness.requests.filter(({ url }) => url.endsWith('/close-intents'));
+        assert.equal(intents.length, trigger === 'pagehide' ? 1 : 0, trigger);
+        assert.equal(harness.requests.length - intents.length, 1, trigger);
     }
 });
 
@@ -641,7 +675,9 @@ test('CLOSED stream recreates after a refused reconnect, resets once and replays
     assert.equal(harness.terminal.output, 'replay');
     assert.equal(harness.terminal.resets, 1);
     assert.equal(harness.sources.length, 3);
-    assert.ok(harness.sources.every(({ url }) => !url.includes('?')));
+    // In-tab reconnects reuse the same server view.
+    assert.ok(harness.sources.every(({ url }) => url === harness.sources[0].url));
+    assert.match(harness.sources[0].url, /^\/webtty\/sessions\/terminal-abcdefghijklmnop\/stream\?view=[A-Za-z0-9_-]{32}$/);
     assert.equal(deletions(harness).length, 0);
 });
 
@@ -680,4 +716,284 @@ test('resync resets before delta output, replay truncation is visible and neithe
     assert.equal(harness.terminal.output, 'new');
     assert.match(harness.elements.get('message').textContent, /recent terminal output/);
     assert.equal(deletions(harness).length, 0);
+});
+
+// ---- Close signal, views, reload and back/forward restore (plan r3 3.5, A9) ----
+
+const SESSION_ID = 'S'.repeat(32);
+const ATTACH_TOKEN = 'T'.repeat(32);
+
+function closeIntents(harness) {
+    return harness.requests.filter(({ url }) => url === `/webtty/sessions/${SESSION_ID}/close-intents`);
+}
+
+function mintHandler({ mintStatus = 201, onAttach = null } = {}) {
+    return (url) => {
+        if (url === `/webtty/live-sessions/${SESSION_ID}/attach-tokens`) {
+            return response(mintStatus, mintStatus === 201
+                ? { ok: true, attach: ATTACH_TOKEN, expiresAt: 5000 } : { ok: false, error: 'not_found' });
+        }
+        if (url === '/webtty/attachments' && onAttach) return onAttach();
+        return undefined;
+    };
+}
+
+test('A9: a top-level owner pagehide sends exactly one keepalive close intent with the page mutation proof', async () => {
+    const harness = createHarness({ hash: `#launch=${'a'.repeat(32)}&close=stop`, sessionOverride: { id: SESSION_ID } });
+    await flushTasks();
+    assert.deepEqual(JSON.parse(harness.requests[0].options.body), {
+        launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'stop',
+    });
+    const view = harness.sources[0].url.split('?view=')[1];
+    assert.match(view, /^[A-Za-z0-9_-]{32}$/);
+    assert.equal(harness.sources[0].url, `/webtty/sessions/${SESSION_ID}/stream?view=${view}`);
+    assert.equal(harness.elements.get('close-policy').value, 'stop');
+    assert.equal(harness.elements.get('close-policy').disabled, false);
+    harness.windowListeners.get('pagehide')();
+    harness.windowListeners.get('pagehide')();
+    await flushTasks();
+    const intents = closeIntents(harness);
+    assert.equal(intents.length, 1);
+    assert.equal(intents[0].options.method, 'POST');
+    assert.equal(intents[0].options.keepalive, true);
+    assert.equal(intents[0].options.credentials, 'same-origin');
+    // The existing proof: the HttpOnly CSRF cookie with exact Origin, no readable token header.
+    assert.deepEqual(JSON.parse(JSON.stringify(intents[0].options.headers)), { 'Content-Type': 'application/json' });
+    assert.deepEqual(JSON.parse(intents[0].options.body), { view, policy: 'stop' });
+    assert.deepEqual(Object.keys(JSON.parse(intents[0].options.body)), ['view', 'policy']);
+    assert.equal(deletions(harness).length, 0);
+    assert.deepEqual(harness.posted, []);
+});
+
+test('A9: a keep page still signals with its belief; embedded pages and watchers never signal', async () => {
+    const keep = createHarness({ sessionOverride: { id: SESSION_ID } });
+    await flushTasks();
+    keep.windowListeners.get('pagehide')();
+    await flushTasks();
+    assert.equal(JSON.parse(closeIntents(keep)[0].options.body).policy, 'keep');
+    for (const options of [{ embedded: true }, { role: 'watcher' }, { role: 'watcher', embedded: true }]) {
+        const harness = createHarness({ ...options, sessionOverride: { id: SESSION_ID } });
+        await flushTasks();
+        harness.windowListeners.get('pagehide')();
+        await flushTasks();
+        assert.equal(closeIntents(harness).length, 0, JSON.stringify(options));
+        assert.equal(harness.requests.length, 1, JSON.stringify(options));
+    }
+});
+
+test('A9: an embedded page announces its view only to its parent origin after attach and each policy change', async () => {
+    const harness = createHarness({ embedded: true, sessionOverride: { id: SESSION_ID, profileLabel: 'Robot <A>' },
+        requestHandler(url, options) {
+            if (url.endsWith('/close-policy')) {
+                return response(200, { ok: true, closePolicy: JSON.parse(options.body).policy, pendingStopUntil: null });
+            }
+        },
+    });
+    await flushTasks();
+    const view = harness.sources[0].url.split('?view=')[1];
+    // The page runs in its own realm; compare plain JSON shapes.
+    assert.deepEqual(JSON.parse(JSON.stringify(harness.posted)), [{
+        message: { type: 'ploinky-webtty:view', sessionId: SESSION_ID, viewId: view, role: 'owner', policy: 'keep' },
+        targetOrigin: 'https://app.example.test',
+    }]);
+    assert.equal(harness.stored.size, 0, 'embedded pages remember nothing');
+    assert.equal(harness.elements.get('profile').textContent, 'Profile: Robot <A>');
+    assert.equal(harness.elements.get('profile').hidden, false);
+    harness.elements.get('close-policy').change('stop');
+    await flushTasks();
+    const policyRequests = harness.requests.filter(({ url }) => url === `/webtty/sessions/${SESSION_ID}/close-policy`);
+    assert.equal(policyRequests.length, 1);
+    assert.deepEqual(JSON.parse(policyRequests[0].options.body), { policy: 'stop' });
+    assert.equal(harness.posted.length, 2);
+    assert.equal(harness.posted[1].message.policy, 'stop');
+    assert.equal(harness.posted[1].targetOrigin, 'https://app.example.test');
+});
+
+test('A9: the owner toggle shows the server result; watchers see the policy read-only', async () => {
+    const harness = createHarness({ sessionOverride: { id: SESSION_ID },
+        requestHandler(url) {
+            // The server answers with its resulting policy, which the page adopts.
+            if (url.endsWith('/close-policy')) return response(200, { ok: true, closePolicy: 'keep', pendingStopUntil: null });
+        },
+    });
+    await flushTasks();
+    assert.equal(harness.elements.get('profile').hidden, true);
+    harness.elements.get('close-policy').change('stop');
+    await flushTasks();
+    assert.equal(harness.elements.get('close-policy').value, 'keep');
+    harness.windowListeners.get('pagehide')();
+    await flushTasks();
+    assert.equal(JSON.parse(closeIntents(harness)[0].options.body).policy, 'keep');
+
+    const refused = createHarness({ sessionOverride: { id: SESSION_ID },
+        requestHandler(url) { if (url.endsWith('/close-policy')) return response(403, { error: 'owner_required' }); },
+    });
+    await flushTasks();
+    refused.elements.get('close-policy').change('stop');
+    await flushTasks();
+    assert.equal(refused.elements.get('close-policy').value, 'keep');
+    assert.match(refused.elements.get('message').textContent, /close setting was not changed/);
+
+    const watcher = createHarness({ role: 'watcher', sessionOverride: { id: SESSION_ID, closePolicy: 'stop' } });
+    await flushTasks();
+    assert.equal(watcher.elements.get('close-policy').value, 'stop');
+    assert.equal(watcher.elements.get('close-policy').disabled, true);
+    watcher.elements.get('close-policy').change('keep');
+    await flushTasks();
+    assert.equal(watcher.requests.filter(({ url }) => url.endsWith('/close-policy')).length, 0);
+    assert.equal(watcher.elements.get('close-policy').value, 'stop');
+});
+
+// Addendum A1 r2: the page remembers exactly {sessionId, viewId} as JSON.
+const STORED_VIEW = 'w'.repeat(32);
+const remembered = (viewId = STORED_VIEW, sessionId = SESSION_ID) => JSON.stringify({ sessionId, viewId });
+
+test('A9: a top-level reload re-attaches the remembered id with a fresh token and never stores tokens', async () => {
+    const first = createHarness({ sessionOverride: { id: SESSION_ID } });
+    await flushTasks();
+    const firstView = first.sources[0].url.split('?view=')[1];
+    assert.deepEqual([...first.stored], [['ploinky.webtty.session', remembered(firstView)]]);
+    const reload = createHarness({
+        hash: '', storage: { 'ploinky.webtty.session': remembered() },
+        sessionOverride: { id: SESSION_ID }, requestHandler: mintHandler(),
+    });
+    await flushTasks();
+    assert.deepEqual(reload.requests.map(({ url, options }) => `${options.method} ${url}`), [
+        `POST /webtty/live-sessions/${SESSION_ID}/attach-tokens`,
+        'POST /webtty/attachments',
+    ]);
+    // The reload supersedes the view it remembers.
+    assert.deepEqual(JSON.parse(reload.requests[0].options.body), { supersedes: STORED_VIEW });
+    assert.deepEqual(JSON.parse(reload.requests[1].options.body), { attach: ATTACH_TOKEN, cols: 80, rows: 24 });
+    assert.equal(reload.sources.length, 1);
+    assert.match(reload.sources[0].url, new RegExp(`^/webtty/sessions/${SESSION_ID}/stream\\?view=`));
+    const reloadView = reload.sources[0].url.split('?view=')[1];
+    assert.notEqual(reloadView, STORED_VIEW);
+    assert.deepEqual([...reload.stored], [['ploinky.webtty.session', remembered(reloadView)]], 'rewritten with the new view');
+    assert.ok([...reload.stored.values()].every((value) => !value.includes(ATTACH_TOKEN)));
+    assert.equal(reload.elements.get('kill').disabled, false);
+});
+
+test('A9: an ended terminal clears the key; storage failures, stale ids and transient errors offer Reopen', async () => {
+    for (const where of ['mint', 'attach']) {
+        const ended = createHarness({
+            hash: '', storage: { 'ploinky.webtty.session': remembered() },
+            requestHandler: where === 'mint' ? mintHandler({ mintStatus: 404 })
+                : mintHandler({ onAttach: () => response(404, { ok: false, error: 'not_found' }) }),
+        });
+        await flushTasks();
+        assert.equal(ended.elements.get('message').textContent, 'This terminal has ended.', where);
+        assert.equal(ended.stored.size, 0, where);
+        assert.equal(ended.sources.length, 0, where);
+    }
+    for (const [name, options, keyKept] of [
+        ['storage throws', { storage: 'throws' }, null],
+        ['nothing stored', { storage: {} }, null],
+        ['stale id', { storage: { 'ploinky.webtty.session': remembered(STORED_VIEW, 'not-a-terminal') } }, false],
+        ['legacy bare id', { storage: { 'ploinky.webtty.session': SESSION_ID } }, false],
+        ['missing view id', { storage: { 'ploinky.webtty.session': JSON.stringify({ sessionId: SESSION_ID }) } }, false],
+        ['malformed view id', { storage: { 'ploinky.webtty.session': remembered('short') } }, false],
+        ['extra key', { storage: { 'ploinky.webtty.session': JSON.stringify({ sessionId: SESSION_ID, viewId: STORED_VIEW, attach: ATTACH_TOKEN }) } }, false],
+        ['not JSON', { storage: { 'ploinky.webtty.session': '{"sessionId":' } }, false],
+        ['transient failure', { storage: { 'ploinky.webtty.session': remembered() }, requestHandler: () => response(503, {}) }, true],
+        ['embedded page', { storage: { 'ploinky.webtty.session': remembered() }, embedded: true }, true],
+    ]) {
+        const harness = createHarness({ hash: '', ...options });
+        await flushTasks();
+        assert.equal(harness.elements.get('status').textContent, 'Reopen terminal', name);
+        assert.match(harness.elements.get('message').textContent, /Reopen this terminal from Live Sessions/, name);
+        assert.equal(harness.sources.length, 0, name);
+        if (keyKept !== null) assert.equal(harness.stored.has('ploinky.webtty.session'), keyKept, name);
+        if (name === 'embedded page' || keyKept === false) assert.equal(harness.requests.length, 0, `${name}: no request without known ids`);
+    }
+});
+
+test('A9: a back/forward restore re-enables the page, re-attaches as a new view and re-announces when embedded', async () => {
+    for (const embedded of [false, true]) {
+        const harness = createHarness({ embedded, sessionOverride: { id: SESSION_ID }, requestHandler: mintHandler() });
+        await flushTasks();
+        const firstView = harness.sources[0].url.split('?view=')[1];
+        harness.windowListeners.get('pagehide')();
+        await flushTasks();
+        assert.equal(harness.terminal.options.disableStdin, true);
+        assert.equal(harness.elements.get('kill').disabled, true);
+        assert.equal(harness.elements.get('close-policy').disabled, true);
+        harness.windowListeners.get('pageshow')({ persisted: false });
+        await flushTasks();
+        assert.equal(harness.sources.length, 1, 'a fresh (non-cached) show does nothing');
+        harness.windowListeners.get('pageshow')({ persisted: true });
+        await flushTasks();
+        const order = harness.requests.map(({ url }) => url).filter((url) => !url.endsWith('/close-intents'));
+        assert.deepEqual(order.slice(-2), [`/webtty/live-sessions/${SESSION_ID}/attach-tokens`, '/webtty/attachments']);
+        // The restored page supersedes its own previous view (addendum A1 r2).
+        const mint = harness.requests.findLast(({ url }) => url.endsWith('/attach-tokens'));
+        assert.deepEqual(JSON.parse(mint.options.body), { supersedes: firstView });
+        assert.equal(harness.sources.length, 2);
+        const secondView = harness.sources[1].url.split('?view=')[1];
+        assert.notEqual(secondView, firstView);
+        assert.equal(harness.terminal.options.disableStdin, false);
+        assert.equal(harness.elements.get('kill').disabled, false);
+        assert.equal(harness.elements.get('close-policy').disabled, false);
+        harness.terminal.cols = 100;
+        harness.windowListeners.get('resize')();
+        harness.terminal.emitData('typed');
+        await flushTasks();
+        assert.ok(harness.requests.some(({ url }) => url.endsWith('/resize')), 'resize works again');
+        assert.ok(harness.requests.some(({ url }) => url.endsWith('/input')), 'input works again');
+        if (embedded) {
+            assert.deepEqual(harness.posted.map(({ message }) => message.viewId), [firstView, secondView]);
+            assert.equal(harness.stored.size, 0, 'an embedded page remembers nothing');
+        } else {
+            assert.deepEqual([...harness.stored], [['ploinky.webtty.session', remembered(secondView)]],
+                'rewritten after the back/forward re-attach');
+            // The restored page signals again for its new view on its next close.
+            harness.windowListeners.get('pagehide')();
+            await flushTasks();
+            assert.deepEqual(closeIntents(harness).map(({ options }) => JSON.parse(options.body).view), [firstView, secondView]);
+        }
+    }
+});
+
+test('A9: only #launch=<id> or #launch=<id>&close=stop launch; any other extra key is rejected', async () => {
+    for (const hash of [
+        `#launch=${'a'.repeat(32)}&close=keep`,
+        `#launch=${'a'.repeat(32)}&close=STOP`,
+        `#launch=${'a'.repeat(32)}&close=stop&close=stop`,
+        `#launch=${'a'.repeat(32)}&close=stop&extra=1`,
+        `#close=stop&launch=${'a'.repeat(32)}`,
+        `#attach=${'a'.repeat(32)}&close=stop`,
+    ]) {
+        const harness = createHarness({ hash });
+        await flushTasks();
+        assert.equal(harness.requests.length, 0, hash);
+        assert.equal(harness.elements.get('status').textContent, 'Reopen terminal', hash);
+    }
+    const stop = createHarness({ hash: `#launch=${'a'.repeat(32)}&close=stop` });
+    await flushTasks();
+    assert.equal(JSON.parse(stop.requests[0].options.body).closePolicy, 'stop');
+    const keep = createHarness({ hash: `#launch=${'a'.repeat(32)}` });
+    await flushTasks();
+    assert.equal(JSON.parse(keep.requests[0].options.body).closePolicy, 'keep');
+});
+
+test('A9: a create response without a server view is invalid and rolls back', async () => {
+    const harness = createHarness({ viewOverride: null });
+    await flushTasks();
+    assert.equal(deletions(harness).length, 1);
+    assert.equal(harness.sources.length, 0);
+    assert.equal(harness.elements.get('status').textContent, 'Unavailable');
+});
+
+test('A9-S: the remembered value is exactly {sessionId, viewId} after an attach handoff, never a token', async () => {
+    const token = 'a'.repeat(32);
+    const harness = createHarness({ hash: `#attach=${token}`, sessionOverride: { id: SESSION_ID } });
+    await flushTasks();
+    const view = harness.sources[0].url.split('?view=')[1];
+    const [[key, value]] = [...harness.stored];
+    assert.equal(key, 'ploinky.webtty.session');
+    assert.deepEqual(Object.keys(JSON.parse(value)).sort(), ['sessionId', 'viewId']);
+    assert.equal(value, remembered(view));
+    assert.doesNotMatch(value, new RegExp(token));
+    // A plain attach handoff (Live Sessions attach or pop-out) never claims anything.
+    assert.deepEqual(Object.keys(JSON.parse(harness.requests[0].options.body)).sort(), ['attach', 'cols', 'rows']);
 });

@@ -36,6 +36,28 @@ test('attach tokens expire at 60 seconds, are single use and bind login, route a
         { code: 'WEBTTY_ATTACH_NOT_FOUND' });
 });
 
+test('an attach record binds an optional recovery claim checked only for format', () => {
+    const records = new WebttyLaunchRecordStore({ now: () => 1000 });
+    const sessionId = 's'.repeat(32);
+    const plain = records.createAttachment({ owner: OWNER, routeBinding: ROUTE, sessionId });
+    assert.equal(records.consumeAttachment({ attach: plain.attach, owner: OWNER, routeBinding: ROUTE }).supersedes, null);
+    const claimed = records.createAttachment({ owner: OWNER, routeBinding: ROUTE, sessionId, supersedes: 'v'.repeat(32) });
+    assert.deepEqual(Object.keys(claimed).sort(), ['attach', 'expiresAt'], 'the token response never echoes the claim');
+    // The claim travels inside the single-use record, bound to the same login and route.
+    assert.throws(() => records.consumeAttachment({ attach: claimed.attach, owner: OTHER_OWNER, routeBinding: ROUTE }),
+        { code: 'WEBTTY_ATTACH_NOT_FOUND' });
+    const record = records.consumeAttachment({ attach: claimed.attach, owner: OWNER, routeBinding: ROUTE });
+    assert.equal(record.supersedes, 'v'.repeat(32));
+    assert.equal(record.sessionId, sessionId);
+    assert.throws(() => records.consumeAttachment({ attach: claimed.attach, owner: OWNER, routeBinding: ROUTE }),
+        { code: 'WEBTTY_ATTACH_NOT_FOUND' });
+    for (const supersedes of ['short', 'v'.repeat(33), 'bad id'.padEnd(32, 'x'), 42, {}]) {
+        assert.throws(() => records.createAttachment({ owner: OWNER, routeBinding: ROUTE, sessionId, supersedes }),
+            { code: 'WEBTTY_ATTACH_CLAIM_INVALID' });
+    }
+    assert.equal(records.attachments.size, 0);
+});
+
 function randomSource() {
     let sequence = 0;
     return (bytes) => {
@@ -300,4 +322,65 @@ test('unsafe display data and mismatched target directories are rejected before 
         (error) => error.code === 'WEBTTY_LAUNCH_DIRECTORY_INVALID',
     );
     assert.deepEqual(records.counts(), { batches: 0, launches: 0 });
+});
+
+function profileHome(translatedHome) {
+    return Object.freeze({
+        relativePath: '.data/provider/profiles/p-1/home',
+        absolutePath: '/physical/workspace/.data/provider/profiles/p-1/home',
+        identity: Object.freeze({ dev: '7', ino: '9' }),
+        translatedHome,
+    });
+}
+
+test('a profile discovery binds profile and per-target HOME and lists ineligible rows without launches', () => {
+    const records = new WebttyLaunchRecordStore({ randomBytes: randomSource() });
+    const profile = Object.freeze({ provider: 'provider', id: 'p-1', label: 'Profile One' });
+    const homeBox = Object.freeze({ ...box(), home: profileHome('/physical/workspace/.data/provider/profiles/p-1/home') });
+    const homeAgent = Object.freeze({ ...agent(), home: profileHome('/data/profiles/p-1/home') });
+    const unreachable = Object.freeze({ ...agent(), containerName: 'isolated', unavailable: 'home-unreachable' });
+    const readOnly = Object.freeze({ ...agent(), containerName: 'read-only', unavailable: 'home-read-only' });
+    const discovery = records.createDiscovery({
+        owner: OWNER, routeBinding: ROUTE, targets: [homeBox, homeAgent, unreachable, readOnly], profile,
+    });
+    assert.deepEqual(discovery.profile, profile);
+    assert.deepEqual(Object.keys(discovery), ['id', 'directory', 'expiresAt', 'agentTargetsAvailable', 'profile', 'targets']);
+    assert.deepEqual(discovery.targets.map((row) => Object.keys(row)), [
+        ['launch', 'kind', 'label', 'detail', 'access', 'cwdDisplay'],
+        ['launch', 'kind', 'label', 'detail', 'access', 'cwdDisplay'],
+        ['kind', 'label', 'detail', 'access', 'cwdDisplay', 'unavailable'],
+        ['kind', 'label', 'detail', 'access', 'cwdDisplay', 'unavailable'],
+    ]);
+    assert.deepEqual(discovery.targets.slice(2).map((row) => row.unavailable), ['home-unreachable', 'home-read-only']);
+    // Neither HOME paths nor identities reach the browser.
+    assert.doesNotMatch(JSON.stringify(discovery), /profiles\/p-1\/home|"ino"|translatedHome/);
+    assert.equal(records.counts().launches, 2);
+    const consumed = records.consume({ launch: discovery.targets[1].launch, owner: OWNER, routeBinding: ROUTE });
+    assert.deepEqual(consumed.target.profile, profile);
+    assert.deepEqual(consumed.target.home, homeAgent.home);
+    assert.equal(Object.isFrozen(consumed.target.home.identity), true);
+});
+
+test('profile and non-profile discoveries cannot mix HOME bindings', () => {
+    const records = new WebttyLaunchRecordStore({ randomBytes: randomSource() });
+    const profile = { provider: 'provider', id: 'p-1', label: 'Profile One' };
+    const homeBox = { ...box(), home: profileHome('/x/home') };
+    for (const request of [
+        { targets: [box()], profile },
+        { targets: [homeBox] },
+        { targets: [homeBox, { ...agent(), unavailable: 'other-reason' }], profile },
+        { targets: [{ ...box(), unavailable: 'home-unreachable' }], profile },
+        { targets: [homeBox], profile: { ...profile, label: 'bad\nlabel' } },
+        { targets: [homeBox], profile: { ...profile, home: '/x' } },
+    ]) {
+        assert.throws(
+            () => records.createDiscovery({ owner: OWNER, routeBinding: ROUTE, ...request }),
+            { code: 'WEBTTY_LAUNCH_TARGET_INVALID' },
+            JSON.stringify(request),
+        );
+    }
+    const plain = records.createDiscovery({ owner: OWNER, routeBinding: ROUTE, targets: [box(), agent()] });
+    assert.deepEqual(Object.keys(plain), ['id', 'directory', 'expiresAt', 'agentTargetsAvailable', 'targets']);
+    const consumed = records.consume({ launch: plain.targets[0].launch, owner: OWNER, routeBinding: ROUTE });
+    assert.equal('profile' in consumed.target || 'home' in consumed.target, false);
 });

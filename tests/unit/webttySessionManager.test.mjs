@@ -8,7 +8,7 @@ import { WebttySessionManager } from '../../cli/server/webtty/sessionManager.mjs
 import { TerminalTargetResolver, terminalTargetRouteBinding } from '../../cli/server/webtty/terminalTargetResolver.mjs';
 import { mintSessionJwt } from '../../cli/server/auth/localService.js';
 import { sessionTokenService } from '../../cli/server/authHandlers/shared.js';
-import { createBrowserSessionLease, validateBrowserSessionLease } from '../../cli/server/webtty/authLease.mjs';
+import { browserPrincipal, createBrowserSessionLease, validateBrowserSessionLease } from '../../cli/server/webtty/authLease.mjs';
 import { onAuthenticatedRequestDecision, publishAuthenticatedRequestDecision } from '../../cli/server/auth/authenticatedRequestEvents.mjs';
 
 // The Router's workspace root is the host-selected path mounted at itself.
@@ -88,6 +88,14 @@ async function createAgentSession(manager, req = {}) {
     });
     const created = await manager.create({ req, routePlan: plan, launch: discovery.targets[1].launch });
     return manager.sessions.get(created.id);
+}
+
+// Every stream binds to a server-issued view of its own principal (plan r3
+// 3.4 hard cut); these direct manager streams open one view per stream.
+function attachViewStream(manager, session, req, res, cursor = '', plan = session?.routePlan) {
+    const streamLease = manager.auth.createLease(req);
+    const view = manager.createView(session, browserPrincipal(streamLease.mode, streamLease.userId));
+    return manager.attachStream(session, req, res, cursor, plan, view.id);
 }
 
 async function settleTarget(session) {
@@ -303,6 +311,7 @@ async function createManager(t, options = {}) {
         agentWorkerFactory: options.agentWorkerFactory || (() => new FakeWorker()),
         launchStore: options.launchStore,
         targetResolver: options.targetResolver,
+        homeProfiles: options.homeProfiles,
         agentProviderAvailable: options.agentProviderAvailable,
         audit: options.audit,
         now: options.now,
@@ -704,7 +713,7 @@ test('browser stream close detaches without reclaiming the terminal', async (t) 
         write() { return true; },
         end() { this.writableEnded = true; },
     };
-    assert.equal(manager.attachStream(session, request, response), true);
+    assert.equal(attachViewStream(manager, session, request, response), true);
     request.emit('close');
     await new Promise((resolve) => setTimeout(resolve, 40));
 
@@ -756,7 +765,7 @@ test('throwing auth unsubscribe cannot bypass worker cleanup or quota release', 
         req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24,
     });
     const session = manager.sessions.get(created.id);
-    manager.attachStream(session, new EventEmitter(), streamResponse());
+    attachViewStream(manager, session, new EventEmitter(), streamResponse());
     session.viewers.values().next().value.unsubscribeAuth = () => { throw new Error('unsubscribe broke'); };
     assert.equal(await manager.closeSession(session, 'test'), true);
     assert.equal(worker.closed, 1);
@@ -802,7 +811,7 @@ test('already-closed and throwing SSE attachments preserve bounded detach cleanu
                 },
                 end() { this.writableEnded = true; },
             };
-            assert.equal(manager.attachStream(session, request, response), false);
+            assert.equal(attachViewStream(manager, session, request, response), false);
             await new Promise((resolve) => setTimeout(resolve, 35));
             assert.equal(manager.activeCount(), 0);
             assert.equal(worker.closed, 1);
@@ -1264,7 +1273,7 @@ test('output sequence, replay gap, and SSE high-water limits fail closed', async
             write(value) { this.body += value; return true; },
             end() { this.writableEnded = true; },
         };
-        assert.equal(manager.attachStream(session, new EventEmitter(), response, '0'), true);
+        assert.equal(attachViewStream(manager, session, new EventEmitter(), response, '0'), true);
         assert.match(response.body, /event: resync/);
         assert.match(response.body, /id: 2/);
         assert.match(response.body, /id: 3/);
@@ -1286,7 +1295,7 @@ test('output sequence, replay gap, and SSE high-water limits fail closed', async
             write() { return true; },
             end() { this.writableEnded = true; },
         };
-        manager.attachStream(session, request, response);
+        attachViewStream(manager, session, request, response);
         worker.emit('output', { sequence: 1, data: 'this output exceeds the writable bound' });
         await new Promise((resolve) => setImmediate(resolve));
         assert.equal(manager.activeCount(), 1);
@@ -1372,7 +1381,7 @@ test('periodic SSO administrator demotion closes the terminal and releases owner
         workerFactory: () => worker,
     });
     const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24 });
-    manager.attachStream(manager.sessions.get(created.id), new EventEmitter(), streamResponse());
+    attachViewStream(manager, manager.sessions.get(created.id), new EventEmitter(), streamResponse());
     administrator = false;
     await manager.validateLiveSessions();
 
@@ -2009,7 +2018,7 @@ test('multiple viewers share ordered output and only the owner can write or resi
     const session = manager.sessions.get(created.id);
     const responses = [streamResponse(), streamResponse()];
     const requests = [Object.assign(new EventEmitter(), owner), Object.assign(new EventEmitter(), watcher)];
-    requests.forEach((req, index) => manager.attachStream(session, req, responses[index]));
+    requests.forEach((req, index) => attachViewStream(manager, session, req, responses[index]));
     worker.emit('output', { sequence: 1, data: 'shared' });
     responses.forEach(res => assert.match(res.body, /id: 1\nevent: output/));
     for (const need of ['input', 'resize']) {
@@ -2035,7 +2044,7 @@ test('a near-1 MiB replay is paced across drains and remains ahead of live outpu
         this.writableLength += Buffer.byteLength(value);
         return this.writableLength < 32_000;
     };
-    assert.equal(manager.attachStream(session, new EventEmitter(), response), true);
+    assert.equal(attachViewStream(manager, session, new EventEmitter(), response), true);
     const viewer = session.viewers.values().next().value;
     assert.ok(viewer.queuedBytes > 900_000);
     worker.emit('output', { sequence: 64, data: 'live' });
@@ -2060,8 +2069,8 @@ test('never-draining viewer detaches at 30 seconds while another viewer and work
     const slow = streamResponse();
     slow.write = function write(value) { this.body += value; return false; };
     const fast = streamResponse();
-    manager.attachStream(session, new EventEmitter(), slow);
-    manager.attachStream(session, new EventEmitter(), fast);
+    attachViewStream(manager, session, new EventEmitter(), slow);
+    attachViewStream(manager, session, new EventEmitter(), fast);
     worker.emit('output', { sequence: 1, data: 'still live' });
     t.mock.timers.tick(29_999);
     assert.equal(session.viewers.size, 2);
@@ -2082,14 +2091,14 @@ test('byte and event rollover allow fresh replay, old-cursor resync and reject m
         for (const [cursor, event] of [['', 'replay-truncated'], ['0', 'resync']]) {
             const response = streamResponse();
             const request = new EventEmitter();
-            assert.equal(manager.attachStream(session, request, response, cursor), true);
+            assert.equal(attachViewStream(manager, session, request, response, cursor), true);
             assert.ok(response.body.indexOf(`event: ${event}`) < response.body.indexOf('event: output'));
             assert.match(response.body, /id: 3/);
             request.emit('close');
         }
         for (const cursor of ['4', 'nope', '1e0', '-1']) {
             const response = streamResponse();
-            assert.equal(manager.attachStream(session, new EventEmitter(), response, cursor), false);
+            assert.equal(attachViewStream(manager, session, new EventEmitter(), response, cursor), false);
             assert.match(response.body, /event: reset/);
         }
     }
@@ -2113,7 +2122,7 @@ test('logout detaches just its viewer; detached shells are not auth checked; own
     const b = await manager.create({ req: owner, routePlan: plan, cwdRelative: '' });
     const session = manager.sessions.get(a.id);
     const response = streamResponse();
-    manager.attachStream(session, Object.assign(new EventEmitter(), owner), response);
+    attachViewStream(manager, session, Object.assign(new EventEmitter(), owner), response);
     listeners.get(owner.lease.sessionFingerprint)('logout');
     assert.match(response.body, /auth_logout/);
     assert.equal(session.viewers.size, 0);
@@ -2121,7 +2130,7 @@ test('logout detaches just its viewer; detached shells are not auth checked; own
     await manager.validateLiveSessions();
     assert.equal(checks, previousChecks);
     assert.equal(manager.activeCount(), 2);
-    manager.attachStream(session, Object.assign(new EventEmitter(), owner), streamResponse());
+    attachViewStream(manager, session, Object.assign(new EventEmitter(), owner), streamResponse());
     listeners.get(owner.lease.sessionFingerprint)('administrator_revoked');
     await Promise.allSettled([...manager.inFlightCloses]);
     assert.equal(manager.sessions.has(a.id), false);
@@ -2146,21 +2155,21 @@ test('production principal quota spans logins and viewer quotas release reusable
         for (let viewer = 0; viewer < 8; viewer += 1) {
             const request = Object.assign(new EventEmitter(), req);
             requests.push(request);
-            manager.attachStream(session, request, streamResponse());
+            attachViewStream(manager, session, request, streamResponse());
         }
     }
     assert.equal(manager.viewerCount, 64);
     await assert.rejects(manager.create({ req: { lease: lease('c') }, routePlan: plan, cwdRelative: '' }),
         { code: 'WEBTTY_USER_QUOTA' });
     assert.equal(allocations, 8);
-    assert.throws(() => manager.attachStream(sessions[0], Object.assign(new EventEmitter(), { lease: lease('a') }), streamResponse()),
+    assert.throws(() => attachViewStream(manager, sessions[0], Object.assign(new EventEmitter(), { lease: lease('a') }), streamResponse()),
         { code: 'WEBTTY_VIEWER_QUOTA' });
     const other = await manager.create({ req: { lease: lease('other', 'other-admin') }, routePlan: plan, cwdRelative: '' });
-    assert.throws(() => manager.attachStream(manager.sessions.get(other.id), Object.assign(new EventEmitter(), { lease: lease('a') }), streamResponse()),
+    assert.throws(() => attachViewStream(manager, manager.sessions.get(other.id), Object.assign(new EventEmitter(), { lease: lease('a') }), streamResponse()),
         { code: 'WEBTTY_VIEWER_QUOTA' });
     requests[0].emit('close');
     assert.equal(manager.viewerCount, 63);
-    assert.equal(manager.attachStream(manager.sessions.get(other.id), Object.assign(new EventEmitter(), { lease: lease('a') }), streamResponse()), true);
+    assert.equal(attachViewStream(manager, manager.sessions.get(other.id), Object.assign(new EventEmitter(), { lease: lease('a') }), streamResponse()), true);
     assert.equal(manager.viewerCount, 64);
 });
 
@@ -2177,7 +2186,7 @@ test('production idle and absolute bounds and never-attached grace remain exact'
     const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
     const session = manager.sessions.get(created.id);
     const request = new EventEmitter();
-    manager.attachStream(session, request, streamResponse());
+    attachViewStream(manager, session, request, streamResponse());
     request.emit('close');
     now += 60_000;
     await manager.validateLiveSessions();
@@ -2271,7 +2280,7 @@ test('generation lease ends only its viewer, then a current stream delta-replays
     const created = await manager.create({ req: {}, routePlan: oldPlan, cwdRelative: '' });
     const session = manager.sessions.get(created.id);
     const oldResponse = streamResponse();
-    manager.attachStream(session, new EventEmitter(), oldResponse, '', oldPlan);
+    attachViewStream(manager, session, new EventEmitter(), oldResponse, '', oldPlan);
     worker.emit('output', { sequence: 1, data: 'one' });
     current = false;
     await manager.validateLiveSessions();
@@ -2286,7 +2295,7 @@ test('generation lease ends only its viewer, then a current stream delta-replays
     newPlan.lease.id = 'generation-b';
     assert.ok(await manager.authorize({}, newPlan, created.id, 'input'));
     const nextResponse = streamResponse();
-    manager.attachStream(session, new EventEmitter(), nextResponse, '1', newPlan);
+    attachViewStream(manager, session, new EventEmitter(), nextResponse, '1', newPlan);
     assert.doesNotMatch(nextResponse.body, /id: 1\n/);
     assert.match(nextResponse.body, /id: 2\n/);
 });
@@ -2419,7 +2428,7 @@ test('24 saturated agent validations stay bounded, enforce deadlines and keep vi
             const response = streamResponse();
             const admitted = routePlan();
             admitted.lease.isCurrent = () => false;
-            manager.attachStream(session, new EventEmitter(), response, '', admitted);
+            attachViewStream(manager, session, new EventEmitter(), response, '', admitted);
             responses.push(response);
         }
         await manager.validateLiveSessions();
@@ -2500,7 +2509,7 @@ test('deadline ignores late results and synchronous cutoff closes by the followi
     });
     const session = await createAgentSession(manager);
     const request = new EventEmitter();
-    manager.attachStream(session, request, streamResponse());
+    attachViewStream(manager, session, request, streamResponse());
     request.emit('close');
     await manager.validateLiveSessions();
     now += 10_000;
@@ -2528,17 +2537,17 @@ test('viewer subscription rollback and a failed later attach preserve the correc
     const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
     const session = manager.sessions.get(created.id);
     rejectSubscription = true;
-    assert.throws(() => manager.attachStream(session, new EventEmitter(), streamResponse()), /subscription refused/);
+    assert.throws(() => attachViewStream(manager, session, new EventEmitter(), streamResponse()), /subscription refused/);
     assert.equal(session.everAttached, false);
     assert.ok(session.detachTimer);
     assert.equal(manager.viewerCount, 0);
     rejectSubscription = false;
     const req = new EventEmitter();
-    manager.attachStream(session, req, streamResponse());
+    attachViewStream(manager, session, req, streamResponse());
     req.emit('close');
     const broken = streamResponse();
     broken.write = () => { throw new Error('connection gone'); };
-    assert.equal(manager.attachStream(session, new EventEmitter(), broken), false);
+    assert.equal(attachViewStream(manager, session, new EventEmitter(), broken), false);
     assert.equal(session.everAttached, true);
     assert.equal(session.detachTimer, null);
     assert.equal(manager.activeCount(), 1);
@@ -2558,8 +2567,8 @@ test('queue overflow removes only the slow viewer; 70-second detached provider o
     slow.write = function write(value) { this.body += value; return false; };
     const fast = streamResponse();
     const fastReq = new EventEmitter();
-    manager.attachStream(session, new EventEmitter(), slow);
-    manager.attachStream(session, fastReq, fast);
+    attachViewStream(manager, session, new EventEmitter(), slow);
+    attachViewStream(manager, session, fastReq, fast);
     for (let sequence = 1; sequence <= 90; sequence += 1) worker.emit('output', { sequence, data: 'x'.repeat(16_000) });
     assert.match(slow.body, /slow_viewer/);
     assert.equal(session.viewers.size, 1);
@@ -2581,7 +2590,7 @@ test('per-viewer provider outage resets on a decided result and detaches only at
     const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
     const session = manager.sessions.get(created.id);
     const response = streamResponse();
-    manager.attachStream(session, new EventEmitter(), response);
+    attachViewStream(manager, session, new EventEmitter(), response);
     unavailable = true;
     await manager.validateLiveSessions();
     now += 59_999;
@@ -2606,7 +2615,7 @@ test('owner admission time only moves forward across devices', async (t) => {
     const created = await manager.create({ req, routePlan: plan, cwdRelative: '' });
     const session = manager.sessions.get(created.id);
     await manager.authorize({ lease: { ...lease('old'), createdAt: 1000 } }, plan, created.id, 'input');
-    manager.attachStream(session, Object.assign(new EventEmitter(), { lease: { ...lease('old'), createdAt: 1000 } }), streamResponse());
+    attachViewStream(manager, session, Object.assign(new EventEmitter(), { lease: { ...lease('old'), createdAt: 1000 } }), streamResponse());
     assert.equal(session.owner.adminAdmittedAt, 5000);
     await manager.authorize({ lease: { ...lease('newer'), createdAt: 6000 } }, plan, created.id, 'input');
     assert.equal(session.owner.adminAdmittedAt, 6000);
@@ -2836,7 +2845,7 @@ test('post-discovery decided demotion closes detached siblings; provider outage 
         const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
         const session = manager.sessions.get(created.id);
         const request = new EventEmitter();
-        manager.attachStream(session, request, streamResponse());
+        attachViewStream(manager, session, request, streamResponse());
         request.emit('close');
         manager.targetResolver.discover = async () => {
             refused = true;
@@ -2868,7 +2877,7 @@ test('decided startup demotion reclaims the new shell and detached siblings with
     const first = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
     const session = manager.sessions.get(first.id);
     const request = new EventEmitter();
-    manager.attachStream(session, request, streamResponse());
+    attachViewStream(manager, session, request, streamResponse());
     request.emit('close');
     await assert.rejects(manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' }), { code: 'WEBTTY_ADMIN_REQUIRED' });
     await Promise.allSettled([...manager.inFlightCloses]);
@@ -2877,4 +2886,1218 @@ test('decided startup demotion reclaims the new shell and detached siblings with
     assert.equal(manager.ownerIndex.size, 0);
     assert.equal(manager.userCounts.size, 0);
     assert.deepEqual(workers.map(worker => worker.closed), [1, 1]);
+});
+
+const PROFILE = Object.freeze({ provider: 'provider', id: 'p-1', label: 'Profile One' });
+const PROFILE_HOME = Object.freeze({
+    relativePath: '.data/provider/profiles/p-1/home',
+    absolutePath: `${WORKSPACE_ROOT}/.data/provider/profiles/p-1/home`,
+    identity: Object.freeze({ dev: '11', ino: '12' }),
+});
+
+function profileTargets() {
+    const [box, agent] = terminalTargets();
+    return Object.freeze([
+        Object.freeze({ ...box, home: Object.freeze({ ...PROFILE_HOME, translatedHome: PROFILE_HOME.absolutePath }) }),
+        Object.freeze({ ...agent, access: 'rw', home: Object.freeze({ ...PROFILE_HOME, translatedHome: '/data/profiles/p-1/home' }) }),
+        Object.freeze({ ...agent, containerName: 'ploinky-agent-isolated', unavailable: 'home-unreachable' }),
+    ]);
+}
+
+function homeProfiles(answers = []) {
+    const calls = [];
+    return {
+        calls,
+        async resolve(args) {
+            calls.push(args);
+            const answer = answers.length ? answers.shift() : null;
+            if (answer instanceof Error) throw answer;
+            return answer || { profile: PROFILE, home: PROFILE_HOME };
+        },
+    };
+}
+
+function profileResolver() {
+    const discoveries = [];
+    return {
+        discoveries,
+        async discover(args) {
+            discoveries.push(args);
+            return { agentTargetsAvailable: true, targets: 'home' in args ? profileTargets() : terminalTargets() };
+        },
+        async revalidate({ target }) { return target; },
+    };
+}
+
+test('a profile discovery resolves the provider after admission and binds only eligible launches', async (t) => {
+    const order = [];
+    const profiles = homeProfiles();
+    const resolve = profiles.resolve;
+    profiles.resolve = async (args) => { order.push('provider'); return resolve(args); };
+    const targetResolver = profileResolver();
+    const manager = await createManager(t, {
+        agentProviderAvailable: true,
+        targetResolver,
+        homeProfiles: profiles,
+        auth: authAdapter({ validate: async () => { order.push('admission'); return { ok: true }; } }),
+    });
+    const req = { user: { id: 'local:admin', roles: ['admin'] } };
+    const discovery = await manager.discoverTargets({
+        req, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
+    });
+    assert.deepEqual(order.slice(0, 2), ['admission', 'provider']);
+    assert.equal(profiles.calls.length, 1);
+    assert.equal(profiles.calls[0].req, req);
+    assert.deepEqual(profiles.calls[0].profile, { provider: 'provider', id: 'p-1' });
+    assert.deepEqual(targetResolver.discoveries[0].home, PROFILE_HOME);
+    assert.deepEqual(discovery.profile, PROFILE);
+    assert.deepEqual(discovery.targets.map((row) => [row.kind, Boolean(row.launch), row.unavailable]), [
+        ['box', true, undefined], ['agent', true, undefined], ['agent', false, 'home-unreachable'],
+    ]);
+    assert.doesNotMatch(JSON.stringify(discovery), /profiles\/p-1\/home/);
+
+    // Without a profile the provider is never consulted and nothing changes.
+    const plain = await manager.discoverTargets({ req, routePlan: routePlan(), directory: 'Projects' });
+    assert.equal(profiles.calls.length, 1);
+    assert.equal('home' in targetResolver.discoveries[1], false);
+    assert.deepEqual(Object.keys(plain), ['id', 'directory', 'expiresAt', 'agentTargetsAvailable', 'targets']);
+    assert.deepEqual(plain.targets.map((row) => Object.keys(row)), [
+        ['launch', 'kind', 'label', 'detail', 'access', 'cwdDisplay'],
+        ['launch', 'kind', 'label', 'detail', 'access', 'cwdDisplay'],
+    ]);
+});
+
+test('a refused profile creates no discovery record and no launch', async (t) => {
+    const refusal = Object.assign(new Error('refused'), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
+    const targetResolver = profileResolver();
+    const manager = await createManager(t, {
+        targetResolver, homeProfiles: homeProfiles([refusal]),
+    });
+    const before = manager.launchStore.counts();
+    await assert.rejects(
+        manager.discoverTargets({
+            req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
+        }),
+        { code: 'WEBTTY_PROFILE_UNAVAILABLE' },
+    );
+    assert.equal(targetResolver.discoveries.length, 0);
+    assert.deepEqual(manager.launchStore.counts(), before);
+    // A manager without a provider refuses every profile the same way.
+    const bare = await createManager(t, { targetResolver: profileResolver() });
+    await assert.rejects(
+        bare.discoverTargets({
+            req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
+        }),
+        { code: 'WEBTTY_PROFILE_UNAVAILABLE' },
+    );
+});
+
+test('a Box profile session re-resolves the provider and changes HOME only in the shell environment', async (t) => {
+    const worker = new FakeWorker();
+    const profiles = homeProfiles();
+    const manager = await createManager(t, {
+        workerFactory: (options) => { worker.factoryOptions = options; return worker; },
+        targetResolver: profileResolver(),
+        homeProfiles: profiles,
+    });
+    const discovery = await manager.discoverTargets({
+        req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
+    });
+    const created = await manager.create({
+        req: {}, routePlan: routePlan(), launch: discovery.targets[0].launch, cols: 90, rows: 30,
+    });
+    assert.equal(profiles.calls.length, 2);
+    assert.deepEqual(profiles.calls[1].profile, { provider: 'provider', id: 'p-1' });
+    assert.deepEqual(Object.keys(worker.startFields).sort(),
+        ['cols', 'cwdRelative', 'homeIdentity', 'homeRelative', 'rows', 'shellEnv']);
+    assert.equal(worker.startFields.homeRelative, PROFILE_HOME.relativePath);
+    assert.deepEqual(worker.startFields.homeIdentity, { dev: '11', ino: '12' });
+    assert.deepEqual(worker.startFields.shellEnv, buildShellEnvironment({}, {
+        workspaceRoot: WORKSPACE_ROOT, profile: { ...PROFILE, home: PROFILE_HOME.absolutePath },
+    }));
+    assert.equal(worker.startFields.shellEnv.HOME, PROFILE_HOME.absolutePath);
+    assert.equal(worker.startFields.shellEnv.INPUTRC, '/etc/inputrc');
+    assert.equal(worker.startFields.shellEnv.PLOINKY_WEBTTY_PROFILE_PROVIDER, 'provider');
+    assert.equal(worker.startFields.shellEnv.PLOINKY_WEBTTY_PROFILE_ID, 'p-1');
+    assert.equal(worker.startFields.shellEnv.PLOINKY_WEBTTY_PROFILE_LABEL, 'Profile One');
+    // The worker process itself is created exactly as before.
+    assert.deepEqual(Object.keys(worker.factoryOptions).sort(), ['marker', 'terminalId', 'workspaceRoot']);
+    assert.deepEqual(manager.sessions.get(created.id).profile, PROFILE);
+});
+
+test('an agent profile session sends the translated HOME and profile to the agent worker only', async (t) => {
+    const agentWorker = new FakeWorker();
+    agentWorker.start = async function start() { return { recoveryEvidence: { exact: true } }; };
+    const manager = await createManager(t, {
+        agentProviderAvailable: true,
+        agentWorkerFactory: (options) => { agentWorker.factoryOptions = options; return agentWorker; },
+        targetResolver: profileResolver(),
+        homeProfiles: homeProfiles(),
+    });
+    const discovery = await manager.discoverTargets({
+        req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
+    });
+    const created = await manager.create({
+        req: {}, routePlan: routePlan(), launch: discovery.targets[1].launch, cols: 92, rows: 31,
+    });
+    assert.deepEqual(agentWorker.startFields, {
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
+        targetUser: '1000:1000',
+        translatedCwd: '/code/Projects',
+        marker: manager.sessions.get(created.id).marker,
+        cols: 92,
+        rows: 31,
+        translatedHome: '/data/profiles/p-1/home',
+        profile: PROFILE,
+    });
+    assert.deepEqual(agentWorker.factoryOptions, { terminalId: created.id });
+});
+
+test('creation fails as target-stale when the provider answer or home identity changed', async (t) => {
+    const refusal = Object.assign(new Error('refused'), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
+    for (const [name, answer] of [
+        ['replaced home', { profile: PROFILE, home: { ...PROFILE_HOME, identity: { dev: '11', ino: '13' } } }],
+        ['moved home', { profile: PROFILE, home: { ...PROFILE_HOME, relativePath: '.data/provider/p-2', absolutePath: `${WORKSPACE_ROOT}/.data/provider/p-2` } }],
+        ['relabelled', { profile: { ...PROFILE, label: 'Other' }, home: PROFILE_HOME }],
+        ['refused', refusal],
+    ]) {
+        const worker = new FakeWorker();
+        let workers = 0;
+        const manager = await createManager(t, {
+            workerFactory: () => { workers += 1; return worker; },
+            targetResolver: profileResolver(),
+            homeProfiles: homeProfiles([null, answer]),
+        });
+        const discovery = await manager.discoverTargets({
+            req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
+        });
+        await assert.rejects(
+            manager.create({ req: {}, routePlan: routePlan(), launch: discovery.targets[0].launch, cols: 80, rows: 24 }),
+            { code: 'WEBTTY_TARGET_STALE' },
+            name,
+        );
+        assert.equal(workers, 0, name);
+        assert.equal(manager.activeCount(), 0, name);
+    }
+});
+
+// ---- Close outcome, retention and listing (plan r3 3.4, A7) ----
+
+const SHELL_ROW_KEYS = [
+    'id', 'source', 'kind', 'title', 'detail', 'cwdDisplay', 'access', 'status',
+    'isOwner', 'ownerLabel', 'viewerCount', 'startedAt', 'lastActivityAt', 'capabilities', 'attach',
+];
+const SHELL_OPTIONAL_KEYS = [
+    'endedAt', 'exitReason', 'closePolicy', 'pendingStopUntil', 'ownerViewOpen', 'profileLabel',
+    'closure', 'closureScope', 'recordCleanup',
+];
+
+// The Explorer row constraints recorded in the implementation checkpoint:
+// optional keys are omitted rather than null, closure only on exited rows,
+// a scope only with an unconfirmed stop, and a positive integer deadline.
+function assertExplorerShellRow(row) {
+    for (const key of SHELL_ROW_KEYS) assert.ok(Object.hasOwn(row, key), `missing ${key}`);
+    for (const key of Object.keys(row)) {
+        assert.ok(SHELL_ROW_KEYS.includes(key) || SHELL_OPTIONAL_KEYS.includes(key), `unexpected ${key}`);
+    }
+    assert.ok(['keep', 'stop'].includes(row.closePolicy));
+    assert.ok(row.pendingStopUntil === null
+        || (Number.isSafeInteger(row.pendingStopUntil) && row.pendingStopUntil > 0));
+    assert.equal(typeof row.ownerViewOpen, 'boolean');
+    assert.ok(row.profileLabel === null || (typeof row.profileLabel === 'string' && row.profileLabel.length > 0));
+    if (Object.hasOwn(row, 'closure')) {
+        assert.equal(row.status, 'exited');
+        assert.ok(['pending', 'proven', 'unconfirmed'].includes(row.closure));
+    }
+    if (Object.hasOwn(row, 'closureScope')) {
+        assert.equal(row.closure, 'unconfirmed');
+        assert.ok(['global', 'provider', 'target'].includes(row.closureScope));
+    }
+    if (Object.hasOwn(row, 'recordCleanup')) {
+        assert.equal(row.status, 'exited');
+        assert.equal(row.recordCleanup, 'failed');
+    }
+    for (const value of Object.values(row)) assert.notEqual(value, undefined);
+}
+
+async function tombstoneRow(manager, id, req = {}) {
+    const { sessions } = await manager.listLiveSessions({ req, routePlan: routePlan() });
+    const row = sessions.find(entry => entry.id === id);
+    if (row) assertExplorerShellRow(row);
+    return row;
+}
+
+test('a successful close is pending while cleanup runs and proven only after exit and reclamation', async (t) => {
+    let releaseClose;
+    const barrier = new Promise((resolve) => { releaseClose = resolve; });
+    const store = recordStore();
+    const worker = new FakeWorker();
+    const baseClose = worker.close.bind(worker);
+    worker.close = async () => { await barrier; return baseClose(); };
+    const manager = await createManager(t, { recordStore: store, workerFactory: () => worker });
+    const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const closing = manager.closeSession(created.id, 'requested');
+    await new Promise((resolve) => setImmediate(resolve));
+    const pending = await tombstoneRow(manager, created.id);
+    assert.equal(pending.status, 'exited');
+    assert.equal(pending.closure, 'pending');
+    assert.equal(Object.hasOwn(pending, 'closureScope'), false);
+    assert.equal(manager.tombstones.get(created.id).expiresAt, Infinity, 'pending outcomes are retained');
+    assert.equal(store.calls.removed, 0);
+    releaseClose();
+    assert.equal(await closing, true);
+    const proven = await tombstoneRow(manager, created.id);
+    assert.equal(proven.closure, 'proven');
+    assert.equal(Object.hasOwn(proven, 'closureScope'), false);
+    assert.equal(Object.hasOwn(proven, 'recordCleanup'), false);
+    assert.equal(store.calls.confirmed, 1);
+    assert.equal(store.calls.removed, 1);
+    assert.ok(Number.isFinite(manager.tombstones.get(created.id).expiresAt), 'proven outcomes keep the short lifetime');
+});
+
+test('unconfirmed exit, thrown wait and unproven reclamation report unconfirmed with the disabled scope', async (t) => {
+    for (const entry of [
+        { name: 'wait false', worker: () => new FakeWorker({ waitForExitResult: false }), category: 'worker_exit_unconfirmed' },
+        {
+            name: 'wait throws',
+            worker: () => Object.assign(new FakeWorker(), { async waitForExit() { throw new Error('wait failed'); } }),
+            category: 'worker_exit_unconfirmed',
+        },
+        { name: 'reclamation false', mutate: (store) => { store.confirmReclaimed = async () => false; }, category: 'terminal_cleanup_unproven' },
+        {
+            name: 'reclamation throws',
+            mutate: (store) => { store.confirmReclaimed = async () => { throw new Error('incomplete proc stat'); }; },
+            category: 'terminal_reclamation_check_failed',
+        },
+    ]) {
+        await t.test(entry.name, async (t2) => {
+            const store = recordStore();
+            entry.mutate?.(store);
+            const worker = entry.worker ? entry.worker() : new FakeWorker();
+            const manager = await createManager(t2, { recordStore: store, workerFactory: () => worker });
+            const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+            assert.equal(await manager.closeSession(created.id, 'requested'), true);
+            assert.deepEqual(manager.availability(), { ok: false, category: entry.category });
+            assert.equal(store.calls.removed, 0);
+            const row = await tombstoneRow(manager, created.id);
+            assert.equal(row.closure, 'unconfirmed');
+            assert.equal(row.closureScope, 'global');
+            assert.equal(manager.tombstones.get(created.id).expiresAt, Infinity);
+        });
+    }
+});
+
+test('agent recovery failures report the provider or target scope that was actually disabled', async (t) => {
+    for (const [name, recoverHandle, scope] of [
+        ['target refusal', async () => ({ recovered: false, category: 'agent_startup_marker_survived', scope: 'target' }), 'target'],
+        ['provider refusal', async () => ({ recovered: false, category: 'agent_record_remove_unconfirmed', scope: 'provider' }), 'provider'],
+        ['thrown target-local evidence', async () => { throw Object.assign(new Error('x'), { code: 'WEBTTY_AGENT_PODMAN_FAILURE', category: 'exec-not-drained' }); }, 'target'],
+        ['thrown systemic evidence', async () => { throw Object.assign(new Error('x'), { code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN' }); }, 'provider'],
+        ['wait false', null, 'provider'],
+    ]) {
+        await t.test(name, async (t2) => {
+            const targets = terminalTargets();
+            const agentWorker = new FakeWorker(recoverHandle ? {} : { waitForExitResult: false });
+            agentWorker.start = async () => ({ recoveryEvidence: { exact: true } });
+            const store = recordStore();
+            if (recoverHandle) store.recoverHandle = recoverHandle;
+            const manager = await createManager(t2, {
+                recordStore: store,
+                agentProviderAvailable: true,
+                agentWorkerFactory: () => agentWorker,
+                targetResolver: {
+                    async discover() { return { agentTargetsAvailable: true, targets }; },
+                    async revalidate({ target }) { return target; },
+                },
+            });
+            const plan = routePlan();
+            const discovery = await manager.discoverTargets({ req: {}, routePlan: plan, directory: 'Projects' });
+            const created = await manager.create({ req: {}, routePlan: plan, launch: discovery.targets[1].launch });
+            assert.equal(await manager.closeSession(created.id, 'requested'), true);
+            const row = await tombstoneRow(manager, created.id);
+            assert.equal(row.closure, 'unconfirmed');
+            assert.equal(row.closureScope, scope);
+            assert.equal(manager.providerAvailability().boxAvailable, true, 'Box terminals stay available');
+            assert.equal(manager.providerAvailability().agentAvailable, scope !== 'provider');
+            assert.equal(manager.isAgentTargetQuarantined(targets[1]), scope === 'target');
+        });
+    }
+});
+
+test('a record-removal failure after proven exit stays proven and flags only the record cleanup', async (t) => {
+    for (const [name, remove] of [
+        ['remove false', async () => false],
+        ['remove throws', async () => { throw new Error('disk failure'); }],
+    ]) {
+        await t.test(name, async (t2) => {
+            const store = recordStore();
+            store.remove = remove;
+            const manager = await createManager(t2, { recordStore: store });
+            const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+            assert.equal(await manager.closeSession(created.id, 'requested'), true);
+            assert.equal(manager.availability().ok, false, 'the existing fail-closed handling is unchanged');
+            const row = await tombstoneRow(manager, created.id);
+            assert.equal(row.closure, 'proven');
+            assert.equal(row.recordCleanup, 'failed');
+            assert.equal(Object.hasOwn(row, 'closureScope'), false);
+        });
+    }
+});
+
+test('a worker cleanup-unproven report keeps a recordless close unconfirmed', async (t) => {
+    let createEntered;
+    let releaseCreate;
+    const entered = new Promise((resolve) => { createEntered = resolve; });
+    const barrier = new Promise((resolve) => { releaseCreate = resolve; });
+    const worker = new FakeWorker();
+    const store = recordStore();
+    const manager = await createManager(t, { recordStore: store, workerFactory: () => worker });
+    // No durable record ever exists for this shell.
+    store.create = async () => { createEntered(); await barrier; throw new Error('record store unavailable'); };
+    const outcome = manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' })
+        .then(() => null, (error) => error);
+    await entered;
+    const id = [...manager.sessions.keys()][0];
+    worker.emit('terminal-error', { category: 'cleanup-unproven' });
+    releaseCreate();
+    assert.ok(await outcome instanceof Error);
+    await Promise.allSettled([...manager.inFlightCloses]);
+    assert.deepEqual(manager.availability(), { ok: false, category: 'cleanup-unproven' });
+    const row = await tombstoneRow(manager, id);
+    assert.equal(row.closure, 'unconfirmed');
+    assert.equal(row.closureScope, 'global');
+});
+
+test('a global-scope outcome stays listed through the handler while WebTTY is disabled', async (t) => {
+    process.env.PLOINKY_MASTER_KEY ||= 'b'.repeat(64);
+    const { handleWebtty } = await import('../../cli/server/handlers/webtty.js');
+    const store = recordStore();
+    store.confirmReclaimed = async () => false;
+    const workers = [new FakeWorker(), new FakeWorker()];
+    const manager = await createManager(t, { recordStore: store, workerFactory: () => workers.shift() });
+    const plan = routePlan();
+    const failed = await manager.create({ req: {}, routePlan: plan, cwdRelative: '' });
+    const quiesced = await manager.create({ req: {}, routePlan: plan, cwdRelative: '' });
+    async function get(url) {
+        const res = {
+            statusCode: 0, headers: {}, body: '',
+            writeHead(status, headers) { this.statusCode = status; this.headers = headers; },
+            write(value) { this.body += String(value); return true; },
+            end(value = '') { this.body += String(value); this.writableEnded = true; },
+        };
+        await handleWebtty({ method: 'GET', headers: {}, user: { id: 'local:admin', roles: ['admin'] } },
+            res, new URL(url, 'http://localhost'), { manager, routePlan: plan });
+        return res;
+    }
+    const before = await get('/webtty/live-sessions');
+    assert.equal(before.statusCode, 200);
+    assert.equal(Object.hasOwn(JSON.parse(before.body), 'available'), false, 'available appears only while disabled');
+    assert.equal(await manager.closeSession(failed.id, 'requested'), true);
+    await Promise.allSettled([...manager.inFlightCloses]);
+    assert.equal(manager.availability().ok, false);
+    const listed = await get('/webtty/live-sessions');
+    assert.equal(listed.statusCode, 200);
+    const payload = JSON.parse(listed.body);
+    assert.deepEqual(Object.keys(payload).sort(), ['available', 'ok', 'sessions', 'version']);
+    assert.equal(payload.available, false);
+    const row = payload.sessions.find(entry => entry.id === failed.id);
+    assertExplorerShellRow(row);
+    assert.equal(row.closure, 'unconfirmed');
+    assert.equal(row.closureScope, 'global');
+    assert.ok(payload.sessions.every(entry => entry.status === 'exited'), 'only retained outcomes are listed');
+    assert.ok(payload.sessions.some(entry => entry.id === quiesced.id), 'the quiesced shell is listed as an outcome');
+    // No other route opens while disabled.
+    const stream = await get(`/webtty/sessions/${quiesced.id}/stream?view=${'v'.repeat(32)}`);
+    assert.equal(stream.statusCode, 503);
+});
+
+test('a concurrent explicit Kill and tab-close deadline run cleanup exactly once', async (t) => {
+    for (const order of ['kill-first', 'deadline-first']) {
+        await t.test(order, async (t2) => {
+            t2.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+            const audits = [];
+            const store = recordStore();
+            const worker = new FakeWorker();
+            const manager = await createManager(t2, {
+                auth: requestAuthAdapter(), recordStore: store, workerFactory: () => worker,
+                audit: (event, details) => audits.push({ event, details }),
+            });
+            const plan = routePlan();
+            const owner = { lease: lease('owner') };
+            const created = await manager.create({ req: owner, routePlan: plan, cwdRelative: '', closePolicy: 'stop' });
+            const session = manager.sessions.get(created.id);
+            manager.attachStream(session, Object.assign(new EventEmitter(), owner), streamResponse(), '', plan, created.view.id);
+            assert.deepEqual(await manager.closeIntent({ req: owner, routePlan: plan, id: created.id, view: created.view.id, policy: 'stop' }),
+                { pending: true, until: 1_030_000 });
+            t2.mock.timers.tick(29_999);
+            let kill;
+            if (order === 'kill-first') {
+                kill = manager.closeAuthorized(owner, plan, created.id);
+                await new Promise((resolve) => setImmediate(resolve));
+                t2.mock.timers.tick(1);
+            } else {
+                t2.mock.timers.tick(1);
+                kill = manager.closeAuthorized(owner, plan, created.id);
+            }
+            assert.equal(await kill, true);
+            await Promise.allSettled([...manager.inFlightCloses]);
+            assert.equal(worker.closed, 1);
+            assert.equal(store.calls.confirmed, 1);
+            assert.equal(store.calls.removed, 1);
+            assert.equal(audits.filter(entry => entry.event === 'webtty_session_closed').length, 1);
+            assert.equal(session.closeReason, order === 'kill-first' ? 'requested' : 'tab_closed');
+            assert.equal(audits.filter(entry => entry.event === 'webtty_closed_on_tab_close').length,
+                order === 'kill-first' ? 0 : 1);
+        });
+    }
+});
+
+test('tombstone eviction under the cap removes proven outcomes first and audits a non-proven eviction', async (t) => {
+    const { WEBTTY_SESSION_LIMITS } = await import('../../cli/server/webtty/sessionManager.mjs');
+    assert.equal(WEBTTY_SESSION_LIMITS.maxTombstones, 256);
+    const audits = [];
+    const store = recordStore();
+    let failReclaim = false;
+    store.confirmReclaimed = async () => { store.calls.confirmed += 1; return !failReclaim; };
+    const manager = await createManager(t, {
+        auth: requestAuthAdapter(),
+        recordStore: store,
+        limits: { maxTombstones: 3 },
+        audit: (event, details) => audits.push({ event, details }),
+    });
+    let logins = 0;
+    // Separate logins keep the per-login creation rate out of the way.
+    const req = () => ({ lease: lease(`login-${logins += 1}`) });
+    // Unproven outcomes disable WebTTY, so keep creating by re-enabling the
+    // surface directly; only retention is under test here.
+    const created = [];
+    for (const proven of [false, true, false, true]) {
+        manager.ready = true;
+        failReclaim = !proven;
+        const entry = await manager.create({ req: req(), routePlan: routePlan(), cwdRelative: '' });
+        await manager.closeSession(entry.id, 'requested');
+        created.push(entry.id);
+    }
+    // Four outcomes under a cap of three: the oldest proven one is evicted,
+    // although an older unconfirmed outcome exists.
+    assert.deepEqual([...manager.tombstones.keys()], [created[0], created[2], created[3]]);
+    assert.deepEqual(audits.filter(entry => entry.event === 'webtty_tombstone_evicted'), []);
+    manager.ready = true;
+    failReclaim = true;
+    const fifth = await manager.create({ req: req(), routePlan: routePlan(), cwdRelative: '' });
+    await manager.closeSession(fifth.id, 'requested');
+    assert.deepEqual([...manager.tombstones.keys()], [created[0], created[2], fifth.id]);
+    manager.ready = true;
+    const sixth = await manager.create({ req: req(), routePlan: routePlan(), cwdRelative: '' });
+    await manager.closeSession(sixth.id, 'requested');
+    // No proven outcome is left: the oldest non-proven one goes, with an audit.
+    assert.deepEqual([...manager.tombstones.keys()], [created[2], fifth.id, sixth.id]);
+    const evicted = audits.filter(entry => entry.event === 'webtty_tombstone_evicted');
+    assert.equal(evicted.length, 1);
+    assert.equal(evicted[0].details.closure, 'unconfirmed');
+});
+
+// ---- Close policy, views and tab-close ordering (plan r3 3.4, A8) ----
+// Deterministic: setTimeout and Date are mocked, so deadlines fire only on tick.
+
+async function closePolicyFixture(t, { closePolicy = 'stop', limits = {} } = {}) {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+    const audits = [];
+    const store = recordStore();
+    const worker = new FakeWorker();
+    const manager = await createManager(t, {
+        auth: requestAuthAdapter(), recordStore: store, workerFactory: () => worker,
+        audit: (event, details) => audits.push({ event, details }), limits,
+    });
+    const plan = routePlan();
+    const owner = { lease: lease('owner') };
+    const created = await manager.create({ req: owner, routePlan: plan, cwdRelative: '', closePolicy });
+    const session = manager.sessions.get(created.id);
+    const fixture = {
+        manager, store, worker, plan, owner, created, session, audits,
+        // A stream bound to a view; `drop` is a signal-free disconnect.
+        open(viewId, req = owner, streamPlan = plan) {
+            const request = Object.assign(new EventEmitter(), req);
+            const response = streamResponse();
+            assert.equal(manager.attachStream(session, request, response, '', streamPlan, viewId), true);
+            return { request, response, drop: () => request.emit('close') };
+        },
+        // `supersedes` is an explicit recovery claim (reload, back/forward or embedded restore).
+        async attach(req = owner, supersedes = null) {
+            const token = await manager.createAttachToken({
+                req, routePlan: plan, id: created.id, ...(supersedes ? { supersedes } : {}),
+            });
+            return manager.attach({ req, routePlan: plan, attach: token.attach, cols: 80, rows: 24 });
+        },
+        view: (id) => session.views.get(id),
+        intent(view, policy = 'stop', req = owner) {
+            return manager.closeIntent({ req, routePlan: plan, id: created.id, view, policy });
+        },
+        async tick(ms) {
+            t.mock.timers.tick(ms);
+            await Promise.allSettled([...manager.inFlightCloses]);
+        },
+        alive: () => manager.sessions.get(created.id) === session && !session.closed,
+        events: (name) => audits.filter(entry => entry.event === name),
+    };
+    return fixture;
+}
+
+test('A8: a keep intent arms nothing and a stop intent with no other owner view stops after 30 seconds', async (t) => {
+    await t.test('session keep, body stop', async (t2) => {
+        const f = await closePolicyFixture(t2, { closePolicy: 'keep' });
+        f.open(f.created.view.id);
+        assert.deepEqual(await f.intent(f.created.view.id, 'stop'), { pending: false });
+        assert.equal(f.session.pendingStop, null);
+        await f.tick(10 * 60_000);
+        assert.equal(f.alive(), true);
+    });
+    await t.test('session stop, body keep', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        assert.deepEqual(await f.intent(f.created.view.id, 'keep'), { pending: false });
+        assert.equal(f.session.pendingStop, null);
+        await f.tick(10 * 60_000);
+        assert.equal(f.alive(), true);
+    });
+    await t.test('stop', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        const stream = f.open(f.created.view.id);
+        assert.deepEqual(await f.intent(f.created.view.id), { pending: true, until: 1_030_000 });
+        // The ended view's stream is released at once, so it cannot count as open.
+        assert.match(stream.response.body, /view_ended/);
+        assert.equal(f.session.viewers.size, 0);
+        const [row] = await f.manager.listSessions({ req: f.owner, routePlan: f.plan });
+        assertExplorerShellRow(row);
+        assert.deepEqual([row.closePolicy, row.pendingStopUntil, row.ownerViewOpen], ['stop', 1_030_000, false]);
+        await f.tick(29_999);
+        assert.equal(f.alive(), true);
+        await f.tick(1);
+        assert.equal(f.alive(), false);
+        assert.equal(f.session.closeReason, 'tab_closed');
+        assert.deepEqual(f.events('webtty_closed_on_tab_close').map(entry => entry.details.closure), ['proven']);
+        assert.equal(f.worker.closed, 1);
+        assert.equal(f.store.calls.removed, 1);
+    });
+});
+
+test('A8: only an explicit recovery claim cancels or supersedes an earlier close signal, and nothing revives it', async (t) => {
+    // Addendum A1 r2: rewritten from "the new view cancels".
+    await t.test('close before attach: a recovery claim of the arming view cancels with reopened', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        await f.intent(f.created.view.id);
+        await f.tick(10_000);
+        const reload = await f.attach(f.owner, f.created.view.id);
+        assert.equal(f.session.pendingStop, null);
+        assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['reopened']);
+        assert.equal(f.view(f.created.view.id).state, 'superseded');
+        assert.equal(f.view(f.created.view.id).supersededBy, reload.view.id);
+        await f.tick(60_000);
+        assert.equal(f.alive(), true);
+        // After recovery a signal-free disconnect (panel detach, session switch) never revives it.
+        f.open(reload.view.id).drop();
+        await f.tick(10 * 60_000);
+        assert.equal(f.alive(), true);
+        assert.equal(f.session.pendingStop, null);
+    });
+    // Addendum A1 r2: rewritten from "the old intent is superseded".
+    await t.test('attach before a delayed close: 409 with a claim, armed without one', async (t2) => {
+        const claimed = await closePolicyFixture(t2);
+        claimed.open(claimed.created.view.id).drop();
+        const reload = await claimed.attach(claimed.owner, claimed.created.view.id);
+        await assert.rejects(claimed.intent(claimed.created.view.id), { code: 'WEBTTY_VIEW_STALE' });
+        assert.equal(claimed.session.pendingStop, null);
+        await claimed.tick(10 * 60_000);
+        assert.equal(claimed.alive(), true);
+        // The recovering view's own intent still stops it.
+        assert.equal((await claimed.intent(reload.view.id)).pending, true);
+        await claimed.tick(30_000);
+        assert.equal(claimed.alive(), false);
+    });
+    await t.test('attach before a delayed close without a claim: the earlier signal still arms', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id).drop();
+        await f.attach();
+        assert.deepEqual(await f.intent(f.created.view.id), { pending: true, until: 1_030_000 });
+        await f.tick(30_000);
+        assert.equal(f.alive(), false, 'the unclaimed view was created at the same time and is abandoned at the deadline');
+    });
+    await t.test('a duplicate or foreign intent is stale and has no effect', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        await f.intent(f.created.view.id);
+        const armed = f.session.pendingStop;
+        await assert.rejects(f.intent(f.created.view.id), { code: 'WEBTTY_VIEW_STALE' });
+        await assert.rejects(f.intent('x'.repeat(32)), { code: 'WEBTTY_VIEW_STALE' });
+        assert.equal(f.session.pendingStop, armed, 'a stale repeat neither re-arms nor cancels');
+        assert.equal(f.session.pendingStop.deadline, 1_030_000);
+    });
+});
+
+test('A8: another device keeps the shell open until its own signal, and a reconnect gap re-arms', async (t) => {
+    await t.test('open elsewhere cancels; that device can later stop it', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        const deviceB = f.open(f.created.view.id);
+        const deviceA = await f.attach({ lease: lease('device-a') });
+        f.open(deviceA.view.id, { lease: lease('device-a') });
+        assert.equal((await f.intent(deviceA.view.id, 'stop', { lease: lease('device-a') })).pending, true);
+        await f.tick(30_000);
+        assert.equal(f.alive(), true);
+        assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['open-elsewhere']);
+        assert.equal(deviceB.response.writableEnded, false);
+        assert.equal((await f.intent(f.created.view.id)).pending, true);
+        await f.tick(29_999);
+        assert.equal(f.alive(), true);
+        await f.tick(1);
+        assert.equal(f.alive(), false);
+    });
+    await t.test('a view that dropped at T-5 s re-arms; the stop follows 30 s without reattach', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        const deviceX = f.open(f.created.view.id);
+        const deviceY = await f.attach({ lease: lease('device-y') });
+        f.open(deviceY.view.id, { lease: lease('device-y') });
+        await f.intent(deviceY.view.id, 'stop', { lease: lease('device-y') });
+        await f.tick(25_000);
+        deviceX.drop();
+        await f.tick(5_000);
+        assert.equal(f.alive(), true);
+        assert.equal(f.session.pendingStop.deadline, 1_055_000);
+        const [row] = await f.manager.listSessions({ req: f.owner, routePlan: f.plan });
+        assert.equal(row.pendingStopUntil, 1_055_000);
+        await f.tick(24_999);
+        assert.equal(f.alive(), true);
+        await f.tick(1);
+        assert.equal(f.alive(), false);
+        assert.equal(f.session.closeReason, 'tab_closed');
+    });
+    // Addendum A1 r2: an owner stream no longer cancels; the deadline does (open-elsewhere).
+    await t.test('a view that dropped at T-5 s and reattaches keeps the shell', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        const deviceX = f.open(f.created.view.id);
+        const deviceY = await f.attach({ lease: lease('device-y') });
+        f.open(deviceY.view.id, { lease: lease('device-y') });
+        await f.intent(deviceY.view.id, 'stop', { lease: lease('device-y') });
+        await f.tick(25_000);
+        deviceX.drop();
+        await f.tick(15_000);
+        f.open(f.created.view.id);
+        assert.equal(f.session.pendingStop.deadline, 1_055_000, 'the reattach itself cancels nothing');
+        await f.tick(14_999);
+        assert.equal(f.events('webtty_close_intent_cancelled').length, 0);
+        await f.tick(1);
+        assert.equal(f.session.pendingStop, null);
+        assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['open-elsewhere']);
+        await f.tick(10 * 60_000);
+        assert.equal(f.alive(), true);
+    });
+    await t.test('a view detached for 60 s reconnects, counts as open, and its own intent can stop', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id).drop();
+        const deviceY = await f.attach({ lease: lease('device-y') });
+        f.open(deviceY.view.id, { lease: lease('device-y') });
+        await f.tick(60_000);
+        f.open(f.created.view.id);
+        assert.equal((await f.manager.listSessions({ req: f.owner, routePlan: f.plan }))[0].ownerViewOpen, true);
+        await f.intent(deviceY.view.id, 'stop', { lease: lease('device-y') });
+        await f.tick(30_000);
+        assert.equal(f.alive(), true);
+        assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['open-elsewhere']);
+        assert.equal((await f.intent(f.created.view.id)).pending, true);
+        await f.tick(30_000);
+        assert.equal(f.alive(), false);
+    });
+    await t.test('a generation change during the grace behaves like a reconnect gap', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        let current = true;
+        const oldPlan = routePlan();
+        oldPlan.lease.isCurrent = () => current;
+        const deviceX = f.open(f.created.view.id, f.owner, oldPlan);
+        const deviceY = await f.attach({ lease: lease('device-y') });
+        f.open(deviceY.view.id, { lease: lease('device-y') });
+        await f.intent(deviceY.view.id, 'stop', { lease: lease('device-y') });
+        await f.tick(20_000);
+        current = false;
+        await f.manager.validateLiveSessions();
+        assert.match(deviceX.response.body, /retry: 1000/);
+        await f.tick(10_000);
+        assert.equal(f.alive(), true);
+        assert.equal(f.session.pendingStop.deadline, 1_050_000);
+        await f.tick(5_000);
+        f.open(f.created.view.id);
+        // Addendum A1 r2: the stop stays armed until its deadline cancels it as open-elsewhere.
+        assert.equal(f.session.pendingStop.deadline, 1_050_000);
+        await f.tick(15_000);
+        assert.equal(f.session.pendingStop, null);
+        assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['open-elsewhere']);
+        await f.tick(10 * 60_000);
+        assert.equal(f.alive(), true);
+    });
+});
+
+test('A8: watchers neither signal nor cancel, and the toggle race arms only with a stop body', async (t) => {
+    await t.test('watcher', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        const watcher = { lease: lease('watcher', 'other-admin') };
+        f.open(f.created.view.id);
+        await f.intent(f.created.view.id);
+        const watched = await f.attach(watcher);
+        assert.equal(watched.role, 'watcher');
+        f.open(watched.view.id, watcher);
+        assert.ok(f.session.pendingStop, 'a watcher view and stream cancel nothing');
+        await assert.rejects(f.intent(watched.view.id, 'stop', watcher), { code: 'WEBTTY_OWNER_REQUIRED' });
+        await assert.rejects(f.manager.setClosePolicy({ req: watcher, routePlan: f.plan, id: f.created.id, policy: 'keep' }),
+            { code: 'WEBTTY_OWNER_REQUIRED' });
+        // An owner cannot use a watcher's view either.
+        await assert.rejects(f.intent(watched.view.id), { code: 'WEBTTY_VIEW_STALE' });
+        await f.tick(30_000);
+        assert.equal(f.alive(), false);
+    });
+    for (const [body, arms] of [['stop', true], ['keep', false]]) {
+        await t.test(`intent body ${body} before the policy change to stop`, async (t2) => {
+            const f = await closePolicyFixture(t2, { closePolicy: 'keep' });
+            f.open(f.created.view.id);
+            assert.deepEqual(await f.intent(f.created.view.id, body), { pending: false });
+            const result = await f.manager.setClosePolicy({ req: f.owner, routePlan: f.plan, id: f.created.id, policy: 'stop' });
+            assert.deepEqual(result, { closePolicy: 'stop', pendingStopUntil: arms ? 1_030_000 : null });
+            await f.tick(30_000);
+            assert.equal(f.alive(), !arms);
+        });
+    }
+    await t.test('policy keep cancels a pending stop', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        await f.intent(f.created.view.id);
+        assert.deepEqual(await f.manager.setClosePolicy({ req: f.owner, routePlan: f.plan, id: f.created.id, policy: 'keep' }),
+            { closePolicy: 'keep', pendingStopUntil: null });
+        assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['policy_keep']);
+        await f.tick(10 * 60_000);
+        assert.equal(f.alive(), true);
+    });
+});
+
+test('A8: a missing signal never closes; only the never-attached, idle and absolute rules do', async (t) => {
+    await t.test('stop policy without a signal stays alive', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id).drop();
+        await f.tick(60 * 60_000);
+        assert.equal(f.alive(), true);
+        const [row] = await f.manager.listSessions({ req: f.owner, routePlan: f.plan });
+        assert.deepEqual([row.closePolicy, row.pendingStopUntil, row.ownerViewOpen], ['stop', null, false]);
+        assert.equal(f.events('webtty_close_intent_armed').length, 0);
+    });
+    await t.test('the never-attached rule still applies with a stop policy', async (t2) => {
+        const f = await closePolicyFixture(t2, { limits: { streamDetachGraceMs: 15_000 } });
+        await f.tick(14_999);
+        assert.equal(f.alive(), true);
+        await f.tick(1);
+        assert.equal(f.session.closeReason, 'stream_never_attached');
+    });
+    await t.test('closeAll clears the pending timer', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        await f.intent(f.created.view.id);
+        assert.ok(f.session.pendingStop);
+        await f.manager.closeAll('router_shutdown');
+        assert.equal(f.session.pendingStop, null);
+        assert.equal(f.session.closeReason, 'router_shutdown');
+        await f.tick(60_000);
+        assert.equal(f.events('webtty_closed_on_tab_close').length, 0);
+        assert.equal(f.worker.closed, 1);
+    });
+});
+
+test('A8: each session keeps at most 32 views and refuses a 33rd non-ended view', async (t) => {
+    const f = await closePolicyFixture(t, { closePolicy: 'keep' });
+    // The creator's view is the first of 32.
+    const views = [f.created.view.id];
+    for (let index = 1; index < 32; index += 1) views.push((await f.attach()).view.id);
+    assert.equal(f.session.views.size, 32);
+    await assert.rejects(f.attach(), { code: 'WEBTTY_VIEW_LIMIT' });
+    // An ended view is evicted first.
+    await f.intent(views[5], 'keep');
+    const next = await f.attach();
+    assert.equal(f.session.views.has(views[5]), false);
+    assert.equal(f.session.views.has(next.view.id), true);
+    await assert.rejects(f.attach(), { code: 'WEBTTY_VIEW_LIMIT' });
+    // Then the oldest abandoned one; open views are never evicted.
+    f.open(views[0]);
+    await f.tick(30_000);
+    const later = await f.attach();
+    assert.equal(f.session.views.has(views[0]), true);
+    assert.equal(f.session.views.has(views[1]), false);
+    assert.equal(f.session.views.has(later.view.id), true);
+    assert.equal(f.session.views.size, 32);
+});
+
+test('a watcher cannot stream on an owner view: stale, view unchanged, pending stop still armed', async (t) => {
+    const f = await closePolicyFixture(t);
+    const watcher = { lease: lease('watcher', 'other-admin') };
+    // The owner's first view is detached but not ended; a second owner view signals stop.
+    f.open(f.created.view.id).drop();
+    const second = await f.attach();
+    await f.intent(second.view.id);
+    const armed = f.session.pendingStop;
+    assert.ok(armed);
+    const ownerView = f.session.views.get(f.created.view.id);
+    const before = { ...ownerView };
+    const request = Object.assign(new EventEmitter(), watcher);
+    const response = streamResponse();
+    assert.throws(() => f.manager.attachStream(f.session, request, response, '', f.plan, f.created.view.id),
+        { code: 'WEBTTY_VIEW_STALE' });
+    assert.deepEqual({ ...ownerView }, before);
+    assert.equal(f.session.viewers.size, 0);
+    assert.equal(response.body, '');
+    assert.equal(f.session.pendingStop, armed);
+    assert.equal(f.session.pendingStop.deadline, 1_030_000);
+    await f.tick(30_000);
+    assert.equal(f.alive(), false, 'the watcher attempt neither reopened the view nor held back the stop');
+});
+
+// ---- Explicit recovery supersession (plan r3 addendum A1 r2, A8-S1..S8) ----
+
+test('A8-S1: an incidental panel view never vetoes an explicit stop', async (t) => {
+    await t.test('the panel detaches during the grace: re-armed in its window, stopped once abandoned', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        const panel = await f.attach();
+        const panelStream = f.open(panel.view.id);
+        assert.deepEqual(await f.intent(f.created.view.id), { pending: true, until: 1_030_000 });
+        await f.tick(10_000);
+        panelStream.drop();
+        await f.tick(20_000);
+        assert.equal(f.alive(), true);
+        assert.equal(f.session.pendingStop.deadline, 1_040_000);
+        await f.tick(9_999);
+        assert.equal(f.alive(), true);
+        await f.tick(1);
+        assert.equal(f.alive(), false);
+        assert.equal(f.session.closeReason, 'tab_closed');
+    });
+    for (const before of [31_000, 5_000]) {
+        await t.test(`the panel detached ${before / 1000} s before the close`, async (t2) => {
+            const f = await closePolicyFixture(t2);
+            f.open(f.created.view.id);
+            const panel = await f.attach();
+            f.open(panel.view.id).drop();
+            await f.tick(before);
+            assert.equal((await f.intent(f.created.view.id)).pending, true);
+            await f.tick(29_999);
+            assert.equal(f.alive(), true);
+            await f.tick(1);
+            assert.equal(f.alive(), false);
+        });
+    }
+});
+
+test('A8-S2: a panel still open at the deadline cancels as open-elsewhere and can stop it itself', async (t) => {
+    const f = await closePolicyFixture(t);
+    f.open(f.created.view.id);
+    const panel = await f.attach();
+    f.open(panel.view.id);
+    assert.equal((await f.intent(f.created.view.id)).pending, true);
+    await f.tick(30_000);
+    assert.equal(f.alive(), true);
+    assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['open-elsewhere']);
+    assert.equal((await f.intent(panel.view.id)).pending, true);
+    await f.tick(30_000);
+    assert.equal(f.alive(), false);
+});
+
+test('A8-S3: a panel-only detach arms nothing, and a keep policy never arms', async (t) => {
+    await t.test('stop policy, panel detach only', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        const panel = await f.attach();
+        f.open(panel.view.id).drop();
+        await f.tick(10 * 60_000);
+        assert.equal(f.session.pendingStop, null);
+        assert.equal(f.alive(), true);
+    });
+    await t.test('keep policy', async (t2) => {
+        const f = await closePolicyFixture(t2, { closePolicy: 'keep' });
+        f.open(f.created.view.id);
+        const panel = await f.attach();
+        f.open(panel.view.id).drop();
+        assert.deepEqual(await f.intent(f.created.view.id, 'stop'), { pending: false });
+        await f.tick(10 * 60_000);
+        assert.equal(f.alive(), true);
+    });
+});
+
+test('A8-S4: top-level and embedded recovery in both orders never revive the old stop', async (t) => {
+    for (const [name, recoverer] of [['top-level', null], ['embedded', { lease: lease('explorer-tab') }]]) {
+        await t.test(`${name}: close before attach`, async (t2) => {
+            const f = await closePolicyFixture(t2);
+            f.open(f.created.view.id);
+            await f.intent(f.created.view.id);
+            const recovered = await f.attach(recoverer || f.owner, f.created.view.id);
+            assert.equal(recovered.role, 'owner');
+            assert.equal(f.session.pendingStop, null);
+            assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['reopened']);
+            f.open(recovered.view.id, recoverer || f.owner).drop();
+            await f.tick(10 * 60_000);
+            assert.equal(f.alive(), true);
+        });
+        await t.test(`${name}: attach before a delayed close`, async (t2) => {
+            const f = await closePolicyFixture(t2);
+            f.open(f.created.view.id).drop();
+            const recovered = await f.attach(recoverer || f.owner, f.created.view.id);
+            await assert.rejects(f.intent(f.created.view.id), { code: 'WEBTTY_VIEW_STALE' });
+            assert.equal(f.session.pendingStop, null);
+            // A delayed signal from the superseded view stays invalid after the recovered view disconnects.
+            f.open(recovered.view.id, recoverer || f.owner).drop();
+            await assert.rejects(f.intent(f.created.view.id), { code: 'WEBTTY_VIEW_STALE' });
+            await f.tick(10 * 60_000);
+            assert.equal(f.alive(), true);
+        });
+    }
+});
+
+test('A8-S5: invalid recovery claims change nothing', async (t) => {
+    async function armed(t2) {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        await f.intent(f.created.view.id);
+        return f;
+    }
+    function unchanged(f, view, before, label) {
+        assert.ok(f.session.pendingStop, `${label}: the stop stays armed`);
+        assert.equal(f.session.pendingStop.deadline, 1_030_000, label);
+        assert.deepEqual({ ...view }, before, `${label}: the claimed view is unchanged`);
+    }
+    const watcher = { lease: lease('watcher', 'other-admin') };
+    await t.test('watcher claim', async (t2) => {
+        const f = await armed(t2);
+        const before = { ...f.view(f.created.view.id) };
+        const attached = await f.attach(watcher, f.created.view.id);
+        assert.equal(attached.role, 'watcher', 'the attach itself proceeds');
+        unchanged(f, f.view(f.created.view.id), before, 'watcher');
+        assert.deepEqual(f.events('webtty_view_supersede_ignored').map(entry => entry.details.reason), ['not_owner']);
+    });
+    await t.test('foreign, unknown and other-session ids', async (t2) => {
+        const f = await armed(t2);
+        const watched = await f.attach(watcher);
+        const other = await f.manager.create({ req: f.owner, routePlan: f.plan, cwdRelative: '', closePolicy: 'stop' });
+        const foreignBefore = { ...f.view(watched.view.id) };
+        const armedBefore = { ...f.view(f.created.view.id) };
+        await f.attach(f.owner, watched.view.id);
+        await f.attach(f.owner, 'u'.repeat(32));
+        await f.attach(f.owner, other.view.id);
+        unchanged(f, f.view(watched.view.id), foreignBefore, 'foreign');
+        assert.deepEqual({ ...f.view(f.created.view.id) }, armedBefore);
+        assert.equal(f.manager.sessions.get(other.id).views.get(other.view.id).state, 'detached');
+        assert.deepEqual(f.events('webtty_view_supersede_ignored').map(entry => entry.details.reason),
+            ['foreign_view', 'unknown_view', 'unknown_view']);
+        // Audits never carry raw view ids.
+        assert.doesNotMatch(JSON.stringify(f.audits), new RegExp(`${watched.view.id}|${other.view.id}|${'u'.repeat(32)}`));
+    });
+    await t.test('already superseded and duplicate claims', async (t2) => {
+        const f = await armed(t2);
+        const panel = await f.attach();
+        await f.attach(f.owner, panel.view.id);
+        assert.equal(f.view(panel.view.id).state, 'superseded');
+        assert.ok(f.session.pendingStop, 'superseding a view that did not arm the stop cancels nothing');
+        const before = { ...f.view(panel.view.id) };
+        await f.attach(f.owner, panel.view.id);
+        unchanged(f, f.view(panel.view.id), before, 'duplicate');
+        assert.deepEqual(f.events('webtty_view_supersede_ignored').map(entry => entry.details.reason), ['already_superseded']);
+    });
+    await t.test('a claim on a failed attach', async (t2) => {
+        const f = await armed(t2);
+        // Fill the cap with views inside their reconnect window; the ended arming view is evicted first.
+        const views = [];
+        for (let index = 0; index < 32; index += 1) views.push((await f.attach()).view.id);
+        assert.equal(f.session.views.has(f.created.view.id), false);
+        const before = { ...f.view(views[0]) };
+        await assert.rejects(f.attach(f.owner, views[0]), { code: 'WEBTTY_VIEW_LIMIT' });
+        unchanged(f, f.view(views[0]), before, 'failed attach');
+        assert.equal(f.events('webtty_view_superseded').length, 0);
+    });
+    await t.test('malformed supersedes at mint', async (t2) => {
+        const f = await armed(t2);
+        for (const supersedes of ['short', 'x'.repeat(33), 'bad id'.padEnd(32, 'x'), 42]) {
+            await assert.rejects(f.manager.createAttachToken({ req: f.owner, routePlan: f.plan, id: f.created.id, supersedes }),
+                { code: 'WEBTTY_ATTACH_CLAIM_INVALID' });
+        }
+    });
+});
+
+test('A8-S6: repeated recoveries leave every replaced view stale and the latest view in charge', async (t) => {
+    const f = await closePolicyFixture(t);
+    f.open(f.created.view.id).drop();
+    const second = await f.attach(f.owner, f.created.view.id);
+    f.open(second.view.id).drop();
+    const third = await f.attach(f.owner, second.view.id);
+    await assert.rejects(f.intent(f.created.view.id), { code: 'WEBTTY_VIEW_STALE' });
+    await assert.rejects(f.intent(second.view.id), { code: 'WEBTTY_VIEW_STALE' });
+    assert.equal(f.session.pendingStop, null);
+    assert.equal((await f.intent(third.view.id)).pending, true);
+    await f.tick(30_000);
+    assert.equal(f.alive(), false);
+});
+
+test('A8-S7: a claim on a still-open view suppresses its signal only while the claimant lives', async (t) => {
+    await t.test('reload while the original stream is still open', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        const recovered = await f.attach(f.owner, f.created.view.id);
+        assert.equal(f.view(f.created.view.id).state, 'open', 'an open view is not ended by a claim');
+        assert.equal(f.view(f.created.view.id).claimedBy, recovered.view.id);
+        assert.deepEqual(await f.intent(f.created.view.id), { pending: false, reason: 'superseded' });
+        assert.equal(f.view(f.created.view.id).state, 'superseded');
+        assert.equal(f.session.pendingStop, null);
+        f.open(recovered.view.id).drop();
+        await f.tick(10 * 60_000);
+        assert.equal(f.alive(), true);
+    });
+    await t.test('duplicated tab: the duplicate can stop; the original counts again once the duplicate ended', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        const duplicate = await f.attach(f.owner, f.created.view.id);
+        f.open(duplicate.view.id);
+        // The duplicate's own signal arms; the original (open) cancels it at the deadline.
+        assert.equal((await f.intent(duplicate.view.id)).pending, true);
+        await f.tick(30_000);
+        assert.equal(f.alive(), true);
+        // The duplicate has ended, so the original's signal is processed normally.
+        assert.equal((await f.intent(f.created.view.id)).pending, true);
+        await f.tick(30_000);
+        assert.equal(f.alive(), false);
+    });
+    await t.test('duplicated tab: the original is suppressed while the duplicate is alive', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        const duplicate = await f.attach(f.owner, f.created.view.id);
+        f.open(duplicate.view.id);
+        assert.deepEqual(await f.intent(f.created.view.id), { pending: false, reason: 'superseded' });
+        assert.equal((await f.intent(duplicate.view.id)).pending, true);
+        await f.tick(30_000);
+        assert.equal(f.alive(), false);
+    });
+});
+
+test('A8-S8: switching to stop arms only for the most recent non-superseded owner intent', async (t) => {
+    async function keepFixture(t2) {
+        return closePolicyFixture(t2, { closePolicy: 'keep' });
+    }
+    const toStop = (f) => f.manager.setClosePolicy({ req: f.owner, routePlan: f.plan, id: f.created.id, policy: 'stop' });
+    await t.test('latest intent stop arms with its sequence', async (t2) => {
+        const f = await keepFixture(t2);
+        const second = await f.attach();
+        await f.intent(f.created.view.id, 'keep');
+        await f.intent(second.view.id, 'stop');
+        assert.equal((await toStop(f)).pendingStopUntil, 1_030_000);
+        assert.equal(f.session.pendingStop.viewSeq, f.view(second.view.id).seq);
+    });
+    await t.test('latest intent keep does not arm', async (t2) => {
+        const f = await keepFixture(t2);
+        const second = await f.attach();
+        await f.intent(f.created.view.id, 'stop');
+        await f.intent(second.view.id, 'keep');
+        assert.equal((await toStop(f)).pendingStopUntil, null);
+    });
+    await t.test('an abandoned non-consenting view does not block', async (t2) => {
+        const f = await keepFixture(t2);
+        f.open(f.created.view.id);
+        const panel = await f.attach();
+        await f.tick(31_000);
+        await f.intent(f.created.view.id, 'stop');
+        assert.equal(f.view(panel.view.id).state, 'detached');
+        assert.equal((await toStop(f)).pendingStopUntil, 1_061_000);
+    });
+    await t.test('an open owner view blocks, and so does one still in its reconnect window', async (t2) => {
+        const f = await keepFixture(t2);
+        f.open(f.created.view.id);
+        const live = await f.attach();
+        const stream = f.open(live.view.id);
+        await f.intent(f.created.view.id, 'stop');
+        assert.equal((await toStop(f)).pendingStopUntil, null);
+        stream.drop();
+        await f.manager.setClosePolicy({ req: f.owner, routePlan: f.plan, id: f.created.id, policy: 'keep' });
+        assert.equal((await toStop(f)).pendingStopUntil, null);
+    });
+});
+
+test('A8-S4 at the view cap: the claimed view is never evicted by its own recovery attach', async (t) => {
+    const f = await closePolicyFixture(t);
+    f.open(f.created.view.id);
+    for (let index = 0; index < 31; index += 1) await f.attach();
+    await f.tick(31_000);
+    assert.equal(f.session.views.size, 32);
+    assert.equal((await f.intent(f.created.view.id)).pending, true);
+    const recovered = await f.attach(f.owner, f.created.view.id);
+    assert.equal(f.session.views.size, 32);
+    assert.equal(f.view(f.created.view.id)?.state, 'superseded', 'the claimed view was retained and superseded');
+    assert.equal(f.session.pendingStop, null);
+    assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['reopened']);
+    assert.equal(f.events('webtty_view_supersede_ignored').length, 0);
+    f.open(recovered.view.id).drop();
+    await f.tick(10 * 60_000);
+    assert.equal(f.alive(), true);
+});
+
+test('a superseded view cannot stream and its delayed close intent stays stale', async (t) => {
+    const f = await closePolicyFixture(t);
+    f.open(f.created.view.id).drop();
+    await f.attach(f.owner, f.created.view.id);
+    const response = streamResponse();
+    assert.throws(() => f.manager.attachStream(f.session, Object.assign(new EventEmitter(), f.owner), response, '', f.plan,
+        f.created.view.id), { code: 'WEBTTY_VIEW_STALE' });
+    assert.equal(response.body, '');
+    assert.equal(f.view(f.created.view.id).state, 'superseded');
+    assert.equal(f.view(f.created.view.id).streams, 0);
+    await assert.rejects(f.intent(f.created.view.id), { code: 'WEBTTY_VIEW_STALE' });
+    assert.equal(f.session.pendingStop, null);
+});
+
+test('a claim on an open view follows the chain of later recoveries', async (t) => {
+    await t.test('the latest successor is alive: the original signal is superseded', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        const second = await f.attach(f.owner, f.created.view.id);
+        assert.equal(f.view(f.created.view.id).claimedBy, second.view.id);
+        const third = await f.attach(f.owner, second.view.id);
+        assert.equal(f.view(second.view.id).state, 'superseded');
+        assert.deepEqual(await f.intent(f.created.view.id), { pending: false, reason: 'superseded' });
+        assert.equal(f.session.pendingStop, null);
+        f.open(third.view.id).drop();
+        await f.tick(10 * 60_000);
+        assert.equal(f.alive(), true);
+    });
+    await t.test('the chain ends in an intent-ended view: the original signal is processed normally', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        f.open(f.created.view.id);
+        const second = await f.attach(f.owner, f.created.view.id);
+        const third = await f.attach(f.owner, second.view.id);
+        assert.equal((await f.intent(third.view.id)).pending, true);
+        await f.tick(10_000);
+        assert.deepEqual(await f.intent(f.created.view.id), { pending: true, until: 1_040_000 });
+        await f.tick(30_000);
+        assert.equal(f.alive(), false);
+    });
+    await t.test('a cyclic or missing chain counts as ended', async (t2) => {
+        const f = await closePolicyFixture(t2);
+        const [a, b] = [await f.attach(), await f.attach()];
+        Object.assign(f.view(a.view.id), { state: 'superseded', supersededBy: b.view.id });
+        Object.assign(f.view(b.view.id), { state: 'superseded', supersededBy: a.view.id });
+        assert.equal(f.manager.recoveryClaimLive(f.session, f.view(a.view.id)), false);
+        Object.assign(f.view(b.view.id), { supersededBy: 'm'.repeat(32) });
+        assert.equal(f.manager.recoveryClaimLive(f.session, f.view(a.view.id)), false);
+    });
+});
+
+test('a watcher claim never pins a view against eviction at the cap', async (t) => {
+    const f = await closePolicyFixture(t);
+    f.open(f.created.view.id);
+    await f.intent(f.created.view.id);
+    for (let index = 0; index < 31; index += 1) await f.attach();
+    assert.equal(f.session.views.size, 32);
+    const watcher = { lease: lease('watcher', 'other-admin') };
+    // The only evictable view is the ended one the watcher names; the attach still succeeds.
+    const watched = await f.attach(watcher, f.created.view.id);
+    assert.equal(watched.role, 'watcher');
+    assert.equal(f.session.views.has(f.created.view.id), false);
+    assert.ok(f.session.pendingStop, 'the ignored claim leaves the stop armed');
 });

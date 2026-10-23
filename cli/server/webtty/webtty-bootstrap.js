@@ -8,8 +8,11 @@
         const keys = [...values.keys()];
         const kind = keys[0];
         const value = values.get(kind) || '';
-        if (keys.length === 1 && ['launch', 'attach'].includes(kind) && tokenPattern.test(value)) {
-            handoff = { kind, value };
+        // Exactly `#launch=<id>`, `#launch=<id>&close=stop` or `#attach=<id>`.
+        const stopOnClose = keys.length === 2 && kind === 'launch' && keys[1] === 'close'
+            && values.get('close') === 'stop';
+        if ((keys.length === 1 || stopOnClose) && ['launch', 'attach'].includes(kind) && tokenPattern.test(value)) {
+            handoff = { kind, value, closePolicy: stopOnClose ? 'stop' : 'keep' };
         }
     } catch (_) {}
     try {

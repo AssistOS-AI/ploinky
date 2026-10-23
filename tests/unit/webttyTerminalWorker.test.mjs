@@ -332,3 +332,99 @@ test('a worker process without a valid trusted workspace root never starts', () 
         assert.equal(processApi.listenerCount('message'), 0);
     }
 });
+
+// A real workspace whose root contains spaces: the worker re-resolves the
+// profile HOME inside it immediately before spawning, like the cwd.
+function profileWorkspace(t) {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky webtty worker home '));
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    const root = fs.realpathSync(parent);
+    fs.mkdirSync(path.join(root, 'repo', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.data', 'provider', 'profiles', 'p-1', 'home'), { recursive: true });
+    const homeRelative = '.data/provider/profiles/p-1/home';
+    const home = path.join(root, homeRelative);
+    const identity = () => {
+        const stat = fs.statSync(home, { bigint: true });
+        return { dev: String(stat.dev), ino: String(stat.ino) };
+    };
+    const shellEnv = (homeValue = home) => buildShellEnvironment({}, {
+        workspaceRoot: root,
+        profile: { home: homeValue, provider: 'provider', id: 'p-1', label: 'Profile One' },
+    });
+    const worker = () => {
+        const processApi = new FakeProcess({ env: { PLOINKY_WORKSPACE_ROOT: root } });
+        const terminal = fakePty();
+        const spawnCalls = [];
+        const instance = new TerminalWorker({
+            processApi,
+            loadNodePty: () => ({
+                spawn(shell, args, options) {
+                    spawnCalls.push({ shell, args, options });
+                    return terminal.api;
+                },
+            }),
+            capturePtyIdentityImpl: () => PTY_IDENTITY,
+            cleanupSessionImpl: async () => true,
+            delayImpl: async () => {},
+            identityWaitMs: 0,
+        });
+        return { worker: instance, processApi, spawnCalls };
+    };
+    return { root, home, homeRelative, identity, shellEnv, worker };
+}
+
+test('a profile init spawns the fixed shell with HOME only after the worker revalidates it', async (t) => {
+    const fx = profileWorkspace(t);
+    const h = fx.worker();
+    await h.worker.initialize(init({
+        cwdRelative: 'repo/src',
+        shellEnv: fx.shellEnv(),
+        homeRelative: fx.homeRelative,
+        homeIdentity: fx.identity(),
+    }));
+    assert.equal(h.spawnCalls.length, 1);
+    assert.equal(h.spawnCalls[0].shell, '/bin/bash');
+    assert.deepEqual(h.spawnCalls[0].args, ['--noprofile', '--norc']);
+    assert.equal(h.spawnCalls[0].options.cwd, path.join(fx.root, 'repo', 'src'));
+    assert.deepEqual(h.spawnCalls[0].options.env, fx.shellEnv());
+    assert.equal(h.spawnCalls[0].options.env.HOME, fx.home);
+    assert.equal(h.spawnCalls[0].options.env.INPUTRC, '/etc/inputrc');
+    assert.equal(h.processApi.sent[0].type, 'ready');
+});
+
+test('the worker refuses a replaced, moved or mismatched profile HOME before loading native bytes', async (t) => {
+    const fx = profileWorkspace(t);
+    const original = fx.identity();
+    const cases = [
+        ['identity mismatch', () => ({ homeIdentity: { ...original, ino: String(BigInt(original.ino) + 1n) } })],
+        ['HOME is not the revalidated directory', () => ({ shellEnv: fx.shellEnv(path.join(fx.root, 'repo')) })],
+        ['escaping relative path', () => ({ homeRelative: '../outside' })],
+        ['missing directory', () => ({ homeRelative: '.data/provider/profiles/p-2/home' })],
+        ['workspace root as HOME', () => ({ homeRelative: '.', shellEnv: fx.shellEnv(fx.root) })],
+        ['replaced at the same path', () => {
+            // Keep the original alive so the replacement cannot reuse its inode.
+            fs.renameSync(fx.home, `${fx.home}-previous`);
+            fs.mkdirSync(fx.home);
+            return {};
+        }],
+    ];
+    for (const [name, change] of cases) {
+        const h = fx.worker();
+        let nativeLoads = 0;
+        h.worker.loadNodePty = () => { nativeLoads += 1; throw new Error('must not load'); };
+        await h.worker.initialize(init({
+            cwdRelative: 'repo/src',
+            shellEnv: fx.shellEnv(),
+            homeRelative: fx.homeRelative,
+            homeIdentity: original,
+            ...change(),
+        }));
+        assert.equal(nativeLoads, 0, name);
+        assert.equal(h.spawnCalls.length, 0, name);
+        assert.ok(h.processApi.sent.some((message) => message.type === 'error' && message.category === 'home-validation'), name);
+    }
+    // Profile variables without a revalidated HOME are not the fixed allowlist.
+    const h = fx.worker();
+    await assert.rejects(() => h.worker.initialize(init({ cwdRelative: 'repo/src', shellEnv: fx.shellEnv() })));
+    assert.equal(h.spawnCalls.length, 0);
+});

@@ -137,3 +137,63 @@ test('worker messages have strict shapes, evidence, bounds, and categories', () 
         category: 'stack: /home/user/project/.ploinky/.secrets',
     })));
 });
+
+const HOME_IDENTITY = Object.freeze({ dev: '16777231', ino: '123456789' });
+
+function profileInit(workspaceRoot, homeRelative, overrides = {}) {
+    return init({
+        shellEnv: buildShellEnvironment({}, {
+            workspaceRoot,
+            profile: { home: `${workspaceRoot}/${homeRelative}`, provider: 'provider', id: 'p-1', label: 'Profile One' },
+        }),
+        homeRelative,
+        homeIdentity: HOME_IDENTITY,
+        ...overrides,
+    });
+}
+
+test('a profile init adds exactly the relative HOME and its directory identity', () => {
+    assert.deepEqual(Object.keys(init()).sort(),
+        ['cols', 'cwdRelative', 'protocol', 'rows', 'shellEnv', 'terminalId', 'type']);
+    const message = profileInit('/home/user/project', '.data/provider/home');
+    assert.equal(validateRouterToWorkerMessage(message).homeRelative, '.data/provider/home');
+    assert.equal(message.shellEnv.INPUTRC, '/etc/inputrc');
+    assert.ok(Object.keys(message.shellEnv).length <= WEBTTY_PROTOCOL_LIMITS.maxEnvironmentEntries);
+    for (const changed of [
+        { ...message, homeIdentity: undefined },
+        Object.fromEntries(Object.entries(message).filter(([key]) => key !== 'homeIdentity')),
+        Object.fromEntries(Object.entries(message).filter(([key]) => key !== 'homeRelative')),
+        { ...message, homeRelative: '' },
+        { ...message, homeRelative: 'x'.repeat(WEBTTY_PROTOCOL_LIMITS.maxCwdBytes + 1) },
+        { ...message, homeRelative: 'a\0b' },
+        { ...message, homeIdentity: { ...HOME_IDENTITY, extra: '1' } },
+        { ...message, homeIdentity: { dev: '1' } },
+        { ...message, homeIdentity: { dev: 1, ino: 2 } },
+        { ...message, homeIdentity: { dev: '-1', ino: '2' } },
+        { ...message, homeIdentity: { dev: '1', ino: '9'.repeat(33) } },
+        { ...message, home: '/root' },
+    ]) {
+        assert.throws(() => validateRouterToWorkerMessage(changed), { code: 'WEBTTY_WORKER_PROTOCOL_INVALID' });
+    }
+});
+
+test('a profile HOME may use the workspace-root bound plus the relative-path bound and no more', () => {
+    assert.equal(WEBTTY_PROTOCOL_LIMITS.maxHomeBytes, 2 * WEBTTY_PROTOCOL_LIMITS.maxCwdBytes + 1);
+    const workspaceRoot = `/${'w'.repeat(WEBTTY_PROTOCOL_LIMITS.maxCwdBytes - 1)}`;
+    const homeRelative = 'h'.repeat(WEBTTY_PROTOCOL_LIMITS.maxCwdBytes);
+    const message = profileInit(workspaceRoot, homeRelative);
+    assert.equal(Buffer.byteLength(message.shellEnv.HOME), WEBTTY_PROTOCOL_LIMITS.maxHomeBytes);
+    assert.equal(validateRouterToWorkerMessage(message).shellEnv.HOME, message.shellEnv.HOME);
+    assert.throws(
+        () => validateRouterToWorkerMessage({ ...message, shellEnv: { ...message.shellEnv, HOME: `${message.shellEnv.HOME}h` } }),
+        { code: 'WEBTTY_WORKER_PROTOCOL_INVALID' },
+    );
+    // Every other value keeps its own smaller bound.
+    assert.throws(
+        () => validateRouterToWorkerMessage({
+            ...message,
+            shellEnv: { ...message.shellEnv, PLOINKY_WEBTTY_PROFILE_LABEL: 'x'.repeat(WEBTTY_PROTOCOL_LIMITS.maxEnvironmentValueBytes + 1) },
+        }),
+        { code: 'WEBTTY_WORKER_PROTOCOL_INVALID' },
+    );
+});

@@ -6,6 +6,7 @@ import { WEBTTY_PROTOCOL_LIMITS } from '../../../core-services/webtty/worker-pro
 import { isAdminUser } from '../auth/localService.js';
 import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
 import { commitRouteGeneration } from '../edgeRoutePlan.js';
+import { validateHomeProfileRequest } from '../webtty/homeProfileProvider.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEBTTY_ROOT = path.resolve(__dirname, '../webtty');
@@ -133,8 +134,19 @@ function validateDimensions(cols, rows) {
 }
 
 function sessionPath(pathname) {
-    const match = pathname.match(/^\/webtty\/sessions\/([A-Za-z0-9_-]{16,128})(?:\/(stream|input|resize))?$/);
+    const match = pathname.match(/^\/webtty\/sessions\/([A-Za-z0-9_-]{16,128})(?:\/(stream|input|resize|close-policy|close-intents))?$/);
     return match ? { id: match[1], operation: match[2] || '' } : null;
+}
+
+const VIEW_ID_PATTERN = /^[A-Za-z0-9_-]{32}$/;
+const CLOSE_POLICIES = new Set(['keep', 'stop']);
+
+// A stream names exactly one server-issued view: `?view=<id>` and nothing else.
+function streamViewId(parsedUrl) {
+    const params = parsedUrl.searchParams;
+    const keys = [...params.keys()];
+    const value = params.get('view');
+    return keys.length === 1 && keys[0] === 'view' && VIEW_ID_PATTERN.test(value || '') ? value : '';
 }
 
 function discoveryPath(pathname) {
@@ -149,6 +161,7 @@ const RETRYABLE_CLIENT_OPERATION_ERRORS = new Set([
     'WEBTTY_SESSION_QUOTA',
     'WEBTTY_CREATION_RATE',
     'WEBTTY_VIEWER_QUOTA',
+    'WEBTTY_VIEW_LIMIT',
     'WEBTTY_INPUT_RATE',
     'WEBTTY_IPC_BACKPRESSURE',
     'WEBTTY_AGENT_IPC_BACKPRESSURE',
@@ -177,6 +190,10 @@ function mapOperationError(res, error) {
         sendError(res, 404, 'not_found');
     } else if (STALE_TARGET_ERRORS.has(code)) {
         sendError(res, 409, 'terminal_target_stale');
+    } else if (code === 'WEBTTY_PROFILE_UNAVAILABLE') {
+        sendError(res, 409, 'terminal_profile_unavailable');
+    } else if (code === 'WEBTTY_VIEW_STALE') {
+        sendError(res, 409, 'terminal_view_stale');
     } else if (code === 'WEBTTY_UNAVAILABLE' || code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') {
         sendError(res, 503, 'webtty_unavailable', { 'Retry-After': '5' });
     } else if (code === 'WEBTTY_GENERATION_CHANGED' || code === 'EDGE_GENERATION_INACTIVE') {
@@ -193,14 +210,20 @@ export async function handleWebtty(req, res, parsedUrl, {
     const pathname = parsedUrl.pathname || '/';
     if (!(pathname === '/webtty' || pathname.startsWith('/webtty/'))) return false;
     if (!requireAdministrator(req, res)) return true;
-    if (!requireAvailable(manager, res)) return true;
     const method = String(req.method || 'GET').toUpperCase();
 
+    // The list stays readable while WebTTY is disabled so that close outcomes
+    // remain visible; it then returns only retained outcomes with
+    // `available: false`. Lease validation still applies. No other route opens.
     if (pathname === '/webtty/live-sessions' && method === 'GET') {
-        try { sendJson(res, 200, { ok: true, version: 1, sessions: await manager.listSessions({ req, routePlan }) }); }
-        catch (error) { mapOperationError(res, error); }
+        try {
+            const { sessions, available } = await manager.listLiveSessions({ req, routePlan });
+            sendJson(res, 200, { ok: true, version: 1, sessions, ...(available === false ? { available: false } : {}) });
+        } catch (error) { mapOperationError(res, error); }
         return true;
     }
+
+    if (!requireAvailable(manager, res)) return true;
 
     const attachTokenPath = pathname.match(/^\/webtty\/live-sessions\/([A-Za-z0-9_-]{32})\/attach-tokens$/);
     if ((attachTokenPath || pathname === '/webtty/attachments') && method === 'POST') {
@@ -211,7 +234,11 @@ export async function handleWebtty(req, res, parsedUrl, {
             sendError(res, error.code === 'UNSUPPORTED_MEDIA_TYPE' ? 415 : error.code === 'BODY_TOO_LARGE' ? 413 : 400, error.code.toLowerCase());
             return true;
         }
-        if (parsedUrl.search || (attachTokenPath ? !exactBodyKeys(body, [])
+        // A token body is exactly {} or {supersedes: <view id>}: an explicit
+        // recovery names the view it replaces; the format is the only check here.
+        const recoveryClaim = attachTokenPath && exactBodyKeys(body, ['supersedes'])
+            && typeof body.supersedes === 'string' && VIEW_ID_PATTERN.test(body.supersedes);
+        if (parsedUrl.search || (attachTokenPath ? !exactBodyKeys(body, []) && !recoveryClaim
             : !exactBodyKeys(body, ['attach', 'cols', 'rows'])
                 || typeof body.attach !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(body.attach)
                 || !validateDimensions(body.cols, body.rows))) {
@@ -221,10 +248,12 @@ export async function handleWebtty(req, res, parsedUrl, {
         if (!commitMutation(routePlan, res)) return true;
         try {
             if (attachTokenPath) {
-                sendJson(res, 201, { ok: true, ...await manager.createAttachToken({ req, routePlan, id: attachTokenPath[1] }) });
+                sendJson(res, 201, { ok: true, ...await manager.createAttachToken({
+                    req, routePlan, id: attachTokenPath[1], ...(recoveryClaim ? { supersedes: body.supersedes } : {}),
+                }) });
             } else {
-                const session = await manager.attach({ req, routePlan, ...body });
-                sendJson(res, 200, { ok: true, session });
+                const { view, ...session } = await manager.attach({ req, routePlan, ...body });
+                sendJson(res, 200, { ok: true, session, view });
             }
         } catch (error) { mapOperationError(res, error); }
         return true;
@@ -272,7 +301,11 @@ export async function handleWebtty(req, res, parsedUrl, {
             sendError(res, error.code === 'UNSUPPORTED_MEDIA_TYPE' ? 415 : error.code === 'BODY_TOO_LARGE' ? 413 : 400, error.code.toLowerCase());
             return true;
         }
-        if (!exactBodyKeys(body, ['dir']) || typeof body.dir !== 'string') {
+        // Exactly `{dir}` (standalone) or `{dir, profile: {provider, id}}`.
+        // The browser names a profile; it never supplies a HOME path.
+        const withProfile = exactBodyKeys(body, ['dir', 'profile']);
+        if ((!withProfile && !exactBodyKeys(body, ['dir'])) || typeof body.dir !== 'string'
+            || (withProfile && !validateHomeProfileRequest(body.profile))) {
             sendError(res, 400, 'invalid_discovery_request');
             return true;
         }
@@ -281,6 +314,7 @@ export async function handleWebtty(req, res, parsedUrl, {
                 req,
                 routePlan,
                 directory: body.dir,
+                ...(withProfile ? { profile: validateHomeProfileRequest(body.profile) } : {}),
             });
             sendJson(res, 201, { ok: true, discovery });
         } catch (error) {
@@ -315,22 +349,24 @@ export async function handleWebtty(req, res, parsedUrl, {
             sendError(res, error.code === 'UNSUPPORTED_MEDIA_TYPE' ? 415 : error.code === 'BODY_TOO_LARGE' ? 413 : 400, error.code.toLowerCase());
             return true;
         }
-        if (!exactBodyKeys(body, ['launch', 'cols', 'rows'])
+        if (!exactBodyKeys(body, ['launch', 'cols', 'rows', 'closePolicy'])
             || typeof body.launch !== 'string'
             || !/^[A-Za-z0-9_-]{32}$/.test(body.launch)
-            || !validateDimensions(body.cols, body.rows)) {
+            || !validateDimensions(body.cols, body.rows)
+            || !CLOSE_POLICIES.has(body.closePolicy)) {
             sendError(res, 400, 'invalid_session_request');
             return true;
         }
         try {
-            const created = await manager.create({
+            const { view, ...session } = await manager.create({
                 req,
                 routePlan,
                 launch: body.launch,
                 cols: body.cols,
                 rows: body.rows,
+                closePolicy: body.closePolicy,
             });
-            sendJson(res, 201, { ok: true, session: created });
+            sendJson(res, 201, { ok: true, session, view });
         } catch (error) {
             mapOperationError(res, error);
         }
@@ -344,10 +380,15 @@ export async function handleWebtty(req, res, parsedUrl, {
     }
 
     if (selected.operation === 'stream' && method === 'GET') {
+        const viewId = streamViewId(parsedUrl);
+        if (!viewId) { sendError(res, 400, 'invalid_stream_request'); return true; }
         let session;
         try {
             session = await manager.authorize(req, routePlan, selected.id, 'watch');
-            if (session) manager.assertViewerQuota(session);
+            if (session) {
+                manager.streamView(session, req, viewId);
+                manager.assertViewerQuota(session);
+            }
         }
         catch (error) { mapOperationError(res, error); return true; }
         if (!session) { sendError(res, 404, 'not_found'); return true; }
@@ -359,7 +400,7 @@ export async function handleWebtty(req, res, parsedUrl, {
         });
         let attached = false;
         try {
-            attached = manager.attachStream(session, req, res, req.headers?.['last-event-id'], routePlan);
+            attached = manager.attachStream(session, req, res, req.headers?.['last-event-id'], routePlan, viewId);
         } catch (_) { }
         if (!attached && !res.writableEnded && !res.destroyed) {
             try { res.end(); } catch (_) { }
@@ -410,6 +451,37 @@ export async function handleWebtty(req, res, parsedUrl, {
         if (!commitMutation(routePlan, res)) return true;
         try { await manager.resize(session, body.cols, body.rows); sendJson(res, 200, { ok: true }); }
         catch (error) { mapOperationError(res, error); }
+        return true;
+    }
+
+    if ((selected.operation === 'close-policy' || selected.operation === 'close-intents') && method === 'POST') {
+        if (!verifyMutationBeforeBody(req, res, routePlan)) return true;
+        let body;
+        try { body = await readJsonBody(req, 1024); }
+        catch (error) {
+            sendError(res, error.code === 'UNSUPPORTED_MEDIA_TYPE' ? 415 : error.code === 'BODY_TOO_LARGE' ? 413 : 400, error.code.toLowerCase());
+            return true;
+        }
+        const intent = selected.operation === 'close-intents';
+        if (parsedUrl.search || !CLOSE_POLICIES.has(body.policy) || (intent
+            ? !exactBodyKeys(body, ['view', 'policy']) || typeof body.view !== 'string' || !VIEW_ID_PATTERN.test(body.view)
+            : !exactBodyKeys(body, ['policy']))) {
+            sendError(res, 400, intent ? 'invalid_close_intent' : 'invalid_close_policy');
+            return true;
+        }
+        if (!commitMutation(routePlan, res)) return true;
+        try {
+            if (intent) {
+                const result = await manager.closeIntent({
+                    req, routePlan, id: selected.id, view: body.view, policy: body.policy,
+                });
+                if (result.pending) sendJson(res, 202, { ok: true, pending: true, until: result.until });
+                else sendJson(res, 200, { ok: true, pending: false, ...(result.reason ? { reason: result.reason } : {}) });
+            } else {
+                const result = await manager.setClosePolicy({ req, routePlan, id: selected.id, policy: body.policy });
+                sendJson(res, 200, { ok: true, closePolicy: result.closePolicy, pendingStopUntil: result.pendingStopUntil });
+            }
+        } catch (error) { mapOperationError(res, error); }
         return true;
     }
 

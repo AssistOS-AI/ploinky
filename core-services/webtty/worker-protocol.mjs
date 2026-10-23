@@ -12,12 +12,17 @@ export const WEBTTY_PROTOCOL_LIMITS = Object.freeze({
     maxRows: 512,
     maxEnvironmentEntries: 16,
     maxEnvironmentValueBytes: 1_024,
+    // A profile HOME is the workspace root (bounded like a cwd) plus one
+    // separator plus a workspace-relative path (bounded like a cwd).
+    maxHomeBytes: 4 * 1024 + 1 + 4 * 1024,
+    maxIdentityBytes: 32,
 });
 
 export const WORKER_ERROR_CATEGORIES = Object.freeze([
     'protocol',
     'native-runtime',
     'cwd-validation',
+    'home-validation',
     'pty-spawn',
     'pty-io',
     'output-limit',
@@ -42,6 +47,12 @@ const ROUTER_MESSAGE_FIELDS = Object.freeze({
     input: Object.freeze(['protocol', 'type', 'terminalId', 'data']),
     resize: Object.freeze(['protocol', 'type', 'terminalId', 'cols', 'rows']),
     close: Object.freeze(['protocol', 'type', 'terminalId']),
+});
+// A home-profile init adds exactly the workspace-relative HOME and the
+// directory identity the worker must find there before spawning.
+const ROUTER_PROFILE_MESSAGE_FIELDS = Object.freeze({
+    ...ROUTER_MESSAGE_FIELDS,
+    init: Object.freeze([...ROUTER_MESSAGE_FIELDS.init, 'homeRelative', 'homeIdentity']),
 });
 const WORKER_MESSAGE_FIELDS = Object.freeze({
     ready: Object.freeze(['protocol', 'type', 'terminalId', 'processIdentity']),
@@ -115,11 +126,14 @@ function validateEnvironment(shellEnv) {
         throw workerProtocolError('environment');
     }
     for (const [key, value] of entries) {
-        // The host-selected workspace can occupy a full filesystem path;
-        // other fixed environment values keep their smaller wire bound.
+        // The host-selected workspace can occupy a full filesystem path, and
+        // a profile HOME lies below it; other fixed environment values keep
+        // their smaller wire bound.
         const maxValueBytes = key === 'PLOINKY_WORKSPACE_ROOT'
             ? WEBTTY_PROTOCOL_LIMITS.maxCwdBytes
-            : WEBTTY_PROTOCOL_LIMITS.maxEnvironmentValueBytes;
+            : key === 'HOME'
+                ? WEBTTY_PROTOCOL_LIMITS.maxHomeBytes
+                : WEBTTY_PROTOCOL_LIMITS.maxEnvironmentValueBytes;
         if (!/^[A-Z][A-Z0-9_]*$/.test(key)
             || utf8Bytes(key) > 64
             || utf8Bytes(value) < 0
@@ -127,6 +141,18 @@ function validateEnvironment(shellEnv) {
             || value.includes('\0')) {
             throw workerProtocolError('environment');
         }
+    }
+}
+
+function validateHomeIdentity(identity) {
+    exactObject(identity, ['dev', 'ino'], 'home-identity');
+    for (const field of ['dev', 'ino']) {
+        boundedString(identity[field], {
+            min: 1,
+            max: WEBTTY_PROTOCOL_LIMITS.maxIdentityBytes,
+            pattern: /^[0-9]+$/,
+            category: 'home-identity',
+        });
     }
 }
 
@@ -155,7 +181,13 @@ export function validateRouterToWorkerMessage(message, {
     closing = false,
     expectedTerminalId,
 } = {}) {
-    validateProtocolEnvelope(message, ROUTER_MESSAGE_FIELDS, { expectedTerminalId });
+    const profileInit = Boolean(message) && typeof message === 'object'
+        && message.type === 'init' && Object.hasOwn(message, 'homeRelative');
+    validateProtocolEnvelope(
+        message,
+        profileInit ? ROUTER_PROFILE_MESSAGE_FIELDS : ROUTER_MESSAGE_FIELDS,
+        { expectedTerminalId },
+    );
     if (!initialized && message.type !== 'init') throw workerProtocolError('pre-init');
     if (initialized && message.type === 'init') throw workerProtocolError('duplicate-init');
     if (closing && message.type !== 'close') throw workerProtocolError('closing');
@@ -167,6 +199,14 @@ export function validateRouterToWorkerMessage(message, {
         });
         validateDimensions(message.cols, message.rows);
         validateEnvironment(message.shellEnv);
+        if (profileInit) {
+            boundedString(message.homeRelative, {
+                min: 1,
+                max: WEBTTY_PROTOCOL_LIMITS.maxCwdBytes,
+                category: 'home',
+            });
+            validateHomeIdentity(message.homeIdentity);
+        }
     } else if (message.type === 'input') {
         boundedString(message.data, {
             min: 1,

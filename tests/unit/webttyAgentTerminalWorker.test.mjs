@@ -1339,3 +1339,54 @@ test('ExecID selection tolerates unrelated removals but rejects concurrent addit
     assert.equal(selectExactNewExecId([oldA, oldB], [oldB, owned]), owned);
     assert.throws(() => selectExactNewExecId([oldA], [oldA, owned, 'd'.repeat(64)]));
 });
+
+const PROFILE = Object.freeze({ provider: 'provider', id: 'p-1', label: 'Profile One' });
+
+test('a profile adds exactly HOME, INPUTRC and three profile variables to the exec, and nothing without one', () => {
+    const plain = fixedAgentPodmanArgv(init());
+    const profiled = fixedAgentPodmanArgv(init({ translatedHome: '/data/profiles/p-1/home', profile: PROFILE }));
+    const containerIndex = plain.indexOf(CONTAINER_ID);
+    assert.deepEqual(profiled, [
+        ...plain.slice(0, containerIndex),
+        '--env', 'HOME=/data/profiles/p-1/home',
+        '--env', 'INPUTRC=/etc/inputrc',
+        '--env', 'PLOINKY_WEBTTY_PROFILE_PROVIDER=provider',
+        '--env', 'PLOINKY_WEBTTY_PROFILE_ID=p-1',
+        '--env', 'PLOINKY_WEBTTY_PROFILE_LABEL=Profile One',
+        ...plain.slice(containerIndex),
+    ]);
+    // Without a profile the exec sets no INPUTRC, exactly as before.
+    assert.equal(plain.some((value) => value.startsWith('INPUTRC=')), false);
+    // The shell, its flags and the bootstrap are unchanged by a profile.
+    assert.deepEqual(profiled.slice(profiled.indexOf(CONTAINER_ID)), plain.slice(containerIndex));
+    for (const shell of ['/bin/bash', '/bin/sh']) {
+        assert.deepEqual(
+            fixedAgentPodmanArgv(init(), shell),
+            fixedAgentPodmanArgv({ ...init(), translatedHome: undefined, profile: undefined }, shell),
+        );
+    }
+});
+
+test('a profile init carries HOME into the exec and startup evidence while the launcher environment stays fixed', async () => {
+    const h = harness();
+    const message = init({ translatedHome: '/data/profiles/p-1/home', profile: PROFILE });
+    await h.worker.initialize(message);
+    const prepared = h.processApi.sent.find((sent) => sent.type === 'prepared');
+    assert.equal(prepared.startupEvidence.translatedHome, '/data/profiles/p-1/home');
+    assert.deepEqual(prepared.startupEvidence.profile, PROFILE);
+    await h.worker.launch();
+    assert.equal(h.spawnCalls.length, 1);
+    assert.deepEqual(h.spawnCalls[0].args, fixedAgentPodmanArgv(message));
+    // The host-side launcher keeps its own fixed HOME and no profile values.
+    assert.deepEqual(h.spawnCalls[0].options.env, { ...buildAgentWorkerEnvironment(), TERM: 'xterm-256color' });
+    assert.equal(h.spawnCalls[0].options.env.HOME, '/home/podman');
+    assert.equal(JSON.stringify(h.spawnCalls[0].options.env).includes('PROFILE'), false);
+
+    const plain = harness();
+    await plain.worker.initialize(init());
+    const plainPrepared = plain.processApi.sent.find((sent) => sent.type === 'prepared');
+    assert.equal('translatedHome' in plainPrepared.startupEvidence, false);
+    assert.equal('profile' in plainPrepared.startupEvidence, false);
+    await plain.worker.launch();
+    assert.deepEqual(plain.spawnCalls[0].options.env, h.spawnCalls[0].options.env);
+});

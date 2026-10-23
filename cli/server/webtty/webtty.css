@@ -83,3 +83,15 @@ main { min-height: 0; flex: 1; display: flex; flex-direction: column; }
 .embedded .warning { display: none; }
 .embedded .details { flex-wrap: wrap; align-items: center; gap: 8px; }
 .embedded #terminal { padding: 4px; }
+.profile-label { white-space: nowrap; color: #c9d1d9; font-weight: 650; }
+.close-policy { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+#close-policy {
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  color: #e6edf3;
+  background: #161b22;
+  padding: 2px 6px;
+  font: inherit;
+}
+#close-policy:disabled { opacity: .6; }
+#close-policy:focus-visible { outline: 2px solid #e6edf3; outline-offset: 2px; }

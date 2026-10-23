@@ -110,6 +110,7 @@ import { createCloudflaredRouterIntegration } from '../../ploinky-box/cloudflare
 import { requestAgentCard } from './agentCardFanout.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { WebttySessionManager } from './webtty/sessionManager.mjs';
+import { WebttyHomeProfileProvider } from './webtty/homeProfileProvider.mjs';
 import { captureEdgeRoutingLease } from '../sandbox/edgeGeneration.js';
 import { onAuthenticatedRequestDecision } from './auth/authenticatedRequestEvents.mjs';
 import { buildAgentWorkerEnvironment } from './webtty/agentWorkerEnvironment.mjs';
@@ -180,6 +181,12 @@ const webttyProviderLocality = resolveWebttyProviderLocality({
 const webttySessionManager = new WebttySessionManager({
     workspaceRoot: PLOINKY_WORKSPACE_ROOT,
     agentProviderAvailable: webttyProviderLocality.agentAvailable,
+    // Optional agent-nominated HOME profiles resolve over the existing private
+    // agent-port relay; no listener, port or credential is added.
+    homeProfiles: new WebttyHomeProfileProvider({
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+        relayManager: runtimeRelayManager,
+    }),
     capturePlan: () => {
         const lease = captureEdgeRoutingLease();
         return { snapshot: lease.snapshot, lease };

@@ -96,6 +96,7 @@ function manager(overrides = {}) {
     return {
         availability: () => ({ ok: true }),
         assertViewerQuota() {},
+        streamView() {},
         async create() { return { id: 'terminal-abcdefghijklmnop', cwd: '.', cols: 80, rows: 24 }; },
         ...overrides,
     };
@@ -157,7 +158,7 @@ test('watcher input is forbidden, watcher Kill succeeds, and stream quota return
         ['GET', '/stream', 503, { authorize: async () => { throw Object.assign(new Error(), { code: 'EDGE_GENERATION_INACTIVE' }); } }],
     ]) {
         const routePlan = plan();
-        const url = `/webtty/sessions/${'a'.repeat(32)}${suffix}`;
+        const url = `/webtty/sessions/${'a'.repeat(32)}${suffix}${suffix === '/stream' ? `?view=${'v'.repeat(32)}` : ''}`;
         const { req } = request({ routePlan, url, method, body: { data: 'x' } });
         const res = new MockResponse();
         await handleWebtty(req, res, new URL(url, 'https://app.example.test'), { manager: manager(overrides), routePlan });
@@ -173,12 +174,12 @@ test('a fresh manager lists no sessions and rejects stale streams after router r
         auth: { createLease: () => ({ mode: 'local', userId: 'admin' }), validateLease: async () => ({ ok: true }) },
     });
     live.ready = true;
-    for (const url of ['/webtty/live-sessions', `/webtty/sessions/${'a'.repeat(32)}/stream`]) {
+    for (const url of ['/webtty/live-sessions', `/webtty/sessions/${'a'.repeat(32)}/stream?view=${'v'.repeat(32)}`]) {
         const routePlan = plan();
         const { req } = request({ routePlan, url, method: 'GET' });
         const res = new MockResponse();
         await handleWebtty(req, res, new URL(url, 'https://app.example.test'), { manager: live, routePlan });
-        assert.equal(res.statusCode, url.endsWith('/stream') ? 404 : 200);
+        assert.equal(res.statusCode, url.includes('/stream') ? 404 : 200);
         if (res.statusCode === 200) assert.deepEqual(JSON.parse(res.body), { ok: true, version: 1, sessions: [] });
     }
 });
@@ -290,7 +291,7 @@ test('local CLI administrator mutations require direct browser proof before body
     const input = request({
         routePlan,
         csrf: false,
-        body: { launch: 'a'.repeat(32), cols: 80, rows: 24 },
+        body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep' },
     });
     let allocations = 0;
     const res = new MockResponse();
@@ -318,7 +319,7 @@ test('create-time authentication races map invalid auth to 401 and administrator
         ['WEBTTY_ADMIN_REQUIRED', 403],
     ]) {
         const routePlan = plan();
-        const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24 } });
+        const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep' } });
         const res = new MockResponse();
         await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
             manager: manager({
@@ -388,12 +389,12 @@ test('target discovery accepts only the canonical directory and returns the mana
 
 test('the session API hard-cuts direct cwd and every raw runtime selector', async () => {
     const forbiddenBodies = [
-        { cwd: 'Projects', cols: 80, rows: 24 },
-        { launch: 'a'.repeat(32), cols: 80, rows: 24, containerId: 'b'.repeat(64) },
-        { launch: 'a'.repeat(32), cols: 80, rows: 24, argv: ['/bin/sh'] },
-        { launch: 'a'.repeat(32), cols: 80, rows: 24, user: '0' },
-        { launch: 'a'.repeat(32), cols: 80, rows: 24, env: { PATH: '/tmp' } },
-        { launch: 'a'.repeat(32), cols: 80, rows: 24, runtime: 'podman' },
+        { cwd: 'Projects', cols: 80, rows: 24, closePolicy: 'keep' },
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep', containerId: 'b'.repeat(64) },
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep', argv: ['/bin/sh'] },
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep', user: '0' },
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep', env: { PATH: '/tmp' } },
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep', runtime: 'podman' },
     ];
     for (const body of forbiddenBodies) {
         const routePlan = plan();
@@ -416,7 +417,7 @@ test('launch replay, stale target, and provider isolation errors use non-oracula
         ['WEBTTY_TARGET_PROVIDER_UNAVAILABLE', 503, 'webtty_unavailable'],
     ]) {
         const routePlan = plan();
-        const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24 } });
+        const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep' } });
         const res = new MockResponse();
         await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
             manager: manager({
@@ -449,7 +450,7 @@ test('only exact client operation errors cross the handler boundary', async () =
         ['WEBTTY_INPUT_RATE', 429, 'webtty_input_rate', true],
     ]) {
         const routePlan = plan();
-        const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24 } });
+        const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep' } });
         const res = new MockResponse();
         await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
             manager: manager({
@@ -479,7 +480,7 @@ test('internal invalid, quota-looking, and rate-looking failures collapse to a n
         'WEBTTY_PROVIDER_RATE_INVALID',
     ]) {
         const routePlan = plan();
-        const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24 } });
+        const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep' } });
         const res = new MockResponse();
         await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
             manager: manager({
@@ -507,7 +508,7 @@ test('availability, ownership, and close internals cannot escape the HTTP error 
                 throw error;
             },
         }],
-        ['GET', '/webtty/sessions/terminal-abcdefghijklmnop/stream', {
+        ['GET', `/webtty/sessions/terminal-abcdefghijklmnop/stream?view=${'v'.repeat(32)}`, {
             async authorize() {
                 const error = new Error('private ownership detail');
                 error.code = 'WEBTTY_AUTH_SUBSCRIPTION_INVALID';
@@ -544,7 +545,7 @@ test('a stream rejected after ownership validation is ended instead of leaked', 
     const input = request({
         routePlan,
         method: 'GET',
-        url: '/webtty/sessions/terminal-abcdefghijklmnop/stream',
+        url: `/webtty/sessions/terminal-abcdefghijklmnop/stream?view=${'v'.repeat(32)}`,
     });
     const res = new MockResponse();
     await handleWebtty(
@@ -600,7 +601,7 @@ test('discovery cancellation is ownership checked after mutation proof and route
 test('a late generation change denies creation after parsing and before allocation', async () => {
     let allocations = 0;
     const routePlan = plan({ commit: () => false });
-    const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24 } });
+    const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep' } });
     const res = new MockResponse();
     await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
         manager: manager({
@@ -667,7 +668,7 @@ test('page, asset, and stream GETs never allocate and assets use a fixed allowli
     const streamRes = new MockResponse();
     await handleWebtty({
         method: 'GET', headers: {}, user: { id: 'local:admin', roles: ['admin'] },
-    }, streamRes, new URL('/webtty/sessions/terminal-abcdefghijklmnop/stream', 'http://localhost'), {
+    }, streamRes, new URL(`/webtty/sessions/terminal-abcdefghijklmnop/stream?view=${'v'.repeat(32)}`, 'http://localhost'), {
         manager: service,
         routePlan,
     });
@@ -678,7 +679,7 @@ test('page, asset, and stream GETs never allocate and assets use a fixed allowli
 
 test('declared oversized JSON is rejected before body reads or allocation', async () => {
     const routePlan = plan();
-    const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24 } });
+    const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep' } });
     input.req.headers['content-length'] = String(9 * 1024);
     let allocations = 0;
     const res = new MockResponse();
@@ -723,14 +724,14 @@ test('only real HTML responses allow same-origin framing; assets, JSON and SSE r
         ['/webtty/', 'text/html', 'SAMEORIGIN'],
         ['/webtty/assets/webtty.js', 'application/javascript', 'DENY'],
         ['/webtty/live-sessions', 'application/json', 'DENY'],
-        [`/webtty/sessions/${'a'.repeat(32)}/stream`, 'text/event-stream', 'DENY'],
+        [`/webtty/sessions/${'a'.repeat(32)}/stream?view=${'v'.repeat(32)}`, 'text/event-stream', 'DENY'],
     ]) {
         const { req } = request({ method: 'GET', url, routePlan });
         const res = new MockResponse();
         await handleWebtty(req, res, new URL(url, 'https://app.example.test'), {
             routePlan,
             manager: manager({
-                listSessions: async () => [],
+                listLiveSessions: async () => ({ sessions: [], available: true }),
                 authorize: async () => ({}),
                 attachStream(session, request, response) { response.write(': connected\n\n'); response.end(); return true; },
             }),
@@ -740,4 +741,278 @@ test('only real HTML responses allow same-origin framing; assets, JSON and SSE r
         assert.equal(res.headers['X-Frame-Options'], frame, url);
         assert.ok(res.headers['Content-Security-Policy'].includes(`frame-ancestors '${frame === 'SAMEORIGIN' ? 'self' : 'none'}'`), url);
     }
+});
+
+test('discovery accepts exactly {dir} or {dir, profile:{provider,id}} and never a HOME path', async () => {
+    const call = async (body, discoverTargets) => {
+        const routePlan = plan();
+        const input = request({ routePlan, url: '/webtty/target-discoveries', body });
+        const res = new MockResponse();
+        await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
+            manager: manager({ discoverTargets }),
+            routePlan,
+        });
+        return res;
+    };
+    const observed = [];
+    const record = async (value) => { observed.push(value); return { id: 'd'.repeat(32), targets: [] }; };
+    assert.equal((await call({ dir: 'Projects' }, record)).statusCode, 201);
+    assert.deepEqual(Object.keys(observed[0]).sort(), ['directory', 'req', 'routePlan']);
+    assert.equal((await call({ dir: 'Projects', profile: { provider: 'provider', id: 'p-1' } }, record)).statusCode, 201);
+    assert.deepEqual(Object.keys(observed[1]).sort(), ['directory', 'profile', 'req', 'routePlan']);
+    assert.deepEqual(observed[1].profile, { provider: 'provider', id: 'p-1' });
+
+    const never = async () => { throw new Error('must not be called'); };
+    for (const body of [
+        { dir: 'Projects', home: '/root' },
+        { dir: 'Projects', profile: { provider: 'provider', id: 'p-1' }, home: '/root' },
+        { dir: 'Projects', profile: { provider: 'provider', id: 'p-1', home: '/root' } },
+        { dir: 'Projects', profile: { provider: 'provider' } },
+        { dir: 'Projects', profile: { provider: 'provider', id: '../p' } },
+        { dir: 'Projects', profile: { provider: '/provider', id: 'p-1' } },
+        { dir: 'Projects', profile: null },
+        { dir: 'Projects', profile: 'provider/p-1' },
+        { profile: { provider: 'provider', id: 'p-1' } },
+    ]) {
+        const res = await call(body, never);
+        assert.equal(res.statusCode, 400, JSON.stringify(body));
+        assert.equal(JSON.parse(res.body).error, 'invalid_discovery_request');
+    }
+
+    const refused = await call({ dir: 'Projects', profile: { provider: 'provider', id: 'p-1' } }, async () => {
+        throw Object.assign(new Error('private provider detail'), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
+    });
+    assert.equal(refused.statusCode, 409);
+    assert.deepEqual(JSON.parse(refused.body), { ok: false, error: 'terminal_profile_unavailable' });
+});
+
+test('the create body stays exactly {launch, cols, rows, closePolicy}: HOME and profile selectors are refused', async () => {
+    for (const body of [
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep', home: '/root' },
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep', profile: { provider: 'provider', id: 'p-1' } },
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep', env: { HOME: '/root' } },
+    ]) {
+        const routePlan = plan();
+        const input = request({ routePlan, body });
+        let allocations = 0;
+        const res = new MockResponse();
+        await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
+            manager: manager({ async create() { allocations += 1; } }),
+            routePlan,
+        });
+        assert.equal(res.statusCode, 400, JSON.stringify(body));
+        assert.equal(allocations, 0, JSON.stringify(body));
+    }
+});
+
+test('create requires closePolicy keep or stop and lifts the server view to the top level', async () => {
+    for (const body of [
+        { launch: 'a'.repeat(32), cols: 80, rows: 24 },
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'maybe' },
+        { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: null },
+    ]) {
+        const routePlan = plan();
+        const input = request({ routePlan, body });
+        let allocations = 0;
+        const res = new MockResponse();
+        await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
+            manager: manager({ async create() { allocations += 1; } }),
+            routePlan,
+        });
+        assert.equal(res.statusCode, 400, JSON.stringify(body));
+        assert.equal(allocations, 0, JSON.stringify(body));
+    }
+    const observed = [];
+    const routePlan = plan();
+    const input = request({ routePlan, body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'stop' } });
+    const res = new MockResponse();
+    await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
+        manager: manager({
+            async create(value) {
+                observed.push(value);
+                return { id: 'terminal-abcdefghijklmnop', role: 'owner', closePolicy: 'stop', view: { id: 'v'.repeat(32) } };
+            },
+        }),
+        routePlan,
+    });
+    assert.equal(res.statusCode, 201);
+    assert.equal(observed[0].closePolicy, 'stop');
+    assert.deepEqual(JSON.parse(res.body), {
+        ok: true,
+        session: { id: 'terminal-abcdefghijklmnop', role: 'owner', closePolicy: 'stop' },
+        view: { id: 'v'.repeat(32) },
+    });
+});
+
+test('a stream must name exactly one view; stale views are refused before the SSE response', async () => {
+    const view = 'v'.repeat(32);
+    for (const query of ['', '?view=short', `?view=${view}&view=${view}`, `?view=${view}&last=1`, `?other=${view}`]) {
+        const routePlan = plan();
+        let authorizations = 0;
+        const url = `/webtty/sessions/${'a'.repeat(32)}/stream${query}`;
+        const { req } = request({ routePlan, url, method: 'GET' });
+        const res = new MockResponse();
+        await handleWebtty(req, res, new URL(url, 'https://app.example.test'), {
+            manager: manager({ async authorize() { authorizations += 1; return {}; } }),
+            routePlan,
+        });
+        assert.equal(res.statusCode, 400, query);
+        assert.equal(JSON.parse(res.body).error, 'invalid_stream_request', query);
+        assert.equal(authorizations, 0, query);
+    }
+    const routePlan = plan();
+    const url = `/webtty/sessions/${'a'.repeat(32)}/stream?view=${view}`;
+    const { req } = request({ routePlan, url, method: 'GET' });
+    const res = new MockResponse();
+    let attached = 0;
+    await handleWebtty(req, res, new URL(url, 'https://app.example.test'), {
+        manager: manager({
+            async authorize() { return {}; },
+            streamView(session, request, viewId) {
+                assert.equal(viewId, view);
+                throw Object.assign(new Error('private'), { code: 'WEBTTY_VIEW_STALE' });
+            },
+            attachStream() { attached += 1; return true; },
+        }),
+        routePlan,
+    });
+    assert.equal(res.statusCode, 409);
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: 'terminal_view_stale' });
+    assert.equal(attached, 0);
+    const passed = [];
+    const okRes = new MockResponse();
+    await handleWebtty(request({ routePlan, url, method: 'GET' }).req, okRes, new URL(url, 'https://app.example.test'), {
+        manager: manager({
+            async authorize() { return {}; },
+            attachStream(...args) { passed.push(args[5]); args[2].end(); return true; },
+        }),
+        routePlan,
+    });
+    assert.equal(okRes.statusCode, 200);
+    assert.deepEqual(passed, [view]);
+});
+
+test('close-policy and close-intents accept exact owner bodies after the mutation proof', async () => {
+    const id = 'a'.repeat(32);
+    const view = 'v'.repeat(32);
+    async function call(operation, body, overrides = {}, { csrf = true } = {}) {
+        const routePlan = plan();
+        const url = `/webtty/sessions/${id}/${operation}`;
+        const input = request({ routePlan, url, body, csrf });
+        const res = new MockResponse();
+        await handleWebtty(input.req, res, new URL(url, 'https://app.example.test'), { manager: manager(overrides), routePlan });
+        return { status: res.statusCode, body: JSON.parse(res.body), consumed: input.wasConsumed() };
+    }
+    const never = {
+        async setClosePolicy() { throw new Error('must not be called'); },
+        async closeIntent() { throw new Error('must not be called'); },
+    };
+    for (const body of [{}, { policy: 'later' }, { policy: 'stop', view }, { policy: 'stop', extra: true }]) {
+        assert.equal((await call('close-policy', body, never)).status, 400, JSON.stringify(body));
+    }
+    for (const body of [{ policy: 'stop' }, { view, policy: 'later' }, { view: 'short', policy: 'stop' }, { view, policy: 'stop', extra: 1 }]) {
+        assert.equal((await call('close-intents', body, never)).status, 400, JSON.stringify(body));
+    }
+    const denied = await call('close-intents', { view, policy: 'stop' }, never, { csrf: false });
+    assert.equal(denied.status, 403);
+    assert.equal(denied.consumed, false);
+
+    const policies = [];
+    const policy = await call('close-policy', { policy: 'stop' }, {
+        async setClosePolicy(value) { policies.push(value); return { closePolicy: 'stop', pendingStopUntil: 1_030_000 }; },
+    });
+    assert.deepEqual(policy, { status: 200, body: { ok: true, closePolicy: 'stop', pendingStopUntil: 1_030_000 }, consumed: true });
+    assert.deepEqual([policies[0].id, policies[0].policy], [id, 'stop']);
+
+    const intents = [];
+    const armed = await call('close-intents', { view, policy: 'stop' }, {
+        async closeIntent(value) { intents.push(value); return { pending: true, until: 1_030_000 }; },
+    });
+    assert.deepEqual([armed.status, armed.body], [202, { ok: true, pending: true, until: 1_030_000 }]);
+    assert.deepEqual([intents[0].id, intents[0].view, intents[0].policy], [id, view, 'stop']);
+    const superseded = await call('close-intents', { view, policy: 'stop' }, {
+        async closeIntent() { return { pending: false, reason: 'superseded' }; },
+    });
+    assert.deepEqual([superseded.status, superseded.body], [200, { ok: true, pending: false, reason: 'superseded' }]);
+    const ignored = await call('close-intents', { view, policy: 'keep' }, { async closeIntent() { return { pending: false }; } });
+    assert.deepEqual([ignored.status, ignored.body], [200, { ok: true, pending: false }]);
+    for (const [code, status, error] of [
+        ['WEBTTY_VIEW_STALE', 409, 'terminal_view_stale'],
+        ['WEBTTY_OWNER_REQUIRED', 403, 'owner_required'],
+        ['WEBTTY_SESSION_NOT_FOUND', 404, 'not_found'],
+    ]) {
+        const refused = await call('close-intents', { view, policy: 'stop' }, {
+            async closeIntent() { throw Object.assign(new Error('private'), { code }); },
+        });
+        assert.deepEqual([refused.status, refused.body], [status, { ok: false, error }], code);
+    }
+    const limited = new MockResponse();
+    const routePlan = plan();
+    const attach = request({ routePlan, url: '/webtty/attachments', body: { attach: 'b'.repeat(32), cols: 80, rows: 24 } });
+    await handleWebtty(attach.req, limited, new URL('/webtty/attachments', 'https://app.example.test'), {
+        manager: manager({ async attach() { throw Object.assign(new Error('private'), { code: 'WEBTTY_VIEW_LIMIT' }); } }),
+        routePlan,
+    });
+    assert.equal(limited.statusCode, 429);
+    assert.equal(JSON.parse(limited.body).error, 'webtty_view_limit');
+});
+
+test('the live list is answered while WebTTY is disabled; other routes stay unavailable', async () => {
+    const disabled = manager({
+        availability: () => ({ ok: false, category: 'cleanup_unproven' }),
+        async listLiveSessions() { return { sessions: [], available: false }; },
+    });
+    const routePlan = plan();
+    const { req } = request({ routePlan, url: '/webtty/live-sessions', method: 'GET' });
+    const res = new MockResponse();
+    await handleWebtty(req, res, new URL('/webtty/live-sessions', 'https://app.example.test'), { manager: disabled, routePlan });
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(JSON.parse(res.body), { ok: true, version: 1, sessions: [], available: false });
+    const denied = new MockResponse();
+    await handleWebtty({ method: 'GET', user: { id: 'user', roles: ['user'] } }, denied,
+        new URL('/webtty/live-sessions', 'https://app.example.test'), { manager: disabled, routePlan });
+    assert.equal(denied.statusCode, 403, 'administrator admission still applies');
+    const page = new MockResponse();
+    await handleWebtty({ ...req, url: '/webtty/' }, page, new URL('/webtty/', 'https://app.example.test'), { manager: disabled, routePlan });
+    assert.equal(page.statusCode, 503);
+});
+
+test('attach-token mint accepts exactly {} or {supersedes: <view id>} and forwards only a well-formed claim', async () => {
+    const id = 'a'.repeat(32);
+    const url = `/webtty/live-sessions/${id}/attach-tokens`;
+    async function call(body) {
+        const minted = [];
+        const routePlan = plan();
+        const input = request({ routePlan, url, body });
+        const res = new MockResponse();
+        await handleWebtty(input.req, res, new URL(url, 'https://app.example.test'), {
+            manager: manager({ async createAttachToken(value) { minted.push(value); return { attach: 't'.repeat(32), expiresAt: 1 }; } }),
+            routePlan,
+        });
+        return { status: res.statusCode, body: JSON.parse(res.body), minted };
+    }
+    const plain = await call({});
+    assert.equal(plain.status, 201);
+    assert.equal(Object.hasOwn(plain.minted[0], 'supersedes'), false);
+    const claimed = await call({ supersedes: 'v'.repeat(32) });
+    assert.equal(claimed.status, 201);
+    assert.equal(claimed.minted[0].supersedes, 'v'.repeat(32));
+    assert.equal(claimed.minted[0].id, id);
+    for (const body of [
+        { supersedes: 'short' }, { supersedes: 'v'.repeat(33) }, { supersedes: 'bad id'.padEnd(32, 'x') },
+        { supersedes: null }, { supersedes: 42 }, { supersedes: 'v'.repeat(32), extra: true }, { view: 'v'.repeat(32) },
+    ]) {
+        const refused = await call(body);
+        assert.deepEqual([refused.status, refused.body], [400, { ok: false, error: 'invalid_attachment_request' }], JSON.stringify(body));
+        assert.equal(refused.minted.length, 0, JSON.stringify(body));
+    }
+    // The attachment body itself never carries a claim.
+    const attachRoutePlan = plan();
+    const attach = request({ routePlan: attachRoutePlan, url: '/webtty/attachments',
+        body: { attach: 'b'.repeat(32), cols: 80, rows: 24, supersedes: 'v'.repeat(32) } });
+    const attachRes = new MockResponse();
+    await handleWebtty(attach.req, attachRes, new URL('/webtty/attachments', 'https://app.example.test'), {
+        manager: manager({ async attach() { throw new Error('must not be called'); } }), routePlan: attachRoutePlan,
+    });
+    assert.equal(attachRes.statusCode, 400);
 });

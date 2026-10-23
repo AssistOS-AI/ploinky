@@ -13,6 +13,7 @@ import {
     validateRouterToWorkerMessage,
     workerMessage,
 } from './worker-protocol.mjs';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -27,6 +28,12 @@ function validateInvocation(argv) {
         error.code = 'WEBTTY_WORKER_INVOCATION_INVALID';
         throw error;
     }
+}
+
+function directoryIdentity(absolutePath) {
+    const stat = fs.statSync(absolutePath, { bigint: true });
+    if (!stat.isDirectory()) throw new Error('profile home is not a directory');
+    return { dev: String(stat.dev), ino: String(stat.ino) };
 }
 
 function delay(milliseconds) {
@@ -58,7 +65,10 @@ export class TerminalWorker {
         // dynamic value is its trusted workspace root.
         workspaceRoot = processApi.env?.PLOINKY_WORKSPACE_ROOT,
         resolveDirectory = (requested) => resolveWorkspaceDirectory(requested, { workspaceRoot }),
-        assertShellEnv = (environment) => assertExactShellEnvironment(environment, { workspaceRoot }),
+        assertShellEnv = (environment, options = {}) => (
+            assertExactShellEnvironment(environment, { ...options, workspaceRoot })
+        ),
+        readDirectoryIdentity = directoryIdentity,
         loadNodePty = loadImmutableNodePty,
         capturePtyIdentityImpl = capturePtyProcessIdentity,
         cleanupSessionImpl = cleanupPtySession,
@@ -68,6 +78,7 @@ export class TerminalWorker {
         this.processApi = processApi;
         this.resolveDirectory = resolveDirectory;
         this.assertShellEnv = assertShellEnv;
+        this.readDirectoryIdentity = readDirectoryIdentity;
         this.loadNodePty = loadNodePty;
         this.capturePtyIdentityImpl = capturePtyIdentityImpl;
         this.cleanupSessionImpl = cleanupSessionImpl;
@@ -173,7 +184,27 @@ export class TerminalWorker {
         this.terminalId = message.terminalId;
         validateRouterToWorkerMessage(message, { initialized: false, expectedTerminalId: this.terminalId });
         this.initialized = true;
-        const shellEnv = this.assertShellEnv(message.shellEnv);
+        let shellEnv;
+        if (Object.hasOwn(message, 'homeRelative')) {
+            try {
+                // A profile HOME is revalidated here, immediately before the
+                // spawn, exactly like the cwd: same path inside the workspace,
+                // same directory identity, and the shell's HOME is that path.
+                const home = this.resolveDirectory(message.homeRelative);
+                const identity = this.readDirectoryIdentity(home.absolutePath);
+                if (!home.relativePath || identity.dev !== message.homeIdentity.dev
+                    || identity.ino !== message.homeIdentity.ino) {
+                    throw new Error('profile home changed');
+                }
+                shellEnv = this.assertShellEnv(message.shellEnv, { home: home.absolutePath });
+            } catch (_) {
+                this.sendError('home-validation');
+                await this.cleanup('worker-error');
+                return;
+            }
+        } else {
+            shellEnv = this.assertShellEnv(message.shellEnv);
+        }
         let cwd;
         try {
             // This is the authoritative worker-side revalidation performed

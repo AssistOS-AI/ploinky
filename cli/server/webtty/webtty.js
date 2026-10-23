@@ -6,6 +6,12 @@
     const INPUT_FLUSH_MS = 20;
     const RESIZE_FLUSH_MS = 100;
     const RECONNECT_LIMIT_MS = 10 * 60_000;
+    const STORAGE_KEY = 'ploinky.webtty.session';
+    const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{32}$/;
+    const VIEW_ID_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
+    // A recovery claim names the replaced view in the attach-token mint body.
+    const CLAIM_PATTERN = /^[A-Za-z0-9_-]{32}$/;
+    const VIEW_MESSAGE = 'ploinky-webtty:view';
     const encoder = new TextEncoder();
     let handoff = null;
     try { handoff = window.__ploinkyTakeWebttyHandoff?.() || null; } catch (_) {}
@@ -14,15 +20,22 @@
     const targetElement = document.getElementById('target');
     const accessElement = document.getElementById('access');
     const roleElement = document.getElementById('role');
+    const profileElement = document.getElementById('profile');
+    const closePolicyElement = document.getElementById('close-policy');
     const killButton = document.getElementById('kill');
     const statusElement = document.getElementById('status');
     const statusDot = document.getElementById('status-dot');
     const dimensionsElement = document.getElementById('dimensions');
     const messageElement = document.getElementById('message');
     const terminalElement = document.getElementById('terminal');
-    if (window.top !== window) document.body.classList.add('embedded');
+    const embedded = window.top !== window;
+    if (embedded) document.body.classList.add('embedded');
 
     let terminalSessionId = '';
+    // The server-issued view of this document; streams and the close signal bind to it.
+    let viewId = '';
+    let closePolicy = 'keep';
+    let intentSentForView = '';
     let role = 'watcher';
     let eventSource = null;
     let closed = false;
@@ -76,17 +89,73 @@
         return body;
     }
 
-    async function inputMutation(url, body) {
+    async function refreshingMutation(url, body, stillWanted = () => true) {
         const options = { method: 'POST', headers: mutationHeaders(), body: JSON.stringify(body) };
         try {
             return await jsonRequest(url, options);
         } catch (error) {
             if (error.status !== 403 || error.body?.error !== 'browser_csrf_invalid') throw error;
             await jsonRequest('/webtty/live-sessions');
-            if (closed || inputStopped || role !== 'owner') return;
+            if (!stillWanted()) return undefined;
             // Refresh once, then propagate any second refusal without another retry.
             return jsonRequest(url, options);
         }
+    }
+
+    function inputMutation(url, body) {
+        return refreshingMutation(url, body, () => !closed && !inputStopped && role === 'owner');
+    }
+
+    // Only a top-level page remembers its terminal: exactly {sessionId,
+    // viewId}, never tokens, rewritten after every successful create, attach
+    // or restore. Every storage failure is contained.
+    function rememberSession() {
+        if (embedded) return;
+        try {
+            window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ sessionId: terminalSessionId, viewId }));
+        } catch (_) {}
+    }
+
+    function forgetSession() {
+        if (embedded) return;
+        try { window.sessionStorage.removeItem(STORAGE_KEY); } catch (_) {}
+    }
+
+    // Returns null when nothing is stored, or the exact remembered ids. Any
+    // other (invalid or legacy) value throws, like a storage read failure.
+    function storedSession() {
+        const value = window.sessionStorage.getItem(STORAGE_KEY);
+        if (value === null) return null;
+        const parsed = JSON.parse(String(value));
+        const keys = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? Object.keys(parsed).sort() : [];
+        if (keys.length !== 2 || keys[0] !== 'sessionId' || keys[1] !== 'viewId'
+            || !SESSION_ID_PATTERN.test(String(parsed.sessionId)) || !CLAIM_PATTERN.test(String(parsed.viewId))
+            || typeof parsed.sessionId !== 'string' || typeof parsed.viewId !== 'string') {
+            throw new Error('invalid remembered terminal');
+        }
+        return { sessionId: parsed.sessionId, viewId: parsed.viewId };
+    }
+
+    function announceView() {
+        if (!embedded || !viewId || !terminalSessionId) return;
+        try {
+            window.parent.postMessage({
+                type: VIEW_MESSAGE, sessionId: terminalSessionId, viewId, role, policy: closePolicy,
+            }, window.location.origin);
+        } catch (_) {}
+    }
+
+    function showClosePolicy() {
+        if (!closePolicyElement) return;
+        closePolicyElement.value = closePolicy;
+        closePolicyElement.disabled = role !== 'owner' || closed || !terminalSessionId;
+        closePolicyElement.title = role === 'owner' ? '' : 'Only the owner can change this';
+    }
+
+    function showProfile(label) {
+        if (!profileElement) return;
+        profileElement.textContent = label ? `Profile: ${label}` : '';
+        profileElement.hidden = !label;
     }
 
     const terminal = new window.Terminal({
@@ -129,6 +198,7 @@
         role = value;
         roleElement.textContent = role === 'owner' ? 'Owner' : 'Watching (read-only)';
         terminal.options.disableStdin = role !== 'owner' || inputStopped || closed;
+        showClosePolicy();
     }
 
     function inputFailure(error) {
@@ -211,6 +281,7 @@
         eventSource?.close();
         eventSource = null;
         killButton.disabled = true;
+        showClosePolicy();
         setStatus('Disconnected');
     }
 
@@ -238,7 +309,7 @@
 
     function attachStream() {
         if (closed) return;
-        const source = new EventSource(`/webtty/sessions/${encodeURIComponent(terminalSessionId)}/stream`);
+        const source = new EventSource(`/webtty/sessions/${encodeURIComponent(terminalSessionId)}/stream?view=${encodeURIComponent(viewId)}`);
         eventSource = source;
         const current = () => !closed && eventSource === source;
         source.addEventListener('open', () => {
@@ -268,6 +339,7 @@
         source.addEventListener('exit', (event) => {
             if (!current()) return;
             shellExited = true;
+            forgetSession();
             let reason = 'Terminal exited.';
             try { reason = `Terminal closed: ${JSON.parse(event.data).reason || 'exited'}.`; } catch (_) {}
             disposeLocal();
@@ -296,6 +368,7 @@
                 method: 'DELETE', headers: mutationHeaders(), keepalive,
             });
             disposeLocal();
+            forgetSession();
             setStatus('Closed', 'error');
             showMessage('Terminal killed.');
         } catch (error) {
@@ -325,21 +398,51 @@
         }
     });
 
-    async function start() {
-        if (!handoff) {
-            setStatus('Reopen terminal', 'error');
-            showMessage('Reopen this terminal from Live Sessions');
+    closePolicyElement?.addEventListener('change', () => {
+        const requested = closePolicyElement.value;
+        if (closed || role !== 'owner' || !terminalSessionId || !['keep', 'stop'].includes(requested)) {
+            showClosePolicy();
             return;
         }
-        const { kind, value } = handoff;
-        handoff = null;
-        setStatus(kind === 'attach' ? 'Attaching terminal…' : 'Creating terminal…');
-        fit();
-        const result = await jsonRequest(kind === 'attach' ? '/webtty/attachments' : '/webtty/sessions', {
-            method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ [kind]: value, ...boundedDimensions() }),
-        });
-        // Unload never kills, even if the response arrives after pagehide.
-        if (closed) return;
+        closePolicyElement.disabled = true;
+        const id = terminalSessionId;
+        refreshingMutation(`/webtty/sessions/${encodeURIComponent(id)}/close-policy`, { policy: requested },
+            () => !closed && terminalSessionId === id)
+            .then((result) => {
+                // The toggle always shows the server's resulting policy.
+                if (terminalSessionId === id && ['keep', 'stop'].includes(result?.closePolicy)) {
+                    closePolicy = result.closePolicy;
+                    announceView();
+                }
+            })
+            .catch((error) => {
+                if (terminalSessionId === id) showMessage(`The close setting was not changed. ${error.message}`);
+            })
+            .finally(showClosePolicy);
+    });
+
+    // Mints a fresh single-use attach token for a known terminal and attaches
+    // with it, which creates a new server view. An explicit recovery names the
+    // view it replaces, so that view's earlier close signal no longer counts.
+    async function attachExisting(id, supersedes) {
+        const minted = await refreshingMutation(`/webtty/live-sessions/${encodeURIComponent(id)}/attach-tokens`,
+            CLAIM_PATTERN.test(String(supersedes || '')) ? { supersedes } : {});
+        if (!/^[A-Za-z0-9_-]{32}$/.test(String(minted?.attach || ''))) throw new Error('The terminal response was invalid.');
+        return refreshingMutation('/webtty/attachments', { attach: minted.attach, ...boundedDimensions() });
+    }
+
+    function showReopen() {
+        setStatus('Reopen terminal', 'error');
+        showMessage('Reopen this terminal from Live Sessions');
+    }
+
+    function showEnded() {
+        forgetSession();
+        setStatus('Closed', 'error');
+        showMessage('This terminal has ended.');
+    }
+
+    async function useSession(result, kind) {
         const session = result?.session;
         const target = session?.target;
         if (!session || !/^[A-Za-z0-9_-]{16,128}$/.test(String(session.id || ''))) {
@@ -350,20 +453,123 @@
             || !target || !['box', 'agent'].includes(target.kind)
             || typeof target.label !== 'string' || !target.label
             || !['rw', 'ro'].includes(target.access)
-            || typeof target.cwdDisplay !== 'string' || !target.cwdDisplay) {
+            || typeof target.cwdDisplay !== 'string' || !target.cwdDisplay
+            || !VIEW_ID_PATTERN.test(String(result?.view?.id || ''))
+            || !['keep', 'stop'].includes(session.closePolicy)) {
             if (kind === 'launch') await killSession({ keepalive: true });
             throw new Error('The terminal response was invalid.');
         }
+        viewId = result.view.id;
+        closePolicy = session.closePolicy;
         setRole(session.role);
+        showProfile(typeof session.profileLabel === 'string' ? session.profileLabel : '');
         targetElement.textContent = `${target.label}${target.detail ? ` — ${target.detail}` : ''}`;
         accessElement.textContent = target.access === 'ro' ? 'Read only folder mapping' : 'Read and write folder mapping';
         accessElement.className = `access-badge access-${target.access}`;
         directoryElement.textContent = target.cwdDisplay;
         killButton.disabled = false;
+        showClosePolicy();
+        rememberSession();
+        announceView();
         attachStream();
         terminal.focus();
     }
-    window.addEventListener('pagehide', disposeLocal);
+
+    async function reattach(id, supersedes) {
+        let result;
+        try {
+            result = await attachExisting(id, supersedes);
+        } catch (error) {
+            disposeLocal();
+            if (error.status === 404) showEnded();
+            else showReopen();
+            return;
+        }
+        // Unload never kills, even if the response arrives after pagehide.
+        if (closed) return;
+        await useSession(result, 'attach');
+    }
+
+    async function start() {
+        if (!handoff) {
+            // A top-level reload re-attaches to the remembered terminal and
+            // supersedes the view it remembers.
+            let stored = null;
+            if (!embedded) {
+                try {
+                    stored = storedSession();
+                } catch (_) {
+                    forgetSession();
+                    stored = null;
+                }
+            }
+            if (!stored) {
+                showReopen();
+                return;
+            }
+            setStatus('Attaching terminal…');
+            fit();
+            await reattach(stored.sessionId, stored.viewId);
+            return;
+        }
+        const { kind, value } = handoff;
+        const requestedPolicy = handoff.closePolicy === 'stop' ? 'stop' : 'keep';
+        handoff = null;
+        setStatus(kind === 'attach' ? 'Attaching terminal…' : 'Creating terminal…');
+        fit();
+        const body = kind === 'attach'
+            ? { attach: value, ...boundedDimensions() }
+            : { launch: value, ...boundedDimensions(), closePolicy: requestedPolicy };
+        const result = await jsonRequest(kind === 'attach' ? '/webtty/attachments' : '/webtty/sessions', {
+            method: 'POST', headers: mutationHeaders(), body: JSON.stringify(body),
+        });
+        // Unload never kills, even if the response arrives after pagehide.
+        if (closed) return;
+        await useSession(result, kind);
+    }
+
+    // A best-effort signal bound to this document's view. A lost or refused
+    // request stops nothing; embedded pages leave the signal to their parent.
+    function sendCloseIntent() {
+        if (embedded || role !== 'owner' || !terminalSessionId || !viewId
+            || shellExited || deletionStarted || intentSentForView === viewId) return;
+        intentSentForView = viewId;
+        try {
+            Promise.resolve(fetch(`/webtty/sessions/${encodeURIComponent(terminalSessionId)}/close-intents`, {
+                method: 'POST',
+                credentials: 'same-origin',
+                cache: 'no-store',
+                keepalive: true,
+                headers: mutationHeaders(),
+                body: JSON.stringify({ view: viewId, policy: closePolicy }),
+            })).catch(() => {});
+        } catch (_) {}
+    }
+
+    window.addEventListener('pagehide', () => {
+        sendCloseIntent();
+        disposeLocal();
+    });
+
+    // A page restored from the back/forward cache attaches again with a fresh
+    // token, which creates a new view and supersedes its earlier signal.
+    window.addEventListener('pageshow', (event) => {
+        if (event?.persisted !== true || !terminalSessionId || shellExited || deletionStarted) return;
+        closed = false;
+        inputStopped = false;
+        reconnectSince = null;
+        reconnectDelay = 1000;
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        messageElement.hidden = true;
+        setStatus('Attaching terminal…');
+        // The restored page supersedes its own previous view.
+        reattach(terminalSessionId, viewId).catch((error) => {
+            disposeLocal();
+            setStatus('Unavailable', 'error');
+            showMessage(error.message);
+        });
+    });
     start().catch((error) => {
         disposeLocal();
         setStatus('Unavailable', 'error');

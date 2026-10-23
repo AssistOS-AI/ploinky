@@ -193,7 +193,7 @@ function conventionAuthDefinition({ snapshot, routeKey, route, selector, decisio
     });
 }
 
-function agentPortPlan({
+export function agentPortPlan({
     req,
     host,
     listener,
