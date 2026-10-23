@@ -11,7 +11,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createTransitionStore } from '../../ploinky-box/hardwareLimitsTransition.mjs';
 import { requireTransport, runBoundedProcess } from './liveProcess.mjs';
 import {
-    HOST_RECORD_DIRECTORIES, ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, commandTails, hostRecordPaths,
+    HOST_RECORD_DIRECTORIES, ID, INSPECT, OWNER_MARKER, assertOwnedDirectory, assertWorkspace, boxPsArgv, candidateEnv, checkedJson, commandTails, hostRecordPaths, hostStateDirectory,
     c5CleanupProofName, canonicalDigest, jsonDigest, liveSourceDigest, observeEngineFacts, quarantinePath,
 } from './liveCommon.mjs';
 import { c5ChainIds, c5IntentOf, driverSettled, productEngineDigest, readDriverReceipt, reconcileC5Custody, sameImage } from './liveBoxTransitionCustody.mjs';
@@ -25,7 +25,7 @@ import { driverArgv, driverParams } from './liveStoreTransition.mjs';
 export function createJournal({ run, persist, processProvider = runBoundedProcess, signal, artifacts = () => {} }) {
     return async function journaled(kind, binary, args, { cwd, env, deadlineMs = 30000, stress = false, resourceIds = [], stdinPath = null, box = null, capture = null } = {}) {
         if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
-        const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds, argvDigest: jsonDigest([binary, ...args]), resultArtifact: null, ...(box ? { box } : {}) };
+        const op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds, argvDigest: jsonDigest([binary, ...(processProvider.effectiveArgv?.(binary, args) ?? args)]), resultArtifact: null, ...(box ? { box } : {}) };
         run.operations.push(op); persist();
         const result = await processProvider(binary, args, { cwd, env, deadlineMs, maxBytes: 65536, signal, ...(stdinPath ? { stdinPath } : {}) });
         op.state = 'observed';
@@ -69,7 +69,7 @@ export function recordedHostRecords(run) {
 // was proved to have no host records before provisioning.
 export function recordHostRecords(run, profile, instance) {
     let changed = false;
-    for (const target of hostRecordPaths(profile.host.home, instance)) {
+    for (const target of hostRecordPaths(profile.workspace.path, instance)) {
         const stat = lstatOrNull(target);
         if (!stat || run.ownedPaths.some(entry => entry.path === target)) continue;
         if (stat.isSymbolicLink() || !(stat.isFile() || stat.isDirectory())) throw new Error(`Unexpected host record kind: ${target}`);
@@ -80,7 +80,7 @@ export function recordHostRecords(run, profile, instance) {
     // absent, and that exists now, was created by this run's candidate
     // commands: it is recorded so that cleanup can remove it once empty.
     for (const directory of HOST_RECORD_DIRECTORIES) {
-        const target = path.join(profile.host.home, '.ploinky-box', directory);
+        const target = path.join(hostStateDirectory(profile.workspace.path), directory);
         const absentBefore = run.operations.some(op => op.kind === 'host-directory-preflight' && op.directory === directory && op.existed === false);
         if (!absentBefore || run.ownedPaths.some(entry => entry.path === target)) continue;
         const stat = lstatOrNull(target);
@@ -193,7 +193,7 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
         throw new Error('Unrelated container inventory changed at final verification; preserve evidence and do not undo it');
     }
     const leftovers = [workspacePath, workspacePath && quarantinePath(workspacePath, run.runId), parent?.path || parentIntent?.path,
-        ...(instance ? hostRecordPaths(profile.host.home, instance) : [])].filter(Boolean).filter(target => lstatOrNull(target));
+        ...(instance && workspacePath ? hostRecordPaths(workspacePath, instance) : [])].filter(Boolean).filter(target => lstatOrNull(target));
     if (leftovers.length) throw new Error(`Owned paths remain after cleanup: ${leftovers.map(value => path.basename(value)).join(', ')}`);
     complete(verify);
     if (profile.cases?.includes('LIVE-C5') && typeof artifacts === 'function' && proofAction) {
@@ -248,7 +248,7 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
 
     function pendingTransitions() {
         const identity = assertWorkspace(profile);
-        return createTransitionStore({ identity, homeDirectory: profile.host.home }).listPending().length > 0;
+        return createTransitionStore({ identity }).listPending().length > 0;
     }
 
     // The exact-ID destruction: the driver runs the real CLI's destroy with its selected ID required to equal the ID cleanup just proved.
@@ -312,10 +312,11 @@ export async function runOwnedCleanup({ run, profile, persist = () => {}, proces
     // unrecorded one refuses the whole step, and a recorded one must still be
     // the recorded object. No glob or substring match is ever used.
     function removeHostRecords() {
-        if (!instance) return;
+        // A workspace that was never created holds no host record.
+        if (!instance || !workspacePath) return;
         const recorded = new Map(recordedHostRecords(run).map(entry => [entry.path, entry]));
         const present = [];
-        for (const target of hostRecordPaths(profile.host.home, instance)) {
+        for (const target of hostRecordPaths(workspacePath, instance)) {
             const stat = lstatOrNull(target);
             if (!stat) continue;
             const entry = recorded.get(target);

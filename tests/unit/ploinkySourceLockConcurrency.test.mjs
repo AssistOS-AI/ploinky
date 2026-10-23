@@ -29,9 +29,9 @@ const LOGGING_MANAGER = String.raw`
 function loggingManager(real, who) {
     const log = event => fs.appendFileSync(process.env.LOCK_EVENTS, JSON.stringify({ who, t: Date.now(), ...event }) + '\n');
     return {
-        async acquire(identity) {
-            const lock = await real.acquire(identity);
-            log({ event: 'acquired', identity });
+        async acquireAt(lockPath, identity) {
+            const lock = await real.acquireAt(lockPath, identity);
+            log({ event: 'acquired', identity, lockPath });
             return {
                 ...lock,
                 assertHeld: value => lock.assertHeld(value),
@@ -101,7 +101,7 @@ test('host and direct-core Ploinky source writers never overlap on the same chec
                 lockManager: loggingManager(real, 'host'),
                 boxMarkerPath: ${JSON.stringify(notABox)},
             });
-            process.stdout.write('RESULT:' + JSON.stringify({ updated: result.updated, outcome: result.record.outcome, locksRoot: real.locksRoot }) + '\n');
+            process.stdout.write('RESULT:' + JSON.stringify({ updated: result.updated, outcome: result.record.outcome }) + '\n');
         `;
         const coreScript = String.raw`
             import fs from 'node:fs';
@@ -115,7 +115,7 @@ test('host and direct-core Ploinky source writers never overlap on the same chec
                 boxMarkerPath: ${JSON.stringify(notABox)},
                 logger: { warn() {} },
             });
-            process.stdout.write('RESULT:' + JSON.stringify({ updated: result.updated, outcome: result.record.outcome, locksRoot: real.locksRoot }) + '\n');
+            process.stdout.write('RESULT:' + JSON.stringify({ updated: result.updated, outcome: result.record.outcome }) + '\n');
         `;
 
         const [host, core] = await Promise.all([runChild(hostScript, env), runChild(coreScript, env)]);
@@ -125,15 +125,17 @@ test('host and direct-core Ploinky source writers never overlap on the same chec
         const hostResult = parse(host);
         const coreResult = parse(core);
 
-        assert.equal(hostResult.locksRoot, coreResult.locksRoot, 'both writers use the same physical lock manager');
-        assert.equal(hostResult.locksRoot, path.join(home, '.ploinky-box', 'locks'));
         assert.deepEqual([hostResult.outcome, coreResult.outcome].sort(), ['changed', 'unchanged'],
             'exactly one writer advanced the checkout; the other verified it current');
         assert.equal(git(checkout, 'rev-parse', 'HEAD'), upstream);
-        assert.deepEqual(fs.readdirSync(hostResult.locksRoot), [], 'the source lock was released');
 
         const events = fs.readFileSync(env.LOCK_EVENTS, 'utf8').trim().split('\n').map(line => JSON.parse(line));
         assert.equal(new Set(events.map(event => event.identity)).size, 1, 'both writers use the same lock name');
+        const lockPaths = new Set(events.filter(event => event.event === 'acquired').map(event => event.lockPath));
+        const sourceLock = path.join(fs.realpathSync(checkout), '.git', 'ploinky-source.lock');
+        assert.deepEqual([...lockPaths], [sourceLock], 'both writers use the lock in the checkout git directory');
+        assert.equal(fs.existsSync(sourceLock), false, 'the source lock was released');
+        assert.equal(fs.existsSync(path.join(home, '.ploinky-box')), false, 'nothing is written under the home directory');
         const interval = who => {
             const acquired = events.find(event => event.who === who && event.event === 'acquired');
             const releasing = events.find(event => event.who === who && event.event === 'releasing');
@@ -160,39 +162,92 @@ test('source lock acquisition retries only transient ownerless observations, wit
     const unrelated = Object.assign(new Error('Mutation lock identity does not match'), { code: 'PLOINKY_BOX_LOCK_FAILED' });
     const lock = { assertHeld() {}, release() {} };
 
+    const source = { canonicalRoot: '/checkout', lockIdentity: 'ploinky-box-source-0123456789ab' };
+    const resolveLockPath = root => `${root}/.git/ploinky-source.lock`;
     const sequence = [wrapped, raw, lock];
     let calls = 0;
     const acquired = await acquireSourceLock({
-        async acquire() {
+        async acquireAt(lockPath, label) {
+            assert.equal(lockPath, '/checkout/.git/ploinky-source.lock');
+            assert.equal(label, source.lockIdentity);
             const next = sequence[calls++];
             if (next instanceof Error) throw next;
             return next;
         },
-    }, 'ploinky-box-source-0123456789ab', { transientRetryMs: 1 });
+    }, source, { transientRetryMs: 1, resolveLockPath });
     assert.equal(acquired, lock);
     assert.equal(calls, 3, 'both transient shapes were retried');
 
     let unrelatedCalls = 0;
     await assert.rejects(() => acquireSourceLock({
-        async acquire() {
+        async acquireAt() {
             unrelatedCalls += 1;
             throw unrelated;
         },
-    }, 'ploinky-box-source-0123456789ab', { transientRetryMs: 1 }), error => error === unrelated);
+    }, source, { transientRetryMs: 1, resolveLockPath }), error => error === unrelated);
     assert.equal(unrelatedCalls, 1, 'an unrelated lock failure propagates immediately');
 
     let now = 0;
     let boundedCalls = 0;
     await assert.rejects(() => acquireSourceLock({
-        async acquire() {
+        async acquireAt() {
             boundedCalls += 1;
             throw wrapped;
         },
-    }, 'ploinky-box-source-0123456789ab', {
+    }, source, {
         transientRetryMs: 1,
         transientTimeoutMs: 100,
         now: () => now,
         delay: async ms => { now += 40; },
+        resolveLockPath,
     }), error => error === wrapped);
     assert.equal(boundedCalls, 4, 'a persistently ownerless lock fails once the bound is reached');
+});
+
+test('the source lock lives in the per-worktree git directory of a linked worktree', async () => {
+    const { ploinkySourceLockPath, resolveCheckoutGitDirectory } = await import('../../cli/utils/git/sourceLock.js');
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-source-gitdir-')));
+    try {
+        const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(scratch, 'gitconfig') };
+        for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete env[name];
+        fs.writeFileSync(env.GIT_CONFIG_GLOBAL, '[user]\n\tname = Ploinky Test\n\temail = test@example.invalid\n');
+        const main = path.join(scratch, 'main');
+        const linked = path.join(scratch, 'linked');
+        execFileSync('git', ['init', '-q', '-b', 'main', main], { env });
+        fs.writeFileSync(path.join(main, 'file'), 'x\n');
+        execFileSync('git', ['-C', main, 'add', '.'], { env });
+        execFileSync('git', ['-C', main, 'commit', '-q', '-m', 'one'], { env });
+        execFileSync('git', ['-C', main, 'worktree', 'add', '-q', '-b', 'side', linked], { env });
+
+        assert.equal(ploinkySourceLockPath(main), path.join(main, '.git', 'ploinky-source.lock'));
+        const perWorktree = String(execFileSync('git', ['-C', linked, 'rev-parse', '--absolute-git-dir'], { env, encoding: 'utf8' })).trim();
+        assert.equal(resolveCheckoutGitDirectory(linked), fs.realpathSync(perWorktree));
+        assert.equal(ploinkySourceLockPath(linked), path.join(fs.realpathSync(perWorktree), 'ploinky-source.lock'));
+        assert.notEqual(ploinkySourceLockPath(linked), ploinkySourceLockPath(main), 'each worktree has its own source lock');
+
+        const plain = path.join(scratch, 'plain');
+        fs.mkdirSync(plain);
+        assert.throws(() => resolveCheckoutGitDirectory(plain), { code: 'PLOINKY_SOURCE_LOCK_PATH_INVALID' });
+        fs.writeFileSync(path.join(plain, '.git'), 'not a gitdir line\n');
+        assert.throws(() => resolveCheckoutGitDirectory(plain), { code: 'PLOINKY_SOURCE_LOCK_PATH_INVALID' });
+    } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+    }
+});
+
+test('a relative gitdir line resolves against the checkout, not the current directory', async () => {
+    const { ploinkySourceLockPath } = await import('../../cli/utils/git/sourceLock.js');
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-source-relative-')));
+    try {
+        // Submodule layout: <super>/.git/modules/ploinky holds the git directory.
+        const checkout = path.join(scratch, 'super', 'ploinky');
+        const gitDirectory = path.join(scratch, 'super', '.git', 'modules', 'ploinky');
+        fs.mkdirSync(checkout, { recursive: true });
+        fs.mkdirSync(gitDirectory, { recursive: true });
+        fs.writeFileSync(path.join(checkout, '.git'), 'gitdir: ../.git/modules/ploinky\n');
+        assert.notEqual(process.cwd(), checkout);
+        assert.equal(ploinkySourceLockPath(checkout), path.join(gitDirectory, 'ploinky-source.lock'));
+    } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+    }
 });

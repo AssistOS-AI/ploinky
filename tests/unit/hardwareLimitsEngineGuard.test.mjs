@@ -429,7 +429,8 @@ test('EG.unlisted-wrappers-launchers-and-embedded-shells-are-analysed', async (t
 // them, so a change of either shape reaches this test.
 test('EG.the-seatbelt-and-bwrap-shapes-the-guard-analyses-are-the-production-shapes', () => {
     const seatbelt = fs.readFileSync(path.join(REPO, 'cli', 'sandbox', 'seatbelt', 'seatbeltServiceManager.js'), 'utf8');
-    assert.match(seatbelt, /spawnSync\('sandbox-exec', \['-f', profilePath, 'sh', '-lc', `cd '\$\{wd\}' && \$\{rewrittenCmd\}`\]/);
+    // The interactive attach now spawns asynchronously (the guard covers spawn and spawnSync alike); the argv shape is unchanged.
+    assert.match(seatbelt, /runHostInteractiveSession\('sandbox-exec', \['-f', profilePath, 'sh', '-lc', `cd '\$\{wd\}' && \$\{rewrittenCmd\}`\]/);
     const bwrap = fs.readFileSync(path.join(REPO, 'cli', 'sandbox', 'bwrap', 'bwrapServiceManager.js'), 'utf8');
     assert.match(bwrap, /bwrapArgs\.push\('--', 'sh', '-lc', shellCommand\)/);
 });

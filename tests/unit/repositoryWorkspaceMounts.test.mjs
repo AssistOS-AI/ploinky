@@ -19,6 +19,8 @@ function fixture(t) {
     const code = path.join(repositories, 'demo', 'agent');
     fs.mkdirSync(code, { recursive: true });
     fs.mkdirSync(path.join(controller, 'data'));
+    // Host launches create the host state skeleton before the guards are planned.
+    fs.mkdirSync(path.join(workspace, '.ploinky-box'));
     return { workspace, controller, repositories, code };
 }
 
@@ -171,5 +173,78 @@ test('interactive shells use the same scoped repository overlay without relaxing
         assert.ok(command.includes(`-v "${repositories}:${repositories}${rw}"`));
         assert.ok(command.includes(`-v "${controller}:${controller}${ro}"`));
         assert.ok(command.includes(`-v "${code}:/code${ro}"`));
+    }
+});
+
+test('podman, docker and bwrap launches mask .ploinky-box read-only, keep the workspace writable and create the skeleton first', t => {
+    const { workspace } = fixture(t);
+    const hostState = path.join(workspace, '.ploinky-box');
+    fs.rmSync(hostState, { recursive: true });
+    for (const runtime of ['podman', 'docker']) {
+        const rw = runtime === 'podman' ? ':z' : '';
+        const ro = runtime === 'podman' ? ':z,ro' : ':ro';
+        const args = ['-v', `${workspace}:/workspace${rw}`];
+        appendContainerGuards(args, runtime, { workspaceRoot: workspace, canonicalRuntimeWorkspaceGuards: false });
+        assert.equal(args[1], `${workspace}:/workspace${rw}`, `${runtime}: the workspace bind stays read-write`);
+        const mask = args.find(value => value.endsWith(`:/workspace/.ploinky-box${ro}`));
+        assert.ok(mask, `${runtime}: ${args.join(' ')}`);
+        assert.notEqual(mask.split(':')[0], hostState, `${runtime}: the mask source is the empty guard`);
+        assert.deepEqual(fs.readdirSync(mask.split(':')[0]), []);
+        assert.equal(args.some(value => value.startsWith(`${workspace}:/workspace`) && value.endsWith('ro')), false);
+    }
+    // The first launch created the skeleton; it is never removed afterwards.
+    assert.deepEqual(fs.readdirSync(hostState).sort(), ['empty', 'locks', 'quarantine']);
+    // bwrap creates it on its own too.
+    fs.rmSync(hostState, { recursive: true });
+    const args = ['--bind', workspace, '/workspace'];
+    appendBwrapGuards(args, { workspaceRoot: workspace });
+    assert.deepEqual(fs.readdirSync(hostState).sort(), ['empty', 'locks', 'quarantine']);
+    assert.deepEqual(args.slice(0, 3), ['--bind', workspace, '/workspace'], 'bwrap keeps the workspace bind read-write');
+    const index = args.indexOf('/workspace/.ploinky-box');
+    assert.equal(args[index - 2], '--ro-bind');
+    assert.notEqual(args[index - 1], hostState);
+});
+
+test('a launch whose .ploinky-box is a link or a file fails before any argument is added', t => {
+    const { workspace } = fixture(t);
+    const hostState = path.join(workspace, '.ploinky-box');
+    const elsewhere = path.join(workspace, 'elsewhere');
+    fs.mkdirSync(elsewhere);
+    fs.rmSync(hostState, { recursive: true });
+    for (const plant of [() => fs.symlinkSync('elsewhere', hostState), () => fs.writeFileSync(hostState, 'x')]) {
+        plant();
+        const containerArgs = ['-v', `${workspace}:/workspace:z`];
+        assert.throws(() => appendContainerGuards(containerArgs, 'podman', {
+            workspaceRoot: workspace, canonicalRuntimeWorkspaceGuards: false,
+        }), error => error?.code === 'PLOINKY_BOX_HOST_STATE_INVALID');
+        assert.deepEqual(containerArgs, ['-v', `${workspace}:/workspace:z`]);
+        const bwrapArgs = ['--bind', workspace, '/workspace'];
+        assert.throws(() => appendBwrapGuards(bwrapArgs, { workspaceRoot: workspace }),
+            error => error?.code === 'PLOINKY_BOX_HOST_STATE_INVALID');
+        assert.deepEqual(bwrapArgs, ['--bind', workspace, '/workspace']);
+        fs.rmSync(hostState, { force: true });
+    }
+    assert.deepEqual(fs.readdirSync(elsewhere), []);
+});
+
+test('an interactive shell on a fresh workspace creates the host state skeleton before it plans the mask', t => {
+    const { workspace, code } = fixture(t);
+    const hostState = path.join(workspace, '.ploinky-box');
+    for (const runtime of ['podman', 'docker']) {
+        fs.rmSync(hostState, { recursive: true, force: true });
+        const ro = runtime === 'podman' ? ':z,ro' : ':ro';
+        const command = buildInteractiveAgentCreateCommand({
+            runtime, containerName: 'host-state-mask-test', envHash: 'test', projectDir: workspace,
+            homeDir: path.join(workspace, '.data', 'demo'), sharedDir: path.join(workspace, '.data', 'shared'),
+            absAgentPath: code, agentLibPath: path.join(workspace, 'Agent'), containerImage: 'node:24',
+            volumeSuffix: runtime === 'podman' ? ':z' : '', readOnlySuffix: ro, workspaceRoot: workspace,
+            agentLibGrant: {
+                sourceDir: path.join(workspace, 'achillesAgentLib'), runtimePath: '/opt/ploinky-agentlib',
+                mode: 'local', fingerprint: 'a1'.repeat(32), commit: '', sourceIdHash: 'b2'.repeat(32), namespaced: true,
+            },
+        });
+        assert.deepEqual(fs.readdirSync(hostState).sort(), ['empty', 'locks', 'quarantine'], runtime);
+        assert.match(command, new RegExp(`-v "[^"]+:${hostState.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${ro}"`), runtime);
+        assert.ok(command.includes(`-v "${workspace}:${workspace}${runtime === 'podman' ? ':z' : ''}"`), `${runtime}: the workspace stays writable`);
     }
 });

@@ -17,7 +17,7 @@ import { assertBoxWorkspaceRoot } from '../../ploinky-box/contract/workspace-roo
 import { EXIT } from './fixtures.mjs';
 import {
     AGENT_INSPECT, BOX_CONTRACT_INSPECT, ID, IMAGE_REF, INSPECT, OWNER_MARKER, absolute, blocked, candidateEnv, checkedJson, digest,
-    HOST_RECORD_DIRECTORIES, assertNoForeignWorkspace, foreignGuardInput, hostRecordPaths, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem,
+    HOST_RECORD_DIRECTORIES, assertNoForeignWorkspace, foreignGuardInput, hostRecordPaths, hostStateDirectory, jsonDigest, keys, liveSourceDigest, observeEngineIdentity, workspaceSocketProblem, withHostProcessAllowance,
 } from './liveCommon.mjs';
 import { runBoundedProcess } from './liveProcess.mjs';
 import { createJournal, recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
@@ -229,6 +229,7 @@ export async function provisionRun({
         if (run.state !== 'proposed' || run.operations.length || run.ownedBoxes.length || run.ownedPaths.length || run.toleratedProcesses?.length
             || run.cleanup.state !== 'not-started') throw new Error('Provisioning needs a fresh proposed manifest');
         profile = validateProfile(run, { partial: true });
+        processProvider = withHostProcessAllowance(processProvider, profile);
         if (profile.workspace || profile.box || profile.agents.length || !profile.provision) throw new Error('Provisioning needs an unprovisioned execution profile');
         validateProvisionPlan(profile.provision, run);
         // The foreign-workspace guard (plan C7): before any host, port or engine touch.
@@ -280,12 +281,12 @@ export async function provisionRun({
             write: artifacts, persist, provision: true, timings: apuHostTimings });
         // No host record may already exist for this fresh instance.
         const instance = run.workspace.instance;
-        const existing = hostRecordPaths(profile.host.home, instance).filter(target => { try { fs.lstatSync(target); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } });
+        const existing = hostRecordPaths(plan.workspace.path, instance).filter(target => { try { fs.lstatSync(target); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } });
         if (existing.length) throw blocked('Host state already exists for the proposed workspace instance; it is not task-owned');
         // Which shared host-record directories exist before this run: one
         // that is absent now and present after the start was created by it.
         for (const directory of HOST_RECORD_DIRECTORIES) {
-            const target = path.join(profile.host.home, '.ploinky-box', directory);
+            const target = path.join(hostStateDirectory(plan.workspace.path), directory);
             let existed = true;
             try { fs.lstatSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; existed = false; }
             observed(intent('host-directory-preflight', { directory }), { existed });
@@ -337,7 +338,7 @@ export async function provisionRun({
                 || value.mounts?.some(mount => mount.Source === workspace.path || String(mount.Source).startsWith(`${workspace.path}/`))) throw blocked('An existing container already claims the new workspace');
             containers.push({ id: value.id, created: value.created, image: value.image });
         }
-        run.preInventory = { ...run.preInventory, containers, ...(profile.model?.profile === 'apple-cpu' ? { gpuGrants: modelGrantInventory(profile.host.home) } : {}) }; persist();
+        run.preInventory = { ...run.preInventory, containers, ...(profile.model?.profile === 'apple-cpu' ? { gpuGrants: modelGrantInventory(workspace.path) } : {}) }; persist();
         if (profile.model?.profile === 'apple-cpu') artifacts('model-grants-before', { runId: run.runId, entries: run.preInventory.gpuGrants });
 
         // 4. The fixture agents, only inside the new workspace.

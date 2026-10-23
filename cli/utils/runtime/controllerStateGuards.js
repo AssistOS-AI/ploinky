@@ -3,6 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { HOST_STATE_DIRECTORY_NAME } from '../../../ploinky-box/constants.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import {
     AGENT_DATA_POLICY_CODE,
@@ -24,11 +25,44 @@ function guardError(message, context = {}) {
 // root (`.ploinky`, including the dependency store) is pinned read-only by
 // `controllerGuardMounts`, which does not make it confidential. Existing writable
 // workspace grants retain a separate writable projection of `.ploinky/repos`.
+//
+// The Box host state (`<workspace>/.ploinky-box`, plan D3) is masked the same
+// way, with one difference: it is never absent. Host launches create its
+// skeleton before they plan mounts, and inside a Box the Box's own read-only
+// mask is always there, so an absent or symlinked directory is a guard error,
+// never a reason to pin the workspace read-only or to skip the mask.
+export const HOST_STATE_GUARD_KEY = 'host';
+
 export function protectedControllerStateRoots(workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
     const root = path.resolve(workspaceRoot);
     return Object.freeze([
         Object.freeze({ key: 'data', hostPath: path.join(root, '.ploinky', 'data') }),
+        Object.freeze({ key: HOST_STATE_GUARD_KEY, hostPath: path.join(root, HOST_STATE_DIRECTORY_NAME) }),
     ]);
+}
+
+// The canonical location of `.ploinky-box`: its canonical parent plus its own
+// name, so that a symlink at the name itself is never followed. It must be a
+// real directory: a missing one means the launch skipped the skeleton, and a
+// link or file there would move the mask somewhere else.
+function canonicalHostStateRoot(hostPath) {
+    const canonical = path.join(projectedCanonicalPath(path.dirname(hostPath)), path.basename(hostPath));
+    let stat;
+    try {
+        stat = fs.lstatSync(canonical);
+    } catch (error) {
+        if (error?.code === 'ENOENT') {
+            throw guardError(`the Box host state directory '${hostPath}' is missing; a host launch must create `
+                + 'its skeleton before it plans the runtime guards', { hostPath });
+        }
+        throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw guardError(`the Box host state directory '${hostPath}' must be a real directory, not a link or a file`, {
+            hostPath,
+        });
+    }
+    return canonical;
 }
 
 function guardBase(workspaceRoot) {
@@ -67,11 +101,13 @@ export function ensureControllerGuardSources({
     return sources;
 }
 
+// The host state skeleton is never removed by code: a masked Box keeps it as a
+// mountpoint. Only the controller data root can be a runtime-created mountpoint.
 export function prepareControllerGuardMountpointCleanup({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
     const missingRoots = protectedControllerStateRoots(workspaceRoot)
-        .filter(({ hostPath }) => !fs.existsSync(hostPath));
+        .filter(({ key, hostPath }) => key !== HOST_STATE_GUARD_KEY && !fs.existsSync(hostPath));
     return () => {
         for (const { hostPath } of missingRoots) {
             let stat;
@@ -147,10 +183,14 @@ export function controllerGuardTargets(bindings, {
         const source = path.resolve(rawSource);
         const canonicalSource = projectedCanonicalPath(source);
         for (const protectedRoot of protectedControllerStateRoots(workspaceRoot)) {
-            const canonicalProtectedRoot = projectedCanonicalPath(protectedRoot.hostPath);
+            const hostState = protectedRoot.key === HOST_STATE_GUARD_KEY;
+            const canonicalProtectedRoot = hostState
+                ? path.join(projectedCanonicalPath(path.dirname(protectedRoot.hostPath)), path.basename(protectedRoot.hostPath))
+                : projectedCanonicalPath(protectedRoot.hostPath);
             // Workspace and controller aliases are allowed. Inspect indirection
-            // introduced below the canonical controller root instead.
-            for (const symlink of protectedRootSymlinks(path.join(frameworkRoot, protectedRoot.key))) {
+            // introduced below the canonical controller root instead. The host
+            // state directory takes no indirection at all (checked below).
+            for (const symlink of hostState ? [] : protectedRootSymlinks(path.join(frameworkRoot, protectedRoot.key))) {
                 const parent = projectedCanonicalPath(path.dirname(symlink));
                 if (binding.readOnly !== true && !isPathWithin(parent, frameworkRoot)
                     && isPathWithin(parent, canonicalSource)) {
@@ -158,6 +198,9 @@ export function controllerGuardTargets(bindings, {
                         symlink, source, destination,
                     });
                 }
+            }
+            if (hostState && isPathWithin(canonicalProtectedRoot, canonicalSource)) {
+                canonicalHostStateRoot(protectedRoot.hostPath);
             }
             if (isPathWithin(canonicalSource, canonicalProtectedRoot)) {
                 throw guardError(
@@ -281,15 +324,21 @@ export function controllerGuardMounts(targets, options = {}) {
     // protects its symlink entries when a protected root points into a code grant.
     for (const binding of bindings) pinAncestors(frameworkRoot, binding, { readOnly: true });
     for (const guard of targets) {
-        const exists = fs.existsSync(guard.protectedHostPath);
+        // The host state directory was proven a real directory when it was
+        // targeted; prove it again here, so it is masked and never treated as
+        // absent (which would pin the whole workspace read-only).
+        const exists = guard.key === HOST_STATE_GUARD_KEY
+            ? Boolean(canonicalHostStateRoot(guard.protectedHostPath))
+            : fs.existsSync(guard.protectedHostPath);
         if (guard.parentTarget) {
             for (const binding of bindings) {
                 if (runtimeDescendant(binding.target, path.relative(binding.source, guard.protectedParentHostPath)) !== guard.parentTarget) continue;
                 pinAncestors(guard.protectedParentHostPath, binding, { readOnly: !exists });
             }
             // Retain the standalone planner contract for callers that already
-            // supplied resolved targets rather than the original bind list.
-            if (!bindings.length) {
+            // supplied resolved targets rather than the original bind list. The
+            // host state parent is the workspace itself: never pin it.
+            if (!bindings.length && guard.key !== HOST_STATE_GUARD_KEY) {
                 const source = fs.existsSync(guard.protectedParentHostPath)
                     ? guard.protectedParentHostPath : sources.get(guard.key);
                 parents.set(guard.parentTarget, { source, target: guard.parentTarget, readOnly: true, parent: true });

@@ -26,7 +26,7 @@ import { canonicalDigest } from '../../cli/utils/dependencies/store/canonical.mj
 import { hashInstalledTree } from '../../cli/utils/dependencies/store/treeHash.mjs';
 import { buildResolutionManifest } from '../../cli/utils/dependencies/store/resolution.mjs';
 import { generationIdFor } from '../../cli/utils/dependencies/store/objectStore.mjs';
-import { assertModelHostSample, parseModelHostSample, createModelHostGuard, observeAppleMachine } from '../hardware-limits/liveModelHostGuard.mjs';
+import { assertModelHostSample, parseModelHostSample, createModelHostGuard, observeAppleMachine, modelGrantInventory } from '../hardware-limits/liveModelHostGuard.mjs';
 import { MODEL_PROCESS_FACTS, LLM_TOOL_CALL } from '../hardware-limits/liveLlmCommands.mjs';
 import { APPLE_DEVICE_INSPECT, APPLE_RENDER_FACTS } from '../hardware-limits/liveModelDevices.mjs';
 import { requiredArtifacts, llmCleanupProofProblem, modelInferenceProofProblem, modelProvisionOnlyCleanupProven, judgeArtifacts, writeUstar } from '../hardware-limits/liveStage.mjs';
@@ -179,6 +179,7 @@ function world(t, profile = 'cpu', fault = {}) {
     const pins = { schema: 1, host: { hostname: 'offline', platform: MODEL_PROFILES[profile].platform, home }, node: { path: node, digest: digest(fs.readFileSync(node)) },
         engine: { path: engine, digest: digest(fs.readFileSync(engine)), identityDigest: engineIdentityDigest(fakeEngineInfo(HOST)) }, boxImage: `docker.io/assistos/box@sha256:${'f'.repeat(64)}`, llm: { image: IMAGE }, model: modelPin(profile),
         ...(['apple', 'apple-cpu'].includes(profile) ? { workspaceParentRoot: root } : { ssh: { alias: 'ubuntu-codex', sshBinary: ssh, address: '192.168.1.63', hostKeyAlias: '192.168.1.63', user: 'offline', knownHosts, identityFile: null } }),
+        ...(fault.allowHostProcesses ? { allowHostProcesses: fault.allowHostProcesses } : {}),
         ...(profile === 'nvidia' ? { gpu: { uuid: 'GPU-12345678', name: 'offline GPU', driverVersion: '595.1', memoryMiB: 6144, smi: { path: engine, digest: digest(fs.readFileSync(engine)) } } } : {}) };
     const runId = crypto.randomBytes(16).toString('hex');
     if (fault.measurement) pins.model.measurement = { schema: 1, comparisonId: 'a'.repeat(32), cohort: 1, scenario: fault.measurement };
@@ -223,6 +224,17 @@ function world(t, profile = 'cpu', fault = {}) {
         cgroupProcs: directory => directory === prefix ? [244954, ...(fault.sharedCgroup ? [249565, ...(running ? [200] : [])] : [])]
             : !fault.sharedCgroup && directory === leaf ? [249565, ...(running ? [200] : [])]
                 : fault.controllerHeavy && [`${prefix}/engine`, `${prefix}/engine/agents`].includes(directory) ? [] : null };
+    // The product's per-workspace decision record, saved as gpuGrant.mjs does: version, identity, vendor, agents, the
+    // admitted wiring and `workspaceDenied`, one line, mode 0600, by temporary file and rename in a 0700 directory.
+    const saveGrantRecord = (workspace, admitted) => {
+        const identity = buildWorkspaceIdentity(workspace);
+        const directory = path.join(workspace, '.ploinky-box', 'gpu-grants');
+        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+        const target = path.join(directory, `${identity.instance}.json`);
+        const temporary = path.join(directory, `.${identity.instance}.json.${crypto.randomUUID()}.tmp`);
+        fs.writeFileSync(temporary, `${JSON.stringify({ version: 1, instance: identity.instance, pathHash: identity.pathHash, workspaceRoot: workspace, vendor: 'nvidia', agents: [], admitted, workspaceDenied: true })}\n`, { mode: 0o600 });
+        fs.renameSync(temporary, target);
+    };
     const provider = async (binary, args, options) => {
         calls.push({ binary, args, env: options.env, cancelled: Boolean(options.signal?.aborted) });
         assert.ok(!args.some(arg => String(arg).includes('/.ploinky/repos/')), 'No managed source operation');
@@ -253,6 +265,14 @@ function world(t, profile = 'cpu', fault = {}) {
                     ...agentLibLabels(imageProvider('f'.repeat(64))) }, mounts: [{ Type: 'bind', Source: options.cwd, Destination: options.cwd, RW: true }], devices: ['/dev/fuse', '/dev/net/tun'].map(name => ({ PathOnHost: name, PathInContainer: name })) };
             agent = { id: '2'.repeat(64), pid: 3190, name: fixtureContainerName(options.cwd, 'local-llm', 'local-llms'), created: box.created, image: CONFIG.slice(7), imageName: IMAGE, running: true, labels: {}, devices: [], mounts: [{ Source: path.join(options.cwd, 'local-llms', 'local-llm'), Destination: '/code', RW: false }] };
             stageModelFixture({ ...run.target.execution, box }, agent);
+            // After the health check the product saves the decision record again with the admitted wiring (a new
+            // file: temporary file and rename) and writes the generation directory of that wiring beside it.
+            if (profile === 'apple-cpu') {
+                const fingerprint = 'f'.repeat(64);
+                saveGrantRecord(options.cwd, { fingerprint });
+                const generation = path.join(options.cwd, '.ploinky-box', 'gpu-grants', buildWorkspaceIdentity(options.cwd).instance, fingerprint);
+                fs.mkdirSync(generation, { recursive: true, mode: 0o700 }); fs.writeFileSync(path.join(generation, 'wiring.json'), '{"state":"revoked"}\n', { mode: 0o600 });
+            }
             if (profile === 'apple' || profile.startsWith('amd-apu') && profile !== 'amd-apu-cpu') { agent.devices = []; box.devices = []; }
             return ok();
         }
@@ -260,7 +280,12 @@ function world(t, profile = 'cpu', fault = {}) {
             if (fault.destroy) return fail('injected destroy failure');
             box = null; agent = null; running = false; return ok();
         }
-        if (binary === node && args.includes('gpu')) return ok();
+        if (binary === node && args.includes('gpu')) {
+            // The product's `gpu revoke` without `--agent` saves the workspace decision record in the workspace's own
+            // state directory (supervisor.mjs, gpuGrant.mjs); the run's host record is recorded right after it.
+            if (args.includes('revoke') && !args.includes('--agent')) saveGrantRecord(options.cwd, null);
+            return ok();
+        }
         if (args[0] === 'info') return ok(JSON.stringify(fakeEngineInfo(HOST)));
         if (args.includes(LLM_TOOL_CALL)) {
             const at = args.indexOf(LLM_TOOL_CALL); const tool = args[at + 1];
@@ -379,6 +404,7 @@ function world(t, profile = 'cpu', fault = {}) {
     };
     const options = () => ({ run, processProvider: provider, hostIdentity: pins.host, hostProc, signal: fault.liveAbort?.signal, remoteArrival: MODEL_PROFILES[profile].platform !== 'darwin', artifacts: (name, data) => {
         artifactPathFor(path.join(evidence, 'run_codex.json'), name);
+        fault.onArtifact?.(name);
         if (fault.proof && name === 'llm-cleanup-proof') throw new Error('injected proof write failure');
         artifacts.set(name, clone(data));
     }, persist: () => {} });
@@ -905,17 +931,125 @@ test('MODEL.apple-cpu-canonical-withdrawal-host-guard-and-cleanup', async t => {
     assert.equal(w.calls.some(call => call.args.includes('grant')), false);
 });
 
-test('MODEL.apple-cpu-preserves-unrelated-grant-records-and-detects-changes', async t => {
+test('MODEL.apple-cpu-grant-inventory-is-the-run-workspace-s-own', async t => {
+    // The inventory is the run workspace's own `.ploinky-box/gpu-grants`, which cleanup removes with the workspace:
+    // the baseline of a new workspace is empty and so is the inventory after cleanup. The standalone-cleanup test
+    // below proves that a baseline which no longer matches is still refused.
     const w = world(t, 'apple-cpu');
-    const directory = path.join(w.pins.host.home, '.ploinky-box', 'gpu-grants'); fs.mkdirSync(directory, { recursive: true });
-    const sentinel = path.join(directory, 'unrelated.json'); fs.writeFileSync(sentinel, '{"grant":"unrelated"}');
+    const workspacePath = w.run.target.execution.provision.workspace.path;
+    assert.equal(fs.existsSync(workspacePath), false, 'the workspace is only proposed');
     assert.equal((await w.provision()).verdict, 'PASS');
-    assert.equal((await w.live()).verdict, 'PASS');
-    assert.equal(fs.readFileSync(sentinel, 'utf8'), '{"grant":"unrelated"}');
-    const changed = world(t, 'apple-cpu'); const grants = path.join(changed.pins.host.home, '.ploinky-box', 'gpu-grants');
-    fs.mkdirSync(grants, { recursive: true }); fs.writeFileSync(path.join(grants, 'other.json'), 'original');
-    assert.equal((await changed.provision()).verdict, 'PASS'); fs.writeFileSync(path.join(grants, 'other.json'), 'changed');
-    assert.notEqual((await changed.live()).verdict, 'PASS');
+    assert.deepEqual(w.run.preInventory.gpuGrants, [], 'a new workspace holds no grant');
+    assert.deepEqual(fs.readdirSync(path.join(workspacePath, '.ploinky-box', 'gpu-grants')).sort(), [w.run.workspace.instance, `${w.run.workspace.instance}.json`].sort(), 'only the run\'s own decision record and its wiring directory exist');
+    assert.ok(w.run.ownedPaths.some(entry => entry.role === 'host-record' && entry.path === path.join(workspacePath, '.ploinky-box', 'gpu-grants', `${w.run.workspace.instance}.json`)), 'the revoke record is recorded as a host record');
+    const livePass = await w.live();
+    assert.equal(livePass.verdict, 'PASS', JSON.stringify(livePass));
+    assert.deepEqual(w.artifacts.get('model-grants-before'), { runId: w.run.runId, entries: [] });
+    assert.deepEqual(w.artifacts.get('model-grants-after'), { runId: w.run.runId, entries: [] });
+    assert.equal(fs.existsSync(workspacePath), false, 'the host state went with the workspace');
+});
+
+test('MODEL.apple-cpu-live-is-not-pass-when-the-run-workspace-s-grant-inventory-changes', async t => {
+    // The baseline is the run workspace's own `.ploinky-box/gpu-grants`, taken before the run's own revoke record
+    // exists, and compared without the run's exact recorded host records. A record added there after provision, or
+    // after the case has run, is not the run's: `live` must name the change and must not pass, and the model is
+    // still stopped with its proof first. The file is not named for the run's instance, so the exact-record cleanup
+    // step is not what refuses it.
+    const change = (grants, kind) => {
+        fs.mkdirSync(grants, { recursive: true });
+        if (kind === 'directory') fs.mkdirSync(path.join(grants, 'other'));
+        else fs.writeFileSync(path.join(grants, 'other.json'), '{"grant":"added"}');
+    };
+    const stopAfterPrompt = w => {
+        const tool = call => call.args.includes(LLM_TOOL_CALL) ? call.args[call.args.indexOf(LLM_TOOL_CALL) + 1] : null;
+        const prompt = w.calls.findIndex(call => tool(call) === 'local_llm_test_prompt');
+        return prompt >= 0 && w.calls.findIndex((call, index) => index > prompt && tool(call) === 'local_llm_stop') > prompt;
+    };
+    for (const [when, kind] of [['after-provision', 'file'], ['after-provision', 'directory'], ['after-the-case', 'file']]) {
+        let grants = null; let fire = false;
+        const w = world(t, 'apple-cpu', { onArtifact: name => { if (fire && name === 'model-live-l7') { fire = false; change(grants, kind); } } });
+        assert.equal((await w.provision()).verdict, 'PASS');
+        grants = path.join(w.run.target.execution.provision.workspace.path, '.ploinky-box', 'gpu-grants');
+        assert.deepEqual(w.run.preInventory.gpuGrants, []);
+        if (when === 'after-provision') change(grants, kind); else fire = true;
+        const result = await w.live();
+        assert.notEqual(result.verdict, 'PASS', `${when} ${kind}: ${JSON.stringify(result)}`);
+        assert.match(JSON.stringify(result), /Unrelated GPU grant inventory changed/, `${when} ${kind}`);
+        assert.equal(fire, false, `${when} ${kind}: the hook ran when armed`);
+        assert.equal(stopAfterPrompt(w), true, `${when} ${kind}: the model was stopped after the prompt`);
+        assert.ok(w.artifacts.get('model-stop-proof'), `${when} ${kind}: the Stop proof exists`);
+        const evidence = w.artifacts.get('model-grants-changed');
+        assert.deepEqual(evidence.observed.map(entry => entry.path), [kind === 'directory' ? 'other' : 'other.json'], `${when} ${kind}: the differing entry is kept, the run's own record is not in it`);
+    }
+});
+
+test('MODEL.apple-cpu-live-passes-with-the-products-own-records-and-refuses-a-recorded-one-that-changed-kind', async t => {
+    // `gpu revoke` saves `<instance>.json` after the baseline, and the start saves it again (a new file) and writes
+    // `<instance>/<fingerprint>/`. All of it is the run's own recorded host records and is not a change. A recorded
+    // record that is no longer a regular file of its recorded kind is one.
+    const w = world(t, 'apple-cpu');
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const grants = path.join(w.run.target.execution.provision.workspace.path, '.ploinky-box', 'gpu-grants');
+    const name = `${w.run.workspace.instance}.json`;
+    assert.deepEqual(fs.readdirSync(grants).sort(), [w.run.workspace.instance, name].sort());
+    const recorded = w.run.ownedPaths.filter(entry => entry.role === 'host-record');
+    assert.deepEqual(recorded.map(entry => path.basename(entry.path)).sort(), [w.run.workspace.instance, name].sort());
+    const recordedInode = recorded.find(entry => entry.path.endsWith('.json')).ino;
+    assert.notEqual(String(fs.statSync(path.join(grants, name)).ino), recordedInode, 'the start saved the record again: the recorded inode is stale');
+    const passed = await w.live(); assert.equal(passed.verdict, 'PASS', JSON.stringify(passed));
+    const changed = world(t, 'apple-cpu');
+    assert.equal((await changed.provision()).verdict, 'PASS');
+    const file = path.join(changed.run.target.execution.provision.workspace.path, '.ploinky-box', 'gpu-grants', name.replace(w.run.workspace.instance, changed.run.workspace.instance));
+    fs.rmSync(file); fs.mkdirSync(file);
+    const refused = await changed.live();
+    assert.notEqual(refused.verdict, 'PASS', JSON.stringify(refused));
+    assert.match(JSON.stringify(refused), /Unrelated GPU grant inventory changed/);
+});
+
+test('MODEL.apple-cpu-a-teardown-failure-is-not-masked-by-the-grant-inventory-change', async t => {
+    const w = world(t, 'apple-cpu', { stop: true });
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const grants = path.join(w.run.target.execution.provision.workspace.path, '.ploinky-box', 'gpu-grants');
+    fs.writeFileSync(path.join(grants, 'other.json'), '{"grant":"added"}');
+    const result = await w.live();
+    assert.notEqual(result.verdict, 'PASS');
+    const failures = JSON.stringify(result.cleanup.failures);
+    assert.match(failures, /GPU pre-cleanup: Live command failed/, 'the teardown error is the one thrown');
+    assert.doesNotMatch(failures, /GPU pre-cleanup: Unrelated/, 'and it is not replaced by the inventory error');
+    assert.match(failures, /Unrelated GPU grant inventory changed/, 'the inventory error is recorded as well');
+});
+
+test('MODEL.apple-cpu-never-touches-another-workspace-s-grant-records', async t => {
+    // Another workspace's `.ploinky-box` holds records of its own instance, including ones named for this run's
+    // instance. None is in the run workspace's inventory and none is removed or changed by live or cleanup.
+    const w = world(t, 'apple-cpu');
+    const neighbour = path.join(w.root, 'neighbour-workspace', '.ploinky-box');
+    const instance = w.run.workspace.instance;
+    const records = new Map([
+        [path.join(neighbour, 'gpu-grants', 'ploinky-box-other-0123456789ab.json'), '{"grant":"other"}'],
+        [path.join(neighbour, 'gpu-grants', 'ploinky-box-other-0123456789ab', 'wiring.json'), '{}'],
+        [path.join(neighbour, 'gpu-grants', `${instance}.json`), '{"grant":"same-name"}'],
+        [path.join(neighbour, 'hardware-limits', instance, 'policy.json'), '{"limits":"same-name"}'],
+    ]);
+    for (const [file, bytes] of records) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, bytes); }
+    const untouched = () => { for (const [file, bytes] of records) assert.equal(fs.readFileSync(file, 'utf8'), bytes, file); };
+    assert.equal((await w.provision()).verdict, 'PASS');
+    assert.deepEqual(w.run.preInventory.gpuGrants, [], 'the neighbour is not part of the run workspace inventory');
+    const livePass = await w.live(); assert.equal(livePass.verdict, 'PASS', JSON.stringify(livePass));
+    untouched();
+    const cleanup = await w.cleanup(); assert.equal(cleanup.verdict, 'PASS', JSON.stringify(cleanup));
+    assert.equal(fs.existsSync(w.run.target.execution.provision.workspace.path), false);
+    untouched();
+    assert.equal(fs.existsSync(path.join(w.pins.host.home, '.ploinky-box')), false, 'no host state is written under the home');
+});
+
+test('MODEL.allowance-reaches-the-candidate-commands-of-provision-live-and-cleanup', async t => {
+    const w = world(t, 'apple-cpu', { allowHostProcesses: [4242, 17] });
+    assert.equal((await w.provision()).verdict, 'PASS');
+    const live = await w.live(); assert.equal(live.verdict, 'PASS', JSON.stringify(live));
+    const candidate = w.calls.filter(call => call.binary === w.pins.node.path && /ploinky-box\.mjs$/.test(String(call.args[0])));
+    for (const verb of ['revoke', 'start', 'destroy']) assert.ok(candidate.some(call => call.args.includes(verb)), verb);
+    for (const call of candidate) assert.deepEqual(call.args.slice(1, 5), ['--allow-host-process', '4242', '--allow-host-process', '17'], call.args.join(' '));
 });
 
 test('MODEL.completed-live-run-allows-repeated-standalone-cleanup', async t => {
@@ -939,23 +1073,24 @@ test('MODEL.completed-live-run-allows-repeated-standalone-cleanup', async t => {
     }
 });
 
-test('MODEL.apple-cpu-standalone-cleanup-retains-complete-grant-and-ownership-checks', async t => {
+test('MODEL.apple-cpu-standalone-cleanup-checks-the-complete-grant-baseline-and-ownership', async t => {
+    // The workspace owns its `.ploinky-box/gpu-grants`, so the baseline of a new workspace is empty and the
+    // cleanup that removes the workspace ends with the same empty inventory.
     const w = world(t, 'apple-cpu');
-    const grants = path.join(w.pins.host.home, '.ploinky-box', 'gpu-grants');
-    const directory = path.join(grants, 'unrelated'); fs.mkdirSync(directory, { recursive: true });
-    const sentinel = path.join(directory, 'grant.json'); const bytes = '{"grant":"unrelated"}'; fs.writeFileSync(sentinel, bytes);
     assert.equal((await w.provision()).verdict, 'PASS');
+    assert.deepEqual(w.run.preInventory.gpuGrants, []);
+    const workspacePath = w.run.target.execution.provision.workspace.path;
+    const grants = path.join(workspacePath, '.ploinky-box', 'gpu-grants');
     assert.equal((await w.live()).verdict, 'PASS');
     const cleanup = run => executeCleanupRun({ ...w.options(), run });
     const result = await w.cleanup(); assert.equal(result.verdict, 'PASS', JSON.stringify(result));
     assert.deepEqual(w.artifacts.get('model-grants-after').entries, w.run.preInventory.gpuGrants);
-    assert.equal(fs.readFileSync(sentinel, 'utf8'), bytes);
+    assert.equal(fs.existsSync(workspacePath), false, 'the workspace and its host state are gone');
     for (const mutate of [
         run => { delete run.preInventory.gpuGrants; },
         run => { run.preInventory.gpuGrants = null; },
-        run => { run.preInventory.gpuGrants.pop(); },
-        run => { run.preInventory.gpuGrants[1].sha256 = '0'.repeat(64); },
-        run => { run.preInventory.gpuGrants[1].path = '../foreign.json'; },
+        run => { run.preInventory.gpuGrants = [{ path: 'unrelated', type: 'directory' }]; },
+        run => { run.preInventory.gpuGrants = [{ path: 'unrelated.json', type: 'file', sha256: '0'.repeat(64) }]; },
     ]) {
         const bad = clone(w.run); mutate(bad);
         const failed = await cleanup(bad); assert.equal(failed.verdict, 'FAIL');
@@ -970,10 +1105,6 @@ test('MODEL.apple-cpu-standalone-cleanup-retains-complete-grant-and-ownership-ch
         assert.equal((await cleanup(bad)).verdict, 'BLOCKED');
         assert.equal(w.calls.length, before, 'invalid inventory or ownership must refuse before commands');
     }
-    fs.writeFileSync(sentinel, 'changed');
-    const changed = await cleanup(clone(w.run)); assert.equal(changed.verdict, 'FAIL');
-    assert.ok(changed.cleanup.failures.includes('Unrelated GPU grant inventory changed'));
-    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'changed');
 });
 
 test('MODEL.measurement-manifest-through-canonical-cohort-retains-receipts', async t => {

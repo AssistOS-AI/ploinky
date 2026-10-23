@@ -34,6 +34,7 @@ import {
 import { isInsideBox } from '../lib/boxMarker.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
 import { TARGETED_UPDATE_OPERATION, formatLimitsStatus } from '../hardwareLimitsGate.mjs';
+import { formatUnlockReport } from '../unlock.mjs';
 
 function formatLimitsClearResult(result) {
     if (result.absent) return 'No hardware limits are stored for this workspace; nothing was changed.\n';
@@ -46,7 +47,7 @@ function formatLimitsClearResult(result) {
 export function publicUsageText() {
     return `ploinky - run Ploinky through its managed outer Box
 
-Usage: ploinky [--debug] [--dry-run] [--port PORT] [--udp-port PORT] [--] COMMAND [ARGS]
+Usage: ploinky [--debug] [--dry-run] [--port PORT] [--udp-port PORT] [--allow-host-process PID] [--] COMMAND [ARGS]
 
 Commands:
   ploinky                         Prepare the Box and open the Ploinky REPL
@@ -85,13 +86,21 @@ Commands:
                                   list remaining manual or administrator actions
   ploinky --dry-run repair        Show the repair plan without applying fixes
   ploinky stop                    Stop core services and the outer Box
+  ploinky unlock [--force-holder PID@MACHINE]
+                                  Remove a workspace or hardware store lock left by a
+                                  command that is no longer running; a holder that
+                                  cannot be checked needs the exact --force-holder
+                                  value from the busy error. Locks with leftover
+                                  contents are listed, never removed
   ploinky update [PATH]           Verified fast-forward update of repos and skills
   ploinky update all [PATH]       (Ploinky only when its checkout is within PATH)
   ploinky update repos|repo NAME  Update registered repositories; activation is pending
   ploinky destroy                 Remove the outer Box without prompting, then this workspace's
-                                  GPU grants and hardware-limits records; retain .ploinky/box
+                                  GPU grants and hardware-limits records (in .ploinky-box);
+                                  retain .ploinky/box, .data, .ploinky/data and .env
   ploinky destroy --delete-cache  Remove the outer Box and those records, and delete
-                                  .ploinky/box/dependencies and .ploinky/box/images without prompting
+                                  .ploinky/box/dependencies and .ploinky/box/images without prompting;
+                                  with no Box present, also .ploinky/agentlib
   ploinky cli                     Open Bash in the Box
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
   ploinky logs tail [TARGET]      Follow Router or agent logs; inspect-only
@@ -109,6 +118,60 @@ Repair applies only supported fixes for the current user and never invokes sudo.
 Both reports distinguish automatic fixes, manual user actions, and actions that
 require administrator privileges. Diagnose and repair must run on the host.
 
+Box host state lives in <workspace>/.ploinky-box: router bindings, GPU grants,
+hardware limits, update records, the workspace lock, quarantine and tmp. Nothing
+goes in ~/.ploinky-box, which is ignored. Every Box and every agent runtime sees
+.ploinky-box as an empty read-only directory (a Box with hardware limits on also
+gets its limits store as a writable bind inside it). Writable mounts must stay
+inside the workspace, manifest volumes may not reach .ploinky-box, and a Ploinky
+checkout inside the workspace is bound read-only over its workspace path. Nested
+Box workspaces are refused in both directions. The first command that configures
+a workspace without .ploinky-box/workspace.json (for example start, restart,
+update, bind, gpu grant or gpu revoke) moves any pre-existing content in
+.ploinky-box (other than its own skeleton) into .ploinky-box/quarantine/ instead
+of trusting it; nothing is deleted. stop, destroy, limits clear and unlock never
+do this.
+
+Creating, recreating or adopting a Box, and creating its data paths, is refused
+while anything else can write the workspace: a host-runtime agent of it or a
+container with a read-write bind of it. Linux checks the mount table of every
+process of the invoking user, with rootless Podman's own infrastructure exempt;
+any other process that has the workspace (or a directory containing it, such as
+the home directory) mounted read-write blocks, for example a snap or Flatpak
+helper. macOS checks the workspace's launch records and ps for command lines that
+name the workspace; a host agent started by an older Ploinky whose launch records
+were erased is not detected and is unsupported. Stop what is listed, or put
+--allow-host-process PID before the command to excuse one process that does not
+write the workspace (repeatable; its start time is checked again, and on macOS
+an agent that an older Ploinky started without the mask cannot be excused).
+
+Upgrading has no backward compatibility. A Box made by an older Ploinky fails the
+compatibility check: run ploinky destroy, then ploinky start. If an older Ploinky
+already destroyed the old Box before this version ever ran, remove the directory
+<workspace>/.ploinky-box (it holds host state only) before the first start. That
+never means deleting .data/, .ploinky/data/ or .env: they hold user data and
+keys, and destroy and destroy --delete-cache keep them. State in the old
+~/.ploinky-box is ignored: re-apply ploinky bind, ploinky gpu grant or revoke and
+hardware limits after the Box is recreated.
+
+ploinky unlock removes a workspace lock, its reclaim guard and the hardware store
+lock (.ploinky-box/hardware-limits/INSTANCE/store/write.lock) that a command no
+longer running left behind, only when the holder is gone. A holder that cannot be
+checked (another machine, or a store lock whose PID is alive on this host) needs
+--force-holder PID@MACHINE, exactly as the busy error prints it; name only a
+holder that is really gone, since naming one that still runs can let two commands
+hold the lock at once. A holder classified as running is never removed, and the
+store lock is removed only with the workspace lock held and the Box stopped or
+absent. A lock with leftover contents, no or a malformed owner record, or that is
+not a private directory is listed with manual steps and never removed; the
+command then exits 1. It does not wait for the
+lock it is recovering and does not accept --allow-host-process. Unlock commands
+for one workspace run one at a time under .ploinky-box/locks/unlock.lock: a
+second one waits up to 2 seconds, then refuses and names the running one. The
+lock of an unlock that is no longer running is taken over automatically; a
+stuck .ploinky-box/locks/unlock.lock.reclaim is never removed by unlock, which
+lists it with the rm -r step to run by hand.
+
 Bind uses BIND_ADDRESS:HOST_TCP_PORT:8080. BIND_ADDRESS is 0 or 0.0.0.0 (all IPv4
 interfaces), 127.0.0.1 (restore local-only access), or an IPv4 address assigned
 to this host, never the browser machine's address. 8080 is the fixed public
@@ -119,8 +182,8 @@ saves the binding for later start, restart, update, and Box recreation. A later
 "ploinky --port PORT start" keeps the saved address and saves the new port.
 Router traffic is plain HTTP, and the bind address is not a client access rule.
 
-A GPU grant is an operator decision for this workspace only, saved outside the
-workspace in ~/.ploinky-box until ploinky destroy removes it (with the saved
+A GPU grant is an operator decision for this workspace only, saved in this
+workspace's .ploinky-box until ploinky destroy removes it (with the saved
 hardware-limits gate and stored limits; router bindings are kept). The Box gets the NVIDIA device nodes and read-only
 driver libraries (no privileged mode or added capabilities), and only the named
 agents may request the device ploinky.local/gpu=all. A grant needs a configured
@@ -139,7 +202,7 @@ If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/
 function outerDebug(parsed, route, stdout) {
     if (!parsed.debug.enabled) return;
     if (['help', 'status', 'stop', 'destroy', 'bash', 'dry-run', 'bind', 'bind-dry-run',
-        'gpu-status', 'gpu-grant', 'gpu-revoke', 'limits-status', 'limits-clear'].includes(route.kind)) {
+        'gpu-status', 'gpu-grant', 'gpu-revoke', 'limits-status', 'limits-clear', 'unlock'].includes(route.kind)) {
         stdout.write('[INFO] Debug mode enabled.\n');
     }
 }
@@ -201,7 +264,9 @@ export async function runOuterCli(argv, options = {}) {
         // core-only options that the outer argument parser does not accept.
         let command = '';
         try { command = parseOuterArguments(argv).command; } catch (_) {}
-        if (command === 'diagnose' || command === 'repair') {
+        // Host-only commands: lock recovery included, since the Box masks the
+        // host state that holds the locks.
+        if (command === 'diagnose' || command === 'repair' || command === 'unlock') {
             errorOutput.write(`ploinky ${command} must run on the physical host, outside the Box. Exit this shell and run ploinky ${command} from the host workspace.\n`);
             return 1;
         }
@@ -286,7 +351,9 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     handoffNow,
     onUpdateResult,
 } = {}) {
-    const selectedSupervisor = supervisor || createBoxSupervisor({ env, launchCwd: launchDirectory });
+    const selectedSupervisor = supervisor || createBoxSupervisor({
+        env, launchCwd: launchDirectory, allowHostProcesses: parsed.allowHostProcesses,
+    });
     const engineEnv = buildEngineProcessEnvironment(env);
     outerDebug(parsed, route, output);
 
@@ -394,6 +461,11 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     if (route.kind === 'limits-status') {
         output.write(formatLimitsStatus(selectedSupervisor.inspectLimitsStatus()));
         return 0;
+    }
+    if (route.kind === 'unlock') {
+        const report = await selectedSupervisor.runUnlock({ forceHolder: route.forceHolder });
+        output.write(formatUnlockReport(report));
+        return report.exitCode;
     }
     if (route.kind === 'limits-clear') {
         const result = await selectedSupervisor.runLimitsClearTransaction({ agentRef: route.agentRef, all: route.all });
@@ -666,7 +738,7 @@ async function runHostUpdate({
         : null;
     let store = updateHostState || null;
     const hostState = () => {
-        store ||= createUpdateHostState();
+        store ||= createUpdateHostState({ identity });
         return store;
     };
     const summary = {

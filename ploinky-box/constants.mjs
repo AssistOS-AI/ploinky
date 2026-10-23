@@ -20,6 +20,9 @@ export const BOX_READY_LINE = 'PLOINKY_BOX_READY';
 export const BOX_MARKER_PATH = '/etc/ploinky-box';
 export const BOX_MARKER_CONTENT = 'assistos/ploinky-box\n';
 export const BOX_ROUTER_HEALTH_SOCKET = '/run/ploinky/router-health.sock';
+// Host-owned Box state lives in this direct child of the workspace root. Every
+// Box and agent runtime masks it read-only, so only host processes write it.
+export const HOST_STATE_DIRECTORY_NAME = '.ploinky-box';
 
 export const BOX_LABELS = Object.freeze({
     pathHash: 'io.assistos.ploinky-box.path-hash',
@@ -50,12 +53,14 @@ export const BOX_GPU_CDI_SPEC_PATH = '/etc/cdi/ploinky-gpu.json';
 export const BOX_GPU_CDI_KIND = 'ploinky.local/gpu';
 export const BOX_GPU_CDI_DEVICE = 'ploinky.local/gpu=all';
 export const BOX_GPU_MARKER_PATH = '/etc/ploinky-box-gpu-grant.json';
-// Host-only record and generation directory under `~/.ploinky-box`.
+// Host-only record and generation directory under `<workspace>/.ploinky-box`.
 export const GPU_GRANT_STATE_DIRECTORY = 'gpu-grants';
+// The saved public Router binding directory under `<workspace>/.ploinky-box`.
+export const ROUTER_BINDING_STATE_DIRECTORY = 'router-bindings';
 
 // Hardware-limits wiring inside a gate-on Box: a read-only identity marker
 // and the read-write private policy store bind. The host-only gate record and
-// store live under `~/.ploinky-box/hardware-limits`.
+// store live under `<workspace>/.ploinky-box/hardware-limits`.
 export const BOX_HARDWARE_MARKER_PATH = '/etc/ploinky-box-hardware-limits.json';
 export const BOX_HARDWARE_STORE_PATH = '/run/ploinky/hardware-limits';
 export const HARDWARE_LIMITS_STATE_DIRECTORY = 'hardware-limits';

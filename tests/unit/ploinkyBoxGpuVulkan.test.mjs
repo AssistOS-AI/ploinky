@@ -13,6 +13,7 @@ import { buildEngineProcessEnvironment } from '../../ploinky-box/process.mjs';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { makeTree } from './fixtures/render-query/make-trees.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 const DRIVER = '595.91.07';
 // Each fixture host names its architecture, so discovery never depends on the
@@ -117,9 +118,9 @@ function fakeHost({
 }
 
 const GOLDEN = JSON.parse(fs.readFileSync(new URL('./fixtures/gpu-base-17a800c1.json', import.meta.url), 'utf8'));
-const IDENTITY = { instance: 'ploinky-box-golden-0123456789ab', pathHash: '0123456789ab', workspaceRoot: '/workspace/golden' };
+const IDENTITY = { instance: 'ploinky-box-golden-0123456789ab', pathHash: '0123456789ab', workspaceRoot: '/workspace/golden', hostStateRoot: '/workspace/golden/.ploinky-box' };
 const BASE_REASON = 'The NVIDIA kernel module is not loaded (/proc/driver/nvidia/version: ENOENT)';
-const wire = (discovery, more = {}) => buildGpuWiring({ identity: IDENTITY, grant: GRANT, discovery, homeDirectory: '/home/golden', ...more });
+const wire = (discovery, more = {}) => buildGpuWiring({ identity: IDENTITY, grant: GRANT, discovery, ...more });
 const linux = (tree) => ({ ...tree, platform: 'linux', procVersionPath: `${tree.root}/proc/driver/nvidia/version` });
 const REPORT = fs.readFileSync(new URL('./fixtures/render-query/venus-machine-query.txt', import.meta.url), 'utf8');
 
@@ -304,10 +305,11 @@ test('render-node diagnostics reach host status and preserve singleton grant byt
     tree.addNode({ name: 'renderD130', vramBytes: '4294967296' });
     const discovery = discoverVulkanRenderNode(linux(tree));
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => IDENTITY,
         discover: () => ({ state: 'absent' }),
         discoverGpuDevices: () => discovery,
-        gpuGrantStore: { read: () => GRANT, homeDirectory: '/home/golden' },
+        gpuGrantStore: { read: () => GRANT },
         scanGpuAgents: () => [],
         hardwareGateStore: { read: () => null },
     });
@@ -508,21 +510,21 @@ test('darwin: supervisor default discovery and grant store receive the superviso
     Object.defineProperty(process, 'platform', { value: 'darwin' });
     t.after(() => Object.defineProperty(process, 'platform', descriptor));
     const fixture = mac();
-    const supervisor = createBoxSupervisor({ runner: fixture.runner, resolveIdentity: () => identity,
+    const supervisor = createBoxSupervisor({ hostStateGuard: PERMISSIVE_HOST_STATE_GUARD, runner: fixture.runner, resolveIdentity: () => identity,
         discover: () => ({ state: 'absent' }), scanGpuAgents: () => [AGENT], hardwareGateStore: { read: () => null } });
     const status = supervisor.inspectGpuGrant();
     assert.equal(status.host.vendor, 'vulkan');
     assert.equal(status.desired.vendor, 'vulkan');
     assert.equal(fixture.calls.length, 8);
-    // The default store uses the host-only home, while the discovery uses the selected engine.
+    // The default store is rooted in the workspace's host-state directory, while the discovery uses the selected engine.
     assert.equal(status.grant, null);
-    assert.ok(status.desired.files.every((file) => file.path.startsWith(`${tree.root}/home/.ploinky-box/gpu-grants/`)));
+    assert.ok(status.desired.files.every((file) => file.path.startsWith(`${tree.root}/workspace/.ploinky-box/gpu-grants/`)));
 });
 
 test('observer round-trips one render node and refuses two', (t) => {
     const wiring = wire(discoverVulkanRenderNode(linux(makeTree(t))));
     const handle = observed(wiring);
-    assert.deepEqual(observeContainerGpuWiring(handle, { identity: IDENTITY, homeDirectory: '/home/golden' }).devices, wiring.devices);
+    assert.deepEqual(observeContainerGpuWiring(handle, { identity: IDENTITY }).devices, wiring.devices);
     handle.runtime.createCommand.push('--device', '/dev/dri/renderD129');
     assert.throws(() => observeContainerGpuWiring(handle), /more than one render/);
 });
@@ -541,17 +543,17 @@ test('kept wiring: Linux render node revalidated with D9; darwin revalidated thr
             return args[1] === 'ssh' ? { ok: true, stdout: report } : fixture.runner.query(command, args, options);
         } };
         const options = platform === 'linux' ? linux(tree) : { ...fixture.options, engineRunner };
-        const wiring = buildGpuWiring({ identity, grant: GRANT, discovery: discoverVulkanRenderNode(options), homeDirectory: home });
+        const wiring = buildGpuWiring({ identity, grant: GRANT, discovery: discoverVulkanRenderNode(options) });
         const fsApi = Object.create(fs);
         fsApi.statSync = (target, ...args) => {
             assert.equal(String(target).startsWith('/dev/dri/'), false, 'render nodes must not use host stat');
             return fs.statSync(target, ...args);
         };
-        const store = createGpuGrantStore({ homeDirectory: home, fsApi, platform, engineRunner,
+        const store = createGpuGrantStore({ fsApi, platform, engineRunner,
             renderOptions: platform === 'linux' ? tree : { env: {} } });
         const lock = { assertHeld(value) { assert.equal(value, identity.instance); } };
         store.materialize(identity, wiring, lock);
-        const kept = observeContainerGpuWiring(observed(wiring), { identity, homeDirectory: home });
+        const kept = observeContainerGpuWiring(observed(wiring), { identity });
         store.materialize(identity, kept, lock);
         if (platform === 'linux') fs.writeFileSync(`${tree.root}/.stat/renderD128`, '21b0 e2 80\n');
         else report = REPORT.replace('21b6', '21b0');

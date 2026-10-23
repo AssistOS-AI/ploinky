@@ -171,7 +171,8 @@ test('static HOME layout retains opaque controller state under the project proje
         }
         const args = ['-v', `${workspaceRoot}:/root:z`, '-v', `${homeDir}:/home/agent:z`];
         const targets = appendControllerStateGuards(args, 'podman', { workspaceRoot });
-        assert.deepEqual(targets.map(target => target.target), ['/root/.ploinky/data']);
+        // The controller data root and the Box host state directory (plan D3).
+        assert.deepEqual(targets.map(target => target.target).sort(), ['/root/.ploinky-box', '/root/.ploinky/data']);
         for (const target of targets) {
             const mount = args.find(value => value.includes(`:${target.target}:`));
             assert.ok(mount);
@@ -193,7 +194,7 @@ test('container runtimes append final read-only opacity guards for broad workspa
     for (const runtime of ['docker', 'podman']) {
         const args = ['-v', `${PLOINKY_WORKSPACE_ROOT}:/workspace${runtime === 'podman' ? ':z' : ''}`];
         const targets = appendControllerStateGuards(args, runtime);
-        assert.deepEqual(targets.map(entry => entry.target), ['/workspace/.ploinky/data']);
+        assert.deepEqual(targets.map(entry => entry.target).sort(), ['/workspace/.ploinky-box', '/workspace/.ploinky/data']);
         const mounts = args.filter((_value, index) => args[index - 1] === '-v');
         for (const target of targets) {
             const match = mounts.find(value => value.includes(`:${target.target}:`));
@@ -218,9 +219,10 @@ test('container runtimes guard canonical controller state for narrow repository 
         const targets = appendControllerStateGuards(args, runtime, {
             canonicalRuntimeWorkspaceGuards: true,
         });
-        assert.deepEqual(targets.map(entry => entry.target), [
+        assert.deepEqual(targets.map(entry => entry.target).sort(), [
+            path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky-box'),
             path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'data'),
-        ]);
+        ].sort());
         const mounts = args.filter((_value, index) => args[index - 1] === '-v');
         for (const target of targets) {
             const match = mounts.find(value => value.includes(`:${target.target}:`));

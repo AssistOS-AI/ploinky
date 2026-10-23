@@ -412,12 +412,10 @@ function boxContext(t, { hostKind = 'native-linux', fake = preparedCgroupFs({ co
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-context-')));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
-    const home = path.join(root, 'home');
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
-    fs.mkdirSync(home);
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     // The host writes the marker exactly as for a gate-on Box of this host kind.
-    const wiring = resolveDesiredHardwareWiring({ identity, enabled: true, hostKind, homeDirectory: home, initializeStore });
+    const wiring = resolveDesiredHardwareWiring({ identity, enabled: true, hostKind, initializeStore });
     resetHardwareContextCacheForTests();
     t.after(() => resetHardwareContextCacheForTests());
     const context = readBoxHardwareContext({

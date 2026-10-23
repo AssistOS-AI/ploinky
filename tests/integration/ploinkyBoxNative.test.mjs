@@ -21,6 +21,13 @@ import {
     imageSourceIdentity,
 } from '../../agentlib/contract.mjs';
 import { normalizeImageId } from '../../ploinky-box/contract/image-id.mjs';
+import {
+    createGpuGrantStore,
+    declaredGpuAgents,
+    discoverGpu,
+    resolveDesiredGpuWiring,
+} from '../../ploinky-box/gpuGrant.mjs';
+import { createHardwareGateStore } from '../../ploinky-box/hardwareLimitsGate.mjs';
 import { resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     removeContainerById,
@@ -33,6 +40,8 @@ import { inspectWorkspaceDataPaths } from '../../ploinky-box/workspace-data.mjs'
 import {
     createPodmanHarness,
     execInBox,
+    expectedOuterMounts,
+    observedOuterMounts,
     requirePodmanCandidate,
 } from '../e2e/ploinkyBox/nativeHelpers.mjs';
 import { readProxyTrace } from '../e2e/ploinkyBox/candidatePodmanProxy.mjs';
@@ -134,6 +143,23 @@ function repeatedArgument(argv, option) {
     return argv.flatMap((value, index) => value === option ? [argv[index + 1]] : []);
 }
 
+// The GPU wiring the host gives a Box it creates now, selected as the
+// supervisor's `selectSavedGpuWiring` selects it with the stores and discovery
+// the native harness leaves at their defaults. It is null on a host without a
+// usable GPU or a workspace without GPU agents.
+function desiredGpuWiring(harness) {
+    const engineRunner = harness.runner;
+    return resolveDesiredGpuWiring(
+        harness.identity,
+        createGpuGrantStore({ engineRunner }).read(harness.identity),
+        declaredGpuAgents(harness.identity.workspaceRoot),
+        {
+            discover: (vendor) => discoverGpu(vendor, { engineRunner }),
+            mpsEnabled: createHardwareGateStore().read(harness.identity)?.enabled === true,
+        },
+    );
+}
+
 function assertExactOuterStorage(harness, containerId, repositoryRoot) {
     const record = boxInspection(harness, containerId);
     const workspaceRoot = harness.identity.workspaceRoot;
@@ -218,16 +244,9 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
             type: 'tmpfs', source: '', name: '', destination: BOX_TMPFS.destination, rw: true,
         });
     }
-    const observed = record.Mounts
-        .filter((mount) => String(mount.Destination || '') !== BOX_TMPFS.destination)
-        .map((mount) => ({
-            type: String(mount.Type || '').toLowerCase(),
-            source: String(mount.Source || ''),
-            destination: String(mount.Destination || ''),
-            rw: mount.RW === true,
-        }))
-        .sort((left, right) => left.destination.localeCompare(right.destination));
-    assert.deepEqual(observed, [
+    // Every Box also carries the host-state mask (and, only for a checkout
+    // inside the workspace, its shadow); any other extra or missing mount fails.
+    assert.deepEqual(observedOuterMounts(record), expectedOuterMounts(workspaceRoot, repositoryRoot, [
         {
             type: 'bind',
             source: harness.identity.dataPaths.images,
@@ -243,7 +262,12 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
         },
         { type: 'bind', source: workspaceRoot, destination: workspaceRoot, rw: true },
         ...expectedAgentLibMounts,
-    ].sort((left, right) => left.destination.localeCompare(right.destination)));
+        // On a GPU host, once installed manifests declare GPU access (D14), each
+        // wiring mount is one read-only bind (`gpuWiringCreateArgs`).
+        ...(desiredGpuWiring(harness)?.mounts || []).map((mount) => ({
+            type: 'bind', source: mount.source, destination: mount.destination, rw: false,
+        })),
+    ]));
     const inspectedTmpfs = record.HostConfig?.Tmpfs;
     assert.deepEqual(Object.keys(inspectedTmpfs || {}), [BOX_TMPFS.destination]);
     const runtimeOptions = String(inspectedTmpfs[BOX_TMPFS.destination]).split(',');
@@ -466,7 +490,9 @@ test('a stopped Box restarts on the same outer ID with a fresh tmpfs boot', {
 });
 
 test('rootless Podman exercises the complete public lifecycle on one workspace identity', {
-    timeout: 30 * 60_000,
+    // On a GPU host the start alone may wait up to the supervisor's 31-minute
+    // no-wait bound before its D14 GPU reapplication, so the limit covers it.
+    timeout: 50 * 60_000,
 }, async (t) => {
     const candidateReference = requirePodmanCandidate(t);
     if (!candidateReference) return;
@@ -698,6 +724,11 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         explicitMediaPort: startRoute.mediaHostPort,
         imageRef: candidateReference,
     });
+    // The result names the Box that exists, also when the graph declares GPU
+    // access and a GPU host replaced the Box once more after the start (D14).
+    t.diagnostic(`start: container ${started.containerId}, GPU reapplication ${started.gpuReapplied?.action || 'none'}`);
+    assert.equal(started.ownership.handles.container.id, started.containerId);
+    assert.equal(harness.supervisor.inspectBoxStatus().ownership.handles.container.id, started.containerId);
     await checkBoxHealth(startRoute.hostPort);
     assert.match(harness.output.bytes,
         new RegExp(`Router: http://127\\.0\\.0\\.1:${startRoute.hostPort}`));
@@ -1072,18 +1103,41 @@ test('a replaced live bind source recreates the outer Box before further writes'
 }, async (t) => {
     const candidateReference = requirePodmanCandidate(t);
     if (!candidateReference) return;
-    const harness = createPodmanHarness(t, candidateReference);
+    // `ploinky restart` is the one command that passes `recoverDataPaths: true`
+    // to the reconciliation (supervisor.mjs runRestartTransaction). A graphless
+    // fixture has no configured graph for the in-Box restart, so this drives the
+    // same outer reconciliation branch through the harness's reconcile seam.
+    let recoverDataPaths = false;
+    const harness = createPodmanHarness(t, candidateReference, {
+        reconcile: (options) => reconcileBoxContainer(
+            recoverDataPaths ? { ...options, recoverDataPaths: true } : options,
+        ),
+    });
     const prepared = await harness.supervisor.prepareBoxForCommand(
         isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.bindReplacement),
     );
     prepareGraphlessBootRepositories(harness, prepared.containerId);
     const originalState = inspectWorkspaceDataPaths({ identity: harness.identity });
     const displaced = path.join(harness.root, 'displaced-dependencies');
+    const dependencies = harness.identity.dataPaths.dependencies;
+    const ownedContainerIds = () => {
+        const listed = harness.runner.query('podman', [
+            'container', 'ls', '--all', '--quiet', '--no-trunc', '--filter',
+            `label=io.assistos.ploinky-box.path-hash=${harness.identity.pathHash}`,
+        ]);
+        assert.equal(listed.ok, true, listed.stderr);
+        return String(listed.stdout || '').split('\n').map((line) => line.trim()).filter(Boolean).sort();
+    };
+    assert.deepEqual(ownedContainerIds(), [prepared.containerId]);
 
     // Renaming a live bind source preserves the old container's mount inode.
     // Recreate the canonical host path to reproduce the stale-bind condition.
-    fs.renameSync(harness.identity.dataPaths.dependencies, displaced);
-    fs.mkdirSync(harness.identity.dataPaths.dependencies);
+    fs.writeFileSync(path.join(dependencies, 'original-marker'), 'original');
+    // Boot already installed dependencies here; the displaced directory must
+    // keep exactly what it held at the rename.
+    const displacedEntries = fs.readdirSync(dependencies).sort();
+    fs.renameSync(dependencies, displaced);
+    fs.mkdirSync(dependencies);
     const replacementState = inspectWorkspaceDataPaths({ identity: harness.identity });
     assert.notEqual(
         replacementState.fingerprints.dependencies,
@@ -1093,18 +1147,46 @@ test('a replaced live bind source recreates the outer Box before further writes'
     assert.equal(staleStatus.state, 'incompatible');
     assert.match(staleStatus.detail, /label set is incompatible/);
 
+    // N1: with the Box running, the replaced directory is never recreated in
+    // place; the command is refused and nothing changes.
+    await assert.rejects(
+        harness.supervisor.prepareBoxForCommand(
+            isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.bindReplacement),
+        ),
+        (error) => {
+            assert.equal(error?.code, 'PLOINKY_BOX_DATA_PATH_MISSING');
+            assert.match(error.message, /nothing was changed/);
+            assert.match(error.message, /ploinky restart/);
+            return true;
+        },
+    );
+    assert.deepEqual(ownedContainerIds(), [prepared.containerId]);
+    assert.equal(boxInspection(harness, prepared.containerId).State?.Running, true);
+    assert.deepEqual(fs.readdirSync(displaced).sort(), displacedEntries);
+    assert.equal(fs.readFileSync(path.join(displaced, 'original-marker'), 'utf8'), 'original');
+    assert.deepEqual(fs.readdirSync(dependencies), []);
+    assert.deepEqual(
+        inspectWorkspaceDataPaths({ identity: harness.identity }).fingerprints.dependencies,
+        replacementState.fingerprints.dependencies,
+    );
+
+    // The supported recovery the message names: the restart reconciliation
+    // replaces the Box with a new container bound to the current directory.
+    recoverDataPaths = true;
     const replaced = await harness.supervisor.prepareBoxForCommand(
         isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.bindReplacement),
     );
+    recoverDataPaths = false;
     assert.equal(replaced.action, 'replaced');
     assert.notEqual(replaced.containerId, prepared.containerId);
+    assert.deepEqual(ownedContainerIds(), [replaced.containerId]);
+    assert.equal(harness.runner.query('podman', ['container', 'inspect', prepared.containerId]).ok, false,
+        'the old Box with the stale mount inode must be gone');
     assertExactOuterStorage(harness, replaced.containerId, repositoryRoot);
-    const record = JSON.parse(harness.runner.query('podman', [
-        'container', 'inspect', replaced.containerId,
-    ]).stdout)[0];
+    const record = boxInspection(harness, replaced.containerId);
     assert.equal(
         record.Config.Labels['io.assistos.ploinky-box.dependencies-fingerprint'],
-        replacementState.fingerprints.dependencies,
+        inspectWorkspaceDataPaths({ identity: harness.identity }).fingerprints.dependencies,
     );
 
     execInBox(harness.runner, replaced.containerId, [
@@ -1118,6 +1200,7 @@ test('a replaced live bind source recreates the outer Box before further writes'
         'canonical-write',
     );
     assert.equal(fs.existsSync(path.join(displaced, 'live-bind-canary')), false);
+    assert.deepEqual(fs.readdirSync(displaced).sort(), displacedEntries);
 });
 
 test('failed candidate create removes the container and retains workspace cache data', {

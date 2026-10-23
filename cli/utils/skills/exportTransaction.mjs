@@ -523,6 +523,10 @@ export function withSkillExportLocks(folders, callback, options = {}) {
             options.exclusions?.assertSafeTarget?.(target);
             const handle = acquireSkillExportLock(target, options);
             handle.assertSafeTarget = () => options.exclusions?.assertSafeTarget?.(target);
+            // Where this transaction stages a private copy of the Git config:
+            // a host process acting for a Box passes its masked staging
+            // directory; every other caller falls back to os.tmpdir().
+            handle.stagingRoot = options.stagingRoot ?? null;
             handle.gitLocks = heldGit;
             held.push(handle);
             handles.push(handle);
@@ -669,7 +673,7 @@ function applyGitConfig(handle, artifact) {
         if (sameValues(current, artifact.after.values)) return true;
         if (!sameValues(current, artifact.before.values)) return false;
         // Parse and edit only a private copy, never a mutable destination link.
-        temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-export-config-'));
+        temporary = fs.mkdtempSync(path.join(handle.stagingRoot || os.tmpdir(), 'skill-export-config-'));
         const staged = path.join(temporary, 'config');
         fs.writeFileSync(staged, before || Buffer.alloc(0), { mode: 0o600 });
         const args = artifact.after.values.length
@@ -1677,7 +1681,7 @@ export function syncManagedSkillExports({ folder, owner, sources, beforeMove = n
 /** Republish only the local exclusions derived from verified owned output,
  * under the folder's locks: no skill publication and no source access. Used
  * by the host after a container run deferred them. */
-export function refreshSkillExportExclusions(folder, { exclusions, authority = null, lock = {} } = {}) {
+export function refreshSkillExportExclusions(folder, { exclusions, authority = null, lock = {}, stagingRoot = null } = {}) {
     if (!exclusions) throw new Error('refreshSkillExportExclusions requires an exclusions planner');
     let roots;
     try { roots = exportRoots(folder, { create: false }); } catch (error) { if (error.code === 'ENOENT') roots = null; else throw error; }
@@ -1685,7 +1689,7 @@ export function refreshSkillExportExclusions(folder, { exclusions, authority = n
     return withSkillExportLocks([roots.root], ([handle]) => {
         const result = publishSkillExports(handle, { owner: 'exclusions', policy: 'exclusions-only', exclusions, lock });
         return { folder: handle.root, exclusions: result.exclusions, transaction: result.transaction, recovery: handle.recovery };
-    }, { ...lock, exclusions, authority: lock.authority ?? authority, create: false });
+    }, { ...lock, exclusions, authority: lock.authority ?? authority, create: false, stagingRoot });
 }
 
 /** Read-only state for UIs: pending or quarantined transactions and the lock. */

@@ -165,7 +165,7 @@ async function main(rawOptions) {
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     assert.equal(identity.instance, admission.manifest.workspace.instance, 'The workspace identity differs from the admitted manifest');
     const locks = createMutationLockManager({ timeoutMs: 30_000 });
-    const hostState = createUpdateHostState();
+    const hostState = createUpdateHostState({ identity });
     const owned = [];
     const observations = {
         runId, workspace, instance: identity.instance, ploinky,
@@ -191,7 +191,7 @@ async function main(rawOptions) {
         realDirectory(reposRoot);
     };
     const locked = async operation => {
-        const lock = await locks.acquire(identity.instance);
+        const lock = await locks.acquire(identity.instance, { workspaceRoot: workspace });
         try { revalidate(); return await operation(); } finally { lock.release(); }
     };
     const writeFile = (target, content) => {

@@ -392,7 +392,7 @@ test('dependency store runtime wiring: every container reuse path consults the g
 
 test('dependency store runtime wiring: sandboxes, attachments and no-wait adoption use the shared decision', () => {
     const bwrap = source('cli/sandbox/bwrap/bwrapServiceManager.js');
-    const ensure = slice(bwrap, 'function ensureBwrapService(', '\nfunction attachBwrapInteractive(');
+    const ensure = slice(bwrap, 'function ensureBwrapService(', '\nasync function attachBwrapInteractive(');
     assert.match(ensure, /bwrapDependencyReuseProblem\(\{ agentName, manifest, record: existingRecord, containerName \}\)/);
     const attach = slice(bwrap, 'function attachBwrapInteractive(', '\nexport {');
     assert.match(attach, /attachAdmittedDependencies\(record,/);
@@ -401,7 +401,7 @@ test('dependency store runtime wiring: sandboxes, attachments and no-wait adopti
     assert.doesNotMatch(bwrap, /ensureAgentCacheForFamily/);
 
     const seatbelt = source('cli/sandbox/seatbelt/seatbeltServiceManager.js');
-    const seatbeltEnsure = slice(seatbelt, 'function ensureSeatbeltService(', '\nfunction attachSeatbeltInteractive(');
+    const seatbeltEnsure = slice(seatbelt, 'function ensureSeatbeltService(', '\nasync function attachSeatbeltInteractive(');
     assert.match(seatbeltEnsure, /seatbeltDependencyReuseProblem\(/);
     const seatbeltAttach = slice(seatbelt, 'function attachSeatbeltInteractive(', '\nexport {');
     assert.match(seatbeltAttach, /attachAdmittedDependencies\(record,/);

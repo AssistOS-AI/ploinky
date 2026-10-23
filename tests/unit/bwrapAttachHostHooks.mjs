@@ -4,9 +4,9 @@
 // `register(new URL('./bwrapAttachHostHooks.mjs', import.meta.url))`.
 //
 // Only for imports whose parent is bwrapServiceManager.js:
-//   - `child_process` resolves to a module whose spawnSync of the absolute
-//     /usr/bin/bwrap appends its argv to $BWRAP_ATTACH_CAPTURE and reports a
-//     clean exit instead of launching anything;
+//   - `child_process` resolves to a module whose spawn and spawnSync of the
+//     absolute /usr/bin/bwrap append its argv to $BWRAP_ATTACH_CAPTURE and
+//     report a clean exit instead of launching anything;
 //   - the edge-generation module resolves to a module identical to the real
 //     one except that assertHostModeGenerationCapability does nothing, so the
 //     interactive path can run without an active routing generation. Capability
@@ -37,9 +37,20 @@ export async function load(url, context, nextLoad) {
             shortCircuit: true,
             source: `
                 import childProcess from 'node:child_process';
+                import { EventEmitter } from 'node:events';
                 import fs from 'node:fs';
                 export * from 'node:child_process';
                 export default childProcess;
+                export function spawn(command, args, options) {
+                    if (command === '/usr/bin/bwrap') {
+                        fs.appendFileSync(process.env.BWRAP_ATTACH_CAPTURE, JSON.stringify({ command, args }) + '\\n');
+                        const child = new EventEmitter();
+                        child.pid = 0;
+                        setImmediate(() => child.emit('close', 0, null));
+                        return child;
+                    }
+                    return childProcess.spawn(command, args, options);
+                }
                 export function spawnSync(command, args, options) {
                     if (command === '/usr/bin/bwrap') {
                         fs.appendFileSync(process.env.BWRAP_ATTACH_CAPTURE, JSON.stringify({ command, args }) + '\\n');

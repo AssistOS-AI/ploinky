@@ -10,7 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 import { stopPloinkyLocalByContainerId } from '../../ploinky-box/lifecycle/container.mjs';
-import { BEHAVIOR_FAILURES, DRIVER_BOUNDS, DriverAssertion, OLD_STOP_PATH, classifyRun, oldStopArgv, runDriver, validateDriverParams } from '../hardware-limits/liveStoreTransition.mjs';
+import { BEHAVIOR_FAILURES, DRIVER_BOUNDS, DriverAssertion, OLD_STOP_PATH, classifyRun, driverParams, oldStopArgv, runDriver, validateDriverParams } from '../hardware-limits/liveStoreTransition.mjs';
 import { PRODUCT_MUTANTS, ROOT, TRANSITION, applyPatches, describeMutation } from '../hardware-limits/c5Mutation.mjs';
 import { C5_DRIVER_SCHEMA, productEngineDigest, validateDriverReceipt } from '../hardware-limits/liveBoxTransitionCustody.mjs';
 import { ENGINE_HOST, REPOSITORY, intentFor, standalone } from '../hardware-limits/c5DriverWorld.mjs';
@@ -72,15 +72,17 @@ test('X5.c5-driver-stop-matcher-is-structural-and-equals-the-products-own-argv',
 test('X5.c5-driver-parameters-are-validated-bounded-and-bound-to-the-frozen-intent', t => {
     const context = standalone({}, t);
     const good = () => JSON.parse(JSON.stringify({
-        schema: 1, mode: 'destroy', runId: context.runId, bounds: DRIVER_BOUNDS, agentRef: null, expectedToken: null, expectedContainerId: HEX64, intent: null, receiptPath: null,
+        schema: 1, mode: 'destroy', runId: context.runId, bounds: DRIVER_BOUNDS, agentRef: null, expectedToken: null, expectedContainerId: HEX64, intent: null, receiptPath: null, allowHostProcesses: [],
         profile: { host: { home: context.home }, workspace: context.workspace, box: context.profile.box, source: context.profile.source, engine: context.profile.engine, cases: ['LIVE-C5'] },
     }));
     assert.doesNotThrow(() => validateDriverParams(good()));
+    assert.doesNotThrow(() => validateDriverParams({ ...good(), allowHostProcesses: [4242, 17] }));
     const bad = mutate => { const value = good(); mutate(value); return value; };
     for (const value of [
         bad(v => { v.mode = 'sideways'; }), bad(v => { v.extra = 1; }), bad(v => { delete v.bounds; }), bad(v => { v.bounds.boundaryMs = DRIVER_BOUNDS.boundaryMs + 1; }),
         bad(v => { v.bounds.adminMs = 0; }), bad(v => { v.expectedContainerId = 'ploinky-box-ws'; }), bad(v => { v.runId = 'x'; }), bad(v => { v.profile.host.home = 'relative'; }),
-        bad(v => { v.mode = 'transition'; }),
+        bad(v => { v.mode = 'transition'; }), bad(v => { delete v.allowHostProcesses; }), bad(v => { v.allowHostProcesses = '4242'; }), bad(v => { v.allowHostProcesses = [0]; }),
+        bad(v => { v.allowHostProcesses = [12, 12]; }), bad(v => { v.allowHostProcesses = ['12']; }),
     ]) assert.throws(() => validateDriverParams(value), error => error instanceof DriverAssertion && error.kind === 'setup');
     // A transition's intent must be the frozen one of THIS run, box and engine.
     const intent = intentFor(context);
@@ -195,6 +197,20 @@ test('X5.c5-driver-refuses-a-lifecycle-mutation-in-the-writer-first-order-itself
         assert.deepEqual(calls, [], `the engine never saw ${words.slice(0, 2).join(' ')}`);
     }
     context.world.restoreHome();
+});
+
+test('X5.c5-driver-hands-the-manifest-allowance-to-its-supervisor-and-nothing-when-none-is-pinned', t => {
+    // The driver runs the product's own CLI over its own supervisor, outside the runner's process provider: the pinned
+    // allowance reaches that supervisor as its `allowHostProcesses` (the product re-verifies each start time).
+    const context = standalone({}, t);
+    const run = { runId: context.runId };
+    assert.deepEqual(driverParams({ mode: 'destroy', profile: context.profile, run, expectedContainerId: HEX64 }).allowHostProcesses, [], 'no pin: no allowance');
+    assert.deepEqual(driverParams({ mode: 'destroy', profile: { ...context.profile, allowHostProcesses: [4242, 17] }, run, expectedContainerId: HEX64 }).allowHostProcesses, [4242, 17]);
+    const pinned = runWorld(t, 'destroy', { options: { allowHostProcesses: [4242, 17] } });
+    assert.equal(pinned.result.exitCode, 0, JSON.stringify(pinned.result.summary));
+    assert.deepEqual(pinned.result.supervisorCalls, [{ allowHostProcesses: [4242, 17] }]);
+    const none = runWorld(t, 'destroy');
+    assert.deepEqual(none.result.supervisorCalls, [{ allowHostProcesses: [] }]);
 });
 
 test('X5.c5-driver-destroy-guards-the-exact-id-and-delegates-the-products-own-destroy-unchanged', t => {

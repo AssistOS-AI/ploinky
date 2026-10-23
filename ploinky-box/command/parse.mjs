@@ -1,5 +1,6 @@
 import { BOX_ROUTER_CONTAINER_PORT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { FORCE_HOLDER_PATTERN } from '../lockFiles.mjs';
 import { defaultGpuVendor, normalizeGpuVendor } from '../gpuGrant.mjs';
 import { parseHostPort } from '../ports.mjs';
 import { parseRouterBindingMapping } from '../routerBinding.mjs';
@@ -114,6 +115,30 @@ function analyzeLimits(tokens, commandToken) {
     return Object.freeze({ action: 'clear', agentRef, all });
 }
 
+const UNLOCK_USAGE = 'use: ploinky unlock [--force-holder PID@MACHINE]';
+
+// Lock recovery is host-owned and never forwarded into the Box.
+function analyzeUnlock(tokens, commandToken) {
+    const tail = tokens.filter((token) => token.rawIndex > commandToken.rawIndex).map((token) => token.text);
+    let forceHolder = null;
+    // `ploinky unlock --help` shows the help, like `ploinky --help unlock`.
+    if (tail.some((text) => text === '--help' || text === '-h')) return Object.freeze({ forceHolder: null, help: true });
+    for (let index = 0; index < tail.length; index += 1) {
+        const text = tail[index];
+        if (text !== '--force-holder') {
+            throw argumentError(`unlock: unexpected argument '${text}'; ${UNLOCK_USAGE}`);
+        }
+        if (forceHolder !== null) throw argumentError(`--force-holder was supplied more than once; ${UNLOCK_USAGE}`);
+        const value = tail[index + 1];
+        if (!value || !FORCE_HOLDER_PATTERN.test(value)) {
+            throw argumentError(`--force-holder requires PID@MACHINE exactly as the busy lock error prints it; ${UNLOCK_USAGE}`);
+        }
+        forceHolder = value;
+        index += 1;
+    }
+    return Object.freeze({ forceHolder, help: false });
+}
+
 const GPU_USAGE = 'use: ploinky gpu status | ploinky gpu grant [--agent REPO/AGENT...] [--vendor VENDOR] '
     + '| ploinky gpu revoke [--agent REPO/AGENT...]';
 
@@ -183,6 +208,7 @@ export function parseOuterArguments(argv) {
     const removedRawIndexes = new Set();
     let explicitPort = null;
     let explicitMediaPort = null;
+    const allowHostProcesses = [];
     let dryRun = false;
     let help = false;
     let commandToken = null;
@@ -221,6 +247,22 @@ export function parseOuterArguments(argv) {
         }
         if (token.text.startsWith('--udp-port=')) {
             throw argumentError('--udp-port=PORT is unsupported; use --udp-port PORT before start');
+        }
+        // Excuses one exact host process from the quiescence gate (plan D3);
+        // the gate re-verifies its start time in the same transaction.
+        if (token.text === '--allow-host-process') {
+            const value = consumeValue(tokens, index, '--allow-host-process');
+            if (!/^[1-9][0-9]{0,9}$/.test(value.text) || !Number.isSafeInteger(Number(value.text))) {
+                throw argumentError('--allow-host-process requires a process ID');
+            }
+            allowHostProcesses.push(Number(value.text));
+            removedRawIndexes.add(token.rawIndex);
+            removedRawIndexes.add(value.rawIndex);
+            index += 1;
+            continue;
+        }
+        if (token.text.startsWith('--allow-host-process=')) {
+            throw argumentError('--allow-host-process=PID is unsupported; use --allow-host-process PID before the command');
         }
         if (token.text === '--dry-run') {
             if (dryRun) throw argumentError('--dry-run was supplied more than once');
@@ -278,6 +320,7 @@ export function parseOuterArguments(argv) {
     const bind = command === 'bind' && !help ? analyzeBind(tokens, commandToken) : null;
     const gpu = command === 'gpu' && !help ? analyzeGpu(tokens, commandToken) : null;
     const limits = command === 'limits' && !help ? analyzeLimits(tokens, commandToken) : null;
+    const unlock = command === 'unlock' && !help ? analyzeUnlock(tokens, commandToken) : null;
     return Object.freeze({
         rawArgv: Object.freeze(raw),
         classificationArgv: Object.freeze(classificationArgv),
@@ -294,9 +337,11 @@ export function parseOuterArguments(argv) {
         terminated,
         explicitPort,
         explicitMediaPort,
+        allowHostProcesses: Object.freeze([...new Set(allowHostProcesses)]),
         start,
         bind,
         gpu,
         limits,
+        unlock,
     });
 }

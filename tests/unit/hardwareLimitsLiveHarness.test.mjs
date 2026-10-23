@@ -220,7 +220,7 @@ test('HLIVE.leaf-inode-change-cannot-prove-enforcement', async t => {
     assert.equal(report.verdict, 'FAIL'); assert.match(report.cases.find(row => row.id === 'LIVE-C2').reason, /identity changed/);
 });
 test('HLIVE.host-state-left-behind-prevents-workspace-deletion', async t => {
-    const f = fixture(t); const directory = path.join(f.profile.host.home, '.ploinky-box', 'hardware-limits');
+    const f = fixture(t); const directory = path.join(f.workspace, '.ploinky-box', 'hardware-limits');
     fs.mkdirSync(directory, { recursive: true }); const record = path.join(directory, f.profile.box.instance + '.json');
     fs.writeFileSync(record, '{}'); t.after(() => fs.rmSync(record, { force: true }));
     const report = await executeLiveRun({ run: f.run, hostIdentity: f.profile.host, action: 'cleanup', processProvider: f.provider });

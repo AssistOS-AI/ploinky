@@ -34,7 +34,7 @@ function fixture(t) {
     fs.mkdirSync(workspace);
     fs.mkdirSync(path.join(workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
-    const paths = hardwareStorePaths({ identity, homeDirectory: path.join(root, 'home') });
+    const paths = hardwareStorePaths({ identity });
     initializeStore({ paths, identity });
     const getContext = () => { const snapshot = readStoreSnapshot({ paths, identity }); return { gate: 'on', prepared: true, backendReady: true, controllers: ['cpu', 'memory', 'pids'], storeState: 'valid', storeToken: snapshot.token, overrides: snapshot.agents, envelope: { cpus: 8, memoryBytes: 8 * 1024 ** 3 }, paths, identity }; };
     const record = (alias = '') => ({ type: 'agent', repoName: 'demo', agentName: 'worker', alias, instanceId: `instance-${alias}`, enableGeneration: `generation-${alias}`, containerId: 'a'.repeat(64) });

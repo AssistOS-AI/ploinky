@@ -15,6 +15,7 @@ import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
 import { createUpdateBoxScenario, SCENARIO_CONTAINER_ID, scenarioCoreCalls } from '../helpers/updateBoxScenario.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 // Mutation-gap regressions for the Box update transaction:
 // - the supervisor wired to the production bounded update runner probes for
@@ -171,12 +172,10 @@ test('a failed start admission restores the prior saved Router binding bytes exa
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const selection = agentLibFixture(identity.workspaceRoot);
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
-    const bindingStore = createRouterBindingStore({ homeDirectory: home });
+    const bindingStore = createRouterBindingStore();
     const heldLock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
     bindingStore.write(identity, { address: '127.0.0.1', hostPort: 8083 }, heldLock);
-    const stateDir = path.join(home, '.ploinky-box');
+    const stateDir = identity.hostStateRoot;
     const bindingFiles = () => {
         const files = {};
         const visit = (dir) => {
@@ -199,6 +198,7 @@ test('a failed start admission restores the prior saved Router binding bytes exa
         handles: { container: { id: SCENARIO_CONTAINER_ID, runtime: { running: true } } },
     };
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         platform: 'linux',
@@ -304,15 +304,13 @@ test('two overlapping update transactions on one real mutation lock never interl
     const root = scratch(t, 'ploinky-update-overlap-');
     fs.mkdirSync(path.join(root, 'first'), { recursive: true });
     fs.mkdirSync(path.join(root, 'second'), { recursive: true });
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
     const timeline = [];
     const gate = deferred();
     const first = gatedScenario(root, 'first', {
-        lockManager: createMutationLockManager({ homeDirectory: home, retryMs: 10, timeoutMs: 10_000 }), timeline, gate,
+        lockManager: createMutationLockManager({ retryMs: 10, timeoutMs: 10_000 }), timeline, gate,
     });
     const second = gatedScenario(root, 'second', {
-        lockManager: createMutationLockManager({ homeDirectory: home, retryMs: 10, timeoutMs: 10_000 }), timeline,
+        lockManager: createMutationLockManager({ retryMs: 10, timeoutMs: 10_000 }), timeline,
     });
     assert.equal(first.identity.instance, second.identity.instance, 'both transactions target one workspace');
 
@@ -332,23 +330,21 @@ test('an overlapping update that cannot get the real mutation lock in time is re
     const root = scratch(t, 'ploinky-update-overlap-refused-');
     fs.mkdirSync(path.join(root, 'first'), { recursive: true });
     fs.mkdirSync(path.join(root, 'second'), { recursive: true });
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
     const timeline = [];
     const gate = deferred();
     const first = gatedScenario(root, 'first', {
-        lockManager: createMutationLockManager({ homeDirectory: home, retryMs: 10, timeoutMs: 10_000 }), timeline, gate,
+        lockManager: createMutationLockManager({ retryMs: 10, timeoutMs: 10_000 }), timeline, gate,
     });
     const second = gatedScenario(root, 'second', {
-        lockManager: createMutationLockManager({ homeDirectory: home, retryMs: 10, timeoutMs: 250 }), timeline,
+        lockManager: createMutationLockManager({ retryMs: 10, timeoutMs: 250 }), timeline,
     });
     const running = first.supervisor.runUpdateTransaction(['update']);
     try {
         await waitFor(() => timeline.includes('first:start'));
         await assert.rejects(second.supervisor.runUpdateTransaction(['update']), (error) => {
             assert.equal(error.code, 'PLOINKY_BOX_LOCK_FAILED');
-            assert.match(error.message, /Timed out waiting for mutation lock/);
-            assert.match(error.message, new RegExp(`Another Ploinky command \\(pid ${process.pid} on `), 'the holder is named');
+            assert.match(error.message, /Timed out waiting for the workspace lock/);
+            assert.match(error.message, new RegExp(`held by pid ${process.pid} on `), 'the holder is named');
             assert.equal(error.workspaceTransactionStarted, false, 'the refusal says the transaction never started');
             assert.equal(error.lockBusy, true, 'the refusal names a busy lock');
             return true;

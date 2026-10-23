@@ -7,6 +7,7 @@ import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { agentLibFixture } from './agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore } from './fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from './hostStateFixture.mjs';
 
 export const SCENARIO_CONTAINER_ID = 'a'.repeat(64);
 
@@ -63,6 +64,7 @@ export function createUpdateBoxScenario({
         ? fakeUpdateCore({ onCall({ argv }) { events.push(['core', [...argv]]); }, ...core })
         : runUpdateCore;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: lockManager || {
@@ -77,7 +79,7 @@ export function createUpdateBoxScenario({
         stdout: quiet(),
         stderr: quiet(),
         updateHostState: store,
-        routerBindingStore: createRouterBindingStore({ homeDirectory: path.join(root, 'home') }),
+        routerBindingStore: createRouterBindingStore(),
         runner: runner || {
             run() {},
             query: () => ({ ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: graph.configured }) }),

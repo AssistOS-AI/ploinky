@@ -21,6 +21,7 @@ import {
 } from '../../ploinky-box/constants.mjs';
 import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
+import { PloinkyBoxError } from '../../ploinky-box/errors.mjs';
 import {
     buildGpuWiring,
     createGpuGrantStore,
@@ -62,6 +63,8 @@ import {
 import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 import { discoverVulkanRenderNode } from '../../ploinky-box/gpuVulkan.mjs';
 import { makeTree } from './fixtures/render-query/make-trees.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
+import { hostStateFixtureMounts } from '../helpers/hostStateFixture.mjs';
 
 test('contract: container device set accepts the render-node wiring', (t) => {
     const state = boxFixture(t);
@@ -235,19 +238,21 @@ function useFakeHostFiles(t, host) {
 }
 
 function workspaceFixture(t, name = 'workspace') {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-gpu-grant-'));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
-    const workspace = path.join(root, name);
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-gpu-grant-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    // The checkout (`root`) is a sibling of the workspace (D6).
+    const root = path.join(base, 'checkout');
+    fs.mkdirSync(root);
+    const workspace = path.join(base, name);
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
-    return { root, home, identity, lock, store: createGpuGrantStore({ homeDirectory: home }) };
+    const store = createGpuGrantStore();
+    return { root, identity, lock, store, directory: store.directoryFor(identity) };
 }
 
-function activeWiring(identity, { grant = GRANT, host = fakeHost(), homeDirectory = os.homedir() } = {}) {
-    return buildGpuWiring({ identity, grant, discovery: host.discover(), homeDirectory });
+function activeWiring(identity, { grant = GRANT, host = fakeHost() } = {}) {
+    return buildGpuWiring({ identity, grant, discovery: host.discover() });
 }
 
 // ---------------------------------------------------------------------------
@@ -271,15 +276,15 @@ test('discovery on a fixture sysroot yields a deterministic device, bind and Box
         [`libnvidia-gpucomp.so.${DRIVER}`, `${LIB}/libnvidia-gpucomp.so.${DRIVER}`],
     ]);
 
-    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery, homeDirectory: state.home });
-    const again = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery, homeDirectory: state.home });
+    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery });
+    const again = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery });
     assert.equal(wiring.fingerprint, again.fingerprint);
     assert.match(wiring.fingerprint, /^[a-f0-9]{64}$/);
     assert.equal(wiring.state, 'active');
     // /dev/nvidia-uvm-tools is deliberately not part of the minimal set.
     assert.deepEqual(wiring.devices, ['/dev/nvidia0', '/dev/nvidiactl', '/dev/nvidia-uvm']);
-    const generation = gpuGenerationDirectory(state.identity, wiring.fingerprint, state.home);
-    assert.equal(generation, path.join(state.home, '.ploinky-box', 'gpu-grants', state.identity.instance, wiring.fingerprint));
+    const generation = gpuGenerationDirectory(state.identity, wiring.fingerprint);
+    assert.equal(generation, path.join(state.identity.hostStateRoot, 'gpu-grants', state.identity.instance, wiring.fingerprint));
     assert.deepEqual(wiring.mounts, [
         { source: path.join(generation, 'box.json'), destination: BOX_GPU_CDI_SPEC_PATH },
         { source: path.join(generation, 'marker.json'), destination: BOX_GPU_MARKER_PATH },
@@ -312,14 +317,12 @@ test('discovery on a fixture sysroot yields a deterministic device, bind and Box
         identity: state.identity,
         grant: { vendor: 'nvidia', agents: [AGENT, 'lab/other'] },
         discovery,
-        homeDirectory: state.home,
     });
     assert.notEqual(otherAgents.fingerprint, wiring.fingerprint);
     const updated = buildGpuWiring({
         identity: state.identity,
         grant: GRANT,
         discovery: fakeHost({ kernel: '600.10', library: '600.10' }).discover(),
-        homeDirectory: state.home,
     });
     assert.notEqual(updated.fingerprint, wiring.fingerprint);
 });
@@ -329,7 +332,7 @@ test('Box create arguments add only the grant devices, read-only binds and label
     const seccomp = nestedPodmanSeccompProfilePath(state.root);
     fs.mkdirSync(path.dirname(seccomp), { recursive: true });
     fs.copyFileSync(new URL('../../ploinky-box/seccomp/podman-nested-pid-fallback.json', import.meta.url), seccomp);
-    const wiring = activeWiring(state.identity, { homeDirectory: state.home });
+    const wiring = activeWiring(state.identity, {});
     const base = {
         identity: state.identity,
         dataFingerprints: DATA_FINGERPRINTS,
@@ -389,8 +392,8 @@ test('arm64 discovery binds the AArch64 driver libraries and wires the Box exact
         [`libnvidia-gpucomp.so.${DRIVER}`, `${armLib}/libnvidia-gpucomp.so.${DRIVER}`],
     ]);
 
-    const armWiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: arm, homeDirectory: state.home });
-    const x64Wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: x64, homeDirectory: state.home });
+    const armWiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: arm });
+    const x64Wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: x64 });
     // The host sources differ, so the fingerprint does; nothing inside the Box does.
     assert.notEqual(armWiring.fingerprint, x64Wiring.fingerprint);
     assert.equal(armWiring.state, 'active');
@@ -440,7 +443,7 @@ test('arm64 discovery binds the AArch64 driver libraries and wires the Box exact
 
     // A Box created with the arm64 wiring reads back as that same wiring.
     const observed = observeContainerGpuWiring(containerHandle(state, { gpu: armWiring }),
-        { identity: state.identity, homeDirectory: state.home });
+        { identity: state.identity });
     assert.equal(observed.state, 'active');
     assert.equal(observed.fingerprint, armWiring.fingerprint);
 });
@@ -528,7 +531,6 @@ test('discovery refuses an unsupported host architecture, which leaves only a st
     );
     const stale = resolveGpuWiring(state.identity, GRANT, {
         discover: () => discoverNvidiaGpu({ arch: 'ppc64', fsApi: host.fsApi, readLdconfig: host.readLdconfig }),
-        homeDirectory: state.home,
     });
     assert.equal(stale.state, 'stale');
     assert.match(stale.reason, /does not support the "ppc64" host architecture/);
@@ -559,7 +561,7 @@ test('NVVM 7.0 is bound when present, under its unversioned real name only', (t)
             'libnvidia-nvvm70.so.4',
             `libnvidia-gpucomp.so.${DRIVER}`,
         ]);
-        const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery, homeDirectory: state.home });
+        const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery });
         assert.deepEqual(
             wiring.mounts.filter((mount) => mount.destination.endsWith('/libnvidia-nvvm70.so.4')),
             [{ source: `${lib}/libnvidia-nvvm70.so.4`, destination: '/usr/local/nvidia/lib64/libnvidia-nvvm70.so.4' }],
@@ -586,7 +588,6 @@ test('a failed discovery wires only a stale-grant marker (D12)', (t) => {
     const state = workspaceFixture(t);
     const stale = resolveGpuWiring(state.identity, GRANT, {
         discover: () => fakeHost({ kernel: '595.91.07', library: '600.10' }).discover(),
-        homeDirectory: state.home,
     });
     assert.equal(stale.state, 'stale');
     assert.match(stale.reason, /version mismatch/);
@@ -612,9 +613,9 @@ test('the grant record is private host state for one exact workspace', (t) => {
     assert.equal(state.store.read(state.identity), null);
     state.store.write(state.identity, GRANT, state.lock, { admitted: null });
     const target = state.store.pathFor(state.identity);
-    assert.equal(path.dirname(target), path.join(state.home, '.ploinky-box', 'gpu-grants'));
+    assert.equal(path.dirname(target), path.join(state.identity.hostStateRoot, 'gpu-grants'));
     assert.equal(fs.statSync(target).mode & 0o777, 0o600);
-    assert.equal(fs.statSync(state.store.directory).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(state.directory).mode & 0o777, 0o700);
     // D14 adds denies to the decision; a record without them keeps its bytes.
     assert.deepEqual(state.store.read(state.identity),
         { vendor: 'nvidia', agents: [AGENT], denied: [], workspaceDenied: false, admitted: null });
@@ -655,20 +656,31 @@ test('the grant record is private host state for one exact workspace', (t) => {
     assert.throws(() => state.store.write(state.identity, GRANT, null), /workspace mutation lock/);
 });
 
-test('the grant state refuses workspaces or caches that alias the host control-state directory', (t) => {
+test('the grant state refuses caches that alias the host control-state directory', (t) => {
     const state = workspaceFixture(t);
-    const inside = path.join(state.home, '.ploinky-box', 'gpu-grants', 'ws');
-    fs.mkdirSync(path.join(inside, '.ploinky'), { recursive: true });
-    const aliased = buildWorkspaceIdentity(inside, { markerFound: true });
-    assert.throws(
-        () => state.store.read(aliased),
-        (error) => error.code === 'PLOINKY_BOX_ROUTER_BINDING_STATE_INVALID' && /overlaps writable Box source/.test(error.message),
-    );
+    fs.mkdirSync(state.identity.boxDataRoot);
+    for (const key of ['dependencies', 'images']) {
+        for (const destination of [state.identity.hostStateRoot, state.directory]) {
+            // These targets do not exist yet; a first grant must not create
+            // host authority under an existing cache alias.
+            fs.symlinkSync(destination, state.identity.dataPaths[key]);
+            assert.throws(
+                () => state.store.read(state.identity),
+                (error) => error.code === 'PLOINKY_BOX_ROUTER_BINDING_STATE_INVALID' && /overlaps writable Box source/.test(error.message),
+            );
+            assert.throws(
+                () => state.store.write(state.identity, GRANT, state.lock),
+                (error) => error.code === 'PLOINKY_BOX_ROUTER_BINDING_STATE_INVALID' && /overlaps writable Box source/.test(error.message),
+            );
+            assert.equal(fs.existsSync(state.directory), false);
+            fs.unlinkSync(state.identity.dataPaths[key]);
+        }
+    }
 });
 
 test('the grant state refuses a workspace that is a bind-mount alias of the gpu-grants directory', (t) => {
     const state = workspaceFixture(t);
-    const grants = path.join(state.home, '.ploinky-box', 'gpu-grants');
+    const grants = path.join(state.identity.hostStateRoot, 'gpu-grants');
     fs.mkdirSync(grants, { recursive: true, mode: 0o700 });
     const grantsStat = fs.statSync(grants);
     const workspace = state.identity.workspaceRoot;
@@ -682,9 +694,24 @@ test('the grant state refuses a workspace that is a bind-mount alias of the gpu-
             return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { dev: grantsStat.dev, ino: grantsStat.ino });
         },
     };
-    assert.doesNotThrow(() => assertRouterBindingStateConfined(state.identity, { homeDirectory: state.home }));
+    assert.doesNotThrow(() => assertRouterBindingStateConfined(state.identity, {}));
     assert.throws(
-        () => assertRouterBindingStateConfined(state.identity, { homeDirectory: state.home, fsApi }),
+        () => assertRouterBindingStateConfined(state.identity, { fsApi }),
+        /overlaps writable Box source/,
+    );
+    // The same alias on a cache path, which no mask will ever cover, is refused too.
+    const cache = state.identity.dataPaths.images;
+    fs.mkdirSync(cache, { recursive: true });
+    const cacheApi = {
+        ...fs,
+        statSync(target, options) {
+            const stat = fs.statSync(target, options);
+            if (path.resolve(target) !== cache) return stat;
+            return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { dev: grantsStat.dev, ino: grantsStat.ino });
+        },
+    };
+    assert.throws(
+        () => assertRouterBindingStateConfined(state.identity, { fsApi: cacheApi }),
         /overlaps writable Box source/,
     );
 });
@@ -725,12 +752,12 @@ test('an observed wiring must bind its own generation files, and a stale one not
 test('D14 an observed marker-only Box is revoked when its own generation marker says so, and stale otherwise', (t) => {
     const state = boxFixture(t);
     const observe = (wiring) => observeContainerGpuWiring(containerHandle(state, { gpu: wiring }),
-        { identity: state.identity, homeDirectory: state.home });
+        { identity: state.identity });
     const revokedWiring = (denials) => buildGpuWiring({
-        identity: state.identity, grant: { vendor: 'nvidia' }, revoked: true, ...denials, homeDirectory: state.home,
+        identity: state.identity, grant: { vendor: 'nvidia' }, revoked: true, ...denials,
     });
     const stale = buildGpuWiring({ identity: state.identity, grant: GRANT,
-        failure: new Error('Unable to read the NVIDIA kernel module version'), homeDirectory: state.home });
+        failure: new Error('Unable to read the NVIDIA kernel module version') });
     state.store.materialize(state.identity, stale, state.lock);
     assert.equal(observe(stale).state, 'stale');
     const workspaceRevoked = revokedWiring({ workspaceDenied: true });
@@ -741,14 +768,14 @@ test('D14 an observed marker-only Box is revoked when its own generation marker 
     const observed = observe(agentRevoked);
     assert.deepEqual([observed.fingerprint, observed.state], [agentRevoked.fingerprint, 'revoked']);
     // Without its generation marker (pruned or unreadable) a marker-only Box reads as stale.
-    fs.rmSync(path.join(gpuGenerationDirectory(state.identity, agentRevoked.fingerprint, state.home), 'marker.json'));
+    fs.rmSync(path.join(gpuGenerationDirectory(state.identity, agentRevoked.fingerprint), 'marker.json'));
     assert.equal(observe(agentRevoked).state, 'stale');
 });
 
 test('generation files are content addressed, private and pruned only by name', (t) => {
     const state = workspaceFixture(t);
-    const first = activeWiring(state.identity, { homeDirectory: state.home });
-    const second = activeWiring(state.identity, { homeDirectory: state.home, host: fakeHost({ mtimeMs: 1 }) });
+    const first = activeWiring(state.identity, {});
+    const second = activeWiring(state.identity, { host: fakeHost({ mtimeMs: 1 }) });
     state.store.materialize(state.identity, first, state.lock);
     state.store.materialize(state.identity, first, state.lock);
     state.store.materialize(state.identity, second, state.lock);
@@ -761,7 +788,7 @@ test('generation files are content addressed, private and pruned only by name', 
     assert.deepEqual(state.store.prune(state.identity, [second.fingerprint], state.lock), [first.fingerprint]);
     assert.equal(fs.existsSync(path.dirname(second.files[0].path)), true);
     assert.deepEqual(state.store.prune(state.identity, [], state.lock), [second.fingerprint]);
-    assert.equal(fs.existsSync(path.join(state.store.directory, state.identity.instance)), false);
+    assert.equal(fs.existsSync(path.join(state.directory, state.identity.instance)), false);
 });
 
 test('destroy teardown preflight is read-only and refuses symlinked, foreign or unexpected GPU state', (t) => {
@@ -769,15 +796,15 @@ test('destroy teardown preflight is read-only and refuses symlinked, foreign or 
     const fresh = workspaceFixture(t, 'fresh');
     assert.equal(typeof fresh.store.planTeardown, 'function', 'the GPU store has a destroy preflight');
     assert.deepEqual(fresh.store.planTeardown(fresh.identity, fresh.lock), { recordPath: null, instanceDir: null, entries: [] });
-    assert.equal(fs.existsSync(path.join(fresh.home, '.ploinky-box')), false, 'the preflight never creates state directories');
+    assert.equal(fs.existsSync(fresh.identity.hostStateRoot), false, 'the preflight never creates state directories');
     assert.throws(() => fresh.store.planTeardown(fresh.identity, null), /requires the workspace mutation lock/);
 
     // A complete record plus generation: planned exactly, nothing deleted.
     const state = workspaceFixture(t);
     state.store.write(state.identity, GRANT, state.lock);
-    const wiring = activeWiring(state.identity, { homeDirectory: state.home });
+    const wiring = activeWiring(state.identity, {});
     state.store.materialize(state.identity, wiring, state.lock);
-    const instanceDir = path.join(state.store.directory, state.identity.instance);
+    const instanceDir = path.join(state.directory, state.identity.instance);
     const generation = path.join(instanceDir, wiring.fingerprint);
     assert.deepEqual(state.store.planTeardown(state.identity, state.lock), {
         recordPath: state.store.pathFor(state.identity), instanceDir, entries: [generation],
@@ -811,7 +838,7 @@ test('destroy teardown preflight is read-only and refuses symlinked, foreign or 
     const outside = path.join(linked.root, 'outside');
     fs.mkdirSync(path.join(outside, 'a'.repeat(64)), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(outside, 'a'.repeat(64), 'keep'), 'outside data', { mode: 0o600 });
-    fs.symlinkSync(outside, path.join(linked.store.directory, linked.identity.instance));
+    fs.symlinkSync(outside, path.join(linked.directory, linked.identity.instance));
     assert.throws(() => linked.store.planTeardown(linked.identity, linked.lock), /is not a real directory/);
     assert.equal(fs.readFileSync(path.join(outside, 'a'.repeat(64), 'keep'), 'utf8'), 'outside data');
     assert.equal(fs.existsSync(linked.store.pathFor(linked.identity)), true, 'the record is kept too');
@@ -825,8 +852,8 @@ test('two workspaces keep separate grants and generations', (t) => {
     const rightLock = { assertHeld(instance) { assert.equal(instance, right.instance); } };
     left.store.write(left.identity, GRANT, left.lock);
     assert.equal(left.store.read(right), null);
-    const leftWiring = activeWiring(left.identity, { homeDirectory: left.home });
-    const rightWiring = activeWiring(right, { homeDirectory: left.home });
+    const leftWiring = activeWiring(left.identity);
+    const rightWiring = activeWiring(right);
     assert.notEqual(leftWiring.fingerprint, rightWiring.fingerprint);
     left.store.materialize(left.identity, leftWiring, left.lock);
     left.store.materialize(right, rightWiring, rightLock);
@@ -844,9 +871,8 @@ function boxMarkerFixture(t, { grant = GRANT, stale = false } = {}) {
     const wiring = stale
         ? resolveGpuWiring(state.identity, grant, {
             discover: () => fakeHost({ library: '600.10' }).discover(),
-            homeDirectory: state.home,
         })
-        : activeWiring(state.identity, { grant, homeDirectory: state.home });
+        : activeWiring(state.identity, { grant });
     state.store.materialize(state.identity, wiring, state.lock);
     const byDestination = Object.fromEntries(wiring.mounts.map((mount) => [mount.destination, mount.source]));
     const boxMarker = path.join(state.root, 'ploinky-box');
@@ -1035,6 +1061,7 @@ function containerHandle(state, { id = OLD_ID, imageId = OLD_IMAGE, hostPort = 8
                 { type: 'bind', name: '', source: state.root, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: state.identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: state.identity.workspaceRoot, destination: state.identity.workspaceRoot, rw: true },
+                ...hostStateFixtureMounts(state.identity.workspaceRoot, state.root),
                 ...agentLibFixtureMounts(state.agentLib, state.identity.workspaceRoot),
                 ...(gpu ? gpu.mounts.map((mount) => ({ type: 'bind', name: '', source: mount.source, destination: mount.destination, rw: false })) : []),
             ].sort((left, right) => left.destination.localeCompare(right.destination)),
@@ -1161,6 +1188,7 @@ function harness(state, { initial = null, failCandidateReady = false } = {}) {
             if (wiring) materialized.push(wiring.fingerprint);
         },
         token: (kind) => (kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24)),
+        quiescence: () => [],
     };
     return { runner, seams, calls, materialized, current: () => current };
 }
@@ -1239,11 +1267,11 @@ test('a failed replacement restores the old Box with its own GPU wiring', async 
 test('MPS enabled Box wiring is observed exactly and preserves both tools during rollback', async (t) => {
     const state = boxFixture(t);
     const host = fakeHost(); useFakeHostFiles(t, host);
-    t.mock.method(os, 'homedir', () => state.home);
+    useTempHome(t, state.root);
     const toolsRoot = path.join(state.root, 'tools'); fs.mkdirSync(toolsRoot);
     for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const mps = discoverMpsTools({ directories: [toolsRoot] });
-    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: host.discover(), mps, homeDirectory: state.home });
+    const wiring = buildGpuWiring({ identity: state.identity, grant: GRANT, discovery: host.discover(), mps });
     state.store.materialize(state.identity, wiring, state.lock);
     const old = containerHandle(state, { gpu: wiring });
     assert.doesNotThrow(() => validateContainerConfiguration(old, desiredFor(state, undefined)));
@@ -1290,7 +1318,6 @@ function fakeLockManager(root, events) {
 function memoryGpuStore(events, initial = null) {
     let value = initial;
     return {
-        homeDirectory: os.homedir(),
         get value() { return value; },
         read() { return value; },
         write(identity, grant, lock, { admitted = null } = {}) {
@@ -1336,6 +1363,7 @@ function graphBox(t, { gpu = null, running = true } = {}) {
 
 function gpuSupervisor(box, events, overrides = {}) {
     return createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {},
         platform: 'linux',
         resolveIdentity: () => box.identity,
@@ -1849,7 +1877,7 @@ test('a kept wiring whose driver files were removed refuses before the old Box i
 
 test('a kept wiring whose device node disappeared refuses with restart guidance', (t) => {
     const fixture = workspaceFixture(t);
-    const wiring = activeWiring(fixture.identity, { homeDirectory: fixture.home });
+    const wiring = activeWiring(fixture.identity);
     fixture.store.materialize(fixture.identity, wiring, fixture.lock);
     const kept = { ...wiring, files: undefined };
     useFakeHostFiles(t, fakeHost());
@@ -2086,7 +2114,7 @@ test('D14 golden: agents without the field, operator grants and their wiring kee
     const gpu = await import(GPU_MODULE);
     assert.equal(typeof gpu.resolveDesiredGpuWiring, 'function');
     // Values computed with the pre-D14 code (69bfdb4c) for these fixed inputs.
-    const identity = { instance: 'ploinky-box-golden-0123456789ab', pathHash: '0123456789ab', workspaceRoot: '/golden/ws' };
+    const identity = { instance: 'ploinky-box-golden-0123456789ab', pathHash: '0123456789ab', workspaceRoot: '/golden/ws', hostStateRoot: '/golden/ws/.ploinky-box' };
     const discovery = {
         vendor: 'nvidia', driverVersion: '595.91.07',
         devices: [
@@ -2103,18 +2131,18 @@ test('D14 golden: agents without the field, operator grants and their wiring kee
     const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
     const marker = (wiring) => wiring.files.find((file) => file.path.endsWith('marker.json')).content;
     const grant = { vendor: 'nvidia', agents: [AGENT] };
-    const active = gpu.buildGpuWiring({ identity, grant, discovery, homeDirectory: '/golden/home' });
+    const active = gpu.buildGpuWiring({ identity, grant, discovery });
     assert.equal(active.fingerprint, '0fead200bc4847bb01b08c9b6abebb9a8b01008aacec983bff4fd9daa3fff60f');
     assert.equal(sha(marker(active)), '68006b1850309910a3153befe931d63f7b321477e9dff4102c12cdc0d1e3bb53');
-    const stale = gpu.buildGpuWiring({ identity, grant, failure: new Error('Unable to read the NVIDIA kernel module version'), homeDirectory: '/golden/home' });
+    const stale = gpu.buildGpuWiring({ identity, grant, failure: new Error('Unable to read the NVIDIA kernel module version') });
     assert.equal(stale.fingerprint, 'ebf1f08471ebd3facf4e93a3b40b2a3d2cde3f3b335f5f167a67568e00d7d25d');
     assert.equal(sha(marker(stale)), 'd487cbeba75577d3fa31b92536452411b0069a8cf3ea6ea9893b3d23a55857e9');
     // The same effective set reached through a manifest, or with a deny that
     // hides no declared agent, keeps the operator grant's fingerprint.
     const discover = () => discovery;
-    const viaManifest = gpu.resolveDesiredGpuWiring(identity, null, [AGENT], { discover, homeDirectory: '/golden/home' });
+    const viaManifest = gpu.resolveDesiredGpuWiring(identity, null, [AGENT], { discover });
     const withIneffectiveDeny = gpu.resolveDesiredGpuWiring(identity, { agents: [AGENT], denied: ['lab/cpu'] }, [],
-        { discover, homeDirectory: '/golden/home' });
+        { discover });
     assert.equal(viaManifest.fingerprint, active.fingerprint);
     assert.equal(withIneffectiveDeny.fingerprint, active.fingerprint);
     const digest = (manifest, agentId) => runtimeCapabilityDigest(resolveEffectiveRuntimeCapabilities(manifest, {
@@ -2205,7 +2233,7 @@ function gpuEnv(args) {
 test('D14 admission: a declaring agent gets the device when wired, and otherwise starts without it and is told why', async (t) => {
     const gpu = await import(GPU_MODULE);
     const desired = (decision, declared) => (state) => gpu.resolveDesiredGpuWiring(state.identity, decision, declared, {
-        discover: () => fakeHost().discover(), homeDirectory: state.home,
+        discover: () => fakeHost().discover(),
     });
     const args = (admission) => renderRuntimePolicyArgs(admission.descriptor, { runtime: 'podman' });
     // Attached: the active wiring names it because its manifest declares the GPU.
@@ -2260,11 +2288,11 @@ test('D14 GPU-less host: a declared agent starts without the device, and its Box
     const noGpu = () => { throw Object.assign(new Error('Unable to read the NVIDIA kernel module version from /proc/driver/nvidia/version'), { code: 'PLOINKY_BOX_GPU_DISCOVERY_FAILED' }); };
     const state = workspaceFixture(t);
     // Manifest only: no wiring at all, exactly today's Box.
-    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu, homeDirectory: state.home }), null);
+    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu }), null);
     // An operator grant keeps today's stale marker.
-    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, { agents: [AGENT] }, [AGENT], { discover: noGpu, homeDirectory: state.home }).state, 'stale');
+    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, { agents: [AGENT] }, [AGENT], { discover: noGpu }).state, 'stale');
     // gpu grant insists on a working GPU.
-    assert.throws(() => gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu, homeDirectory: state.home, strict: true }),
+    assert.throws(() => gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu, strict: true }),
         /NVIDIA kernel module version/);
     // Start on that host: the Box is created without GPU wiring, the note names
     // the declaring agents, and the agent is refused with the guidance.
@@ -2298,7 +2326,7 @@ test('D14 no declarations and no record: no GPU wiring, as before', async (t) =>
     const gpu = await import(GPU_MODULE);
     const state = workspaceFixture(t);
     assert.equal(gpu.resolveDesiredGpuWiring(state.identity, null, [], {
-        discover: () => assert.fail('no discovery without a GPU agent'), homeDirectory: state.home,
+        discover: () => assert.fail('no discovery without a GPU agent'),
     }), null);
     const box = graphBox(t);
     const events = [];
@@ -2376,6 +2404,18 @@ test('D14 revoke pre-check: a manifest-declared agent does not block a revoke, s
         (error) => error.code !== 'PLOINKY_BOX_GPU_AGENTS_ENABLED' && /reached reconcile/.test(error.message));
 });
 
+// D14 reapplication: a start, whole restart or activating update whose
+// in-Box run installed a declaring repo replaces the Box once more, and its
+// result must then name the Box that exists. Each generation has its own
+// container ID, so a result that still names the removed Box is told apart.
+const REPLACEMENT_ID = 'c'.repeat(64);
+const RESTORED_ID = '7'.repeat(64);
+const STRAY_ID = '9'.repeat(64);
+
+function boxGeneration(box, id, gpu = null) {
+    return { state: 'owned', engine: box.ownership.engine, handles: { container: containerHandle(box, { id, gpu }) } };
+}
+
 test('D14 first start: a start that installs a declaring repo replaces the Box once, and only then', async (t) => {
     const probe = boxFixture(t);
     useTempHome(t, probe.root);
@@ -2385,17 +2425,21 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
         const events = [];
         const seen = [];
         let scans = 0;
+        let current = box.ownership;
         // The start returns while its no-wait launches (image pulls) still run.
         const workers = [2, 1, 0];
         const supervisor = gpuSupervisor(box, events, {
             gpuGrantStore: memoryGpuStore(events),
+            discover: () => current,
             // Nothing is installed when the host prepares the Box; the in-Box
             // start then clones the repo.
             scanGpuAgents: () => (scans++ === 0 ? [] : declaredAfterStart),
             async reconcile(options) {
                 seen.push(options.gpu);
                 events.push('reconcile');
-                return prepared(box, seen.length === 1 ? 'reused' : 'replaced', options.gpu, events);
+                if (seen.length === 1) return prepared(box, 'reused', options.gpu, events);
+                current = boxGeneration(box, REPLACEMENT_ID, options.gpu);
+                return { ...prepared(box, 'replaced', options.gpu, events), ownership: current };
             },
             async startCore() { events.push('start-core'); },
             async healthCheck() { events.push('health'); },
@@ -2415,11 +2459,13 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
         if (declaredAfterStart.length) {
             assert.deepEqual(seen[1].agents, [AGENT]);
             assert.equal(result.gpuReapplied.action, 'replaced');
+            assert.equal(result.containerId, REPLACEMENT_ID);
             assert.equal(events.filter((event) => event === 'start-core').length, 2);
             // The Box is replaced only once no no-wait launch is left.
             assert.deepEqual(noWait, ['reconcile', 'no-wait:2', 'no-wait:1', 'no-wait:0', 'reconcile']);
         } else {
             assert.equal(result.gpuReapplied, undefined);
+            assert.equal(result.containerId, OLD_ID);
             assert.equal(events.filter((event) => event === 'start-core').length, 1);
             // No change to apply: the start never waits for its no-wait launches.
             assert.deepEqual(noWait, ['reconcile']);
@@ -2437,12 +2483,16 @@ test('D14 first start: by default the no-wait launches are counted with pgrep in
     const counts = [{ ok: true, status: 0, stdout: '2\n' }, { ok: false, status: 1, stdout: '0\n' }];
     const pgrepCalls = [];
     let scans = 0;
+    let current = box.ownership;
     const supervisor = gpuSupervisor(box, events, {
         gpuGrantStore: memoryGpuStore(events),
+        discover: () => current,
         scanGpuAgents: () => (scans++ === 0 ? [] : [AGENT]),
         async reconcile(options) {
             seen.push(options.gpu);
-            return prepared(box, seen.length === 1 ? 'reused' : 'replaced', options.gpu, events);
+            if (seen.length === 1) return prepared(box, 'reused', options.gpu, events);
+            current = boxGeneration(box, REPLACEMENT_ID, options.gpu);
+            return { ...prepared(box, 'replaced', options.gpu, events), ownership: current };
         },
         async startCore() { events.push('start-core'); },
         async healthCheck() { events.push('health'); },
@@ -2515,6 +2565,300 @@ test('D14 first start: no-wait launches that outlast the bound, or cannot be cou
     }
 });
 
+const REAPPLY_OPERATIONS = Object.freeze([
+    ['start', (supervisor) => supervisor.runStartTransaction(['start', 'explorer', '8080'])],
+    ['restart', (supervisor) => supervisor.runRestartTransaction(['restart'])],
+    ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
+]);
+
+/**
+ * The transaction's own reconcile reuses generation A (OLD_ID); the in-Box
+ * core then installs a declaring repo, and the reapplication's reconcile
+ * replaces A with B (REPLACEMENT_ID). `discover` always answers with the Box
+ * the latest reconcile or rollback left, as the engine would.
+ */
+function reapplySupervisor(t, {
+    declares = true,
+    failReplacementHealth = false,
+    replacementRollback = null,
+    afterReplacement = null,
+    replacementReconcile = null,
+    overrides = {},
+} = {}) {
+    const box = graphBox(t);
+    const events = [];
+    const output = [];
+    const store = memoryGpuStore(events);
+    let current = box.ownership;
+    let installed = false;
+    let reconciles = 0;
+    const setCurrent = (next) => { current = next; };
+    const install = (event) => { events.push(event); installed = true; };
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: store,
+        discover: () => current,
+        scanGpuAgents: () => (declares && installed ? [AGENT] : []),
+        async reconcile(options) {
+            reconciles += 1;
+            events.push('reconcile');
+            if (reconciles === 1) return { ...prepared(box, 'reused', options.gpu, events), ownership: current };
+            if (replacementReconcile) return replacementReconcile(setCurrent, options);
+            const replacement = boxGeneration(box, REPLACEMENT_ID, options.gpu);
+            current = replacement;
+            return {
+                ...prepared(box, 'replaced', options.gpu, events),
+                ownership: replacement,
+                finalize() {
+                    events.push('finalize');
+                    afterReplacement?.(setCurrent, options.gpu);
+                },
+                async rollback() {
+                    events.push('outer-rollback');
+                    return replacementRollback(setCurrent);
+                },
+            };
+        },
+        async startCore() { install('start-core'); },
+        async healthCheck() {
+            events.push('health');
+            if (failReplacementHealth && current.handles?.container?.id === REPLACEMENT_ID) {
+                throw new Error('the replacement Box failed its health check');
+            }
+        },
+        selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
+        updateAgentLib: async () => ({ selection: box.agentLib, changed: false, previous: null }),
+        updateWorkspacePloinky: async () => ({ found: false }),
+        commitAgentLibSelection: () => {},
+        revalidateAgentLibSource: () => {},
+        captureCoreStartArgv: () => ['start', 'explorer', '8080'],
+        runCoreCommand: async () => { install('core'); },
+        runRestartCore: fakeRestartCore(async () => { install('restart-core'); }),
+        runUpdateCore: fakeUpdateCore({ onCall: () => { install('update-core'); } }),
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        countNoWaitWorkers: () => 0,
+        waitDelay: async () => {},
+        stderr: { write(text) { output.push(String(text)); } },
+        ...overrides,
+    });
+    return { box, events, output, store, supervisor, current: () => current };
+}
+
+// The previous Box comes back as a new container: replacement rollback
+// recreates it (restoreOldContainer → createAndStart).
+function restoredRollback(box) {
+    return (setCurrent) => {
+        const restored = boxGeneration(box, RESTORED_ID, null);
+        setCurrent(restored);
+        return {
+            action: 'restored',
+            ownership: restored,
+            containerId: RESTORED_ID,
+            hostPort: 8090,
+            mediaHostPort: 7882,
+            routerBinding: { address: '127.0.0.1', hostPort: 8090, hosts: null },
+            gpu: null,
+            hardware: null,
+            agentLib: box.agentLib,
+        };
+    };
+}
+
+function assertNamesExistingBox(result, scenario, label) {
+    const container = scenario.current().handles.container;
+    assert.equal(result.containerId, container.id, `${label}: containerId names the Box that exists`);
+    assert.equal(result.ownership.handles.container.id, container.id, `${label}: ownership names the Box that exists`);
+    assert.equal(result.gpu?.fingerprint ?? null, container.labels[BOX_LABELS.gpuGrant] ?? null,
+        `${label}: the GPU wiring is the Box's own`);
+}
+
+for (const [operation, invoke] of REAPPLY_OPERATIONS) {
+    test(`D14 ${operation}: the result names the replacement Box after the GPU reapplication`, async (t) => {
+        const probe = boxFixture(t);
+        useTempHome(t, probe.root);
+        useFakeHostFiles(t, fakeHost());
+        const scenario = reapplySupervisor(t);
+        const result = await invoke(scenario.supervisor);
+        assert.equal(result.gpuReapplied?.action, 'replaced', scenario.events.join(' '));
+        assert.equal(result.gpuReapplied.containerId, REPLACEMENT_ID);
+        assert.equal(scenario.current().handles.container.id, REPLACEMENT_ID);
+        assertNamesExistingBox(result, scenario, operation);
+        assert.deepEqual(result.gpu.agents, [AGENT]);
+        assert.equal(result.gpu.fingerprint, result.gpuReapplied.gpu.fingerprint);
+        // The first phase's action stays; the replacement keeps the publication.
+        assert.equal(result.action, 'reused');
+        assert.equal(result.hostPort, 8090);
+        assert.equal(result.mediaHostPort, 7882);
+        assert.deepEqual(result.routerBinding, { address: '127.0.0.1', hostPort: 8090, hosts: null });
+        if (operation === 'update') assert.equal(result.activation.outcome, 'restarted');
+    });
+
+    test(`D14 ${operation}: without a GPU change the result names the Box the transaction prepared`, async (t) => {
+        const probe = boxFixture(t);
+        useTempHome(t, probe.root);
+        useFakeHostFiles(t, fakeHost());
+        const scenario = reapplySupervisor(t, { declares: false });
+        const result = await invoke(scenario.supervisor);
+        assert.equal(result.gpuReapplied, undefined);
+        assert.equal(scenario.events.filter((event) => event === 'reconcile').length, 1);
+        assert.equal(result.containerId, OLD_ID);
+        assertNamesExistingBox(result, scenario, operation);
+        assert.equal(result.gpu, null);
+    });
+
+    test(`D14 ${operation}: a failed GPU reapplication names the restored previous Box`, async (t) => {
+        const probe = boxFixture(t);
+        useTempHome(t, probe.root);
+        useFakeHostFiles(t, fakeHost());
+        let scenario;
+        scenario = reapplySupervisor(t, {
+            failReplacementHealth: true,
+            replacementRollback: (setCurrent) => restoredRollback(scenario.box)(setCurrent),
+        });
+        const result = await invoke(scenario.supervisor);
+        assert.equal(result.gpuReapplied, undefined);
+        assert.ok(scenario.events.includes('outer-rollback'), scenario.events.join(' '));
+        assert.equal(scenario.current().handles.container.id, RESTORED_ID);
+        assertNamesExistingBox(result, scenario, operation);
+        assert.equal(result.gpu, null);
+        assert.match(scenario.output.join(''), /the workspace keeps running without that GPU wiring/);
+        assert.equal(scenario.store.value, null, 'the GPU grant record is restored');
+    });
+
+    test(`D14 ${operation}: a GPU reapplication whose rollback failed fails the operation`, async (t) => {
+        const probe = boxFixture(t);
+        useTempHome(t, probe.root);
+        useFakeHostFiles(t, fakeHost());
+        let scenario;
+        scenario = reapplySupervisor(t, {
+            failReplacementHealth: true,
+            replacementRollback: (setCurrent) => {
+                setCurrent({ state: 'absent', engine: scenario.box.ownership.engine, handles: {} });
+                throw new Error('old Box restoration: the engine refused to create it');
+            },
+        });
+        await assert.rejects(() => invoke(scenario.supervisor),
+            (error) => error.code === 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED'
+                && /applying the GPU agents after start did not complete/.test(error.message)
+                // An admitted update keeps its verified input outcomes in the failure.
+                && (operation !== 'update' || error.updateRecords?.some((record) => record.id === 'fixture-repo')));
+        assert.ok(scenario.events.includes('outer-rollback'), scenario.events.join(' '));
+        assert.doesNotMatch(scenario.output.join(''), /keeps running/);
+    });
+}
+
+test('D14 first start: launches that outlast the bound, or cannot be counted, keep the prepared Box in the result', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    for (const count of [() => 1, () => null]) {
+        let clock = 0;
+        const scenario = reapplySupervisor(t, {
+            overrides: {
+                countNoWaitWorkers: count,
+                now: () => clock,
+                waitDelay: async (milliseconds) => { clock += milliseconds; },
+            },
+        });
+        const result = await scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']);
+        assert.equal(result.gpuReapplied, undefined);
+        assert.equal(scenario.events.filter((event) => event === 'reconcile').length, 1);
+        assert.equal(result.containerId, OLD_ID);
+        assertNamesExistingBox(result, scenario, 'timeout');
+        assert.match(scenario.output.join(''), /the workspace keeps running without that GPU wiring/);
+    }
+});
+
+test('D14 first start: each failed rollback of the GPU reapplication fails the start on its own', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    // The replacement's own rollback restored the previous Box but could not
+    // remove the candidate: the code alone says the state is uncertain.
+    let scenario = reapplySupervisor(t, {
+        replacementReconcile: (setCurrent) => {
+            const restored = restoredRollback(scenario.box)(setCurrent);
+            const error = new PloinkyBoxError('Box container transaction failed; rollback failures: candidate removal: busy',
+                { code: 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED' });
+            error.boxRollback = Object.freeze({ ...restored, oldStopAttempted: true });
+            throw error;
+        },
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']),
+        (error) => error.code === 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED' && error.activation?.outcome === 'restored');
+    assert.doesNotMatch(scenario.output.join(''), /keeps running/);
+    // The previous Box was restored, but its graph had no running agent when
+    // the reapplication began, so no graph is rebuilt on it: the activation
+    // outcome alone says the replacement's graph start left it disrupted.
+    const idleInbox = { ok: true, status: 0, stdout: JSON.stringify({
+        state: 'running', initialized: true, routingConfigured: true, trackedAgents: 1, runningAgents: 0, warnings: [],
+    }) };
+    scenario = reapplySupervisor(t, {
+        failReplacementHealth: true,
+        replacementRollback: (setCurrent) => restoredRollback(scenario.box)(setCurrent),
+        overrides: {
+            runner: {
+                run() {},
+                async stream() { return { ok: true, status: 0 }; },
+                query: () => idleInbox,
+            },
+        },
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']),
+        (error) => !['PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED', 'PLOINKY_BOX_GPU_REAPPLY_CHANGED'].includes(error.code)
+            && error.activation?.outcome === 'recovery-required');
+    assert.doesNotMatch(scenario.output.join(''), /keeps running/);
+});
+
+test('D14 first start: a Box that differs from the reapplication outcome fails closed', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    const changed = (error) => error.code === 'PLOINKY_BOX_GPU_REAPPLY_CHANGED';
+    // A different Box, with the same wiring, after a successful replacement.
+    let scenario = reapplySupervisor(t, {
+        afterReplacement: (setCurrent, gpu) => setCurrent(boxGeneration(scenario.box, STRAY_ID, gpu)),
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']), changed);
+    // No Box after a successful replacement.
+    scenario = reapplySupervisor(t, {
+        afterReplacement: (setCurrent) => setCurrent({ state: 'absent', engine: scenario.box.ownership.engine, handles: {} }),
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']), changed);
+    // An engine that cannot be inspected after the replacement.
+    scenario = reapplySupervisor(t, {
+        afterReplacement: (setCurrent) => setCurrent(null),
+        overrides: {
+            discover: () => {
+                const current = scenario.current();
+                if (!current) throw new Error('podman inspect failed');
+                return current;
+            },
+        },
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']),
+        (error) => changed(error) && /could not be observed \(podman inspect failed\)/.test(error.message));
+    // The replacement's ID, reported by another engine.
+    scenario = reapplySupervisor(t, {
+        afterReplacement: (setCurrent) => setCurrent({
+            ...scenario.current(), engine: { name: 'podman', identity: 'other-engine' },
+        }),
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']), changed);
+    // A restored Box whose GPU wiring is not the prepared one.
+    scenario = reapplySupervisor(t, {
+        failReplacementHealth: true,
+        replacementRollback: (setCurrent) => {
+            const result = restoredRollback(scenario.box)(setCurrent);
+            const wired = boxGeneration(scenario.box, RESTORED_ID, activeWiring(scenario.box.identity));
+            setCurrent(wired);
+            return { ...result, ownership: wired };
+        },
+    });
+    await assert.rejects(() => scenario.supervisor.runStartTransaction(['start', 'explorer', '8080']), changed);
+    assert.doesNotMatch(scenario.output.join(''), /keeps running/);
+});
+
 // ---------------------------------------------------------------------------
 // Hardware limits: every gate-on generation a GPU grant, revoke or internal
 // GPU reapply creates or replaces is prepared before its graph (U11, §6.5).
@@ -2527,19 +2871,24 @@ test('G.every-final-generation-gpu', async (t) => {
     const { initializeStore } = await import('../../cli/sandbox/hardwareLimits/store.mjs');
     const scenario = async (label, { gpu = null, overrides = {}, invoke, generations }) => {
         const box = graphBox(t, { gpu });
-        const gateStore = createHardwareGateStore({ homeDirectory: home });
+        const gateStore = createHardwareGateStore();
         gateStore.write(box.identity, true, box.lock);
-        const wiring = resolveDesiredHardwareWiring({ identity: box.identity, enabled: true, homeDirectory: home, initializeStore });
+        const wiring = resolveDesiredHardwareWiring({ identity: box.identity, enabled: true, initializeStore });
         const events = [];
         let replacements = 0;
+        let current = box.ownership;
         const supervisor = gpuSupervisor(box, events, {
             gpuGrantStore: memoryGpuStore(events),
             hardwareGateStore: gateStore,
+            discover: () => current,
             async reconcile(options) {
                 events.push('reconcile');
                 replacements += 1;
+                const action = replacements === 1 && label === 'reapply' ? 'reused' : 'replaced';
+                // A replacement is a new generation, carrying the requested GPU wiring.
+                if (action === 'replaced') current = boxGeneration(box, `${replacements}`.repeat(64), options.gpu);
                 // An existing Box keeps its observed hardware wiring.
-                return { ...prepared(box, replacements === 1 && label === 'reapply' ? 'reused' : 'replaced', options.gpu, events), hardware: options.hardware ?? wiring };
+                return { ...prepared(box, action, options.gpu, events), ownership: current, hardware: options.hardware ?? wiring };
             },
             async startCore() { events.push('start-core'); },
             async healthCheck() { events.push('health'); },
@@ -2598,7 +2947,7 @@ for (const [operation, invoke] of [
         const home = useTempHome(t, box.root);
         useFakeHostFiles(t, fakeHost());
         const { createHardwareGateStore } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
-        const gateStore = createHardwareGateStore({ homeDirectory: home });
+        const gateStore = createHardwareGateStore();
         gateStore.write(box.identity, false, box.lock);
         const toolsRoot = path.join(box.root, 'mps-tools'); fs.mkdirSync(toolsRoot);
         for (const destination of Object.values(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(toolsRoot, path.basename(destination)), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
@@ -2647,7 +2996,7 @@ async function restartedMarker(t, discoverGpuMpsTools, { toolsRoot = null } = {}
     const home = useTempHome(t, box.root);
     useFakeHostFiles(t, fakeHost());
     const { createHardwareGateStore } = await import('../../ploinky-box/hardwareLimitsGate.mjs');
-    const gateStore = createHardwareGateStore({ homeDirectory: home });
+    const gateStore = createHardwareGateStore();
     gateStore.write(box.identity, false, box.lock);
     const events = [];
     const requested = [];

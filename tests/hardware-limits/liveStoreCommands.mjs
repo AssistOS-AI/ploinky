@@ -7,12 +7,14 @@
 // installs or removes the downgrade barrier with the product's own functions (cli/sandbox/hardwareLimits/store.mjs and storeLock.mjs), from the host
 // and from inside the Box, so both sides see the SAME directory through the same mount.
 
+import path from 'node:path';
+
 import { BOX_STORE_ROOT, hardwareStorePaths } from '../../cli/sandbox/hardwareLimits/store.mjs';
-import { STORE_BUSY_MESSAGE, STORE_LOCK_DEADLINE_MS, STORE_LOCK_DIRECTORY } from '../../cli/sandbox/hardwareLimits/storeLock.mjs';
+import { STORE_BUSY_MESSAGE, STORE_LOCK_DEADLINE_MS, STORE_LOCK_NAME } from '../../cli/sandbox/hardwareLimits/storeLock.mjs';
 
 export const C5_AGENTS = Object.freeze(['s']);                       // one managed-network agent: the stored override is the writers' target
 export const BOX_PRODUCT_ROOT = '/opt/ploinky';                      // the product modules the Box mounts read-only
-export { BOX_STORE_ROOT, STORE_BUSY_MESSAGE, STORE_LOCK_DEADLINE_MS, STORE_LOCK_DIRECTORY };
+export { BOX_STORE_ROOT, STORE_BUSY_MESSAGE, STORE_LOCK_DEADLINE_MS, STORE_LOCK_NAME };
 export const OVERRIDES = Object.freeze({ low: Object.freeze({ memoryPercent: 10 }), high: Object.freeze({ memoryPercent: 20 }) });
 // Every bound is a manifest value shown in the approval summary. A held lock outlasts the product's own 10 s wait for it, so the contender is refused.
 export const STORE_BOUNDS = Object.freeze({
@@ -42,7 +44,9 @@ export const RECOVERY_REFUSALS = Object.freeze({
 const problem = message => Object.assign(new Error(message), { store: true });
 const text = (value, max = 240) => String(value ?? '').slice(0, max);
 
-export const hostStoreRoot = (home, instance) => hardwareStorePaths({ identity: { instance }, homeDirectory: home }).storeRoot;
+export const hostStoreRoot = (workspaceRoot, instance) => hardwareStorePaths({
+    identity: { instance, workspaceRoot, hostStateRoot: path.join(workspaceRoot, '.ploinky-box') },
+}).storeRoot;
 
 // Runs on the host or inside the Box. argv[1] is one JSON object; the product source root and the store root are parameters, never source text.
 export const STORE_PROGRAM = String.raw`
@@ -53,14 +57,13 @@ const MODES = ['inspect', 'hold', 'stale', 'barrier-begin', 'barrier-remove', 'g
 const HEX32 = /^[a-f0-9]{32}$/;
 if (params.schema !== 1 || !MODES.includes(params.mode) || !['host', 'box'].includes(params.domain) || !path.isAbsolute(params.root) || !path.isAbsolute(params.storeRoot)
   || !/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(params.instance) || !/^[a-f0-9]{12}$/.test(params.pathHash) || !path.isAbsolute(params.workspaceRoot)
-  || (params.domain === 'host' && !path.isAbsolute(params.home))
   || !Number.isInteger(params.acquireMs) || params.acquireMs < 0 || params.acquireMs > 60000
   || !Number.isInteger(params.holdMs) || params.holdMs < 0 || params.holdMs > 300000
   || (params.operationId !== undefined && !HEX32.test(params.operationId))) throw new Error('Invalid store program parameters');
 const load = (relative) => import(new URL('file://' + params.root + '/' + relative).href);
 const [store, lockModule] = await Promise.all([load('cli/sandbox/hardwareLimits/store.mjs'), load('cli/sandbox/hardwareLimits/storeLock.mjs')]);
-const identity = { instance: params.instance, pathHash: params.pathHash, workspaceRoot: params.workspaceRoot };
-const paths = store.hardwareStorePaths({ identity, context: params.domain, homeDirectory: params.home, boxRoot: params.storeRoot });
+const identity = { instance: params.instance, pathHash: params.pathHash, workspaceRoot: params.workspaceRoot, hostStateRoot: path.join(params.workspaceRoot, '.ploinky-box') };
+const paths = store.hardwareStorePaths({ identity, context: params.domain, boxRoot: params.storeRoot });
 if (paths.storeRoot !== params.storeRoot) throw new Error('The store root is not the one this workspace derives');
 const out = (value) => fs.writeSync(1, JSON.stringify({ schema: 1, mode: params.mode, domain: params.domain, ...value }) + '\n');
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -73,9 +76,9 @@ try {
     const barrier = store.readBarrier({ paths });
     let quarantined = [];
     try {
-      quarantined = fs.readdirSync(paths.storeRoot).filter((name) => name.startsWith('${STORE_LOCK_DIRECTORY}.stale-')).sort().map((name) => {
+      quarantined = fs.readdirSync(paths.storeRoot).filter((name) => name.startsWith('${STORE_LOCK_NAME}.stale-')).sort().map((name) => {
         let ownerToken = null;
-        try { ownerToken = JSON.parse(fs.readFileSync(path.join(paths.storeRoot, name, 'owner.json'), 'utf8')).token; } catch (error) { ownerToken = null; }
+        try { ownerToken = JSON.parse(fs.readFileSync(path.join(paths.storeRoot, name), 'utf8')).token; } catch (error) { ownerToken = null; }
         return { name, ownerToken };
       });
     } catch (error) { quarantined = []; }
@@ -104,14 +107,13 @@ try {
 `;
 
 // The parameters of one program run. `domain` decides the product root and the store root: the Box mounts /opt/ploinky and the store at
-// BOX_STORE_ROOT; the host reads the same directory under its own home.
+// BOX_STORE_ROOT; the host reads the same directory under the workspace's `.ploinky-box`.
 export function storeProgramParams({ profile, identity, domain, mode, holdMs = 0, acquireMs = STORE_BOUNDS.acquireMs, operationId }) {
     if (!['host', 'box'].includes(domain)) throw new Error('Unknown store domain');
-    const home = profile.host.home;
     return {
         schema: 1, mode, domain, root: domain === 'box' ? BOX_PRODUCT_ROOT : profile.source.root,
-        storeRoot: domain === 'box' ? BOX_STORE_ROOT : hostStoreRoot(home, identity.instance),
-        instance: identity.instance, pathHash: identity.pathHash, workspaceRoot: identity.workspaceRoot, ...(domain === 'host' ? { home } : {}),
+        storeRoot: domain === 'box' ? BOX_STORE_ROOT : hostStoreRoot(identity.workspaceRoot, identity.instance),
+        instance: identity.instance, pathHash: identity.pathHash, workspaceRoot: identity.workspaceRoot,
         acquireMs, holdMs, ...(operationId === undefined ? {} : { operationId }),
     };
 }

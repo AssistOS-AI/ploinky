@@ -6,6 +6,7 @@ import {
     BOX_DATA_KEYS,
     BOX_DATA_RELATIVE_NAMES,
     BOX_DATA_ROOT_NAME,
+    HOST_STATE_DIRECTORY_NAME,
 } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 
@@ -83,6 +84,7 @@ export function buildWorkspaceIdentity(workspaceRoot, {
         instance,
         anchorPath: path.join(selectedRoot, '.ploinky'),
         boxDataRoot: path.join(selectedRoot, '.ploinky', BOX_DATA_ROOT_NAME),
+        hostStateRoot: path.join(selectedRoot, HOST_STATE_DIRECTORY_NAME),
         dataPaths: Object.freeze(Object.fromEntries(BOX_DATA_KEYS.map((key) => [
             key,
             path.join(selectedRoot, '.ploinky', BOX_DATA_ROOT_NAME, BOX_DATA_RELATIVE_NAMES[key]),

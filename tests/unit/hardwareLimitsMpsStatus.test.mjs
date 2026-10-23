@@ -54,7 +54,7 @@ test('MS.POST GPU validation sees exact profiles and fails before store write', 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mps-api-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const identity = buildWorkspaceIdentity(root, { markerFound: true });
-    const paths = hardwareStorePaths({ identity, homeDirectory: path.join(root, 'home') });
+    const paths = hardwareStorePaths({ identity });
     initializeStore({ paths, identity });
     const snapshot = readStoreSnapshot({ paths, identity });
     const registry = { exact: { type: 'agent', repoName: 'demo', agentName: 'worker', alias: 'router', profile: 'small' }, unrelated: { type: 'agent', repoName: 'other', agentName: 'worker' } };

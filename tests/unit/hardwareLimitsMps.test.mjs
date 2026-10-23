@@ -18,14 +18,14 @@ function fixture(t) {
     for (const [key, destination] of Object.entries(MPS_TOOL_PATHS)) fs.writeFileSync(path.join(root, path.basename(destination)), `#!/bin/sh\n# ${key}\n`, { mode: 0o755 });
     const mps = discoverMpsTools({ directories: [root] });
     const pathHash = crypto.createHash('sha256').update(root).digest('hex').slice(0, 12);
-    const identity = { workspaceRoot: root, pathHash, instance: `ploinky-box-test-${pathHash}` };
-    return { root, mps, identity, wiring: (extra = {}) => buildGpuWiring({ identity, grant, discovery, homeDirectory: root, ...extra }) };
+    const identity = { workspaceRoot: root, pathHash, instance: `ploinky-box-test-${pathHash}`, hostStateRoot: path.join(root, '.ploinky-box') };
+    return { root, mps, identity, wiring: (extra = {}) => buildGpuWiring({ identity, grant, discovery, ...extra }) };
 }
 
 test('MP.disabled-bytes', (t) => {
     const { identity, root, wiring } = fixture(t);
     const old = wiring();
-    const disabled = resolveDesiredGpuWiring(identity, grant, [], { discover: () => discovery, homeDirectory: root, mpsEnabled: false, discoverMps: () => { throw new Error('must not discover when disabled'); } });
+    const disabled = resolveDesiredGpuWiring(identity, grant, [], { discover: () => discovery, mpsEnabled: false, discoverMps: () => { throw new Error('must not discover when disabled'); } });
     assert.deepEqual(disabled, old);
     assert.equal(JSON.parse(old.files.at(-1).content).mps, undefined);
 });
@@ -57,7 +57,7 @@ test('MP.tool-only-fingerprint', (t) => {
 });
 test('MP.missing-tools-ordinary-grant', (t) => {
     const { root, identity, wiring } = fixture(t);
-    const actual = resolveDesiredGpuWiring(identity, grant, [], { discover: () => discovery, homeDirectory: root, mpsEnabled: true, discoverMps: () => { throw new Error('missing'); } });
+    const actual = resolveDesiredGpuWiring(identity, grant, [], { discover: () => discovery, mpsEnabled: true, discoverMps: () => { throw new Error('missing'); } });
     // Still an ordinary active grant: same agents, devices, driver and mounts, without the MPS tools. Only the
     // recorded cause (and so the content-addressed generation that carries it) differs.
     const ordinary = wiring();

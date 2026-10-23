@@ -47,6 +47,7 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { hostStateFixtureMounts, PERMISSIVE_HOST_STATE_GUARD, quiescentEngine } from '../helpers/hostStateFixture.mjs';
 
 const DATA_FINGERPRINTS = Object.freeze({
     dependencies: 'd'.repeat(64),
@@ -64,10 +65,14 @@ function storedLogs(text) {
 }
 
 function fixture(t) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-transaction-'));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const workspace = path.join(root, 'workspace');
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-transaction-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    // The checkout (`root`) and the workspace are siblings: a workspace inside
+    // the invoking checkout is refused (D6).
+    const root = path.join(base, 'checkout');
+    const workspace = path.join(base, 'workspace');
     const lockPath = path.join(root, 'lock');
+    fs.mkdirSync(root);
     fs.mkdirSync(workspace);
     fs.mkdirSync(path.join(workspace, '.ploinky'));
     fs.mkdirSync(lockPath);
@@ -85,7 +90,7 @@ function fixture(t) {
     // Every Box now carries the direct-mounted achillesAgentLib source as part
     // of its immutable contract, so the fixture selects one for the workspace.
     const agentLib = agentLibFixture(identity.workspaceRoot);
-    return { root, identity, lock, agentLib };
+    return { root, base, identity, lock, agentLib };
 }
 
 function dataDirectoriesExist(identity) {
@@ -175,6 +180,7 @@ function containerHandle({
                 { type: 'bind', name: '', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: identity.workspaceRoot, destination: identity.workspaceRoot, rw: true },
+                ...hostStateFixtureMounts(identity.workspaceRoot, repositoryRoot),
                 ...agentLibFixtureMounts(agentLib, identity.workspaceRoot),
             ],
         },
@@ -474,6 +480,10 @@ function harness(state, {
             return current ? { state: 'owned', handles: { container: current } } : { state: 'absent', handles: null };
         },
         token(kind) { return kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24); },
+        quiescence({ excludeContainerIds = [] } = {}) {
+            calls.push(['seam', excludeContainerIds.length ? 'pre-stop-scan' : 'quiescence']);
+            return quiescentEngine();
+        },
     };
     if (!realDataPaths) {
         seams.ensureDataPaths = () => {
@@ -503,7 +513,7 @@ function assertNoEngineVolumeCommand(calls) {
 for (const [name, failDuringReconcile] of [['G.first-enable-rollback-policy', false], ['G.first-enable-reconcile-failure-policy', true]]) {
     test(name, async (t) => {
         const state = fixture(t);
-        const paths = hardwareStorePaths({ identity: state.identity, homeDirectory: path.join(state.root, 'private-home') });
+        const paths = hardwareStorePaths({ identity: state.identity });
         initializeStore({ paths, identity: state.identity });
         const installPolicy = () => setAgentLimits({
             paths, identity: state.identity, expectedToken: readStoreSnapshot({ paths, identity: state.identity }).token,
@@ -560,7 +570,8 @@ for (const imageIdPrefix of ['', 'sha256:']) {
         const result = await reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams);
         assert.equal(result.action, 'created');
         const created = h.current();
-        assert.equal(created.runtime.mounts.length, 4);
+        // Source, workspace, host state mask and the two data binds.
+        assert.equal(created.runtime.mounts.length, 5);
         assert.equal(created.runtime.environment.PLOINKY_AGENTLIB_MODE, 'image');
         assert.equal(created.runtime.environment.PLOINKY_BOX_IMAGE_ID, state.agentLib.supplyingImageId,
             'the outer image ID is set once at creation, in canonical form');
@@ -631,7 +642,8 @@ test('failed image-bundle replacement restores the old image without host source
     await assert.rejects(reconcileBoxContainer(reconciliationArguments(state, h, initial, true), h.seams), /ready timeout/);
     assert.equal(h.current().runtime.imageId, initial.runtime.imageId);
     assert.equal(h.current().labels[BOX_LABELS.routerHostPort], '8080');
-    assert.equal(h.current().runtime.mounts.length, 4);
+    // Source, workspace, host state mask and the two data binds.
+    assert.equal(h.current().runtime.mounts.length, 5);
     assert.equal(probes, 3);
 });
 
@@ -684,16 +696,18 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     ]);
     assert.equal(args.some((value) => /(?:^|:)\/workspace(?:\/|:|$)/.test(value)), false);
 
-    // Exactly six durable binds and one transient tmpfs, with no named volume.
-    // The two achillesAgentLib binds come last and are both read-only: the
-    // stable runtime path, then the shadow over the writable workspace alias
-    // that would otherwise leave the same inode writable.
+    // Exactly seven durable binds and one transient tmpfs, with no named volume.
+    // The host state mask follows the workspace bind it covers. The two
+    // achillesAgentLib binds come last and are both read-only: the stable
+    // runtime path, then the shadow over the writable workspace alias that
+    // would otherwise leave the same inode writable.
     const mountArgs = args.flatMap((value, index) => (
         value === '--volume' ? [args[index + 1]] : []
     ));
     assert.deepEqual(mountArgs, [
         `${state.root}:/opt/ploinky:ro`,
         `${workspaceRoot}:${workspaceRoot}`,
+        `${workspaceRoot}/.ploinky-box/empty:${workspaceRoot}/.ploinky-box:ro`,
         `${state.identity.dataPaths.dependencies}:/opt/ploinky/node_modules`,
         `${state.identity.dataPaths.images}:/home/podman/.local/share/ploinky-images`,
         `${state.agentLib.sourceDir}:/opt/ploinky-agentlib:ro`,
@@ -1233,7 +1247,7 @@ test('a replaced live bind source forces outer-container replacement', async (t)
     );
 
     const h = harness(state, { initial: current, realDataPaths: true });
-    const result = await reconcileBoxContainer({
+    const options = {
         identity: state.identity,
         agentLib: state.agentLib,
         ownership: { state: 'owned', handles: { container: current } },
@@ -1241,9 +1255,26 @@ test('a replaced live bind source forces outer-container replacement', async (t)
         runner: h.runner,
         lock: state.lock,
         repositoryRoot: state.root,
-    }, h.seams);
+    };
+    // N1: while the Box runs, a replaced data path is never recreated in
+    // place; only a command that recreates the Box quiescently (restart) may.
+    await assert.rejects(reconcileBoxContainer(options, h.seams), { code: 'PLOINKY_BOX_DATA_PATH_MISSING' });
+    assert.equal(h.calls.some((call) => call[0] === 'run'), false, 'nothing was mutated');
+    const result = await reconcileBoxContainer({ ...options, recoverDataPaths: true }, h.seams);
 
     assert.equal(result.action, 'replaced');
+    // Scan while the old Box runs, stop it, prove quiescence, then remove it
+    // and create the new one.
+    const order = h.calls.map((call) => call.join(' '));
+    const at = (needle) => {
+        const index = order.findIndex((entry) => entry.includes(needle));
+        assert.ok(index >= 0, `${needle} happened`);
+        return index;
+    };
+    assert.ok(at('seam pre-stop-scan') < at('container stop'));
+    assert.ok(at('container stop') < at('seam quiescence'));
+    assert.ok(at('seam quiescence') < at('container rm -f'));
+    assert.ok(at('container rm -f') < at('container create'));
     assert.notEqual(result.ownership.handles.container.id, current.id);
     assert.equal(
         h.current().labels[BOX_LABELS.dependenciesFingerprint],
@@ -2056,9 +2087,9 @@ test('an unmountable workspace root is rejected before any engine, image, or dat
 
 test('create arguments carry spaces, Unicode, metacharacters, and symlink selections as exact values', (t) => {
     const state = fixture(t);
-    const unusual = path.join(state.root, "proiect ăîș $(touch owned);'\"&|*");
-    const target = path.join(state.root, 'canonical project');
-    const link = path.join(state.root, 'selected link');
+    const unusual = path.join(state.base, "proiect ăîș $(touch owned);'\"&|*");
+    const target = path.join(state.base, 'canonical project');
+    const link = path.join(state.base, 'selected link');
     fs.mkdirSync(path.join(unusual, '.ploinky'), { recursive: true });
     fs.mkdirSync(path.join(target, '.ploinky'), { recursive: true });
     fs.symlinkSync(target, link, 'dir');
@@ -2091,14 +2122,14 @@ test('create arguments carry spaces, Unicode, metacharacters, and symlink select
             identity, agentLib, repositoryRoot: state.root, imageId: 'a'.repeat(64), imageRef: 'runtime', hostPort: 19090,
         }));
     }
-    assert.equal(fs.existsSync(path.join(state.root, 'owned')), false);
+    assert.equal(fs.existsSync(path.join(state.base, 'owned')), false);
     assert.equal(fs.existsSync('owned'), false);
 });
 
 test('two workspaces render independent identities and same-path binds', (t) => {
     const state = fixture(t);
-    const first = path.join(state.root, 'project');
-    const second = path.join(state.root, 'project-other');
+    const first = path.join(state.base, 'project');
+    const second = path.join(state.base, 'project-other');
     const identities = [first, second].map((root) => {
         fs.mkdirSync(path.join(root, '.ploinky'), { recursive: true });
         return buildWorkspaceIdentity(root, { markerFound: true });
@@ -2188,7 +2219,8 @@ test('guarded native start reuses the same stopped Box and validates dependencie
     h.seams.verifyExistingDependencies = () => { dependencyChecks++; };
     h.seams.discover = (() => { const original = h.seams.discover; return () => ({ ...original(), engine: { name: 'podman', identity: 'engine' } }); })();
     let starts = 0;
-    const supervisor = createBoxSupervisor({ repositoryRoot: state.root, launchCwd: state.identity.workspaceRoot,
+    const supervisor = createBoxSupervisor({ hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        repositoryRoot: state.root, launchCwd: state.identity.workspaceRoot,
         env: {}, platform: 'linux', resolveIdentity: () => state.identity, discover,
         lockManager: { async acquire() { return { ...state.lock, release() {} }; } }, runner: h.runner,
         updateHostState: { read() { return null; }, write() {}, remove() {} },

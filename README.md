@@ -291,10 +291,12 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and actions labelled by privilege and automation eligibility |
 | `ploinky repair [--dry-run] [--json]` | Apply supported normal-user fixes, verify with diagnostics, and list remaining manual and sudo-required actions; `--dry-run` only inspects and previews |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
+| `ploinky unlock [--force-holder PID@MACHINE]` | Remove a workspace lock, its reclaim guard or the hardware store lock that a command no longer running left behind; see [Box host state, upgrading and recovery](#box-host-state-upgrading-and-recovery) |
+| `ploinky --allow-host-process PID <command>` | Excuse one running host process (repeatable) from the check that refuses Box creation while something else can write the workspace; its start time is verified again; see the same section |
 | `ploinky update` / `ploinky update all [PATH]` | Update Ploinky (only when its checkout is inside the selected folder or the command is run from inside that checkout), AgentLib, registered and discovered repositories, and skills with verified fast-forward-only Git updates, then restart an already configured running workspace when every required input verified. `PATH` must be inside the workspace. Dirty, conflicted, diverged, detached, or operation-in-progress checkouts are preserved and reported as named skips; nothing is stashed, rebased, or reset. Dependency caches are not touched |
 | `ploinky update repos` / `ploinky update repo <name>` | Update only registered repositories (or one) under the same workspace transaction; activation is recorded as pending rather than restarting the whole graph — run `ploinky restart` when ready |
-| `ploinky destroy` | Without prompting, stop nested agents and remove the outer container, then this workspace's GPU-grant and hardware-limits records in `~/.ploinky-box`; retain the host workspace, `.ploinky/box` and the saved Router binding |
-| `ploinky destroy --delete-cache` | Remove the outer container and those records without prompting, then delete only `.ploinky/box/dependencies` and `.ploinky/box/images` |
+| `ploinky destroy` | Without prompting, stop nested agents and remove the outer container, then this workspace's GPU-grant and hardware-limits records in `<workspace>/.ploinky-box`; retain the host workspace, `.data`, `.ploinky/data`, `.env`, `.ploinky/box` and the saved Router binding |
+| `ploinky destroy --delete-cache` | Remove the outer container and those records without prompting, then delete `.ploinky/box/dependencies` and `.ploinky/box/images`, and, when no Box existed as destroy started, the Ploinky-managed AgentLib state `.ploinky/agentlib` |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 Workspaces that have never enabled hardware limits retain the existing
@@ -329,8 +331,10 @@ images or foreign owned resources are rejected before
 pulling, cache preparation, restart, upgrade, or replacement. Ploinky does not
 migrate, clean, relabel, or adopt them: run `ploinky destroy` explicitly, then
 recreate the Box. Ordinary destroy retains `.ploinky/box`;
-`--delete-cache` performs an explicit storage reset of exactly those two cache
-directories without deleting any other workspace file. Both forms remove this
+`--delete-cache` performs an explicit storage reset of those two cache
+directories and, when no Box existed as destroy started, of the Ploinky-managed
+AgentLib state `.ploinky/agentlib` (a local `achillesAgentLib` checkout is never
+touched), without deleting any other workspace file. Both forms remove this
 workspace's host GPU-grant and hardware-limits records once the Box is gone, so
 the next `ploinky start` at the same path begins from manifest defaults (see the
 state table below).
@@ -367,9 +371,9 @@ State follows these stop/start and destroy boundaries:
 | Nested container records and writable layers | Box writable layer under `/home/podman/.local/share/containers/storage` | Yes | No |
 | Inner Podman named volumes | Under the same disposable graphroot | Yes | No |
 | Transient runtime metadata | Tmpfs path `/tmp/storage-run-1000` | No; `/tmp` is fresh each boot | No |
-| Saved Router binding | Host file `~/.ploinky-box/router-bindings/<box-instance>.json` | Yes | Yes |
-| GPU grant record (grants, denies, workspace revoke) and its generation files | Host `~/.ploinky-box/gpu-grants/<box-instance>.json` and `gpu-grants/<box-instance>/` | Yes | No; both destroy forms remove them after the Box is gone |
-| Hardware-limits gate, policy store, transition journals and markers | Host `~/.ploinky-box/hardware-limits/<box-instance>.json` and `hardware-limits/<box-instance>/` | Yes | No; both destroy forms remove them after the Box is gone |
+| Saved Router binding | Host file `<workspace>/.ploinky-box/router-bindings/<box-instance>.json` | Yes | Yes |
+| GPU grant record (grants, denies, workspace revoke) and its generation files | Host `<workspace>/.ploinky-box/gpu-grants/<box-instance>.json` and `gpu-grants/<box-instance>/` | Yes | No; both destroy forms remove them after the Box is gone |
+| Hardware-limits gate, policy store, transition journals and markers | Host `<workspace>/.ploinky-box/hardware-limits/<box-instance>.json` and `hardware-limits/<box-instance>/` | Yes | No; both destroy forms remove them after the Box is gone |
 
 Destroy removes the two host record sets only after the outer Box is proven
 gone, and only the paths derived from this exact workspace identity; another
@@ -382,6 +386,66 @@ state), the Box stays removed, the records are kept, the command exits 1 with a
 message that says the records were kept and names the fix, and running
 `ploinky destroy` again finishes. `--delete-cache` still deletes the cache in
 that case and lists what it deleted.
+
+## Box host state, upgrading and recovery
+
+### Where Box host state lives
+
+Each Box keeps its host state in `<workspace>/.ploinky-box/`: the saved Router binding, GPU grants, hardware limits, update records, the workspace lock, `quarantine/` and `tmp/`. Nothing goes in `~/.ploinky-box`; a directory by that name from an older Ploinky is ignored. Every Box and every agent runtime sees `.ploinky-box` as an empty read-only directory, so only host commands write it. The one exception is a Box with hardware limits on, which also gets its limits store (`.ploinky-box/hardware-limits/<box-instance>/store`) as a writable bind inside that directory.
+
+### Upgrading and clean start
+
+There is no backward compatibility. A Box created by an older Ploinky fails the compatibility check and must be recreated:
+
+```sh
+ploinky destroy
+ploinky start
+```
+
+If an older Ploinky already destroyed the old Box before this version ever ran, remove the host-state directory itself before the first start (it holds host state only):
+
+```sh
+rm -r -- "<workspace>/.ploinky-box"
+```
+
+This never means deleting `.data/`, `.ploinky/data/` or `.env`, and it is not `.ploinky/` or `.ploinky/box`. Those hold user data and keys (agent homes, `master-key`, provider keys), and both `ploinky destroy` and `ploinky destroy --delete-cache` keep them. State in the old `~/.ploinky-box` is not read, so after the Box is recreated re-apply `ploinky bind`, `ploinky gpu grant` or `ploinky gpu revoke`, and any hardware limits.
+
+If `.ploinky-box` already holds anything other than its own skeleton when the first command that configures the workspace (for example `start`, `restart`, `update`, `bind`, `gpu grant` or `gpu revoke`) adopts it (it has no `.ploinky-box/workspace.json` yet), that content is not trusted: it is moved to `.ploinky-box/quarantine/<UTC time>-<random>/`, and `workspace.json` records the adoption. Nothing is deleted. The same adoption removes the group and other permission bits of a `.ploinky-box` you own that an earlier version left readable (for example 0755); a link, a non-directory or a directory owned by someone else is refused instead. `stop`, `destroy`, `limits clear` and `unlock` never adopt.
+
+### Refusals that protect host state
+
+Creating or recreating a Box, adopting a workspace and creating a Box data path are refused while anything other than the command itself can write the workspace. A running container with a read-write bind of the workspace, of a directory containing it or of a directory inside it blocks, and so does a host-runtime agent:
+
+| Platform | What is checked |
+| --- | --- |
+| Linux | The mount table of every process of the invoking user that is outside the command's own mount namespace. A process that has the workspace, or a directory containing it such as the home directory, mounted read-write blocks; so does a process whose mount table cannot be read. Snap and Flatpak desktop helpers that have the home directory mounted writable fall under this rule. Rootless Podman's own infrastructure (its pause process, `conmon`, `pasta` and the like, found through the user's `pause.pid`) is exempt when that can be proven |
+| macOS | The workspace's launch records under `.ploinky/bwrap-pids` plus a `ps` scan for command lines that name the workspace. The residual: a host agent started by an older Ploinky whose launch records were erased is not detected, and that case is unsupported |
+
+Stop what the refusal lists (`ploinky stop` for a Box of this workspace), or excuse one process that does not write the workspace by naming it before the command, for example `ploinky --allow-host-process 4242 start`. The option is repeatable, holds only for that exact process (its start time is read at the scan and verified again before the check passes), and does not excuse an agent that an older Ploinky started without the host-state mask (macOS launch records). `ploinky unlock` does not accept it.
+
+Other refusals and protections:
+
+| Rule | Effect |
+| --- | --- |
+| Nested Box workspaces | A Box whose workspace contains this one, or lies inside it, makes Box creation refuse, in both directions; stop and destroy one of them |
+| Writable mounts stay inside the workspace | A read-write bind of the Box other than the workspace itself must resolve strictly inside the workspace and away from every `.ploinky-box` (any path component that folds to that name, including `.PLOINKY-BOX`), the Ploinky checkout and other Boxes' workspaces |
+| Manifest volumes | A manifest volume source may not resolve into `.ploinky-box` of this or any workspace |
+| Checkout shadow | When the Ploinky checkout lies inside the workspace, the Box binds it read-only over its workspace path, and binds each directory between the workspace and the checkout onto itself (still writable, but no longer renameable from inside the Box). A workspace that is, or lies inside, the checkout is refused |
+| Router | Router-served workspace files never include `.ploinky-box`, at any depth |
+| First-use quarantine | Described above |
+
+### Recovering stuck locks with `ploinky unlock`
+
+```sh
+ploinky unlock
+ploinky unlock --force-holder PID@MACHINE
+```
+
+`ploinky unlock` is host-only. It looks at three locks that a command which is no longer running can leave behind: the reclaim guard `.ploinky-box/locks/workspace.lock.reclaim`, the workspace lock `.ploinky-box/locks/workspace.lock` and the hardware store lock `.ploinky-box/hardware-limits/<box-instance>/store/write.lock`. It removes one only when its holder is proven gone, using the same checks as lock acquisition. A holder that cannot be checked (it is on another machine, or it is a store lock whose PID is alive on this host) is removed only when `--force-holder PID@MACHINE` names exactly that holder, with the value printed by the busy error. Name only a holder that is really gone: naming one that is still running can let two commands hold the lock at once. A holder that is running is never removed, and the store lock is touched only with the workspace lock held and the Box observed stopped or absent.
+
+It never removes a lock directory that holds anything besides its owner record, a lock with no or a malformed owner record, or anything that is not a private directory owned by you. Those are listed with the manual steps and the command exits 1; it exits 0 when no stuck lock remains. It never waits for the lock it is recovering and never creates `.ploinky-box`. A command that finds the workspace lock held prints a hint that names what `ploinky unlock` will do for that holder.
+
+Unlock commands for one workspace run one at a time, under their own lock `.ploinky-box/locks/unlock.lock`. A second `ploinky unlock` waits up to 2 seconds for the running one, then refuses, names it and exits 1 without inspecting or removing anything; run it again once the first has finished. The lock of an unlock that is no longer running (for example one that was killed) is taken over automatically by the next one. Unlock never removes its own lock's reclaim guard: a stuck `.ploinky-box/locks/unlock.lock.reclaim` is listed with the `rm -r` step to run by hand once no unlock runs. A guard that vanishes while unlock handles it is reported as removed by another command; a guard that took the judged one's place is never deleted: it is put back under its name or, if that name is taken again, left aside and listed.
 
 ## WebTTY terminal targets
 
@@ -477,11 +541,12 @@ public `--name`, `--engine`, or `PLOINKY_BOX_ENGINE` override. Ordinary
 `destroy` removes only the selected outer container, preserving the host
 workspace, the nested image cache, and the Ploinky dependency cache for
 recreation; it then removes this workspace's GPU-grant and hardware-limits
-records from `~/.ploinky-box`. The explicit `destroy --delete-cache` form also
-deletes exactly `.ploinky/box/dependencies` and `.ploinky/box/images` after the
-outer container is gone; neither form removes the workspace,
-`.ploinky/data/master-key`, repositories, agents, the saved Router binding, or
-secrets.
+records from `<workspace>/.ploinky-box`. The explicit `destroy --delete-cache` form also
+deletes `.ploinky/box/dependencies` and `.ploinky/box/images` after the outer
+container is gone, and, when no Box existed as destroy started, the
+Ploinky-managed AgentLib state `.ploinky/agentlib`; neither form removes the workspace, `.data`,
+`.ploinky/data` (including `master-key`), `.env`, repositories, agents, the
+saved Router binding, or secrets.
 
 Every managed box has exactly two engine publications, independent of graph or
 workspace state: `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and
@@ -639,13 +704,14 @@ listeners on the requested port are rejected, including listeners on other
 interfaces when widening from loopback to `0.0.0.0` on the same port.
 
 The binding is saved for this exact workspace as
-`~/.ploinky-box/router-bindings/<box-instance>.json` with mode `0600`. It lives
-outside the workspace because agents can write the workspace bind. `ploinky
+`<workspace>/.ploinky-box/router-bindings/<box-instance>.json` with mode `0600`.
+Every Box and agent runtime sees `.ploinky-box` as an empty read-only directory,
+so agents cannot write it. `ploinky
 start`, `restart`, `update`, commands that create a missing Box, and recreation
 after `destroy` reuse it. A later `ploinky --port PORT start` keeps the saved
 address and saves the new port. Without a saved binding a workspace stays
 loopback-only; an unsafe or malformed saved binding fails closed. Ploinky refuses
-workspace or writable cache paths that overlap its host control-state directory,
+workspace or writable cache paths that overlap the `.ploinky-box` host state directory,
 including symlinks and filesystem aliases, before admitting or creating a Box.
 
 Publishing the port alone is not enough, because the Router rejects unknown
@@ -732,7 +798,7 @@ restart recovery. Administration remains a separate navigation tab.
 
 Hardware limits are off by default. Turn them on for a workspace with
 `PLOINKY_BOX_HARDWARE_LIMITS=on ploinky start` (or `restart`, `update`); the
-choice is saved on the host in `~/.ploinky-box/hardware-limits` and later
+choice is saved on the host in `<workspace>/.ploinky-box/hardware-limits` and later
 commands reuse it until `ploinky destroy` removes it with the stored limits.
 Only `start`, `restart` and `update` apply the variable.
 Turning the gate off while agents still have stored limits is refused with:
@@ -912,13 +978,13 @@ ones (none after a workspace revoke), plus the operator's grants. Manifests are
 read from `.ploinky/repos/<repo>/<agent>/manifest.json` and from workspace
 checkouts `<workspace>/<repo>/<agent>/manifest.json`; they are workspace files
 that agents with workspace access can write, so the operator revoke, recorded
-outside the workspace, is the override. `--vendor VENDOR` (or `--vendor=VENDOR`)
+in the workspace's masked `.ploinky-box/gpu-grants`, is the override. `--vendor VENDOR` (or `--vendor=VENDOR`)
 is optional: it defaults to the only supported vendor, `nvidia`, and is required
 only if several are ever supported.
 
 The operator's grants, denies and workspace revoke are saved for this exact
-workspace as `~/.ploinky-box/gpu-grants/<box-instance>.json` with mode `0600`,
-outside the workspace because agents can write the workspace bind, and with the
+workspace as `<workspace>/.ploinky-box/gpu-grants/<box-instance>.json` with mode `0600`,
+inside `.ploinky-box`, which every Box and agent runtime masks read-only, and with the
 same confinement checks as Router bindings. They last until `ploinky destroy`,
 which removes them with the generation files: after a destroy, an operator
 revoke or deny no longer applies, and the next start gives the GPU to the
@@ -974,7 +1040,10 @@ may just have installed a repo whose manifest declares the GPU; the Box is then
 replaced once more, restarting the graph once). That replacement first waits for
 the start's no-wait launches, which may still be pulling images, to finish, for
 at most 31 minutes; if they are still running then, the workspace keeps running
-without that wiring and a later `ploinky start` applies it. A driver update or a changed
+without that wiring and a later `ploinky start` applies it. If the replacement
+fails and its rollback brings the previous Box and graph back, the workspace
+also keeps running without that wiring; if the rollback cannot, the command
+fails. A driver update or a changed
 set of GPU agents changes the wiring fingerprint (the Box label
 `io.assistos.ploinky-box.gpu-grant`), so the Box is recreated with regenerated
 wiring. If discovery fails, the Box starts without GPU devices: an operator

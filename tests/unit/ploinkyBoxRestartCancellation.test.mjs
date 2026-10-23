@@ -13,6 +13,7 @@ import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { runUpdateExec } from '../../ploinky-box/update/coreRunner.mjs';
 import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 // An operator Ctrl+C, or a lost engine connection, during an ordinary
 // workspace `ploinky restart`. The exec client ending never ends the in-Box
@@ -124,6 +125,7 @@ function scenario(t, { processRef, writer, runRestartCore, runCoreCommand, probe
         },
     };
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: { async acquire() { return { assertHeld() {}, release() {} }; } },

@@ -50,7 +50,7 @@ function world(t, manifest, { records = {}, context = {} } = {}) {
     fs.mkdirSync(workspace);
     fs.mkdirSync(path.join(workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
-    const paths = hardwareStorePaths({ identity, homeDirectory: path.join(root, 'home') });
+    const paths = hardwareStorePaths({ identity });
     initializeStore({ paths, identity });
     const manifestPath = path.join(root, 'manifest.json');
     fs.writeFileSync(manifestPath, JSON.stringify(manifest));

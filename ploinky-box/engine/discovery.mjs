@@ -265,6 +265,67 @@ export function listWorkspaceContainers(engine, identity, runner) {
     return ids.every(id => /^[0-9a-f]{64}$/.test(id)) ? ids : null;
 }
 
+function engineViewContainer(record) {
+    const id = String(record?.Id ?? record?.ID ?? '').trim();
+    if (!/^[0-9a-f]{64}$/.test(id)) throw new Error('container record has no immutable ID');
+    if (!Array.isArray(record.Mounts)) throw new Error(`container ${id} has no mount list`);
+    const state = record.State;
+    if (!state || typeof state !== 'object') throw new Error(`container ${id} has no state`);
+    return Object.freeze({
+        id,
+        name: String(record.Name ?? '').replace(/^\//, ''),
+        labels: Object.freeze(labelsFrom(record)),
+        running: state.Running === true || String(state.Status || '') === 'running',
+        pid: Number.isSafeInteger(state.Pid) && state.Pid > 0 ? state.Pid : null,
+        mounts: Object.freeze(record.Mounts.map((mount) => Object.freeze({
+            type: String(mount?.Type ?? '').toLowerCase(),
+            source: String(mount?.Source ?? ''),
+            destination: String(mount?.Destination ?? ''),
+            rw: mount?.RW === true,
+        }))),
+    });
+}
+
+function readEngineViewOnce(engine, runner) {
+    const listed = query(runner, engine.name, ['ps', '--all', '--no-trunc', '--format', '{{.ID}}']);
+    if (!listed?.ok) return null;
+    const ids = String(listed.stdout || '').split('\n').map((line) => line.trim()).filter(Boolean);
+    if (!ids.every((id) => /^[0-9a-f]{64}$/.test(id))) return null;
+    if (!ids.length) return [];
+    const inspected = query(runner, engine.name, ['container', 'inspect', ...ids]);
+    // A container removed between the listing and the inspection fails the
+    // whole batch; the caller lists again.
+    if (!inspected?.ok) return null;
+    const records = parseJsonRecords(inspected.stdout);
+    if (records.length !== ids.length) return null;
+    const containers = records.map(engineViewContainer);
+    const seen = new Set(containers.map((container) => container.id));
+    if (seen.size !== ids.length || ids.some((id) => !seen.has(id))) return null;
+    return containers;
+}
+
+/**
+ * Every container of the engine, in any state, with its labels, running state
+ * and mounts: the evidence for the nested-workspace refusal, the quiescence
+ * gate's engine half and the data-path confinement. Fails closed: an engine
+ * that does not answer exactly raises PLOINKY_BOX_DISCOVERY_FAILED.
+ *
+ * @returns {ReadonlyArray<{ id, name, labels, running, mounts }>}
+ */
+export function discoverEngineView(engine, runner, { attempts = 3 } = {}) {
+    if (!engine?.name) throw discoveryError('The engine view requires a reachable Box engine');
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        let containers;
+        try {
+            containers = readEngineViewOnce(engine, runner);
+        } catch (error) {
+            throw discoveryError(`${engine.name} returned malformed container information: ${error.message}`);
+        }
+        if (containers) return Object.freeze(containers);
+    }
+    throw discoveryError(`${engine.name} could not list and inspect every container; nothing was changed`);
+}
+
 function hasWorkspaceOwnership(labels, pathHash, role) {
     return String(labels?.[BOX_LABELS.pathHash] || '') === pathHash
         && String(labels?.[BOX_LABELS.role] || '') === role;

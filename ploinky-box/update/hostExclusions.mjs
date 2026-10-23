@@ -14,6 +14,7 @@ import {
     skillExportRecoveryProblem,
 } from '../../cli/utils/skills/exportTransaction.mjs';
 import { relativeBoxWorkspacePath } from '../contract/workspace-root.mjs';
+import { createHostStaging } from '../hostState/staging.mjs';
 
 // The in-Box core cannot see the host user's Git excludes view, so it defers
 // exclusions for Git targets and lists those export folders (Box spelling) in
@@ -101,6 +102,10 @@ function recordedFolders(stored, identity) {
  *   caller's ownership of SIGINT/SIGTERM, checked before every folder
  * @param {{ write(record: object): unknown, remove(): unknown }} [options.intent]
  *   private host record of the folders whose locks this refresh may hold
+ * @param {string} [options.stagingRoot] host staging directory for the
+ *   planner's capability probe and the Git config copy; by default a private
+ *   `<workspace>/.ploinky-box/tmp/<rand>/` is created for this refresh and
+ *   removed at its end, never a directory in the shared `os.tmpdir()`
  * @returns {Promise<object[]>} operation records
  */
 export async function refreshDeferredHostExclusions({
@@ -112,6 +117,8 @@ export async function refreshDeferredHostExclusions({
     limit = MAX_DEFERRED_EXCLUSION_FOLDERS,
     cancellation = null,
     intent = null,
+    stagingRoot = null,
+    createStaging = createHostStaging,
 } = {}) {
     if (folders === undefined || folders === null) return [];
     if (!Array.isArray(folders)) {
@@ -131,15 +138,6 @@ export async function refreshDeferredHostExclusions({
             details: { listed: unique.length, refreshed: limit },
         }));
     }
-    const planner = createPlanner({
-        authorizeComposition: env.PLOINKY_SKILL_EXCLUDES_COMPOSE === '1',
-        nonGitBlock: false,
-        env,
-        // This runs in the host process that owns the outer Box.
-        containerExecutor: false,
-        // Folders come from the Box; their Git metadata must stay inside the workspace.
-        gitDirBoundary: identity.workspaceRoot,
-    });
     const targets = [];
     const seenHostFolders = new Set();
     for (const boxFolder of selected) {
@@ -217,8 +215,46 @@ export async function refreshDeferredHostExclusions({
             return records;
         }
     }
+    // Folders whose locks may stay held are written back, or the record is
+    // removed when none remain.
+    const settleIntent = (unreleased) => {
+        try {
+            const remaining = [...new Set([...kept, ...unreleased])];
+            if (intent && remaining.length) intent.write(intentRecord(identity, remaining));
+            else intent?.remove();
+        } catch (_) {}
+    };
+    // Host-side staging for this Box operation: the Git config copy and the
+    // capability probe live in the masked host-state directory, not os.tmpdir().
+    let staging = null;
+    let stagingDirectory = stagingRoot;
+    if (!stagingDirectory) {
+        try {
+            staging = createStaging(identity);
+            stagingDirectory = staging.root;
+        } catch (error) {
+            records.push(createOperationRecord({
+                phase: 'skills-manifest', id: 'exclusions:staging', outcome: 'uncertain', required: false,
+                code: 'exclusions-staging-unavailable',
+                reason: `No host exclusions were refreshed: private host staging could not be created (${describeFailure(error)}).`,
+                details: { folders: targets.map(target => target.folder) },
+            }));
+            settleIntent([]);
+            return records;
+        }
+    }
     const unreleased = [];
     try {
+        const planner = createPlanner({
+            authorizeComposition: env.PLOINKY_SKILL_EXCLUDES_COMPOSE === '1',
+            nonGitBlock: false,
+            env,
+            // This runs in the host process that owns the outer Box.
+            containerExecutor: false,
+            // Folders come from the Box; their Git metadata must stay inside the workspace.
+            gitDirBoundary: identity.workspaceRoot,
+            stagingRoot: stagingDirectory,
+        });
         for (const [index, { id, folder }] of targets.entries()) {
             const signal = cancellation ? await cancellation.signalReceived() : '';
             if (signal) {
@@ -233,7 +269,7 @@ export async function refreshDeferredHostExclusions({
                 break;
             }
             try {
-                const result = refresh(folder, { exclusions: planner, authority: HOST_EXCLUSIONS_AUTHORITY });
+                const result = refresh(folder, { exclusions: planner, authority: HOST_EXCLUSIONS_AUTHORITY, stagingRoot: stagingDirectory });
                 const recoveryProblem = skillExportRecoveryProblem(result);
                 if (recoveryProblem) {
                     records.push(exclusionRecord(id, 'uncertain', {
@@ -272,11 +308,8 @@ export async function refreshDeferredHostExclusions({
     } finally {
         // Every other lock was released before its refresh returned. A record
         // left behind costs the next update one inspection of free locks.
-        try {
-            const remaining = [...new Set([...kept, ...unreleased])];
-            if (intent && remaining.length) intent.write(intentRecord(identity, remaining));
-            else intent?.remove();
-        } catch (_) {}
+        settleIntent(unreleased);
+        staging?.release();
     }
     return records;
 }

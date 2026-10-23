@@ -6,6 +6,7 @@ import os from 'os';
 import { execFileSync } from 'child_process';
 
 import { readProcessStartIdentity } from '../../sandbox/processIdentity.js';
+import { assertHostLaunchLockOrder } from '../../sandbox/hostLaunchExclusionState.js';
 
 import { RUNNING_DIR } from '../config.js';
 
@@ -181,6 +182,7 @@ function createWorkspaceMutationLease({
     operation = 'workspace-mutation',
     requireQuiescenceOnOwnerDeath = false,
 } = {}) {
+    assertHostLaunchLockOrder('The workspace mutation lease');
     const existing = inspectWorkspaceStartLock();
     if (existing.recoveryRequired) {
         const error = new Error(existing.malformed

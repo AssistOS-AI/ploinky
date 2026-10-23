@@ -96,7 +96,13 @@ export async function updateHostPloinkySource({
             ...source,
         });
     }
-    const lock = await acquireSourceLock(lockManager, source.lockIdentity);
+    let lock;
+    try {
+        lock = await acquireSourceLock(lockManager, source);
+    } catch (error) {
+        if (error?.code !== 'PLOINKY_SOURCE_LOCK_PATH_INVALID') throw error;
+        throw hostUpdateError(`Unable to update the host Ploinky checkout: ${error.message}`, error);
+    }
     try {
         lock.assertHeld(source.lockIdentity);
         let result;

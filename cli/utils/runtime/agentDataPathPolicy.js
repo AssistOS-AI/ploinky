@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 
+import { hasHostStateComponent } from '../../../ploinky-box/hostState/paths.mjs';
+
 export const AGENT_DATA_POLICY_CODE = 'PLOINKY_AGENT_DATA_POLICY_VIOLATION';
 
 function resolvePolicyWorkspaceRoot(workspaceRoot) {
@@ -294,6 +296,14 @@ export function assertManifestVolumeStoragePolicy(source, {
     const resolvedSource = path.isAbsolute(String(source))
         ? path.resolve(String(source))
         : path.resolve(root, String(source));
+    // The Box host state directory (`<workspace>/.ploinky-box`, of this or any
+    // other workspace) is host-only: no agent volume may resolve into it.
+    if (hasHostStateComponent(resolvedSource) || hasHostStateComponent(projectedCanonicalPath(resolvedSource))) {
+        throw policyError(`manifest volume source '${source}' targets the protected Box host state directory`, {
+            source: String(source),
+            resolvedSource,
+        });
+    }
     // The whole controller root is off limits to manifest volumes: it holds
     // Router and edge state, the dependency store, the registry and secrets.
     // Agent data lives under `.data`; a broad workspace volume still reaches

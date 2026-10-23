@@ -219,9 +219,9 @@ function dataState(identity, fsApi, {
     });
 }
 
-export function workspaceDataMountArgs(identity) {
+export function workspaceDataMountArgs(identity, sources = identity?.dataPaths) {
     return BOX_DATA_KEYS.flatMap((key) => {
-        const source = identity.dataPaths?.[key];
+        const source = sources?.[key];
         const destination = BOX_DATA_MOUNTS[key];
         if (!source || !destination) {
             throw workspaceDataError(`Unknown Box data key ${key}`);

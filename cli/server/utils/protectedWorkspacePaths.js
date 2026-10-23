@@ -1,11 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 
+import { HOST_STATE_DIRECTORY_NAME } from '../../../ploinky-box/constants.mjs';
+import { HOST_STATE_FOLDED_NAME, foldPathName } from '../../../ploinky-box/hostState/paths.mjs';
 import { resolveCanonicalPathAsync, toRealPathSafeAsync } from './workspacePaths.js';
 
 // Router-served workspace files never include controller state (`.ploinky`),
-// agent private data (`.data`) or key material (`master-key`, `*.secrets`, and
-// `.env`, which Ploinky reads for PLOINKY_MASTER_KEY and provider keys).
+// agent private data (`.data`), the Box host state (`.ploinky-box`, at any
+// depth) or key material (`master-key`, `*.secrets`, and `.env`, which
+// Ploinky reads for PLOINKY_MASTER_KEY and provider keys).
 // Repository checkouts under the workspace's `.ploinky/repos` stay readable:
 // Explorer previews, downloads, plugin assets and WebChat source links read
 // agent source there.
@@ -21,12 +24,15 @@ const O_NOFOLLOW_ANY = 0x20000000;
 // or Unicode form (APFS, also through the Box's virtiofs mount), where
 // `.PLOINKY`, `.ploinKy` (Kelvin sign) and `maſter-key` (long s)
 // open the protected entry. Names are compared in that folded form, and
-// trailing dots and spaces are dropped for filesystems that ignore them.
-export function foldWorkspaceName(name) {
-    return String(name).normalize('NFKC').toLowerCase().replace(/[. ]+$/, '');
-}
+// trailing dots and spaces are dropped for filesystems that ignore them. The
+// fold is the Box host-state guards' own (`foldPathName`), so the Router and
+// those guards refuse exactly the same `.ploinky-box` spellings.
+export const foldWorkspaceName = foldPathName;
 
 export function isProtectedWorkspaceSegments(segments) {
+    // `.ploinky-box` as an exact (folded) component at any depth, never as a
+    // name prefix: `.ploinky-box-mcp-sdk.json` and `x.ploinky-box` stay servable.
+    if (segments.some((segment) => segment && foldWorkspaceName(segment) === HOST_STATE_FOLDED_NAME)) return true;
     for (let index = 0; index < segments.length; index += 1) {
         const name = foldWorkspaceName(segments[index]);
         if (PROTECTED_FILE_NAMES.has(name) || name.endsWith(SECRETS_SUFFIX) || name === AGENT_DATA_ROOT) return true;
@@ -54,13 +60,14 @@ async function fileIdentity(target) {
 }
 
 // A top-level entry that the filesystem resolves to the workspace's own
-// `.ploinky` or `.data` directory is that directory, whatever folding rules
-// produced the match.
+// `.ploinky`, `.data` or `.ploinky-box` directory is that directory, whatever
+// folding rules produced the match.
 async function aliasesProtectedRoot(workspaceRoot, segments) {
     if (!foldWorkspaceName(segments[0]).startsWith('.')) return false;
     const entry = await fileIdentity(path.join(workspaceRoot, segments[0]));
     if (!entry) return false;
     if (entry === await fileIdentity(path.join(workspaceRoot, AGENT_DATA_ROOT))) return true;
+    if (entry === await fileIdentity(path.join(workspaceRoot, HOST_STATE_DIRECTORY_NAME))) return true;
     return segments[1] !== REPOSITORIES_DIRECTORY
         && entry === await fileIdentity(path.join(workspaceRoot, CONTROLLER_ROOT));
 }

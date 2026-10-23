@@ -29,9 +29,7 @@ const originalEnv = {
 };
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-repeat-')));
 const workspace = path.join(root, 'workspace');
-const home = path.join(root, 'home');
 fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
-fs.mkdirSync(home);
 process.chdir(workspace);
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 process.env.PLOINKY_ROUTER_HOST_PORT = '8080';
@@ -102,8 +100,8 @@ function compositeFs(fake) {
 }
 
 const lock = { assertHeld() {} };
-const gateStore = createHardwareGateStore({ homeDirectory: home });
-const wire = () => resolveDesiredHardwareWiring({ identity, enabled: true, hostKind: 'podman-machine', homeDirectory: home, initializeStore });
+const gateStore = createHardwareGateStore();
+const wire = () => resolveDesiredHardwareWiring({ identity, enabled: true, hostKind: 'podman-machine', initializeStore });
 const bytesOf = (file) => fs.readFileSync(file);
 
 test('RS.host-env-gate-repeat-and-saved-gate-repeat-select-the-same-wiring-and-rewrite-nothing', () => {

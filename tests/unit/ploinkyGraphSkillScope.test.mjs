@@ -10,6 +10,7 @@ import { GRAPH_SKILL_SCOPE_FILE, readGraphSkillScope, validateGraphSkillScope, w
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeUpdateCore, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 function fixture(t, { symlinkedState = false } = {}) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-scope-')));
@@ -37,6 +38,7 @@ function fixture(t, { symlinkedState = false } = {}) {
         if (!state.initial && containerId === candidate.handles.container.id && state.failAt === 'core') throw new Error('candidate core failed');
     };
     const create = launchCwd => createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         checkHostPrerequisites: () => {},
         env: {}, launchCwd, resolveIdentity: () => identity, discover: () => prior,
         lockManager: { async acquire() {
