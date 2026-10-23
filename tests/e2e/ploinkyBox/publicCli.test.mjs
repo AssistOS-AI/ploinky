@@ -182,6 +182,10 @@ test('installed public shims honor only the environment image override through t
     delete publicEnvironment.PLOINKY_BOX_CANDIDATE_REF;
     delete publicEnvironment.PLOINKY_BOX_REAL_PODMAN;
     delete publicEnvironment.PLOINKY_BOX_PROXY_TRACE_ARTIFACT;
+    // Importing the CLI config (through the native helpers) sets this to the
+    // test's own cwd; the public commands must find the harness workspace
+    // from their own cwd instead.
+    delete publicEnvironment.PLOINKY_WORKSPACE_ROOT;
     function publicCommand(argv, { input } = {}) {
         return run(installedPloinky, argv, {
             cwd: harness.child,
