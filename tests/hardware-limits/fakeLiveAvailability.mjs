@@ -9,7 +9,7 @@
 //   - an agent in the registry but outside the root's closure is an enabled extra, refused on its own;
 //   - a refused or blocked route keeps its logical entry with `hardwareAvailability` and loses every runtime target.
 // Faults (all default off): setterAccepts (the setter commits instead of refusing), restartStatus, settleAfterPolls, omitBlocked, blockedByWrong,
-// routeKeepsTarget, loginStatus, staticAnswer, adminStatus, dropRoute, nestedKeepsRunning, controllersChange, optionalBlocks, extraDropped,
+// routeKeepsTarget, loginAnswer (the whole /auth/login reply), staticAnswer, adminStatus, dropRoute, nestedKeepsRunning, controllersChange, optionalBlocks, extraDropped,
 // omitRefusal, adminListEmpty, setterNotCommitted, refusalBumpsToken, clearKeepsOverride, limitsStatusExit, limitsClearExit, notReadyAtStart (a name), notReady ({ name, from }: not ready from that restart on).
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -176,7 +176,8 @@ export function createFakeAvailability({ base, workspace, root, faults = {} }) {
     async function http({ port, path: requestPath, headers = {} }) {
         ensure();
         model.httpCalls.push({ port, path: requestPath, headers });
-        if (requestPath === '/auth/login') return { status: faults.loginStatus ?? 200, contentType: 'text/html', body: '<html>login</html>', truncated: false };
+        // The fixture declares no authentication: the Router answers /auth/login with its auth_disabled refusal (authRoutes.js).
+        if (requestPath === '/auth/login') return faults.loginAnswer ?? { status: 404, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'auth_disabled' }), truncated: false };
         if (requestPath === '/') {
             const entry = model.status.get(rootName());
             if (faults.staticAnswer === 'startup-page') return { status: 200, contentType: 'text/html', body: '<html>Starting...</html>', truncated: false };
