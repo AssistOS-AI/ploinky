@@ -11,7 +11,7 @@ import path from 'node:path';
 
 import { BOX_HARDWARE_MARKER_PATH, BOX_HARDWARE_STORE_PATH, BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { createHardwareGateStore } from '../../ploinky-box/hardwareLimitsGate.mjs';
-import { BOX_CONTRACT_INSPECT, ID, INSPECT, assertWorkspace, canonicalDigest, checkedJson, jsonDigest, observeEngineFacts } from './liveCommon.mjs';
+import { BOX_CONTRACT_INSPECT, ID, INSPECT, assertAuthDisabledAnswer, assertWorkspace, canonicalDigest, checkedJson, jsonDigest, observeEngineFacts } from './liveCommon.mjs';
 import {
     C5_DRIVER_NAME, createC5Intent, driverSettled, productEngineDigest, productTransitionIds, readDriverReceipt, reconcileC5Custody, sameImage,
 } from './liveBoxTransitionCustody.mjs';
@@ -23,19 +23,8 @@ import {
 export const WRITER_FIRST_CODE = 'PLOINKY_BOX_HARDWARE_LIMITS_STORED';
 const LOGIN = { path: '/auth/login', headers: { accept: 'text/html' } };
 
-// The fixture manifest declares no auth directive and no guest, so the Router's own answer to /auth/login is the auth-disabled JSON refusal
-// (HTTP 404 `{ ok: false, error: 'auth_disabled' }`). It proves the replacement's Router answers through the published loopback port. A 200 would
-// mean the fixture unexpectedly has auth; any other status, a transport error, a timeout, a truncated or unparsable body fails.
-export function assertAuthDisabledAnswer(login) {
-    if (!login || login.error || login.status === null || login.status === undefined) return `The replacement Box's Router did not answer /auth/login (${login?.error ?? 'no response'})`;
-    if (login.status !== 404) return `The replacement Box's Router answered /auth/login with HTTP ${login.status}, not the auth-less fixture's HTTP 404 auth_disabled`;
-    if (login.truncated) return 'The replacement Box\'s /auth/login answer was truncated';
-    if (!/^application\/json\b/i.test(String(login.contentType ?? ''))) return `The replacement Box's /auth/login answer is not JSON (content type ${login.contentType || 'none'})`;
-    let body;
-    try { body = JSON.parse(String(login.body ?? '')); } catch { return 'The replacement Box\'s /auth/login answer is not parsable JSON'; }
-    if (!body || body.ok !== false || body.error !== 'auth_disabled') return `The replacement Box's /auth/login answer is not the Router's auth_disabled refusal (ok ${JSON.stringify(body?.ok)}, error ${JSON.stringify(body?.error)})`;
-    return null;
-}
+// The replacement's Router must give the auth-less fixture's own /auth/login answer; the validator is shared with LIVE-C3V.
+export { assertAuthDisabledAnswer };
 
 // The driver's one stdout line, or null when it printed none.
 export function parseDriverSummary(result) {

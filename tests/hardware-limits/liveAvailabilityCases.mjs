@@ -7,17 +7,18 @@
 // Variant iii (an independently explicit status waiter) has no live producer in this revision: it is declared infeasible, never passed.
 //
 // C3V: in a dedicated workspace and Box, the STATIC agent is the refused fixture. The Router keeps its own controls: the static route answers the
-// terminal unavailable response, /auth/login answers 200, the administrator API answers 200, and the host `limits status` and `limits clear` exit 0.
+// terminal unavailable response, /auth/login answers the auth-less fixture's 404 auth_disabled JSON, the administrator API answers 200, and the host
+// `limits status` and `limits clear` exit 0.
 // The Box is then destroyed and proven absent by the cleanup action (AC-S7-3).
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { blocked, digest } from './liveCommon.mjs';
+import { assertAuthDisabledAnswer, blocked, digest } from './liveCommon.mjs';
 import { ADMIN_REQUEST } from './liveGpuCommands.mjs';
 import { FIXTURE_REPOSITORY, fixtureContainerName } from './liveFixture.mjs';
 import {
     C3_AGENTS, C3V_AGENTS, MANIFEST_ENABLE, NESTED_STATE_FORMAT, STORED_OVERRIDE, VARIANT_III_EVIDENCE, availabilityPolling,
-    assertAdminListsRefused, assertBlockedBy, assertControllersUnchanged, assertExitZero, assertNestedStates, assertReady, assertRefused, assertRoutes, assertRouterControl,
+    assertAdminListsRefused, assertBlockedBy, assertControllersUnchanged, assertExitZero, assertNestedStates, assertReady, assertRefused, assertRoutes,
     assertSetterRefused, assertStaticTerminal, containerOf, d4Manifest, httpProbe, manifestText, parseAdminReply, parseNestedStates, withEnable,
 } from './liveAvailabilityCommands.mjs';
 
@@ -244,8 +245,12 @@ export function createAvailabilityCases({ profile, run, command, engine, core, n
         let terminal;
         try { terminal = assertStaticTerminal(staticReply); } catch (error) { throw fail(error.message, { static: { status: staticReply?.status ?? null, contentType: staticReply?.contentType ?? null, body: String(staticReply?.body ?? '').slice(0, 300), error: staticReply?.error ?? null } }); }
         record('static-route', terminal);
+        // The fixture declares no authentication, so the Router's own /auth/login answer is its auth_disabled refusal, never a 200 login page.
         const login = await http({ port: run.ports.tcp, path: '/auth/login', headers: { accept: 'text/html' } });
-        try { record('auth-login', assertRouterControl('/auth/login', login)); } catch (error) { throw fail(error.message, { login: { status: login?.status ?? null, contentType: login?.contentType ?? null, error: login?.error ?? null } }); }
+        const loginProblem = assertAuthDisabledAnswer(login, 'The dedicated Box\'s');
+        if (loginProblem) throw fail(loginProblem, { login: { status: login?.status ?? null, contentType: login?.contentType ?? null, body: String(login?.body ?? '').slice(0, 300), truncated: login?.truncated ?? null, error: login?.error ?? null } });
+        const loginBody = JSON.parse(login.body);
+        record('auth-login', { status: login.status, contentType: login.contentType, ok: loginBody.ok, error: loginBody.error });
         const adminReply = await adminCall('availability-admin-get', 'GET');
         try { record('admin-api', assertAdminListsRefused(adminReply, { ref, key })); } catch (error) { throw fail(error.message, { admin: { status: adminReply.status, body: adminReply.text.slice(0, 300) } }); }
         const status = await command('availability-limits-status', profile.node.path, [profile.candidate.path, 'limits', 'status'], { deadlineMs: 120000, tolerate: true, capture: 'availability-limits-status' });

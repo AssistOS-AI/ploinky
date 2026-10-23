@@ -68,6 +68,21 @@ export function absolute(value) {
 export function bounded(value, max = 4096) { return typeof value === 'string' && value.length > 0 && value.length <= max; }
 export function blocked(message) { return Object.assign(new Error(message), { code: 'LIVE_PREREQUISITE_MISSING' }); }
 
+// The fixture manifest declares no auth directive and no guest, so the Router's own answer to /auth/login is the auth-disabled JSON refusal
+// (HTTP 404 `{ ok: false, error: 'auth_disabled' }`). It proves a Box's Router answers through the published loopback port. A 200 would
+// mean the fixture unexpectedly has auth; any other status, a transport error, a timeout, a truncated or unparsable body fails. `subject`
+// names the Box in the problem (LIVE-C5's replacement Box by default, LIVE-C3V's dedicated Box).
+export function assertAuthDisabledAnswer(login, subject = 'The replacement Box\'s') {
+    if (!login || login.error || login.status === null || login.status === undefined) return `${subject} Router did not answer /auth/login (${login?.error ?? 'no response'})`;
+    if (login.status !== 404) return `${subject} Router answered /auth/login with HTTP ${login.status}, not the auth-less fixture's HTTP 404 auth_disabled`;
+    if (login.truncated) return `${subject} /auth/login answer was truncated`;
+    if (!/^application\/json\b/i.test(String(login.contentType ?? ''))) return `${subject} /auth/login answer is not JSON (content type ${login.contentType || 'none'})`;
+    let body;
+    try { body = JSON.parse(String(login.body ?? '')); } catch { return `${subject} /auth/login answer is not parsable JSON`; }
+    if (!body || body.ok !== false || body.error !== 'auth_disabled') return `${subject} /auth/login answer is not the Router's auth_disabled refusal (ok ${JSON.stringify(body?.ok)}, error ${JSON.stringify(body?.error)})`;
+    return null;
+}
+
 export function receipt(value) {
     keys(value, ['path', 'uid', 'dev', 'ino', 'marker'], 'workspace receipt');
     if (!absolute(value.path) || !Number.isSafeInteger(value.uid) || value.uid < 0
