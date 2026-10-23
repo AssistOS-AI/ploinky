@@ -2219,6 +2219,7 @@ test('guarded native start reuses the same stopped Box and validates dependencie
     h.seams.verifyExistingDependencies = () => { dependencyChecks++; };
     h.seams.discover = (() => { const original = h.seams.discover; return () => ({ ...original(), engine: { name: 'podman', identity: 'engine' } }); })();
     let starts = 0;
+    let gpuScans = 0;
     const supervisor = createBoxSupervisor({ hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         repositoryRoot: state.root, launchCwd: state.identity.workspaceRoot,
         env: {}, platform: 'linux', resolveIdentity: () => state.identity, discover,
@@ -2229,9 +2230,11 @@ test('guarded native start reuses the same stopped Box and validates dependencie
         readEdgeDesired: () => null, resolveHostReachableIpv4: async () => '', captureCoreStartArgv: () => null,
         startCore: async () => { starts++; }, healthCheck: async () => {},
         revalidateAgentLibSource() {}, commitAgentLibSelection() {},
-        scanGpuAgents() { assert.fail('guarded resume must not discover new GPU declarations'); },
+        // A failure thrown here would be swallowed by the GPU re-check, so the call is counted instead.
+        scanGpuAgents() { gpuScans++; return []; },
     });
     const result = await supervisor.runStartTransaction(['start'], { requireExistingContainerId: current.id });
+    assert.equal(gpuScans, 0, 'guarded resume must not discover new GPU declarations');
     assert.equal(result.containerId, current.id);
     assert.equal(starts, 1);
     assert.equal(dependencyChecks, 2);
