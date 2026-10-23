@@ -11,7 +11,7 @@
     }
   ],
   "counts": {
-    "live": 806,
+    "live": 796,
     "offline": 10
   },
   "checks": [
@@ -3686,102 +3686,6 @@
       ],
       "boundary": "agents",
       "source": "agent-probes.mjs agentReadTools"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.resources.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.resources.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.resources.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.resources.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.resources.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.discovery.resources.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.tools.list.anonymous",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.tools.list.positive",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": null,
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.tools.list.selfRegistered",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.tools.list.userA",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
-    },
-    {
-      "id": "agent.umamiAgent.discovery.tools.list.userB",
-      "kind": "live",
-      "count": 1,
-      "positiveControlAnyOf": [
-        "agent.umamiAgent.discovery.tools.list.positive"
-      ],
-      "boundary": "agents",
-      "source": "agent-probes.mjs discoverAgentMcp"
     },
     {
       "id": "agent.username-admin.monitor-denial",

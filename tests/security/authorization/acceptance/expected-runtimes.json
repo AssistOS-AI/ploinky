@@ -14,9 +14,9 @@
     "DocumentationSkills"
   ],
   "counts": {
-    "total": 27,
-    "enabled": 16,
-    "disabled": 11
+    "total": 28,
+    "enabled": 15,
+    "disabled": 13
   },
   "enabled": [
     {
@@ -72,10 +72,6 @@
       "agent": "local-llm"
     },
     {
-      "repo": "UmamiAgent",
-      "agent": "umamiAgent"
-    },
-    {
       "repo": "webmeet",
       "agent": "liveKitServerAgent"
     },
@@ -120,6 +116,14 @@
     {
       "repo": "OnlyOfficeAgent",
       "agent": "onlyOffice"
+    },
+    {
+      "repo": "UmamiAgent",
+      "agent": "umamiAgent"
+    },
+    {
+      "repo": "webmeet",
+      "agent": "moderator"
     },
     {
       "repo": "webmeet",
