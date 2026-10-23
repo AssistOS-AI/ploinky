@@ -10,6 +10,11 @@ import { parseOuterArguments } from '../../../ploinky-box/command/parse.mjs';
 import { routeOuterCommand } from '../../../ploinky-box/command/route.mjs';
 import { readSmokeGraphInputs, stageSmokeGraph } from '../../../ploinky-box/smoke/graph.mjs';
 import {
+    ALLOW_HOST_PROCESSES_ENV,
+    allowHostProcessArgs,
+    allowHostProcessesFromEnv,
+} from '../../helpers/allowHostProcesses.mjs';
+import {
     readProxyTrace,
     writeCandidatePodmanProxy,
 } from './candidatePodmanProxy.mjs';
@@ -116,7 +121,13 @@ test('installed public shims honor only the environment image override through t
     if (!candidateReference) return;
     const harness = createPodmanHarness(t, candidateReference);
     const graph = readSmokeGraphInputs(process.env, { runner: harness.runner });
-    const publicGraphArgs = ['--udp-port', '17892', ...graph.args];
+    // The public CLI children only see their own arguments, so the explicit
+    // allowance reaches their Box creation as `--allow-host-process PID`.
+    const allowHostProcesses = allowHostProcessesFromEnv();
+    if (allowHostProcesses.length) t.diagnostic(`${ALLOW_HOST_PROCESSES_ENV}: excusing ${allowHostProcesses.join(', ')}`);
+    const publicGraphArgs = [
+        ...allowHostProcessArgs(allowHostProcesses), '--udp-port', '17892', ...graph.args,
+    ];
     const startRoute = routeOuterCommand(parseOuterArguments(publicGraphArgs));
     assert.equal(startRoute.kind, 'start');
 
@@ -168,7 +179,6 @@ test('installed public shims honor only the environment image override through t
     });
     const publicEnvironment = {
         ...process.env,
-        HOME: harness.lockHome,
         ...(harness.engineEnvironment.XDG_CONFIG_HOME
             ? { XDG_CONFIG_HOME: harness.engineEnvironment.XDG_CONFIG_HOME }
             : {}),

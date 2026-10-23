@@ -162,10 +162,7 @@ export function createPodmanHarness(t, candidateReference, {
     });
     const workspace = path.join(root, workspaceName);
     const child = path.join(workspace, 'child');
-    // A private HOME for the CLI child processes the tests start; host state is kept in the workspace.
-    const lockHome = path.join(root, 'lock-home');
     fs.mkdirSync(child, { recursive: true });
-    fs.mkdirSync(lockHome);
     const lookupRunner = createProcessRunner({
         env: buildEngineProcessEnvironment(process.env),
     });
@@ -227,7 +224,6 @@ export function createPodmanHarness(t, candidateReference, {
         root,
         workspace,
         child,
-        lockHome,
         runner,
         supervisor,
         identity,

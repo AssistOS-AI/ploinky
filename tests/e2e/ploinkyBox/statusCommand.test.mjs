@@ -166,7 +166,6 @@ test('public status renders the core workspace view without mutating Box state',
     const runtimeBefore = inBoxRuntimeInventory(prepared.containerId, harness);
     const environment = {
         ...process.env,
-        HOME: harness.lockHome,
         ...(harness.engineEnvironment.XDG_CONFIG_HOME
             ? { XDG_CONFIG_HOME: harness.engineEnvironment.XDG_CONFIG_HOME }
             : {}),
