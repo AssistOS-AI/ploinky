@@ -9,7 +9,11 @@ import { BOX_LABELS, BOX_MEDIA_PORT, resolveBoxImageReference } from './constant
 import { discoverBoxOwnership } from './engine/discovery.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from './identity.mjs';
 import { IMAGE_OBSERVATION_UNAVAILABLE, inspectAndValidateImage, normalizeImageInspect, validateImageContract } from './contract/image.mjs';
-import { observeContainerRouterBinding, validateContainerConfiguration } from './contract/container.mjs';
+import {
+    observeContainerRouterBinding,
+    validateContainerConfiguration,
+    validateContainerPublications,
+} from './contract/container.mjs';
 import { agentLibContractFromContainer } from './contract/agentlib.mjs';
 import {
     assertBoxWorkspaceRoot,
@@ -280,19 +284,29 @@ export function validateCurrentBox({ ownership, identity, repositoryRoot, runner
     const container = ownership.handles?.container;
     if (!container) return;
     const imageRef = container.labels?.[BOX_LABELS.imageRef];
+    const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
+    const mediaHostPort = Number(container.labels?.[BOX_LABELS.mediaHostPort]);
+    // Discovery: a legacy `N:7882` Box is observed and reported, not rejected.
+    const { mediaContainerPort } = validateContainerPublications(
+        container, hostPort, mediaHostPort, null, { observeLegacyMedia: true },
+    );
     // Check the selected filesystem boundary before running any process inside it.
     validateContainerConfiguration(container, {
         identity, repositoryRoot, imageRef, imageId: container.runtime?.imageId,
         dataFingerprints: inspectWorkspaceDataPaths({ identity }).fingerprints,
         agentLib: agentLibContractFromContainer(container),
-        hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
-        mediaHostPort: Number(container.labels?.[BOX_LABELS.mediaHostPort]),
+        hostPort,
+        mediaHostPort,
+        mediaContainerPort,
         hostKind: ownership.engine?.hostKind,
     });
     const inspected = runner.query('podman', ['image', 'inspect', container.runtime.imageId]);
     if (!inspected.ok) throw new Error(`Cannot inspect the current Box image: ${inspected.stderr}`);
     const image = validateImageContract(normalizeImageInspect(inspected.stdout), imageRef);
     if (image.immutableId !== container.runtime.imageId) throw new Error('Current Box immutable image identity changed');
+    return mediaContainerPort === mediaHostPort
+        ? undefined
+        : Object.freeze({ mediaNotice: `legacy media target ${mediaContainerPort} (replaced on next start)` });
 }
 
 /**
@@ -517,7 +531,13 @@ export async function diagnoseWorkspace({
         ownership = await stage('workspace.ownership', 'Inspect the selected Box ownership', async () => {
             const found = discover(identity, { runner, platform, env });
             if (!['absent', 'owned'].includes(found.state)) throw new Error(found.message || `Workspace is ${found.state}`);
-            if (found.handles?.container) admitCurrentBox({ ownership: found, identity, repositoryRoot, runner });
+            const admitted = found.handles?.container
+                ? admitCurrentBox({ ownership: found, identity, repositoryRoot, runner })
+                : undefined;
+            if (admitted?.mediaNotice) {
+                checks.push({ id: 'workspace.media', label: 'Current Box media UDP target', status: 'warn',
+                    detail: clean(admitted.mediaNotice), next: 'Run ploinky start to replace the Box with a media listener that matches its published port.' });
+            }
             return found;
         });
     }

@@ -52,6 +52,10 @@ export function resolveEffectiveHostPort({
             container,
             existingHostPort,
             existingMediaHostPort,
+            null,
+            // Discovery: a Box created before the in-Box listener followed the
+            // host port is observed here and replaced by a coherent start.
+            { observeLegacyMedia: true },
         );
     }
     if (ownership?.state !== 'absent'
@@ -227,7 +231,7 @@ export async function preflightPublications({
         mediaHostPort: mediaPort,
         address: bindAddress,
         tcp: `${bindAddress}:${port}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
-        udp: `0.0.0.0:${mediaPort}:${BOX_MEDIA_PORT}/udp`,
+        udp: `0.0.0.0:${mediaPort}:${mediaPort}/udp`,
         reusedSelfReservation: !tcpAvailable || !udpAvailable,
         // A self-reservation is only a hypothesis until the old listener is
         // gone; the lifecycle proves it before creating the candidate.

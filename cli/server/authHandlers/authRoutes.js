@@ -38,7 +38,6 @@ import {
     renderAuthErrorHtml,
     renderLoggedOutHtml,
     renderLogoutConfirmationHtml,
-    renderSsoLoginHtml,
 } from './authPages.js';
 import { LOGIN_FAILURE, resolvePublicLoginError } from './loginErrors.js';
 
@@ -330,15 +329,10 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             if (!bindingCookieName || !browserBinding) throw new Error('Invalid authorization browser binding');
             appendSetCookie(res, buildLoginBindingCookie(bindingCookieName, browserBinding, baseUrl,
                 Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000))));
-            res.writeHead(200, {
-                'Content-Type': 'text/html; charset=utf-8',
-                'Cache-Control': 'no-store'
-            });
-            res.end(renderSsoLoginHtml({
-                agentName: authContext.boundHostRouteKey || authContext.routeKey,
-                returnTo,
-                redirectUrl
-            }));
+            // Browsers store the binding cookie from the redirect response itself,
+            // so no intermediate page is needed before the provider.
+            res.writeHead(303, { Location: redirectUrl, 'Cache-Control': 'no-store' });
+            res.end();
             appendLog('auth_login_redirect', { returnTo });
             return true;
         }

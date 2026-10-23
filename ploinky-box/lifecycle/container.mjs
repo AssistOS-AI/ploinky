@@ -6,6 +6,7 @@ import {
     BOX_DATA_KEYS,
     BOX_LABELS,
     BOX_MEDIA_PORT,
+    BOX_MEDIA_PORT_ENV,
     BOX_READY_LINE,
     BOX_ROUTER_CONTAINER_PORT,
     BOX_ROUTER_HEALTH_SOCKET,
@@ -173,7 +174,7 @@ export function containerCreateArgs({
         '--security-opt', `seccomp=${seccompProfile.path}`,
         ...(networkMode ? ['--network', networkMode] : []),
         '--publish', `${publication.address}:${hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
-        '--publish', `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
+        '--publish', `0.0.0.0:${mediaHostPort}:${mediaHostPort}/udp`,
         '--tmpfs', tmpfsCreateArgument(),
         '--volume', `${source}:/opt/ploinky:ro`,
         // The selected workspace keeps its host path inside the Box, which is
@@ -198,6 +199,11 @@ export function containerCreateArgs({
         '--env', `PLOINKY_ROUTER_HEALTH_SOCKET=${BOX_ROUTER_HEALTH_SOCKET}`,
         ...(publication.hosts
             ? ['--env', `${PUBLIC_ROUTER_HOSTS_ENV}=${serializePublicRouterHosts(publication.hosts)}`]
+            : []),
+        // The in-Box media listener equals the published host port. The default
+        // port carries no variable, so default Boxes stay byte-identical.
+        ...(Number(mediaHostPort) !== BOX_MEDIA_PORT
+            ? ['--env', `${BOX_MEDIA_PORT_ENV}=${String(mediaHostPort)}`]
             : []),
         ...Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
         '--cidfile', cidfile,

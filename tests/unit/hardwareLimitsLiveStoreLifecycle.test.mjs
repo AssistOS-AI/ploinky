@@ -23,7 +23,7 @@ const BLOCK = 'apparatus-store';
 const REPOSITORY = fs.realpathSync(new URL('../..', import.meta.url).pathname);
 const SECCOMP = fs.readFileSync(path.join(REPOSITORY, 'ploinky-box/seccomp/podman-nested-pid-fallback.json'));
 const real = ms => new Promise(resolve => setTimeout(resolve, ms));
-const SEAMS = { sleep: real, polling: { deadlineMs: 15000, intervalMs: 20 }, routerPolling: { deadlineMs: 15000, intervalMs: 20 }, http: async () => ({ status: 200, contentType: 'text/html', body: '' }) };
+const SEAMS = { sleep: real, polling: { deadlineMs: 15000, intervalMs: 20 }, routerPolling: { deadlineMs: 15000, intervalMs: 20 }, http: async () => ({ status: 303, contentType: 'text/html', body: '' }) };
 const LIFECYCLE_KEYS = ['restart-on', 'writer-first', 'writer-first-clear', 'transition-first', 'final-generation', 'c5-receipt'];
 
 async function liveWorld(t, { faults = {}, lifecycleFaults = {} } = {}) {
@@ -237,8 +237,8 @@ test('X5.c5-lifecycle-the-final-proof-of-the-replacement-names-what-is-wrong-wit
         const outcome = await fails(t, editReplacement(edit), pattern, { cleanup });
         assert.ok(outcome.context.fake.model.driverRuns.some(entry => entry.mode === 'transition'), label);
     }
-    // The Router of the replacement must answer /auth/login with 200.
-    await fails(t, { seams: { ...SEAMS, http: async () => ({ status: 503, contentType: 'text/html' }) } }, /does not answer \/auth\/login with HTTP 200/);
+    // The Router of the replacement must answer /auth/login with 303.
+    await fails(t, { seams: { ...SEAMS, http: async () => ({ status: 503, contentType: 'text/html' }) } }, /does not answer \/auth\/login with HTTP 303/);
 });
 
 test('X5.c5-lifecycle-artifacts-and-the-stager-require-the-c5-evidence-and-a-cleanup-proof-of-this-action-and-run', () => {

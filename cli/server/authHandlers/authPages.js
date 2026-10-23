@@ -309,49 +309,8 @@ function renderAuthErrorHtml({
 </html>`;
 }
 
-function renderSsoLoginHtml({ returnTo = '/', redirectUrl = '' } = {}) {
-    const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
-    const safeRedirectUrl = escapeHtml(redirectUrl || '#');
-    return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Sign in</title>
-  <style>
-    ${getAuthPageStyles()}
-  </style>
-</head>
-<body>
-  <main class="auth-shell">
-    <section class="auth-card">
-      <div class="auth-kicker">Workspace Access</div>
-      <h1>Continue with Single Sign-On</h1>
-      <p>Redirecting you to the identity provider to sign in.</p>
-      <div class="auth-actions">
-        <a class="auth-btn" href="${safeRedirectUrl}">Continue</a>
-        <a class="auth-btn secondary" href="${safeReturnTo}">Back</a>
-      </div>
-      <div class="auth-meta">If nothing happens, use Continue to open the sign-in page.</div>
-    </section>
-    <aside class="auth-side">
-      <div class="auth-side-label">Workspace</div>
-      <div class="auth-side-title">Centralized identity for workspace apps</div>
-      <p>Single Sign-On protects routed applications and MCP endpoints under the same workspace policy.</p>
-    </aside>
-  </main>
-  <script>
-    window.setTimeout(function () {
-      window.location.replace(${JSON.stringify(redirectUrl || '/')});
-    }, 120);
-  </script>
-</body>
-</html>`;
-}
-
 export {
     renderAuthErrorHtml,
     renderLoggedOutHtml,
     renderLogoutConfirmationHtml,
-    renderSsoLoginHtml,
 };

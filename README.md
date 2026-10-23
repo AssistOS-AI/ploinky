@@ -277,7 +277,7 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky restart AGENT` | Replace one agent's runtime in the existing Box generation; a routed managed container is drained and replaced only after it exits 0 within 35 seconds, otherwise its route stays draining and automatic replacement is blocked |
 | `ploinky restart AGENT --accept-failed-drain CONTAINER_ID` | Replace the stopped container whose targeted drain was refused (its full `containerId` from `.ploinky/agents.json`), accepting possible loss of data it did not persist, and reopen the route after readiness |
-| `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
+| `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; the in-Box Router target remains `8080/tcp` and the in-Box media listener equals the selected UDP port (default `7882/udp`) |
 | `ploinky bind [ADDRESS:PORT:8080]` | Publish the public Router on this machine's IPv4 `ADDRESS` (`0` for all interfaces) and TCP `PORT`; recreate the Box and restart the configured graph when the mapping changes; save the binding for later lifecycle commands |
 | `ploinky bind 127.0.0.1:PORT:8080` | Restore local-only Router access |
 | `ploinky gpu grant [--agent REPO/AGENT] [--vendor VENDOR]` | Let the named agents use the host NVIDIA GPU and lift their denies; without `--agent`, lift a workspace-wide revoke so manifest-declared agents get the GPU again; recreate the Box with the device nodes and read-only driver libraries and restart the configured graph when the wiring changes |
@@ -485,14 +485,17 @@ secrets.
 
 Every managed box has exactly two engine publications, independent of graph or
 workspace state: `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and
-`0.0.0.0:<selectedMediaHostPort>:7882/udp`. Only an explicit `ploinky bind`
+`0.0.0.0:<selectedMediaHostPort>:<selectedMediaHostPort>/udp`. Only an explicit `ploinky bind`
 replaces the Router's loopback address with `0.0.0.0` or one IPv4 address of this
 host, as described in
 [Publishing the Router on a host network interface](#publishing-the-router-on-a-host-network-interface).
-`--port` changes only the physical Router port. `--udp-port` changes only the physical media UDP port and defaults
-to `7882`; the in-Box LiveKit listener remains fixed on wildcard UDP `7882`.
+`--port` changes only the physical Router port. `--udp-port` selects the media UDP port, which is both the physical-host port
+and the in-Box listener port, and defaults to `7882`; the default publication stays `7882:7882`. A Box with a non-default
+media port exports it to in-Box processes as `PLOINKY_BOX_MEDIA_PORT`; the default Box carries no such variable.
 For example, `ploinky --port 9090 --udp-port 12345 start explorer` publishes
-host TCP `9090` to in-Box TCP `8080` and host UDP `12345` to in-Box UDP `7882`.
+host TCP `9090` to in-Box TCP `8080` and host UDP `12345` to in-Box UDP `12345`.
+A Box created by an earlier revision with a non-default host port and in-Box target `7882` is reported as
+`legacy media target 7882 (replaced on next start)` and is replaced by the next `ploinky start`.
 `--publish`, `--expose`, and `--listen-lan` are rejected. Agent `openPorts`,
 HTTP-service targets, readiness, profiles, manifests, labels, and retained state
 remain private and cannot add a third mapping. A managed Box creates its sole

@@ -121,10 +121,9 @@ test('login delegates to SSO and old local login/account requests fail over HTTP
     t.after(() => new Promise((resolve) => server.close(resolve)));
     const base = `http://127.0.0.1:${server.address().port}`;
     const headers = { cookie: `ploinky_jwt=${localToken}` };
-    const login = await fetch(`${base}/auth/login?returnTo=/files`, { headers });
-    const loginHtml = await login.text();
-    assert.equal(login.status, 200, loginHtml);
-    assert.match(loginHtml, /\/identity\/login/);
+    const login = await fetch(`${base}/auth/login?returnTo=/files`, { headers, redirect: 'manual' });
+    assert.equal(login.status, 303, await login.text());
+    assert.equal(login.headers.get('location'), `${base}/identity/login`);
     assert.equal(beginLogin.mock.callCount(), 1);
     assert.ok(login.headers.get('set-cookie').includes('HttpOnly'));
     const passwordPost = await fetch(`${base}/auth/login`, { method: 'POST', headers, body: 'username=old-admin&password=fixture+password' });

@@ -607,9 +607,8 @@ test('browser auth host binding rejects selector switches and ignores raw candid
         new URL(fixedReq.url, 'http://explorer.localhost:8080'),
         { routePlan },
     );
-    assert.equal(fixedRes.statusCode, 200);
-    assert.match(fixedRes.body, /Single Sign-On/);
-    assert.doesNotMatch(fixedRes.body, /name="agent"/);
+    assert.equal(fixedRes.statusCode, 303);
+    assert.equal(fixedRes.getHeader('location'), '/identity/login');
 
     routePlan.lease.commit = () => false;
     const staleRes = new MockResponse();
@@ -979,8 +978,8 @@ test('SSO login and callback keep every return target inside the normalized same
             new URL(req.url, 'http://localhost'),
             { routePlan: createRoutePlan() },
         );
-        assert.equal(res.statusCode, 200);
-        assert.doesNotMatch(res.body, /evil\.example/);
+        assert.equal(res.statusCode, 303);
+        assert.equal(res.getHeader('location'), 'https://identity.example.test/authorize');
     }
     assert.deepEqual(observedReturnTargets, Array(5).fill('/'));
 
@@ -997,7 +996,7 @@ test('SSO login and callback keep every return target inside the normalized same
         new URL(validReq.url, 'http://localhost'),
         { routePlan: createRoutePlan() },
     );
-    assert.equal(validRes.statusCode, 200);
+    assert.equal(validRes.statusCode, 303);
     assert.equal(observedReturnTargets.at(-1), validTarget);
 
     authService.handleCallback = async () => ({
@@ -2208,8 +2207,8 @@ test('temporary login retries preserve secondary-agent selection and the request
 
         unavailable = false;
         const retried = await dispatch(`${retry.pathname}${retry.search}`);
-        assert.equal(retried.statusCode, 200, retried.body);
-        assert.match(retried.body, /Single Sign-On/);
+        assert.equal(retried.statusCode, 303, retried.body);
+        assert.equal(retried.getHeader('location'), '/identity/login');
         assert.ok(retried.getHeader('set-cookie'));
         assert.equal(calls.at(-1).prompt, prompt);
         assert.equal(calls.at(-1).returnTo, expectedReturnTo);

@@ -6,6 +6,7 @@ import {
     BOX_DATA_MOUNTS,
     BOX_LABELS,
     BOX_MEDIA_PORT,
+    BOX_MEDIA_PORT_ENV,
     BOX_ROUTER_CONTAINER_PORT,
     BOX_ROUTER_HEALTH_SOCKET,
     BOX_TMPFS,
@@ -252,11 +253,19 @@ export function observeContainerRouterBinding(containerHandle) {
     return Object.freeze({ address, hosts });
 }
 
+// The media UDP publication targets the same in-Box port as the host port.
+// Strict validation (create, restore, reuse of a known shape) requires exactly
+// that. Discovery callers pass `observeLegacyMedia` so that a Box created before
+// the in-Box listener followed the host port (`N:7882`) can be observed,
+// reported, and replaced instead of making every command fail. An exact
+// `mediaContainerPort` (the shape a discovery caller observed) is accepted only
+// as the host port itself or, for a non-default host port, the legacy 7882.
 export function validateContainerPublications(
     containerHandle,
     expectedHostPort,
     expectedMediaHostPort = BOX_MEDIA_PORT,
     expectedBinding = null,
+    { observeLegacyMedia = false, mediaContainerPort = undefined } = {},
 ) {
     const runtime = containerHandle?.runtime;
     const port = String(expectedHostPort);
@@ -280,7 +289,20 @@ export function validateContainerPublications(
             );
         }
     }
-    const expected = [
+    const legacyShapeAllowed = mediaPort !== String(BOX_MEDIA_PORT);
+    let acceptedContainerPorts = [mediaPort];
+    if (mediaContainerPort !== undefined) {
+        const exact = String(mediaContainerPort);
+        if (exact !== mediaPort && !(legacyShapeAllowed && exact === String(BOX_MEDIA_PORT))) {
+            throw publicationError(
+                `Owned Box media container port ${exact} is not a supported shape for host port ${mediaPort}`,
+            );
+        }
+        acceptedContainerPorts = [exact];
+    } else if (observeLegacyMedia === true && legacyShapeAllowed) {
+        acceptedContainerPorts = [mediaPort, String(BOX_MEDIA_PORT)];
+    }
+    const expectedFor = (containerPort) => [
         {
             containerPort: String(BOX_ROUTER_CONTAINER_PORT),
             protocol: 'tcp',
@@ -288,19 +310,23 @@ export function validateContainerPublications(
             hostPort: port,
         },
         {
-            containerPort: String(BOX_MEDIA_PORT),
+            containerPort,
             protocol: 'udp',
             hostIp: '0.0.0.0',
             hostPort: mediaPort,
         },
     ].sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
-    if (JSON.stringify(runtime.publications) !== JSON.stringify(expected)) {
+    const observedPublications = JSON.stringify(runtime.publications);
+    const matchedContainerPort = acceptedContainerPorts
+        .find((containerPort) => observedPublications === JSON.stringify(expectedFor(containerPort)));
+    if (matchedContainerPort === undefined) {
         throw publicationError(
             'Owned Box publications do not match the fixed TCP/UDP contract: '
-            + `observed=${JSON.stringify(runtime.publications)} `
-            + `expected=${JSON.stringify(expected)}`,
+            + `observed=${observedPublications} `
+            + `expected=${JSON.stringify(expectedFor(acceptedContainerPorts[0]))}`,
         );
     }
+    const expected = expectedFor(matchedContainerPort);
     if (containerHandle.labels?.[BOX_LABELS.routerHostPort] !== port) {
         throw publicationError('Owned Box host-port label does not match its publication');
     }
@@ -319,6 +345,7 @@ export function validateContainerPublications(
     return Object.freeze({
         hostPort: Number(port),
         mediaHostPort: Number(mediaPort),
+        mediaContainerPort: Number(matchedContainerPort),
         address: binding.address,
         hosts: binding.hosts,
         tcp: expected.find((item) => item.protocol === 'tcp'),
@@ -333,6 +360,9 @@ export function validateContainerConfiguration(containerHandle, {
     agentLib,
     hostPort,
     mediaHostPort = BOX_MEDIA_PORT,
+    // The one exact in-Box media port this check expects. Only discovery
+    // callers that observed a legacy shape pass anything but the default.
+    mediaContainerPort = mediaHostPort,
     routerBinding = null,
     imageId,
     imageRef,
@@ -349,7 +379,13 @@ export function validateContainerConfiguration(containerHandle, {
     assertRouterBindingStateConfined(identity);
     const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
     assertBoxPloinkySource(containerHandle?.runtime, repositoryRoot);
-    const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort, routerBinding);
+    const publication = validateContainerPublications(
+        containerHandle,
+        hostPort,
+        mediaHostPort,
+        routerBinding,
+        { mediaContainerPort },
+    );
     const gpuWiring = gpu === undefined
         ? observeContainerGpuWiring(containerHandle, { identity })
         : gpu;
@@ -436,6 +472,11 @@ export function validateContainerConfiguration(containerHandle, {
         PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET,
         ...(publication.hosts
             ? { [PUBLIC_ROUTER_HOSTS_ENV]: serializePublicRouterHosts(publication.hosts) }
+            : {}),
+        // A Box whose media listener is not the default carries the port; the
+        // default Box and a legacy `N:7882` Box carry no variable.
+        ...(publication.mediaContainerPort !== BOX_MEDIA_PORT
+            ? { [BOX_MEDIA_PORT_ENV]: String(publication.mediaContainerPort) }
             : {}),
     };
     const observedEnvironment = { ...runtime.environment };

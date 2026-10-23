@@ -96,7 +96,7 @@ export const inspectModel = record => ({
         Memory: record.memory ?? 0, MemorySwap: record.memorySwap ?? 0, NanoCpus: record.nanoCpus ?? 0, CpuQuota: record.cpuQuota ?? 0, CpuPeriod: record.cpuPeriod ?? 0, PidsLimit: record.pidsLimit ?? 0,
         Privileged: record.privileged ?? false, CapAdd: record.capAdd ?? ['SYS_ADMIN', 'NET_ADMIN'], CapDrop: record.capDrop ?? null, SecurityOpt: record.securityOpt ?? ['label=disable'], Init: record.init ?? true,
         NetworkMode: record.networkMode ?? 'bridge', UsernsMode: record.usernsMode ?? 'private', Devices: record.devices ?? [],
-        PortBindings: record.portBindings ?? { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '23456' }], '7882/udp': [{ HostIp: '0.0.0.0', HostPort: '34567' }] },
+        PortBindings: record.portBindings ?? { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '23456' }], '34567/udp': [{ HostIp: '0.0.0.0', HostPort: '34567' }] },
     },
 });
 const psModel = record => ({

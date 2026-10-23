@@ -219,16 +219,16 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
             noHardwareBinds: !destinations.includes(BOX_HARDWARE_STORE_PATH) && !destinations.includes(BOX_HARDWARE_MARKER_PATH),
             workspaceMounted: mounts.some(mount => mount.Source === profile.workspace.path && mount.Destination === profile.workspace.path && mount.RW === true),
             sourceMounted: mounts.some(mount => mount.Destination === '/opt/ploinky' && mount.Source === profile.source.root && mount.RW === false),
-            publications: JSON.stringify(Object.keys(contract.publications || {}).sort()) === JSON.stringify(['7882/udp', '8080/tcp'])
+            publications: JSON.stringify(Object.keys(contract.publications || {}).sort()) === JSON.stringify([`${run.ports.udp}/udp`, '8080/tcp'].sort())
                 && (contract.publications['8080/tcp'] || []).length === 1 && contract.publications['8080/tcp'][0].HostIp === '127.0.0.1' && String(contract.publications['8080/tcp'][0].HostPort) === String(run.ports.tcp)
-                && (contract.publications['7882/udp'] || []).length === 1 && String(contract.publications['7882/udp'][0].HostPort) === String(run.ports.udp),
+                && (contract.publications[`${run.ports.udp}/udp`] || []).length === 1 && String(contract.publications[`${run.ports.udp}/udp`][0].HostPort) === String(run.ports.udp),
             unprivileged: contract.privileged === false,
         };
         const wrong = Object.entries(checks).filter(([, ok]) => !ok).map(([name]) => name);
         if (wrong.length) throw fail(`The replacement Box ${String(current.id).slice(0, 12)} is not the gate-off generation the transition committed (${wrong.join(', ')})`, { checks, labels: Object.keys(labels).sort(), destinations });
         // The Router of the replacement answers as a browser's address would reach it.
         const login = await http({ port: run.ports.tcp, path: LOGIN.path, headers: LOGIN.headers });
-        if (login?.status !== 200) throw fail('The replacement Box\'s Router does not answer /auth/login with HTTP 200', { status: login?.status ?? null, error: login?.error ?? null });
+        if (login?.status !== 303) throw fail('The replacement Box\'s Router does not answer /auth/login with HTTP 303', { status: login?.status ?? null, error: login?.error ?? null });
         const host = await view(identity(), 'host', 'after the committed transition');
         if (host.count !== 0 || host.barrier || host.lock) throw fail('The store is not empty and free after the committed transition', { count: host.count, barrier: host.barrier, lock: host.lock });
         if (tokenKey(host.token) !== tokenKey(token)) throw fail('The host store is not at the stamp T after the committed transition', { stamp: token, now: host.token });

@@ -57,7 +57,7 @@ Commands:
                                   Replace the stopped predecessor whose targeted drain
                                   was refused, accepting possible loss of its data
   ploinky --udp-port PORT start AGENT [PORT]
-                                  Select the media host UDP port; defaults to 7882
+                                  Select the media UDP port (host and in-Box listener); defaults to 7882
   ploinky bind [ADDRESS:PORT:8080]
                                   Publish the public Router on this host's ADDRESS and
                                   TCP PORT; the Box and graph restart when it changes
@@ -313,6 +313,7 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
             if (status.routerBinding && !isLoopbackRouterBinding(status.routerBinding)) {
                 output.write(`${formatRouterBindingLines(status.routerBinding).join('\n')}\n`);
             }
+            if (status.mediaNotice) output.write(`Media: ${status.mediaNotice}\n`);
             const coreStatus = executePrepared({
                 identity: status.identity,
                 containerId: container.id,

@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
-import { normalizeContainerRuntime } from '../../ploinky-box/contract/container.mjs';
+import { normalizeContainerRuntime, validateContainerPublications } from '../../ploinky-box/contract/container.mjs';
 import {
     preflightPublications,
     probeTcpAvailability,
@@ -19,6 +19,7 @@ function owned(port = 19090, {
     labelPort,
     mediaPort = 17891,
     mediaLabelPort,
+    mediaContainerPort,
 } = {}) {
     return {
         state: 'owned',
@@ -33,7 +34,7 @@ function owned(port = 19090, {
                     running,
                     environment: { PLOINKY_PUBLIC_AUTHORITY: authority ?? `127.0.0.1:${port}` },
                     publications: publications ?? [
-                        { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaPort) },
+                        { containerPort: String(mediaContainerPort ?? mediaPort), protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaPort) },
                         { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: String(port) },
                     ],
                 },
@@ -51,6 +52,7 @@ function bound(port, options = {}) {
         authority,
         running = true,
         mediaPort = 17891,
+        mediaContainerPort,
         publications,
     } = options;
     // An explicit undefined label models a Box that never recorded one.
@@ -73,7 +75,7 @@ function bound(port, options = {}) {
                         ...(hosts === undefined ? {} : { PLOINKY_PUBLIC_ROUTER_HOSTS: hosts }),
                     },
                     publications: publications ?? [
-                        { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaPort) },
+                        { containerPort: String(mediaContainerPort ?? mediaPort), protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaPort) },
                         { containerPort: '8080', protocol: 'tcp', hostIp: address, hostPort: String(port) },
                     ],
                 },
@@ -121,7 +123,7 @@ test('existing label, publication, and authority must agree exactly', () => {
     }) }), /publications/);
     assert.throws(() => resolveEffectiveHostPort({ ownership: owned(19090, {
         publications: [
-            { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7883' },
+            { containerPort: '7883', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7883' },
             { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: '19090' },
         ],
     }) }), /publications/);
@@ -190,7 +192,7 @@ test('only a validated running current Box receives the self-reservation excepti
     });
     assert.equal(result.reusedSelfReservation, true);
     assert.equal(result.tcp, '127.0.0.1:19090:8080/tcp');
-    assert.equal(result.udp, '0.0.0.0:17891:7882/udp');
+    assert.equal(result.udp, '0.0.0.0:17891:17891/udp');
 
     await assert.rejects(() => preflightPublications({
         hostPort: 19090,
@@ -240,7 +242,7 @@ test('non-loopback publications require an exact label, trusted host list, and a
     assert.equal(specific.address, '192.168.1.63');
     assert.deepEqual(specific.hosts, ['192.168.1.63']);
 
-    const udp = { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891' };
+    const udp = { containerPort: '17891', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891' };
     for (const [name, ownership, pattern] of [
         ['wildcard publication without a label', bound(19090, {
             address: '0.0.0.0', labelAddress: undefined, authority: '127.0.0.1:19090',
@@ -329,7 +331,7 @@ test('widening onto the wildcard defers the old listener but detects other inter
         localAddresses: () => ['100.76.22.69', '127.0.0.1', '192.168.1.63'],
     });
     assert.equal(result.tcp, '0.0.0.0:19090:8080/tcp');
-    assert.equal(result.udp, '0.0.0.0:17891:7882/udp');
+    assert.equal(result.udp, '0.0.0.0:17891:17891/udp');
     assert.deepEqual(result.recheckAfterRelease, { tcp: true, udp: true });
     assert.deepEqual(probes, ['0.0.0.0:19090', '100.76.22.69:19090', '192.168.1.63:19090']);
 
@@ -449,4 +451,91 @@ test('wildcard TCP availability rejects a specific-address listener even if wild
     });
     assert.equal(available, false);
     assert.deepEqual(checked, ['127.0.0.1', '10.20.30.40']);
+});
+
+test('preflight publishes the selected media UDP port on both sides', async () => {
+    for (const mediaHostPort of [1, 17891, 65535]) {
+        const result = await preflightPublications({
+            hostPort: 19090,
+            mediaHostPort,
+            checkTcp: async () => true,
+            checkUdp: async () => true,
+        });
+        assert.equal(result.udp, `0.0.0.0:${mediaHostPort}:${mediaHostPort}/udp`);
+    }
+    const defaults = await preflightPublications({
+        hostPort: 8080,
+        checkTcp: async () => true,
+        checkUdp: async () => true,
+    });
+    assert.equal(defaults.udp, '0.0.0.0:7882:7882/udp');
+});
+
+test('strict validation rejects the legacy N:7882 shape that discovery observes', () => {
+    const legacy = owned(19090, { mediaContainerPort: 7882 }).handles.container;
+    assert.throws(() => validateContainerPublications(legacy, 19090, 17891), /publications/);
+    assert.throws(
+        () => validateContainerPublications(legacy, 19090, 17891, null, { observeLegacyMedia: false }),
+        /publications/,
+    );
+    const strict = validateContainerPublications(owned(19090).handles.container, 19090, 17891);
+    assert.equal(strict.mediaContainerPort, 17891);
+    assert.deepEqual(strict.udp, {
+        containerPort: '17891', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891',
+    });
+
+    const observed = validateContainerPublications(legacy, 19090, 17891, null, { observeLegacyMedia: true });
+    assert.equal(observed.mediaContainerPort, 7882);
+    assert.equal(observed.mediaHostPort, 17891);
+    assert.equal(
+        validateContainerPublications(owned(19090).handles.container, 19090, 17891, null, { observeLegacyMedia: true })
+            .mediaContainerPort,
+        17891,
+    );
+    // Observation accepts exactly the former fixed target and nothing else.
+    const other = owned(19090, { mediaContainerPort: 7899 }).handles.container;
+    assert.throws(() => validateContainerPublications(other, 19090, 17891, null, { observeLegacyMedia: true }), /publications/);
+    assert.throws(() => validateContainerPublications(other, 19090, 17891), /publications/);
+    // A default Box has one shape; observation never widens it.
+    const defaultBox = owned(19090, { mediaPort: 7882, mediaContainerPort: 7899 }).handles.container;
+    assert.throws(() => validateContainerPublications(defaultBox, 19090, 7882, null, { observeLegacyMedia: true }), /publications/);
+    assert.equal(
+        validateContainerPublications(owned(19090, { mediaPort: 7882 }).handles.container, 19090, 7882, null, { observeLegacyMedia: true })
+            .mediaContainerPort,
+        7882,
+    );
+    // An exact container port is accepted only as one of the two known shapes.
+    assert.equal(validateContainerPublications(legacy, 19090, 17891, null, { mediaContainerPort: 7882 }).mediaContainerPort, 7882);
+    assert.throws(() => validateContainerPublications(legacy, 19090, 17891, null, { mediaContainerPort: 7899 }), /not a supported shape/);
+    assert.throws(
+        () => validateContainerPublications(owned(19090).handles.container, 19090, 17891, null, { mediaContainerPort: 7882 }),
+        /publications/,
+    );
+});
+
+test('port selection observes a legacy N:7882 Box and keeps its host port', () => {
+    const plan = resolveEffectiveHostPort({ ownership: owned(19090, { mediaContainerPort: 7882 }) });
+    assert.equal(plan.mediaHostPort, 17891);
+    assert.equal(plan.existingPublication.mediaContainerPort, 7882);
+    assert.throws(
+        () => resolveEffectiveHostPort({ ownership: owned(19090, { mediaContainerPort: 7899 }) }),
+        /publications/,
+    );
+    const current = resolveEffectiveHostPort({ ownership: owned(19090) });
+    assert.equal(current.existingPublication.mediaContainerPort, 17891);
+});
+
+test('self-reservation recognizes the Box itself for the boundary UDP ports', async () => {
+    for (const mediaPort of [1, 65535]) {
+        const { existingPublication } = resolveEffectiveHostPort({ ownership: owned(19090, { mediaPort }) });
+        const result = await preflightPublications({
+            hostPort: 19090,
+            mediaHostPort: mediaPort,
+            existingPublication,
+            checkTcp: async () => false,
+            checkUdp: async () => false,
+        });
+        assert.equal(result.udp, `0.0.0.0:${mediaPort}:${mediaPort}/udp`);
+        assert.equal(result.reusedSelfReservation, true);
+    }
 });

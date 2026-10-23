@@ -88,9 +88,17 @@ function containerHandle(state, {
     imageRef = BOX_IMAGE_REFERENCE,
     hostPort = 8083,
     mediaHostPort = 7882,
+    // The in-Box media listener; N:N for a current Box, 7882 for a legacy one.
+    mediaContainerPort = mediaHostPort,
+    // 'auto' derives the variable a current Box carries; the fake engine passes
+    // what the create arguments actually requested (a string, or null).
+    boxMediaPortEnv = 'auto',
     routerBinding = null,
     running = true,
 } = {}) {
+    const mediaEnv = boxMediaPortEnv === 'auto'
+        ? (Number(mediaContainerPort) === 7882 ? null : String(mediaContainerPort))
+        : boxMediaPortEnv;
     const address = routerBinding?.address ?? '127.0.0.1';
     const hosts = routerBinding?.hosts ?? null;
     return {
@@ -127,10 +135,11 @@ function containerHandle(state, {
                 PLOINKY_PUBLIC_AUTHORITY: `${['127.0.0.1', '0.0.0.0'].includes(address) ? '127.0.0.1' : address}:${hostPort}`,
                 PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET,
                 ...(hosts ? { PLOINKY_PUBLIC_ROUTER_HOSTS: JSON.stringify(hosts) } : {}),
+                ...(mediaEnv === null ? {} : { PLOINKY_BOX_MEDIA_PORT: mediaEnv }),
                 HOSTNAME: id.slice(0, 12),
             },
             publications: [
-                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
+                { containerPort: String(mediaContainerPort), protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
                 { containerPort: '8080', protocol: 'tcp', hostIp: address, hostPort: String(hostPort) },
             ],
             running,
@@ -190,12 +199,15 @@ function harness(state, {
                 const labels = optionValues(args, '--label');
                 const environment = optionValues(args, '--env');
                 const [address, hostPort] = optionValues(args, '--publish')[0].split(':');
+                const mediaContainerPort = Number(optionValues(args, '--publish')[1].split(':')[2].split('/')[0]);
                 const created = containerHandle(state, {
                     id,
                     imageId: args.at(-1),
                     imageRef: suffixAfter(labels, `${BOX_LABELS.imageRef}=`),
                     hostPort: Number(hostPort),
                     mediaHostPort: Number(suffixAfter(labels, `${BOX_LABELS.mediaHostPort}=`)),
+                    mediaContainerPort,
+                    boxMediaPortEnv: suffixAfter(environment, 'PLOINKY_BOX_MEDIA_PORT=') ?? null,
                     running: false,
                 });
                 created.runtime.publications[1].hostIp = address;
@@ -304,14 +316,14 @@ test('create arguments publish exactly one Router TCP binding and keep media UDP
     };
     const legacy = containerCreateArgs(base);
     assert.deepEqual(containerCreateArgs({ ...base, routerBinding: LOOPBACK }), legacy);
-    assert.deepEqual(optionValues(legacy, '--publish'), ['127.0.0.1:8083:8080/tcp', '0.0.0.0:17891:7882/udp']);
+    assert.deepEqual(optionValues(legacy, '--publish'), ['127.0.0.1:8083:8080/tcp', '0.0.0.0:17891:17891/udp']);
     assert.equal(optionValues(legacy, '--env').includes('PLOINKY_PUBLIC_AUTHORITY=127.0.0.1:8083'), true);
     assert.equal(legacy.some((value) => (
         value.startsWith(`${BOX_LABELS.routerBindAddress}=`) || value.startsWith('PLOINKY_PUBLIC_ROUTER_HOSTS=')
     )), false);
 
     const wide = containerCreateArgs({ ...base, routerBinding: wildcard() });
-    assert.deepEqual(optionValues(wide, '--publish'), ['0.0.0.0:8083:8080/tcp', '0.0.0.0:17891:7882/udp']);
+    assert.deepEqual(optionValues(wide, '--publish'), ['0.0.0.0:8083:8080/tcp', '0.0.0.0:17891:17891/udp']);
     assert.equal(optionValues(wide, '--label').includes(`${BOX_LABELS.routerBindAddress}=0.0.0.0`), true);
     assert.equal(optionValues(wide, '--env').includes(
         'PLOINKY_PUBLIC_ROUTER_HOSTS=["192.168.1.63","apparatus","apparatus.local"]',
@@ -319,7 +331,7 @@ test('create arguments publish exactly one Router TCP binding and keep media UDP
     assert.equal(optionValues(wide, '--env').includes('PLOINKY_PUBLIC_AUTHORITY=127.0.0.1:8083'), true);
 
     const specific = containerCreateArgs({ ...base, routerBinding: { address: '192.168.1.63', hosts: ['192.168.1.63'] } });
-    assert.deepEqual(optionValues(specific, '--publish'), ['192.168.1.63:8083:8080/tcp', '0.0.0.0:17891:7882/udp']);
+    assert.deepEqual(optionValues(specific, '--publish'), ['192.168.1.63:8083:8080/tcp', '0.0.0.0:17891:17891/udp']);
     assert.equal(optionValues(specific, '--env').includes('PLOINKY_PUBLIC_AUTHORITY=192.168.1.63:8083'), true);
 
     for (const args of [legacy, wide, specific]) {
@@ -376,7 +388,7 @@ test('an address-only change replaces the Box with the same image, port, and med
     const replacement = h.current();
     assert.equal(replacement.runtime.imageId, OLD_IMAGE);
     assert.deepEqual(replacement.runtime.publications, [
-        { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891' },
+        { containerPort: '17891', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891' },
         { containerPort: '8080', protocol: 'tcp', hostIp: '0.0.0.0', hostPort: '8083' },
     ]);
     const events = flat(h.calls);
@@ -636,7 +648,15 @@ function memoryStore(events, initial = null) {
     };
 }
 
-function boxWorkspace(t, { running = true, routerBinding = null, hostPort = 8083, graph = true, scope = true } = {}) {
+function boxWorkspace(t, {
+    running = true,
+    routerBinding = null,
+    hostPort = 8083,
+    mediaHostPort = 7882,
+    mediaContainerPort = mediaHostPort,
+    graph = true,
+    scope = true,
+} = {}) {
     const state = fixture(t);
     if (graph) {
         fs.writeFileSync(path.join(state.identity.anchorPath, 'routing.json'), JSON.stringify({
@@ -651,7 +671,9 @@ function boxWorkspace(t, { running = true, routerBinding = null, hostPort = 8083
             assertHeld(instance) { assert.equal(instance, state.identity.instance); },
         });
     }
-    const container = containerHandle(state, { hostPort, routerBinding, running });
+    const container = containerHandle(state, {
+        hostPort, mediaHostPort, mediaContainerPort, routerBinding, running,
+    });
     const ownership = { state: 'owned', engine: { name: 'podman', identity: 'engine' }, handles: { container } };
     return { ...state, scopeEnv, container, ownership };
 }
@@ -1361,4 +1383,243 @@ test('the public CLI dispatches bind and its dry run only to the host supervisor
     assert.match(help.value(), /127\.0\.0\.1 \(restore local-only access\)/);
     assert.match(help.value(), /8081 and agent ports cannot be published/);
     assert.match(help.value(), /plain HTTP/);
+});
+
+const GOLDEN_DEFAULT_ARGS = JSON.parse(fs.readFileSync(
+    new URL('../fixtures/box-create-args/default-7882-base-02efe682.json', import.meta.url),
+    'utf8',
+));
+
+// The golden file was produced by the create arguments of origin/master
+// 02efe682 with this exact input. The workspace-specific values are replaced by
+// placeholders so the comparison holds in any temporary directory.
+function normalizedCreateArgs(state, args) {
+    return args.map((value) => value
+        .split(state.root).join('<root>')
+        .split(state.identity.instance).join('<instance>')
+        .split(state.identity.pathHash).join('<pathHash>')
+        .replace(/(SOURCE_ID=|source-id=)[0-9a-f]{64}/, '$1<sourceId>'));
+}
+
+function mediaCreateInput(state, mediaHostPort) {
+    return {
+        identity: state.identity,
+        dataFingerprints: { dependencies: 'd'.repeat(64), images: 'f'.repeat(64) },
+        agentLib: state.agentLib,
+        imageId: 'a'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8083,
+        mediaHostPort,
+        repositoryRoot: state.root,
+        cidfile: path.join(state.root, 'candidate.cid'),
+    };
+}
+
+test('default 7882 create arguments are byte-identical to origin/master and carry no media variable', (t) => {
+    const state = fixture(t);
+    const args = containerCreateArgs(mediaCreateInput(state, 7882));
+    assert.deepEqual(normalizedCreateArgs(state, args), GOLDEN_DEFAULT_ARGS);
+    assert.equal(optionValues(args, '--publish').includes('0.0.0.0:7882:7882/udp'), true);
+    assert.equal(optionValues(args, '--env').some((value) => value.startsWith('PLOINKY_BOX_MEDIA_PORT=')), false);
+    // Omitting the port selects the same default Box.
+    const { mediaHostPort: _omitted, ...withoutPort } = mediaCreateInput(state, 7882);
+    assert.deepEqual(containerCreateArgs(withoutPort), args);
+});
+
+test('a non-default media port is published N:N and exported as the only extra environment entry', (t) => {
+    const state = fixture(t);
+    for (const port of [1, 7893, 17891, 65535]) {
+        const args = containerCreateArgs(mediaCreateInput(state, port));
+        assert.equal(optionValues(args, '--publish').includes(`0.0.0.0:${port}:${port}/udp`), true, String(port));
+        assert.deepEqual(
+            optionValues(args, '--env').filter((value) => value.startsWith('PLOINKY_BOX_MEDIA_PORT=')),
+            [`PLOINKY_BOX_MEDIA_PORT=${port}`],
+        );
+        assert.equal(optionValues(args, '--label').includes(`${BOX_LABELS.mediaHostPort}=${port}`), true);
+        // Against the default Box the delta is exactly the publication, the
+        // label and the variable; nothing else changes.
+        const normalized = normalizedCreateArgs(state, args);
+        const withoutVariable = normalized.filter((value, index) => !(
+            value === `PLOINKY_BOX_MEDIA_PORT=${port}`
+            || (value === '--env' && normalized[index + 1] === `PLOINKY_BOX_MEDIA_PORT=${port}`)
+        ));
+        assert.deepEqual(withoutVariable, GOLDEN_DEFAULT_ARGS.map((value) => (
+            value === '0.0.0.0:7882:7882/udp' ? `0.0.0.0:${port}:${port}/udp`
+                : value === `${BOX_LABELS.mediaHostPort}=7882` ? `${BOX_LABELS.mediaHostPort}=${port}`
+                    : value
+        )));
+    }
+});
+
+test('configuration validation requires the exact media shape and the matching environment variable', (t) => {
+    const state = fixture(t);
+    const desired = (mediaHostPort, extra = {}) => ({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: OLD_IMAGE,
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8083,
+        mediaHostPort,
+        dataFingerprints: DATA_FINGERPRINTS,
+        ...extra,
+    });
+    // A current N:N Box carries the variable and validates.
+    const current = containerHandle(state, { mediaHostPort: 17891 });
+    assert.equal(current.runtime.environment.PLOINKY_BOX_MEDIA_PORT, '17891');
+    assert.doesNotThrow(() => validateContainerConfiguration(current, desired(17891)));
+    // N:N without the variable, and 7882:7882 with it, are both incompatible.
+    const missing = containerHandle(state, { mediaHostPort: 17891, boxMediaPortEnv: null });
+    assert.throws(() => validateContainerConfiguration(missing, desired(17891)), /environment allowlist/);
+    const defaultBox = containerHandle(state, { mediaHostPort: 7882 });
+    assert.equal('PLOINKY_BOX_MEDIA_PORT' in defaultBox.runtime.environment, false);
+    assert.doesNotThrow(() => validateContainerConfiguration(defaultBox, desired(7882)));
+    const stray = containerHandle(state, { mediaHostPort: 7882, boxMediaPortEnv: '7882' });
+    assert.throws(() => validateContainerConfiguration(stray, desired(7882)), /environment allowlist/);
+    // A wrong value is incompatible too.
+    const wrongValue = containerHandle(state, { mediaHostPort: 17891, boxMediaPortEnv: '17892' });
+    assert.throws(() => validateContainerConfiguration(wrongValue, desired(17891)), /environment allowlist/);
+
+    // The default-parameter check never accepts the legacy shape, with or without a variable.
+    const legacy = containerHandle(state, { mediaHostPort: 17891, mediaContainerPort: 7882 });
+    assert.equal('PLOINKY_BOX_MEDIA_PORT' in legacy.runtime.environment, false);
+    assert.throws(() => validateContainerConfiguration(legacy, desired(17891)), /publications/);
+    const legacyWithVariable = containerHandle(state, {
+        mediaHostPort: 17891, mediaContainerPort: 7882, boxMediaPortEnv: '17891',
+    });
+    assert.throws(() => validateContainerConfiguration(legacyWithVariable, desired(17891)), /publications/);
+    // Discovery passes the observed shape: the legacy Box validates exactly
+    // without a variable, and a variable on it is incompatible.
+    assert.doesNotThrow(() => validateContainerConfiguration(legacy, desired(17891, { mediaContainerPort: 7882 })));
+    assert.throws(
+        () => validateContainerConfiguration(legacyWithVariable, desired(17891, { mediaContainerPort: 7882 })),
+        /environment allowlist/,
+    );
+    // Neither an unrelated container port nor a current Box under the legacy
+    // expectation validates.
+    const other = containerHandle(state, { mediaHostPort: 17891, mediaContainerPort: 7899, boxMediaPortEnv: '7899' });
+    assert.throws(() => validateContainerConfiguration(other, desired(17891, { mediaContainerPort: 7899 })), /not a supported shape/);
+    assert.throws(() => validateContainerConfiguration(other, desired(17891)), /publications/);
+    assert.throws(
+        () => validateContainerConfiguration(current, desired(17891, { mediaContainerPort: 7882 })),
+        /publications/,
+    );
+});
+
+test('an owned legacy N:7882 Box is replaced by N:N with the variable, and a failed create restores N:N', async (t) => {
+    const state = fixture(t);
+    const legacy = containerHandle(state, { mediaHostPort: 17891, mediaContainerPort: 7882 });
+    const h = harness(state, { initial: legacy });
+    const result = await reconcileBoxContainer(reconcileArguments(state, h, legacy, {
+        imagePolicy: 'preserve',
+    }), h.seams);
+    assert.equal(result.action, 'replaced');
+    assert.equal(result.mediaHostPort, 17891);
+    const createCalls = h.calls.filter((call) => call[0] === 'run' && call[2] === 'container' && call[3] === 'create');
+    assert.equal(createCalls.length, 1);
+    const createArgs = createCalls[0].slice(2);
+    assert.equal(optionValues(createArgs, '--publish').includes('0.0.0.0:17891:17891/udp'), true);
+    assert.equal(optionValues(createArgs, '--env').includes('PLOINKY_BOX_MEDIA_PORT=17891'), true);
+    assert.deepEqual(h.current().runtime.publications.find((item) => item.protocol === 'udp'), {
+        containerPort: '17891', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891',
+    });
+
+    // The candidate fails readiness after the legacy Box was removed: the
+    // restore recreates the new shape, never the legacy one.
+    const failing = fixture(t);
+    const failingLegacy = containerHandle(failing, { mediaHostPort: 17891, mediaContainerPort: 7882 });
+    const failed = harness(failing, { initial: failingLegacy, failCandidateReady: true });
+    await assert.rejects(
+        () => reconcileBoxContainer(reconcileArguments(failing, failed, failingLegacy, {
+            imagePolicy: 'preserve',
+        }), failed.seams),
+        (error) => error.boxRollback.action === 'restored' && error.boxRollback.mediaHostPort === 17891,
+    );
+    const restored = failed.current();
+    assert.deepEqual(restored.runtime.publications.find((item) => item.protocol === 'udp'), {
+        containerPort: '17891', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '17891',
+    });
+    assert.equal(restored.runtime.environment.PLOINKY_BOX_MEDIA_PORT, '17891');
+    const creates = failed.calls.filter((call) => call[0] === 'run' && call[2] === 'container' && call[3] === 'create');
+    assert.equal(creates.length, 2);
+    for (const call of creates) {
+        assert.equal(optionValues(call.slice(2), '--publish').includes('0.0.0.0:17891:17891/udp'), true);
+        assert.equal(optionValues(call.slice(2), '--env').includes('PLOINKY_BOX_MEDIA_PORT=17891'), true);
+    }
+});
+
+test('an N:N Box with the variable is reused unchanged, with and without an explicit equal port', async (t) => {
+    for (const explicitMediaPort of [undefined, 17891]) {
+        const state = fixture(t);
+        const initial = containerHandle(state, { mediaHostPort: 17891 });
+        const h = harness(state, { initial });
+        const result = await reconcileBoxContainer(reconcileArguments(state, h, initial, {
+            imagePolicy: 'preserve',
+            explicitMediaPort,
+        }), h.seams);
+        assert.equal(result.action, 'reused', String(explicitMediaPort));
+        assert.equal(h.current(), initial);
+        assert.equal(h.calls.some((call) => ['create', 'rm', 'stop', 'start', 'pull'].some((word) => call.includes(word))), false);
+    }
+});
+
+test('status reports a legacy N:7882 Box as a compatible legacy media target', (t) => {
+    const legacy = boxWorkspace(t, { mediaHostPort: 17891, mediaContainerPort: 7882 });
+    const supervisorFor = (box) => bindSupervisor(box, [], {
+        validateExistingImage: () => ({ immutableId: OLD_IMAGE }),
+        inspectBoxData: () => ({ paths: box.identity.dataPaths, fingerprints: DATA_FINGERPRINTS }),
+    });
+    const status = supervisorFor(legacy).inspectBoxStatus();
+    assert.equal(status.state, 'running-initialized');
+    assert.equal(status.mediaNotice, 'legacy media target 7882 (replaced on next start)');
+    assert.match(formatBoxStatus(status), /Media: legacy media target 7882 \(replaced on next start\)/);
+
+    const stopped = boxWorkspace(t, { mediaHostPort: 17891, mediaContainerPort: 7882, running: false });
+    const stoppedStatus = supervisorFor(stopped).inspectBoxStatus();
+    assert.equal(stoppedStatus.state, 'stopped');
+    assert.equal(stoppedStatus.mediaNotice, 'legacy media target 7882 (replaced on next start)');
+
+    const current = boxWorkspace(t, { mediaHostPort: 17891 });
+    const currentStatus = supervisorFor(current).inspectBoxStatus();
+    assert.equal(currentStatus.state, 'running-initialized');
+    assert.equal(currentStatus.mediaNotice, undefined);
+    assert.doesNotMatch(formatBoxStatus(currentStatus), /Media:/);
+
+    // Only the former fixed target is a legacy shape; any other mismatch is incompatible.
+    const other = boxWorkspace(t, { mediaHostPort: 17891, mediaContainerPort: 7899 });
+    assert.equal(supervisorFor(other).inspectBoxStatus().state, 'incompatible');
+    // A default Box and a missing variable on an N:N Box are incompatible, not legacy.
+    const missingVariable = boxWorkspace(t, { mediaHostPort: 17891 });
+    delete missingVariable.container.runtime.environment.PLOINKY_BOX_MEDIA_PORT;
+    assert.equal(supervisorFor(missingVariable).inspectBoxStatus().state, 'incompatible');
+});
+
+test('the bind plan and result print the in-Box media port equal to the selected port', (t) => {
+    const box = boxWorkspace(t, { mediaHostPort: 17891 });
+    const events = [];
+    const supervisor = bindSupervisor(box, events, { reconcile: async () => assert.fail('dry-run never reconciles') });
+    const plan = supervisor.planBindDryRun({ address: '0.0.0.0', hostPort: 8083, containerPort: 8080 });
+    assert.deepEqual(plan.publications, ['0.0.0.0:8083:8080/tcp', '0.0.0.0:17891:17891/udp']);
+    assert.equal(plan.boxAction, 'replace');
+
+    // A legacy Box with an unchanged Router binding is still replaced by a bind.
+    const legacy = boxWorkspace(t, { mediaHostPort: 17891, mediaContainerPort: 7882 });
+    const legacyPlan = bindSupervisor(legacy, [], {
+        reconcile: async () => assert.fail('dry-run never reconciles'),
+    }).planBindDryRun({ address: '127.0.0.1', hostPort: 8083, containerPort: 8080 });
+    assert.deepEqual(legacyPlan.publications, ['127.0.0.1:8083:8080/tcp', '0.0.0.0:17891:17891/udp']);
+    assert.equal(legacyPlan.boxAction, 'replace');
+    const currentPlan = bindSupervisor(box, [], {
+        reconcile: async () => assert.fail('dry-run never reconciles'),
+    }).planBindDryRun({ address: '127.0.0.1', hostPort: 8083, containerPort: 8080 });
+    assert.equal(currentPlan.boxAction, 'reuse');
+
+    assert.match(
+        formatBindResult({ action: 'replaced', routerBinding: LOOPBACK, hostPort: 8083, mediaHostPort: 17891 }),
+        /Media publication: 0\.0\.0\.0:17891 -> 17891\/udp \(unchanged\)/,
+    );
+    assert.match(
+        formatBindResult({ action: 'created', routerBinding: LOOPBACK, hostPort: 8083, mediaHostPort: 7882 }),
+        /Media publication: 0\.0\.0\.0:7882 -> 7882\/udp(?! \()/,
+    );
 });
