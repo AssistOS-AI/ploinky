@@ -23,6 +23,20 @@ import {
 export const WRITER_FIRST_CODE = 'PLOINKY_BOX_HARDWARE_LIMITS_STORED';
 const LOGIN = { path: '/auth/login', headers: { accept: 'text/html' } };
 
+// The fixture manifest declares no auth directive and no guest, so the Router's own answer to /auth/login is the auth-disabled JSON refusal
+// (HTTP 404 `{ ok: false, error: 'auth_disabled' }`). It proves the replacement's Router answers through the published loopback port. A 200 would
+// mean the fixture unexpectedly has auth; any other status, a transport error, a timeout, a truncated or unparsable body fails.
+export function assertAuthDisabledAnswer(login) {
+    if (!login || login.error || login.status === null || login.status === undefined) return `The replacement Box's Router did not answer /auth/login (${login?.error ?? 'no response'})`;
+    if (login.status !== 404) return `The replacement Box's Router answered /auth/login with HTTP ${login.status}, not the auth-less fixture's HTTP 404 auth_disabled`;
+    if (login.truncated) return 'The replacement Box\'s /auth/login answer was truncated';
+    if (!/^application\/json\b/i.test(String(login.contentType ?? ''))) return `The replacement Box's /auth/login answer is not JSON (content type ${login.contentType || 'none'})`;
+    let body;
+    try { body = JSON.parse(String(login.body ?? '')); } catch { return 'The replacement Box\'s /auth/login answer is not parsable JSON'; }
+    if (!body || body.ok !== false || body.error !== 'auth_disabled') return `The replacement Box's /auth/login answer is not the Router's auth_disabled refusal (ok ${JSON.stringify(body?.ok)}, error ${JSON.stringify(body?.error)})`;
+    return null;
+}
+
 // The driver's one stdout line, or null when it printed none.
 export function parseDriverSummary(result) {
     const line = String(result?.stdout ?? '').split('\n').filter(value => value.startsWith('{')).at(-1);
@@ -228,11 +242,13 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
         if (wrong.length) throw fail(`The replacement Box ${String(current.id).slice(0, 12)} is not the gate-off generation the transition committed (${wrong.join(', ')})`, { checks, labels: Object.keys(labels).sort(), destinations });
         // The Router of the replacement answers as a browser's address would reach it.
         const login = await http({ port: run.ports.tcp, path: LOGIN.path, headers: LOGIN.headers });
-        if (login?.status !== 200) throw fail('The replacement Box\'s Router does not answer /auth/login with HTTP 200', { status: login?.status ?? null, error: login?.error ?? null });
+        const loginProblem = assertAuthDisabledAnswer(login);
+        if (loginProblem) throw fail(loginProblem, { status: login?.status ?? null, contentType: login?.contentType ?? null, error: login?.error ?? null, truncated: login?.truncated ?? null });
+        const routerBody = JSON.parse(login.body);
         const host = await view(identity(), 'host', 'after the committed transition');
         if (host.count !== 0 || host.barrier || host.lock) throw fail('The store is not empty and free after the committed transition', { count: host.count, barrier: host.barrier, lock: host.lock });
         if (tokenKey(host.token) !== tokenKey(token)) throw fail('The host store is not at the stamp T after the committed transition', { stamp: token, now: host.token });
-        return { id: current.id, created: current.created, checks, router: login.status, gate: false, store: { token: host.token, count: host.count, barrier: null }, publications: contract.publications };
+        return { id: current.id, created: current.created, checks, router: { status: login.status, contentType: login.contentType, ok: routerBody.ok, error: routerBody.error }, gate: false, store: { token: host.token, count: host.count, barrier: null }, publications: contract.publications };
     }
 
     return { restartOn, writerFirst, clearAfterRefusal, transitionFirst, internals: { capture, listIds, inspectExact, engineFacts, finalGeneration, inspectFull } };

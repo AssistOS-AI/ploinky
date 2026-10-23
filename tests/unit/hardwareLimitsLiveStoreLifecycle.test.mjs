@@ -13,7 +13,7 @@ import { createFakeStore } from '../hardware-limits/fakeLiveStore.mjs';
 import { ENGINE_HOST, world, free } from '../hardware-limits/executorWorld.mjs';
 import { artifactPathFor, c5CleanupProofName } from '../hardware-limits/liveCommon.mjs';
 import { C5_BOX_SCHEMA, C5_DRIVER_NAME, c5IntentOf, validateC5BoxReceipts } from '../hardware-limits/liveBoxTransitionCustody.mjs';
-import { WRITER_FIRST_CODE, assertWriterFirstRefusal, parseDriverSummary, transportProblem } from '../hardware-limits/liveStoreLifecycle.mjs';
+import { WRITER_FIRST_CODE, assertAuthDisabledAnswer, assertWriterFirstRefusal, parseDriverSummary, transportProblem } from '../hardware-limits/liveStoreLifecycle.mjs';
 import { C5_CLEANUP_PROOF, C5_LIVE_ARTIFACTS, c5CleanupProofProblem, c5RequiredArtifacts } from '../hardware-limits/liveStage.mjs';
 import { writePrivateJson } from '../hardware-limits/fixtures.mjs';
 import { clearAgentLimits, readStoreSnapshot, setAgentLimits } from '../../cli/sandbox/hardwareLimits/store.mjs';
@@ -23,7 +23,8 @@ const BLOCK = 'apparatus-store';
 const REPOSITORY = fs.realpathSync(new URL('../..', import.meta.url).pathname);
 const SECCOMP = fs.readFileSync(path.join(REPOSITORY, 'ploinky-box/seccomp/podman-nested-pid-fallback.json'));
 const real = ms => new Promise(resolve => setTimeout(resolve, ms));
-const SEAMS = { sleep: real, polling: { deadlineMs: 15000, intervalMs: 20 }, routerPolling: { deadlineMs: 15000, intervalMs: 20 }, http: async () => ({ status: 200, contentType: 'text/html', body: '' }) };
+const AUTH_DISABLED = { status: 404, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'auth_disabled' }), truncated: false };
+const SEAMS = { sleep: real, polling: { deadlineMs: 15000, intervalMs: 20 }, routerPolling: { deadlineMs: 15000, intervalMs: 20 }, http: async () => AUTH_DISABLED };
 const LIFECYCLE_KEYS = ['restart-on', 'writer-first', 'writer-first-clear', 'transition-first', 'final-generation', 'c5-receipt'];
 
 async function liveWorld(t, { faults = {}, lifecycleFaults = {} } = {}) {
@@ -237,8 +238,23 @@ test('X5.c5-lifecycle-the-final-proof-of-the-replacement-names-what-is-wrong-wit
         const outcome = await fails(t, editReplacement(edit), pattern, { cleanup });
         assert.ok(outcome.context.fake.model.driverRuns.some(entry => entry.mode === 'transition'), label);
     }
-    // The Router of the replacement must answer /auth/login with 200.
-    await fails(t, { seams: { ...SEAMS, http: async () => ({ status: 503, contentType: 'text/html' }) } }, /does not answer \/auth\/login with HTTP 200/);
+    // The auth-less fixture's Router answers /auth/login with its own 404 auth_disabled JSON; nothing else proves the published port.
+    const pattern = /did not answer \/auth\/login|answered \/auth\/login with HTTP|answer is not|answer was truncated/;
+    for (const [reply, reason] of [
+        [{ status: 200, contentType: 'text/html', body: '<html>login</html>', truncated: false }, /answered \/auth\/login with HTTP 200, not the auth-less fixture's HTTP 404/],
+        [{ status: 503, contentType: 'text/html', body: '', truncated: false }, /answered \/auth\/login with HTTP 503/],
+        [{ ...AUTH_DISABLED, body: JSON.stringify({ ok: false, error: 'other' }) }, /not the Router's auth_disabled refusal/],
+        [{ ...AUTH_DISABLED, body: JSON.stringify({ ok: true, error: 'auth_disabled' }) }, /not the Router's auth_disabled refusal/],
+        [{ ...AUTH_DISABLED, contentType: 'text/html' }, /not JSON/],
+        [{ ...AUTH_DISABLED, body: '{"ok":false,' }, /not parsable JSON/],
+        [{ ...AUTH_DISABLED, truncated: true }, /was truncated/],
+        [{ status: null, error: 'ECONNREFUSED' }, /did not answer \/auth\/login \(ECONNREFUSED\)/],
+        [{ status: null, error: 'timeout' }, /did not answer \/auth\/login \(timeout\)/],
+    ]) {
+        const outcome = await fails(t, { seams: { ...SEAMS, http: async () => reply } }, reason);
+        assert.match(outcome.case.reason, pattern);
+    }
+    assert.equal(assertAuthDisabledAnswer(AUTH_DISABLED), null);
 });
 
 test('X5.c5-lifecycle-artifacts-and-the-stager-require-the-c5-evidence-and-a-cleanup-proof-of-this-action-and-run', () => {

@@ -47,7 +47,7 @@ async function liveRun(context, { mutate = null, seams = SEAMS } = {}) {
     const provider = mutate ? async (binary, args, options) => { mutate(args); return fake.provider(binary, args, options); } : fake.provider;
     const report = await executeLiveRun({ run: w.run, hostIdentity: w.hostIdentity, processProvider: provider, persist: w.persist, remoteArrival: true,
         artifacts: (name, value) => artifacts.set(name, structuredClone(value)), artifactPath: name => artifactPathFor(w.runPath, name),
-        storeSeams: { http: async () => ({ status: 200, contentType: 'text/html', body: '' }), ...seams } });
+        storeSeams: { http: async () => ({ status: 404, contentType: 'application/json', body: '{"ok":false,"error":"auth_disabled"}', truncated: false }), ...seams } });
     return { report, artifacts, case: report.cases.find(entry => entry.id === 'LIVE-C5') };
 }
 const failsWith = async (t, faults, pattern, { result = 'fail', seams } = {}) => {
