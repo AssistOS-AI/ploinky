@@ -461,7 +461,9 @@ test('a stopped Box restarts on the same outer ID with a fresh tmpfs boot', {
 });
 
 test('rootless Podman exercises the complete public lifecycle on one workspace identity', {
-    timeout: 30 * 60_000,
+    // On a GPU host the start alone may wait up to the supervisor's 31-minute
+    // no-wait bound before its D14 GPU reapplication, so the limit covers it.
+    timeout: 50 * 60_000,
 }, async (t) => {
     const candidateReference = requirePodmanCandidate(t);
     if (!candidateReference) return;
