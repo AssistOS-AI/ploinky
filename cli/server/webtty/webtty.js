@@ -21,7 +21,6 @@
     const accessElement = document.getElementById('access');
     const roleElement = document.getElementById('role');
     const profileElement = document.getElementById('profile');
-    const closePolicyElement = document.getElementById('close-policy');
     const killButton = document.getElementById('kill');
     const statusElement = document.getElementById('status');
     const statusDot = document.getElementById('status-dot');
@@ -34,6 +33,7 @@
     let terminalSessionId = '';
     // The server-issued view of this document; streams and the close signal bind to it.
     let viewId = '';
+    // The session's stored policy as the server reports it; only announced to an embedding page.
     let closePolicy = 'keep';
     let intentSentForView = '';
     let role = 'watcher';
@@ -145,13 +145,6 @@
         } catch (_) {}
     }
 
-    function showClosePolicy() {
-        if (!closePolicyElement) return;
-        closePolicyElement.value = closePolicy;
-        closePolicyElement.disabled = role !== 'owner' || closed || !terminalSessionId;
-        closePolicyElement.title = role === 'owner' ? '' : 'Only the owner can change this';
-    }
-
     function showProfile(label) {
         if (!profileElement) return;
         profileElement.textContent = label ? `Profile: ${label}` : '';
@@ -198,7 +191,6 @@
         role = value;
         roleElement.textContent = role === 'owner' ? 'Owner' : 'Watching (read-only)';
         terminal.options.disableStdin = role !== 'owner' || inputStopped || closed;
-        showClosePolicy();
     }
 
     function inputFailure(error) {
@@ -281,7 +273,6 @@
         eventSource?.close();
         eventSource = null;
         killButton.disabled = true;
-        showClosePolicy();
         setStatus('Disconnected');
     }
 
@@ -398,29 +389,6 @@
         }
     });
 
-    closePolicyElement?.addEventListener('change', () => {
-        const requested = closePolicyElement.value;
-        if (closed || role !== 'owner' || !terminalSessionId || !['keep', 'stop'].includes(requested)) {
-            showClosePolicy();
-            return;
-        }
-        closePolicyElement.disabled = true;
-        const id = terminalSessionId;
-        refreshingMutation(`/webtty/sessions/${encodeURIComponent(id)}/close-policy`, { policy: requested },
-            () => !closed && terminalSessionId === id)
-            .then((result) => {
-                // The toggle always shows the server's resulting policy.
-                if (terminalSessionId === id && ['keep', 'stop'].includes(result?.closePolicy)) {
-                    closePolicy = result.closePolicy;
-                    announceView();
-                }
-            })
-            .catch((error) => {
-                if (terminalSessionId === id) showMessage(`The close setting was not changed. ${error.message}`);
-            })
-            .finally(showClosePolicy);
-    });
-
     // Mints a fresh single-use attach token for a known terminal and attaches
     // with it, which creates a new server view. An explicit recovery names the
     // view it replaces, so that view's earlier close signal no longer counts.
@@ -468,7 +436,6 @@
         accessElement.className = `access-badge access-${target.access}`;
         directoryElement.textContent = target.cwdDisplay;
         killButton.disabled = false;
-        showClosePolicy();
         rememberSession();
         announceView();
         attachStream();
@@ -513,13 +480,12 @@
             return;
         }
         const { kind, value } = handoff;
-        const requestedPolicy = handoff.closePolicy === 'stop' ? 'stop' : 'keep';
         handoff = null;
         setStatus(kind === 'attach' ? 'Attaching terminal…' : 'Creating terminal…');
         fit();
         const body = kind === 'attach'
             ? { attach: value, ...boundedDimensions() }
-            : { launch: value, ...boundedDimensions(), closePolicy: requestedPolicy };
+            : { launch: value, ...boundedDimensions(), closePolicy: 'keep' };
         const result = await jsonRequest(kind === 'attach' ? '/webtty/attachments' : '/webtty/sessions', {
             method: 'POST', headers: mutationHeaders(), body: JSON.stringify(body),
         });
@@ -528,7 +494,9 @@
         await useSession(result, kind);
     }
 
-    // A best-effort signal bound to this document's view. A lost or refused
+    // A best-effort signal bound to this document's view. Closing, reloading
+    // or leaving the tab always keeps the shell running, whatever policy the
+    // session stores, so the signal only ends this view. A lost or refused
     // request stops nothing; embedded pages leave the signal to their parent.
     function sendCloseIntent() {
         if (embedded || role !== 'owner' || !terminalSessionId || !viewId
@@ -541,7 +509,7 @@
                 cache: 'no-store',
                 keepalive: true,
                 headers: mutationHeaders(),
-                body: JSON.stringify({ view: viewId, policy: closePolicy }),
+                body: JSON.stringify({ view: viewId, policy: 'keep' }),
             })).catch(() => {});
         } catch (_) {}
     }

@@ -64,7 +64,7 @@ function createHarness({
         elements.set(id, value);
         return value;
     }
-    for (const id of ['directory', 'target', 'access', 'status', 'status-dot', 'dimensions', 'message', 'terminal', 'role', 'profile', 'close-policy', 'kill']) element(id);
+    for (const id of ['directory', 'target', 'access', 'status', 'status-dot', 'dimensions', 'message', 'terminal', 'role', 'profile', 'kill']) element(id);
 
     class FakeTerminal {
         constructor(options) {
@@ -738,17 +738,16 @@ function mintHandler({ mintStatus = 201, onAttach = null } = {}) {
     };
 }
 
-test('A9: a top-level owner pagehide sends exactly one keepalive close intent with the page mutation proof', async () => {
+test('A9: a top-level owner pagehide sends exactly one keepalive keep intent with the page mutation proof, even from a legacy stop fragment', async () => {
     const harness = createHarness({ hash: `#launch=${'a'.repeat(32)}&close=stop`, sessionOverride: { id: SESSION_ID } });
     await flushTasks();
+    // The legacy `close=stop` hint is accepted but every shell is created with Keep running.
     assert.deepEqual(JSON.parse(harness.requests[0].options.body), {
-        launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'stop',
+        launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep',
     });
     const view = harness.sources[0].url.split('?view=')[1];
     assert.match(view, /^[A-Za-z0-9_-]{32}$/);
     assert.equal(harness.sources[0].url, `/webtty/sessions/${SESSION_ID}/stream?view=${view}`);
-    assert.equal(harness.elements.get('close-policy').value, 'stop');
-    assert.equal(harness.elements.get('close-policy').disabled, false);
     harness.windowListeners.get('pagehide')();
     harness.windowListeners.get('pagehide')();
     await flushTasks();
@@ -759,13 +758,14 @@ test('A9: a top-level owner pagehide sends exactly one keepalive close intent wi
     assert.equal(intents[0].options.credentials, 'same-origin');
     // The existing proof: the HttpOnly CSRF cookie with exact Origin, no readable token header.
     assert.deepEqual(JSON.parse(JSON.stringify(intents[0].options.headers)), { 'Content-Type': 'application/json' });
-    assert.deepEqual(JSON.parse(intents[0].options.body), { view, policy: 'stop' });
+    assert.deepEqual(JSON.parse(intents[0].options.body), { view, policy: 'keep' });
     assert.deepEqual(Object.keys(JSON.parse(intents[0].options.body)), ['view', 'policy']);
     assert.equal(deletions(harness).length, 0);
+    assert.equal(harness.requests.filter(({ url }) => url.endsWith('/close-policy')).length, 0);
     assert.deepEqual(harness.posted, []);
 });
 
-test('A9: a keep page still signals with its belief; embedded pages and watchers never signal', async () => {
+test('A9: a keep page signals keep; embedded pages and watchers never signal', async () => {
     const keep = createHarness({ sessionOverride: { id: SESSION_ID } });
     await flushTasks();
     keep.windowListeners.get('pagehide')();
@@ -781,14 +781,8 @@ test('A9: a keep page still signals with its belief; embedded pages and watchers
     }
 });
 
-test('A9: an embedded page announces its view only to its parent origin after attach and each policy change', async () => {
-    const harness = createHarness({ embedded: true, sessionOverride: { id: SESSION_ID, profileLabel: 'Robot <A>' },
-        requestHandler(url, options) {
-            if (url.endsWith('/close-policy')) {
-                return response(200, { ok: true, closePolicy: JSON.parse(options.body).policy, pendingStopUntil: null });
-            }
-        },
-    });
+test('A9: an embedded page announces its view only to its parent origin after attach', async () => {
+    const harness = createHarness({ embedded: true, sessionOverride: { id: SESSION_ID, profileLabel: 'Robot <A>' } });
     await flushTasks();
     const view = harness.sources[0].url.split('?view=')[1];
     // The page runs in its own realm; compare plain JSON shapes.
@@ -799,49 +793,35 @@ test('A9: an embedded page announces its view only to its parent origin after at
     assert.equal(harness.stored.size, 0, 'embedded pages remember nothing');
     assert.equal(harness.elements.get('profile').textContent, 'Profile: Robot <A>');
     assert.equal(harness.elements.get('profile').hidden, false);
-    harness.elements.get('close-policy').change('stop');
-    await flushTasks();
-    const policyRequests = harness.requests.filter(({ url }) => url === `/webtty/sessions/${SESSION_ID}/close-policy`);
-    assert.equal(policyRequests.length, 1);
-    assert.deepEqual(JSON.parse(policyRequests[0].options.body), { policy: 'stop' });
-    assert.equal(harness.posted.length, 2);
-    assert.equal(harness.posted[1].message.policy, 'stop');
-    assert.equal(harness.posted[1].targetOrigin, 'https://app.example.test');
-});
-
-test('A9: the owner toggle shows the server result; watchers see the policy read-only', async () => {
-    const harness = createHarness({ sessionOverride: { id: SESSION_ID },
-        requestHandler(url) {
-            // The server answers with its resulting policy, which the page adopts.
-            if (url.endsWith('/close-policy')) return response(200, { ok: true, closePolicy: 'keep', pendingStopUntil: null });
-        },
-    });
-    await flushTasks();
-    assert.equal(harness.elements.get('profile').hidden, true);
-    harness.elements.get('close-policy').change('stop');
-    await flushTasks();
-    assert.equal(harness.elements.get('close-policy').value, 'keep');
+    // The page has no policy control, so nothing re-announces or changes the policy.
     harness.windowListeners.get('pagehide')();
     await flushTasks();
-    assert.equal(JSON.parse(closeIntents(harness)[0].options.body).policy, 'keep');
+    assert.equal(harness.posted.length, 1);
+    assert.equal(harness.requests.filter(({ url }) => url.endsWith('/close-policy') || url.endsWith('/close-intents')).length, 0);
+});
 
-    const refused = createHarness({ sessionOverride: { id: SESSION_ID },
-        requestHandler(url) { if (url.endsWith('/close-policy')) return response(403, { error: 'owner_required' }); },
-    });
-    await flushTasks();
-    refused.elements.get('close-policy').change('stop');
-    await flushTasks();
-    assert.equal(refused.elements.get('close-policy').value, 'keep');
-    assert.match(refused.elements.get('message').textContent, /close setting was not changed/);
+test('A9: the terminal page has no close-policy selector and never changes the policy', () => {
+    assert.doesNotMatch(pageSource, /<select|close-policy|When this tab closes/);
+    assert.doesNotMatch(clientSource, /close-policy|getElementById\('close-policy'\)/);
+    assert.doesNotMatch(fs.readFileSync(path.join(webttyDirectory, 'webtty.css'), 'utf8'), /close-policy/);
+    assert.match(pageSource, /<button id="kill" type="button" disabled>Kill<\/button>/, 'the existing Kill stays');
+});
 
-    const watcher = createHarness({ role: 'watcher', sessionOverride: { id: SESSION_ID, closePolicy: 'stop' } });
-    await flushTasks();
-    assert.equal(watcher.elements.get('close-policy').value, 'stop');
-    assert.equal(watcher.elements.get('close-policy').disabled, true);
-    watcher.elements.get('close-policy').change('keep');
-    await flushTasks();
-    assert.equal(watcher.requests.filter(({ url }) => url.endsWith('/close-policy')).length, 0);
-    assert.equal(watcher.elements.get('close-policy').value, 'stop');
+test('A9: an attached legacy Stop-it session still sends only a keep intent on top-level pagehide', async () => {
+    for (const role of ['owner', 'watcher']) {
+        const harness = createHarness({ hash: `#attach=${'b'.repeat(32)}`, role, sessionOverride: { id: SESSION_ID, closePolicy: 'stop' } });
+        await flushTasks();
+        assert.equal(harness.sources.length, 1, role);
+        const view = harness.sources[0].url.split('?view=')[1];
+        harness.windowListeners.get('pagehide')();
+        harness.windowListeners.get('pagehide')();
+        await flushTasks();
+        const intents = closeIntents(harness);
+        assert.deepEqual(intents.map(({ options }) => JSON.parse(options.body)), role === 'owner' ? [{ view, policy: 'keep' }] : [], role);
+        assert.equal(deletions(harness).length, 0, role);
+        assert.equal(harness.requests.filter(({ url }) => url.endsWith('/close-policy')).length, 0, role);
+        assert.match(String(harness.stored.get('ploinky.webtty.session')), new RegExp(view), `${role}: recovery storage is retained`);
+    }
 });
 
 // Addendum A1 r2: the page remembers exactly {sessionId, viewId} as JSON.
@@ -917,7 +897,6 @@ test('A9: a back/forward restore re-enables the page, re-attaches as a new view 
         await flushTasks();
         assert.equal(harness.terminal.options.disableStdin, true);
         assert.equal(harness.elements.get('kill').disabled, true);
-        assert.equal(harness.elements.get('close-policy').disabled, true);
         harness.windowListeners.get('pageshow')({ persisted: false });
         await flushTasks();
         assert.equal(harness.sources.length, 1, 'a fresh (non-cached) show does nothing');
@@ -933,7 +912,6 @@ test('A9: a back/forward restore re-enables the page, re-attaches as a new view 
         assert.notEqual(secondView, firstView);
         assert.equal(harness.terminal.options.disableStdin, false);
         assert.equal(harness.elements.get('kill').disabled, false);
-        assert.equal(harness.elements.get('close-policy').disabled, false);
         harness.terminal.cols = 100;
         harness.windowListeners.get('resize')();
         harness.terminal.emitData('typed');
@@ -954,7 +932,7 @@ test('A9: a back/forward restore re-enables the page, re-attaches as a new view 
     }
 });
 
-test('A9: only #launch=<id> or #launch=<id>&close=stop launch; any other extra key is rejected', async () => {
+test('A9: only #launch=<id> or #launch=<id>&close=stop launch, both with keep; any other extra key is rejected', async () => {
     for (const hash of [
         `#launch=${'a'.repeat(32)}&close=keep`,
         `#launch=${'a'.repeat(32)}&close=STOP`,
@@ -970,7 +948,7 @@ test('A9: only #launch=<id> or #launch=<id>&close=stop launch; any other extra k
     }
     const stop = createHarness({ hash: `#launch=${'a'.repeat(32)}&close=stop` });
     await flushTasks();
-    assert.equal(JSON.parse(stop.requests[0].options.body).closePolicy, 'stop');
+    assert.equal(JSON.parse(stop.requests[0].options.body).closePolicy, 'keep');
     const keep = createHarness({ hash: `#launch=${'a'.repeat(32)}` });
     await flushTasks();
     assert.equal(JSON.parse(keep.requests[0].options.body).closePolicy, 'keep');

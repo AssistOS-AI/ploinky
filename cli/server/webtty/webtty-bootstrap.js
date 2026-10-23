@@ -8,11 +8,12 @@
         const keys = [...values.keys()];
         const kind = keys[0];
         const value = values.get(kind) || '';
-        // Exactly `#launch=<id>`, `#launch=<id>&close=stop` or `#attach=<id>`.
-        const stopOnClose = keys.length === 2 && kind === 'launch' && keys[1] === 'close'
+        // Exactly `#launch=<id>`, `#launch=<id>&close=stop` or `#attach=<id>`. The legacy
+        // `close=stop` hint is still accepted but ignored: every shell is created with Keep running.
+        const legacyStopHint = keys.length === 2 && kind === 'launch' && keys[1] === 'close'
             && values.get('close') === 'stop';
-        if ((keys.length === 1 || stopOnClose) && ['launch', 'attach'].includes(kind) && tokenPattern.test(value)) {
-            handoff = { kind, value, closePolicy: stopOnClose ? 'stop' : 'keep' };
+        if ((keys.length === 1 || legacyStopHint) && ['launch', 'attach'].includes(kind) && tokenPattern.test(value)) {
+            handoff = { kind, value };
         }
     } catch (_) {}
     try {
