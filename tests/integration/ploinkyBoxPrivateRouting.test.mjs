@@ -147,9 +147,9 @@ test('one nested rootless-Podman container reaches the unpublished private liste
         assert.equal(observedLabels[BOX_AGENTLIB_LABELS.sourceRelativePath], 'image');
         assert.equal(observedLabels[BOX_AGENTLIB_LABELS.sourceIdHash],
             imageSourceIdHash(imageSourceIdentity(normalizeImageId(outerInspection?.Image))));
-        // This default Box has the loopback publication and no GPU grant, so it
-        // carries neither conditional label and trusts no outer Router hosts.
-        // Present only with a non-default binding, a GPU grant or the hardware-limits gate.
+        // This Box has the loopback publication, no GPU grant and the
+        // hardware-limits gate off, so it carries none of the conditional
+        // labels and trusts no outer Router hosts.
         const conditionalLabels = [BOX_LABELS.routerBindAddress, BOX_LABELS.gpuGrant, BOX_LABELS.hardwareLimits];
         assert.deepEqual(
             Object.keys(observedLabels)

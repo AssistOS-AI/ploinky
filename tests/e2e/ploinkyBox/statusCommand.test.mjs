@@ -143,6 +143,8 @@ test('public status renders the core workspace view without mutating Box state',
     const harness = createPodmanHarness(t, candidateReference);
     const prepared = await harness.supervisor.prepareBoxForCommand({
         explicitPort: await availableHostPort(),
+        // A media port no other Box test uses, so a Box on the default 7882 cannot block it.
+        explicitMediaPort: 17903,
         imageRef: candidateReference,
     });
     execInBox(harness.runner, prepared.containerId, [
