@@ -21,6 +21,13 @@ import {
     imageSourceIdentity,
 } from '../../agentlib/contract.mjs';
 import { normalizeImageId } from '../../ploinky-box/contract/image-id.mjs';
+import {
+    createGpuGrantStore,
+    declaredGpuAgents,
+    discoverGpu,
+    resolveDesiredGpuWiring,
+} from '../../ploinky-box/gpuGrant.mjs';
+import { createHardwareGateStore } from '../../ploinky-box/hardwareLimitsGate.mjs';
 import { resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     removeContainerById,
@@ -136,6 +143,23 @@ function repeatedArgument(argv, option) {
     return argv.flatMap((value, index) => value === option ? [argv[index + 1]] : []);
 }
 
+// The GPU wiring the host gives a Box it creates now, selected as the
+// supervisor's `selectSavedGpuWiring` selects it with the stores and discovery
+// the native harness leaves at their defaults. It is null on a host without a
+// usable GPU or a workspace without GPU agents.
+function desiredGpuWiring(harness) {
+    const engineRunner = harness.runner;
+    return resolveDesiredGpuWiring(
+        harness.identity,
+        createGpuGrantStore({ engineRunner }).read(harness.identity),
+        declaredGpuAgents(harness.identity.workspaceRoot),
+        {
+            discover: (vendor) => discoverGpu(vendor, { engineRunner }),
+            mpsEnabled: createHardwareGateStore().read(harness.identity)?.enabled === true,
+        },
+    );
+}
+
 function assertExactOuterStorage(harness, containerId, repositoryRoot) {
     const record = boxInspection(harness, containerId);
     const workspaceRoot = harness.identity.workspaceRoot;
@@ -238,6 +262,11 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
         },
         { type: 'bind', source: workspaceRoot, destination: workspaceRoot, rw: true },
         ...expectedAgentLibMounts,
+        // On a GPU host, once installed manifests declare GPU access (D14), each
+        // wiring mount is one read-only bind (`gpuWiringCreateArgs`).
+        ...(desiredGpuWiring(harness)?.mounts || []).map((mount) => ({
+            type: 'bind', source: mount.source, destination: mount.destination, rw: false,
+        })),
     ]));
     const inspectedTmpfs = record.HostConfig?.Tmpfs;
     assert.deepEqual(Object.keys(inspectedTmpfs || {}), [BOX_TMPFS.destination]);
