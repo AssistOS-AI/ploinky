@@ -142,6 +142,8 @@ function engineContainers(w) {
     }]));
 }
 
+const engineRecord = (w, containerName) => structuredClone(w.engine.state().containers[containerName]);
+
 function editEngine(w, edit) {
     const state = w.engine.state();
     edit(state.containers);
@@ -274,15 +276,21 @@ test('an enable killed after its receipt but before the rotated registry leaves 
     assert.deepEqual(receipts(w).map((entry) => entry.name), [inert.name]);
 });
 
-function killedAfterRegistry(t, manifest = NONE) {
-    const w = workspace(t, { media: manifest, bystander: NONE });
+function killedAfterRegistry(t, manifest = NONE, { staticRoot = false } = {}) {
+    const w = workspace(t, { media: manifest, bystander: NONE, ...(staticRoot ? { root: NONE } : {}) });
+    let rootName = null;
+    if (staticRoot) {
+        // An independent, unchanged static root; the target stays non-static.
+        assert.equal(w.drive('static-root', { agent: 'root' }).ok, true);
+        rootName = enabled(w, 'root').result.containerName;
+    }
     const bystander = enabled(w, 'bystander').result.containerName;
     const containerName = enabled(w, 'media').result.containerName;
     const predecessor = registry(w)[containerName];
     const bystanderRuntime = engineContainers(w)[bystander];
     w.change('media', manifest);
     enabled(w, 'media', { killAfterRegistry: true }, { killed: true });
-    return { w, containerName, predecessor, bystander, bystanderRuntime };
+    return { w, containerName, predecessor, bystander, bystanderRuntime, rootName };
 }
 
 test('an enable killed after the rotated registry leaves its predecessor provable and bound', (t) => {
@@ -304,17 +312,28 @@ test('an enable killed after the rotated registry leaves its predecessor provabl
 });
 
 test('a workspace start recovers a killed enable: it removes only the original predecessor and retires its proof', (t) => {
-    const { w, containerName, predecessor, bystander, bystanderRuntime } = killedAfterRegistry(t);
+    const { w, containerName, predecessor, bystander, rootName } = killedAfterRegistry(t, NONE, { staticRoot: true });
+    const untouched = Object.fromEntries([rootName, bystander].map((name) => [name, {
+        record: registry(w)[name], runtime: engineRecord(w, name),
+    }]));
     const callsBefore = calls(w).length;
-    const recovered = w.drive('stage', { staticAgent: 'repo/media' });
+    const recovered = w.drive('stage', { staticAgent: 'repo/root' });
     assert.equal(recovered.ok, true, JSON.stringify(recovered));
-    assert.ok(recovered.changedContainers.includes(containerName));
-    const removedIds = calls(w).slice(callsBefore).filter((argv) => argv[0] === 'rm').flatMap((argv) => argv.slice(1));
-    assert.ok(removedIds.includes(predecessor.containerId));
-    assert.equal(removedIds.includes(bystanderRuntime.id), recovered.changedContainers.includes(bystander),
-        'the bystander is touched only when the start itself replaces it');
+    t.diagnostic(`graph replacement: ${JSON.stringify(recovered.lines)}`);
+    // Ordinary graph planning selects only the target, for its own reason.
+    assert.deepEqual(recovered.changedContainers, [containerName]);
+    assert.match(recovered.lines.find((line) => line.includes('replacing its runtime')), /runtimeIdentityDrift/);
+    const after = calls(w).slice(callsBefore);
+    const removed = callIndex(after, (argv) => argv[0] === 'rm' && argv.includes(predecessor.containerId));
+    const created = callIndex(after, (argv) => argv[0] === 'create' && argv.includes(containerName));
+    assert.ok(removed >= 0 && created > removed, 'exact predecessor removal precedes the successor');
+    assert.equal(after.filter((argv) => argv[0] === 'rm').length, 1, 'only the original predecessor was removed');
     assertCommittedSuccessor(w, containerName, { predecessorId: predecessor.containerId });
     assert.deepEqual(receipts(w), []);
+    for (const [name, before] of Object.entries(untouched)) {
+        assert.deepEqual(registry(w)[name], before.record, `${name} record unchanged`);
+        assert.deepEqual(engineRecord(w, name), before.runtime, `${name} runtime unchanged`);
+    }
 });
 
 test('a later explicit enable recovers a killed enable by carrying its proof forward', (t) => {
@@ -590,22 +609,24 @@ test('a native predecessor re-enabled as a none container stages no receipt', (t
     assert.deepEqual(w.drive('lookup', { containerName: names.web }), { ok: true, receipt: null });
 });
 
-test('an absent managed predecessor is proven absent and a none successor is created (never a present-runtime removal)', (t) => {
-    const { w, names } = seeded(t, { web: withNetwork('default') }, [PREDECESSOR('web')]);
-    assert.deepEqual(engineContainers(w), {}, 'the recorded predecessor has no runtime');
-    const callsBefore = calls(w).length;
-    w.change('web', NONE);
-    const result = enabled(w, 'web');
-    const after = calls(w).slice(callsBefore);
-    assert.equal(after.some((argv) => argv[0] === 'rm'), false, 'nothing present was removed');
-    assert.ok(after.some((argv) => argv[0] === 'container' && argv[1] === 'inspect' && argv.includes('c'.repeat(64))),
-        'its absence was proven by its exact ID');
-    const receiptWrite = result.trace.findIndex((entry) => entry.event === 'receipt');
-    const registryWrite = result.trace.findIndex((entry) => entry.event === 'registry');
-    assert.ok(receiptWrite >= 0 && receiptWrite < registryWrite, JSON.stringify(result.trace));
-    assertCommittedSuccessor(w, names.web, { predecessorId: 'c'.repeat(64) });
-    assert.deepEqual(receipts(w), []);
-});
+for (const [label, successor] of [['none', NONE], ['host', HOST]]) {
+    test(`an absent managed predecessor is proven absent and a ${label} successor is created (never a present-runtime removal)`, (t) => {
+        const { w, names } = seeded(t, { web: withNetwork('default') }, [PREDECESSOR('web')]);
+        assert.deepEqual(engineContainers(w), {}, 'the recorded predecessor has no runtime');
+        const callsBefore = calls(w).length;
+        w.change('web', successor);
+        const result = enabled(w, 'web');
+        const after = calls(w).slice(callsBefore);
+        assert.equal(after.some((argv) => argv[0] === 'rm'), false, 'nothing present was removed');
+        assert.ok(after.some((argv) => argv[0] === 'container' && argv[1] === 'inspect' && argv.includes('c'.repeat(64))),
+            'its absence was proven by its exact ID');
+        const receiptWrite = result.trace.findIndex((entry) => entry.event === 'receipt');
+        const registryWrite = result.trace.findIndex((entry) => entry.event === 'registry');
+        assert.ok(receiptWrite >= 0 && receiptWrite < registryWrite, JSON.stringify(result.trace));
+        assertCommittedSuccessor(w, names.web, { predecessorId: 'c'.repeat(64) });
+        assert.deepEqual(receipts(w), []);
+    });
+}
 
 test('a none runtime re-enabled on a managed network keeps the base managed dispatch outcome', (t) => {
     const w = workspace(t, { media: NONE });
@@ -634,7 +655,6 @@ test('a none runtime re-enabled on a managed network keeps the base managed disp
 // has already published the rotated record and its receipt, and the refusal
 // must leave the predecessor, its proof and the inactive routing exactly so.
 
-const engineRecord = (w, containerName) => structuredClone(w.engine.state().containers[containerName]);
 const DESTRUCTIVE = new Set(['rm', 'stop', 'kill', 'create', 'start']);
 
 // A published managed runtime with a signed descriptor (see the driver), or
