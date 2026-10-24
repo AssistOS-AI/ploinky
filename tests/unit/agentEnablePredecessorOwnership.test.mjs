@@ -668,6 +668,11 @@ function presentPredecessor(w, agent, kind) {
         agent, network: kind === 'bridge' ? BRIDGE_NETWORK : { mode: kind },
     });
     assert.equal(fixture.ok, true, JSON.stringify(fixture));
+    // The rendered semantic label is the one the graph's retained managed
+    // recomputation expects, so no replacement reason is manufactured.
+    assert.match(fixture.envHash, /^[a-f0-9]{64}$/);
+    assert.equal(fixture.retainedEnvHash, fixture.envHash);
+    assert.equal(engineRecord(w, fixture.containerName).Labels['ploinky.envhash'], fixture.envHash);
     return fixture;
 }
 

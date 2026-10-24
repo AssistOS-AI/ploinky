@@ -154,7 +154,8 @@ async function run() {
         // descriptor mounted read-only and recorded in the registry. The full
         // managed launch cannot run offline (its Router authority attestation
         // needs a live Router and helper container), so the same production
-        // helpers build the labels, the network name and the signed descriptor.
+        // helpers build the labels, the network name, the signed descriptor and
+        // the semantic environment-hash label the managed create renders.
         const { getAgentContainerName } = await cli('sandbox/docker/index.js');
         const { getAgentDataDir } = await cli('utils/workspaceStructure.js');
         const { NETWORK_LABELS, physicalNetworkName, workspaceNetworkIdentity } = await cli('sandbox/networkIdentity.js');
@@ -162,6 +163,9 @@ async function run() {
         const { effectiveInstanceKey } = await cli('utils/workspaceDependencyGraph.js');
         const { deriveAgentPrincipalId } = await cli('utils/security/agentIdentity.js');
         const descriptors = await cli('utils/security/generatedRouterDescriptor.js');
+        const { buildRuntimeNetworkPlan, computeAgentEnvHash } = await cli('sandbox/docker/agentServiceManager.js');
+        const { computeRetainedManagedEnvHash } = await cli('commands/workspaceUtil.js');
+        const { resolveManifestRuntimeProfile } = await cli('utils/runtime/profileService.js');
         const { agent, network } = argument;
         const containerName = getAgentContainerName(agent, 'repo');
         const instanceId = `${agent}-managed-instance`;
@@ -180,6 +184,20 @@ async function run() {
         descriptors.writeGeneratedRouterDescriptorFile(
             descriptorFile, descriptors.signGeneratedRouterDescriptorEnvelope(payload).bytes,
         );
+        const manifest = readJson(path.join(root, '.ploinky', 'repos', 'repo', agent, 'manifest.json'));
+        const profile = resolveManifestRuntimeProfile(manifest, { agentName: `repo/${agent}`, path: `manifest(repo/${agent})` });
+        if (JSON.stringify(profile.network) !== JSON.stringify(network)) {
+            throw new Error(`fixture network ${JSON.stringify(network)} differs from the manifest's ${JSON.stringify(profile.network)}`);
+        }
+        const runtimeNetworkPlan = buildRuntimeNetworkPlan('podman', profile.network);
+        const principalId = deriveAgentPrincipalId('repo', agent);
+        // The label computeSemanticEnvHash(payload) gives the managed create.
+        const envHash = computeAgentEnvHash(manifest, profile.profileConfig, {
+            agentName: agent,
+            repoName: 'repo',
+            runtimeNetworkPlan,
+            generatedRouter: { payload, principalId, instanceId, enableGeneration },
+        });
         const workspaceHash = workspaceNetworkIdentity(root).hash;
         const [attachment] = logicalNetworkAttachments(network, agent, {
             instanceKey: effectiveInstanceKey('repo', agent, ''),
@@ -192,7 +210,7 @@ async function run() {
             [NETWORK_LABELS.contract]: networkContractHash(network),
             [NETWORK_LABELS.instanceId]: instanceId,
             [NETWORK_LABELS.enableGeneration]: enableGeneration,
-            'ploinky.envhash': 'managed-launch-semantic-envhash',
+            'ploinky.envhash': envHash,
         };
         const descriptorTarget = '/run/ploinky/router-descriptor.json';
         const containerId = execFileSync('podman', [
@@ -224,7 +242,13 @@ async function run() {
         } };
         fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify(routing, null, 2));
         applyEdgeRoutingGeneration({ reason: 'test-published-managed-runtime' });
-        return { ok: true, containerName, containerId, descriptorFile };
+        // What the graph recomputes for this retained runtime from its record
+        // and signed descriptor; it must agree with the rendered label.
+        const retainedEnvHash = computeRetainedManagedEnvHash(
+            { repoName: 'repo', shortAgentName: agent, manifest, profile: '' },
+            records[containerName], profile.profileConfig, runtimeNetworkPlan,
+        );
+        return { ok: true, containerName, containerId, descriptorFile, envHash, retainedEnvHash };
     }
 
     if (phase === 'allow-host-sandbox') {
