@@ -4101,3 +4101,112 @@ test('a watcher claim never pins a view against eviction at the cap', async (t) 
     assert.equal(f.session.views.has(f.created.view.id), false);
     assert.ok(f.session.pendingStop, 'the ignored claim leaves the stop armed');
 });
+
+// ---- Retired streams: a view that missed its shell's exit notification ----
+// Generation invalidation drops an old-generation viewer for reconnect
+// (`retry: 1000`) before deferred target validation retires the shell, so the
+// dropped viewer never receives the exit event that went to attached viewers.
+
+function sseResponse() {
+    return Object.assign(streamResponse(), {
+        statusCode: 0,
+        headers: {},
+        writeHead(status, headers = {}) { this.statusCode = status; this.headers = { ...headers }; },
+        // JSON refusals pass their body to end().
+        end(value = '') { this.body += String(value); this.writableEnded = true; },
+    });
+}
+
+function adminStreamRequest(selectedLease) {
+    return Object.assign(new EventEmitter(), {
+        method: 'GET',
+        headers: {},
+        lease: selectedLease,
+        user: { id: selectedLease.userId, roles: ['admin'] },
+    });
+}
+
+async function streamThroughHandler(manager, plan, id, viewId, selectedLease) {
+    process.env.PLOINKY_MASTER_KEY ||= 'b'.repeat(64);
+    const { handleWebtty } = await import('../../cli/server/handlers/webtty.js');
+    const req = adminStreamRequest(selectedLease);
+    const res = sseResponse();
+    await handleWebtty(req, res, new URL(`/webtty/sessions/${id}/stream?view=${viewId}`, 'http://localhost'),
+        { manager, routePlan: plan });
+    return { req, res, status: res.statusCode, body: res.body };
+}
+
+function currentGenerationPlan() {
+    const plan = routePlan();
+    plan.lease.id = 'generation-b';
+    return plan;
+}
+
+async function missedExitFixture(t, { auth = requestAuthAdapter(), ...options } = {}) {
+    let releaseValidation = null;
+    let generationCurrent = true;
+    const worker = new FakeWorker();
+    const manager = await createManager(t, {
+        auth,
+        agentProviderAvailable: true,
+        agentWorkerFactory: () => worker,
+        ...options,
+        targetResolver: {
+            async revalidate({ target }) { return target; },
+            async revalidateRunningAgent() {
+                await new Promise((resolve) => { releaseValidation = resolve; });
+                throw Object.assign(new Error('replaced'), { code: 'WEBTTY_TARGET_IDENTITY_STALE' });
+            },
+        },
+    });
+    const owner = lease('owner');
+    const oldPlan = routePlan();
+    oldPlan.lease.isCurrent = oldPlan.lease.commit = () => generationCurrent;
+    const session = await createAgentSession(manager, { lease: owner });
+    const [viewId] = session.views.keys();
+    return {
+        manager, worker, session, owner, oldPlan, viewId,
+        open: (selectedLease = owner, selectedView = viewId, plan = oldPlan) => (
+            streamThroughHandler(manager, plan, session.id, selectedView, selectedLease)
+        ),
+        stream: (selectedLease = owner, selectedView = viewId, plan = currentGenerationPlan()) => (
+            streamThroughHandler(manager, plan, session.id, selectedView, selectedLease)
+        ),
+        // The validateLiveSessions route-lease path: retry, then end.
+        async dropOldGeneration() {
+            generationCurrent = false;
+            await manager.validateLiveSessions();
+        },
+        // Deferred target validation proves the identity replaced.
+        async retire() {
+            assert.equal(typeof releaseValidation, 'function', 'target validation must be in flight');
+            releaseValidation();
+            await settleTarget(session);
+            await session.closePromise;
+        },
+    };
+}
+
+test('a viewer dropped for reconnect before target retirement receives one finite exit on its next stream', async (t) => {
+    const f = await missedExitFixture(t);
+    const first = await f.open();
+    assert.equal(first.res.statusCode, 200);
+    f.worker.emit('output', { sequence: 1, data: 'one' });
+    assert.match(first.res.body, /event: output/);
+    await f.dropOldGeneration();
+    assert.equal(first.res.writableEnded, true);
+    assert.match(first.res.body, /retry: 1000\n\n$/);
+    assert.equal(f.session.views.get(f.viewId).state, 'detached');
+    assert.equal(f.manager.activeCount(), 1, 'generation loss alone never closes the shell');
+    await f.retire();
+    assert.equal(f.session.closeReason, 'target_identity_changed');
+    assert.ok(f.manager.tombstones.has(f.session.id));
+    assert.doesNotMatch(first.res.body, /event: exit/, 'the dropped viewer missed the exit notification');
+    const again = await f.stream();
+    t.diagnostic(`same-view reconnect after retirement: ${JSON.stringify({ status: again.status, body: again.body })}`);
+    assert.equal(again.status, 200);
+    assert.match(again.res.headers['Content-Type'], /^text\/event-stream/);
+    assert.equal(again.body, `event: exit\ndata: ${JSON.stringify({ reason: 'target_identity_changed' })}\n\n`);
+    assert.equal(again.res.writableEnded, true);
+    assert.equal(f.manager.viewerCount, 0);
+});
