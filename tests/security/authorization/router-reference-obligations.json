@@ -3768,6 +3768,58 @@
             "anchor": null,
             "statement": "if (!selected.operation && method === 'DELETE') {"
           }
+        },
+        "c048c0fc0bda861e98c10130019a640e23cbba3c1ca31a0d7d9f90e967fb2d5e": {
+          "webtty-ui.get": {
+            "line": 262,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-ui-slash.get": {
+            "line": 262,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-assets.get": {
+            "line": 277,
+            "anchor": "pathname.startsWith('/webtty/assets/')",
+            "statement": "if (pathname.startsWith('/webtty/assets/') && method === 'GET') {"
+          },
+          "webtty-discover.post": {
+            "line": 296,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/target-discoveries' && method === 'POST') {"
+          },
+          "webtty-discovery-delete.delete": {
+            "line": 327,
+            "anchor": null,
+            "statement": "if (selectedDiscovery && method === 'DELETE') {"
+          },
+          "webtty-create.post": {
+            "line": 344,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/sessions' && method === 'POST') {"
+          },
+          "webtty-stream.get": {
+            "line": 382,
+            "anchor": null,
+            "statement": "if (selected.operation === 'stream' && method === 'GET') {"
+          },
+          "webtty-input.post": {
+            "line": 426,
+            "anchor": null,
+            "statement": "if (selected.operation === 'input' && method === 'POST') {"
+          },
+          "webtty-resize.post": {
+            "line": 450,
+            "anchor": null,
+            "statement": "if (selected.operation === 'resize' && method === 'POST') {"
+          },
+          "webtty-delete.delete": {
+            "line": 503,
+            "anchor": null,
+            "statement": "if (!selected.operation && method === 'DELETE') {"
+          }
         }
       },
       "candidate": "0c0d70d80e8113db35b46432e17a50aaf6372fedeadcff9cd19c83ad4d5070f6"
