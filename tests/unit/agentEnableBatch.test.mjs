@@ -40,6 +40,12 @@ const routing = await import(new URL('../../cli/server/routingFile.js', import.m
 const agents = await import(new URL('../../cli/utils/agents.js', import.meta.url).href);
 const manager = await import(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url).href);
 const coordinated = await import(new URL('../../cli/sandbox/coordinatedEdgeApply.js', import.meta.url).href);
+const predecessors = await import(new URL('../../cli/sandbox/runtimePredecessorStore.js', import.meta.url).href);
+const docker = await import(new URL('../../cli/sandbox/docker/index.js', import.meta.url).href);
+const predecessorReceiptDir = path.join(workspace, '.ploinky', 'run', 'runtime-predecessors');
+const predecessorReceiptFiles = () => (fs.existsSync(predecessorReceiptDir)
+    ? fs.readdirSync(predecessorReceiptDir).filter((name) => name.endsWith('.json')).sort()
+    : []);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -365,6 +371,14 @@ test('same-name re-enable that changes more than the identity uses fail-closed r
             () => edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }),
             { code: 'EDGE_GENERATION_INACTIVE' },
         );
+        // A managed successor never reaches the predecessor receipt consumer,
+        // so its staging writes no receipt and copies no predecessor provenance.
+        const [plan] = prepared.plans;
+        const staged = prepared.preparedGeneration.generation.agents[plan.containerName];
+        assert.equal(Object.hasOwn(staged, 'containerId'), false);
+        assert.equal(Object.hasOwn(staged, 'runtime'), false);
+        assert.deepEqual(predecessorReceiptFiles(), []);
+        assert.equal(predecessors.readRuntimePredecessor(plan.containerName, staged), null);
     } finally {
         if (prepared) {
             edge.abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease, {
@@ -457,4 +471,76 @@ test('replacement policy rename failure preserves the previous policy and remove
     assert.equal(fs.existsSync(paths.preparationLeaseFile), false);
     assert.deepEqual(fs.readdirSync(paths.generationsDir).sort(), generationsBefore);
     assert.deepEqual(fs.readdirSync(path.dirname(paths.policyFile)).filter((name) => name.endsWith('.tmp')), []);
+});
+
+test('a host re-enable makes its predecessor proof durable before the rotated registry is published', (t) => {
+    const { paths } = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    const containerName = docker.getAgentContainerName('livekit', 'media');
+    const predecessor = {
+        type: 'agent', agentName: 'livekit', repoName: 'media', containerImage: 'node:20-alpine',
+        createdAt: new Date().toISOString(), projectPath: workspace, runMode: 'global', profile: 'default',
+        instanceId: 'livekit-predecessor-instance', enableGeneration: 'livekit-predecessor-generation',
+        containerId: 'c'.repeat(64), auth: { mode: 'none' }, config: { binds: [], env: [], ports: [] },
+    };
+    const registryBefore = JSON.parse(fs.readFileSync(paths.agentsFile, 'utf8'));
+    fs.writeFileSync(paths.agentsFile, JSON.stringify({ ...registryBefore, [containerName]: predecessor }, null, 2));
+    const routingBefore = JSON.parse(fs.readFileSync(paths.routingFile, 'utf8'));
+    routing.writeRoutingConfig({
+        ...routingBefore,
+        routes: { ...routingBefore.routes, livekit: { container: containerName, repo: 'media', agent: 'livekit' } },
+    }, { coordinate: false });
+    coordinated.applyEdgeRoutingGeneration({ reason: 'test-host-predecessor-baseline' });
+    const manifestPath = path.join(workspace, '.ploinky', 'repos', 'media', 'livekit', 'manifest.json');
+    const manifestBefore = fs.readFileSync(manifestPath, 'utf8');
+    writeManifest('media', 'livekit', {
+        container: 'node:20-alpine', network: { mode: 'host' }, about: 'changed manifest bytes',
+    });
+
+    const order = [];
+    const originalLink = fs.linkSync;
+    const originalRename = fs.renameSync;
+    t.mock.method(fs, 'linkSync', (source, destination, ...rest) => {
+        const result = originalLink(source, destination, ...rest);
+        if (path.dirname(String(destination)) === predecessorReceiptDir) {
+            order.push({ event: 'receipt', selector: JSON.parse(fs.readFileSync(paths.activeSelectorFile, 'utf8')).state });
+        }
+        return result;
+    });
+    t.mock.method(fs, 'renameSync', (source, destination, ...rest) => {
+        const result = originalRename(source, destination, ...rest);
+        if (destination === paths.agentsFile) order.push({ event: 'registry', receipts: predecessorReceiptFiles() });
+        return result;
+    });
+
+    let prepared;
+    let receipt = null;
+    try {
+        prepared = agents.prepareAgentEnableBatch([{ agentName: 'media/livekit', mode: 'global' }], {
+            reason: 'test-host-predecessor-replacement',
+            retireNoWaitMarkers: () => [],
+        });
+        assert.equal(prepared.preparedGeneration.preparationLease.mode, 'replacement');
+        const [plan] = prepared.plans;
+        const staged = JSON.parse(fs.readFileSync(paths.agentsFile, 'utf8'))[containerName];
+        assert.deepEqual(prepared.preparedGeneration.generation.agents[containerName], staged);
+        assert.notEqual(staged.instanceId, predecessor.instanceId);
+        assert.equal(staged.instanceId, plan.instanceId);
+        assert.equal(staged.containerId, predecessor.containerId, 'the rotated record names the predecessor container ID');
+        // The receipt was linked while the selector was still active, before
+        // the registry rotated; that registry write found it already durable.
+        assert.deepEqual(order.map((entry) => entry.event), ['receipt', 'registry']);
+        assert.equal(order[0].selector, 'active');
+        assert.equal(order[1].receipts.length, 1);
+        receipt = predecessors.readRuntimePredecessor(containerName, staged);
+        assert.equal(receipt.successor.instanceId, staged.instanceId);
+        assert.equal(receipt.successor.enableGeneration, staged.enableGeneration);
+        assert.equal(receipt.predecessor.instanceId, predecessor.instanceId);
+        assert.equal(receipt.predecessor.enableGeneration, predecessor.enableGeneration);
+        assert.equal(receipt.predecessor.containerId, predecessor.containerId);
+    } finally {
+        if (prepared) edge.abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease);
+        if (receipt) predecessors.retireRuntimePredecessor(receipt);
+        fs.writeFileSync(manifestPath, manifestBefore);
+    }
+    assert.deepEqual(predecessorReceiptFiles(), []);
 });

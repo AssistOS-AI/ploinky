@@ -241,6 +241,7 @@ import {
 } from '../runtimeCleanupReceipt.js';
 
 import { readRuntimeCandidate, writeRuntimeCandidate, retireRuntimeCandidate } from '../runtimeCandidateStore.js';
+import { readRuntimePredecessor, retireRuntimePredecessor } from '../runtimePredecessorStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -901,6 +902,15 @@ function appendEnvFlagsFromMap(envFlags, envMap) {
 function removeContainerForRecreate(runtime, containerName, label, record = null) {
     let exactRecord = record || loadAgentsMap()[containerName];
     try {
+        // A prepared replacement rotated this record's tuple before launch and
+        // first made the predecessor's own tuple durable in a receipt keyed by
+        // the rotated one. Only that receipt proves the container still
+        // present here; it never authorizes removal by itself, and one that
+        // exists but does not bind this record is refused.
+        const predecessorReceipt = readRuntimePredecessor(containerName, exactRecord);
+        if (predecessorReceipt) {
+            exactRecord = { ...exactRecord, ...structuredClone(predecessorReceipt.predecessor) };
+        }
         const pending = exactRecord?.instanceId && exactRecord?.enableGeneration
             ? readRuntimeCandidate(containerName, exactRecord)
             : null;
@@ -917,6 +927,9 @@ function removeContainerForRecreate(runtime, containerName, label, record = null
             throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
         }
         if (pending) retireRuntimeCandidate(pending);
+        // Removed, or its absence proven by its own engine: the proof is spent.
+        // A failed retirement aborts this launch before any successor exists.
+        if (predecessorReceipt) retireRuntimePredecessor(predecessorReceipt);
         clearLivenessState(containerName);
         return result;
     } catch (cause) {
