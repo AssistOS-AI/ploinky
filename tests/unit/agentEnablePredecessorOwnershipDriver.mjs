@@ -4,6 +4,8 @@
 // against the workspace in PLOINKY_WORKSPACE_ROOT with the fake engine on
 // PATH, and prints one JSON result line.
 
+import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -134,6 +136,97 @@ async function run() {
         return { ok: true, names };
     }
 
+    if (phase === 'static-root') {
+        // The workspace's configured static agent, set before that agent is
+        // enabled so its staged project path is already the workspace root.
+        const records = readJson(agentsFile);
+        records._config = { ...(records._config || {}), static: { agent: argument.agent, port: 8080 } };
+        fs.writeFileSync(agentsFile, JSON.stringify(records, null, 2));
+        applyEdgeRoutingGeneration({ reason: 'test-static-root-config' });
+        return { ok: true };
+    }
+
+    if (phase === 'managed-predecessor') {
+        // A published managed (default/bridge) runtime as its launch leaves it:
+        // a container carrying this workspace's managed ownership labels for
+        // its network contract, its exact tuple and an init reaper, attached to
+        // its physical managed network, with a signed generated Router
+        // descriptor mounted read-only and recorded in the registry. The full
+        // managed launch cannot run offline (its Router authority attestation
+        // needs a live Router and helper container), so the same production
+        // helpers build the labels, the network name and the signed descriptor.
+        const { getAgentContainerName } = await cli('sandbox/docker/index.js');
+        const { getAgentDataDir } = await cli('utils/workspaceStructure.js');
+        const { NETWORK_LABELS, physicalNetworkName, workspaceNetworkIdentity } = await cli('sandbox/networkIdentity.js');
+        const { NETWORK_SCHEMA_VERSION, logicalNetworkAttachments, networkContractHash } = await cli('sandbox/networkContract.js');
+        const { effectiveInstanceKey } = await cli('utils/workspaceDependencyGraph.js');
+        const { deriveAgentPrincipalId } = await cli('utils/security/agentIdentity.js');
+        const descriptors = await cli('utils/security/generatedRouterDescriptor.js');
+        const { agent, network } = argument;
+        const containerName = getAgentContainerName(agent, 'repo');
+        const instanceId = `${agent}-managed-instance`;
+        const enableGeneration = `${agent}-managed-generation`;
+        const envelope = JSON.parse(fs.readFileSync(
+            new URL('../fixtures/router-descriptor/managed-envelope.json', import.meta.url), 'utf8',
+        ));
+        const payload = {
+            ...envelope.payload,
+            agentPrincipal: deriveAgentPrincipalId('repo', agent),
+            instanceId,
+            generationId: enableGeneration,
+            launchId: randomUUID(),
+        };
+        const descriptorFile = path.join(root, '.ploinky', 'run', 'router-descriptors', `${payload.launchId}.json`);
+        descriptors.writeGeneratedRouterDescriptorFile(
+            descriptorFile, descriptors.signGeneratedRouterDescriptorEnvelope(payload).bytes,
+        );
+        const workspaceHash = workspaceNetworkIdentity(root).hash;
+        const [attachment] = logicalNetworkAttachments(network, agent, {
+            instanceKey: effectiveInstanceKey('repo', agent, ''),
+        });
+        const labels = {
+            [NETWORK_LABELS.managed]: '1',
+            [NETWORK_LABELS.resource]: 'agent',
+            [NETWORK_LABELS.schema]: NETWORK_SCHEMA_VERSION,
+            [NETWORK_LABELS.workspace]: workspaceHash,
+            [NETWORK_LABELS.contract]: networkContractHash(network),
+            [NETWORK_LABELS.instanceId]: instanceId,
+            [NETWORK_LABELS.enableGeneration]: enableGeneration,
+            'ploinky.envhash': 'managed-launch-semantic-envhash',
+        };
+        const descriptorTarget = '/run/ploinky/router-descriptor.json';
+        const containerId = execFileSync('podman', [
+            'create', '--init', '--name', containerName,
+            ...Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
+            ...Object.entries(descriptors.buildGeneratedRouterDescriptorEnv(payload)).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
+            '-v', `${descriptorFile}:${descriptorTarget}:ro`,
+            '--network', physicalNetworkName(workspaceHash, attachment.name),
+            'node:20',
+        ], { encoding: 'utf8' }).trim();
+        execFileSync('podman', ['start', containerId], { stdio: 'ignore' });
+        const records = readJson(agentsFile);
+        records[containerName] = {
+            agentName: agent, repoName: 'repo', containerImage: 'node:20', createdAt: new Date().toISOString(),
+            projectPath: getAgentDataDir(agent), runMode: 'isolated', type: 'agent', profile: 'default',
+            auth: { mode: 'none' }, instanceId, enableGeneration, containerId, runtime: 'podman',
+            config: {
+                binds: [{ source: descriptorFile, target: descriptorTarget, ro: true, generatedRouterDescriptor: true }],
+                env: [], ports: [],
+            },
+        };
+        fs.writeFileSync(agentsFile, JSON.stringify(records, null, 2));
+        const routing = readJson(path.join(root, '.ploinky', 'routing.json'));
+        routing.routes = { ...(routing.routes || {}), [agent]: {
+            container: containerName,
+            hostPath: path.join(root, '.ploinky', 'repos', 'repo', agent),
+            repo: 'repo',
+            agent,
+        } };
+        fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), JSON.stringify(routing, null, 2));
+        applyEdgeRoutingGeneration({ reason: 'test-published-managed-runtime' });
+        return { ok: true, containerName, containerId, descriptorFile };
+    }
+
     if (phase === 'allow-host-sandbox') {
         // The operator opt-in that lets a lite-sandbox manifest run natively.
         const { setHostSandboxDisabled } = await cli('utils/runtime/sandboxRuntime.js');
@@ -232,6 +325,7 @@ async function run() {
         const workspaceSvc = await cli('utils/workspace.js');
         return locks.withWorkspaceMutationLease({ operation: 'workspace-start' }, (lease) => (
             network.withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
+                const lines = [];
                 try {
                     edge.retireAbandonedWorkspaceStartPreparation({
                         workspaceRoot: root,
@@ -243,6 +337,7 @@ async function run() {
                     const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: argument.staticAgent, registry });
                     const staged = ensureGraphNodesEnabled(graph, registry, {
                         additionalNodes: resolveExtraEnabledRuntimeNodes(graph, registry),
+                        logLine: (line) => lines.push(line),
                     });
                     const published = {};
                     for (const containerName of staged.changedContainers) {
@@ -269,9 +364,9 @@ async function run() {
                         preparationLease: staged.preparedGeneration.preparationLease,
                         networkLifecycleCapability,
                     });
-                    return { ok: true, changedContainers: staged.changedContainers, published };
+                    return { ok: true, changedContainers: staged.changedContainers, published, lines };
                 } catch (error) {
-                    return failure(error);
+                    return { ...failure(error), lines };
                 }
             })
         ));

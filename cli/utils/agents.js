@@ -698,11 +698,14 @@ function withdrawnReplacementEligible(plans, previousAgents, routing, policy) {
     return { plan, predecessor };
 }
 
-// Only a successor that launches as a host or none container removes its
+// Only a successor that launches as a host or none container can remove its
 // same-name predecessor through the exact receipt consumer (the unmanaged
 // branch of startAgentContainer). A managed (default/bridge) or native
 // successor never reaches it, so it is given no receipt it could not consume.
 // The selected profile's network decides, never the top-level manifest.
+// Eligibility only preserves proof for that potential removal; it does not
+// promise the launch reaches it. A present predecessor of another network
+// contract is still refused as foreign first, and its proof stays bound.
 function preparedPredecessorReceiptEligible(input) {
     const mode = input?.profileResolution?.network?.mode;
     return input?.runtimeKind === 'container'

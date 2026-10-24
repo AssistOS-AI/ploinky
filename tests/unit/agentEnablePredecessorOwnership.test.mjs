@@ -590,10 +590,16 @@ test('a native predecessor re-enabled as a none container stages no receipt', (t
     assert.deepEqual(w.drive('lookup', { containerName: names.web }), { ok: true, receipt: null });
 });
 
-test('a managed predecessor that is already absent is replaced by a none successor through the receipt consumer', (t) => {
+test('an absent managed predecessor is proven absent and a none successor is created (never a present-runtime removal)', (t) => {
     const { w, names } = seeded(t, { web: withNetwork('default') }, [PREDECESSOR('web')]);
+    assert.deepEqual(engineContainers(w), {}, 'the recorded predecessor has no runtime');
+    const callsBefore = calls(w).length;
     w.change('web', NONE);
     const result = enabled(w, 'web');
+    const after = calls(w).slice(callsBefore);
+    assert.equal(after.some((argv) => argv[0] === 'rm'), false, 'nothing present was removed');
+    assert.ok(after.some((argv) => argv[0] === 'container' && argv[1] === 'inspect' && argv.includes('c'.repeat(64))),
+        'its absence was proven by its exact ID');
     const receiptWrite = result.trace.findIndex((entry) => entry.event === 'receipt');
     const registryWrite = result.trace.findIndex((entry) => entry.event === 'registry');
     assert.ok(receiptWrite >= 0 && receiptWrite < registryWrite, JSON.stringify(result.trace));
@@ -619,28 +625,222 @@ test('a none runtime re-enabled on a managed network keeps the base managed disp
     assert.deepEqual(w.drive('lookup', { containerName }), { ok: true, receipt: null });
 });
 
-// A present predecessor of a different network contract (here none to host)
-// is refused as foreign by the launch's existing contract inspection before
-// the receipt consumer is reached; that guard is unchanged. The receipt keeps
-// the predecessor provable, and a workspace start replaces it exactly.
-test('a none runtime re-enabled on a host network keeps its proof through the contract refusal', (t) => {
-    const w = workspace(t, { media: NONE });
-    const containerName = enabled(w, 'media').result.containerName;
-    const predecessor = registry(w)[containerName];
-    const runtimeBefore = engineContainers(w);
-    w.change('media', HOST);
-    const refused = w.drive('enable', { agent: 'repo/media' });
-    assert.equal(refused.ok, false);
-    assert.match(refused.message, /refusing to replace foreign\/unsupported exact-name container/);
-    assert.deepEqual(engineContainers(w), runtimeBefore);
-    const lookup = w.drive('lookup', { containerName });
-    assert.equal(lookup.receipt.predecessor.instanceId, predecessor.instanceId);
-    assert.equal(lookup.receipt.predecessor.containerId, predecessor.containerId);
+// ------------------------------------------------------------------
+// A different effective network contract keeps the existing guard.
+//
+// The launch inspects a present runtime against its successor's network
+// contract hash, so a predecessor of another contract is refused as foreign
+// before the receipt consumer is reached. That guard is unchanged: preparation
+// has already published the rotated record and its receipt, and the refusal
+// must leave the predecessor, its proof and the inactive routing exactly so.
 
-    const recovered = w.drive('stage', { staticAgent: 'repo/media' });
-    assert.equal(recovered.ok, true, JSON.stringify(recovered));
-    assertCommittedSuccessor(w, containerName, { predecessorId: predecessor.containerId });
-    assert.equal(engineContainers(w)[containerName].network, 'host');
+const engineRecord = (w, containerName) => structuredClone(w.engine.state().containers[containerName]);
+const DESTRUCTIVE = new Set(['rm', 'stop', 'kill', 'create', 'start']);
+
+// A published managed runtime with a signed descriptor (see the driver), or
+// a host/none runtime enabled through production.
+function presentPredecessor(w, agent, kind) {
+    if (kind === 'enabled') {
+        const containerName = enabled(w, agent).result.containerName;
+        return { containerName, containerId: registry(w)[containerName].containerId };
+    }
+    const fixture = w.drive('managed-predecessor', {
+        agent, network: kind === 'bridge' ? BRIDGE_NETWORK : { mode: kind },
+    });
+    assert.equal(fixture.ok, true, JSON.stringify(fixture));
+    return fixture;
+}
+
+function refusedByContract(w, agent, successor, { profile } = {}) {
+    const containerName = Object.keys(registry(w)).find((key) => registry(w)[key]?.agentName === agent);
+    const predecessor = registry(w)[containerName];
+    const runtimeBefore = engineRecord(w, containerName);
+    const callsBefore = calls(w).length;
+    w.change(agent, successor);
+    const refused = w.drive('enable', { agent: `repo/${agent}`, ...(profile ? { profile } : {}) });
+    assert.equal(refused.ok, false, JSON.stringify(refused));
+    assert.match(refused.message, /refusing to replace foreign\/unsupported exact-name container/);
+    // The predecessor proof was durable before the rotated record.
+    const receiptWrite = refused.trace.findIndex((entry) => entry.event === 'receipt');
+    const registryWrite = refused.trace.findIndex((entry) => entry.event === 'registry');
+    assert.ok(receiptWrite >= 0 && receiptWrite < registryWrite, JSON.stringify(refused.trace));
+    // Runtime: the exact prior ID, labels, mounts and state, untouched.
+    assert.deepEqual(engineRecord(w, containerName), runtimeBefore);
+    const after = calls(w).slice(callsBefore);
+    assert.equal(after.some((argv) => DESTRUCTIVE.has(argv[0])), false, JSON.stringify(after));
+    // Registry: the staged successor tuple keeps the original ID and engine.
+    const staged = registry(w)[containerName];
+    assert.notEqual(staged.instanceId, predecessor.instanceId);
+    assert.equal(staged.containerId, predecessor.containerId);
+    assert.equal(staged.runtime, 'podman');
+    // Receipt: valid selected proof of the original predecessor.
+    const lookup = w.drive('lookup', { containerName });
+    assert.equal(lookup.ok, true, JSON.stringify(lookup));
+    assert.equal(lookup.receipt.successor.instanceId, staged.instanceId);
+    assert.equal(lookup.receipt.predecessor.instanceId, predecessor.instanceId);
+    assert.equal(lookup.receipt.predecessor.enableGeneration, predecessor.enableGeneration);
+    assert.equal(lookup.receipt.predecessor.containerId, predecessor.containerId);
+    assert.deepEqual(lookup.receipt.predecessor.config.binds,
+        (predecessor.config.binds || []).filter((bind) => bind.generatedRouterDescriptor === true));
+    // Routing: the replacement stays inactive; nothing was reactivated.
+    const generation = w.drive('generation');
+    assert.equal(generation.ok, false);
+    assert.equal(generation.selector, 'inactive');
+    return { containerName, predecessor, runtimeBefore, staged };
+}
+
+for (const [label, kind, successor] of [
+    ['a present managed (default) runtime re-enabled as none', 'default', NONE],
+    ['a present managed (bridge) runtime re-enabled as host', 'bridge', HOST],
+    ['a present none runtime re-enabled as host', 'enabled-none', HOST],
+    ['a present host runtime re-enabled as none', 'enabled-host', NONE],
+]) {
+    test(`${label} keeps the contract refusal, its runtime and its proof`, (t) => {
+        const initial = kind === 'enabled-host' ? HOST : kind === 'enabled-none' ? NONE
+            : withNetwork(kind);
+        const w = workspace(t, { web: initial });
+        const present = presentPredecessor(w, 'web', kind.startsWith('enabled') ? 'enabled' : kind);
+        const refused = refusedByContract(w, 'web', successor);
+        assert.equal(refused.predecessor.containerId, present.containerId);
+        if (!kind.startsWith('enabled')) {
+            assert.equal(refused.runtimeBefore.Mounts.filter((mount) => mount.Destination === '/run/ploinky/router-descriptor.json').length, 1);
+            assert.deepEqual(refused.predecessor.config.binds.map((bind) => bind.source), [present.descriptorFile]);
+            assert.ok(fs.existsSync(present.descriptorFile), 'the signed descriptor is preserved');
+        }
+    });
+}
+
+test('a selected profile that changes the effective contract keeps the same refusal', (t) => {
+    const manifest = { ...NONE, profiles: { default: {}, hosted: { network: { mode: 'host' } } } };
+    const w = workspace(t, { web: manifest });
+    presentPredecessor(w, 'web', 'enabled');
+    refusedByContract(w, 'web', manifest, { profile: 'hosted' });
+});
+
+test('a profile and manifest change that keeps the effective contract still replaces exactly', (t) => {
+    const manifest = { ...NONE, profiles: { default: {}, quiet: { network: { mode: 'none' } } } };
+    const w = workspace(t, { web: manifest });
+    const { containerName, containerId } = presentPredecessor(w, 'web', 'enabled');
+    w.change('web', manifest);
+    const result = enabled(w, 'web', { profile: 'quiet' });
+    assert.equal(result.trace.find((entry) => entry.event === 'registry').selector, 'inactive');
+    assertCommittedSuccessor(w, containerName, { predecessorId: containerId });
+    assert.equal(registry(w)[containerName].profile, 'quiet');
+    assert.deepEqual(receipts(w), []);
+});
+
+// The supported recovery of such a refusal is a workspace start whose
+// ordinary graph planning selects replacement. The static root is an
+// independent, unchanged agent; the refused target stays non-static.
+function refusedBesideStaticRoot(t, kind, initial, successor) {
+    const w = workspace(t, { root: NONE, web: initial });
+    assert.equal(w.drive('static-root', { agent: 'root' }).ok, true);
+    const rootName = enabled(w, 'root').result.containerName;
+    presentPredecessor(w, 'web', kind);
+    const refused = refusedByContract(w, 'web', successor);
+    const root = { record: registry(w)[rootName], runtime: engineRecord(w, rootName) };
+    return { w, rootName, root, ...refused };
+}
+
+for (const [label, kind, initial, successor] of [
+    ['a refused managed (default) to none replacement', 'default', withNetwork('default'), NONE],
+    ['a refused none to host replacement', 'enabled', NONE, HOST],
+]) {
+    test(`a workspace start recovers ${label} through ordinary graph planning`, (t) => {
+        const { w, rootName, root, containerName, predecessor } = refusedBesideStaticRoot(t, kind, initial, successor);
+        const callsBefore = calls(w).length;
+        const recovered = w.drive('stage', { staticAgent: 'repo/root' });
+        assert.equal(recovered.ok, true, JSON.stringify(recovered));
+        t.diagnostic(`graph replacement: ${JSON.stringify(recovered.lines)}`);
+        // The graph selected the replacement for its own observed reason; the
+        // static root kept its role and was not replaced.
+        assert.deepEqual(recovered.changedContainers, [containerName]);
+        const reasonLine = recovered.lines.find((line) => line.includes('replacing its runtime'));
+        assert.match(reasonLine, /envHash/, 'the ordinary environment-hash drift selects replacement');
+        const after = calls(w).slice(callsBefore);
+        const removed = callIndex(after, (argv) => argv[0] === 'rm' && argv.includes(predecessor.containerId));
+        const created = callIndex(after, (argv) => argv[0] === 'create' && argv.includes(containerName));
+        assert.ok(removed >= 0 && created > removed, 'exact predecessor removal precedes the successor');
+        assert.equal(after.filter((argv) => argv[0] === 'rm').length, 1);
+        assertCommittedSuccessor(w, containerName, { predecessorId: predecessor.containerId });
+        assert.equal(engineContainers(w)[containerName].network, successor.network.mode);
+        assert.deepEqual(receipts(w), [], 'the carried proof was retired after the exact removal');
+        assert.deepEqual(registry(w)[rootName], root.record);
+        assert.deepEqual(engineRecord(w, rootName), root.runtime);
+        if (kind !== 'enabled') {
+            assert.equal(fs.existsSync(predecessor.config.binds[0].source), false, 'its descriptor went with it');
+        }
+    });
+}
+
+test('a graph removal failure after the refusal creates and activates nothing and keeps the proof', (t) => {
+    const { w, containerName, predecessor, runtimeBefore } = refusedBesideStaticRoot(t, 'default', withNetwork('default'), NONE);
+    const callsBefore = calls(w).length;
+    const failed = w.drive('stage', { staticAgent: 'repo/root' }, {
+        extraEnv: { FAKE_SHIM_RULE: JSON.stringify({
+            command: ['rm'], id: predecessor.containerId, status: 1, stderr: 'Error: transient storage failure',
+        }) },
+    });
+    assert.equal(failed.ok, false);
+    assert.equal(failed.code, 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS', JSON.stringify(failed));
+    assert.match(failed.message, /preserved container '.*' because exact immutable ownership\/removal was not proven/);
+    const after = calls(w).slice(callsBefore);
+    assert.equal(after.some((argv) => argv[0] === 'create' || argv[0] === 'start'), false, JSON.stringify(after));
+    // The exact removal signalled the predecessor by its immutable ID before
+    // the failed rm; everything but its run state is unchanged.
+    const { State: _stateAfter, ...runtimeAfter } = engineRecord(w, containerName);
+    const { State: _stateBefore, ...runtimeExpected } = runtimeBefore;
+    assert.deepEqual(runtimeAfter, runtimeExpected);
+    assert.ok(after.filter((argv) => ['kill', 'stop', 'rm'].includes(argv[0]))
+        .every((argv) => argv.at(-1) === predecessor.containerId), JSON.stringify(after));
+    const lookup = w.drive('lookup', { containerName });
+    assert.equal(lookup.receipt?.predecessor?.containerId, predecessor.containerId, 'the carried proof stays bound');
+    assert.equal(w.drive('generation').selector, 'inactive');
+});
+
+test('a changed predecessor descriptor makes the graph removal refuse without touching the runtime', (t) => {
+    const { w, containerName, predecessor, runtimeBefore } = refusedBesideStaticRoot(t, 'default', withNetwork('default'), NONE);
+    const descriptorFile = predecessor.config.binds[0].source;
+    // No longer the exact private 0600 artifact the launch recorded.
+    fs.chmodSync(descriptorFile, 0o644);
+    const changed = fs.readFileSync(descriptorFile);
+    const callsBefore = calls(w).length;
+    const refused = w.drive('stage', { staticAgent: 'repo/root' });
+    assert.equal(refused.ok, false, JSON.stringify(refused));
+    assert.equal(refused.code, 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS', JSON.stringify(refused));
+    assert.match(refused.cause, /not an exact 0600 regular file/, JSON.stringify(refused));
+    assert.equal(calls(w).slice(callsBefore).some((argv) => DESTRUCTIVE.has(argv[0])), false);
+    assert.deepEqual(engineRecord(w, containerName), runtimeBefore);
+    assert.deepEqual(fs.readFileSync(descriptorFile), changed, 'the descriptor artifact is preserved');
+    assert.equal(w.drive('lookup', { containerName }).receipt?.predecessor?.containerId, predecessor.containerId);
+});
+
+test('graph planning reaches its own final foreign-contract refusal only with no earlier replacement reason', (t) => {
+    const w = workspace(t, { root: NONE, web: NONE });
+    assert.equal(w.drive('static-root', { agent: 'root' }).ok, true);
+    enabled(w, 'root');
+    const { containerName } = presentPredecessor(w, 'web', 'enabled');
+    // Control: the same running, exact graph has no replacement reason at all.
+    const reused = w.drive('stage', { staticAgent: 'repo/root' });
+    assert.equal(reused.ok, true, JSON.stringify(reused));
+    assert.deepEqual(reused.changedContainers, []);
+    // Only the contract label now differs: env hash, state and tuple still
+    // match, so the graph's last check (its contract inspection) refuses.
+    editEngine(w, (containers) => {
+        const entry = containers[containerName];
+        entry.Labels = { ...entry.Labels, 'io.assistos.ploinky.network-contract': 'e'.repeat(64) };
+        entry.Config.Labels = entry.Labels;
+    });
+    const registryBytes = fs.readFileSync(agentsFile(w));
+    const runtimeBefore = engineRecord(w, containerName);
+    const callsBefore = calls(w).length;
+    const refused = w.drive('stage', { staticAgent: 'repo/root' });
+    assert.equal(refused.ok, false);
+    assert.match(refused.message, /refusing graph replacement of foreign runtime/);
+    assert.deepEqual(refused.lines.filter((line) => line.includes('replacing its runtime')), []);
+    assert.deepEqual(fs.readFileSync(agentsFile(w)), registryBytes);
+    assert.deepEqual(engineRecord(w, containerName), runtimeBefore);
+    assert.equal(calls(w).slice(callsBefore).some((argv) => DESTRUCTIVE.has(argv[0])), false);
     assert.deepEqual(receipts(w), []);
 });
 
@@ -657,30 +857,45 @@ test('a second enable and a Watchdog tick neither rotate nor replace a runtime w
     const ready = path.join(w.root, 'first-ready');
     const release = path.join(w.root, 'first-release');
     const first = w.driveAsync('enable', { agent: 'repo/media', pauseAfterRegistry: { ready, release } });
-    const deadline = Date.now() + 60_000;
-    while (!fs.existsSync(ready)) {
-        assert.ok(Date.now() < deadline, 'first enable reached its registry write');
-        await new Promise((resolve) => setTimeout(resolve, 25));
+    let second = null;
+    let heldTuple;
+    let events;
+    try {
+        const deadline = Date.now() + 60_000;
+        while (!fs.existsSync(ready)) {
+            assert.ok(Date.now() < deadline, 'first enable reached its registry write');
+            await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const heldRegistry = fs.readFileSync(agentsFile(w));
+        heldTuple = JSON.parse(heldRegistry)[containerName];
+        const callsHeld = calls(w).length;
+
+        second = w.driveAsync('enable', { agent: 'repo/media' });
+        const monitored = w.drive('monitor', null, { extraEnv: { FAKE_SHIM_RUNNING_PS: '1' } });
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        assert.deepEqual(fs.readFileSync(agentsFile(w)), heldRegistry, 'no second tuple was published during the lease');
+        assert.equal(engineContainers(w)[containerName].id, predecessorId);
+        assert.equal(calls(w).slice(callsHeld).some((argv) => ['rm', 'create', 'start', 'stop', 'kill'].includes(argv[0])), false,
+            JSON.stringify(calls(w).slice(callsHeld)));
+        events = monitored.events.map((entry) => entry.event);
+        // The Watchdog tick deferred to the operation holding the workspace lease
+        // instead of restarting the stopped runtime.
+        assert.ok(events.includes('container_monitor_deferred_workspace_start'), JSON.stringify(monitored.events));
+        assert.equal(events.some((event) => /restart_success|restart_attempt|scheduling_restart/.test(event)), false,
+            JSON.stringify(monitored.events));
+    } catch (error) {
+        // Never leave the paused enable (or the waiting one) running.
+        fs.writeFileSync(release, '1');
+        await Promise.allSettled([first, second]);
+        throw error;
     }
-    const heldRegistry = fs.readFileSync(agentsFile(w));
-    const heldTuple = JSON.parse(heldRegistry)[containerName];
-    const callsHeld = calls(w).length;
-
-    const second = w.driveAsync('enable', { agent: 'repo/media' });
-    const monitored = w.drive('monitor', null, { extraEnv: { FAKE_SHIM_RUNNING_PS: '1' } });
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    assert.deepEqual(fs.readFileSync(agentsFile(w)), heldRegistry, 'no second tuple was published during the lease');
-    assert.equal(engineContainers(w)[containerName].id, predecessorId);
-    assert.equal(calls(w).slice(callsHeld).some((argv) => ['rm', 'create', 'start', 'stop', 'kill'].includes(argv[0])), false,
-        JSON.stringify(calls(w).slice(callsHeld)));
-    const events = monitored.events.filter((entry) => entry.container === containerName).map((entry) => entry.event);
-    assert.equal(events.some((event) => /restart_success|restart_attempt/.test(event)), false, JSON.stringify(monitored.events));
-
     fs.writeFileSync(release, '1');
     const [firstRun, secondRun] = await Promise.all([first, second]);
     const firstResult = JSON.parse(firstRun.stdout.trim().split('\n').at(-1));
     assert.equal(firstResult.ok, true, `${firstRun.stdout}\n${firstRun.stderr}`);
     const secondResult = JSON.parse(secondRun.stdout.trim().split('\n').at(-1));
+    t.diagnostic(`second enable: ${JSON.stringify({ ok: secondResult.ok, code: secondResult.code ?? null })}`);
+    t.diagnostic(`monitor events: ${JSON.stringify(events)}`);
     // The second enable waited for the lease (or reported it busy); either way
     // it acted only on the first enable's published successor.
     if (secondResult.ok) {
