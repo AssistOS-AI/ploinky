@@ -97,6 +97,8 @@ function manager(overrides = {}) {
         availability: () => ({ ok: true }),
         assertViewerQuota() {},
         streamView() {},
+        async retiredStreamOutcome() { return null; },
+        commitRetiredStreamOutcome() { return null; },
         async create() { return { id: 'terminal-abcdefghijklmnop', cwd: '.', cols: 80, rows: 24 }; },
         ...overrides,
     };
@@ -1015,4 +1017,168 @@ test('attach-token mint accepts exactly {} or {supersedes: <view id>} and forwar
         manager: manager({ async attach() { throw new Error('must not be called'); } }), routePlan: attachRoutePlan,
     });
     assert.equal(attachRes.statusCode, 400);
+});
+
+// ---- Retired streams through the real handler and manager ----
+// A shell retired with a detached, eligible view: the real close path records
+// the retained outcome; the real browser lease derives the principal.
+async function retiredStreamFixture(t, { limits = undefined, validateLease = async () => ({ ok: true }) } = {}) {
+    const { WebttySessionManager } = await import('../../cli/server/webtty/sessionManager.mjs');
+    const { createBrowserSessionLease } = await import('../../cli/server/webtty/authLease.mjs');
+    let validate = validateLease;
+    const live = new WebttySessionManager({
+        workspaceRoot: '/private/tmp/ls-p1',
+        auth: { validateLease: (...args) => validate(...args) },
+        ...(limits ? { limits } : {}),
+    });
+    live.ready = true;
+    const routePlan = plan();
+    t.after(() => live.closeAll('test_cleanup'));
+    const ownerLease = createBrowserSessionLease(request({ routePlan, method: 'GET' }).req);
+    function retire(id) {
+        const session = {
+            id, routerEpoch: live.routerEpoch,
+            owner: { principal: ownerLease.principal, userId: ownerLease.userId, label: 'admin', adminAdmittedAt: 0 },
+            binding: { host: routePlan.host, hostRouteKey: routePlan.hostSelection.record.routeKey },
+            viewers: new Map(), views: new Map(), viewSeq: 0, cwdRelative: 'Projects', cols: 80, rows: 24,
+            target: { kind: 'box', label: 'Ploinky Box', detail: 'Workspace runtime', access: 'rw', cwdDisplay: '/workspace/Projects' },
+            worker: { async close() {}, async waitForExit() { return true; } },
+            createdAt: 1, lastActivityAt: 1, closePolicy: 'keep', pendingStop: null, validationEpoch: 0,
+            recordWritePromise: Promise.resolve(), releaseQuota() {}, cleanupFailureScope: '',
+        };
+        live.sessions.set(id, session);
+        const view = live.createView(session, ownerLease.principal).id;
+        return { session, view, closed: live.closeSession(session, 'target_identity_changed') };
+    }
+    const id = 'a'.repeat(32);
+    const retired = retire(id);
+    await retired.closed;
+    async function stream(query = `?view=${retired.view}`, { selectedPlan = routePlan, mutate = null, res = new MockResponse() } = {}) {
+        const url = `/webtty/sessions/${id}/stream${query}`;
+        const { req } = request({ routePlan: selectedPlan, url, method: 'GET' });
+        mutate?.(req);
+        await handleWebtty(req, res, new URL(url, 'https://app.example.test'), { manager: live, routePlan: selectedPlan });
+        return res;
+    }
+    return {
+        live, routePlan, id, view: retired.view, retire, stream,
+        setValidate(next) { validate = next; },
+        record: () => live.tombstones.get(id),
+    };
+}
+
+const EXIT_EVENT = `event: exit\ndata: ${JSON.stringify({ reason: 'target_identity_changed' })}\n\n`;
+
+test('a retained view exit uses the stream query grammar and answers one finite SSE exit', async (t) => {
+    const f = await retiredStreamFixture(t);
+    let lookups = 0;
+    const lookup = f.live.retiredStreamOutcome.bind(f.live);
+    f.live.retiredStreamOutcome = async (...args) => { lookups += 1; return lookup(...args); };
+    for (const query of ['', '?view=short', `?view=${f.view}&view=${f.view}`, `?view=${f.view}&last=1`,
+        `?other=${f.view}`, `?view=${'é'.repeat(32)}`, `?view=${f.view.slice(0, 31)}%E2%9C%93`]) {
+        const res = await f.stream(query);
+        assert.equal(res.statusCode, 400, query);
+        assert.deepEqual(JSON.parse(res.body), { ok: false, error: 'invalid_stream_request' }, query);
+        assert.match(res.headers['Content-Type'], /application\/json/, query);
+    }
+    assert.equal(lookups, 0, 'malformed queries never reach the retained lookup');
+    const res = await f.stream();
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.headers['Content-Type'], 'text/event-stream; charset=utf-8');
+    assert.equal(res.headers['X-Frame-Options'], 'DENY');
+    assert.equal(res.headers['Cache-Control'], 'no-store');
+    assert.equal(res.body, EXIT_EVENT);
+    assert.equal(res.writableEnded, true);
+    assert.equal(lookups, 1);
+    assert.equal(f.live.viewerCount, 0);
+});
+
+test('the final synchronous guard refuses route, record and manager changes queued after the retained lookup', async (t) => {
+    for (const [name, change, expected] of [
+        ['route invalidation', (f) => { f.routePlan.lease.commit = () => false; },
+            { status: 503, error: 'edge_generation_changed' }],
+        ['record eviction', (f) => { f.retire('b'.repeat(32)); },
+            { status: 404, error: 'not_found' }],
+        ['manager disabled', (f) => { f.live.disableForUnprovenCleanup('cleanup_unproven'); },
+            { status: 503, error: 'webtty_unavailable' }],
+        ['manager shut down', (f) => { void f.live.closeAll('router_shutdown'); },
+            { status: 503, error: 'webtty_unavailable' }],
+    ]) {
+        await t.test(name, async (t2) => {
+            const f = await retiredStreamFixture(t2, { limits: { maxTombstones: 1 } });
+            const lookup = f.live.retiredStreamOutcome.bind(f.live);
+            let candidates = 0;
+            f.live.retiredStreamOutcome = async (...args) => {
+                const candidate = await lookup(...args);
+                assert.ok(candidate, 'the lookup admitted the retained view');
+                candidates += 1;
+                // Queued after the lookup returned, before the handler resumes.
+                queueMicrotask(() => change(f));
+                return candidate;
+            };
+            const res = await f.stream();
+            assert.equal(candidates, 1);
+            assert.equal(res.statusCode, expected.status, name);
+            assert.deepEqual(JSON.parse(res.body), { ok: false, error: expected.error }, name);
+            assert.doesNotMatch(res.headers['Content-Type'], /event-stream/, name);
+            assert.doesNotMatch(res.body, /event: exit/, name);
+            assert.equal(f.live.viewerCount, 0, name);
+        });
+    }
+    // Control: the same wrapped lookup without a change answers the exit, and
+    // the response is complete before any task queued by the guard can run.
+    const f = await retiredStreamFixture(t);
+    const lookup = f.live.retiredStreamOutcome.bind(f.live);
+    f.live.retiredStreamOutcome = async (...args) => {
+        const candidate = await lookup(...args);
+        await new Promise((resolve) => queueMicrotask(resolve));
+        return candidate;
+    };
+    const commit = f.live.commitRetiredStreamOutcome.bind(f.live);
+    const res = new MockResponse();
+    let observedAfterGuard = null;
+    f.live.commitRetiredStreamOutcome = (...args) => {
+        const event = commit(...args);
+        queueMicrotask(() => {
+            observedAfterGuard = { status: res.statusCode, ended: res.writableEnded, body: res.body };
+        });
+        return event;
+    };
+    await f.stream(undefined, { res });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body, EXIT_EVENT);
+    assert.deepEqual(observedAfterGuard, { status: 200, ended: true, body: EXIT_EVENT },
+        'nothing is awaited between the final guard and the finished response');
+});
+
+test('retained view refusals keep the existing 401/403/503 mapping with the real browser lease', async (t) => {
+    const f = await retiredStreamFixture(t);
+    const json = (status, error) => [status, { ok: false, error }];
+    for (const [name, validate, mutate, expected] of [
+        ['expired login', async () => ({ ok: false, reason: 'expired' }), null, json(401, 'authentication_required')],
+        ['changed login', async () => ({ ok: false, reason: 'session_changed' }), null, json(401, 'authentication_required')],
+        ['revoked administrator', async () => ({ ok: false, reason: 'administrator_revoked' }), null, json(403, 'administrator_required')],
+        ['provider outage', async () => ({ ok: false, reason: 'provider_unavailable' }), null, json(503, 'webtty_unavailable')],
+        ['no browser login', async () => ({ ok: true }), (req) => { req.sessionId = ''; }, json(401, 'authentication_required')],
+        ['another administrator', async () => ({ ok: true }), (req) => { req.user = { ...req.user, id: 'local:other-admin' }; },
+            json(404, 'not_found')],
+        ['current route of another host', async () => ({ ok: true }), null, json(404, 'not_found')],
+    ]) {
+        f.setValidate(validate);
+        let selectedPlan = f.routePlan;
+        if (name === 'current route of another host') {
+            selectedPlan = plan();
+            selectedPlan.hostSelection.record.routeKey = 'other-route';
+        }
+        const res = await f.stream(undefined, { selectedPlan, mutate });
+        assert.deepEqual([res.statusCode, JSON.parse(res.body)], expected, name);
+        assert.doesNotMatch(res.headers['Content-Type'], /event-stream/, name);
+        assert.equal(f.live.viewerCount, 0, name);
+        assert.equal(f.live.launchAuthSubscriptions.size, 0, name);
+    }
+    f.setValidate(async () => ({ ok: true }));
+    const res = await f.stream();
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body, EXIT_EVENT);
+    assert.equal(f.record().closure, 'proven');
 });

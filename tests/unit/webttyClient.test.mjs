@@ -681,6 +681,55 @@ test('CLOSED stream recreates after a refused reconnect, resets once and replays
     assert.equal(deletions(harness).length, 0);
 });
 
+// A retired shell answers a reconnect of its eligible view with one exit
+// event and a finished response; the recovered stream must then stay closed.
+test('a recovered stream that receives exit shows Closed and stops recovery, input and mutations', async () => {
+    for (const reconnect of ['recovered source', 'native reconnect']) {
+        const harness = createHarness();
+        await flushTasks();
+        const first = harness.sources[0];
+        first.emit('open');
+        first.emit('output', { data: 'before' });
+        let source = first;
+        if (reconnect === 'recovered source') {
+            first.readyState = 2;
+            first.emit('error');
+            assert.equal(harness.runRecoveryTimer(), 1000, reconnect);
+            source = harness.sources[1];
+            assert.notEqual(source, first, reconnect);
+        } else {
+            // `retry: 1000` then end: the browser reconnects the same source.
+            first.readyState = 0;
+            first.emit('error');
+            assert.equal(harness.elements.get('status').textContent, 'Reconnecting…', reconnect);
+        }
+        assert.equal(harness.stored.has('ploinky.webtty.session'), true, `${reconnect}: remembered while live`);
+        const before = harness.requests.length;
+        source.emit('exit', { reason: 'target_identity_changed' });
+        await flushTasks();
+        assert.equal(harness.elements.get('status').textContent, 'Closed', reconnect);
+        assert.equal(harness.elements.get('message').textContent, 'Terminal closed: target_identity_changed.', reconnect);
+        assert.equal(harness.terminal.options.disableStdin, true, reconnect);
+        assert.equal(harness.elements.get('kill').disabled, true, reconnect);
+        assert.equal(source.closed, true, reconnect);
+        assert.equal(source.readyState, 2, reconnect);
+        assert.equal(harness.timers.size, 0, `${reconnect}: no recovery or resize timer`);
+        assert.equal(harness.stored.has('ploinky.webtty.session'), false, `${reconnect}: the ended session is forgotten`);
+        const sources = harness.sources.length;
+        harness.terminal.emitData('after exit');
+        harness.windowListeners.get('resize')();
+        harness.elements.get('kill').click();
+        source.emit('error');
+        harness.advanceClock(60_000);
+        await flushTasks();
+        assert.equal(harness.timers.size, 0, reconnect);
+        assert.equal(harness.sources.length, sources, `${reconnect}: no new EventSource`);
+        assert.deepEqual(harness.requests.slice(before), [], `${reconnect}: no input, resize, create, attach or DELETE`);
+        assert.equal(harness.requests.filter(({ url }) => url === '/webtty/sessions').length, 1, reconnect);
+        assert.equal(deletions(harness).length, 0, reconnect);
+    }
+});
+
 test('recovery backoff is bounded and ends after ten minutes, while pagehide cancels it', async () => {
     const harness = createHarness();
     await flushTasks();

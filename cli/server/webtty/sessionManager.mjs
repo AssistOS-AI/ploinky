@@ -1650,6 +1650,14 @@ export class WebttySessionManager {
             closure: 'pending',
             closureScope: '',
             recordCleanup: '',
+            // Internal only, never listed: the close reason and each view still
+            // eligible at retirement with its principal, so that a view whose
+            // stream was dropped before the close can learn its exit once it
+            // reconnects. Bounded by the per-session view cap.
+            closeReason: String(session.closeReason || ''),
+            retiredViews: new Map([...this.sessionViews(session).values()]
+                .filter(view => !this.viewTerminal(view))
+                .map(view => [view.id, view.principal])),
         };
         session.tombstone = tombstone;
         this.tombstones.delete(session.id);
@@ -1701,6 +1709,50 @@ export class WebttySessionManager {
         const requestBinding = routeBinding(routePlan);
         this.auth.createLease(req);
         return bindingMatches(tombstone.binding, requestBinding);
+    }
+
+    // The unexpired retained close outcome on this host-route that still
+    // holds the eligible view, or null.
+    retiredRecord(routePlan, id, viewId) {
+        const record = this.tombstones.get(String(id || ''));
+        if (!record?.retiredViews?.has(String(viewId || '')) || this.now() >= record.expiresAt) return null;
+        let binding;
+        try { binding = routeBinding(routePlan); } catch (_) { return null; }
+        return bindingMatches(record.binding, binding) ? record : null;
+    }
+
+    // Used only after live authorization found no session. A stream dropped
+    // for reconnect before its shell closed never received the exit event;
+    // its exact view may learn the stored close reason, authorized only as the
+    // principal recorded for that view and only with this request's current
+    // authentication. Returns an opaque candidate for the synchronous
+    // commitRetiredStreamOutcome, or null. Nothing is allocated or subscribed.
+    async retiredStreamOutcome(req, routePlan, sessionId, viewId) {
+        const id = String(sessionId || '');
+        const view = String(viewId || '');
+        const record = this.retiredRecord(routePlan, id, view);
+        if (!record) return null;
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        const lease = this.auth.createLease(req);
+        const principal = browserPrincipal(lease.mode, lease.userId);
+        if (record.retiredViews.get(view) !== principal) return null;
+        await this.revalidateLease(lease, undefined, { req });
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        if (this.retiredRecord(routePlan, id, view) !== record
+            || record.retiredViews.get(view) !== principal) return null;
+        return Object.freeze({ record, sessionId: id, viewId: view, principal });
+    }
+
+    // The final guard, called synchronously right before the response is
+    // written: the encoded exit event, or null when the outcome is gone. A
+    // disabled manager or a replaced route refuses as before.
+    commitRetiredStreamOutcome(routePlan, candidate) {
+        if (!this.availability().ok) throw errorWithCode('WEBTTY_UNAVAILABLE');
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        const record = this.retiredRecord(routePlan, candidate?.sessionId, candidate?.viewId);
+        if (!record || record !== candidate.record
+            || record.retiredViews.get(candidate.viewId) !== candidate.principal) return null;
+        return this.encodeSse('exit', { reason: record.closeReason });
     }
 
     disableForUnprovenCleanup(category = 'cleanup_unproven', primarySession = null) {

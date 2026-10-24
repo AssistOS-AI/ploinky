@@ -4126,11 +4126,10 @@ function adminStreamRequest(selectedLease) {
     });
 }
 
-async function streamThroughHandler(manager, plan, id, viewId, selectedLease) {
+async function streamThroughHandler(manager, plan, id, viewId, selectedLease, res = sseResponse()) {
     process.env.PLOINKY_MASTER_KEY ||= 'b'.repeat(64);
     const { handleWebtty } = await import('../../cli/server/handlers/webtty.js');
     const req = adminStreamRequest(selectedLease);
-    const res = sseResponse();
     await handleWebtty(req, res, new URL(`/webtty/sessions/${id}/stream?view=${viewId}`, 'http://localhost'),
         { manager, routePlan: plan });
     return { req, res, status: res.statusCode, body: res.body };
@@ -4142,10 +4141,9 @@ function currentGenerationPlan() {
     return plan;
 }
 
-async function missedExitFixture(t, { auth = requestAuthAdapter(), ...options } = {}) {
+async function missedExitFixture(t, { auth = requestAuthAdapter(), worker = new FakeWorker(), ...options } = {}) {
     let releaseValidation = null;
     let generationCurrent = true;
-    const worker = new FakeWorker();
     const manager = await createManager(t, {
         auth,
         agentProviderAvailable: true,
@@ -4178,10 +4176,14 @@ async function missedExitFixture(t, { auth = requestAuthAdapter(), ...options } 
             await manager.validateLiveSessions();
         },
         // Deferred target validation proves the identity replaced.
-        async retire() {
+        async startRetirement() {
             assert.equal(typeof releaseValidation, 'function', 'target validation must be in flight');
             releaseValidation();
             await settleTarget(session);
+            assert.ok(session.closePromise, 'retirement started');
+        },
+        async retire() {
+            await this.startRetirement();
             await session.closePromise;
         },
     };
@@ -4209,4 +4211,360 @@ test('a viewer dropped for reconnect before target retirement receives one finit
     assert.equal(again.body, `event: exit\ndata: ${JSON.stringify({ reason: 'target_identity_changed' })}\n\n`);
     assert.equal(again.res.writableEnded, true);
     assert.equal(f.manager.viewerCount, 0);
+});
+
+const RETAINED_NOT_FOUND = { status: 404, body: JSON.stringify({ ok: false, error: 'not_found' }) };
+
+function exitBody(reason = 'target_identity_changed') {
+    return `event: exit\ndata: ${JSON.stringify({ reason })}\n\n`;
+}
+
+function assertRetainedExit(read, reason, message) {
+    assert.equal(read.status, 200, message);
+    assert.match(read.res.headers['Content-Type'], /^text\/event-stream/, message);
+    assert.equal(read.body, exitBody(reason), message);
+    assert.equal(read.res.writableEnded, true, message);
+    assert.equal(read.req.listenerCount('close'), 0, `${message}: no viewer binds the request`);
+}
+
+function assertRetainedRefusal(read, expected, message) {
+    assert.deepEqual({ status: read.status, body: read.body }, expected, message);
+    assert.doesNotMatch(String(read.res.headers['Content-Type'] || ''), /event-stream/, message);
+}
+
+// One-shot pause of the next lease validation, released by the test.
+function validationGate() {
+    let release;
+    let entered;
+    const gate = {
+        armed: false,
+        entered: new Promise((resolve) => { entered = resolve; }),
+        released: new Promise((resolve) => { release = resolve; }),
+        release: () => release(),
+        // Waits until `pending` is paused at the gate; fails instead of
+        // hanging if it settled without authenticating.
+        async reached(pending) {
+            const skipped = Symbol('skipped');
+            const first = await Promise.race([gate.entered, pending.then(() => skipped, () => skipped)]);
+            if (first === skipped) assert.fail('the request settled without reaching lease validation');
+        },
+        async pass() {
+            if (!gate.armed) return;
+            gate.armed = false;
+            entered();
+            await gate.released;
+        },
+    };
+    return gate;
+}
+
+// Counts timers armed while `operation` runs.
+async function countTimers(operation) {
+    const { setTimeout: originalTimeout, setInterval: originalInterval } = globalThis;
+    let armed = 0;
+    globalThis.setTimeout = (...args) => { armed += 1; return originalTimeout(...args); };
+    globalThis.setInterval = (...args) => { armed += 1; return originalInterval(...args); };
+    try {
+        return { result: await operation(), armed };
+    } finally {
+        globalThis.setTimeout = originalTimeout;
+        globalThis.setInterval = originalInterval;
+    }
+}
+
+test('retained exits authorize only the principal recorded for each view eligible at retirement', async (t) => {
+    const f = await missedExitFixture(t);
+    const plan = routePlan();
+    const watcher = lease('watcher', 'other-admin');
+    const attachView = async (req, supersedes = null) => {
+        const token = await f.manager.createAttachToken({ req, routePlan: plan, id: f.session.id,
+            ...(supersedes ? { supersedes } : {}) });
+        return (await f.manager.attach({ req, routePlan: plan, attach: token.attach, cols: 80, rows: 24 })).view.id;
+    };
+    const watcherView = await attachView({ lease: watcher });
+    const endedView = await attachView({ lease: f.owner });
+    await f.manager.closeIntent({ req: { lease: f.owner }, routePlan: plan, id: f.session.id, view: endedView, policy: 'keep' });
+    const replacedView = await attachView({ lease: f.owner });
+    const recoveryView = await attachView({ lease: f.owner }, replacedView);
+    assert.equal(f.session.views.get(endedView).state, 'ended');
+    assert.equal(f.session.views.get(replacedView).state, 'superseded');
+    await f.open();
+    await f.dropOldGeneration();
+    await f.retire();
+    const record = f.manager.tombstones.get(f.session.id);
+    assert.deepEqual([...record.retiredViews.keys()].sort(), [f.viewId, watcherView, recoveryView].sort());
+    // Each exact view, as its recorded principal (any current login of that principal).
+    assertRetainedExit(await f.stream(f.owner, f.viewId), 'target_identity_changed', 'owner view');
+    assertRetainedExit(await f.stream(lease('new-login'), f.viewId), 'target_identity_changed', 'owner view, new login');
+    assertRetainedExit(await f.stream(watcher, watcherView), 'target_identity_changed', 'watcher view');
+    assertRetainedExit(await f.stream(f.owner, recoveryView), 'target_identity_changed', 'recovery view');
+    for (const [name, selectedLease, view] of [
+        ['foreign administrator on the owner view', lease('intruder', 'third-admin'), f.viewId],
+        ['watcher on the owner view', watcher, f.viewId],
+        ['owner on the watcher view', f.owner, watcherView],
+        ['intent-ended view', f.owner, endedView],
+        ['superseded view', f.owner, replacedView],
+        ['unknown valid view', f.owner, 'u'.repeat(32)],
+    ]) {
+        assertRetainedRefusal(await f.stream(selectedLease, view), RETAINED_NOT_FOUND, name);
+    }
+    // View identities never reach the Live Sessions projection.
+    const listed = JSON.stringify(await f.manager.listLiveSessions({ req: { lease: f.owner }, routePlan: plan }));
+    for (const view of [f.viewId, watcherView, endedView, replacedView, recoveryView]) assert.equal(listed.includes(view), false);
+    assertExplorerShellRow(await tombstoneRow(f.manager, f.session.id, { lease: f.owner }));
+});
+
+test('expired, evicted and fresh-manager retained outcomes answer 404 without SSE', async (t) => {
+    await t.test('expired', async (t2) => {
+        let now = 1_000_000;
+        const f = await missedExitFixture(t2, { now: () => now });
+        await f.open();
+        await f.dropOldGeneration();
+        await f.retire();
+        const record = f.manager.tombstones.get(f.session.id);
+        assert.equal(record.closure, 'proven');
+        now = record.expiresAt - 1;
+        assertRetainedExit(await f.stream(), 'target_identity_changed', 'before expiry');
+        now = record.expiresAt;
+        assertRetainedRefusal(await f.stream(), RETAINED_NOT_FOUND, 'at expiry');
+    });
+    await t.test('evicted', async (t2) => {
+        const f = await missedExitFixture(t2, { limits: { maxTombstones: 1 } });
+        await f.open();
+        await f.dropOldGeneration();
+        await f.retire();
+        const other = await f.manager.create({ req: { lease: f.owner }, routePlan: routePlan(), cwdRelative: '' });
+        await f.manager.closeSession(other.id, 'requested');
+        assert.deepEqual([...f.manager.tombstones.keys()], [other.id]);
+        assertRetainedRefusal(await f.stream(), RETAINED_NOT_FOUND, 'evicted');
+    });
+    await t.test('fresh manager', async (t2) => {
+        const f = await missedExitFixture(t2);
+        await f.open();
+        await f.dropOldGeneration();
+        await f.retire();
+        const fresh = await createManager(t2, { auth: requestAuthAdapter() });
+        assertRetainedRefusal(
+            await streamThroughHandler(fresh, currentGenerationPlan(), f.session.id, f.viewId, f.owner),
+            RETAINED_NOT_FOUND, 'fresh manager');
+    });
+});
+
+test('repeated retained reads each end with one exit and grow no worker, viewer, index, record or subscription', async (t) => {
+    const store = recordStore();
+    const auth = requestAuthAdapter();
+    let subscriptions = 0;
+    auth.subscribeInvalidation = () => { subscriptions += 1; return () => {}; };
+    let factories = 0;
+    const worker = new FakeWorker();
+    const f = await missedExitFixture(t, { auth, recordStore: store, worker });
+    f.manager.workerFactory = f.manager.agentWorkerFactory = () => { factories += 1; throw new Error('no worker may start'); };
+    const first = await f.open();
+    worker.emit('output', { sequence: 1, data: 'one' });
+    await f.dropOldGeneration();
+    await f.retire();
+    assert.doesNotMatch(first.body, /event: exit/);
+    const record = f.manager.tombstones.get(f.session.id);
+    const snapshot = () => JSON.stringify({
+        viewers: f.manager.viewerCount, sessions: f.manager.sessions.size, owners: f.manager.ownerIndex.size,
+        pending: f.manager.pendingCreations.size, closes: f.manager.inFlightCloses.size,
+        launches: f.manager.launchAuthSubscriptions.size, tombstones: f.manager.tombstones.size,
+        retained: [...record.retiredViews], closure: record.closure, scope: record.closureScope,
+        expiresAt: record.expiresAt, store: store.calls, workerClosed: worker.closed, subscriptions, factories,
+        sessionViewers: f.session.viewers.size, views: f.session.views.size, replay: f.session.replay.length,
+        available: f.manager.availability(),
+    });
+    const before = snapshot();
+    for (let read = 0; read < 5; read += 1) {
+        const { result: retained, armed } = await countTimers(() => f.stream());
+        assert.equal(armed, 0, `read ${read}: no timer`);
+        assertRetainedExit(retained, 'target_identity_changed', `read ${read}`);
+        assert.doesNotMatch(retained.body, /event: output|one/, `read ${read}: no replay`);
+        assert.equal(snapshot(), before, `read ${read}`);
+    }
+    assert.equal(f.manager.tombstones.get(f.session.id), record, 'the same retained record');
+});
+
+test('retirement during live authentication falls back to the retained exit without a dead viewer', async (t) => {
+    const gate = validationGate();
+    const auth = requestAuthAdapter();
+    let validations = 0;
+    auth.validateLease = async () => { validations += 1; await gate.pass(); return { ok: true }; };
+    const f = await missedExitFixture(t, { auth });
+    await f.open();
+    await f.dropOldGeneration();
+    const before = validations;
+    gate.armed = true;
+    const reconnect = f.stream();
+    await gate.reached(reconnect);
+    assert.equal(f.manager.sessions.has(f.session.id), true, 'live authorization is in flight on a live shell');
+    await f.retire();
+    gate.release();
+    const read = await reconnect;
+    assertRetainedExit(read, 'target_identity_changed', 'fallback after live authorization');
+    assert.equal(validations - before, 2, 'live and retained authorization each validated');
+    assert.equal(f.manager.viewerCount, 0);
+    assert.equal(f.session.viewers.size, 0);
+});
+
+test('eviction or expiry during retained authentication never answers a stale exit', async (t) => {
+    await t.test('expiry', async (t2) => {
+        let now = 1_000_000;
+        const gate = validationGate();
+        const auth = requestAuthAdapter();
+        auth.validateLease = async () => { await gate.pass(); return { ok: true }; };
+        const f = await missedExitFixture(t2, { auth, now: () => now });
+        await f.open();
+        await f.dropOldGeneration();
+        await f.retire();
+        const record = f.manager.tombstones.get(f.session.id);
+        gate.armed = true;
+        const reconnect = f.stream();
+        await gate.reached(reconnect);
+        now = record.expiresAt;
+        gate.release();
+        assertRetainedRefusal(await reconnect, RETAINED_NOT_FOUND, 'expired during authentication');
+    });
+    await t.test('eviction', async (t2) => {
+        const gate = validationGate();
+        const auth = requestAuthAdapter();
+        auth.validateLease = async () => { await gate.pass(); return { ok: true }; };
+        const f = await missedExitFixture(t2, { auth, limits: { maxTombstones: 1 } });
+        await f.open();
+        await f.dropOldGeneration();
+        await f.retire();
+        gate.armed = true;
+        const reconnect = f.stream();
+        await gate.reached(reconnect);
+        const other = await f.manager.create({ req: { lease: f.owner }, routePlan: routePlan(), cwdRelative: '' });
+        await f.manager.closeSession(other.id, 'requested');
+        assert.equal(f.manager.tombstones.has(f.session.id), false);
+        gate.release();
+        assertRetainedRefusal(await reconnect, RETAINED_NOT_FOUND, 'evicted during authentication');
+    });
+});
+
+test('retirement queued after live authorization resolves gives one empty finite stream, then one exit', async (t) => {
+    const f = await missedExitFixture(t);
+    const first = await f.open();
+    f.worker.emit('output', { sequence: 1, data: 'one' });
+    await f.dropOldGeneration();
+    const authorize = f.manager.authorize.bind(f.manager);
+    let retiredAfterAuthorize = false;
+    f.manager.authorize = async (...args) => {
+        const session = await authorize(...args);
+        if (session && !retiredAfterAuthorize) {
+            retiredAfterAuthorize = true;
+            // Synchronously closing, removed and retained before the handler resumes.
+            void f.manager.closeSession(session, 'target_identity_changed');
+        }
+        return session;
+    };
+    const empty = await f.stream();
+    assert.equal(retiredAfterAuthorize, true);
+    assert.equal(empty.status, 200);
+    assert.match(empty.res.headers['Content-Type'], /^text\/event-stream/);
+    assert.equal(empty.body, '', 'no attachment, replay or exit on the first response');
+    assert.equal(empty.res.writableEnded, true);
+    assert.equal(empty.req.listenerCount('close'), 0);
+    assert.equal(f.manager.viewerCount, 0);
+    assert.equal(f.session.viewers.size, 0);
+    assert.equal(f.manager.sessions.size, 0);
+    await f.session.closePromise;
+    assert.equal(f.worker.closed, 1, 'only the retirement closed the worker');
+    assertRetainedExit(await f.stream(), 'target_identity_changed', 'next same-view reconnect');
+    assert.doesNotMatch(first.body, /event: exit/);
+});
+
+test('retained exits leave pending and unconfirmed cleanup outcomes unchanged', async (t) => {
+    await t.test('pending', async (t2) => {
+        let releaseClose;
+        const barrier = new Promise((resolve) => { releaseClose = resolve; });
+        const worker = new FakeWorker();
+        const baseClose = worker.close.bind(worker);
+        worker.close = async () => { await barrier; return baseClose(); };
+        const f = await missedExitFixture(t2, { worker });
+        await f.open();
+        await f.dropOldGeneration();
+        await f.startRetirement();
+        const record = f.manager.tombstones.get(f.session.id);
+        assert.deepEqual([record.closure, record.expiresAt], ['pending', Infinity]);
+        assertRetainedExit(await f.stream(), 'target_identity_changed', 'pending cleanup');
+        assert.deepEqual([record.closure, record.expiresAt], ['pending', Infinity], 'exit asserts no cleanup');
+        assert.equal((await tombstoneRow(f.manager, f.session.id, { lease: f.owner })).closure, 'pending');
+        releaseClose();
+        await f.session.closePromise;
+        assert.equal(record.closure, 'proven');
+    });
+    await t.test('unconfirmed', async (t2) => {
+        const store = recordStore();
+        store.recoverHandle = async () => ({ recovered: false, category: 'agent_startup_marker_survived', scope: 'target' });
+        const f = await missedExitFixture(t2, { recordStore: store });
+        await f.open();
+        await f.dropOldGeneration();
+        await f.retire();
+        const record = f.manager.tombstones.get(f.session.id);
+        const outcome = () => [record.closure, record.closureScope, record.expiresAt,
+            f.manager.isAgentTargetQuarantined(f.session.target), f.manager.availability().ok];
+        assert.deepEqual(outcome(), ['unconfirmed', 'target', Infinity, true, true]);
+        assertRetainedExit(await f.stream(), 'target_identity_changed', 'unconfirmed cleanup');
+        assertRetainedExit(await f.stream(), 'target_identity_changed', 'unconfirmed cleanup, again');
+        assert.deepEqual(outcome(), ['unconfirmed', 'target', Infinity, true, true]);
+        const row = await tombstoneRow(f.manager, f.session.id, { lease: f.owner });
+        assert.deepEqual([row.closure, row.closureScope], ['unconfirmed', 'target']);
+    });
+});
+
+test('retained reads keep authentication refusals and survive failed writes without allocating', async (t) => {
+    let validate = async () => ({ ok: true });
+    let createLease = (req) => req.lease;
+    let subscriptions = 0;
+    const auth = {
+        ...requestAuthAdapter(),
+        createLease: (req) => createLease(req),
+        validateLease: (...args) => validate(...args),
+        subscribeInvalidation: () => { subscriptions += 1; return () => {}; },
+    };
+    const f = await missedExitFixture(t, { auth });
+    await f.open();
+    await f.dropOldGeneration();
+    await f.retire();
+    const record = f.manager.tombstones.get(f.session.id);
+    const snapshot = () => JSON.stringify({
+        viewers: f.manager.viewerCount, sessions: f.manager.sessions.size, owners: f.manager.ownerIndex.size,
+        launches: f.manager.launchAuthSubscriptions.size, tombstones: f.manager.tombstones.size,
+        retained: [...record.retiredViews], closure: record.closure, workerClosed: f.worker.closed, subscriptions,
+    });
+    const before = snapshot();
+    const json = (status, error) => ({ status, body: JSON.stringify({ ok: false, error }) });
+    for (const [name, reason, expected] of [
+        ['expired login', 'expired', json(401, 'authentication_required')],
+        ['missing login', 'missing_or_expired', json(401, 'authentication_required')],
+        ['revoked administrator', 'administrator_revoked', json(403, 'administrator_required')],
+        ['provider outage', 'provider_unavailable', json(503, 'webtty_unavailable')],
+    ]) {
+        validate = async () => ({ ok: false, reason });
+        const { result: refused, armed } = await countTimers(() => f.stream());
+        assertRetainedRefusal(refused, expected, name);
+        assert.equal(armed, 0, `${name}: no timer`);
+        assert.equal(snapshot(), before, name);
+    }
+    validate = async () => { throw new Error('private provider failure'); };
+    assertRetainedRefusal(await f.stream(), json(503, 'terminal_runtime_failure'), 'validation throws');
+    validate = async () => ({ ok: true });
+    createLease = () => { throw Object.assign(new Error('no login'), { code: 'WEBTTY_AUTH_SESSION_REQUIRED' }); };
+    assertRetainedRefusal(await f.stream(), json(401, 'authentication_required'), 'lease creation throws');
+    createLease = (req) => req.lease;
+    assert.equal(snapshot(), before);
+    for (const failing of ['write', 'end']) {
+        const res = sseResponse();
+        res[failing] = () => { throw new Error('socket reset'); };
+        const { result: read, armed } = await countTimers(() => (
+            streamThroughHandler(f.manager, currentGenerationPlan(), f.session.id, f.viewId, f.owner, res)));
+        assert.equal(armed, 0, `${failing}: no timer`);
+        assert.equal(read.status, 200, failing);
+        assert.equal(read.req.listenerCount('close'), 0, failing);
+        assert.equal(snapshot(), before, failing);
+    }
+    assertRetainedExit(await f.stream(), 'target_identity_changed', 'the record still answers');
 });

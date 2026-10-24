@@ -383,21 +383,36 @@ export async function handleWebtty(req, res, parsedUrl, {
         const viewId = streamViewId(parsedUrl);
         if (!viewId) { sendError(res, 400, 'invalid_stream_request'); return true; }
         let session;
+        let retired = null;
         try {
             session = await manager.authorize(req, routePlan, selected.id, 'watch');
             if (session) {
                 manager.streamView(session, req, viewId);
                 manager.assertViewerQuota(session);
+            } else {
+                // A view that missed its retired shell's exit may still learn it.
+                retired = await manager.retiredStreamOutcome(req, routePlan, selected.id, viewId);
             }
         }
         catch (error) { mapOperationError(res, error); return true; }
-        if (!session) { sendError(res, 404, 'not_found'); return true; }
-        res.writeHead(200, {
+        const streamHeaders = {
             ...SECURITY_HEADERS,
             'Content-Type': 'text/event-stream; charset=utf-8',
             Connection: 'keep-alive',
             'X-Accel-Buffering': 'no',
-        });
+        };
+        if (!session) {
+            // Final guard: nothing is awaited between it and the response.
+            let exitEvent = null;
+            try { exitEvent = retired ? manager.commitRetiredStreamOutcome(routePlan, retired) : null; }
+            catch (error) { mapOperationError(res, error); return true; }
+            if (!exitEvent) { sendError(res, 404, 'not_found'); return true; }
+            res.writeHead(200, streamHeaders);
+            try { res.write(exitEvent); } catch (_) { }
+            try { res.end(); } catch (_) { }
+            return true;
+        }
+        res.writeHead(200, streamHeaders);
         let attached = false;
         try {
             attached = manager.attachStream(session, req, res, req.headers?.['last-event-id'], routePlan, viewId);
