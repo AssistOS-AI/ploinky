@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const moduleSuffix = `?t=${Date.now()}-${Math.random()}`;
-const { RouterRequestTokenService } = await import(`../../cli/server/security/tokens/RouterRequestTokenService.js${moduleSuffix}`);
+const { RouterRequestTokenService, normalizeActor, normalizeUserClaims } = await import(`../../cli/server/security/tokens/RouterRequestTokenService.js${moduleSuffix}`);
 
 test('RouterRequestTokenService mints byte-compatible router-request payloads', async () => {
     const signed = [];
@@ -71,4 +71,39 @@ test('RouterRequestTokenService clamps caller-supplied TTLs and carries singular
     assert.equal(payload.tool, 'write');
     assert.equal(payload.delegation.sourceAgentId, 'agent:repo/source');
     assert.equal(payload.delegation.tool, 'write');
+});
+
+test('normalizeActor passes a trimmed, capped displayName for user actors only and omits it when empty', () => {
+    const user = { kind: 'user', id: 'user:USER.3', roles: ['user'] };
+    assert.equal(normalizeActor({ ...user, displayName: '  alice  ' }).displayName, 'alice');
+    assert.equal(normalizeActor({ ...user, displayName: 'n'.repeat(300) }).displayName, 'n'.repeat(128));
+    for (const empty of [undefined, '', '   ', 42, null, {}]) {
+        assert.equal('displayName' in normalizeActor({ ...user, displayName: empty }), false, String(empty));
+    }
+    assert.equal('displayName' in normalizeActor({ kind: 'guest', id: 'guest:x', roles: ['guest'], displayName: 'alice' }), false);
+    assert.equal('displayName' in normalizeActor({ kind: 'agent', id: 'agent:a/b', roles: [], displayName: 'alice' }), false);
+    assert.equal(JSON.stringify(normalizeActor(user)), '{"kind":"user","id":"user:USER.3","roles":["user"]}');
+});
+
+test('normalizeUserClaims carries displayName only when non-empty', () => {
+    assert.equal(normalizeUserClaims({ id: 'u1', displayName: ' bob ' }).displayName, 'bob');
+    assert.equal('displayName' in normalizeUserClaims({ id: 'u1', displayName: ' ' }), false);
+    assert.equal('displayName' in normalizeUserClaims({ id: 'u1' }), false);
+});
+
+test('a minted direct user actor carries displayName and still has no usr claim', async () => {
+    const signed = [];
+    const service = new RouterRequestTokenService({
+        jwsCodec: { signHmacJwt: async (input) => { signed.push(input); return 'rr.jwt'; } },
+        resolveAgentSecret: async () => 'secret',
+        now: () => new Date('2026-10-26T00:00:00.000Z'),
+        randomId: () => 'nonce',
+    });
+    await service.mint({
+        targetAgentId: 'agent-a', sub: 'user:USER.3',
+        actor: { kind: 'user', id: 'user:USER.3', roles: ['user'], displayName: 'alice' },
+        method: 'POST', path: '/mcp', rch: 'r',
+    });
+    assert.deepEqual(signed[0].payload.actor, { kind: 'user', id: 'user:USER.3', roles: ['user'], displayName: 'alice' });
+    assert.equal('usr' in signed[0].payload, false);
 });

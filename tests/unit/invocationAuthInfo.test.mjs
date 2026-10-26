@@ -16,7 +16,8 @@ test('authInfoFromInvocation promotes router user actor into authInfo.user', () 
         id: 'local:admin',
         username: 'admin',
         email: '',
-        roles: ['admin']
+        roles: ['admin'],
+        displayName: ''
     });
     assert.equal(authInfo.invocation.actor.id, 'user:local:admin');
 });
@@ -182,4 +183,74 @@ test('authInfoFromInvocation keeps the singular delegation and plural delegation
     assert.equal(authInfo.delegations, undefined);
     assert.equal(authInfo.user.id, 'local:admin');
     assert.equal(authInfo.agent.principalId, 'agent:AchillesIDE/gitAgent');
+});
+
+test('authInfoFromInvocation exposes the actor displayName without changing username, id or roles', () => {
+    const authInfo = authInfoFromInvocation({
+        iss: 'ploinky-router',
+        sub: 'user:USER.3',
+        actor: { kind: 'user', id: 'user:USER.3', roles: ['user'], displayName: 'adiganga2002' },
+        tool: 'webmeet_chat_send'
+    });
+
+    assert.deepEqual(authInfo.user, {
+        id: 'USER.3',
+        username: 'USER.3',
+        email: '',
+        roles: ['user'],
+        displayName: 'adiganga2002'
+    });
+    assert.deepEqual(authInfo.invocation.actor, { kind: 'user', id: 'user:USER.3', roles: ['user'], capabilities: [] });
+    assert.equal('displayName' in authInfo.invocation.actor, false);
+});
+
+test('authInfoFromInvocation defaults displayName to an empty string when the actor carries none', () => {
+    const authInfo = authInfoFromInvocation({
+        iss: 'ploinky-router',
+        sub: 'user:USER.3',
+        actor: { kind: 'user', id: 'user:USER.3', roles: ['user'] },
+        tool: 'webmeet_chat_send'
+    });
+    assert.equal(authInfo.user.displayName, '');
+    assert.equal(authInfo.user.username, 'USER.3');
+});
+
+test('authInfoFromInvocation reads usr.displayName in the delegated branch and keeps role precedence', () => {
+    const authInfo = authInfoFromInvocation({
+        iss: 'ploinky-router',
+        sub: 'agent:AssistOSExplorer/gitAgent',
+        actor: { kind: 'agent', id: 'agent:AssistOSExplorer/gitAgent', roles: ['admin'], displayName: 'ignored' },
+        usr: { id: 'USER.3', username: 'alice', email: 'a@x.test', roles: ['user'], displayName: 'alice' },
+        tool: 'dpu_secret_put'
+    });
+    assert.deepEqual(authInfo.user, {
+        id: 'USER.3',
+        username: 'alice',
+        email: 'a@x.test',
+        roles: ['user'],
+        displayName: 'alice'
+    });
+
+    const without = authInfoFromInvocation({
+        iss: 'ploinky-router',
+        sub: 'agent:AssistOSExplorer/gitAgent',
+        actor: { kind: 'agent', id: 'agent:AssistOSExplorer/gitAgent', roles: [] },
+        usr: { id: 'USER.3', roles: ['user'] },
+        tool: 'dpu_secret_put'
+    });
+    assert.equal(without.user.displayName, '');
+});
+
+test('a displayName of admin grants no identity or roles (display-only)', () => {
+    const authInfo = authInfoFromInvocation({
+        iss: 'ploinky-router',
+        sub: 'user:USER.3',
+        actor: { kind: 'user', id: 'user:USER.3', roles: ['user'], displayName: 'admin' },
+        tool: 'workspace_monitor_status'
+    });
+    assert.equal(authInfo.user.displayName, 'admin');
+    assert.notEqual(authInfo.user.username.toLowerCase(), 'admin');
+    assert.notEqual(authInfo.user.id, 'local:admin');
+    assert.notEqual(authInfo.principalId, 'user:local:admin');
+    assert.deepEqual(authInfo.user.roles, ['user']);
 });

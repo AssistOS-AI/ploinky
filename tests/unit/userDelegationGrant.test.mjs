@@ -257,3 +257,23 @@ test('mint still clamps to the default 28800 ceiling when env is unset', () => {
         if (prev !== undefined) process.env.PLOINKY_USER_DELEGATION_MAX_TTL_SECONDS = prev;
     }
 });
+
+test('delegation grants carry a trimmed, capped displayName and omit it when empty', () => {
+    const withName = mint({ user: { ...USER, displayName: `  ${'d'.repeat(200)}  ` } });
+    assert.equal(withName.payload.usr.displayName, 'd'.repeat(128));
+    const verified = verifyUserDelegationGrant({
+        signingSecret: SIGNING_SECRET,
+        token: withName.token,
+        expectedSourceAgentId: SOURCE_AGENT,
+        expectedTargetAgentId: TARGET_AGENT,
+        expectedTool: TOOL,
+        replayCache: createMemoryReplayCache(),
+    });
+    assert.equal(verified.user.displayName, 'd'.repeat(128));
+    assert.equal(verified.user.username, 'alice', 'username fallback is unchanged');
+
+    for (const displayName of [undefined, '', '  ', 7]) {
+        const { payload } = mint({ user: { ...USER, displayName } });
+        assert.equal('displayName' in payload.usr, false, String(displayName));
+    }
+});

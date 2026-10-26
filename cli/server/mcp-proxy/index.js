@@ -455,6 +455,11 @@ export function buildInvocationContextForProviderCall({
             // delegated branch above never signs capabilities.
             capabilities: req.user?.capabilities,
         };
+        // Display-only name for agents; never an authorization input.
+        if (actor.kind === 'user') {
+            const displayName = String(req.user?.username || '').trim();
+            if (displayName) actor.displayName = displayName;
+        }
         const delegations = buildMcpDelegationsForUserCall({ req, routeKey: agentName, toolName });
         const { token, payload } = buildRouterRequest({
             targetAgentId,

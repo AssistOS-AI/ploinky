@@ -150,6 +150,7 @@ export function buildMcpDelegationsForUserCall({ req, routeKey, toolName, routes
                 id: user.id,
                 username: user.username || user.name || user.email || '',
                 email: user.email || '',
+                displayName: user.username || '',
                 roles: Array.isArray(user.roles) ? [...user.roles] : [],
             },
             targetAgentId: entry.targetAgentId,
