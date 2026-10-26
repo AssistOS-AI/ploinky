@@ -10,9 +10,7 @@ import { agentServerIdentityInputs, createAgentServerCodeIdentity, formatIdentit
 import { createAgentServerCodeIdentityThread } from './toolCodeIdentityThread.mjs';
 import { preserveJsonSchemaToolListings } from './inputSchema.mjs';
 import { getConfiguredToolInputSchema } from './toolInputSchemaCache.mjs';
-import {
-    createMemoryReplayCache
-} from '../lib/jwtVerify.mjs';
+import { createBoundedReplayCache, legacyMinRetentionMs } from '../lib/replayCache.mjs';
 import {
     hasInvocationTokenHeader,
     verifyRouterRequestFromHeaders,
@@ -43,7 +41,10 @@ const TASK_QUEUE_FILE = path.join(
     taskQueueHome && path.isAbsolute(taskQueueHome) ? taskQueueHome : process.cwd(),
     '.tasksQueue',
 );
-const invocationReplayCache = createMemoryReplayCache({ maxSize: 4096 });
+const invocationReplayCache = createBoundedReplayCache({
+    maxSize: 32768,
+    legacyMinRetentionMs: legacyMinRetentionMs({ maxTtlSeconds: 60 }),
+});
 const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 const OPENAI_MODELS_PATH = '/v1/models';
 const AGENT_CARD_PATH = '/agent-card';

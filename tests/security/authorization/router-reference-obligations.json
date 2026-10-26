@@ -2535,6 +2535,123 @@
             "anchor": null,
             "statement": "return {"
           }
+        },
+        "3b6493c75232b7670198bbb2a6fda1dc9522d93a6a941ca39bb688ddece7dfd8": {
+          "root.get": {
+            "line": 780,
+            "anchor": null,
+            "statement": "}"
+          },
+          "root-index.get": {
+            "line": 780,
+            "anchor": null,
+            "statement": "}"
+          },
+          "health.get": {
+            "line": 653,
+            "anchor": null,
+            "statement": "Number.isInteger(error?.status) ? error.status : 502,"
+          },
+          "agent-card.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (!staticAgent) return null;"
+          },
+          "agent-card-slash.get": {
+            "line": 332,
+            "anchor": null,
+            "statement": "if (!staticAgent) return null;"
+          },
+          "mcp-browser-client.get": {
+            "line": 486,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 486,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 433,
+            "anchor": null,
+            "statement": "res,"
+          },
+          "agent-mcp.post": {
+            "line": 751,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-mcp.delete": {
+            "line": 751,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-mcp.get": {
+            "line": 751,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-task-status.get": {
+            "line": 613,
+            "anchor": null,
+            "statement": "// One authorization path for transparent agent routes and agent-port relays."
+          },
+          "agent-task-status-alias.get": {
+            "line": 613,
+            "anchor": null,
+            "statement": "// One authorization path for transparent agent routes and agent-port relays."
+          },
+          "agent-task-cancel.post": {
+            "line": 555,
+            "anchor": null,
+            "statement": "});"
+          },
+          "agent-openai.post": {
+            "line": 598,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 401, {"
+          },
+          "agent-root-websocket.get": {
+            "line": 964,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 995,
+            "anchor": null,
+            "statement": "return;"
+          },
+          "internal-agent-control.*": {
+            "line": 501,
+            "anchor": null,
+            "statement": "if (hasInternalAgentSegment(pathname)) {"
+          },
+          "reserved--metrics.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--health-internal.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--admin.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "reserved--admin-*.*": {
+            "line": 251,
+            "anchor": null,
+            "statement": "}"
+          },
+          "unix-health.get": {
+            "line": 935,
+            "anchor": null,
+            "statement": "return {"
+          }
         }
       },
       "candidate": "27fb848deaa7824177c9fb16cc265da2b9bb9cc919021fcaacb18580026596a9"
@@ -2858,6 +2975,38 @@
           },
           "marketplace-disable_agent.post": {
             "line": 1024,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
+        },
+        "e38c339b8bc7775fc7110384c2b454f5a472b7ed6443d5dd5754f2afe8e09e62": {
+          "marketplace-repos-read.get": {
+            "line": 933,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 903,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 1006,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 1006,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 1032,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 1034,
             "anchor": "action === 'disable_agent'",
             "statement": "} else if (action === 'disable_agent') {"
           }
@@ -3753,6 +3902,66 @@
         }
       },
       "candidate": "894d28dbcd19dc51b2393a7f34b0a06d9c4e40804cb4a81460ff65f5131ed17f"
+    },
+    "cli/server/edgeRoutePlan.js": {
+      "baseline": "ca3a2b27e4bf09a7812725c5d23e68764b49b2dc78c34dc08162699207c9d4d8",
+      "blobs": {
+        "ca3a2b27e4bf09a7812725c5d23e68764b49b2dc78c34dc08162699207c9d4d8": {
+          "agent-additional-http.*": {
+            "line": 195,
+            "anchor": "function agentPortPlan({",
+            "statement": "function agentPortPlan({"
+          },
+          "private-workspace-logs.post": {
+            "line": 757,
+            "anchor": "pathname === '/api/edge/workspace-logs'",
+            "statement": "if (pathname === '/api/edge/workspace-logs') {"
+          },
+          "private-workspace-metrics.get": {
+            "line": 775,
+            "anchor": "pathname === '/api/edge/workspace-metrics'",
+            "statement": "if (pathname === '/api/edge/workspace-metrics') {"
+          },
+          "private-runtime-origins.get": {
+            "line": 793,
+            "anchor": "pathname === '/api/edge/runtime-origins'",
+            "statement": "if (pathname === '/api/edge/runtime-origins') {"
+          },
+          "private-turn-credentials.post": {
+            "line": 814,
+            "anchor": "pathname === '/api/edge/turn-credentials'",
+            "statement": "if (pathname === '/api/edge/turn-credentials') {"
+          }
+        },
+        "ec1bdbc2950ba777748c2ec46808832e408a0c20357bd78fff86b2124798adb7": {
+          "agent-additional-http.*": {
+            "line": 196,
+            "anchor": "function agentPortPlan({",
+            "statement": "function agentPortPlan({"
+          },
+          "private-workspace-logs.post": {
+            "line": 808,
+            "anchor": "pathname === '/api/edge/workspace-logs'",
+            "statement": "if (pathname === '/api/edge/workspace-logs') {"
+          },
+          "private-workspace-metrics.get": {
+            "line": 826,
+            "anchor": "pathname === '/api/edge/workspace-metrics'",
+            "statement": "if (pathname === '/api/edge/workspace-metrics') {"
+          },
+          "private-runtime-origins.get": {
+            "line": 844,
+            "anchor": "pathname === '/api/edge/runtime-origins'",
+            "statement": "if (pathname === '/api/edge/runtime-origins') {"
+          },
+          "private-turn-credentials.post": {
+            "line": 865,
+            "anchor": "pathname === '/api/edge/turn-credentials'",
+            "statement": "if (pathname === '/api/edge/turn-credentials') {"
+          }
+        }
+      },
+      "candidate": "ca3a2b27e4bf09a7812725c5d23e68764b49b2dc78c34dc08162699207c9d4d8"
     }
   }
 }

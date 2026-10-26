@@ -1,10 +1,19 @@
-import { createMemoryReplayCache } from './jwtVerify.mjs';
+import { createBoundedReplayCache, legacyMinRetentionMs } from './replayCache.mjs';
 import { verifyRouterRequestToken } from './requestSignedTokens.mjs';
 import { computeRchHttp, sha256RawBodyHash } from './requestHash.mjs';
 
-const httpRouteReplayCache = createMemoryReplayCache({ maxSize: 4096 });
-const openAiServiceReplayCache = createMemoryReplayCache({ maxSize: 4096 });
-const openAiModelsReplayCache = createMemoryReplayCache({ maxSize: 4096 });
+// Only the Router holds this agent's secret, so these caches are filled by
+// Router-minted tokens alone; they refuse new tokens when full.
+function createRouterRequestReplayCache() {
+    return createBoundedReplayCache({
+        maxSize: 32768,
+        legacyMinRetentionMs: legacyMinRetentionMs({ maxTtlSeconds: 60 }),
+    });
+}
+
+const httpRouteReplayCache = createRouterRequestReplayCache();
+const openAiServiceReplayCache = createRouterRequestReplayCache();
+const openAiModelsReplayCache = createRouterRequestReplayCache();
 
 // Tool name the router binds into the Router Request token it mints for a
 // verified agent-to-agent OpenAI call. Kept here so router (minter) and agent
@@ -110,7 +119,7 @@ export function verifyRouterRequestFromHeaders(headers = {}, {
         });
         return { ok: true, payload, rawToken };
     } catch (err) {
-        return { ok: false, reason: err?.message || String(err) };
+        return { ok: false, reason: err?.message || String(err), ...(err?.code ? { code: String(err.code) } : {}) };
     }
 }
 

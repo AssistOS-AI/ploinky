@@ -40,6 +40,7 @@ import {
 import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
 import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
+import { replayRefusalStatus } from '../../../Agent/lib/replayCache.mjs';
 import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { repositoryWorkerEligible, runMarketplaceRepositoryWorker } from '../marketplaceRepositoryWorker.mjs';
 import { diagnosticIdentity } from '../marketplaceRepositoryDiagnostics.mjs';
@@ -54,7 +55,7 @@ export const MARKETPLACE_PATH = '/api/marketplace';
 export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
 export const MARKETPLACE_READ_TOOL = 'marketplace.read';
 export const MARKETPLACE_ENABLE_TOOL = 'marketplace.enable_agent';
-const marketplaceAssertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
+const marketplaceAssertionReplayCache = createTokenReplayCache();
 
 const SAFE_LIFECYCLE_ERRORS = new Map([
     ['PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED', { status: 503, message: 'Repository operation requires workspace recovery. Stop the exact Box from its host workspace, then start it again.' }],
@@ -277,8 +278,17 @@ function ensureMarketplaceAgentRequest(req, res, details) {
     let verified;
     try {
         verified = verifyMarketplaceAgentRequest({ req, ...details });
-    } catch (_) {
-        sendMarketplaceError(res, 401, 'agent_assertion_rejected', 'Agent authentication failed.');
+    } catch (error) {
+        // A replay quota or capacity refusal is reached only after the signature
+        // verified, so it reveals only the caller's own quota or server load.
+        const status = replayRefusalStatus(error);
+        if (status === 429) {
+            sendMarketplaceError(res, status, 'replay_quota_exhausted', 'Agent request rate exceeded.');
+        } else if (status) {
+            sendMarketplaceError(res, status, 'replay_capacity_exhausted', 'Service temporarily unavailable.');
+        } else {
+            sendMarketplaceError(res, 401, 'agent_assertion_rejected', 'Agent authentication failed.');
+        }
         return false;
     }
     // Marketplace defines no delegated-user projection: an explicitly delegated

@@ -32,7 +32,7 @@ const TASK_STATUS_TOOL = '__task_status__';
 const TASK_CANCEL_TOOL = '__task_cancel__';
 const TASK_CANCEL_PATH = '/task/cancel';
 // Replay cache for verified Agent Assertions (agent-to-agent jti single-use).
-const assertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
+const assertionReplayCache = createTokenReplayCache();
 
 // Session store for agent MCP connections
 const agentSessionStore = new Map();

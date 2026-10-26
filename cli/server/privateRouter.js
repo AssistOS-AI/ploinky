@@ -1,6 +1,11 @@
 import crypto from 'node:crypto';
 
-import { verifyJws, createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
+import { verifyJws } from '../../Agent/lib/jwtVerify.mjs';
+import {
+    createPartitionedReplayCache,
+    legacyMinRetentionMs,
+    replayRefusalStatus,
+} from '../../Agent/lib/replayCache.mjs';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
 import { parseRouterOriginList } from '../../Agent/lib/routerOrigins.mjs';
 import {
@@ -17,7 +22,14 @@ const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;
 const RUNTIME_ORIGINS_PATH = '/api/edge/runtime-origins';
 const RUNTIME_ORIGINS_SCHEMA_VERSION = 1;
 const ACTIVATION_ID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
-const replayCache = createMemoryReplayCache({ maxSize: 8192 });
+// One replay quota per enabled agent, so an agent that exhausts its own quota
+// is refused with 429 while every other agent keeps working.
+const replayCache = createPartitionedReplayCache({
+    perCallerMaxSize: 16384,
+    maxSize: 131072,
+    maxPartitions: 256,
+    legacyMinRetentionMs: legacyMinRetentionMs({ maxTtlSeconds: 30 }),
+});
 
 export function createTurnCredentialRateLimiter({
     maximumRequests = 20,
@@ -202,12 +214,24 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
         current.enableGeneration,
         { encoding: 'buffer' },
     );
-    const { payload } = verifyJws(token, {
-        secret,
-        expectedAudience: PRIVATE_ROUTER_AUDIENCE,
-        replayCache: assertionCache,
-        maxTtlSeconds: 30,
-    });
+    // The partition key is the current enabled agent; nothing is allocated
+    // until verifyJws records a jti after the signature check.
+    const cache = typeof assertionCache?.forCaller === 'function'
+        ? assertionCache.forCaller(current.agentId)
+        : assertionCache;
+    let payload;
+    try {
+        ({ payload } = verifyJws(token, {
+            secret,
+            expectedAudience: PRIVATE_ROUTER_AUDIENCE,
+            replayCache: cache,
+            maxTtlSeconds: 30,
+        }));
+    } catch (error) {
+        const status = replayRefusalStatus(error);
+        if (status && !error.status) error.status = status;
+        throw error;
+    }
     if (payload?.typ !== 'private-agent-assertion'
         || payload?.iss !== agentId
         || payload?.sub !== agentId

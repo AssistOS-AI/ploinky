@@ -3,6 +3,7 @@ import { resolveEnabledAgentRecord } from '../utils/agents.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { verifyAgentAssertion } from './mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from './security/tokens/JwsCodec.js';
+import { replayRefusalStatus } from '../../Agent/lib/replayCache.mjs';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
 
 /**
@@ -32,7 +33,7 @@ const CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 // Process-wide replay cache so a captured assertion `jti` cannot be reused across
 // requests. Created once at module scope (NOT per request) — a per-request cache
 // would make replay protection a no-op.
-const discoveryReplayCache = createTokenReplayCache({ maxSize: 4096 });
+const discoveryReplayCache = createTokenReplayCache();
 
 function isActiveHostPort(value) {
     const port = Number(value);
@@ -202,7 +203,15 @@ export function handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl, {
             targetAgentId: OPENAI_AGENT_DISCOVERY_TARGET,
             replayCache,
         });
-    } catch (_) {
+    } catch (error) {
+        // A replay quota or capacity refusal is reached only after the signature
+        // verified, so it reveals only the caller's own quota or server load.
+        const status = replayRefusalStatus(error);
+        if (status) {
+            const code = status === 429 ? 'replay_quota_exhausted' : 'replay_capacity_exhausted';
+            sendJson(res, status, { complete: false, error: code });
+            return true;
+        }
         // Never echo the verifier's reason — an agent-only endpoint must not help a
         // caller probe why its assertion was rejected.
         sendJson(res, 401, { complete: false, error: 'agent_assertion_required' });

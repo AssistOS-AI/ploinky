@@ -27,6 +27,12 @@ function parseIssuer(token) {
     return iss;
 }
 
+// A partitioned cache charges each verified issuer its own replay quota. The
+// issuer is bound by the signature because its secret is derived from `iss`.
+function replayCacheForIssuer(replayCache, iss) {
+    return typeof replayCache?.forCaller === 'function' ? replayCache.forCaller(iss) : replayCache;
+}
+
 function bindingError(message) {
     return new Error(`AGENT_ASSERTION_BINDING_MISMATCH: ${message}`);
 }
@@ -82,6 +88,7 @@ export class AgentAssertionService {
             iss = String(targetAgentId || '').trim();
             if (!iss) throw error;
         }
+        const cache = replayCacheForIssuer(replayCache, iss);
         const secret = await this.resolveAgentSecret(iss);
         const { payload } = await this.jwsCodec.verifyJws(token, {
             secret,
@@ -90,7 +97,7 @@ export class AgentAssertionService {
             path,
             tool,
             rch,
-            replayCache,
+            replayCache: cache,
             maxTtlSeconds: 60,
         });
         validatePayload(payload, { method, path, tool, rch, targetAgentId });
@@ -99,6 +106,7 @@ export class AgentAssertionService {
 
     verifySync({ token, method, path, tool, rch, targetAgentId, replayCache }) {
         const iss = parseIssuer(token);
+        const cache = replayCacheForIssuer(replayCache, iss);
         const secret = this.resolveAgentSecret(iss);
         if (isPromiseLike(secret)) {
             throw new Error('AgentAssertionService: async secret resolver cannot be used through sync adapter');
@@ -106,7 +114,7 @@ export class AgentAssertionService {
         const result = this.jwsCodec.verifyJws(token, {
             secret,
             expectedAudience: 'ploinky-router',
-            replayCache,
+            replayCache: cache,
             maxTtlSeconds: 60,
         });
         if (isPromiseLike(result)) {
