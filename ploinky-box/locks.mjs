@@ -219,6 +219,7 @@ export function createMutationLockManager({
     // One acquisition attempt, shared by the asynchronous and synchronous
     // drivers. Returns a handle, or tells the driver to retry now or after a wait.
     function attempt(state) {
+        state.validatePath?.();
         if (!state.ready) {
             try {
                 state.prepare(state.first);
@@ -285,7 +286,7 @@ export function createMutationLockManager({
         return { wait: true };
     }
 
-    function createHandle({ lockPath, label, instance, workspaceRoot, ownerBytes, dirStat }) {
+    function createHandle({ lockPath, label, instance, workspaceRoot, ownerBytes, dirStat, validatePath }) {
         let released = false;
         const heldName = instance ?? label;
 
@@ -305,6 +306,7 @@ export function createMutationLockManager({
 
         // The held lock is this exact directory with these exact owner bytes.
         function verifyAt(candidate, code) {
+            validatePath?.();
             const fail = (cause) => lockError(
                 `The ${label} lock held by this command is not at ${candidate}`,
                 { code, cause },
@@ -393,7 +395,14 @@ export function createMutationLockManager({
         });
     }
 
+    function pathValidator(options) {
+        if (!options || !Object.hasOwn(options, 'validatePath')) return undefined;
+        if (typeof options.validatePath !== 'function') throw new TypeError('validatePath must be a synchronous function');
+        return options.validatePath;
+    }
+
     function workspaceState(instance, options) {
+        const validatePath = pathValidator(options);
         if (typeof instance !== 'string' || !INSTANCE_PATTERN.test(instance)) {
             throw lockError(`Invalid mutation lock identity: ${instance}`);
         }
@@ -408,6 +417,7 @@ export function createMutationLockManager({
             label: WORKSPACE_LOCK_LABEL,
             instance,
             workspaceRoot,
+            validatePath,
             first: true,
             ready: false,
             prepare(first) {
@@ -416,7 +426,8 @@ export function createMutationLockManager({
         };
     }
 
-    function pathState(lockPath, label) {
+    function pathState(lockPath, label, options) {
+        const validatePath = pathValidator(options);
         if (typeof lockPath !== 'string' || !path.isAbsolute(lockPath)) {
             throw lockError(`Lock path must be absolute: ${lockPath}`);
         }
@@ -429,6 +440,7 @@ export function createMutationLockManager({
             label,
             instance: null,
             workspaceRoot: null,
+            validatePath,
             first: true,
             ready: false,
             prepare() {
@@ -449,7 +461,7 @@ export function createMutationLockManager({
     // A retry right after a reclaim or a vanished lock is attempted at once,
     // even past the deadline, so that a slow attempt never turns a lock that
     // was just freed into a busy error; consecutive immediate retries are bounded.
-    // An unpublished staging directory is always removed on the way out.
+    // Unpublished staging is removed only while its ancestry remains valid.
     function nextStep(state, progress) {
         const step = attempt(state);
         if (step.handle) return step;
@@ -462,6 +474,14 @@ export function createMutationLockManager({
         return { sleep: true };
     }
 
+    function discardStaging(state) {
+        if (!state.staged) return;
+        // A failed acquisition keeps its original error. Leave staging for
+        // recovery when its ancestor can no longer be trusted.
+        try { state.validatePath?.(); } catch { return; }
+        discardDirectory(fsApi, state.staged.staging);
+    }
+
     async function drive(state, limitMs = timeoutMs) {
         const progress = { deadline: clock() + limitMs, immediate: 0 };
         try {
@@ -471,7 +491,7 @@ export function createMutationLockManager({
                 if (step.sleep) await delay(retryMs);
             }
         } finally {
-            if (state.staged) discardDirectory(fsApi, state.staged.staging);
+            discardStaging(state);
         }
     }
 
@@ -484,7 +504,7 @@ export function createMutationLockManager({
                 if (step.sleep) sleepSync(retryMs);
             }
         } finally {
-            if (state.staged) discardDirectory(fsApi, state.staged.staging);
+            discardStaging(state);
         }
     }
 
@@ -500,8 +520,8 @@ export function createMutationLockManager({
         acquireSync: (instance, options) => driveSync(workspaceState(instance, options)),
         // `timeoutMs` shortens the wait for this one acquisition (`ploinky
         // unlock` refuses quickly instead of queueing behind another unlock).
-        acquireAt: async (lockPath, label, { timeoutMs: limitMs } = {}) => drive(pathState(lockPath, label),
-            Number.isFinite(limitMs) && limitMs >= 0 ? limitMs : timeoutMs),
+        acquireAt: async (lockPath, label, options = {}) => drive(pathState(lockPath, label, options),
+            Number.isFinite(options.timeoutMs) && options.timeoutMs >= 0 ? options.timeoutMs : timeoutMs),
         lockPathFor: (workspaceRoot) => hostStatePaths(workspaceRoot).workspaceLock,
     });
 }

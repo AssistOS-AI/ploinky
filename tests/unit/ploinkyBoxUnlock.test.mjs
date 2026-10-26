@@ -113,6 +113,71 @@ test('nothing to unlock: nothing is created and the command succeeds', async (t)
     assert.match(formatUnlockReport(report), /No stuck lock remains/);
 });
 
+test('unlock preserves valid incomplete skeletons and accepted root permissions', async (t) => {
+    const { workspace, identity } = fixture(t);
+    const root = path.join(workspace, '.ploinky-box');
+    fs.mkdirSync(root, { mode: 0o755 });
+    for (const child of [null, 'locks', 'quarantine']) {
+        if (child) fs.mkdirSync(path.join(root, child), { mode: 0o700 });
+        const before = fs.readdirSync(root).sort();
+        const report = await unlock(identity, fakeLiveness());
+        assert.equal(report.exitCode, 0);
+        assert.deepEqual(fs.readdirSync(root).sort(), before);
+        assert.equal(fs.statSync(root).mode & 0o777, 0o755);
+        if (child === 'locks') assert.deepEqual(fs.readdirSync(path.join(root, child)), []);
+    }
+    fs.rmSync(workspace, { recursive: true });
+    await assert.rejects(unlock(identity, fakeLiveness()), { code: 'PLOINKY_BOX_WORKSPACE_ABSENT' });
+    assert.equal(fs.existsSync(workspace), false);
+});
+
+test('unlock rejects invalid existing skeleton components before any lock operation', async (t) => {
+    const cases = ['dangling-root', 'file-root', 'writable-root', 'writable-locks', 'foreign-root',
+        'linked-locks', 'linked-quarantine', 'linked-empty', 'writable-empty', 'nonempty-empty'];
+    for (const invalid of cases) {
+        await t.test(invalid, async (t) => {
+            const { root, workspace, identity } = fixture(t);
+            const state = path.join(workspace, '.ploinky-box');
+            const target = path.join(root, 'target');
+            fs.mkdirSync(target, { mode: 0o700 });
+            fs.writeFileSync(path.join(target, 'sentinel'), 'preserve');
+            if (invalid === 'dangling-root') fs.symlinkSync(path.join(root, 'missing'), state);
+            else if (invalid === 'file-root') fs.writeFileSync(state, 'preserve');
+            else {
+                fs.mkdirSync(state, { mode: 0o700 });
+                if (invalid.startsWith('linked-')) fs.symlinkSync(target, path.join(state, invalid.slice(7)));
+                if (invalid.startsWith('writable-')) {
+                    const directory = invalid === 'writable-root' ? state : path.join(state, invalid.slice(9));
+                    if (directory !== state) fs.mkdirSync(directory);
+                    fs.chmodSync(directory, 0o777);
+                }
+                if (invalid === 'nonempty-empty') {
+                    fs.mkdirSync(path.join(state, 'empty'));
+                    fs.writeFileSync(path.join(state, 'empty', 'sentinel'), 'preserve');
+                    fs.chmodSync(path.join(state, 'empty'), 0o555);
+                }
+            }
+            const fsApi = { ...fs, lstatSync(targetPath, ...options) {
+                const stat = fs.lstatSync(targetPath, ...options);
+                if (invalid === 'foreign-root' && targetPath === state) stat.uid += 1;
+                return stat;
+            } };
+            const originalMode = fs.lstatSync(state).mode;
+            await assert.rejects(unlockWorkspace({ identity, fsApi,
+                lockManager: { acquireAt: () => assert.fail('invalid state reached lock acquisition') },
+                observeBoxState: () => assert.fail('invalid state reached engine observation'),
+            }), { code: 'PLOINKY_BOX_HOST_STATE_INVALID' });
+            assert.equal(fs.lstatSync(state).mode, originalMode);
+            assert.deepEqual(fs.readdirSync(target), ['sentinel']);
+            assert.equal(fs.readFileSync(path.join(target, 'sentinel'), 'utf8'), 'preserve');
+            if (invalid === 'nonempty-empty') {
+                assert.equal(fs.readFileSync(path.join(state, 'empty', 'sentinel'), 'utf8'), 'preserve');
+                fs.chmodSync(path.join(state, 'empty'), 0o755);
+            }
+        });
+    }
+});
+
 test('a stale workspace lock is reclaimed; a live holder is never removed, even when named', async (t) => {
     const { workspace, identity } = fixture(t);
     plantDirectory(lockPathOf(workspace), owner({ pid: 101 }));
@@ -121,6 +186,10 @@ test('a stale workspace lock is reclaimed; a live holder is never removed, even 
     assert.equal(removed.exitCode, 0);
     assert.equal(fs.existsSync(lockPathOf(workspace)), false);
     assert.deepEqual(fs.readdirSync(path.dirname(lockPathOf(workspace))), [], 'no guard or debris is left');
+
+    const repeated = await unlock(identity, fakeLiveness({ dead: [101] }));
+    assert.equal(repeated.exitCode, 0);
+    assert.deepEqual(states(repeated), ['reclaim-guard:absent', 'workspace-lock:absent', 'store-lock:absent']);
 
     plantDirectory(lockPathOf(workspace), owner({ pid: 102 }));
     for (const forceHolder of [null, `102@${MACHINE}`]) {

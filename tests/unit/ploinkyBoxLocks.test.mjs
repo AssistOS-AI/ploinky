@@ -382,6 +382,94 @@ test('acquireAt takes a labelled lock at an exact path inside an existing direct
     await assert.rejects(() => manager.acquireAt(lockPath, 'Bad Label'), /Invalid lock label/);
 });
 
+test('opt-in path validators reject invalid types and initial failures before filesystem access', async (t) => {
+    const root = fixture(t);
+    const { workspace, identity } = workspaceIn(root);
+    const manager = createMutationLockManager({ liveness: fakeLiveness(), fsApi: new Proxy(fs, {
+        get(target, key) {
+            if (typeof target[key] === 'function') return () => assert.fail(`unexpected filesystem access: ${key}`);
+            return target[key];
+        },
+    }) });
+    const failure = new Error('path refused');
+    for (const validatePath of [undefined, null, false, 'guard', 1, () => { throw failure; }]) {
+        const expected = typeof validatePath === 'function' ? (error) => error === failure : TypeError;
+        await assert.rejects(manager.acquireAt(path.join(root, 'source.lock'), 'source', { validatePath }), expected);
+        await assert.rejects(manager.acquire(identity.instance, { workspaceRoot: workspace, validatePath }), expected);
+        assert.throws(() => manager.acquireSync(identity.instance, { workspaceRoot: workspace, validatePath }), expected);
+    }
+    assert.deepEqual(fs.readdirSync(workspace), []);
+});
+
+test('opt-in held-lock validation refuses assertHeld and release before reading the lock', async (t) => {
+    const root = fixture(t);
+    const { workspace, identity } = workspaceIn(root);
+    let refused = false;
+    let readsAfterRefusal = 0;
+    const failure = new Error('ancestry changed');
+    const fsApi = { ...fs, lstatSync(...args) {
+        if (refused) readsAfterRefusal += 1;
+        return fs.lstatSync(...args);
+    } };
+    const manager = createMutationLockManager({ fsApi, liveness: fakeLiveness() });
+    for (const kind of ['path', 'workspace']) {
+        const validatePath = () => { if (refused) throw failure; };
+        const held = kind === 'path' ? await manager.acquireAt(path.join(root, 'source.lock'), 'source', { validatePath })
+            : await manager.acquire(identity.instance, { workspaceRoot: workspace, validatePath });
+        const before = fs.readFileSync(path.join(held.path, 'owner.json'));
+        refused = true;
+        assert.throws(() => held.assertHeld(held.instance), (error) => error === failure);
+        assert.throws(() => held.release(), (error) => error === failure);
+        assert.equal(readsAfterRefusal, 0);
+        assert.deepEqual(fs.readFileSync(path.join(held.path, 'owner.json')), before);
+        refused = false;
+        held.release();
+    }
+});
+
+test('both lock drivers retain staging and the primary failure when deferred validation refuses cleanup', async (t) => {
+    for (const kind of ['path', 'workspace', 'sync-workspace']) {
+        await t.test(kind, async (t) => {
+            const root = fixture(t);
+            const { workspace, identity } = workspaceIn(root);
+            const lockPath = kind === 'path' ? path.join(root, 'source.lock') : lockPathOf(workspace);
+            fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
+            const original = `${JSON.stringify(v2Owner({ pid: 300 }))}\n`;
+            fs.writeFileSync(path.join(lockPath, 'owner.json'), original, { mode: 0o600 });
+            const primary = new Error('retry validation refused');
+            const cleanup = new Error('cleanup validation refused');
+            let calls = 0;
+            let waited = false;
+            const validatePath = () => {
+                calls += 1;
+                if (calls === 2) throw primary;
+                if (calls > 2) throw cleanup;
+            };
+            const liveness = fakeLiveness();
+            const manager = createMutationLockManager({ retryMs: 1, timeoutMs: 200,
+                sleepSync: () => { waited = true; },
+                liveness: { ...liveness, classify(record) {
+                    if (kind !== 'sync-workspace') queueMicrotask(() => { waited = true; });
+                    return liveness.classify(record);
+                } },
+            });
+            const options = { workspaceRoot: workspace, validatePath };
+            if (kind === 'sync-workspace') {
+                assert.throws(() => manager.acquireSync(identity.instance, options), (error) => error === primary);
+            } else {
+                await assert.rejects(kind === 'path' ? manager.acquireAt(lockPath, 'source', { validatePath })
+                    : manager.acquire(identity.instance, options), (error) => error === primary);
+            }
+            assert.equal(waited, true);
+            assert.equal(calls, 3, 'first attempt, retry and final cleanup each validate');
+            const staged = fs.readdirSync(path.dirname(lockPath)).filter((name) => name.includes('.staging-'));
+            assert.equal(staged.length, 1, 'failed validation keeps staging for later recovery');
+            assert.ok(fs.existsSync(path.join(path.dirname(lockPath), staged[0], 'owner.json')));
+            assert.equal(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'), original);
+        });
+    }
+});
+
 test('lock before anchor: the identity hand-off releases the provisional lock and anchors only under the final one', async (t) => {
     const root = fixture(t);
     const parent = path.join(root, 'parent');

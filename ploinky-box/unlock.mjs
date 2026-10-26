@@ -6,7 +6,7 @@ import { readStoreLockOwner, recoverStaleStoreLock, storeLockHolderToken, STORE_
 import { hardwareStorePaths } from '../cli/sandbox/hardwareLimits/store.mjs';
 import { sanitizeControlDiagnosticText } from '../cli/utils/diagnosticText.js';
 import { PloinkyBoxError } from './errors.mjs';
-import { hostStatePaths } from './hostState/root.mjs';
+import { inspectHostStateSkeleton } from './hostState/root.mjs';
 import {
     describeHolder,
     discardDirectory,
@@ -290,7 +290,7 @@ function storeForceStep(token, lockPath) {
  * The hardware store lock, under a freshly taken workspace lock, through the
  * store's own recovery (the Box must be observed stopped or absent).
  */
-async function unlockStoreLock(identity, { lockManager, forceHolder, observeBoxState, fsApi, workspaceClear }) {
+async function unlockStoreLock(identity, { lockManager, forceHolder, observeBoxState, fsApi, workspaceClear, validatePath }) {
     const { storeRoot } = hardwareStorePaths({ identity });
     const lockPath = path.join(storeRoot, STORE_LOCK_NAME);
     const current = readStoreLockOwner(storeRoot, { fsApi });
@@ -306,11 +306,13 @@ async function unlockStoreLock(identity, { lockManager, forceHolder, observeBoxS
     }
     let lock;
     try {
-        lock = await lockManager.acquire(identity.instance, { workspaceRoot: identity.workspaceRoot });
+        lock = await lockManager.acquire(identity.instance, { workspaceRoot: identity.workspaceRoot, validatePath });
     } catch (error) {
         return item('store-lock', lockPath, 'kept', { reason: `the workspace lock could not be taken: ${error.message}`, holder: current.owner, token });
     }
+    let recoveryFailed = false;
     try {
+        validatePath();
         const result = recoverStaleStoreLock({
             storeRoot, hostLock: lock, instance: identity.instance, fsApi, forceHolder,
             inspectBox: () => observeBoxState(identity),
@@ -320,13 +322,18 @@ async function unlockStoreLock(identity, { lockManager, forceHolder, observeBoxS
         return item('store-lock', lockPath, 'removed', { reason: `${how}; moved aside to ${result.quarantine}`, holder: result.owner });
     } catch (error) {
         if (error?.code === 'ENOENT') return item('store-lock', lockPath, 'absent', { reason: VANISHED });
-        if (error?.code !== 'store_busy') throw error;
+        if (error?.code !== 'store_busy') {
+            recoveryFailed = true;
+            throw error;
+        }
         return item('store-lock', lockPath, 'kept', {
             reason: error.message, holder: current.owner, token,
             steps: current.owner?.domain === 'box' ? undefined : [storeForceStep(token, lockPath)],
         });
     } finally {
-        lock.release();
+        try { lock.release(); } catch (error) {
+            if (!recoveryFailed) throw error;
+        }
     }
 }
 
@@ -383,7 +390,7 @@ function unlockLockRefusal(lockPath, error, { lockManager, fsApi }) {
  * null when the workspace has no `locks/` directory: unlock does not create
  * it) or `{ refused }`, the item that explains why unlock stops.
  */
-async function takeUnlockLock(locksPath, { lockManager, fsApi, uid, waitMs }) {
+async function takeUnlockLock(locksPath, { lockManager, fsApi, uid, waitMs, validatePath }) {
     const lockPath = path.join(locksPath, UNLOCK_LOCK_NAME);
     let stat;
     try {
@@ -401,7 +408,7 @@ async function takeUnlockLock(locksPath, { lockManager, fsApi, uid, waitMs }) {
         };
     }
     try {
-        return { lock: await lockManager.acquireAt(lockPath, UNLOCK_LOCK_LABEL, { timeoutMs: waitMs }), lockPath };
+        return { lock: await lockManager.acquireAt(lockPath, UNLOCK_LOCK_LABEL, { timeoutMs: waitMs, validatePath }), lockPath };
     } catch (error) {
         return { refused: unlockLockRefusal(lockPath, error, { lockManager, fsApi }) };
     }
@@ -418,7 +425,7 @@ function unlockGuardLeftover(guardPath, { lockManager, fsApi }) {
     });
 }
 
-async function recoverLocks(identity, paths, { lockManager, forceHolder, observeBoxState, fsApi, uid, locksPresent }) {
+async function recoverLocks(identity, paths, { lockManager, forceHolder, observeBoxState, fsApi, uid, locksPresent, validatePath }) {
     const lockPath = paths.workspaceLock;
     const guardPath = `${lockPath}${RECLAIM_SUFFIX}`;
     const guard = locksPresent
@@ -430,7 +437,7 @@ async function recoverLocks(identity, paths, { lockManager, forceHolder, observe
         workspaceLock = item('workspace-lock', lockPath, 'kept', { reason: 'its reclaim guard is still in place (see above)' });
     } else workspaceLock = unlockWorkspaceLock(lockPath, { lockManager, forceHolder, fsApi });
     const store = await unlockStoreLock(identity, {
-        lockManager, forceHolder, observeBoxState, fsApi, workspaceClear: workspaceLock.state !== 'kept',
+        lockManager, forceHolder, observeBoxState, fsApi, workspaceClear: workspaceLock.state !== 'kept', validatePath,
     });
     return [guard, workspaceLock, store];
 }
@@ -459,14 +466,17 @@ export async function unlockWorkspace({
             code: 'PLOINKY_BOX_ARGUMENT_INVALID',
         });
     }
-    const paths = hostStatePaths(identity.workspaceRoot);
-    const serial = await takeUnlockLock(paths.locks, { lockManager, fsApi, uid, waitMs: unlockWaitMs });
+    const validatePath = () => inspectHostStateSkeleton(identity.workspaceRoot, { fsApi, uid });
+    const paths = validatePath();
+    const serial = await takeUnlockLock(paths.locks, { lockManager, fsApi, uid, waitMs: unlockWaitMs, validatePath });
     if (serial.refused) return unlockReport(identity, [serial.refused]);
     let items;
     try {
+        validatePath();
         items = await recoverLocks(identity, paths, {
-            lockManager, forceHolder, observeBoxState, fsApi, uid, locksPresent: serial.lock !== null,
+            lockManager, forceHolder, observeBoxState, fsApi, uid, locksPresent: serial.lock !== null, validatePath,
         });
+        validatePath();
         const leftover = serial.lock ? unlockGuardLeftover(`${serial.lockPath}${RECLAIM_SUFFIX}`, { lockManager, fsApi }) : null;
         if (leftover) items.push(leftover);
     } catch (error) {

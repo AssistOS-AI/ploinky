@@ -96,6 +96,170 @@ function unlock(identity, liveness, { fsApi = fs, unlockWaitMs = 50, box = 'abse
 
 const states = (report) => report.items.map((entry) => `${entry.kind}:${entry.state}`);
 
+// Include names, bytes, modes and link targets without following links.
+function snapshot(directory) {
+    const stat = fs.lstatSync(directory);
+    const entry = { mode: stat.mode, uid: stat.uid };
+    if (stat.isSymbolicLink()) entry.link = fs.readlinkSync(directory);
+    else if (stat.isDirectory()) entry.children = Object.fromEntries(fs.readdirSync(directory).sort()
+        .map((name) => [name, snapshot(path.join(directory, name))]));
+    else entry.bytes = fs.readFileSync(directory).toString('hex');
+    return entry;
+}
+
+test('unlock refuses a host-state root link without changing the other workspace, even with force', async (t) => {
+    const root = fixture(t);
+    const a = workspaceIn(root, 'a');
+    const b = workspaceIn(root, 'b');
+    plantDirectory(lockPathOf(b.workspace), owner({ pid: 101 }));
+    fs.symlinkSync(path.join(b.workspace, '.ploinky-box'), path.join(a.workspace, '.ploinky-box'));
+    const before = snapshot(b.workspace);
+    for (const forceHolder of [null, `101@${MACHINE}`]) {
+        await assert.rejects(unlockWorkspace({
+            identity: a.identity,
+            lockManager: createMutationLockManager({ liveness: fakeLiveness({ dead: [101] }) }),
+            observeBoxState: () => assert.fail('invalid host state must not reach the engine'), forceHolder,
+        }), { code: 'PLOINKY_BOX_HOST_STATE_INVALID' });
+        assert.deepEqual(snapshot(b.workspace), before);
+    }
+});
+
+test('unlock revalidates after serialization contention and guards deferred staging cleanup', async (t) => {
+    const root = fixture(t);
+    const a = workspaceIn(root, 'a');
+    const b = workspaceIn(root, 'b');
+    plantDirectory(unlockLockOf(a.workspace), owner({ label: 'unlock', pid: 300 }));
+    plantDirectory(unlockLockOf(b.workspace), owner({ label: 'unlock', pid: 301 }));
+    plantDirectory(guardPathOf(b.workspace), owner({ pid: 101 }));
+    const liveness = fakeLiveness({ dead: [101, 301] });
+    let switched = false;
+    let before;
+    let staged;
+    const manager = createMutationLockManager({
+        retryMs: 1, timeoutMs: 200,
+        liveness: { ...liveness, classify(record) {
+            if (record.pid === 300 && !switched) {
+                queueMicrotask(() => {
+                    staged = fs.readdirSync(locksOf(a.workspace)).find((name) => name.includes('.staging-'));
+                    assert.ok(staged, 'the contended attempt has unpublished staging');
+                    fs.cpSync(path.join(locksOf(a.workspace), staged), path.join(locksOf(b.workspace), staged),
+                        { recursive: true });
+                    before = snapshot(b.workspace);
+                    fs.renameSync(path.join(a.workspace, '.ploinky-box'), path.join(root, 'original-state'));
+                    fs.symlinkSync(path.join(b.workspace, '.ploinky-box'), path.join(a.workspace, '.ploinky-box'));
+                    switched = true;
+                });
+            }
+            return liveness.classify(record);
+        } },
+    });
+    const report = await unlockWorkspace({ identity: a.identity, lockManager: manager,
+        observeBoxState: () => assert.fail('invalid host state must not reach the engine') });
+    assert.equal(switched, true);
+    assert.deepEqual(snapshot(b.workspace), before, 'retry and final cleanup preserve the replacement target');
+    assert.deepEqual(states(report), ['unlock-lock:refused']);
+    assert.equal(report.exitCode, 1);
+    assert.match(report.items[0].reason, /Host state path is not a real directory/);
+    assert.ok(fs.existsSync(path.join(root, 'original-state', 'locks', staged)), 'original staging is retained');
+});
+
+test('unlock validates immediately after serialization acquisition before inspecting recovery locks', async (t) => {
+    const root = fixture(t);
+    const a = workspaceIn(root, 'a');
+    const b = workspaceIn(root, 'b');
+    plantDirectory(locksOf(a.workspace));
+    plantDirectory(lockPathOf(b.workspace), owner({ pid: 101 }));
+    plantDirectory(guardPathOf(b.workspace), owner({ pid: 101 }));
+    const before = snapshot(b.workspace);
+    const manager = createMutationLockManager({ liveness: fakeLiveness({ dead: [101] }) });
+    let held;
+    await assert.rejects(unlockWorkspace({ identity: a.identity,
+        observeBoxState: () => assert.fail('recovery must not start'),
+        lockManager: { ...manager, async acquireAt(...args) {
+            held = await manager.acquireAt(...args);
+            fs.renameSync(path.join(a.workspace, '.ploinky-box'), path.join(root, 'original-state'));
+            fs.symlinkSync(path.join(b.workspace, '.ploinky-box'), path.join(a.workspace, '.ploinky-box'));
+            return held;
+        } },
+    }), { code: 'PLOINKY_BOX_HOST_STATE_INVALID' });
+    assert.deepEqual(snapshot(b.workspace), before);
+    assert.ok(fs.existsSync(path.join(root, 'original-state', 'locks', 'unlock.lock')));
+    assert.throws(() => held.release(), { code: 'PLOINKY_BOX_HOST_STATE_INVALID' });
+});
+
+test('store recovery refuses host-state replacement during its later acquisition and post-await boundary', async (t) => {
+    for (const boundary of ['retry', 'acquired']) {
+        await t.test(boundary, async (t) => {
+            const root = fixture(t);
+            const a = workspaceIn(root, 'a');
+            const b = workspaceIn(root, 'b');
+            plantDirectory(locksOf(a.workspace));
+            plantStoreLock(a.identity, storeOwner());
+            plantDirectory(lockPathOf(b.workspace), owner({ pid: 301 }));
+            // Same instance suffix as A: traversal would reach this real target store.
+            plantStoreLock({ ...a.identity, workspaceRoot: b.workspace }, storeOwner());
+            const liveness = fakeLiveness({ dead: [301] });
+            let switched = false;
+            let before;
+            let staged;
+            const switchRoot = () => {
+                staged = fs.readdirSync(locksOf(a.workspace)).find((name) => name.startsWith('workspace.lock.staging-'));
+                if (staged) fs.cpSync(path.join(locksOf(a.workspace), staged), path.join(locksOf(b.workspace), staged),
+                    { recursive: true });
+                before = snapshot(b.workspace);
+                fs.renameSync(path.join(a.workspace, '.ploinky-box'), path.join(root, 'original-state'));
+                fs.symlinkSync(path.join(b.workspace, '.ploinky-box'), path.join(a.workspace, '.ploinky-box'));
+                switched = true;
+            };
+            const manager = createMutationLockManager({ retryMs: 1, timeoutMs: 200,
+                liveness: { ...liveness, classify(record) {
+                    if (record.pid === 300 && !switched) queueMicrotask(switchRoot);
+                    return liveness.classify(record);
+                } },
+            });
+            await assert.rejects(unlockWorkspace({ identity: a.identity,
+                observeBoxState: () => assert.fail('invalid path must not reach store recovery'),
+                lockManager: { ...manager, async acquire(...args) {
+                    if (boundary === 'retry') plantDirectory(lockPathOf(a.workspace), owner({ pid: 300 }));
+                    const held = await manager.acquire(...args);
+                    if (boundary === 'acquired') switchRoot();
+                    return held;
+                } },
+            }), { code: 'PLOINKY_BOX_HOST_STATE_INVALID' });
+            assert.equal(switched, true);
+            assert.deepEqual(snapshot(b.workspace), before, 'target locks, store and staging remain unchanged');
+            assert.ok(fs.existsSync(path.join(root, 'original-state', 'locks', 'unlock.lock')));
+            assert.ok(fs.existsSync(path.join(root, 'original-state', 'locks', 'workspace.lock')));
+            if (boundary === 'retry') {
+                assert.ok(staged, 'the later acquisition waited with staging');
+                assert.ok(fs.existsSync(path.join(root, 'original-state', 'locks', staged)));
+            }
+        });
+    }
+});
+
+test('store recovery preserves its primary failure when release fails and surfaces release-only failures', async (t) => {
+    const { workspace, identity } = workspaceIn(fixture(t));
+    plantDirectory(locksOf(workspace));
+    plantStoreLock(identity, storeOwner());
+    const primary = new Error('primary recovery failure');
+    const releaseOnly = new Error('release failure');
+    for (const failRecovery of [true, false]) {
+        const manager = createMutationLockManager({ liveness: fakeLiveness() });
+        let held;
+        let releases = 0;
+        await assert.rejects(unlockWorkspace({ identity,
+            observeBoxState: () => { if (failRecovery) throw primary; return { state: 'absent' }; },
+            lockManager: { ...manager, async acquire(...args) {
+                held = await manager.acquire(...args);
+                return { ...held, release() { releases += 1; throw releaseOnly; } };
+            } },
+        }), (error) => error === (failRecovery ? primary : releaseOnly));
+        assert.equal(releases, 1);
+        held.release();
+    }
+});
+
 // S1 (review): the other unlock retires the judged guard just before this
 // one moves it. The rename finds nothing: the guard is reported as removed by
 // another command, and the workspace lock and store lock steps still run.
