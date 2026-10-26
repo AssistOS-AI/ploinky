@@ -17,7 +17,35 @@ export const HASH = /^sha256:[a-f0-9]{64}$/;
 export const RUN_ID = /^[a-f0-9]{32}$/;
 export const OWNER_MARKER = '.ploinky-hwl-owner';
 // The only host record directories cleanup may touch, each holding at most an
-// INSTANCE.json record and an INSTANCE generation/store directory.
+// INSTANCE.json record and an INSTANCE generation/store directory. They live in
+// the workspace's own `.ploinky-box` directory.
+// The explicit host-process allowance (`ploinky --allow-host-process PID`, an outer option before the command): a
+// pinned, exact list of process IDs the quiescence gate may excuse, for example a snap desktop helper that holds `/`
+// mounted writable on a desktop Linux host. Nothing is detected or defaulted; the product re-verifies each process's
+// start time. The list is part of the manifest, so the approval summary shows it and the authorization binding covers it.
+export const ALLOW_HOST_PROCESS_PATTERN = /^[1-9][0-9]{0,9}$/;
+export const ALLOW_HOST_PROCESS_MAX = 16;
+export function validateAllowHostProcesses(value, label = 'allowHostProcesses') {
+    if (!Array.isArray(value) || value.length < 1 || value.length > ALLOW_HOST_PROCESS_MAX
+        || value.some(pid => !Number.isSafeInteger(pid) || !ALLOW_HOST_PROCESS_PATTERN.test(String(pid))) || new Set(value).size !== value.length) {
+        throw new Error(`${label} must be a list of 1 to ${ALLOW_HOST_PROCESS_MAX} distinct positive process IDs`);
+    }
+    return value;
+}
+export const allowHostProcessArgv = pids => pids.flatMap(pid => ['--allow-host-process', String(pid)]);
+// The candidate command line with the allowance as outer options right after the candidate path.
+export function candidateArgvWithAllowance(profile, argv) {
+    const pids = profile?.allowHostProcesses;
+    if (!pids?.length || argv[0] !== profile.candidate.path || argv[1] === '--allow-host-process') return argv;
+    return [argv[0], ...allowHostProcessArgv(pids), ...argv.slice(1)];
+}
+// A process provider that forwards the pinned allowance to every candidate command and to nothing else.
+export function withHostProcessAllowance(provider, profile) {
+    if (!profile?.allowHostProcesses?.length) return provider;
+    const effectiveArgv = (binary, args) => (binary === profile.node.path ? candidateArgvWithAllowance(profile, args) : args);
+    // `effectiveArgv` lets a journal digest the command line that actually runs.
+    return Object.assign((binary, args, options) => provider(binary, effectiveArgv(binary, args), options), { effectiveArgv });
+}
 export const HOST_RECORD_DIRECTORIES = Object.freeze(['hardware-limits', 'gpu-grants', 'router-bindings']);
 export const IMAGE_REF = /^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?\/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$/;
 
@@ -40,6 +68,21 @@ export function absolute(value) {
 export function bounded(value, max = 4096) { return typeof value === 'string' && value.length > 0 && value.length <= max; }
 export function blocked(message) { return Object.assign(new Error(message), { code: 'LIVE_PREREQUISITE_MISSING' }); }
 
+// The fixture manifest declares no auth directive and no guest, so the Router's own answer to /auth/login is the auth-disabled JSON refusal
+// (HTTP 404 `{ ok: false, error: 'auth_disabled' }`). It proves a Box's Router answers through the published loopback port. A 200 would
+// mean the fixture unexpectedly has auth; any other status, a transport error, a timeout, a truncated or unparsable body fails. `subject`
+// names the Box in the problem (LIVE-C5's replacement Box by default, LIVE-C3V's dedicated Box).
+export function assertAuthDisabledAnswer(login, subject = 'The replacement Box\'s') {
+    if (!login || login.error || login.status === null || login.status === undefined) return `${subject} Router did not answer /auth/login (${login?.error ?? 'no response'})`;
+    if (login.status !== 404) return `${subject} Router answered /auth/login with HTTP ${login.status}, not the auth-less fixture's HTTP 404 auth_disabled`;
+    if (login.truncated) return `${subject} /auth/login answer was truncated`;
+    if (!/^application\/json\b/i.test(String(login.contentType ?? ''))) return `${subject} /auth/login answer is not JSON (content type ${login.contentType || 'none'})`;
+    let body;
+    try { body = JSON.parse(String(login.body ?? '')); } catch { return `${subject} /auth/login answer is not parsable JSON`; }
+    if (!body || body.ok !== false || body.error !== 'auth_disabled') return `${subject} /auth/login answer is not the Router's auth_disabled refusal (ok ${JSON.stringify(body?.ok)}, error ${JSON.stringify(body?.error)})`;
+    return null;
+}
+
 export function receipt(value) {
     keys(value, ['path', 'uid', 'dev', 'ino', 'marker'], 'workspace receipt');
     if (!absolute(value.path) || !Number.isSafeInteger(value.uid) || value.uid < 0
@@ -55,11 +98,14 @@ export function quarantinePath(workspacePath, runId) {
     return path.join(path.dirname(workspacePath), `.hwl-removing-${runId}`);
 }
 
+// The workspace's host-state directory, which holds every host record of its Box.
+export const hostStateDirectory = workspaceRoot => path.join(workspaceRoot, '.ploinky-box');
+
 // The exact task-owned host record paths for one workspace instance. Cleanup
 // never globs or matches substrings; it considers only these six names.
-export function hostRecordPaths(home, instance) {
-    if (!absolute(home) || !/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(String(instance))) throw new Error('Invalid host record identity');
-    const root = path.join(home, '.ploinky-box');
+export function hostRecordPaths(workspaceRoot, instance) {
+    if (!absolute(workspaceRoot) || !/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(String(instance))) throw new Error('Invalid host record identity');
+    const root = hostStateDirectory(workspaceRoot);
     return HOST_RECORD_DIRECTORIES.flatMap(directory => [path.join(root, directory, `${instance}.json`), path.join(root, directory, instance)]);
 }
 

@@ -185,13 +185,12 @@ test('a recorded publication carries exactly the trusted hosts its address requi
 function storeFixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-binding-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const home = path.join(root, 'home');
     const workspace = path.join(root, 'workspace');
-    fs.mkdirSync(home, { mode: 0o700 });
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
-    return { root, home, identity, lock, store: createRouterBindingStore({ homeDirectory: home }) };
+    const store = createRouterBindingStore();
+    return { root, identity, lock, store, directory: store.directoryFor(identity) };
 }
 
 test('saved bindings round-trip privately and atomically for one exact workspace', (t) => {
@@ -199,9 +198,11 @@ test('saved bindings round-trip privately and atomically for one exact workspace
     assert.equal(state.store.read(state.identity), null);
     state.store.write(state.identity, { address: '0.0.0.0', hostPort: 8083 }, state.lock);
     const target = state.store.pathFor(state.identity);
-    assert.equal(path.dirname(target), path.join(state.home, '.ploinky-box', 'router-bindings'));
+    assert.equal(path.dirname(target), path.join(state.identity.workspaceRoot, '.ploinky-box', 'router-bindings'));
+    assert.equal(state.directory, path.dirname(target));
     assert.equal(fs.statSync(target).mode & 0o777, 0o600);
-    assert.equal(fs.statSync(state.store.directory).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(state.directory).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(state.identity.hostStateRoot).mode & 0o777, 0o700);
     assert.deepEqual(state.store.read(state.identity), binding('0.0.0.0', 8083));
     assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), {
         version: 1,
@@ -212,7 +213,7 @@ test('saved bindings round-trip privately and atomically for one exact workspace
         hostPort: 8083,
         containerPort: 8080,
     });
-    assert.deepEqual(fs.readdirSync(state.store.directory), [path.basename(target)]);
+    assert.deepEqual(fs.readdirSync(state.directory), [path.basename(target)]);
 
     const otherRoot = path.join(state.root, 'other');
     fs.mkdirSync(path.join(otherRoot, '.ploinky'), { recursive: true });
@@ -282,61 +283,53 @@ test('saved bindings fail closed on unsafe modes, links, schemas, sizes, and for
     rejects(/non-linked regular file/);
     fs.rmSync(target, { force: true });
 
-    fs.chmodSync(state.store.directory, 0o777);
+    fs.chmodSync(state.directory, 0o777);
     rejects(/group- or world-writable/);
-    fs.chmodSync(state.store.directory, 0o700);
+    fs.chmodSync(state.directory, 0o700);
     assert.equal(state.store.read(state.identity), null);
 });
 
-test('saved bindings are refused wherever the workspace could alias the state directory', (t) => {
-    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-binding-home-workspace-'));
-    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
-    fs.mkdirSync(path.join(workspace, '.ploinky'));
-    const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
-    const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
-    // The home directory is the workspace, so agents could write the record.
-    const store = createRouterBindingStore({ homeDirectory: workspace });
+test('saved bindings are refused when the state directory is a link out of the workspace', (t) => {
+    const state = storeFixture(t);
+    // `.ploinky-box` must be a directory of this workspace: a link out of it
+    // would let the record live where this workspace's own mask cannot reach.
+    const elsewhere = path.join(state.root, 'elsewhere');
+    fs.mkdirSync(elsewhere, { mode: 0o700 });
+    fs.symlinkSync(elsewhere, state.identity.hostStateRoot);
     assert.throws(
-        () => store.write(identity, { address: '0.0.0.0', hostPort: 8083 }, lock),
-        /overlaps writable Box source .*agents can write it/,
+        () => state.store.write(state.identity, { address: '0.0.0.0', hostPort: 8083 }, state.lock),
+        /does not resolve inside its workspace/,
     );
-    assert.throws(() => store.read(identity), /overlaps writable Box source/);
-    assert.equal(fs.existsSync(path.join(workspace, '.ploinky-box')), false);
-
-    fs.mkdirSync(store.directory, { recursive: true, mode: 0o700 });
-    fs.chmodSync(path.dirname(store.directory), 0o700);
-    fs.writeFileSync(store.pathFor(identity), JSON.stringify({
-        version: 1,
-        instance: identity.instance,
-        pathHash: identity.pathHash,
-        workspaceRoot: identity.workspaceRoot,
-        address: '0.0.0.0',
-        hostPort: 8083,
-        containerPort: 8080,
-    }), { mode: 0o600 });
-    assert.throws(() => store.read(identity), /overlaps writable Box source/);
+    assert.throws(() => state.store.read(state.identity), /does not resolve inside its workspace/);
+    assert.deepEqual(fs.readdirSync(elsewhere), []);
+    // A dangling link is refused the same way, and nothing is created behind it.
+    fs.unlinkSync(state.identity.hostStateRoot);
+    const missing = path.join(state.root, 'missing');
+    fs.symlinkSync(missing, state.identity.hostStateRoot);
+    assert.throws(() => state.store.read(state.identity), /does not resolve inside its workspace/);
+    assert.equal(fs.existsSync(missing), false);
 });
 
 test('saved bindings reject writable cache aliases before reading or creating state', (t) => {
     const state = storeFixture(t);
     fs.mkdirSync(state.identity.boxDataRoot);
     for (const key of ['dependencies', 'images']) {
-        for (const destination of [state.home, path.dirname(state.store.directory), state.store.directory]) {
-            // The latter two targets do not exist yet. A later first bind must
-            // not materialize host authority under an existing cache alias.
+        for (const destination of [state.identity.hostStateRoot, state.directory]) {
+            // These targets do not exist yet. A later first bind must not
+            // materialize host authority under an existing cache alias.
             fs.symlinkSync(destination, state.identity.dataPaths[key]);
             assert.throws(() => state.store.read(state.identity), /overlaps writable Box source/);
             assert.throws(
                 () => state.store.write(state.identity, { address: '0.0.0.0', hostPort: 8083 }, state.lock),
                 /overlaps writable Box source/,
             );
-            assert.equal(fs.existsSync(state.store.directory), false);
+            assert.equal(fs.existsSync(state.directory), false);
             fs.unlinkSync(state.identity.dataPaths[key]);
         }
     }
     state.store.write(state.identity, { address: '127.0.0.1', hostPort: 8083 }, state.lock);
     const before = fs.readFileSync(state.store.pathFor(state.identity));
-    fs.symlinkSync(state.store.directory, state.identity.dataPaths.images);
+    fs.symlinkSync(state.directory, state.identity.dataPaths.images);
     assert.throws(() => state.store.read(state.identity), /overlaps writable Box source/);
     assert.throws(
         () => state.store.write(state.identity, { address: '0.0.0.0', hostPort: 8083 }, state.lock),
@@ -348,7 +341,7 @@ test('saved bindings reject writable cache aliases before reading or creating st
 test('host-state confinement resolves aliases through workspace cache parents', (t) => {
     const state = storeFixture(t);
     fs.mkdirSync(state.identity.boxDataRoot);
-    fs.symlinkSync(state.store.directory, state.identity.dataPaths.images);
+    fs.symlinkSync(state.directory, state.identity.dataPaths.images);
     const external = path.join(state.root, 'external-state');
     fs.renameSync(state.identity.anchorPath, external);
     fs.symlinkSync(external, state.identity.anchorPath);
@@ -359,7 +352,7 @@ test('host-state confinement detects directory inode aliases as well as symlinks
     const state = storeFixture(t);
     state.store.write(state.identity, { address: '127.0.0.1', hostPort: 8083 }, state.lock);
     fs.mkdirSync(state.identity.dataPaths.images, { recursive: true });
-    const stat = fs.statSync(state.store.directory);
+    const stat = fs.statSync(state.directory);
     // A bind mount retains its distinct realpath but exposes the same device
     // and inode. Model that kernel observation without requiring mount rights.
     const fsApi = {
@@ -369,7 +362,7 @@ test('host-state confinement detects directory inode aliases as well as symlinks
         },
     };
     assert.throws(
-        () => assertRouterBindingStateConfined(state.identity, { homeDirectory: state.home, fsApi }),
+        () => assertRouterBindingStateConfined(state.identity, { fsApi }),
         /overlaps writable Box source/,
     );
 });
@@ -377,7 +370,7 @@ test('host-state confinement detects directory inode aliases as well as symlinks
 test('Box creation and existing-container admission enforce host-state confinement', (t) => {
     const state = storeFixture(t);
     fs.mkdirSync(state.identity.boxDataRoot);
-    fs.symlinkSync(path.join(os.homedir(), '.ploinky-box'), state.identity.dataPaths.images);
+    fs.symlinkSync(state.identity.hostStateRoot, state.identity.dataPaths.images);
     // Both entry points reject before consulting image or runtime metadata.
     assert.throws(() => containerCreateArgs({ identity: state.identity }), /overlaps writable Box source/);
     assert.throws(

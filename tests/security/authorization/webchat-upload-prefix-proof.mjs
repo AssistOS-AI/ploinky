@@ -6,7 +6,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { Client, TARGET, collectSecrets, digest, ownershipGuard, responseSummary, runVerdict, safeError, validateArtifactRoots, validateTarget, writePrivate } from './core.mjs';
+import { Client, TARGET, WORKSPACE, collectSecrets, digest, ownershipGuard, responseSummary, runVerdict, safeError, validateArtifactRoots, validateTarget, writePrivate } from './core.mjs';
 import { runWebchatUploadDenialProof } from './stream-probes.mjs';
 import { createMutationLockManager } from '../../../ploinky-box/locks.mjs';
 
@@ -55,7 +55,7 @@ const ctx = {
 };
 try {
     ctx.report.deployment = await ctx.guard();
-    mutationLock = await createMutationLockManager({ timeoutMs: 1000 }).acquire(ctx.report.deployment.instance);
+    mutationLock = await createMutationLockManager({ timeoutMs: 1000 }).acquire(ctx.report.deployment.instance, { workspaceRoot: WORKSPACE });
     await ctx.guard();
     ctx.report.workspaceMutationLock = 'HELD';
     ctx.clients.anonymous = new Client([], { onSecret: value => ctx.secrets.add(value), beforeMutation: ctx.guard });

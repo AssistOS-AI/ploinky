@@ -18,6 +18,7 @@ import {
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
 import { fakeUpdateCore, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 function bufferStream(isTTY = false) {
     let bytes = '';
@@ -85,6 +86,7 @@ function matrixSupervisor(identity, events) {
         },
     };
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -197,6 +199,7 @@ test('start stages host-owned edge desired state under the Box lock before core 
         size: 123,
     };
     const stagedSupervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -262,6 +265,7 @@ test('foreign ownership blocks every lifecycle path with zero engine mutation', 
     for (const argv of [['status'], ['stop'], ['destroy'], ['start', 'Agent'], ['logs'], ['list']]) {
         const mutations = [];
         const supervisor = createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
             checkHostPrerequisites: () => {},
             resolveIdentity: () => identity,
             discover: () => ({ state: 'foreign', message: 'foreign exact-name resource' }),
@@ -307,6 +311,7 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         instance: 'ploinky-box-workspace-123456789abc',
         pathHash: '123456789abc',
         workspaceRoot: '/private/workspace',
+        hostStateRoot: '/private/workspace/.ploinky-box',
         anchorPath: '/private/workspace/.ploinky',
         boxDataRoot: '/private/workspace/.ploinky/box',
         dataPaths: Object.freeze({

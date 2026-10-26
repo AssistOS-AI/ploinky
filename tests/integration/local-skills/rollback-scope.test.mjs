@@ -17,6 +17,44 @@ const { readGraphSkillScope } = await importSource('ploinky-box/graphSkillScope.
 const { agentLibFixture } = await importSource('tests/helpers/agentlibFixture.mjs');
 const { fakeRestartCore } = await importSource('tests/helpers/fakeUpdateCore.mjs');
 const { fingerprintSource } = await importSource('agentlib/fingerprint.mjs');
+const { BOX_LABELS, BOX_ROLES } = await importSource('ploinky-box/constants.mjs');
+const { createHostStateGuard } = await importSource('ploinky-box/hostState/guard.mjs');
+const { hostStateMaskMount } = await importSource('ploinky-box/hostState/root.mjs');
+const { createMutationLockManager } = await importSource('ploinky-box/locks.mjs');
+const { allowHostProcessesFromEnv } = await importSource('tests/helpers/allowHostProcesses.mjs');
+
+// The workspace is adopted once, behind the real quiescence gate, as the start
+// that created its Box would have done. On a desktop Linux host whose helpers
+// hold `/` mounted writable, name them after checking they do not write the
+// test workspace: PLOINKY_TEST_ALLOW_HOST_PROCESSES=<pid>[,<pid>...]
+// (tests/helpers/allowHostProcesses.mjs; a malformed value fails here).
+const allowHostProcesses = allowHostProcessesFromEnv();
+
+// The engine's own listing and inspection forms for the Box containers the
+// fixture engine holds; the host-state guard reads them through `runner.query`
+// exactly as it reads Podman (engine/discovery.mjs).
+function fixtureEngineQuery(identity, containers) {
+    const record = (handle) => ({
+        Id: handle.id,
+        Name: identity.instance,
+        State: { Running: handle.runtime.running, Status: handle.runtime.running ? 'running' : 'exited' },
+        Config: { Labels: { [BOX_LABELS.role]: BOX_ROLES.container, [BOX_LABELS.pathHash]: identity.pathHash } },
+        Mounts: handle.runtime.mounts.map((mount) => ({ Type: 'bind', Source: mount.source, Destination: mount.destination, RW: mount.rw })),
+    });
+    return (command, args) => {
+        assert.equal(command, 'fixture-engine');
+        const handles = containers();
+        if (args.join(' ') === 'ps --all --no-trunc --format {{.ID}}') {
+            return { ok: true, status: 0, stdout: handles.map((handle) => `${handle.id}\n`).join(''), stderr: '' };
+        }
+        if (args[0] === 'container' && args[1] === 'inspect') {
+            const selected = args.slice(2).map((id) => handles.find((handle) => handle.id === id));
+            if (selected.some((handle) => !handle)) return { ok: false, status: 125, stdout: '', stderr: 'no such container' };
+            return { ok: true, status: 0, stdout: JSON.stringify(selected.map(record)), stderr: '' };
+        }
+        return { ok: false, status: 125, stdout: '', stderr: `fixture-engine does not answer ${args.join(' ')}` };
+    };
+}
 
 for (const differentLaunch of [false, true]) {
     test(differentLaunch
@@ -35,11 +73,27 @@ for (const differentLaunch of [false, true]) {
         const candidateAgentLib = agentLibFixture(workspace, { sourceRelativePath: '.ploinky/agentlib/candidate' });
         const priorContainer = 'a'.repeat(64);
         const candidateContainer = 'c'.repeat(64);
+        const engine = { name: 'fixture-engine', identity: 'fixture-engine' };
+        const mask = hostStateMaskMount(workspace);
+        // A Box of this Ploinky: the workspace bind plus the read-only host state mask.
         const ownership = id => ({
-            state: 'owned', engine: { name: 'fixture-engine', identity: 'fixture-engine' },
-            handles: { container: { id, runtime: { running: true } } },
+            state: 'owned', engine,
+            handles: { container: { id, runtime: { running: true, mounts: [
+                { type: 'bind', source: workspace, destination: workspace, rw: true },
+                { type: 'bind', source: mask.source, destination: mask.destination, rw: false },
+            ] } } },
         });
         const oldOwnership = ownership(priorContainer);
+        let engineContainers = [];
+        const query = fixtureEngineQuery(identity, () => engineContainers);
+        const seed = await createMutationLockManager().acquire(identity.instance, { workspaceRoot: workspace });
+        try {
+            createHostStateGuard({ runner: { query }, allowHostProcesses, stderr: null })
+                .underLock(identity, seed, { state: 'absent', engine, handles: null });
+        } finally {
+            seed.release();
+        }
+        engineContainers = [oldOwnership.handles.container];
         const calls = [];
         let healthChecks = 0;
         let initial = true;
@@ -61,7 +115,7 @@ for (const differentLaunch of [false, true]) {
             },
             // Engine processes are substituted; graph admission and scope state
             // use the product implementation and a real disposable filesystem.
-            runner: { run() { return { status: 0, stdout: '', stderr: '' }; } },
+            runner: { run() { return { status: 0, stdout: '', stderr: '' }; }, query },
             stdout: { write() {} }, stderr: { write() {} }, readEdgeDesired: () => null,
             selectAgentLib: async () => {
                 const contract = initial ? priorAgentLib : candidateAgentLib;

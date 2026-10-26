@@ -105,6 +105,57 @@ function resolver(root, inspectContainer, options = {}) {
     });
 }
 
+test('running-agent checks preserve inspection classification and never resolve directory or translate mounts', async (t) => {
+    const { root, selected } = fixture(t);
+    const plan = routePlan({ [CONTAINER_NAME]: agentRecord() });
+    let raw = inspected([bind(root, '/code')]);
+    let failure = '';
+    const targets = resolver(root, async () => {
+        if (failure) throw Object.assign(new Error(), { code: failure });
+        return raw;
+    });
+    const discovery = await targets.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    const target = discovery.targets[1];
+    fs.renameSync(selected, `${selected}-renamed`);
+    targets.directoryResolver = () => { assert.fail('running shell must not resolve cwd'); };
+    assert.equal(await targets.revalidateRunningAgent({ routePlan: plan, target }), target);
+    for (const code of ['WEBTTY_TARGET_INSPECT_FAILED', 'WEBTTY_TARGET_INSPECT_ABORTED', 'WEBTTY_TARGET_IDENTITY_STALE']) {
+        failure = code;
+        await assert.rejects(targets.revalidateRunningAgent({ routePlan: plan, target }), { code });
+    }
+    failure = '';
+    for (const changed of [
+        { ...raw, Id: 'b'.repeat(64) },
+        { ...raw, Config: { ...raw.Config, User: '2000:2000' } },
+        { ...raw, Config: { ...raw.Config, Labels: { ...raw.Config.Labels, [NETWORK_LABELS.workspace]: 'foreign' } } },
+    ]) {
+        const previous = raw;
+        raw = changed;
+        await assert.rejects(targets.revalidateRunningAgent({ routePlan: plan, target }), { code: 'WEBTTY_TARGET_IDENTITY_STALE' });
+        raw = previous;
+    }
+    const replacement = routePlan({ [CONTAINER_NAME]: agentRecord({ containerId: 'b'.repeat(64) }) });
+    await assert.rejects(targets.revalidateRunningAgent({ routePlan: replacement, target }), { code: 'WEBTTY_TARGET_IDENTITY_STALE' });
+});
+
+test('launch and running-agent revalidation preserve a generation flip after successful inspection', async (t) => {
+    const { root } = fixture(t);
+    let current = true;
+    let flip = false;
+    const plan = routePlan({ [CONTAINER_NAME]: agentRecord() }, () => current);
+    const targets = resolver(root, async () => {
+        if (flip) current = false;
+        return inspected([bind(root, '/code')]);
+    });
+    const discovery = await targets.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    flip = true;
+    for (const method of ['revalidate', 'revalidateRunningAgent']) {
+        current = true;
+        await assert.rejects(targets[method]({ routePlan: plan, target: discovery.targets[1] }),
+            { code: 'WEBTTY_TARGET_GENERATION_STALE' });
+    }
+});
+
 test('exact inspect uses only runtime plus immutable id and immediately redacts unrelated data', async () => {
     const calls = [];
     const raw = inspected([]);
@@ -752,4 +803,143 @@ test('Box targets resolve through the explicit workspace root and display the wo
         new TerminalTargetResolver({ inspectContainer: async () => null }).discover({ routePlan: plan, requestedDirectory: '' }),
         (error) => error.code === 'WEBTTY_CWD_INVALID' && error.category === 'workspace-root',
     );
+});
+
+// A home profile as the provider resolves it: workspace-relative realpath,
+// absolute realpath and directory identity.
+function spacedProfileFixture(t) {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky webtty home '));
+    const root = path.join(parent, 'my work space');
+    const data = path.join(root, '.data', 'roboTeamAgent');
+    fs.mkdirSync(path.join(root, 'projects', 'demo'), { recursive: true });
+    fs.mkdirSync(path.join(data, 'robots', 'r-1', 'home'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.data', 'isolated', 'work'), { recursive: true });
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    return { parent, root, data };
+}
+
+function resolvedHome(root, relative = '.data/roboTeamAgent/robots/r-1/home') {
+    const resolved = resolveWorkspaceDirectory(relative, { workspaceRoot: root });
+    const stat = fs.statSync(resolved.absolutePath, { bigint: true });
+    return Object.freeze({
+        relativePath: resolved.relativePath,
+        absolutePath: resolved.absolutePath,
+        identity: Object.freeze({ dev: String(stat.dev), ino: String(stat.ino) }),
+    });
+}
+
+test('profile HOME is the same-path Box home and a writable live-mount translation per agent', async (t) => {
+    const { root, data } = spacedProfileFixture(t);
+    assert.equal(root.startsWith('/workspace'), false);
+    assert.match(root, / /);
+    const home = resolvedHome(root);
+    const records = {
+        global_like: agentRecord({ containerId: 'a'.repeat(64), agentName: 'global' }),
+        isolated_like: agentRecord({ containerId: 'b'.repeat(64), agentName: 'isolated' }),
+    };
+    const mountsById = {
+        // The workspace at its own path, plus the provider data directory at
+        // /data and /root as equivalent aliases.
+        ['a'.repeat(64)]: [bind(root, root, true), bind(data, '/data', true), bind(data, '/root', true)],
+        // Only its own data directory at /root.
+        ['b'.repeat(64)]: [bind(path.join(root, '.data', 'isolated'), '/root', true)],
+    };
+    const inspectContainer = async (_runtime, id) => {
+        const name = Object.keys(records).find((key) => records[key].containerId === id);
+        return { ...inspectedAgent(root, name, records[name]), Mounts: mountsById[id] };
+    };
+    const targetResolver = resolver(root, inspectContainer);
+    const plan = routePlan(records);
+
+    const project = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo', home });
+    const [box, globalAgent] = project.targets;
+    assert.equal(box.kind, 'box');
+    assert.equal(box.home.translatedHome, fs.realpathSync(path.join(data, 'robots', 'r-1', 'home')));
+    assert.equal(box.home.translatedHome, home.absolutePath);
+    assert.equal(globalAgent.agentName, 'global');
+    assert.equal(globalAgent.translatedCwd, path.join(root, 'projects', 'demo'));
+    assert.equal(globalAgent.home.translatedHome, '/data/robots/r-1/home');
+    assert.deepEqual(globalAgent.home.identity, home.identity);
+    assert.equal(globalAgent.unavailable, undefined);
+    assert.equal(project.targets.length, 2, 'the isolated agent cannot reach the project cwd');
+
+    const own = await targetResolver.discover({ routePlan: plan, requestedDirectory: '.data/isolated/work', home });
+    const isolated = own.targets.find((target) => target.agentName === 'isolated');
+    assert.equal(isolated.translatedCwd, '/root/work');
+    assert.equal(isolated.unavailable, 'home-unreachable');
+    assert.equal(isolated.home, undefined);
+
+    // Without a profile the same discovery is exactly today's.
+    const plain = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    assert.equal(plain.targets.some((target) => 'home' in target || 'unavailable' in target), false);
+});
+
+test('read-only, conflicting-alias and shadowed profile homes are refused, never bypassed', async (t) => {
+    const { root, data } = spacedProfileFixture(t);
+    const home = resolvedHome(root);
+    const homeSource = path.join(data, 'robots', 'r-1', 'home');
+    const cases = [
+        ['home-read-only', [bind(root, root, true), bind(data, '/data', false), bind(data, '/root', false)]],
+        // A writable alias never wins over a read-only alias of the same source.
+        ['home-unreachable', [bind(root, root, true), bind(data, '/data', true), bind(data, '/root', false)]],
+        ['home-unreachable', [
+            bind(root, root, true),
+            { Type: 'volume', Source: 'named', Destination: path.join(root, '.data'), RW: true, Name: 'named' },
+        ]],
+        ['home-unreachable', [bind(root, root, true), bind(path.join(root, 'projects'), homeSource, true)]],
+    ];
+    for (const [reason, mounts] of cases) {
+        const record = agentRecord();
+        const targetResolver = resolver(root, async () => ({
+            ...inspectedAgent(root, CONTAINER_NAME, record), Mounts: mounts,
+        }));
+        const discovery = await targetResolver.discover({
+            routePlan: routePlan({ [CONTAINER_NAME]: record }), requestedDirectory: 'projects/demo', home,
+        });
+        const agent = discovery.targets[1];
+        assert.equal(agent?.unavailable, reason, JSON.stringify(mounts));
+        assert.equal(agent.home, undefined);
+        await assert.rejects(
+            targetResolver.revalidate({ routePlan: routePlan({ [CONTAINER_NAME]: record }), target: agent }),
+            (error) => error.code === 'WEBTTY_TARGET_STALE',
+        );
+    }
+});
+
+test('create-time revalidation repeats the profile HOME identity and translation', async (t) => {
+    const { root, data } = spacedProfileFixture(t);
+    const home = resolvedHome(root);
+    const record = agentRecord();
+    let mounts = [bind(root, root, true), bind(data, '/data', true)];
+    const targetResolver = resolver(root, async () => ({
+        ...inspectedAgent(root, CONTAINER_NAME, record), Mounts: mounts,
+    }));
+    const plan = routePlan({ [CONTAINER_NAME]: record });
+    const discovery = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo', home });
+    const [box, agent] = discovery.targets;
+    const profile = Object.freeze({ provider: 'roboTeamAgent', id: 'r-1', label: 'Robot One' });
+    const acceptedBox = await targetResolver.revalidate({ routePlan: plan, target: { ...box, profile } });
+    assert.deepEqual(acceptedBox.home, box.home);
+    assert.deepEqual(acceptedBox.profile, profile);
+    const acceptedAgent = await targetResolver.revalidate({ routePlan: plan, target: { ...agent, profile } });
+    assert.equal(acceptedAgent.home.translatedHome, '/data/robots/r-1/home');
+
+    // The mount now reaches the home only read-only.
+    mounts = [bind(root, root, true), bind(data, '/data', false)];
+    await assert.rejects(
+        targetResolver.revalidate({ routePlan: plan, target: agent }),
+        (error) => error.code === 'WEBTTY_TARGET_STALE',
+    );
+    mounts = [bind(root, root, true), bind(data, '/data', true)];
+    // The home directory is replaced at the same path (new dev/ino).
+    const homePath = path.join(data, 'robots', 'r-1', 'home');
+    // Keep the original alive so the replacement cannot reuse its inode.
+    fs.renameSync(homePath, `${homePath}-previous`);
+    fs.mkdirSync(homePath);
+    for (const target of [box, agent]) {
+        await assert.rejects(
+            targetResolver.revalidate({ routePlan: plan, target }),
+            (error) => error.code === 'WEBTTY_TARGET_STALE',
+        );
+    }
 });

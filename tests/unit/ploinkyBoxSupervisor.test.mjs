@@ -31,22 +31,21 @@ import {
     imageAgentLibFixture,
 } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
     fs.mkdirSync(workspace);
-    // Host operator state lives in a private home under the fixture, never the real one.
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
-    return { root, workspace, home, stores: hostStores(home) };
+    // Host operator state lives in the fixture workspace's `.ploinky-box`.
+    return { root, workspace, stores: hostStores() };
 }
 
-function hostStores(home) {
+function hostStores() {
     return {
-        gpuGrantStore: createGpuGrantStore({ homeDirectory: home }),
-        hardwareGateStore: createHardwareGateStore({ homeDirectory: home }),
+        gpuGrantStore: createGpuGrantStore(),
+        hardwareGateStore: createHardwareGateStore(),
     };
 }
 
@@ -127,6 +126,7 @@ for (const [name, invoke] of [
         const failure = new Error('Workspace identity sentinel');
         const unexpected = name => () => { events.push(name); throw new Error(`Unexpected ${name}`); };
         const supervisor = createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
             platform: 'linux',
             env,
             runner,
@@ -156,6 +156,7 @@ test('status, dry-run, stop, and destroy need no prerequisite probes', async t =
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: false });
     const events = [];
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         platform: 'linux',
         resolveIdentity: () => identity,
@@ -180,6 +181,7 @@ test('destroying a running Box stops nested agents before the outer Box is remov
     const events = [];
     const ownership = owned(identity, { running: true });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -209,6 +211,7 @@ test('destroy revalidates the exact container after stopping it', async (t) => {
     fs.mkdirSync(replacedRoot);
     const replacedEvents = [];
     const replaced = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -234,6 +237,7 @@ test('destroy revalidates the exact container after stopping it', async (t) => {
     fs.mkdirSync(recoveryRoot);
     const recoveryEvents = [];
     const recovery = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -261,6 +265,7 @@ test('a failed nested stop halts the Box but removes nothing', async (t) => {
     const events = [];
     const ownership = owned(identity, { running: true });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -298,6 +303,7 @@ test('a failed outer removal retains the workspace cache data', async (t) => {
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -326,6 +332,7 @@ test('unsupported discovery happens before markerless anchor materialization', a
     const events = [];
     const lockManager = fakeLockManager(state.root, events);
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => resolveWorkspaceIdentity({ env: {}, cwd: () => state.workspace }),
         lockManager,
         discover: () => ({ state: 'unsupported', message: 'native Linux required' }),
@@ -346,6 +353,7 @@ test('prepare locks and reconciles without prerequisite probes, then validates d
     const imageOverride = 'registry.example.test/ploinky-box:dev';
     const runner = { run(command, args) { events.push(`run:${args.join(' ')}`); } };
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager,
@@ -382,6 +390,7 @@ test('targeted restart preserves the exact running Box and mounted AgentLib gene
     container.labels[BOX_LABELS.routerHostPort] = '19090';
     container.labels[BOX_LABELS.mediaHostPort] = '17891';
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {}, // Deliberately resolves to :latest, unlike the running Box.
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -467,6 +476,7 @@ test('targeted restart refuses retained initialization metadata before Core can 
     ownership.handles.container.labels[BOX_LABELS.mediaHostPort] = '17882';
     const events = [];
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: state.workspace,
         lockManager: fakeLockManager(state.root, events),
@@ -507,6 +517,7 @@ test('targeted restart refuses stopped and uninitialized Boxes without mutation'
         ownership.handles.container.labels[BOX_LABELS.routerHostPort] = '8080';
         ownership.handles.container.labels[BOX_LABELS.mediaHostPort] = '7882';
         const supervisor = createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
             resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
             lockManager: fakeLockManager(caseRoot, []),
@@ -555,6 +566,7 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
         pullStrategy: 'rebase-autostash',
     });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager,
@@ -634,6 +646,7 @@ test('stop relays to ploinky-local before stopping the outer Box without depende
     const events = [];
     const ownership = owned(identity);
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -663,6 +676,7 @@ function guardedStopSupervisor(t, { scenario, requireExistingContainerId }) {
     const lockEvents = [];
     let discoveries = 0;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, lockEvents),
@@ -722,6 +736,7 @@ test('destroy revalidates the inspected immutable ID and retains cache data by d
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -751,6 +766,7 @@ test('explicit cache deletion happens only after the outer container is removed'
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -792,6 +808,7 @@ test('cache deletion works when the outer container is already absent', async (t
     seedBoxCache(identity);
     const events = [];
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -820,6 +837,7 @@ test('status and dry-run inspect without acquiring a lock or creating an anchor'
     const events = [];
     const lockManager = fakeLockManager(state.root, events);
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager,
@@ -838,6 +856,7 @@ test('running status uses immutable-ID inbox inspection and allowlists its outpu
     const ownership = owned(identity);
     const calls = [];
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -873,6 +892,7 @@ test('running status allowlists and renders concise Cloudflare publication state
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
     const ownership = owned(identity);
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -925,6 +945,7 @@ test('status reports an older owned image as incompatible while destroy remains 
     const events = [];
     const lockManager = fakeLockManager(state.root, events);
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -964,6 +985,7 @@ test('status reports a timed-out image probe as unknown without admitting or ent
         },
     }];
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -992,6 +1014,7 @@ test('status validates the complete mount contract before entering the Box', (t)
     const ownership = owned(identity);
     let inboxQueried = false;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -1025,6 +1048,7 @@ test('failed ploinky-local stop still stops the outer Box', async (t) => {
     const ownership = owned(identity);
     const events = [];
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -1057,6 +1081,7 @@ test('start selects the AgentLib source and passes the host address into the bou
     let revalidated = null;
     let committed = null;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1110,6 +1135,7 @@ test('a source that changes during startup is not committed and is not declared 
     const agentLib = agentLibFixture(identity.workspaceRoot);
     let committed = false;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1179,6 +1205,7 @@ test('a failed replacement restores and health-checks the prior Box graph before
         assert.deepEqual(options.skillScopeEnv, priorScope);
     };
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env: {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1616,6 +1643,7 @@ test('destroy retires retained markers and workspace lease only after exact Box 
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1641,6 +1669,7 @@ test('repeat destroy recovers markers when the Box is already absent without rea
     fs.writeFileSync(path.join(identity.anchorPath, 'agents.json'), '{malformed retained registry');
     const events = [];
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1663,6 +1692,7 @@ test('failed Box removal preserves current no-wait markers and workspace lease',
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         ...state.stores,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1692,6 +1722,7 @@ test('an unmountable workspace path fails before locking inspection, anchoring, 
         const events = [];
         const unexpected = label => () => { events.push(label); throw new Error(`Unexpected ${label}`); };
         const supervisor = createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
             ...state.stores,
             resolveIdentity: () => identity,
             launchCwd: selected,
@@ -1709,8 +1740,10 @@ test('an unmountable workspace path fails before locking inspection, anchoring, 
         await assert.rejects(invoke(supervisor), (error) => (
             error.code === 'PLOINKY_BOX_WORKSPACE_ROOT_INVALID' && /contains ':'/.test(error.message)
         ), name);
-        assert.deepEqual(events, ['lock', 'release'], name);
+        // The lock lives inside the workspace, so the path is refused before it is taken.
+        assert.deepEqual(events, [], name);
         assert.equal(fs.existsSync(path.join(selected, '.ploinky')), false, name);
+        assert.equal(fs.existsSync(path.join(selected, '.ploinky-box')), false, name);
     }
 });
 
@@ -1722,8 +1755,8 @@ function hostLockFor(identity) {
     return { assertHeld: (instance) => assert.equal(instance, identity.instance) };
 }
 
-function canonicalRecords(home, identity) {
-    const root = path.join(home, '.ploinky-box');
+function canonicalRecords(identity) {
+    const root = identity.hostStateRoot;
     return [
         path.join(root, 'gpu-grants', `${identity.instance}.json`),
         path.join(root, 'gpu-grants', identity.instance),
@@ -1734,16 +1767,16 @@ function canonicalRecords(home, identity) {
 
 // Every host operator record of one workspace, through the real stores, plus
 // a router binding that destroy must keep.
-function seedOperatorRecords(home, identity) {
+function seedOperatorRecords(identity) {
     const lock = hostLockFor(identity);
-    const { gpuGrantStore, hardwareGateStore } = hostStores(home);
+    const { gpuGrantStore, hardwareGateStore } = hostStores();
     gpuGrantStore.write(identity, { vendor: 'nvidia', agents: ['demo/agent'], denied: ['other/agent'] }, lock);
-    const [, gpuDir, , instanceDir] = canonicalRecords(home, identity);
+    const [, gpuDir, , instanceDir] = canonicalRecords(identity);
     const generation = path.join(gpuDir, 'e'.repeat(64));
     fs.mkdirSync(generation, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(generation, 'marker.json'), '{}\n', { mode: 0o600 });
     hardwareGateStore.write(identity, true, lock);
-    const paths = hardwareStorePaths({ identity, homeDirectory: home });
+    const paths = hardwareStorePaths({ identity });
     const { token } = initializeStore({ paths, identity });
     setAgentLimits({
         paths, identity, expectedToken: token, agentRef: 'demo/agent', limits: { cpus: 2 },
@@ -1756,10 +1789,10 @@ function seedOperatorRecords(home, identity) {
     const marker = path.join(instanceDir, 'f'.repeat(64), 'marker.json');
     fs.mkdirSync(path.dirname(marker), { mode: 0o700 });
     fs.writeFileSync(marker, '{}\n', { mode: 0o600 });
-    const binding = path.join(home, '.ploinky-box', 'router-bindings', `${identity.instance}.json`);
+    const binding = path.join(identity.hostStateRoot, 'router-bindings', `${identity.instance}.json`);
     fs.mkdirSync(path.dirname(binding), { recursive: true, mode: 0o700 });
     fs.writeFileSync(binding, '{"address":"0.0.0.0","hostPort":8080}\n', { mode: 0o600 });
-    return { canonical: canonicalRecords(home, identity), details: [generation, paths.policyPath, transitions, marker], binding };
+    return { canonical: canonicalRecords(identity), details: [generation, paths.policyPath, transitions, marker], binding };
 }
 
 function treeDigest(target) {
@@ -1782,7 +1815,8 @@ function absentOwnership() {
 function recordsSupervisor(state, identity, { discover = () => absentOwnership(), runner, ...overrides } = {}) {
     const events = [];
     const supervisor = createBoxSupervisor({
-        ...hostStores(state.home),
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        ...hostStores(),
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(fs.mkdtempSync(path.join(state.root, 'locks-')), events),
@@ -1803,7 +1837,7 @@ function destroyFixture(t, name = 'workspace') {
 
 test('destroy removes the GPU-grant and hardware-limits records only after the Box, and keeps the router binding', async (t) => {
     const { state, identity } = destroyFixture(t);
-    const seeded = seedOperatorRecords(state.home, identity);
+    const seeded = seedOperatorRecords(identity);
     const bindingBytes = fs.readFileSync(seeded.binding);
     const ownership = owned(identity, { running: false });
     let atRemoval = null;
@@ -1827,7 +1861,7 @@ test('destroy removes the GPU-grant and hardware-limits records only after the B
 
 test('destroy removes the records of a Box that is already absent or was never created, and creates no state', async (t) => {
     const { state, identity } = destroyFixture(t);
-    const seeded = seedOperatorRecords(state.home, identity);
+    const seeded = seedOperatorRecords(identity);
     const { supervisor } = recordsSupervisor(state, identity, {
         runner: { run() { assert.fail('an absent Box needs no engine command'); }, query() { assert.fail('an absent Box needs no engine query'); } },
     });
@@ -1837,16 +1871,16 @@ test('destroy removes the records of a Box that is already absent or was never c
     for (const target of seeded.canonical) assert.equal(fs.existsSync(target), false, target);
     assert.ok(fs.existsSync(seeded.binding));
 
-    // A fresh home: nothing to remove and no state directory is created.
+    // A fresh workspace: nothing to remove and no state directory is created.
     const fresh = destroyFixture(t);
     const empty = recordsSupervisor(fresh.state, fresh.identity, { runner: { run() { assert.fail('no engine command'); } } });
     assert.deepEqual((await empty.supervisor.runDestroyTransaction(null)).removedRecords, []);
-    assert.equal(fs.existsSync(path.join(fresh.state.home, '.ploinky-box')), false);
+    assert.equal(fs.existsSync(fresh.identity.hostStateRoot), false);
 });
 
 test('destroy is idempotent and finishes what a crash left behind', async (t) => {
     const { state, identity } = destroyFixture(t);
-    const seeded = seedOperatorRecords(state.home, identity);
+    const seeded = seedOperatorRecords(identity);
     const { supervisor } = recordsSupervisor(state, identity);
     assert.deepEqual((await supervisor.runDestroyTransaction(null)).removedRecords, seeded.canonical);
     for (let round = 0; round < 2; round += 1) {
@@ -1855,7 +1889,7 @@ test('destroy is idempotent and finishes what a crash left behind', async (t) =>
         assert.deepEqual(again.removedRecords, [], `round ${round}`);
     }
     // Crash states: a half-deleted store, a gate record removed before the tree, and generations left after the GPU record.
-    const [gpuRecord, gpuDir, hardwareRecord, instanceDir] = canonicalRecords(state.home, identity);
+    const [gpuRecord, gpuDir, hardwareRecord, instanceDir] = canonicalRecords(identity);
     fs.mkdirSync(path.join(instanceDir, 'store'), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(instanceDir, 'store', 'limits.json'), '{"half":', { mode: 0o600 });
     fs.mkdirSync(path.join(gpuDir, 'e'.repeat(64)), { recursive: true, mode: 0o700 });
@@ -1866,31 +1900,31 @@ test('destroy is idempotent and finishes what a crash left behind', async (t) =>
 
 test('destroy preflights both stores before deleting anything', async (t) => {
     for (const [label, corrupt] of [
-        ['hardware-limits/INSTANCE is a symlink', (home, identity, outside) => {
-            const [, , , instanceDir] = canonicalRecords(home, identity);
+        ['hardware-limits/INSTANCE is a symlink', (identity, outside) => {
+            const [, , , instanceDir] = canonicalRecords(identity);
             fs.rmSync(instanceDir, { recursive: true, force: true });
             fs.symlinkSync(outside, instanceDir);
         }],
-        ['gpu-grants/INSTANCE is a symlink', (home, identity, outside) => {
-            const [, gpuDir] = canonicalRecords(home, identity);
+        ['gpu-grants/INSTANCE is a symlink', (identity, outside) => {
+            const [, gpuDir] = canonicalRecords(identity);
             fs.rmSync(gpuDir, { recursive: true, force: true });
             fs.symlinkSync(outside, gpuDir);
         }],
-        ['hardware-limits/INSTANCE has an unexpected entry', (home, identity) => {
-            fs.mkdirSync(path.join(canonicalRecords(home, identity)[3], 'evil'), { mode: 0o700 });
+        ['hardware-limits/INSTANCE has an unexpected entry', (identity) => {
+            fs.mkdirSync(path.join(canonicalRecords(identity)[3], 'evil'), { mode: 0o700 });
         }],
-        ['gpu-grants/INSTANCE.json is a directory', (home, identity) => {
-            const [gpuRecord] = canonicalRecords(home, identity);
+        ['gpu-grants/INSTANCE.json is a directory', (identity) => {
+            const [gpuRecord] = canonicalRecords(identity);
             fs.rmSync(gpuRecord);
             fs.mkdirSync(gpuRecord, { mode: 0o700 });
         }],
     ]) {
         const { state, identity } = destroyFixture(t);
-        const seeded = seedOperatorRecords(state.home, identity);
+        const seeded = seedOperatorRecords(identity);
         const outside = path.join(state.root, 'outside');
         fs.mkdirSync(path.join(outside, 'store'), { recursive: true, mode: 0o700 });
         fs.writeFileSync(path.join(outside, 'store', 'keep'), 'outside data', { mode: 0o600 });
-        corrupt(state.home, identity, outside);
+        corrupt(identity, outside);
         const before = seeded.canonical.map((target) => (fs.existsSync(target) ? treeDigest(target) : null));
         const { supervisor } = recordsSupervisor(state, identity);
         await assert.rejects(supervisor.runDestroyTransaction(null), (error) => {
@@ -1903,12 +1937,12 @@ test('destroy preflights both stores before deleting anything', async (t) => {
     }
 });
 
-test('destroy leaves every record of another workspace in the same home byte-identical', async (t) => {
+test('destroy leaves every record of another workspace byte-identical', async (t) => {
     const { state, identity } = destroyFixture(t);
     fs.mkdirSync(path.join(state.root, 'other', '.ploinky'), { recursive: true });
     const other = buildWorkspaceIdentity(path.join(state.root, 'other'), { markerFound: true });
-    const seeded = seedOperatorRecords(state.home, identity);
-    const kept = seedOperatorRecords(state.home, other);
+    const seeded = seedOperatorRecords(identity);
+    const kept = seedOperatorRecords(other);
     const before = kept.canonical.map(treeDigest);
     const ownership = owned(identity, { running: false });
     const { supervisor } = recordsSupervisor(state, identity, { discover: () => ownership });
@@ -1918,28 +1952,24 @@ test('destroy leaves every record of another workspace in the same home byte-ide
     assert.deepEqual(kept.canonical.map(treeDigest), before, 'the other workspace is untouched');
 });
 
-test('destroy never deletes records when the workspace overlaps the host control-state directory', async (t) => {
-    const state = fixture(t);
-    const nested = path.join(state.home, '.ploinky-box', 'nested-workspace');
-    fs.mkdirSync(path.join(nested, '.ploinky'), { recursive: true, mode: 0o700 });
-    const identity = buildWorkspaceIdentity(nested, { markerFound: true });
-    const records = canonicalRecords(state.home, identity);
-    for (const directory of [path.dirname(records[0]), records[1], records[3]]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(records[0], '{}\n', { mode: 0o600 });
-    fs.writeFileSync(records[2], '{}\n', { mode: 0o600 });
+test('destroy never deletes records when a cache path overlaps the host control-state directory', async (t) => {
+    const { state, identity } = destroyFixture(t);
+    const seeded = seedOperatorRecords(identity);
+    fs.mkdirSync(identity.boxDataRoot, { recursive: true });
+    fs.symlinkSync(identity.hostStateRoot, identity.dataPaths.images);
     const { supervisor } = recordsSupervisor(state, identity);
     await assert.rejects(supervisor.runDestroyTransaction(null), (error) => {
         assert.equal(error.code, 'PLOINKY_BOX_DESTROY_RECORDS_KEPT');
-        assert.match(error.message, /overlaps ~\/\.ploinky-box, so destroy never deletes there/);
+        assert.match(error.message, new RegExp(`overlaps the host-state directory ${identity.hostStateRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}, so destroy never deletes there`));
         return true;
     });
-    for (const target of records) assert.ok(fs.existsSync(target), target);
+    for (const target of seeded.canonical) assert.ok(fs.existsSync(target), target);
 });
 
 test('destroy --delete-cache deletes the cache of a gone Box even when the records are kept, then reports both', async (t) => {
     const { state, identity } = destroyFixture(t);
     seedBoxCache(identity);
-    const seeded = seedOperatorRecords(state.home, identity);
+    const seeded = seedOperatorRecords(identity);
     fs.mkdirSync(path.join(seeded.canonical[3], 'evil'), { mode: 0o700 });
     const ownership = owned(identity, { running: false });
     const { supervisor, events } = recordsSupervisor(state, identity, { discover: () => ownership });
@@ -1958,7 +1988,7 @@ test('destroy --delete-cache deletes the cache of a gone Box even when the recor
 test('destroy refuses an unproven Box observation without deleting the cache or any record', async (t) => {
     const { state, identity } = destroyFixture(t);
     seedBoxCache(identity);
-    const seeded = seedOperatorRecords(state.home, identity);
+    const seeded = seedOperatorRecords(identity);
     for (const observation of [{ state: 'unknown', message: 'engine unavailable' }, { state: 'foreign' }]) {
         const { supervisor } = recordsSupervisor(state, identity, {
             discover: () => observation,
@@ -1973,7 +2003,7 @@ test('destroy refuses an unproven Box observation without deleting the cache or 
 
 test('a deletion failure midway keeps the rest for a re-run, which finishes', async (t) => {
     const { state, identity } = destroyFixture(t);
-    const seeded = seedOperatorRecords(state.home, identity);
+    const seeded = seedOperatorRecords(identity);
     let failures = 0;
     const failingFs = new Proxy(fs, {
         get(target, property) {
@@ -1990,7 +2020,7 @@ test('a deletion failure midway keeps the rest for a re-run, which finishes', as
         },
     });
     const failing = recordsSupervisor(state, identity, {
-        hardwareGateStore: createHardwareGateStore({ homeDirectory: state.home, fsApi: failingFs }),
+        hardwareGateStore: createHardwareGateStore({ fsApi: failingFs }),
     });
     await assert.rejects(failing.supervisor.runDestroyTransaction(null), (error) => {
         assert.equal(error.code, 'PLOINKY_BOX_DESTROY_RECORDS_KEPT');
@@ -2008,12 +2038,13 @@ test('a deletion failure midway keeps the rest for a re-run, which finishes', as
 
 test('two concurrent destroys serialize on the real workspace lock; the second sees nothing left', async (t) => {
     const { state, identity } = destroyFixture(t);
-    const seeded = seedOperatorRecords(state.home, identity);
+    const seeded = seedOperatorRecords(identity);
     let present = true;
     const ownership = owned(identity, { running: false });
-    const lockManager = createMutationLockManager({ homeDirectory: state.home });
+    const lockManager = createMutationLockManager();
     const supervisor = createBoxSupervisor({
-        ...hostStores(state.home),
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        ...hostStores(),
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager,

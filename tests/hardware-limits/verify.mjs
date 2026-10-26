@@ -479,8 +479,8 @@ export async function runSuite({
     const temp = createOwnedShortTemp(tempParent, { name: `hwl-${childId.replace(/[^A-Za-z0-9-]/g, '-')}-${randomRunId().slice(0, 8)}` });
     let run;
     try {
-        // Test children never see the real HOME (~/.ploinky-box host
-        // records, locks): it is a fresh directory inside the owned temp tree.
+        // Test children never see the real HOME: it is a fresh directory
+        // inside the owned temp tree.
         const home = path.join(temp.path, 'home');
         fs.mkdirSync(home, { mode: 0o700 });
         const env = {

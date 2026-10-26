@@ -60,6 +60,25 @@ The private-listener block (`:807-881` in ec1bdbc2) is textually unchanged; earl
 | private-turn-credentials.post | 814 | 865 | Yes | Same. |
 | agent-additional-http.* | 195 | 196 | Prefixed form yes | For the prefixed form the `requestTarget` default equals the old expression (`:206`). The `/admin` guard and `forwardedPrefix: ''` apply only under `rootMount` (`:301,372`). |
 
+## Live Sessions merge reconciliation
+
+The merge of master `a2965b603a391e4d2505bd7553139bf7775a1b80` and Live Sessions `66cfe40a576f5b331eca6fed446e1a2f09e6ffb5` retains both registries' blobs, stage pointers, canonical rows and historical contract digests unchanged. The merged `RoutingServer.js`, `edgeRoutePlan.js` and WebTTY handler match already registered incoming blobs exactly. Only `marketplaceRoutes.js` has new source bytes: `40669dc57fd19edc2168181b3b9b97c1739f0345d1e64ad45168f7cfd90939a6`.
+
+Compared with master's `e38c339b` blob, that file adds the authenticated-request observer import and three notifications after successful browser-session validation. Each notification follows assignment of the validated user, session, session id and authentication mode. The observer publishes only identity, roles, mode and decision time; listener failures are contained. It does not change the marketplace allow decision. The agent assertion path retains master's replay cache and post-verification quota/capacity refusals. `authorizeRead`, the administrator and mutation proof gates, the agent action allowlist, and the route dispatch branches are unchanged.
+
+The six references below retain their statements and anchors and move by exactly four lines. Each statement was checked at its explicit destination line, and the authentication and dispatch code was inspected; no first-match discovery or inventory contract regeneration was used.
+
+| Row | Master line | Merged line | Retained gate |
+| --- | --- | --- | --- |
+| marketplace-repos-read.get | 933 | 937 | GET calls `authorizeRead` before the payload |
+| marketplace-agents-read.get | 903 | 907 | Same GET gate; display projection keeps role-based permissions |
+| marketplace-install_repo.post | 1006 | 1010 | Browser administrator and CSRF, or allowed agent action plus verified assertion |
+| marketplace-uninstall_repo.post | 1006 | 1010 | Browser administrator and CSRF; refused for agent callers |
+| marketplace-enable_agent.post | 1032 | 1036 | Browser administrator and CSRF, or allowed agent action plus verified assertion |
+| marketplace-disable_agent.post | 1034 | 1038 | Browser administrator and CSRF; refused for agent callers |
+
+The inventory keeps the 128 historical obligations separately from the 133-row Live Sessions overlay. Source drift remains an aggregated mandatory failure before deployment observation or requests. If source drift prevents constructing the overlay, importing the inventory retains unresolved historical rows so independent checks can run; mandatory source-drift and overlay assertions still fail. These are source and harness claims, not live acceptance evidence.
+
 ## Limits
 
 The RoutingServer.js pins carry the fd33e338 statements over by offset (+0 or +9), except for the `internal-agent-control.*` rebind. Many of them (`}`, `res,`, `return;`, the detailed-health response) prove only blob identity and line position, not the dispatch statement. The Review column records the judgement on the real dispatch code; it is not what the pin itself proves.

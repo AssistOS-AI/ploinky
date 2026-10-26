@@ -729,7 +729,7 @@ test('B5-13: the unit-test MCP SDK is the commit the Box image provides', async 
 
 const PROXY_CONTAINER = 'pool-echo-agent-container';
 const PROXY_USER = { id: 'alice', username: 'alice', roles: ['user'] };
-const PROXY_ACTOR = { kind: 'user', id: 'user:alice', roles: ['user'] };
+const PROXY_ACTOR = { kind: 'user', id: 'user:alice', roles: ['user'], displayName: 'alice' };
 let proxyFixturePromise = null;
 const originalCwd = process.cwd();
 const originalEnv = Object.fromEntries(['PLOINKY_MASTER_KEY', 'PLOINKY_WORKSPACE_ROOT', 'PLOINKY_ROUTER_HOST_PORT', 'PLOINKY_MCP_UPSTREAM_POOL']

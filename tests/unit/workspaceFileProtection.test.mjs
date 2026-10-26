@@ -320,3 +320,77 @@ test('a top-level entry that the filesystem resolves to .ploinky is refused by i
     });
     await assertDenied('/workspace-files/.plo%E2%80%8Cinky/agents.json');
 });
+
+// A12 / N18: the Box host state directory (`.ploinky-box`) is never served, as
+// an exact folded path component at any depth, whether or not the entry
+// exists. Names that merely start or end with it stay servable.
+test('the Box host state directory is refused in every spelling and at any depth; look-alike names are served', async (t) => {
+    await assertPositiveControls();
+    write('.ploinky-box/workspace.json', JSON.stringify({ marker: SENTINEL }));
+    write('.ploinky-box/x');
+    write('.ploinky-box/quarantine/1/x');
+    write('.ploinky-box/locks/workspace.lock/owner.json');
+    write('projects/site/.ploinky-box/x');
+    write('.ploinky-box-mcp-sdk.json', '{"sdk":true}\n');
+    write('docs/x.ploinky-box', 'suffix\n');
+    write('.ploinky-boxes/y', 'plural\n');
+    link('docs/host-state-link', '../.ploinky-box');
+    t.after(() => {
+        for (const entry of ['.ploinky-box', 'projects/site/.ploinky-box', '.ploinky-box-mcp-sdk.json', 'docs/x.ploinky-box',
+            '.ploinky-boxes', 'docs/host-state-link']) {
+            fs.rmSync(path.join(workspace, entry), { recursive: true, force: true });
+        }
+    });
+    for (const target of [
+        '.ploinky-box/x',
+        '.PLOINKY-BOX/x',
+        // U+212A KELVIN SIGN folds to k.
+        '.ploin%E2%84%AAy-box/x',
+        '.ploinky-box/quarantine/1/x',
+        '.ploinky-box/workspace.json',
+        '.ploinky-box/locks/workspace.lock/owner.json',
+        '.ploinky-box/missing',
+        '.ploinky-box',
+        '.ploinky-box/',
+        '.ploinky-box./x',
+        '.Ploinky-Box%20/x',
+        'projects/site/.ploinky-box/x',
+        'docs/../.ploinky-box/x',
+        '%2Eploinky-box/x',
+        'docs/host-state-link/workspace.json',
+    ]) {
+        await t.test(target, () => assertDenied(`/workspace-files/${target}`));
+    }
+    await t.test('HEAD .ploinky-box/workspace.json', () => assertDenied('/workspace-files/.ploinky-box/workspace.json', 'HEAD'));
+    await assertServed('/workspace-files/.ploinky-box-mcp-sdk.json', '{"sdk":true}\n');
+    await assertServed('/workspace-files/docs/x.ploinky-box', 'suffix\n');
+    await assertServed('/workspace-files/.ploinky-boxes/y', 'plural\n');
+});
+
+test('a top-level entry that the filesystem resolves to .ploinky-box is refused by identity', async (t) => {
+    await assertPositiveControls();
+    write('.ploinky-box/workspace.json');
+    const alias = path.join(workspace, '.plo‌inky-box');
+    write('.plo‌inky-box/workspace.json');
+    const originalStat = fs.promises.stat;
+    fs.promises.stat = (value, ...rest) => originalStat(value === alias ? path.join(workspace, '.ploinky-box') : value, ...rest);
+    t.after(() => {
+        fs.promises.stat = originalStat;
+        fs.rmSync(alias, { recursive: true, force: true });
+        fs.rmSync(path.join(workspace, '.ploinky-box'), { recursive: true, force: true });
+    });
+    await assertDenied('/workspace-files/.plo%E2%80%8Cinky-box/workspace.json');
+});
+
+// The Router and the host-state guards share one fold (NFKC, then lower case):
+// U+017F LATIN SMALL LETTER LONG S reaches protected names outside `.ploinky`.
+test('long-s spellings of protected names are refused outside the controller root too', async (t) => {
+    await assertPositiveControls();
+    for (const url of [
+        '/workspace-files/docs/ma%C5%BFter-key',
+        '/workspace-files/docs/.%C5%BFecrets',
+        '/workspace-files/docs/app.%C5%BFecrets',
+    ]) {
+        await t.test(url, () => assertDenied(url));
+    }
+});

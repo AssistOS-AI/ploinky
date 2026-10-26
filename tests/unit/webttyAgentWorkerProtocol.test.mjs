@@ -6,6 +6,7 @@ import {
     WEBTTY_AGENT_PROTOCOL_LIMITS,
     WEBTTY_AGENT_WORKER_PROTOCOL,
     agentWorkerMessage,
+    validateAgentStartupEvidence,
     validateAgentWorkerToRouterMessage,
     validateRouterToAgentWorkerMessage,
 } from '../../cli/server/webtty/agentWorkerProtocol.mjs';
@@ -198,4 +199,59 @@ test('worker output, exits, errors, and terminal correlation are exact and bound
         agentWorkerMessage('ready', TERMINAL_ID, { recoveryEvidence: recovery() }),
         { expectedTerminalId: 'z'.repeat(24) },
     ));
+});
+
+test('init-agent and startup evidence accept exactly an optional translated HOME plus profile', () => {
+    const profile = { provider: 'provider', id: 'p-1', label: 'Profile One' };
+    const base = {
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
+        targetUser: '1000:1000',
+        translatedCwd: '/workspace/demo',
+        marker: 'marker_abcdefghijklmnopqrstuvwx',
+        cols: 80,
+        rows: 24,
+    };
+    const message = (fields) => agentWorkerMessage('init-agent', 'abcdefghijklmnopqrstuvwx', { ...base, ...fields });
+    assert.doesNotThrow(() => validateRouterToAgentWorkerMessage(message({})));
+    assert.doesNotThrow(() => validateRouterToAgentWorkerMessage(message({ translatedHome: '/data/home', profile })));
+    const longHome = `/${'h'.repeat(WEBTTY_AGENT_PROTOCOL_LIMITS.maxTranslatedHomeBytes - 1)}`;
+    assert.doesNotThrow(() => validateRouterToAgentWorkerMessage(message({ translatedHome: longHome, profile })));
+    for (const fields of [
+        { translatedHome: '/data/home' },
+        { profile },
+        { translatedHome: `${longHome}x`, profile },
+        { translatedHome: 'data/home', profile },
+        { translatedHome: '/data/../home', profile },
+        { translatedHome: '/data//home', profile },
+        { translatedHome: '/', profile },
+        { translatedHome: '/data/home', profile: { ...profile, extra: true } },
+        { translatedHome: '/data/home', profile: { ...profile, label: 'bad\nlabel' } },
+        { translatedHome: '/data/home', profile: { ...profile, label: 'x'.repeat(129) } },
+        { translatedHome: '/data/home', profile: { ...profile, id: '../p' } },
+        { translatedHome: '/data/home', profile: { ...profile, provider: '' } },
+        { translatedHome: '/data/home', profile, home: '/data/home' },
+    ]) {
+        assert.throws(
+            () => validateRouterToAgentWorkerMessage(message(fields)),
+            { code: 'WEBTTY_AGENT_WORKER_PROTOCOL_INVALID' },
+            JSON.stringify(fields).slice(0, 120),
+        );
+    }
+    const startup = {
+        backend: WEBTTY_AGENT_BACKEND,
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
+        targetUser: '1000:1000',
+        translatedCwd: '/workspace/demo',
+        marker: 'marker_abcdefghijklmnopqrstuvwx',
+        baselineExecIds: [],
+        containerInitProcess: { pid: 4299, startToken: 'linux-proc:42990', pidNamespace: 'pid:[9001]' },
+    };
+    assert.doesNotThrow(() => validateAgentStartupEvidence(startup));
+    assert.doesNotThrow(() => validateAgentStartupEvidence({ ...startup, translatedHome: '/data/home', profile }));
+    for (const extra of [{ translatedHome: '/data/home' }, { profile }, { translatedHome: '/data/home', profile: {} }]) {
+        assert.throws(() => validateAgentStartupEvidence({ ...startup, ...extra }),
+            { code: 'WEBTTY_AGENT_WORKER_PROTOCOL_INVALID' });
+    }
 });

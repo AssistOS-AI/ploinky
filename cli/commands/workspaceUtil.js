@@ -94,6 +94,7 @@ import {
   REPOS_DIR,
   RUNNING_DIR,
 } from '../utils/config.js';
+import { preflightLinkedRepositories } from '../utils/linkInstall.mjs';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from '../utils/workspaceDependencyGraph.js';
 import {
   mergeRoutingConfig,
@@ -714,13 +715,19 @@ async function waitForRouterReady(port, child, timeoutMs = 15000, {
   throw new Error(`router TCP listener did not become ready at 127.0.0.1:${validatedPort}`);
 }
 
+// Input stays suspended until an asynchronous foreground session has ended.
 function runWithSuspendedInput(callback) {
   const restoreInput = inputState.prepareForExternalCommand?.() || (() => {});
+  let result;
   try {
-    return callback();
-  } finally {
+    result = callback();
+  } catch (error) {
     restoreInput();
+    throw error;
   }
+  if (typeof result?.then === 'function') return Promise.resolve(result).finally(restoreInput);
+  restoreInput();
+  return result;
 }
 
 function getCliCmd(manifest) {
@@ -2046,12 +2053,22 @@ function ensureGraphNodesEnabled(graph, reg, {
     const preliminary = {
       node, existing, expectedExecution, executionChanged, profileChanged, predecessorBackend,
     };
+    let observedRuntimeReason = '';
+    let runtimeReasonObserved = false;
+    const observeRuntimeReplacementReason = () => {
+      if (!runtimeReasonObserved) {
+        observedRuntimeReason = String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+        runtimeReasonObserved = true;
+      }
+      return observedRuntimeReason;
+    };
     // A stalled worker of an earlier start still holds this exact staged
     // identity and would resume under any generation that carries it again, so
     // the identity always rotates and its unpublished runtime is removed.
     const superseded = supersededNoWaitRunFor(supersededNoWaitRuns, existing.key, existing.rec);
     // A refused or blocked instance keeps no authority: an existing runtime is
-    // revoked by identity rotation and removed through exact ownership checks.
+    // revoked by identity rotation and removed through exact ownership checks,
+    // unless it is the kept predecessor of a refused targeted drain (below).
     const hardwareUnavailable = unavailableNodeIds.has(node.id)
       && (runtimeReplacementOptions?.containerExistsImpl || dockerSvc.containerExists)(existing.key);
     let runtimeReason = '';
@@ -2060,7 +2077,7 @@ function ensureGraphNodesEnabled(graph, reg, {
         ? 'hardwareUnavailable'
         : superseded
           ? 'noWaitRunSuperseded'
-          : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+          : observeRuntimeReplacementReason();
     }
     // A start that stopped after persisting this record's rotated tuple but
     // before removing its predecessor left that predecessor's own tuple in a
@@ -2102,6 +2119,8 @@ function ensureGraphNodesEnabled(graph, reg, {
       ...preliminary,
       executionDifferences,
       runtimeReason,
+      supersededNoWaitRun: superseded,
+      observeRuntimeReplacementReason,
       registryRecord: structuredClone(existing.rec),
       priorPredecessorReceipt,
       predecessorProcess,
@@ -2112,8 +2131,44 @@ function ensureGraphNodesEnabled(graph, reg, {
     });
   }
 
-  const changedPlans = existingPlans
-    .filter((plan) => plan.executionChanged || plan.profileChanged || plan.runtimeReason)
+  // Removing the predecessor of a refused targeted drain would let a later
+  // restart replace it without any acknowledgement, so it is never rotated or
+  // removed here. A no-wait or hardware-refused node keeps that predecessor
+  // under its exact identity and stays unlaunched behind its draining route
+  // while the rest of the graph starts; any other node refuses the whole graph
+  // while nothing has been logged, revoked, rotated or removed.
+  const replacementCandidates = existingPlans
+    .filter((plan) => plan.executionChanged || plan.profileChanged || plan.runtimeReason);
+  const drainingRouting = replacementCandidates.length ? loadRouting() : null;
+  const retainedDrainingPlans = [];
+  for (const plan of replacementCandidates) {
+    try {
+      dockerSvc.assertAgentServiceNotDraining(plan.existing.key, {
+        loadRouting: () => drainingRouting,
+        expectedPredecessor: registeredRuntimeTuple(plan.registryRecord),
+      });
+    } catch (error) {
+      if (error?.code !== 'PLOINKY_AGENT_DRAINING') throw error;
+      // The displayed reason can hide independent supersession or MPS facts.
+      // Observe a skipped runtime reason only when containment needs that fact.
+      const containable = (deferredNodeIds.has(plan.node.id) || unavailableNodeIds.has(plan.node.id))
+        && !plan.supersededNoWaitRun
+        && plan.observeRuntimeReplacementReason() !== 'mpsCohortTransition';
+      if (!containable) throw error;
+      retainedDrainingPlans.push(plan);
+    }
+  }
+  for (const plan of retainedDrainingPlans) {
+    const deferred = graphReplacementLine(plan).replace(/^.*?: replacing its runtime /, '');
+    const agent = plan.existing.rec.alias || plan.existing.rec.agentName || plan.node.shortAgentName;
+    logLine(`[start] ${plan.node.id}: keeping its stopped runtime after a refused targeted drain instead of replacing it ${deferred}; `
+      + `it stays unavailable until 'ploinky restart ${agent} --accept-failed-drain <container-id>'`);
+    plan.executionChanged = false;
+    plan.profileChanged = false;
+    plan.runtimeReason = '';
+  }
+  const changedPlans = replacementCandidates
+    .filter((plan) => !retainedDrainingPlans.includes(plan))
     .sort((left, right) => left.node.id.localeCompare(right.node.id));
   const changedContainers = changedPlans.map((plan) => plan.existing.key);
   // Say why each runtime is replaced before anything is revoked or removed.
@@ -2791,6 +2846,20 @@ function buildRouterUrl(staticPort, env = process.env) {
     : `http://127.0.0.1:${staticPort}`;
 }
 
+// Every admitted node counts, blocking or no-wait: a no-wait agent is launched
+// by a detached worker after startWorkspace has returned, so only this parent
+// step can stop the start on a link-install branch mismatch.
+export function preflightStartLinkedRepositories(admittedStart, {
+  workspaceRoot,
+  branchPolicy,
+  preflight = preflightLinkedRepositories,
+  ...options
+} = {}) {
+  if (!branchPolicy?.branch) return [];
+  const nodes = [...admittedStart.graph.nodes.values(), ...(admittedStart.additionalNodes || [])];
+  return preflight(nodes.map((node) => node.manifest), { ...options, workspaceRoot, branchPolicy });
+}
+
 export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { hardwareContext, boxMarkerOptions } = {}) {
   const configured = workspaceSvc.getConfig()?.static?.agent || '';
   let staticAgent = String(staticAgentArg || configured || '').trim();
@@ -2902,6 +2971,9 @@ async function startWorkspace(staticAgentArg, portArg, {
       .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
   }
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  // `--branch` reaches link-install repositories here, for the whole admitted
+  // graph including no-wait agents, before any mutation, wave or worker.
+  preflightStartLinkedRepositories(lockedStart, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, branchPolicy });
   // Hardware refusals are recorded per exact instance; blocking and explicit
   // waiting consumers become blocked, unrelated agents start (plan §9.1).
   // A refusal raised later at launch is recorded in the same tracker.
@@ -4004,13 +4076,13 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   if (actualRuntime === 'bwrap') {
     const attach = attachBwrapInteractive
       || (await import('../sandbox/bwrap/bwrapServiceManager.js')).attachBwrapInteractive;
-    exitCode = withSuspendedInput(() => {
+    exitCode = await withSuspendedInput(() => {
       return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint, onReady: notifyCliReady });
     });
   } else if (actualRuntime === 'seatbelt') {
     const attach = attachSeatbeltInteractive
       || (await import('../sandbox/seatbelt/seatbeltServiceManager.js')).attachSeatbeltInteractive;
-    exitCode = withSuspendedInput(() => {
+    exitCode = await withSuspendedInput(() => {
       return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint, onReady: notifyCliReady });
     });
   } else {
@@ -4163,16 +4235,12 @@ async function runShell(agentName) {
     console.log(`[shell] bwrap agent: ${shortAgentName}`);
     console.log(`[shell] command: ${cmd}`);
     const { attachBwrapInteractive } = await import('../sandbox/bwrap/bwrapServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
-    });
+    await runWithSuspendedInput(() => attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint }));
   } else if (actualRuntime === 'seatbelt') {
     console.log(`[shell] seatbelt agent: ${shortAgentName}`);
     console.log(`[shell] command: ${cmd}`);
     const { attachSeatbeltInteractive } = await import('../sandbox/seatbelt/seatbeltServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
-    });
+    await runWithSuspendedInput(() => attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint }));
   } else {
     console.log(`[shell] container: ${containerName}`);
     console.log(`[shell] command: ${cmd}`);
@@ -4261,6 +4329,9 @@ async function reinstallAgent(agentName) {
                 )) {
               throw new Error(`Agent '${agentName}' changed while waiting for reinstall; retry with its current registration.`);
             }
+            // A refused targeted drain keeps its stopped predecessor for the
+            // operator's explicit recovery; refuse before any request or removal.
+            dockerSvc.assertAgentServiceNotDraining(containerName);
             // One exact logical registration gets a persistent desired rebuild
             // request (reused while it is still pending or failed). Its runtime
             // then builds from empty npm state, bypassing seeds.

@@ -570,11 +570,10 @@ export function createGpuWorld({ statePath, node, engine, host, gpu, faults = {}
         if (refusal) return failed(`ploinky: ${refusal}`, 1);
         const verbs = args.filter(value => !value.startsWith('-') && !/^[0-9]+$/.test(value));
         const identity = buildWorkspaceIdentity(options.cwd);
-        const home = options.env.HOME;
         if (verbs.includes('gpu') && verbs.includes('grant')) {
             model.grantCalls.push(args);
             if (faults.grantFails) return failed('PLOINKY_BOX_GPU_DISCOVERY_FAILED: nvidia-uvm is missing', 1);
-            const directory = path.join(home, '.ploinky-box', 'gpu-grants');
+            const directory = path.join(identity.hostStateRoot, 'gpu-grants');
             fs.mkdirSync(path.join(directory, identity.instance), { recursive: true, mode: 0o700 });
             fs.writeFileSync(path.join(directory, identity.instance, 'wiring.json'), '{}');
             fs.writeFileSync(path.join(directory, `${identity.instance}.json`), JSON.stringify({ agents: args.filter((value, i) => args[i - 1] === '--agent') }));

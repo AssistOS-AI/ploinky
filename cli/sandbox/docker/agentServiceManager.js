@@ -75,6 +75,7 @@ import {
     TARGETED_DRAIN_ACKNOWLEDGEMENT,
     drainAndRemoveTargetedContainer,
     drainTargetedContainer,
+    normalizeAcceptedFailedDrain,
 } from './targetedContainerLifecycle.js';
 import {
     admitManifestRuntimeCapabilities,
@@ -95,6 +96,7 @@ import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, read
 import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
 import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, PLOINKY_SKILL_SCOPE_ENV, SHARED_DIR } from '../../utils/config.js';
+import { ensureHostLaunchSkeleton, withHostLaunchExclusion } from '../hostLaunchExclusion.js';
 import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
@@ -239,6 +241,7 @@ import {
 } from '../runtimeCleanupReceipt.js';
 
 import { readRuntimeCandidate, writeRuntimeCandidate, retireRuntimeCandidate } from '../runtimeCandidateStore.js';
+import { readRuntimePredecessor, retireRuntimePredecessor } from '../runtimePredecessorStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -899,6 +902,15 @@ function appendEnvFlagsFromMap(envFlags, envMap) {
 function removeContainerForRecreate(runtime, containerName, label, record = null) {
     let exactRecord = record || loadAgentsMap()[containerName];
     try {
+        // A prepared replacement rotated this record's tuple before launch and
+        // first made the predecessor's own tuple durable in a receipt keyed by
+        // the rotated one. Only that receipt proves the container still
+        // present here; it never authorizes removal by itself, and one that
+        // exists but does not bind this record is refused.
+        const predecessorReceipt = readRuntimePredecessor(containerName, exactRecord);
+        if (predecessorReceipt) {
+            exactRecord = { ...exactRecord, ...structuredClone(predecessorReceipt.predecessor) };
+        }
         const pending = exactRecord?.instanceId && exactRecord?.enableGeneration
             ? readRuntimeCandidate(containerName, exactRecord)
             : null;
@@ -915,6 +927,9 @@ function removeContainerForRecreate(runtime, containerName, label, record = null
             throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
         }
         if (pending) retireRuntimeCandidate(pending);
+        // Removed, or its absence proven by its own engine: the proof is spent.
+        // A failed retirement aborts this launch before any successor exists.
+        if (predecessorReceipt) retireRuntimePredecessor(predecessorReceipt);
         clearLivenessState(containerName);
         return result;
     } catch (cause) {
@@ -941,11 +956,13 @@ function normalizeTargetedRestart(value) {
     if (typeof value.assertSelectorsInactive !== 'function') {
         throw new Error('targetedRestart.assertSelectorsInactive must prove the exact affected selectors are inactive');
     }
+    const acceptedFailedDrain = normalizeAcceptedFailedDrain(value.acceptedFailedDrain);
     return Object.freeze({
         acknowledgement: value.acknowledgement,
         affectedSelectors: Object.freeze([...value.affectedSelectors]),
         assertSelectorsInactive: value.assertSelectorsInactive,
         ...(value.timeoutMs === undefined ? {} : { timeoutMs: value.timeoutMs }),
+        ...(acceptedFailedDrain ? { acceptedFailedDrain } : {}),
     });
 }
 
@@ -1063,6 +1080,9 @@ function appendControllerStateGuards(args, runtime, {
     workspaceRoot,
     canonicalRuntimeWorkspaceGuards = isPloinkyBoxRuntime(),
 } = {}) {
+    // The guards always mask `.ploinky-box`, so its skeleton exists before
+    // they are planned; a launch that cannot create it fails here.
+    ensureHostLaunchSkeleton(workspaceRoot || PLOINKY_WORKSPACE_ROOT);
     const bindings = expectedBindMountsFromArgs(args).map(mount => ({
         hostPath: mount.source,
         runtimePath: mount.destination,
@@ -1516,6 +1536,9 @@ export function selectLaunchImages({ resolvedImage, launch = null } = {}) {
 }
 
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
+    // Host Podman launches create the host state skeleton first and fail if
+    // they cannot; in-Box (nested) launches skip it.
+    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const managedControlEnv = buildManagedControlEnv(manifest);
@@ -2733,9 +2756,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         networkLifecycleCapability: options.networkLifecycleCapability,
                         beforeDestructiveWork: options.beforeHardwareMutation,
                 };
+                // Create and start run under the workspace lock, after the
+                // caller's start lease (host only; adoption launches nothing).
                 const launched = adoptManagedRuntimeOnly
                     ? networkLifecycle.adoptManagedContainerTransaction(transaction)
-                    : networkLifecycle.runManagedContainerTransaction({
+                    : withHostLaunchExclusion(() => networkLifecycle.runManagedContainerTransaction({
                         ...transaction,
                         createContainer,
                         prepareLaunch: prepareGeneratedRouterLaunch,
@@ -2744,7 +2769,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         finalizeLaunch: finalizeGeneratedRouterLaunch,
                         onContainerCreated: recordCreatedIdentity,
                         commandPrefix: hardwareLaunch.commandPrefix(),
-                    });
+                    }), { workspaceRoot: PLOINKY_WORKSPACE_ROOT, label: `container launch of ${containerName}` });
                 if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
                     const mismatch = new Error(
                         `managed candidate '${containerName}' failed exact active-generation adoption: ${String(launched?.reason || 'mismatch')}`,
@@ -2781,7 +2806,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     predecessorId: String(existingRecord.containerId || ''),
                     ownershipProof: { predecessorRegistryIdentity: true, predecessorRemoved: predecessorRemoval.state },
                 });
-                launchedContainerId = withNetworkLifecycleLock(() => {
+                launchedContainerId = withNetworkLifecycleLock(() => withHostLaunchExclusion(() => {
                     const createdId = createContainer(unmanagedNetworkLifecyclePlan);
                     return String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
                         network: manifestNetwork,
@@ -2792,7 +2817,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         afterStart: cleanupGuardMountpointsAfterStart,
                         commandPrefix: hardwareLaunch.commandPrefix(),
                     }) || '');
-                }, { waitMs: 15 * 60 * 1000 });
+                }, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, label: `container launch of ${containerName}` }),
+                { waitMs: 15 * 60 * 1000 });
             }
             if (!launchedContainerId) {
                 throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
@@ -4582,13 +4608,18 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             assertSelectorsInactive: targetedRestart.assertSelectorsInactive,
             retireControlSocket: retireRuntimeRelaySocket,
             ...(targetedRestart.timeoutMs === undefined ? {} : { timeoutMs: targetedRestart.timeoutMs }),
+            ...(targetedRestart.acceptedFailedDrain ? { acceptedFailedDrain: targetedRestart.acceptedFailedDrain } : {}),
         };
+        let drained = null;
         if (runtimeNetworkPlan.requiresManagedNetwork) {
             // The managed transaction preserves a stopped predecessor for
             // diagnostics/rollback, but never restarts it after this drain.
-            drainTargetedContainer(containerName, drainOptions);
+            drained = drainTargetedContainer(containerName, drainOptions);
         } else {
-            drainAndRemoveTargetedContainer(containerName, drainOptions);
+            drained = drainAndRemoveTargetedContainer(containerName, drainOptions);
+        }
+        if (drained?.state === 'accepted-failed-drain') {
+            console.log(`[restart] ${agentName}: replacing predecessor ${drained.containerId.slice(0, 12)} after its refused drain (exit=${drained.exitCode ?? 'unknown'}${drained.oomKilled ? ', oom-killed' : ''}); the operator accepted possible data loss`);
         }
         clearLivenessState(containerName);
     }

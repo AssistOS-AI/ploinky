@@ -5,10 +5,13 @@ export const WEBTTY_LAUNCH_LIMITS = Object.freeze({
     maxBatchesPerAuthSession: 3,
     maxLaunchRecords: 512,
     ttlMs: 5 * 60_000,
+    attachTtlMs: 60_000,
+    maxAttachRecords: 512,
 });
 
 const SAFE_TARGET_KEYS = Object.freeze(['kind', 'label', 'detail', 'access', 'cwdDisplay']);
 const DISPLAY_LIMITS = Object.freeze({ label: 128, detail: 256, cwdDisplay: 4 * 1024 });
+const TARGET_UNAVAILABLE_REASONS = new Set(['home-unreachable', 'home-read-only']);
 
 function launchError(code, message = code) {
     const error = new Error(message);
@@ -29,7 +32,7 @@ function exactText(value) {
 }
 
 function exactOwner(owner) {
-    const userId = exactText(owner?.userId);
+    const userId = typeof owner?.userId === 'string' ? owner.userId : '';
     const sessionFingerprint = exactText(owner?.sessionFingerprint);
     if (!userId || !sessionFingerprint) throw launchError('WEBTTY_LAUNCH_OWNER_INVALID');
     return Object.freeze({ userId, sessionFingerprint });
@@ -80,7 +83,28 @@ function safeTarget(target) {
     if (Object.keys(row).some((key) => !SAFE_TARGET_KEYS.includes(key))) {
         throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
     }
+    if (target.unavailable !== undefined) {
+        // An ineligible profile row is listed with its reason and no launch.
+        if (target.kind !== 'agent' || !TARGET_UNAVAILABLE_REASONS.has(target.unavailable)) {
+            throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
+        }
+        row.unavailable = target.unavailable;
+    }
     return Object.freeze(row);
+}
+
+function safeProfile(profile) {
+    if (profile === null || profile === undefined) return null;
+    const keys = profile && typeof profile === 'object' && !Array.isArray(profile) ? Object.keys(profile).sort() : [];
+    if (keys.join(',') !== 'id,label,provider'
+        || typeof profile.provider !== 'string' || !profile.provider
+        || typeof profile.id !== 'string' || !profile.id
+        || typeof profile.label !== 'string' || !profile.label
+        || /[\u0000-\u001f\u007f]/.test(profile.label)
+        || Buffer.byteLength(profile.label, 'utf8') > DISPLAY_LIMITS.label) {
+        throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
+    }
+    return Object.freeze({ provider: profile.provider, id: profile.id, label: profile.label });
 }
 
 function cloneInternal(value) {
@@ -115,12 +139,51 @@ export class WebttyLaunchRecordStore {
         this.limits = Object.freeze({ ...WEBTTY_LAUNCH_LIMITS, ...limits });
         this.batches = new Map();
         this.launches = new Map();
+        this.attachments = new Map();
     }
 
     cleanupExpired(now = this.now()) {
         for (const batch of [...this.batches.values()]) {
             if (batch.expiresAt <= now) this.removeBatch(batch);
         }
+        for (const [id, record] of this.attachments) {
+            if (record.expiresAt <= now) this.attachments.delete(id);
+        }
+    }
+
+    // `supersedes` optionally names the view an explicit recovery replaces.
+    // Only its format is checked here; the session manager decides whether
+    // the claim applies when the single-use record is consumed.
+    createAttachment({ owner, routeBinding, sessionId, supersedes = null } = {}) {
+        this.cleanupExpired();
+        if (this.attachments.size >= this.limits.maxAttachRecords) throw launchError('WEBTTY_LAUNCH_QUOTA');
+        if (!/^[A-Za-z0-9_-]{32}$/.test(sessionId)) throw launchError('WEBTTY_SESSION_NOT_FOUND');
+        if (supersedes !== null && (typeof supersedes !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(supersedes))) {
+            throw launchError('WEBTTY_ATTACH_CLAIM_INVALID');
+        }
+        const record = Object.freeze({
+            id: this.mintUniqueId(this.attachments, this.launches, this.batches),
+            owner: exactOwner(owner),
+            routeBinding: exactRouteBinding(routeBinding),
+            sessionId,
+            supersedes,
+            expiresAt: this.now() + this.limits.attachTtlMs,
+        });
+        this.attachments.set(record.id, record);
+        return Object.freeze({ attach: record.id, expiresAt: record.expiresAt });
+    }
+
+    consumeAttachment({ attach, owner, routeBinding } = {}) {
+        this.cleanupExpired();
+        const record = this.attachments.get(exactText(attach));
+        try {
+            if (!record || !ownerMatches(record.owner, exactOwner(owner))
+                || !routeMatches(record.routeBinding, exactRouteBinding(routeBinding))) {
+                throw launchError('WEBTTY_ATTACH_NOT_FOUND');
+            }
+        } catch (_) { throw launchError('WEBTTY_ATTACH_NOT_FOUND'); }
+        this.attachments.delete(record.id);
+        return record;
     }
 
     removeBatch(batch) {
@@ -149,6 +212,7 @@ export class WebttyLaunchRecordStore {
         routeBinding: routeBindingInput,
         targets,
         agentTargetsAvailable = true,
+        profile = null,
     } = {}) {
         const now = this.now();
         this.cleanupExpired(now);
@@ -161,11 +225,21 @@ export class WebttyLaunchRecordStore {
         }
         const directory = canonicalDirectory(targets);
         const rows = targets.map(safeTarget);
+        const responseProfile = safeProfile(profile);
+        // With a profile, every launchable record binds that profile and its
+        // per-target HOME; without one, records are exactly as before.
+        for (const target of targets) {
+            if (target.unavailable !== undefined) continue;
+            if (responseProfile ? !target.home : target.home !== undefined) {
+                throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
+            }
+        }
+        const launchable = targets.filter((target) => target.unavailable === undefined).length;
         const prior = this.sessionBatches(owner);
         const evictionCount = Math.max(0, prior.length - this.limits.maxBatchesPerAuthSession + 1);
         const evictions = prior.slice(0, evictionCount);
         const evictedLaunches = evictions.reduce((total, batch) => total + batch.launchIds.length, 0);
-        if (this.launches.size - evictedLaunches + targets.length > this.limits.maxLaunchRecords) {
+        if (this.launches.size - evictedLaunches + launchable > this.limits.maxLaunchRecords) {
             throw launchError('WEBTTY_LAUNCH_QUOTA');
         }
         const id = this.mintUniqueId(this.batches, this.launches);
@@ -184,6 +258,10 @@ export class WebttyLaunchRecordStore {
         const responseTargets = [];
         const stagedLaunches = [];
         for (let index = 0; index < targets.length; index += 1) {
+            if (targets[index].unavailable !== undefined) {
+                responseTargets.push(rows[index]);
+                continue;
+            }
             const launchId = this.mintUniqueId(this.batches, this.launches, reservedIds);
             reservedIds.add(launchId);
             const record = Object.freeze({
@@ -194,7 +272,9 @@ export class WebttyLaunchRecordStore {
                 directory,
                 createdAt: now,
                 expiresAt,
-                target: cloneInternal(targets[index]),
+                target: cloneInternal(responseProfile
+                    ? { ...targets[index], profile: responseProfile }
+                    : targets[index]),
             });
             stagedLaunches.push([launchId, record]);
             batch.launchIds.push(launchId);
@@ -210,6 +290,7 @@ export class WebttyLaunchRecordStore {
             directory,
             expiresAt,
             agentTargetsAvailable: agentTargetsAvailable === true,
+            ...(responseProfile ? { profile: responseProfile } : {}),
             targets: Object.freeze(responseTargets),
         });
     }
@@ -269,6 +350,9 @@ export class WebttyLaunchRecordStore {
         for (const batch of [...this.batches.values()]) {
             if (batch.owner.sessionFingerprint === fingerprint && this.removeBatch(batch)) removed += 1;
         }
+        for (const [id, record] of this.attachments) {
+            if (record.owner.sessionFingerprint === fingerprint) this.attachments.delete(id);
+        }
         return removed;
     }
 
@@ -283,6 +367,9 @@ export class WebttyLaunchRecordStore {
         for (const batch of [...this.batches.values()]) {
             if (routeMatches(batch.routeBinding, routeBinding) && this.removeBatch(batch)) removed += 1;
         }
+        for (const [id, record] of this.attachments) {
+            if (routeMatches(record.routeBinding, routeBinding)) this.attachments.delete(id);
+        }
         return removed;
     }
 
@@ -295,13 +382,17 @@ export class WebttyLaunchRecordStore {
                 && !routeMatches(batch.routeBinding, current)
                 && this.removeBatch(batch)) removed += 1;
         }
+        for (const [id, record] of this.attachments) {
+            if (record.routeBinding.host === current.host && record.routeBinding.hostRouteKey === current.hostRouteKey
+                && !routeMatches(record.routeBinding, current)) this.attachments.delete(id);
+        }
         return removed;
     }
 
     hasAuthSession(sessionFingerprint) {
         this.cleanupExpired();
         const fingerprint = exactText(sessionFingerprint);
-        return Boolean(fingerprint && [...this.batches.values()].some(
+        return Boolean(fingerprint && [...this.batches.values(), ...this.attachments.values()].some(
             (batch) => batch.owner.sessionFingerprint === fingerprint,
         ));
     }

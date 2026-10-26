@@ -11,7 +11,7 @@ import path from 'node:path';
 
 import { BOX_HARDWARE_MARKER_PATH, BOX_HARDWARE_STORE_PATH, BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { createHardwareGateStore } from '../../ploinky-box/hardwareLimitsGate.mjs';
-import { BOX_CONTRACT_INSPECT, ID, INSPECT, assertWorkspace, canonicalDigest, checkedJson, jsonDigest, observeEngineFacts } from './liveCommon.mjs';
+import { BOX_CONTRACT_INSPECT, ID, INSPECT, assertAuthDisabledAnswer, assertWorkspace, canonicalDigest, checkedJson, jsonDigest, observeEngineFacts } from './liveCommon.mjs';
 import {
     C5_DRIVER_NAME, createC5Intent, driverSettled, productEngineDigest, productTransitionIds, readDriverReceipt, reconcileC5Custody, sameImage,
 } from './liveBoxTransitionCustody.mjs';
@@ -22,6 +22,9 @@ import {
 
 export const WRITER_FIRST_CODE = 'PLOINKY_BOX_HARDWARE_LIMITS_STORED';
 const LOGIN = { path: '/auth/login', headers: { accept: 'text/html' } };
+
+// The replacement's Router must give the auth-less fixture's own /auth/login answer; the validator is shared with LIVE-C3V.
+export { assertAuthDisabledAnswer };
 
 // The driver's one stdout line, or null when it printed none.
 export function parseDriverSummary(result) {
@@ -57,7 +60,7 @@ export function assertWriterFirstRefusal(result, summary) {
 
 export function createLifecycle({ profile, run, command, engine, inspectBox, persist, artifactPath, http, sleep, polling, routerPolling = polling, fail, adminState, setLimits, hostClear, view, agentRef }) {
     const identity = () => assertWorkspace(profile);
-    const gateEnabled = () => createHardwareGateStore({ homeDirectory: profile.host.home }).read(identity())?.enabled ?? null;
+    const gateEnabled = () => createHardwareGateStore().read(identity())?.enabled ?? null;
     const startDeadline = () => (Number.isInteger(run.deadlines?.startMs) ? run.deadlines.startMs : 1200000);
     const preInventory = () => (run.preInventory?.containers || []).map(value => value.id);
 
@@ -228,11 +231,13 @@ export function createLifecycle({ profile, run, command, engine, inspectBox, per
         if (wrong.length) throw fail(`The replacement Box ${String(current.id).slice(0, 12)} is not the gate-off generation the transition committed (${wrong.join(', ')})`, { checks, labels: Object.keys(labels).sort(), destinations });
         // The Router of the replacement answers as a browser's address would reach it.
         const login = await http({ port: run.ports.tcp, path: LOGIN.path, headers: LOGIN.headers });
-        if (login?.status !== 303) throw fail('The replacement Box\'s Router does not answer /auth/login with HTTP 303', { status: login?.status ?? null, error: login?.error ?? null });
+        const loginProblem = assertAuthDisabledAnswer(login);
+        if (loginProblem) throw fail(loginProblem, { status: login?.status ?? null, contentType: login?.contentType ?? null, error: login?.error ?? null, truncated: login?.truncated ?? null });
+        const routerBody = JSON.parse(login.body);
         const host = await view(identity(), 'host', 'after the committed transition');
         if (host.count !== 0 || host.barrier || host.lock) throw fail('The store is not empty and free after the committed transition', { count: host.count, barrier: host.barrier, lock: host.lock });
         if (tokenKey(host.token) !== tokenKey(token)) throw fail('The host store is not at the stamp T after the committed transition', { stamp: token, now: host.token });
-        return { id: current.id, created: current.created, checks, router: login.status, gate: false, store: { token: host.token, count: host.count, barrier: null }, publications: contract.publications };
+        return { id: current.id, created: current.created, checks, router: { status: login.status, contentType: login.contentType, ok: routerBody.ok, error: routerBody.error }, gate: false, store: { token: host.token, count: host.count, barrier: null }, publications: contract.publications };
     }
 
     return { restartOn, writerFirst, clearAfterRefusal, transitionFirst, internals: { capture, listIds, inspectExact, engineFacts, finalGeneration, inspectFull } };

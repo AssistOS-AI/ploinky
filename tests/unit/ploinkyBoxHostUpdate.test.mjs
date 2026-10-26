@@ -31,14 +31,15 @@ test('host source update uses one canonical source lock and releases it after th
     const events = [];
     try {
         fs.symlinkSync(root, alias, 'dir');
+        fs.mkdirSync(path.join(root, '.git'));
         const expected = hostSourceLockIdentity(root);
         assert.deepEqual(hostSourceLockIdentity(alias), expected);
         const result = await updateHostPloinkySource({
             repositoryRoot: alias,
             updateScopeRoot: root,
             lockManager: {
-                async acquire(identity) {
-                    events.push(['acquire', identity]);
+                async acquireAt(lockPath, identity) {
+                    events.push(['acquire', identity, lockPath]);
                     return {
                         assertHeld(value) { events.push(['held', value]); },
                         release() { events.push(['release', identity]); },
@@ -54,6 +55,8 @@ test('host source update uses one canonical source lock and releases it after th
         assert.equal(result.canonicalRoot, fs.realpathSync.native(root));
         assert.deepEqual(events.map((entry) => entry[0]), ['acquire', 'held', 'update', 'release']);
         assert.equal(events[0][1], expected.lockIdentity);
+        assert.equal(events[0][2], path.join(expected.canonicalRoot, '.git', 'ploinky-source.lock'),
+            'the source lock lives in the checkout git directory');
         assert.equal(events[2][1].repoPath, expected.canonicalRoot);
         assert.equal(events[2][1].updateScopePath, expected.canonicalRoot);
         assert.equal(events[2][1].interactiveSession, false);
@@ -69,6 +72,7 @@ test('host source update uses one canonical source lock and releases it after th
 test('host source update releases its lock on failure and rejects skipped updates', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-host-update-failure-'));
     try {
+        fs.mkdirSync(path.join(root, '.git'));
         const dirty = { outcome: 'skipped', code: 'dirty-worktree', reason: 'uncommitted changes are present' };
         for (const updateSelf of [
             () => { throw new Error('pull failed'); },
@@ -80,7 +84,7 @@ test('host source update releases its lock on failure and rejects skipped update
                 repositoryRoot: root,
                 updateScopeRoot: root,
                 lockManager: {
-                    async acquire() {
+                    async acquireAt() {
                         return {
                             assertHeld() {},
                             release() { released = true; },
@@ -109,7 +113,7 @@ test('host source update pulls its configured upstream and is idempotent', async
         stdio: ['ignore', 'pipe', 'pipe'],
     });
     const lockManager = {
-        async acquire(identity) {
+        async acquireAt(lockPath, identity) {
             return {
                 assertHeld(value) { assert.equal(value, identity); },
                 release() {},
@@ -253,7 +257,7 @@ test('workspace Ploinky Git config is delegated without executing host hooks or 
         const result = await updateWorkspacePloinkySource({
             identity: { workspaceRoot, instance: 'fixture' }, lock: { assertHeld() {} },
             repositoryRoot: hostSource, updateScopeRoot: workspaceRoot,
-            sourceLockManager: { acquire() { throw new Error('host source mutation forbidden'); } },
+            sourceLockManager: { acquireAt() { throw new Error('host source mutation forbidden'); } },
         });
         assert.equal(result.deferredToCore, true);
         assert.equal(result.delegatedBoxRepoPath, checkout);

@@ -22,6 +22,7 @@ import {
     normalizeBoxAgentLib,
 } from '../contract/agentlib.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
+import { checkoutShadowArgs, checkoutShadowMount } from '../contract/checkoutAlias.mjs';
 import { normalizeImageId } from '../contract/image-id.mjs';
 import { PASTA_IPV4_NETWORK } from '../contract/network.mjs';
 import {
@@ -31,6 +32,7 @@ import {
     boxWorkspaceVolume,
 } from '../contract/workspace-root.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { hostStateMaskArgs } from '../hostState/root.mjs';
 import {
     PUBLIC_ROUTER_HOSTS_ENV,
     serializePublicRouterHosts,
@@ -97,6 +99,9 @@ function tmpfsCreateArgument() {
 export function containerCreateArgs({
     identity,
     dataFingerprints,
+    // The confined data-path sources (hostState/confinement.mjs); a caller
+    // that has not resolved them renders the identity's own paths.
+    dataSources = identity?.dataPaths,
     agentLib,
     imageId,
     imageRef,
@@ -180,7 +185,12 @@ export function containerCreateArgs({
         // The selected workspace keeps its host path inside the Box, which is
         // also the Box working directory and its reserved workspace root.
         '--volume', boxWorkspaceVolume(workspaceRoot),
-        ...workspaceDataMountArgs(identity),
+        // Read-only binds over the writable workspace bind, so rendered after
+        // it: the empty mask over the host state directory, and the shadow of
+        // the invoking checkout when it lies inside the workspace.
+        ...hostStateMaskArgs(workspaceRoot),
+        ...checkoutShadowArgs(checkoutShadowMount(workspaceRoot, source)),
+        ...workspaceDataMountArgs(identity, dataSources),
         ...gpuArgs.volumes,
         ...hardwareArgs.volumes,
         // The AgentLib binds come last so the read-only alias shadow lands on

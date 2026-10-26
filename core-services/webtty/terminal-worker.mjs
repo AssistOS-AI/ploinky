@@ -5,23 +5,21 @@ import { assertExactShellEnvironment } from './environment.mjs';
 import { loadImmutableNodePty } from './native-runtime.mjs';
 import {
     capturePtyProcessIdentity,
+    cleanupPtySession,
     processIdentityError,
-    signalVerifiedPtyProcessGroup,
-    waitForPtyProcessExit,
 } from './process-identity.mjs';
 import {
     WEBTTY_PROTOCOL_LIMITS,
     validateRouterToWorkerMessage,
     workerMessage,
 } from './worker-protocol.mjs';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const MAX_QUEUED_IPC_BYTES = 256 * 1024;
 const MAX_PENDING_OUTPUT_BYTES = 128 * 1024;
 const IDENTITY_WAIT_MS = 500;
-const TERMINATION_GRACE_MS = 750;
-const FORCE_GRACE_MS = 500;
 const EXIT_SEND_GRACE_MS = 100;
 
 function validateInvocation(argv) {
@@ -30,6 +28,12 @@ function validateInvocation(argv) {
         error.code = 'WEBTTY_WORKER_INVOCATION_INVALID';
         throw error;
     }
+}
+
+function directoryIdentity(absolutePath) {
+    const stat = fs.statSync(absolutePath, { bigint: true });
+    if (!stat.isDirectory()) throw new Error('profile home is not a directory');
+    return { dev: String(stat.dev), ino: String(stat.ino) };
 }
 
 function delay(milliseconds) {
@@ -61,21 +65,23 @@ export class TerminalWorker {
         // dynamic value is its trusted workspace root.
         workspaceRoot = processApi.env?.PLOINKY_WORKSPACE_ROOT,
         resolveDirectory = (requested) => resolveWorkspaceDirectory(requested, { workspaceRoot }),
-        assertShellEnv = (environment) => assertExactShellEnvironment(environment, { workspaceRoot }),
+        assertShellEnv = (environment, options = {}) => (
+            assertExactShellEnvironment(environment, { ...options, workspaceRoot })
+        ),
+        readDirectoryIdentity = directoryIdentity,
         loadNodePty = loadImmutableNodePty,
         capturePtyIdentityImpl = capturePtyProcessIdentity,
-        signalGroupImpl = signalVerifiedPtyProcessGroup,
-        waitForExitImpl = waitForPtyProcessExit,
+        cleanupSessionImpl = cleanupPtySession,
         delayImpl = delay,
         identityWaitMs = IDENTITY_WAIT_MS,
     } = {}) {
         this.processApi = processApi;
         this.resolveDirectory = resolveDirectory;
         this.assertShellEnv = assertShellEnv;
+        this.readDirectoryIdentity = readDirectoryIdentity;
         this.loadNodePty = loadNodePty;
         this.capturePtyIdentityImpl = capturePtyIdentityImpl;
-        this.signalGroupImpl = signalGroupImpl;
-        this.waitForExitImpl = waitForExitImpl;
+        this.cleanupSessionImpl = cleanupSessionImpl;
         this.delayImpl = delayImpl;
         this.identityWaitMs = identityWaitMs;
         this.terminalId = '';
@@ -90,6 +96,7 @@ export class TerminalWorker {
         this.pty = null;
         this.ptyIdentity = null;
         this.ptyExited = false;
+        this.nativeExit = null;
         this.cleanupPromise = null;
         this.requestedExitCategory = 'worker-error';
         this.cleanupUnprovenReported = false;
@@ -177,7 +184,27 @@ export class TerminalWorker {
         this.terminalId = message.terminalId;
         validateRouterToWorkerMessage(message, { initialized: false, expectedTerminalId: this.terminalId });
         this.initialized = true;
-        const shellEnv = this.assertShellEnv(message.shellEnv);
+        let shellEnv;
+        if (Object.hasOwn(message, 'homeRelative')) {
+            try {
+                // A profile HOME is revalidated here, immediately before the
+                // spawn, exactly like the cwd: same path inside the workspace,
+                // same directory identity, and the shell's HOME is that path.
+                const home = this.resolveDirectory(message.homeRelative);
+                const identity = this.readDirectoryIdentity(home.absolutePath);
+                if (!home.relativePath || identity.dev !== message.homeIdentity.dev
+                    || identity.ino !== message.homeIdentity.ino) {
+                    throw new Error('profile home changed');
+                }
+                shellEnv = this.assertShellEnv(message.shellEnv, { home: home.absolutePath });
+            } catch (_) {
+                this.sendError('home-validation');
+                await this.cleanup('worker-error');
+                return;
+            }
+        } else {
+            shellEnv = this.assertShellEnv(message.shellEnv);
+        }
         let cwd;
         try {
             // This is the authoritative worker-side revalidation performed
@@ -230,15 +257,13 @@ export class TerminalWorker {
     handlePtyExit(event = {}) {
         if (this.ptyExited) return;
         this.ptyExited = true;
-        const exitCode = Number.isSafeInteger(event.exitCode) ? event.exitCode : null;
-        const signal = Number.isSafeInteger(event.signal) ? event.signal : null;
+        this.nativeExit = {
+            exitCode: Number.isSafeInteger(event.exitCode) ? event.exitCode : null,
+            signal: Number.isSafeInteger(event.signal) ? event.signal : null,
+        };
         let category = this.closing ? this.requestedExitCategory : 'clean';
-        if (!this.closing && signal) category = 'signal';
-        if (!this.exitSent) {
-            this.exitSent = true;
-            this.send('exit', { exitCode, signal, category });
-        }
-        void this.cleanup(category, { ptyAlreadyExited: true });
+        if (!this.closing && this.nativeExit.signal) category = 'signal';
+        void this.cleanup(category);
     }
 
     handleMessage(raw) {
@@ -283,55 +308,38 @@ export class TerminalWorker {
         }
     }
 
-    cleanup(category, { ptyAlreadyExited = false } = {}) {
+    cleanup(category) {
         if (this.cleanupPromise) return this.cleanupPromise;
         this.closing = true;
         this.requestedExitCategory = category;
-        this.cleanupPromise = this.performCleanup(category, { ptyAlreadyExited });
+        this.cleanupPromise = this.performCleanup(category);
         return this.cleanupPromise;
     }
 
-    async performCleanup(category, { ptyAlreadyExited }) {
-        // This proves the recorded shell/session leader has exited. The Router
-        // separately verifies that no process remains in the recorded Linux
-        // terminal session before deleting durable recovery evidence.
-        let cleanupProven = Boolean(ptyAlreadyExited || this.ptyExited);
-        let safeToDispose = cleanupProven;
-        if (this.pty && !this.ptyIdentity && !cleanupProven) this.reportCleanupUnproven();
-        if (this.pty && this.ptyIdentity && !ptyAlreadyExited && !this.ptyExited) {
+    async performCleanup(category) {
+        // Native exit proves only shell exit. Session cleanup precedes the one
+        // terminal-exit message; the Router independently confirms reclamation.
+        let cleanupProven = !this.pty;
+        if (this.pty && this.ptyIdentity) {
             try {
-                this.signalGroupImpl(this.ptyIdentity, 'SIGTERM');
-                const exited = await this.waitForExitImpl(this.ptyIdentity, { timeoutMs: TERMINATION_GRACE_MS });
-                cleanupProven = exited;
-                if (!exited) {
-                    this.signalGroupImpl(this.ptyIdentity, 'SIGKILL');
-                    cleanupProven = await this.waitForExitImpl(this.ptyIdentity, { timeoutMs: FORCE_GRACE_MS });
-                    if (!cleanupProven) this.reportCleanupUnproven();
-                }
-            } catch (error) {
-                if (error?.code === 'WEBTTY_PROCESS_IDENTITY_STALE') cleanupProven = true;
-                else {
-                    this.sendError('cleanup');
-                    this.reportCleanupUnproven();
-                }
+                cleanupProven = await this.cleanupSessionImpl(this.ptyIdentity);
+            } catch (_) {
+                this.sendError('cleanup');
             }
         }
-        if (this.ptyExited) {
-            cleanupProven = true;
-            safeToDispose = true;
-        }
+        if (!cleanupProven) this.reportCleanupUnproven();
         // If identity became ambiguous, exiting the worker closes the PTY
         // master. A stale identity proves that the original process is gone,
         // but does not make node-pty's stored numeric PID safe for dispose().
-        if (safeToDispose) {
+        if (this.ptyExited) {
             try { this.pty?.dispose?.(); } catch (_) { }
         }
         if (!this.exitSent && this.terminalId) {
             this.exitSent = true;
             this.send('exit', {
-                exitCode: null,
-                signal: null,
-                category: ['requested', 'parent-disconnect', 'protocol-error'].includes(category)
+                exitCode: this.nativeExit?.exitCode ?? null,
+                signal: this.nativeExit?.signal ?? null,
+                category: ['requested', 'parent-disconnect', 'protocol-error', 'clean', 'signal'].includes(category)
                     ? category
                     : 'worker-error',
             });

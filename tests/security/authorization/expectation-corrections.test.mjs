@@ -252,6 +252,7 @@ async function terminalWorld({ deleteWorks = true, consumeRemovesBatch = true } 
     const fixture = { directory: 'authz-term-test-terminal', host };
     const discoveries = new Map();
     const sessions = new Set();
+    const views = new Map();
     let counter = 0;
     const id = (prefix) => `${prefix}${String(++counter).padStart(32 - prefix.length, 'x')}`;
     const handler = async (actor, { method = 'GET', path: p, body, stream }) => {
@@ -275,14 +276,27 @@ async function terminalWorld({ deleteWorks = true, consumeRemovesBatch = true } 
             const found = [...discoveries].find(([, launch]) => launch === body.launch);
             if (!found) return response(404, { ok: false, error: 'not_found' });
             if (consumeRemovesBatch) discoveries.delete(found[0]);
+            // The create body is exactly {launch, cols, rows, closePolicy}; the response carries a server view.
+            if (Object.keys(body).sort().join() !== 'closePolicy,cols,launch,rows' || !['keep', 'stop'].includes(body.closePolicy)) {
+                return response(400, { ok: false, error: 'invalid_session_request' });
+            }
             const sessionId = id('s');
+            const viewId = id('v');
             sessions.add(sessionId);
-            return response(201, { ok: true, session: { id: sessionId, target: { kind: 'box' } } });
+            views.set(sessionId, viewId);
+            return response(201, { ok: true, session: { id: sessionId, target: { kind: 'box' }, closePolicy: body.closePolicy }, view: { id: viewId } });
         }
-        const session = p.match(/^\/webtty\/sessions\/([^/]+)(\/(stream|input|resize))?$/);
+        const [pathOnly, query = ''] = p.split('?');
+        const session = pathOnly.match(/^\/webtty\/sessions\/([^/]+)(\/(stream|input|resize))?$/);
         if (session) {
             if (denied) return denied;
-            if (session[3] === 'stream') return { status: 200, headers: { 'content-type': 'text/event-stream' }, text: '', json: undefined };
+            if (session[3] === 'stream') {
+                // Streams are bound to the issued view: exactly ?view=<id>.
+                const params = new URLSearchParams(query);
+                if ([...params.keys()].join() !== 'view') return response(400, { ok: false, error: 'invalid_stream_request' });
+                if (params.get('view') !== views.get(session[1])) return response(409, { ok: false, error: 'terminal_view_stale' });
+                return { status: 200, headers: { 'content-type': 'text/event-stream' }, text: '', json: undefined };
+            }
             if (session[3] === 'input') { await fsPromises.writeFile(path.join(host, 'marker.txt'), `${body.data.match(/'(authz-[a-z0-9-]+)'/)[1]}\n`); return response(200, { ok: true }); }
             if (session[3] === 'resize') return response(200, { ok: true });
             if (method === 'DELETE') { sessions.delete(session[1]); return response(200, { ok: true }); }

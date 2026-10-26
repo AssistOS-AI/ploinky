@@ -1329,3 +1329,55 @@ test('worker KILL refuses a PID recycled after TERM grace', async (t) => {
     assert.equal(recovery.category, 'worker_force_revalidation_failed');
     assert.deepEqual(signals, [[201, 'SIGTERM']]);
 });
+
+test('pty-starting recovery rebuilds the exact profile-bearing Podman client argv from durable evidence', async (t) => {
+    const procRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ploinky-webtty-profile-proc-'));
+    t.after(() => fs.rm(procRoot, { recursive: true, force: true }));
+    const profiled = agentStartupEvidence(undefined, {
+        translatedHome: '/data/profiles/p-1/home',
+        profile: { provider: 'provider', id: 'p-1', label: 'Profile One' },
+    });
+    const { translatedHome: _home, profile: _profile, ...plain } = profiled;
+    const argv = ['/usr/bin/podman', ...fixedAgentPodmanArgv(profiled)];
+    assert.equal(argv.includes('HOME=/data/profiles/p-1/home'), true);
+    assert.equal(argv.includes('INPUTRC=/etc/inputrc'), true);
+    await fs.mkdir(path.join(procRoot, '4100'));
+    await fs.writeFile(path.join(procRoot, '4100', 'cmdline'), `${argv.join('\0')}\0`);
+    const observed = {
+        pid: 4100, state: 'S', pgrp: 4100, session: 4100, startToken: 'linux-proc:41000', uid: 1000, cmdline: argv,
+    };
+    assert.equal(agentStartupClientMatches(observed, profiled, 1000), true);
+    // The durable evidence rebuilds the identical client argv, INPUTRC included.
+    assert.deepEqual(['/usr/bin/podman', ...fixedAgentPodmanArgv(JSON.parse(JSON.stringify(profiled)))], argv);
+    // Evidence without the profile would miss this live client entirely.
+    assert.equal(agentStartupClientMatches(observed, plain, 1000), false);
+    const list = (startup) => listExactAgentStartupPodmanClients(startup, 1000, {
+        procRoot, readIdentity: async () => observed,
+    });
+    assert.deepEqual(await list(profiled), [observed]);
+    assert.deepEqual(await list(plain), []);
+
+    // The durable record accepts the profile evidence; no-profile records are unchanged.
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'ploinky-webtty-profile-records-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const store = new RuntimeRecordStore({ directory });
+    const marker = 'worker-marker-abcdefghijklmnopqrstuvwx';
+    const handle = await store.create({
+        routerEpoch: 'router-epoch-abcdefghijklmnop',
+        marker,
+        targetKind: 'agent',
+        target: agentTarget(),
+        worker: workerIdentity(),
+    });
+    assert.equal(await store.markAgentPtyStarting(handle, { ...profiled, marker }), true);
+    assert.deepEqual(handle.record.agentStartup.profile, profiled.profile);
+    const plainHandle = await store.create({
+        routerEpoch: 'router-epoch-abcdefghijklmnop',
+        marker,
+        targetKind: 'agent',
+        target: agentTarget(),
+        worker: workerIdentity(),
+    });
+    assert.equal(await store.markAgentPtyStarting(plainHandle, { ...plain, marker }), true);
+    assert.deepEqual(Object.keys(plainHandle.record.agentStartup).sort(), Object.keys(plain).sort());
+});

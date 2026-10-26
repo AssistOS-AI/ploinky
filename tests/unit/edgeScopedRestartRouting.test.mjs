@@ -27,6 +27,11 @@ const { coordinateReplacementRuntimeIdentity } = await import('../../cli/sandbox
 const { resolveEdgeRoutePlan } = await import('../../cli/server/edgeRoutePlan.js');
 const { dispatchAgentStartupAfterRouterSurfaces } = await import('../../cli/server/agentStartupDispatch.js');
 const { saveAgents } = await import('../../cli/utils/workspace.js');
+const { prepareTargetedAgentRestart, commitTargetedAgentRestart } = await import('../../cli/commands/targetedAgentRestart.js');
+const { withEdgeSelectionObserver } = await import('../../cli/sandbox/edgeSelectionMutations.mjs');
+const { reconcileExactHardwareInstance } = await import('../../cli/sandbox/hardwareLimits/reconcile.mjs');
+const { HardwareLimitsError } = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
+const { refusalOutcome } = await import('./hardwareAvailabilityFixtures.mjs');
 
 test.after(() => {
     for (const [name, value] of Object.entries(previous)) {
@@ -58,7 +63,7 @@ function record(agentName) {
     };
 }
 
-function seedWorkspace() {
+function seedWorkspace({ predecessorId } = {}) {
     fs.rmSync(ploinkyDir, { recursive: true, force: true });
     writeJson(path.join(repoDir, 'agentA', 'manifest.json'), { container: 'node:20-alpine', network: { mode: 'host' } });
     writeJson(path.join(repoDir, 'agentB', 'manifest.json'), { container: 'node:20-alpine' });
@@ -70,7 +75,7 @@ function seedWorkspace() {
     });
     writeJson(path.join(ploinkyDir, 'agents.json'), {
         'agentA-container': record('agentA'),
-        'agentB-container': record('agentB'),
+        'agentB-container': { ...record('agentB'), ...(predecessorId ? { containerId: predecessorId, runtime: 'podman' } : {}) },
     });
     writeJson(path.join(ploinkyDir, 'data', 'edge-routing', 'desired.json'), {
         hosts: { [PUBLIC_HOST]: { agent: 'media/agentB', routerSurfaces: ['browser-auth'] } },
@@ -186,8 +191,49 @@ test('A6 a host-network fixed-port restart withdraws only the restarting agent u
     assert.equal(plan(PUBLIC_HOST, '/auth/login').ok, true);
 });
 
-const { prepareTargetedAgentRestart, commitTargetedAgentRestart } = await import('../../cli/commands/targetedAgentRestart.js');
-const { withEdgeSelectionObserver } = await import('../../cli/sandbox/edgeSelectionMutations.mjs');
+for (const scenario of ['no prior drain', 'wrong accepted ID', 'valid prior refusal']) {
+    test(`scoped targeted restart acceptance: ${scenario}`, async () => {
+        const predecessorId = 'a'.repeat(64);
+        seedWorkspace({ predecessorId });
+        const agentRecord = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }).generation.agents['agentB-container'];
+        const prepare = (acceptedFailedDrain) => withNetworkLifecycleLock((networkLifecycleCapability) => (
+            prepareTargetedAgentRestart({
+                containerName: 'agentB-container', routeKey: 'agentB', repoName: 'media', shortAgentName: 'agentB',
+                record: agentRecord, networkLifecycleCapability, acceptedFailedDrain,
+            }, { mergeRouting() { throw new Error('the scoped transaction must not fall back'); } })
+        ));
+        if (scenario !== 'no prior drain') await prepare(null);
+        const before = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+        const routingBefore = fs.readFileSync(path.join(ploinkyDir, 'routing.json'), 'utf8');
+        const registryBefore = fs.readFileSync(path.join(ploinkyDir, 'agents.json'), 'utf8');
+        const writes = [];
+        const acceptedFailedDrain = { containerId: scenario === 'wrong accepted ID' ? 'b'.repeat(64) : predecessorId };
+        await withEdgeSelectionObserver((entry) => writes.push(entry), async () => {
+            if (scenario === 'valid prior refusal') {
+                const transition = await prepare(acceptedFailedDrain);
+                assert.deepEqual(transition.targetedRestart.acceptedFailedDrain, acceptedFailedDrain);
+                assert.equal(transition.predecessorRoute.draining, undefined);
+            } else {
+                await assert.rejects(prepare(acceptedFailedDrain), scenario === 'no prior drain'
+                    ? /has no refused targeted drain to accept/ : /is not the registered predecessor/);
+            }
+        });
+        const after = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+        if (scenario === 'valid prior refusal') {
+            assert.equal(after.generation.routing.routes.agentB.draining, true);
+            assert.deepEqual(after.generation.agents['agentB-container'], agentRecord);
+            assert.equal(after.selector.state, 'active');
+            assert.deepEqual(after.selector, before.selector, 'accepting an already selected drain is idempotent');
+            assert.ok(writes.every((entry) => entry.after.state === 'active'));
+        } else {
+            assert.deepEqual(after, before, 'rejection preserves the exact selected generation');
+            assert.equal(fs.readFileSync(path.join(ploinkyDir, 'routing.json'), 'utf8'), routingBefore);
+            assert.equal(fs.readFileSync(path.join(ploinkyDir, 'agents.json'), 'utf8'), registryBefore);
+            assert.deepEqual(writes, [], 'rejection must precede every routing selector mutation');
+        }
+        assert.equal(plan(CONTROL_HOST, '/agentA/').target.hostPort, 7880);
+    });
+}
 
 test('W8 a targeted restart drains and reopens its route active to active, keeping its identity', async () => {
     seedWorkspace();
@@ -236,10 +282,6 @@ test('W8 a targeted restart drains and reopens its route active to active, keepi
     assert.equal(reopened.generation.agents['agentB-container'].instanceId, agentRecord.instanceId);
     assert.equal(reopened.selector.publicationState, 'ready');
 });
-
-const { reconcileExactHardwareInstance } = await import('../../cli/sandbox/hardwareLimits/reconcile.mjs');
-const { HardwareLimitsError } = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
-const { refusalOutcome } = await import('./hardwareAvailabilityFixtures.mjs');
 
 function refusedReconcile(withdrawUnavailable) {
     const record = { type: 'agent', repoName: 'media', agentName: 'agentB', instanceId: 'agentB-instance', enableGeneration: 'agentB-generation', containerId: 'a'.repeat(64) };

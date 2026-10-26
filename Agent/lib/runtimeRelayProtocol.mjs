@@ -32,7 +32,11 @@ function restoreFrameData(frame) {
 
 export function encodeRelayFrame(frameOrType, payload, { maxFrameBytes = DEFAULT_MAX_RELAY_FRAME_BYTES } = {}) {
     const body = Buffer.from(JSON.stringify(normalizeFrame(frameOrType, payload)), 'utf8');
-    if (!body.length || body.length > maxFrameBytes) throw new Error(`runtimeRelayProtocol: invalid frame length ${body.length}`);
+    if (!body.length || body.length > maxFrameBytes) {
+        const error = new Error(`runtimeRelayProtocol: invalid frame length ${body.length}`);
+        error.code = 'RELAY_FRAME_TOO_LARGE';
+        throw error;
+    }
     const prefix = Buffer.allocUnsafe(4);
     prefix.writeUInt32BE(body.length, 0);
     return Buffer.concat([prefix, body]);

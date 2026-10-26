@@ -83,7 +83,7 @@ function harness(overrides = {}) {
     const processApi = overrides.processApi || new FakeProcess();
     const terminal = fakePty();
     const spawnCalls = [];
-    const signals = [];
+    const cleanups = [];
     const worker = new TerminalWorker({
         processApi,
         ...(overrides.defaultDirectoryResolver ? {} : {
@@ -100,12 +100,14 @@ function harness(overrides = {}) {
             },
         })),
         capturePtyIdentityImpl: overrides.capturePtyIdentityImpl || (() => PTY_IDENTITY),
-        signalGroupImpl: overrides.signalGroupImpl || ((identity, signal) => signals.push([identity, signal])),
-        waitForExitImpl: overrides.waitForExitImpl || (async () => true),
+        cleanupSessionImpl: async (identity) => {
+            cleanups.push(identity);
+            return overrides.cleanupSessionImpl ? overrides.cleanupSessionImpl(identity) : true;
+        },
         delayImpl: async () => {},
         identityWaitMs: overrides.identityWaitMs ?? 0,
     });
-    return { worker, processApi, terminal, spawnCalls, signals };
+    return { worker, processApi, terminal, spawnCalls, cleanups };
 }
 
 test('one init creates one fixed bash PTY after cwd revalidation and reports evidence', async () => {
@@ -146,12 +148,12 @@ test('output is UTF-8 byte chunked, sequenced, and never precedes ready', async 
     assert.equal(h.processApi.sent[0].type, 'ready');
 });
 
-test('close and parent IPC EOF use verified TERM cleanup and exact-once exit', async () => {
+test('close and parent IPC EOF use session cleanup and exact-once exit', async () => {
     for (const category of ['requested', 'parent-disconnect']) {
         const h = harness();
         await h.worker.initialize(init());
         await h.worker.cleanup(category);
-        assert.deepEqual(h.signals, [[PTY_IDENTITY, 'SIGTERM']]);
+        assert.deepEqual(h.cleanups, [PTY_IDENTITY]);
         assert.equal(h.terminal.state.disposed, 0);
         const exits = h.processApi.sent.filter((message) => message.type === 'exit');
         assert.equal(exits.length, 1);
@@ -160,26 +162,29 @@ test('close and parent IPC EOF use verified TERM cleanup and exact-once exit', a
     }
 });
 
-test('force cleanup revalidates again before SIGKILL', async () => {
-    let waits = 0;
-    const h = harness({ waitForExitImpl: async () => (++waits === 1 ? false : true) });
+test('concurrent close, disconnect and native exit share one pending cleanup', async () => {
+    let finish;
+    const h = harness({ cleanupSessionImpl: () => new Promise((resolve) => { finish = resolve; }) });
     await h.worker.initialize(init());
-    await h.worker.cleanup('requested');
-    assert.deepEqual(h.signals, [
-        [PTY_IDENTITY, 'SIGTERM'],
-        [PTY_IDENTITY, 'SIGKILL'],
-    ]);
-    assert.equal(h.terminal.state.disposed, 0);
+    const first = h.worker.cleanup('requested');
+    assert.equal(h.worker.cleanup('parent-disconnect'), first);
+    h.terminal.state.exitHandler({ exitCode: 0, signal: 9 });
+    h.terminal.state.exitHandler({ exitCode: 1, signal: 1 });
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 0);
+    finish(true);
+    await first;
+    assert.deepEqual(h.cleanups, [PTY_IDENTITY]);
+    const exits = h.processApi.sent.filter((message) => message.type === 'exit');
+    assert.equal(exits.length, 1);
+    assert.equal(exits[0].category, 'requested');
+    assert.equal(exits[0].signal, 9);
 });
 
 test('cleanup reports unproven when the process remains after TERM and KILL waits', async () => {
-    const h = harness({ waitForExitImpl: async () => false });
+    const h = harness({ cleanupSessionImpl: async () => false });
     await h.worker.initialize(init());
     await h.worker.cleanup('requested');
-    assert.deepEqual(h.signals, [
-        [PTY_IDENTITY, 'SIGTERM'],
-        [PTY_IDENTITY, 'SIGKILL'],
-    ]);
+    assert.deepEqual(h.cleanups, [PTY_IDENTITY]);
     assert.equal(h.terminal.state.disposed, 0);
     const cleanupErrorIndex = h.processApi.sent.findIndex(
         (message) => message.type === 'error' && message.category === 'cleanup-unproven',
@@ -189,11 +194,9 @@ test('cleanup reports unproven when the process remains after TERM and KILL wait
     assert.ok(cleanupErrorIndex < exitIndex, 'Router must receive ambiguity before the worker exit');
 });
 
-test('cleanup revalidation ambiguity emits cleanup-unproven and never force-signals', async () => {
-    const signals = [];
+test('cleanup revalidation ambiguity emits cleanup-unproven once', async () => {
     const h = harness({
-        signalGroupImpl: (identity, signal) => {
-            signals.push([identity, signal]);
+        cleanupSessionImpl: () => {
             const error = new Error('identity changed');
             error.code = 'WEBTTY_PROCESS_IDENTITY_UNPROVEN';
             throw error;
@@ -201,7 +204,7 @@ test('cleanup revalidation ambiguity emits cleanup-unproven and never force-sign
     });
     await h.worker.initialize(init());
     await h.worker.cleanup('requested');
-    assert.equal(signals.length, 1);
+    assert.equal(h.cleanups.length, 1);
     assert.equal(h.terminal.state.disposed, 0);
     assert.equal(
         h.processApi.sent.filter((message) => message.type === 'error' && message.category === 'cleanup-unproven').length,
@@ -209,11 +212,9 @@ test('cleanup revalidation ambiguity emits cleanup-unproven and never force-sign
     );
 });
 
-test('stale identity proves the original process gone without invoking native dispose', async () => {
-    let signalAttempts = 0;
+test('stale shell identity alone does not prove session cleanup', async () => {
     const h = harness({
-        signalGroupImpl: () => {
-            signalAttempts += 1;
+        cleanupSessionImpl: () => {
             const error = new Error('original process gone or pid reused');
             error.code = 'WEBTTY_PROCESS_IDENTITY_STALE';
             throw error;
@@ -221,11 +222,11 @@ test('stale identity proves the original process gone without invoking native di
     });
     await h.worker.initialize(init());
     await h.worker.cleanup('requested');
-    assert.equal(signalAttempts, 1);
+    assert.equal(h.cleanups.length, 1);
     assert.equal(h.terminal.state.disposed, 0);
     assert.equal(
         h.processApi.sent.some((message) => message.type === 'error' && message.category === 'cleanup-unproven'),
-        false,
+        true,
     );
     assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.category, 'requested');
 });
@@ -240,7 +241,7 @@ test('ambiguous identity never calls a native PID kill helper and reports unprov
     });
     await h.worker.initialize(init());
     assert.equal(h.terminal.state.disposed, 0);
-    assert.equal(h.signals.length, 0);
+    assert.equal(h.cleanups.length, 0);
     assert.equal(
         h.processApi.sent.filter((message) => message.type === 'error' && message.category === 'cleanup-unproven').length,
         1,
@@ -269,16 +270,30 @@ test('cwd and environment failures happen before loading native bytes', async ()
     assert.equal(altered.spawnCalls.length, 0);
 });
 
-test('normal native exit reports once and disposes without group signaling', async () => {
+test('normal native exit checks the whole session before notifying and disposing', async () => {
     const h = harness();
     await h.worker.initialize(init());
     h.terminal.state.exitHandler({ exitCode: 7, signal: 0 });
     await h.worker.cleanupPromise;
-    assert.equal(h.signals.length, 0);
+    assert.deepEqual(h.cleanups, [PTY_IDENTITY]);
     assert.equal(h.terminal.state.disposed, 1);
     assert.deepEqual(h.processApi.sent.filter((message) => message.type === 'exit'), [
         workerMessage('exit', TERMINAL_ID, { exitCode: 7, signal: 0, category: 'clean' }),
     ]);
+});
+
+test('native exit with unproven residue reports ambiguity before its single exit', async () => {
+    let finish;
+    const h = harness({ cleanupSessionImpl: () => new Promise((resolve) => { finish = resolve; }) });
+    await h.worker.initialize(init());
+    h.terminal.state.exitHandler({ exitCode: 7, signal: 0 });
+    assert.equal(h.processApi.sent.some((message) => message.type === 'exit'), false);
+    finish(false);
+    await h.worker.cleanupPromise;
+    const notifications = h.processApi.sent.filter((message) => message.type !== 'ready');
+    assert.deepEqual(notifications.map((message) => message.category), ['cleanup-unproven', 'clean']);
+    assert.equal(notifications[1].exitCode, 7);
+    assert.equal(h.cleanups.length, 1);
 });
 
 test('the worker resolves cwd and validates its shell environment against its own trusted root', async (t) => {
@@ -316,4 +331,100 @@ test('a worker process without a valid trusted workspace root never starts', () 
         assert.equal(processApi.connected, false);
         assert.equal(processApi.listenerCount('message'), 0);
     }
+});
+
+// A real workspace whose root contains spaces: the worker re-resolves the
+// profile HOME inside it immediately before spawning, like the cwd.
+function profileWorkspace(t) {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky webtty worker home '));
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    const root = fs.realpathSync(parent);
+    fs.mkdirSync(path.join(root, 'repo', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.data', 'provider', 'profiles', 'p-1', 'home'), { recursive: true });
+    const homeRelative = '.data/provider/profiles/p-1/home';
+    const home = path.join(root, homeRelative);
+    const identity = () => {
+        const stat = fs.statSync(home, { bigint: true });
+        return { dev: String(stat.dev), ino: String(stat.ino) };
+    };
+    const shellEnv = (homeValue = home) => buildShellEnvironment({}, {
+        workspaceRoot: root,
+        profile: { home: homeValue, provider: 'provider', id: 'p-1', label: 'Profile One' },
+    });
+    const worker = () => {
+        const processApi = new FakeProcess({ env: { PLOINKY_WORKSPACE_ROOT: root } });
+        const terminal = fakePty();
+        const spawnCalls = [];
+        const instance = new TerminalWorker({
+            processApi,
+            loadNodePty: () => ({
+                spawn(shell, args, options) {
+                    spawnCalls.push({ shell, args, options });
+                    return terminal.api;
+                },
+            }),
+            capturePtyIdentityImpl: () => PTY_IDENTITY,
+            cleanupSessionImpl: async () => true,
+            delayImpl: async () => {},
+            identityWaitMs: 0,
+        });
+        return { worker: instance, processApi, spawnCalls };
+    };
+    return { root, home, homeRelative, identity, shellEnv, worker };
+}
+
+test('a profile init spawns the fixed shell with HOME only after the worker revalidates it', async (t) => {
+    const fx = profileWorkspace(t);
+    const h = fx.worker();
+    await h.worker.initialize(init({
+        cwdRelative: 'repo/src',
+        shellEnv: fx.shellEnv(),
+        homeRelative: fx.homeRelative,
+        homeIdentity: fx.identity(),
+    }));
+    assert.equal(h.spawnCalls.length, 1);
+    assert.equal(h.spawnCalls[0].shell, '/bin/bash');
+    assert.deepEqual(h.spawnCalls[0].args, ['--noprofile', '--norc']);
+    assert.equal(h.spawnCalls[0].options.cwd, path.join(fx.root, 'repo', 'src'));
+    assert.deepEqual(h.spawnCalls[0].options.env, fx.shellEnv());
+    assert.equal(h.spawnCalls[0].options.env.HOME, fx.home);
+    assert.equal(h.spawnCalls[0].options.env.INPUTRC, '/etc/inputrc');
+    assert.equal(h.processApi.sent[0].type, 'ready');
+});
+
+test('the worker refuses a replaced, moved or mismatched profile HOME before loading native bytes', async (t) => {
+    const fx = profileWorkspace(t);
+    const original = fx.identity();
+    const cases = [
+        ['identity mismatch', () => ({ homeIdentity: { ...original, ino: String(BigInt(original.ino) + 1n) } })],
+        ['HOME is not the revalidated directory', () => ({ shellEnv: fx.shellEnv(path.join(fx.root, 'repo')) })],
+        ['escaping relative path', () => ({ homeRelative: '../outside' })],
+        ['missing directory', () => ({ homeRelative: '.data/provider/profiles/p-2/home' })],
+        ['workspace root as HOME', () => ({ homeRelative: '.', shellEnv: fx.shellEnv(fx.root) })],
+        ['replaced at the same path', () => {
+            // Keep the original alive so the replacement cannot reuse its inode.
+            fs.renameSync(fx.home, `${fx.home}-previous`);
+            fs.mkdirSync(fx.home);
+            return {};
+        }],
+    ];
+    for (const [name, change] of cases) {
+        const h = fx.worker();
+        let nativeLoads = 0;
+        h.worker.loadNodePty = () => { nativeLoads += 1; throw new Error('must not load'); };
+        await h.worker.initialize(init({
+            cwdRelative: 'repo/src',
+            shellEnv: fx.shellEnv(),
+            homeRelative: fx.homeRelative,
+            homeIdentity: original,
+            ...change(),
+        }));
+        assert.equal(nativeLoads, 0, name);
+        assert.equal(h.spawnCalls.length, 0, name);
+        assert.ok(h.processApi.sent.some((message) => message.type === 'error' && message.category === 'home-validation'), name);
+    }
+    // Profile variables without a revalidated HOME are not the fixed allowlist.
+    const h = fx.worker();
+    await assert.rejects(() => h.worker.initialize(init({ cwdRelative: 'repo/src', shellEnv: fx.shellEnv() })));
+    assert.equal(h.spawnCalls.length, 0);
 });

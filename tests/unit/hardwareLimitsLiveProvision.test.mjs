@@ -13,12 +13,13 @@ import { fileURLToPath } from 'node:url';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { writePrivateJson } from '../hardware-limits/fixtures.mjs';
-import { executeCleanupRun, jsonDigest, liveSourceDigest, runLiveCommand, validateExecutionProfile, validateProfile } from '../hardware-limits/liveHarness.mjs';
+import { executeCleanupRun, jsonDigest, liveSourceDigest, runLiveCommand, validateAuthorization, validateExecutionProfile, validateProfile } from '../hardware-limits/liveHarness.mjs';
 import { FIXTURE_HARDWARE_LIMITS, FIXTURE_REPOSITORY, fixtureContainerName, fixtureManifest, fixturePlan, provisionRun, validateProvisionPlan } from '../hardware-limits/liveFixture.mjs';
 import { admitManifestRuntimeCapabilities, validateManifestRuntimeCapabilities } from '../../cli/sandbox/runtimeCapabilities.js';
 import { deprecatedHardwareDeclarations } from '../../cli/sandbox/hardwareLimits/declaredLimits.mjs';
 import { candidateArgvProblem, candidateOperationsOf, isCandidateArgv } from '../hardware-limits/candidateArgv.mjs';
-import { buildConcreteManifest, summaryPathFor } from '../hardware-limits/liveManifest.mjs';
+import { buildConcreteManifest, plannedCommands, renderSummary, summaryPathFor, validatePins } from '../hardware-limits/liveManifest.mjs';
+import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
 import { ARTIFACT_LIMITS, ARTIFACT_VERSIONS, requiredArtifacts, retainArtifact, stageAndDispatch, writeUstar } from '../hardware-limits/liveStage.mjs';
 import { AGENT_INSPECT, ENGINE_INFO_ARGV, INSPECT, MAX_TAIL_BYTES, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, PS_IDENTITY_FORMAT, boxPsArgv, engineIdentityDigest, engineIdentityFacts, hostRecordPaths, observeEngineIdentity, quarantinePath, workspaceSocketProblem } from '../hardware-limits/liveCommon.mjs';
 import { CRASH_EXIT, FAKE_CONNECTIONS, createFakeSsh, createFakeWorld, evaluateTemplate, fakeEngineInfo, ok, unsupportedFormat, worldState } from '../hardware-limits/fakeLiveEngine.mjs';
@@ -56,7 +57,7 @@ function scratch(t) {
 
 // One fake world: a candidate source, a fake engine binary, a host home, an
 // evidence directory and a concrete manifest built by the real builder.
-function world(t, { block = 'mac-cpu', platform = null, stagedRoot = true, faults = {}, suffix = 'claude' } = {}) {
+function world(t, { block = 'mac-cpu', platform = null, stagedRoot = true, faults = {}, suffix = 'claude', allowHostProcesses } = {}) {
     const root = scratch(t);
     const remote = block === 'apparatus-cpu';
     const directory = name => { const target = path.join(root, name); fs.mkdirSync(target, { recursive: true, mode: 0o700 }); return target; };
@@ -78,6 +79,7 @@ function world(t, { block = 'mac-cpu', platform = null, stagedRoot = true, fault
         schema: 1, host: hostIdentity, node: { path: node, digest: hash(fs.readFileSync(node)) },
         engine: { path: engine, digest: hash(fs.readFileSync(engine)), identityDigest: engineIdentityDigest(fakeEngineInfo(ENGINE_HOST)) }, boxImage: BOX_IMAGE,
         ...(remote ? { ssh: { alias: 'ubuntu-codex', sshBinary: ssh, address: '100.76.22.69', hostKeyAlias: '192.168.1.63', user: 'skutner', knownHosts, identityFile: null } } : { workspaceParentRoot: parentRoot }),
+        ...(allowHostProcesses !== undefined ? { allowHostProcesses } : {}),
     };
     const runId = crypto.randomBytes(16).toString('hex');
     const candidate = { root: source, digest: liveSourceDigest(source), revision: 'c'.repeat(40) };
@@ -123,7 +125,7 @@ function assertNothingOwned(w) {
     assert.deepEqual(Object.keys(state.boxes), []);
     const plan = w.run.target.execution.provision;
     for (const target of [plan.workspace.path, quarantinePath(plan.workspace.path, w.runId), ...(plan.workspace.parentMode === 'create' ? [plan.workspace.parent] : []),
-        ...hostRecordPaths(w.home, w.run.workspace.instance)]) assert.equal(exists(target), false, target);
+        ...hostRecordPaths(plan.workspace.path, w.run.workspace.instance)]) assert.equal(exists(target), false, target);
 }
 
 test('L1.provision-mac-c1-c2-success', async t => {
@@ -155,7 +157,7 @@ test('L1.provision-mac-c1-c2-success', async t => {
     assert.ok(start.path.startsWith(`${path.dirname(w.engine)}:`));
     // Host records the start created are recorded exactly.
     assert.deepEqual(w.run.ownedPaths.filter(entry => entry.role === 'host-record').map(entry => entry.path).sort(),
-        hostRecordPaths(w.home, profile.box.instance).filter(target => exists(target)).sort());
+        hostRecordPaths(plan.workspace.path, profile.box.instance).filter(target => exists(target)).sort());
     // Every receipt was persisted before later work depended on it.
     const index = predicate => writes.findIndex(predicate);
     const receipt = index(run => run.target.execution.workspace !== null);
@@ -377,6 +379,82 @@ test('L1.provision-port-collision-aborts', async t => {
     }
 });
 
+// F: the explicit host-process allowance. A pinned list of PIDs goes into the manifest (so the approval summary shows
+// it and the authorization binding over the manifest bytes covers it) and is forwarded as `--allow-host-process PID`
+// to every candidate command; the product re-verifies each start time. No default, no detection.
+const candidateCalls = (w, calls) => async (binary, args, options) => { if (binary === w.node && isCandidateArgv(args)) calls.push(args); return w.engineProvider(binary, args, options); };
+const allowedWords = pids => pids.flatMap(pid => ['--allow-host-process', String(pid)]);
+
+test('L1.allowance-pin-is-strictly-validated-and-never-defaulted', async t => {
+    const w = world(t);
+    for (const bad of [[], [0], [-1], [1.5], ['12'], [12, 12], [1e10], [Number.MAX_SAFE_INTEGER + 1], 'x', 12, null, Array.from({ length: 17 }, (_, i) => i + 1)]) {
+        assert.throws(() => validatePins({ ...w.pins, allowHostProcesses: bad }, 'mac-cpu'), /pins\.allowHostProcesses must be a list/, JSON.stringify(bad));
+    }
+    // A valid list passes the allowance check and is refused only later, by the fake world's home that is not this host's.
+    assert.throws(() => validatePins({ ...w.pins, allowHostProcesses: [4242, 17] }, 'mac-cpu'), /Pinned host is not this host|Invalid pins/);
+    // Unset: no allowance anywhere, in the profile, the plan or the summary.
+    assert.equal(Object.hasOwn(w.run.target.execution, 'allowHostProcesses'), false);
+    assert.equal(JSON.stringify(w.run.target.plan).includes('--allow-host-process'), false);
+    assert.equal(renderSummary(w.run, '/x/run_claude.json').includes('allow-host-process'), false);
+});
+
+test('L1.allowance-is-in-the-manifest-the-plan-the-summary-and-the-binding-digest', async t => {
+    const plain = world(t);
+    const w = world(t, { allowHostProcesses: [4242, 17] });
+    assert.deepEqual(w.run.target.execution.allowHostProcesses, [4242, 17]);
+    assert.equal(validateProfile(w.run, { partial: true }).allowHostProcesses.length, 2);
+    const planned = candidateOperationsOf(w.run);
+    assert.ok(planned.length >= 4, 'candidate commands are planned');
+    for (const operation of planned) {
+        assert.deepEqual(operation.argv.slice(1, 5), allowedWords([4242, 17]), operation.id);
+        assert.equal(candidateArgvProblem(operation.argv), null, operation.id);
+        assert.deepEqual([...parseOuterArguments(operation.argv.slice(1)).allowHostProcesses], [4242, 17], operation.id);
+    }
+    assert.ok(w.run.target.plan.cleanup.length > 0);
+    const summary = renderSummary(w.run, '/x/run_claude.json');
+    assert.match(summary, /Host-process allowance \| PIDs 4242, 17/);
+    assert.ok(summary.includes('ploinky-box.mjs --allow-host-process 4242 --allow-host-process 17 --port'), 'the fixture start line shows it');
+    // The authorization binds the exact manifest bytes and target: a binding made over `[4242]` refuses the same run
+    // edited to `[4242, 17]`, and one made over the edited run accepts it.
+    const bind = (run, action = 'provision') => {
+        const bytes = Buffer.from(JSON.stringify(run));
+        return { bytes, authorization: { schema: 1, runId: run.runId, manifestDigest: hash(bytes), targetDigest: jsonDigest(run.target), action } };
+    };
+    const one = structuredClone(w.run); one.target.execution.allowHostProcesses = [4242]; one.target.plan = plannedCommands(one);
+    const { bytes: oneBytes, authorization } = bind(one);
+    assert.doesNotThrow(() => validateAuthorization(one, oneBytes, authorization, 'provision'));
+    const two = structuredClone(one); two.target.execution.allowHostProcesses = [4242, 17]; two.target.plan = plannedCommands(two);
+    assert.throws(() => validateAuthorization(two, Buffer.from(JSON.stringify(two)), authorization, 'provision'), /binding does not match/);
+    const bound = bind(two);
+    assert.doesNotThrow(() => validateAuthorization(two, bound.bytes, bound.authorization, 'provision'));
+    const dropped = structuredClone(one); delete dropped.target.execution.allowHostProcesses; dropped.target.plan = plannedCommands(dropped);
+    assert.throws(() => validateAuthorization(dropped, Buffer.from(JSON.stringify(dropped)), authorization, 'provision'), /binding does not match/);
+    // A tampered execution list is refused like any other malformed pin.
+    const tampered = structuredClone(w.run); tampered.target.execution.allowHostProcesses = [4242, 4242];
+    assert.throws(() => validateProfile(tampered, { partial: true }), /allowHostProcesses/);
+});
+
+test('L1.allowance-reaches-every-candidate-command-of-provision-and-cleanup-and-nothing-else', async t => {
+    for (const pids of [undefined, [4242, 17]]) {
+        const w = world(t, { allowHostProcesses: pids });
+        const calls = [];
+        const provider = candidateCalls(w, calls);
+        const report = await provisionRun({ run: w.run, persist: w.persist, processProvider: provider, portProbe: free, hostIdentity: w.hostIdentity, remoteArrival: w.remote, validateProfile });
+        assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
+        const cleaned = await executeCleanupRun({ run: w.run, persist: w.persist, processProvider: provider, hostIdentity: w.hostIdentity, remoteArrival: w.remote });
+        assert.equal(cleaned.verdict, 'PASS', JSON.stringify(w.run.cleanup));
+        assert.ok(calls.some(args => args.includes('start')) && calls.some(args => args.includes('destroy')), 'start and destroy were run');
+        // The journal digests the command line that ran, allowance included.
+        const destroy = w.run.operations.find(op => op.kind === 'destroy-box');
+        assert.equal(destroy.argvDigest, jsonDigest([w.node, ...calls.find(args => args.includes('destroy'))]), 'the journaled digest is of the executed argv');
+        for (const args of calls) {
+            if (pids) assert.deepEqual(args.slice(1, 5), allowedWords(pids), args.join(' '));
+            else assert.equal(args.includes('--allow-host-process'), false, args.join(' '));
+            assert.equal(args.filter(word => word === '--allow-host-process').length, pids ? pids.length : 0, 'forwarded once, not twice');
+        }
+    }
+});
+
 test('L1.provision-refuses-preexisting-workspace', async t => {
     // mac: the task parent already exists with foreign content.
     const w = world(t);
@@ -398,12 +476,16 @@ test('L1.provision-refuses-preexisting-workspace', async t => {
 
 test('L1.provision-refuses-existing-host-record', async t => {
     const w = world(t);
-    const record = hostRecordPaths(w.home, w.run.workspace.instance)[2];
+    const record = hostRecordPaths(w.run.target.execution.provision.workspace.path, w.run.workspace.instance)[2];
     fs.mkdirSync(path.dirname(record), { recursive: true }); fs.writeFileSync(record, '{"foreign":true}');
     const report = await provision(w);
     assert.equal(report.verdict, 'BLOCKED'); assert.match(report.limitations[0], /not task-owned/);
     assert.equal(fs.readFileSync(record, 'utf8'), '{"foreign":true}');
-    assert.equal(exists(w.run.target.execution.provision.workspace.parent), false);
+    // The foreign record's own directories are all that exists: provisioning created nothing beside them.
+    const plan = w.run.target.execution.provision;
+    assert.deepEqual(fs.readdirSync(plan.workspace.parent), [path.basename(plan.workspace.path)]);
+    assert.deepEqual(fs.readdirSync(plan.workspace.path), ['.ploinky-box']);
+    assert.deepEqual(fs.readdirSync(path.join(plan.workspace.path, '.ploinky-box')), [path.basename(path.dirname(record))]);
     assert.deepEqual(worldState(w.statePath).calls.map(call => call.kind), ['info']);
 });
 
@@ -618,28 +700,47 @@ test('L1.cleanup-after-interrupted-provision-without-receipts', async t => {
     }
 });
 
+// Samples the world once, right after the cleanup's host-records step is persisted as complete,
+// which is the moment the record step's own effect (and nothing from the workspace removal) is visible.
+function sampleWhenHostRecordsComplete(w, sample) {
+    const samples = [];
+    const persist = () => {
+        w.persist();
+        if (samples.length === 0 && w.run.cleanup?.steps?.some(entry => entry.id === 'host-records' && entry.state === 'complete')) samples.push(sample());
+    };
+    return { samples, persist };
+}
+
 test('L1.cleanup-removes-exact-recorded-host-records', async t => {
     const w = await provisioned(t);
     const instance = w.run.workspace.instance;
+    const stateDirectory = path.join(w.run.target.execution.provision.workspace.path, '.ploinky-box');
     const recorded = w.run.ownedPaths.filter(entry => entry.role === 'host-record').map(entry => entry.path).sort();
-    assert.deepEqual(recorded, [path.join(w.home, '.ploinky-box', 'hardware-limits', instance), path.join(w.home, '.ploinky-box', 'hardware-limits', `${instance}.json`)]);
-    // Similar names and another instance's records are not ours.
-    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    assert.deepEqual(recorded, [path.join(stateDirectory, 'hardware-limits', instance), path.join(stateDirectory, 'hardware-limits', `${instance}.json`)]);
+    // Similar names and another instance's records are not ours: the record step leaves them in place.
+    const directory = path.join(stateDirectory, 'hardware-limits');
     const neighbours = [`${instance}.json.bak`, `${instance}-copy`, 'ploinky-box-workspace-000000000000.json'].map(name => path.join(directory, name));
     for (const target of neighbours) fs.writeFileSync(target, 'keep');
-    const report = await cleanup(w);
+    const kept = sampleWhenHostRecordsComplete(w, () => neighbours.map(target => exists(target)));
+    const report = await executeCleanupRun({ run: w.run, persist: kept.persist, processProvider: w.engineProvider, hostIdentity: w.hostIdentity, remoteArrival: w.remote });
     assert.equal(report.verdict, 'PASS', JSON.stringify(w.run.cleanup));
     for (const target of recorded) assert.equal(exists(target), false);
-    for (const target of neighbours) assert.equal(fs.readFileSync(target, 'utf8'), 'keep');
+    // The record step removed only the exact recorded names: its neighbours were still there when it completed.
+    assert.deepEqual(kept.samples, [[true, true, true]], 'sampled once, when the host-records step completed');
+    // The workspace removal took the rest afterwards.
+    for (const target of neighbours) assert.equal(exists(target), false, 'removed with the workspace, not by the record step');
+    assert.equal(exists(w.run.target.execution.provision.workspace.path), false);
 });
 
-// O11: a shared host-record directory the run created is removed once empty;
-// one that existed before the run, or that holds anything else, is kept.
+// O11: a host-record directory the run created (inside its own new workspace)
+// is removed once empty; one that holds anything else is kept until the
+// workspace goes.
 test('L1.cleanup-removes-the-host-record-directory-this-run-created-when-empty', async t => {
     const w = world(t);
-    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    const plan = w.run.target.execution.provision;
+    const directory = path.join(plan.workspace.path, '.ploinky-box', 'hardware-limits');
     assert.equal(exists(directory), false, 'the directory is absent before the run');
-    assert.equal(exists(path.join(w.home, '.ploinky-box')), false);
+    assert.equal(exists(plan.workspace.path), false, 'so is the proposed workspace');
     const report = await provision(w);
     assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
     assert.equal(exists(directory), true, 'the start created it');
@@ -650,35 +751,35 @@ test('L1.cleanup-removes-the-host-record-directory-this-run-created-when-empty',
     const result = await cleanup(w);
     assert.equal(result.verdict, 'PASS', JSON.stringify(w.run.cleanup));
     assert.equal(exists(directory), false, 'the run-created, now empty directory is removed');
-    assert.equal(exists(path.join(w.home, '.ploinky-box')), true, 'the shared parent is never removed');
+    assert.equal(exists(path.join(plan.workspace.path, '.ploinky-box')), false, 'the host-state directory left with the workspace');
 });
 
-test('L1.cleanup-keeps-a-host-record-directory-that-existed-before-the-run', async t => {
+test('L1.provision-refuses-a-proposed-workspace-that-already-holds-host-state', async t => {
     const w = world(t);
-    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    const plan = w.run.target.execution.provision;
+    const directory = path.join(plan.workspace.path, '.ploinky-box', 'hardware-limits');
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const report = await provision(w);
-    assert.equal(report.verdict, 'PASS', JSON.stringify(report.limitations));
-    assert.deepEqual(w.run.operations.filter(op => op.kind === 'host-directory-preflight').map(op => [op.directory, op.existed]), [['hardware-limits', true], ['gpu-grants', false], ['router-bindings', false]]);
-    assert.equal(w.run.ownedPaths.some(entry => entry.role === 'host-created-directory'), false);
-    const result = await cleanup(w);
-    assert.equal(result.verdict, 'PASS', JSON.stringify(w.run.cleanup));
-    assert.equal(exists(directory), true, 'a pre-existing directory is kept even though it is empty');
+    assert.notEqual(report.verdict, 'PASS', 'a workspace that is not new is never adopted');
+    assert.equal(exists(directory), true, 'what was already there is left untouched');
     assert.deepEqual(fs.readdirSync(directory), []);
+    assert.equal(w.run.ownedPaths.some(entry => entry.role === 'host-created-directory'), false, 'nothing pre-existing is recorded as ours');
 });
 
 test('L1.cleanup-keeps-a-run-created-host-record-directory-that-holds-something-else', async t => {
     const w = await provisioned(t);
-    const directory = path.join(w.home, '.ploinky-box', 'hardware-limits');
+    const directory = path.join(w.run.target.execution.provision.workspace.path, '.ploinky-box', 'hardware-limits');
     fs.writeFileSync(path.join(directory, 'someone-elses.json'), 'keep');
-    const result = await cleanup(w);
+    const kept = sampleWhenHostRecordsComplete(w, () => fs.readFileSync(path.join(directory, 'someone-elses.json'), 'utf8'));
+    const result = await executeCleanupRun({ run: w.run, persist: kept.persist, processProvider: w.engineProvider, hostIdentity: w.hostIdentity, remoteArrival: w.remote });
     assert.equal(result.verdict, 'PASS', JSON.stringify(w.run.cleanup));
-    assert.equal(fs.readFileSync(path.join(directory, 'someone-elses.json'), 'utf8'), 'keep');
+    assert.deepEqual(kept.samples, ['keep'], 'the record step left the directory and its foreign file in place');
+    assert.equal(exists(directory), false, 'the workspace removal took it');
 });
 
 test('L1.cleanup-refuses-unrecorded-host-record', async t => {
     const w = await provisioned(t);
-    const unrecorded = hostRecordPaths(w.home, w.run.workspace.instance).find(target => target.includes('/router-bindings/') && target.endsWith('.json'));
+    const unrecorded = hostRecordPaths(w.run.target.execution.provision.workspace.path, w.run.workspace.instance).find(target => target.includes('/router-bindings/') && target.endsWith('.json'));
     fs.mkdirSync(path.dirname(unrecorded), { recursive: true }); fs.writeFileSync(unrecorded, '{}');
     const recorded = w.run.ownedPaths.filter(entry => entry.role === 'host-record').map(entry => entry.path);
     const report = await cleanup(w);
@@ -687,7 +788,7 @@ test('L1.cleanup-refuses-unrecorded-host-record', async t => {
     for (const target of recorded) assert.equal(exists(target), true, 'nothing is removed when one record is unrecorded');
     assert.equal(exists(w.run.target.execution.workspace.path), true);
     // A manifest that names a non-exact record is refused outright.
-    w.run.ownedPaths.push({ path: path.join(w.home, '.ploinky-box', 'hardware-limits', 'other.json'), role: 'host-record', type: 'file', uid: 1, dev: '1', ino: '1' });
+    w.run.ownedPaths.push({ path: path.join(w.run.target.execution.provision.workspace.path, '.ploinky-box', 'hardware-limits', 'other.json'), role: 'host-record', type: 'file', uid: 1, dev: '1', ino: '1' });
     assert.throws(() => validateProfile(w.run, { partial: true }), /non-exact host record/);
 });
 
@@ -924,7 +1025,7 @@ test('G1.prepare-live-apparatus-mps-concrete-manifest-and-summary', async t => {
         '## GPU idle gate', 'compute mode is Default', 'a bare PID, UID or name never excludes', 'the runner never changes the compute mode and never signals a foreign process', f.gpuPins.uuid,
         '## GPU operations', 'P1-apply', 'P2-probe-bypass', 'P3-apply-default-change', 'P3-kill-owned-daemon', 'P3-restart-agent', 'P4-control-rw-widen-sm', 'gpu-final-observation',
         '## Images, tools and digests', IMAGE, BOX_IMAGE, f.gpuPins.smi.digest, f.gpuPins.mpsControl.digest, f.gpuPins.mpsServer.digest, profile.gpu.probe.digest,
-        '## Grant and policy records', `~/.ploinky-box/gpu-grants/${run.workspace.instance}.json`, `~/.ploinky-box/hardware-limits/${run.workspace.instance}/`, 'already exists and stays',
+        '## Grant and policy records', `${profile.provision.workspace.path}/.ploinky-box/gpu-grants/${run.workspace.instance}.json`, `${profile.provision.workspace.path}/.ploinky-box/hardware-limits/${run.workspace.instance}/`, 'created inside this run\'s own workspace',
         'Order: gpu-stop-owned-helpers, revalidate-identity, destroy-box, host-records, workspace-removal, verify-absent, gpu-final-observation', 'No case is unsupported on this target.',
     ]) assert.ok(summary.includes(text), text);
     assert.equal(fs.statSync(runPath).mode & 0o077, 0);

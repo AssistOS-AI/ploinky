@@ -6,8 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export function modelGrantInventory(home) {
-    const root = path.join(home, '.ploinky-box', 'gpu-grants'); const entries = [];
+export function modelGrantInventory(workspaceRoot) {
+    const root = path.join(workspaceRoot, '.ploinky-box', 'gpu-grants'); const entries = [];
     const visit = directory => {
         const stat = fs.lstatSync(directory);
         if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('GPU grant inventory directory changed');
@@ -31,10 +31,31 @@ export function modelGrantInventory(home) {
     return entries;
 }
 
+// The inventory of the run workspace's own `.ploinky-box/gpu-grants` without the run's own exact host records: the
+// `<instance>.json` decision record that `gpu revoke` saves and the `<instance>/` subtree, each recorded in
+// `run.ownedPaths` and each still of the recorded kind and owner (a directory: the recorded object). A recorded record
+// that is no longer so stays in the inventory, so it counts as a change. The baseline is taken before that record exists and is never moved.
+export function modelGrantInventoryWithoutOwnRecords(run, workspaceRoot) {
+    const root = path.join(workspaceRoot, '.ploinky-box', 'gpu-grants');
+    const own = [];
+    for (const entry of Array.isArray(run.ownedPaths) ? run.ownedPaths : []) {
+        if (entry.role !== 'host-record' || typeof entry.path !== 'string' || !entry.path.startsWith(`${root}${path.sep}`)) continue;
+        let stat; try { stat = fs.lstatSync(entry.path); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+        // The same rule as cleanup's assertRecordedHostRecord (liveCleanup.mjs): a record file is one regular, singly linked
+        // file of the recorded owner, because the product saves it atomically (temporary file and rename, a new inode) at
+        // `gpu revoke` and again after the start's health check (supervisor.mjs:1179-1184, gpuGrant.mjs:1034-1055); a
+        // record directory is the recorded object (device and inode).
+        if (stat.isSymbolicLink() || stat.uid !== entry.uid) continue;
+        if (entry.type === 'file' ? !stat.isFile() || stat.nlink !== 1 : !stat.isDirectory() || String(stat.dev) !== entry.dev || String(stat.ino) !== entry.ino) continue;
+        own.push(path.relative(root, entry.path));
+    }
+    return modelGrantInventory(workspaceRoot).filter(entry => !own.some(name => entry.path === name || entry.path.startsWith(`${name}${path.sep}`)));
+}
+
 export function assertModelGrantInventory(run, profile) {
     if (profile.model?.profile !== 'apple-cpu') return;
     if (!Array.isArray(run.preInventory.gpuGrants)
-        || JSON.stringify(modelGrantInventory(profile.host.home)) !== JSON.stringify(run.preInventory.gpuGrants)) throw new Error('Unrelated GPU grant inventory changed');
+        || JSON.stringify(modelGrantInventoryWithoutOwnRecords(run, profile.workspace.path)) !== JSON.stringify(run.preInventory.gpuGrants)) throw new Error('Unrelated GPU grant inventory changed');
 }
 
 export const MODEL_HOST_LIMITS = Object.freeze({ memoryLevel: 20, pressure: 2, swapGrowthMiB: 1024, krunkitRssMiB: 9216 });

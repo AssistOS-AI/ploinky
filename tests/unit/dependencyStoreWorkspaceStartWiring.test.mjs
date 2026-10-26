@@ -106,6 +106,7 @@ function startFixture(t) {
         getProfileConfig: () => ({}),
         preflightWorkspaceStartRuntimeCapabilities: () => ({ admissions: ['admitted'], graph, registry, additionalNodes: [] }),
         resetPreinstallRunInProcess: () => {},
+        preflightStartLinkedRepositories: (admitted, options) => { calls.push(['linkPreflight', admitted, options]); return []; },
         acquireSettledWorkspaceMutationLease: async (options) => { calls.push(['acquireLease', options.operation]); return workspaceLease; },
         inspectLiveNoWaitWorkers: () => { calls.push(['inspectStalled']); return stalledNoWaitRuns; },
         releaseWorkspaceStartLock: (lease) => calls.push(['releaseLease', lease === workspaceLease]),
@@ -243,6 +244,31 @@ test('a refused abandoned preparation stops workspace start before any selector,
         assert.equal(names.includes(forbidden), false, `${forbidden} must not run after the refusal`);
     }
     assert.deepEqual(fixture.calls.filter(([name]) => name === 'releaseLease'), [['releaseLease', true]]);
+});
+
+test('workspace start resolves link-install branches over the admitted graph under the lease, before any mutation or launch', async (t) => {
+    const fixture = startFixture(t);
+    const branchPolicy = { branch: 'feature', repoBranches: {}, fallback: 'fail', resetRepos: false };
+    await sandbox(fixture.collaborators)('repo/demo', '8080', { branchPolicy });
+    const names = fixture.calls.map(([name]) => name);
+    const at = names.indexOf('linkPreflight');
+    assert.ok(at > names.indexOf('acquireLease'), 'it runs under the workspace start lease');
+    for (const later of ['retirePreparation', 'inactivate', 'ensureGraphNodesEnabled', 'ensureAgentService']) {
+        assert.ok(names.indexOf(later) > at, `${later} must follow the link-install preflight`);
+    }
+    const [, admitted, options] = fixture.calls[at];
+    assert.ok(admitted.graph.nodes.size > 0 && Array.isArray(admitted.additionalNodes), 'it receives the admitted graph');
+    assert.equal(options.branchPolicy, branchPolicy);
+    assert.equal(options.workspaceRoot, fixture.collaborators.PLOINKY_WORKSPACE_ROOT);
+    // A preflight refusal stops the start before anything mutates or launches.
+    const refused = startFixture(t);
+    refused.collaborators.preflightStartLinkedRepositories = () => { throw new Error('link-install repository Library is on main'); };
+    await assert.rejects(sandbox(refused.collaborators)('repo/demo', '8080', { branchPolicy }), /link-install repository Library is on main/);
+    const refusedNames = refused.calls.map(([name]) => name);
+    for (const forbidden of ['retirePreparation', 'inactivate', 'ensureGraphNodesEnabled', 'ensureAgentService']) {
+        assert.equal(refusedNames.includes(forbidden), false, `${forbidden} must not run after the refusal`);
+    }
+    assert.deepEqual(refused.calls.filter(([name]) => name === 'releaseLease'), [['releaseLease', true]]);
 });
 
 test('workspace start launches each graph runtime with its prepared registry record and the post-provider preparation lease', async (t) => {

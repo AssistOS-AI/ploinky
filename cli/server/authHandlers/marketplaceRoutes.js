@@ -28,6 +28,7 @@ import {
 } from '../noWaitAgentStartupState.js';
 import { collectAgentsSummary } from '../../utils/status.js';
 import { isAdminUser } from '../auth/localService.js';
+import { publishAuthenticatedRequestDecision } from '../auth/authenticatedRequestEvents.mjs';
 import { projectMarketplaceAgent, projectMarketplaceRepository, projectRepositorySource } from './marketplaceProjection.js';
 import { canonicalControlOrigin, verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
@@ -787,6 +788,7 @@ async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
         req.session = session;
         req.sessionId = ssoSessionId;
         req.authMode = 'sso';
+        publishAuthenticatedRequestDecision(req);
         return { ok: true, session };
     }
     if (localSessionId) {
@@ -796,6 +798,7 @@ async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
             req.session = session;
             req.sessionId = localSessionId;
             req.authMode = 'local';
+            publishAuthenticatedRequestDecision(req);
             return { ok: true, session };
         }
     }
@@ -810,6 +813,7 @@ async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
             req.session = session;
             req.sessionId = ssoSessionId;
             req.authMode = 'sso';
+            publishAuthenticatedRequestDecision(req);
             return { ok: true, session };
         }
     }

@@ -1,9 +1,11 @@
 import crypto from 'node:crypto';
+import { isAdminUser } from '../auth/localService.js';
 
 import { assertWebttyWorkspaceRoot } from '../../../core-services/webtty/cwd.mjs';
 import { buildShellEnvironment } from '../../../core-services/webtty/environment.mjs';
 import { WEBTTY_PROTOCOL_LIMITS } from '../../../core-services/webtty/worker-protocol.mjs';
 import {
+    browserPrincipal,
     createBrowserSessionLease,
     requestMatchesBrowserSessionLease,
     subscribeToBrowserSessionInvalidation,
@@ -59,19 +61,23 @@ function reclamationAuditReason(error) {
 }
 
 export const WEBTTY_SESSION_LIMITS = Object.freeze({
-    global: 12,
-    perUser: 6,
-    perAuthSession: 3,
+    global: 24,
+    perUser: 8,
     createWindowMs: 60_000,
     createsPerWindow: 5,
     inputWindowMs: 10_000,
     inputBytesPerWindow: 512 * 1024,
     outputReplayBytes: 1024 * 1024,
-    outputReplayEvents: 512,
-    sseWritableBytes: 256 * 1024,
-    idleLifetimeMs: 10 * 60_000,
-    absoluteLifetimeMs: 60 * 60_000,
+    outputReplayEvents: 8192,
+    viewersPerSession: 8,
+    viewersGlobal: 64,
+    viewerQueueBytes: 1280 * 1024,
+    viewerDrainTimeoutMs: 30_000,
+    idleLifetimeMs: 24 * 60 * 60_000,
+    absoluteLifetimeMs: 7 * 24 * 60 * 60_000,
     authenticationIntervalMs: 5_000,
+    targetUndecidedLimitMs: 120_000,
+    targetValidationDeadlineMs: 10_000,
     // Longest continuous stretch of undecided periodic checks (provider
     // unavailable) an open terminal survives. A provider restart is normally
     // decided again within a few 5 s checks (the Router answers fast 503s
@@ -83,7 +89,16 @@ export const WEBTTY_SESSION_LIMITS = Object.freeze({
     streamDetachGraceMs: 15_000,
     tombstoneLifetimeMs: 5 * 60_000,
     maxTombstones: 256,
+    // Server views: one per create or attach. A view without a stream for
+    // this long no longer holds back a pending stop (it can still reconnect).
+    viewsPerSession: 32,
+    viewReconnectWindowMs: 30_000,
+    closeIntentGraceMs: 30_000,
 });
+
+const CLOSE_POLICIES = new Set(['keep', 'stop']);
+// A wider cleanup-failure scope always wins over a narrower one.
+const CLEANUP_FAILURE_SCOPE_RANK = Object.freeze({ target: 1, provider: 2, global: 3 });
 
 function randomId(bytes = 24) {
     return crypto.randomBytes(bytes).toString('base64url');
@@ -104,15 +119,23 @@ function routeBinding(routePlan) {
 
 function bindingMatches(left, right) {
     return left.host === right.host
-        && left.hostRouteKey === right.hostRouteKey
-        && left.generation === right.generation
-        && left.activationId === right.activationId;
+        && left.hostRouteKey === right.hostRouteKey;
 }
 
 function errorWithCode(code, message = code) {
     const error = new Error(message);
     error.code = code;
     return error;
+}
+
+function displayText(value, maxBytes, fallback = '') {
+    const source = String(value || fallback).replace(/[\u0000-\u001f\u007f]/g, ' ');
+    let text = '';
+    for (const character of source) {
+        if (Buffer.byteLength(text + character) > maxBytes) break;
+        text += character;
+    }
+    return text;
 }
 
 export class WebttySessionManager {
@@ -125,6 +148,8 @@ export class WebttySessionManager {
         }),
         launchStore = new WebttyLaunchRecordStore(),
         targetResolver = null,
+        homeProfiles = null,
+        capturePlan = null,
         agentProviderAvailable = false,
         workspaceRoot,
         auth = DEFAULT_AUTH_ADAPTER,
@@ -142,11 +167,16 @@ export class WebttySessionManager {
         this.auth = Object.freeze({ ...DEFAULT_AUTH_ADAPTER, ...auth });
         this.now = now;
         this.audit = audit;
+        this.capturePlan = capturePlan;
+        this.homeProfiles = homeProfiles;
+        this.validationStartIndex = 0;
         this.routerEpoch = randomId(18);
         this.sessions = new Map();
+        this.pendingCreations = new Map();
         this.tombstones = new Map();
         this.userCounts = new Map();
-        this.authCounts = new Map();
+        this.ownerIndex = new Map();
+        this.viewerCount = 0;
         this.creationRates = new Map();
         this.launchAuthSubscriptions = new Map();
         this.agentStartLocks = new Map();
@@ -294,25 +324,21 @@ export class WebttySessionManager {
         if (!this.availability().ok) throw errorWithCode('WEBTTY_UNAVAILABLE');
         const now = this.now();
         this.cleanupRates(now);
-        const userCount = this.userCounts.get(lease.userId) || 0;
-        const authCount = this.authCounts.get(lease.sessionFingerprint) || 0;
+        const principal = browserPrincipal(lease.mode, lease.userId);
+        const userCount = this.userCounts.get(principal) || 0;
         if (this.sessions.size >= this.limits.global) throw errorWithCode('WEBTTY_GLOBAL_QUOTA');
         if (userCount >= this.limits.perUser) throw errorWithCode('WEBTTY_USER_QUOTA');
-        if (authCount >= this.limits.perAuthSession) throw errorWithCode('WEBTTY_SESSION_QUOTA');
         const creations = this.creationRates.get(lease.sessionFingerprint) || [];
         if (creations.length >= this.limits.createsPerWindow) throw errorWithCode('WEBTTY_CREATION_RATE');
         creations.push(now);
         this.creationRates.set(lease.sessionFingerprint, creations);
-        this.userCounts.set(lease.userId, userCount + 1);
-        this.authCounts.set(lease.sessionFingerprint, authCount + 1);
+        this.userCounts.set(principal, userCount + 1);
         let released = false;
         return () => {
             if (released) return;
             released = true;
-            const nextUser = Math.max(0, (this.userCounts.get(lease.userId) || 1) - 1);
-            const nextAuth = Math.max(0, (this.authCounts.get(lease.sessionFingerprint) || 1) - 1);
-            if (nextUser) this.userCounts.set(lease.userId, nextUser); else this.userCounts.delete(lease.userId);
-            if (nextAuth) this.authCounts.set(lease.sessionFingerprint, nextAuth); else this.authCounts.delete(lease.sessionFingerprint);
+            const nextUser = Math.max(0, (this.userCounts.get(principal) || 1) - 1);
+            if (nextUser) this.userCounts.set(principal, nextUser); else this.userCounts.delete(principal);
         };
     }
 
@@ -328,6 +354,11 @@ export class WebttySessionManager {
         const currentAuth = await this.auth.validateLease(lease, { req });
         if (!currentAuth.ok) {
             const reason = currentAuth.reason;
+            if (reason === 'administrator_revoked') {
+                // Do not join cleanup here: a starting shell's cleanup waits
+                // for this validation path to release startupFinished.
+                void this.closePrincipal(browserPrincipal(lease.mode, lease.userId));
+            }
             if (AUTH_LEASE_AUDIT_PHASES.has(auditPhase)) {
                 try {
                     // Diagnostics must not replace the rejection or delay startup cleanup.
@@ -412,14 +443,25 @@ export class WebttySessionManager {
         }
     }
 
-    async discoverTargets({ req, routePlan, directory }) {
+    // The provider is asked only after this request's own administrator
+    // admission was revalidated, and it signs with that identity.
+    async resolveHomeProfile({ req, routePlan, profile }) {
+        if (typeof this.homeProfiles?.resolve !== 'function') throw errorWithCode('WEBTTY_PROFILE_UNAVAILABLE');
+        const resolved = await this.homeProfiles.resolve({ req, routePlan, profile });
+        if (!resolved?.profile || !resolved?.home) throw errorWithCode('WEBTTY_PROFILE_UNAVAILABLE');
+        return resolved;
+    }
+
+    async discoverTargets({ req, routePlan, directory, profile = null }) {
         if (!this.availability().ok) throw errorWithCode('WEBTTY_UNAVAILABLE');
         const lease = await this.validatedLease(req);
         const binding = terminalTargetRouteBinding(routePlan);
+        const resolvedProfile = profile ? await this.resolveHomeProfile({ req, routePlan, profile }) : null;
         const discovered = await this.targetResolver.discover({
             routePlan,
             requestedDirectory: directory,
             agentProviderAvailable: this.agentProviderReady,
+            ...(resolvedProfile ? { home: resolvedProfile.home } : {}),
         });
         if (this.agentProviderReady && discovered.agentTargetsAvailable === false) {
             this.disableAgentProvider('discovery_provider_unavailable');
@@ -435,6 +477,7 @@ export class WebttySessionManager {
                 routeBinding: binding,
                 targets: discovered.targets,
                 agentTargetsAvailable: discovered.agentTargetsAvailable,
+                ...(resolvedProfile ? { profile: resolvedProfile.profile } : {}),
             });
         } catch (error) {
             this.cleanupLaunchSubscription(lease.sessionFingerprint);
@@ -447,6 +490,31 @@ export class WebttySessionManager {
             agentTargetsAvailable: created.agentTargetsAvailable,
         });
         return created;
+    }
+
+    // Creation asks the provider again and requires the same answer and the
+    // same directory identity; any difference or refusal is a stale target.
+    async revalidateHomeProfile({ req, routePlan, target }) {
+        let current;
+        try {
+            current = await this.resolveHomeProfile({
+                req,
+                routePlan,
+                profile: { provider: target.profile.provider, id: target.profile.id },
+            });
+        } catch (_) {
+            throw errorWithCode('WEBTTY_TARGET_STALE');
+        }
+        const home = target.home;
+        if (!home || current.profile.provider !== target.profile.provider
+            || current.profile.id !== target.profile.id
+            || current.profile.label !== target.profile.label
+            || current.home.relativePath !== home.relativePath
+            || current.home.absolutePath !== home.absolutePath
+            || current.home.identity.dev !== home.identity.dev
+            || current.home.identity.ino !== home.identity.ino) {
+            throw errorWithCode('WEBTTY_TARGET_STALE');
+        }
     }
 
     async revalidateTarget(options) {
@@ -471,8 +539,438 @@ export class WebttySessionManager {
         return cancelled;
     }
 
-    async create({ req, routePlan, launch, cols = 80, rows = 24 }) {
+    profileLabel(session) {
+        return session.profile?.label ? displayText(session.profile.label, 128) || null : null;
+    }
+
+    closePolicyOf(session) {
+        return session.closePolicy === 'stop' ? 'stop' : 'keep';
+    }
+
+    sessionDescription(session, principal) {
+        return {
+            id: session.id,
+            role: principal === session.owner.principal ? 'owner' : 'watcher',
+            state: session.viewers.size ? 'attached' : 'detached',
+            cwd: session.cwdRelative || '.',
+            cols: session.cols,
+            rows: session.rows,
+            target: Object.fromEntries(['kind', 'label', 'detail', 'access', 'cwdDisplay']
+                .map(key => [key, session.target[key]])),
+            closePolicy: this.closePolicyOf(session),
+            pendingStopUntil: session.pendingStop?.deadline ?? null,
+            profileLabel: this.profileLabel(session),
+        };
+    }
+
+    displayRow(session, principal, endedAt = null) {
+        const isOwner = principal === session.owner.principal;
+        const live = endedAt === null;
+        return {
+            id: session.id, source: 'webtty', kind: 'shell',
+            title: displayText(session.target.label, 256, 'Terminal'),
+            detail: displayText(session.target.detail, 256),
+            cwdDisplay: displayText(session.target.cwdDisplay, 4096),
+            access: session.target.access,
+            status: live ? (session.viewers.size ? 'attached' : 'detached') : 'exited',
+            isOwner, ownerLabel: displayText(session.owner.label, 128),
+            viewerCount: live ? session.viewers.size : 0,
+            startedAt: session.createdAt, lastActivityAt: session.lastActivityAt,
+            ...(live ? {} : { endedAt, exitReason: displayText(session.closeReason, 128) }),
+            closePolicy: this.closePolicyOf(session),
+            pendingStopUntil: live ? session.pendingStop?.deadline ?? null : null,
+            ownerViewOpen: live && this.ownerViewOpen(session),
+            profileLabel: this.profileLabel(session),
+            capabilities: { watch: true, input: isOwner, stop: true, message: false },
+            attach: { mode: 'webtty' },
+        };
+    }
+
+    // Tombstone rows carry the close outcome. Optional keys are omitted, never
+    // null: a scope only for an unconfirmed stop, the record flag only if set.
+    tombstoneRow(tombstone, principal) {
+        const isOwner = principal === tombstone.principal;
+        return {
+            ...tombstone.row,
+            isOwner,
+            capabilities: { ...tombstone.row.capabilities, input: isOwner },
+            closure: tombstone.closure,
+            ...(tombstone.closure === 'unconfirmed' && tombstone.closureScope
+                ? { closureScope: tombstone.closureScope } : {}),
+            ...(tombstone.recordCleanup === 'failed' ? { recordCleanup: 'failed' } : {}),
+        };
+    }
+
+    // The list stays readable while WebTTY is disabled: it then carries only
+    // the retained close outcomes, and `available` reports the disabled state.
+    async listLiveSessions({ req, routePlan }) {
         const lease = await this.validatedLease(req);
+        const binding = routeBinding(routePlan);
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        const available = this.availability().ok === true;
+        const principal = browserPrincipal(lease.mode, lease.userId);
+        const sessions = available
+            ? [...this.sessions.values()]
+                .filter(session => !session.startupInProgress && !session.closed && !session.closing
+                    && bindingMatches(session.binding, binding))
+                .map(session => this.displayRow(session, principal))
+            : [];
+        for (const [id, tombstone] of this.tombstones) {
+            if (this.now() >= tombstone.expiresAt) { this.tombstones.delete(id); continue; }
+            if (!bindingMatches(tombstone.binding, binding)) continue;
+            sessions.push(this.tombstoneRow(tombstone, principal));
+        }
+        return { sessions, available };
+    }
+
+    async listSessions(options) {
+        return (await this.listLiveSessions(options)).sessions;
+    }
+
+    safeAudit(event, details) {
+        try {
+            // Diagnostics never replace, reject or delay the lifecycle decision.
+            Promise.resolve(this.audit(event, details)).catch(() => {});
+        } catch (_) { }
+    }
+
+    sessionViews(session) {
+        if (!(session.views instanceof Map)) {
+            session.views = new Map();
+            session.viewSeq = 0;
+        }
+        return session.views;
+    }
+
+    ownerViews(session) {
+        return [...this.sessionViews(session).values()]
+            .filter(view => view.principal === session.owner.principal);
+    }
+
+    ownerViewOpen(session) {
+        return this.ownerViews(session).some(view => view.state === 'open');
+    }
+
+    // Intent-ended and superseded views are terminal: they never stream,
+    // never count at a deadline and are evicted first.
+    viewTerminal(view) {
+        return view.state === 'ended' || view.state === 'superseded';
+    }
+
+    viewWithinReconnectWindow(view, now = this.now()) {
+        return view.state === 'detached' && now - view.detachedAt < this.limits.viewReconnectWindowMs;
+    }
+
+    // A view is server-issued per create or attach and starts detached. Only
+    // an accepted close intent or a valid recovery claim ends it; a detached
+    // view can reopen any time. Creating a view never cancels a pending stop.
+    // `retain` names a view that must survive eviction: the view a recovery
+    // claim is about to supersede.
+    createView(session, principal, { retain = null } = {}) {
+        const views = this.sessionViews(session);
+        const now = this.now();
+        if (views.size >= this.limits.viewsPerSession) {
+            const ordered = [...views.values()].filter(view => view.id !== retain);
+            const evicted = ordered.find(view => this.viewTerminal(view))
+                || ordered.find(view => view.state === 'detached' && !this.viewWithinReconnectWindow(view, now));
+            if (!evicted) throw errorWithCode('WEBTTY_VIEW_LIMIT');
+            views.delete(evicted.id);
+        }
+        session.viewSeq = (session.viewSeq || 0) + 1;
+        const view = {
+            id: randomId(24),
+            seq: session.viewSeq,
+            principal,
+            role: principal === session.owner.principal ? 'owner' : 'watcher',
+            state: 'detached',
+            detachedAt: now,
+            endedBy: null,
+            endedPolicy: null,
+            supersededBy: null,
+            claimedBy: null,
+            streams: 0,
+        };
+        views.set(view.id, view);
+        return view;
+    }
+
+    // An explicit reload, back/forward or embedded restore names the view it
+    // replaces. The claim is a hint, never a credential: it applies only to a
+    // retained owner view of this session, attached by the owner, and not
+    // already superseded. Called synchronously right after the new view
+    // exists; an invalid claim changes nothing.
+    applyRecoveryClaim(session, principal, view, claimedId) {
+        if (!claimedId) return;
+        const auditId = this.auditId(session.id);
+        const claimed = this.sessionViews(session).get(String(claimedId));
+        let ignored = '';
+        if (principal !== session.owner.principal) ignored = 'not_owner';
+        else if (!claimed || claimed === view) ignored = 'unknown_view';
+        else if (claimed.principal !== session.owner.principal) ignored = 'foreign_view';
+        else if (claimed.state === 'superseded') ignored = 'already_superseded';
+        if (ignored) {
+            this.safeAudit('webtty_view_supersede_ignored', { id: auditId, reason: ignored });
+            return;
+        }
+        if (claimed.state === 'open') {
+            // A live document keeps its view; its own later signal is
+            // suppressed only while this claimant has not ended (latest wins).
+            claimed.claimedBy = view.id;
+            this.safeAudit('webtty_view_superseded', { id: auditId, outcome: 'claimed' });
+            return;
+        }
+        claimed.state = 'superseded';
+        claimed.endedBy = 'superseded';
+        claimed.supersededBy = view.id;
+        claimed.detachedAt = null;
+        this.safeAudit('webtty_view_superseded', { id: auditId, outcome: 'superseded' });
+        if (session.pendingStop && session.pendingStop.viewSeq === claimed.seq) {
+            this.cancelPendingStop(session, 'reopened');
+        }
+    }
+
+    // A claim recorded on an open view stays alive while the claimant, or the
+    // latest view that superseded it in turn, has not ended. The walk is
+    // bounded; a cycle, an overflow or a missing successor counts as ended.
+    recoveryClaimLive(session, claimant) {
+        const views = this.sessionViews(session);
+        let current = claimant;
+        for (let hops = 0; current && hops < this.limits.viewsPerSession; hops += 1) {
+            if (current.principal !== session.owner.principal) return false;
+            if (current.state !== 'superseded') return !this.viewTerminal(current);
+            current = views.get(current.supersededBy);
+        }
+        return false;
+    }
+
+    // A stream binds to a non-terminal view of the requesting principal.
+    streamView(session, req, viewId) {
+        const lease = this.auth.createLease(req);
+        const principal = browserPrincipal(lease.mode, lease.userId);
+        const view = this.sessionViews(session).get(String(viewId || ''));
+        if (!view || view.principal !== principal || this.viewTerminal(view)) {
+            throw errorWithCode('WEBTTY_VIEW_STALE');
+        }
+        return view;
+    }
+
+    endViewByIntent(session, view, policy) {
+        this.endView(session, view, { state: 'ended', endedBy: 'intent', endedPolicy: policy });
+    }
+
+    endView(session, view, fields) {
+        Object.assign(view, fields);
+        view.detachedAt = null;
+        for (const viewer of [...session.viewers.values()]) {
+            if (viewer.view === view) this.removeViewer(session, viewer, { event: 'detached', reason: 'view_ended' });
+        }
+    }
+
+    clearPendingStop(session) {
+        const pending = session.pendingStop;
+        session.pendingStop = null;
+        if (pending) clearTimeout(pending.timer);
+        return pending;
+    }
+
+    cancelPendingStop(session, reason) {
+        if (!this.clearPendingStop(session)) return false;
+        this.safeAudit('webtty_close_intent_cancelled', { id: this.auditId(session.id), reason });
+        return true;
+    }
+
+    schedulePendingStop(session, pending) {
+        clearTimeout(pending.timer);
+        pending.timer = setTimeout(
+            () => this.onPendingStopDeadline(session, pending),
+            Math.max(0, pending.deadline - this.now()),
+        );
+        pending.timer.unref?.();
+    }
+
+    armPendingStop(session, viewSeq) {
+        this.clearPendingStop(session);
+        const pending = { deadline: this.now() + this.limits.closeIntentGraceMs, viewSeq, timer: null };
+        session.pendingStop = pending;
+        this.schedulePendingStop(session, pending);
+        return pending;
+    }
+
+    onPendingStopDeadline(session, pending) {
+        if (session.pendingStop !== pending) return;
+        if (session.closed || session.closing || this.sessions.get(session.id) !== session) {
+            // An explicit Kill or another close already owns cleanup.
+            this.clearPendingStop(session);
+            return;
+        }
+        const now = this.now();
+        const ownerViews = this.ownerViews(session).filter(view => !this.viewTerminal(view));
+        if (ownerViews.some(view => view.state === 'open')) {
+            this.cancelPendingStop(session, 'open-elsewhere');
+            return;
+        }
+        const reconnecting = ownerViews.filter(view => this.viewWithinReconnectWindow(view, now));
+        if (reconnecting.length) {
+            // A recently dropped owner stream is a reconnect gap, not a close.
+            pending.deadline = Math.max(...reconnecting.map(
+                view => view.detachedAt + this.limits.viewReconnectWindowMs,
+            ));
+            this.schedulePendingStop(session, pending);
+            return;
+        }
+        this.clearPendingStop(session);
+        const auditId = this.auditId(session.id);
+        const settled = () => this.safeAudit('webtty_closed_on_tab_close', {
+            id: auditId,
+            closure: session.tombstone?.closure || 'unconfirmed',
+        });
+        void this.closeSession(session, 'tab_closed').then(settled, settled);
+    }
+
+    async setClosePolicy({ req, routePlan, id, policy }) {
+        if (!CLOSE_POLICIES.has(policy)) throw errorWithCode('WEBTTY_CLOSE_POLICY_INVALID');
+        const session = await this.authorize(req, routePlan, id, 'control');
+        if (!session) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
+        session.closePolicy = policy;
+        if (policy === 'keep') {
+            this.cancelPendingStop(session, 'policy_keep');
+        } else if (!session.pendingStop) {
+            // A toggle that reaches the server after its tab's close intent:
+            // the most recent non-superseded owner intent decides, and no
+            // owner view may be open or still within its reconnect window.
+            const owners = this.ownerViews(session);
+            const latest = owners.filter(view => view.state === 'ended' && view.endedBy === 'intent')
+                .reduce((best, view) => (!best || view.seq > best.seq ? view : best), null);
+            const now = this.now();
+            const present = owners.some(view => view.state === 'open' || this.viewWithinReconnectWindow(view, now));
+            if (latest?.endedPolicy === 'stop' && !present) {
+                this.armPendingStop(session, latest.seq);
+                this.safeAudit('webtty_close_intent_armed', { id: this.auditId(session.id), source: 'policy' });
+            }
+        }
+        this.safeAudit('webtty_close_policy_changed', {
+            id: this.auditId(session.id),
+            policy,
+            pending: Boolean(session.pendingStop),
+        });
+        return {
+            closePolicy: this.closePolicyOf(session),
+            pendingStopUntil: session.pendingStop?.deadline ?? null,
+        };
+    }
+
+    async closeIntent({ req, routePlan, id, view: viewId, policy }) {
+        if (!CLOSE_POLICIES.has(policy)) throw errorWithCode('WEBTTY_CLOSE_POLICY_INVALID');
+        const session = await this.authorize(req, routePlan, id, 'control');
+        if (!session) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
+        const auditId = this.auditId(session.id);
+        const view = this.sessionViews(session).get(String(viewId || ''));
+        // (1) Unknown, foreign and already ended or superseded views have no
+        // effect, which also deduplicates a repeated or delayed signal.
+        if (!view || view.principal !== session.owner.principal || this.viewTerminal(view)) {
+            this.safeAudit('webtty_close_intent_ignored', { id: auditId, reason: 'view_stale' });
+            throw errorWithCode('WEBTTY_VIEW_STALE');
+        }
+        // A recovery claim recorded while this view was still open suppresses
+        // its signal for as long as the claiming view has not ended.
+        const claimant = view.claimedBy ? this.sessionViews(session).get(view.claimedBy) : null;
+        if (claimant && this.recoveryClaimLive(session, claimant)) {
+            this.endView(session, view, { state: 'superseded', endedBy: 'superseded', supersededBy: claimant.id });
+            this.safeAudit('webtty_close_intent_ignored', { id: auditId, reason: 'superseded' });
+            return { pending: false, reason: 'superseded' };
+        }
+        // (2) The signalling document is gone.
+        this.endViewByIntent(session, view, policy);
+        // (3) Both the document's belief and the session policy must be stop.
+        // Sequence numbers alone never supersede an explicit signal.
+        if (policy !== 'stop' || this.closePolicyOf(session) !== 'stop') {
+            this.safeAudit('webtty_close_intent_ignored', { id: auditId, reason: 'keep' });
+            return { pending: false };
+        }
+        // (4) Arm or re-arm the grace period.
+        const pending = this.armPendingStop(session, view.seq);
+        this.safeAudit('webtty_close_intent_armed', { id: auditId, source: 'intent' });
+        return { pending: true, until: pending.deadline };
+    }
+
+    async createAttachToken({ req, routePlan, id, supersedes = null }) {
+        const session = await this.authorize(req, routePlan, id);
+        if (!session) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
+        const lease = this.auth.createLease(req);
+        this.ensureLaunchInvalidationSubscription(lease);
+        try {
+            return this.launchStore.createAttachment({
+                owner: this.launchOwner(lease), routeBinding: terminalTargetRouteBinding(routePlan), sessionId: id,
+                ...(supersedes === null ? {} : { supersedes }),
+            });
+        } catch (error) {
+            this.cleanupLaunchSubscription(lease.sessionFingerprint);
+            throw error;
+        }
+    }
+
+    async attach({ req, routePlan, attach, cols, rows }) {
+        const lease = await this.validatedLease(req);
+        let record;
+        try {
+            record = this.launchStore.consumeAttachment({
+                attach, owner: this.launchOwner(lease), routeBinding: terminalTargetRouteBinding(routePlan),
+            });
+        } finally { this.cleanupLaunchSubscription(lease.sessionFingerprint); }
+        const session = await this.authorize(req, routePlan, record.sessionId, 'attach');
+        if (!session) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
+        const principal = browserPrincipal(lease.mode, lease.userId);
+        if (principal === session.owner.principal) await this.resize(session, cols, rows);
+        if (session.closed || session.closing) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
+        // A refused view (WEBTTY_VIEW_LIMIT) leaves any recovery claim unused.
+        // An owner's claimed view is kept out of eviction so the claim can apply.
+        const claimed = principal === session.owner.principal ? record.supersedes || null : null;
+        const view = this.createView(session, principal, { retain: claimed });
+        this.applyRecoveryClaim(session, principal, view, record.supersedes || null);
+        this.touch(session);
+        // The handler lifts `view` to the top level of its response.
+        return { ...this.sessionDescription(session, principal), view: { id: view.id } };
+    }
+
+    async create({ req, routePlan, launch, cols = 80, rows = 24, closePolicy = 'keep' }) {
+        if (!CLOSE_POLICIES.has(closePolicy)) throw errorWithCode('WEBTTY_CLOSE_POLICY_INVALID');
+        const lease = this.auth.createLease(req);
+        const attempt = {
+            id: randomId(),
+            owner: {
+                principal: browserPrincipal(lease.mode, lease.userId),
+                userId: lease.userId,
+                label: displayText(req?.user?.displayName || req?.user?.username || lease.userId, 128),
+                adminAdmittedAt: Number(lease.createdAt) || 0,
+            },
+            cancellation: '',
+        };
+        // Observe demotion before the first provider/target await without
+        // reserving a worker or quota for an unauthenticated attempt.
+        this.pendingCreations.set(attempt.id, attempt);
+        const owned = this.ownerIndex.get(attempt.owner.principal) || new Set();
+        owned.add(attempt.id);
+        this.ownerIndex.set(attempt.owner.principal, owned);
+        try {
+            return await this.createAttempt({ req, routePlan, launch, cols, rows, closePolicy }, lease, attempt);
+        } finally {
+            this.pendingCreations.delete(attempt.id);
+            if (!this.sessions.has(attempt.id)) {
+                const remaining = this.ownerIndex.get(attempt.owner.principal);
+                remaining?.delete(attempt.id);
+                if (!remaining?.size) this.ownerIndex.delete(attempt.owner.principal);
+            }
+        }
+    }
+
+    assertCreationActive(attempt) {
+        if (attempt.cancellation || this.closed) throw errorWithCode('WEBTTY_AUTH_INVALID');
+    }
+
+    async createAttempt({ req, routePlan, launch, cols, rows, closePolicy }, lease, attempt) {
+        this.assertCreationActive(attempt);
+        await this.revalidateLease(lease, undefined, { req });
+        this.assertCreationActive(attempt);
         const binding = routeBinding(routePlan);
         this.launchStore.invalidateReplacedGenerations(terminalTargetRouteBinding(routePlan));
         let consumed;
@@ -481,11 +979,16 @@ export class WebttySessionManager {
                 launch,
                 owner: this.launchOwner(lease),
                 routeBinding: terminalTargetRouteBinding(routePlan),
-                revalidate: (storedTarget) => this.revalidateTarget({
-                    routePlan,
-                    target: storedTarget,
-                    agentProviderAvailable: this.agentProviderReady,
-                }),
+                revalidate: async (storedTarget) => {
+                    if (storedTarget.profile) {
+                        await this.revalidateHomeProfile({ req, routePlan, target: storedTarget });
+                    }
+                    return this.revalidateTarget({
+                        routePlan,
+                        target: storedTarget,
+                        agentProviderAvailable: this.agentProviderReady,
+                    });
+                },
             });
         } catch (error) {
             if (['WEBTTY_TARGET_STALE', 'WEBTTY_TARGET_DIRECTORY_STALE', 'WEBTTY_TARGET_GENERATION_STALE']
@@ -497,15 +1000,18 @@ export class WebttySessionManager {
         } finally {
             this.cleanupLaunchSubscription(lease.sessionFingerprint);
         }
+        this.assertCreationActive(attempt);
         const target = consumed.target;
         await this.revalidateLease(lease);
+        this.assertCreationActive(attempt);
         if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
         const releaseQuota = this.reserveQuota(lease);
-        const id = randomId();
+        const id = attempt.id;
         const marker = randomId(32);
         const createdAt = this.now();
         let worker;
         try {
+            this.assertCreationActive(attempt);
             worker = target.kind === 'agent'
                 ? this.agentWorkerFactory({ terminalId: id })
                 : this.workerFactory({ terminalId: id, marker, workspaceRoot: this.workspaceRoot });
@@ -520,11 +1026,22 @@ export class WebttySessionManager {
             marker,
             routerEpoch: this.routerEpoch,
             lease,
+            owner: attempt.owner,
             binding,
             routePlan,
             routeLease: routePlan.lease,
             cwdRelative: target.directory.relativePath,
             target,
+            // This session field is in memory only. Agent startup evidence
+            // does persist translatedHome and the profile for exact recovery.
+            profile: target.profile || null,
+            // Close policy, views and a pending stop are in memory only.
+            closePolicy,
+            views: new Map(),
+            viewSeq: 0,
+            pendingStop: null,
+            tombstone: null,
+            cleanupFailureScope: '',
             createdAt,
             lastActivityAt: createdAt,
             worker,
@@ -534,7 +1051,10 @@ export class WebttySessionManager {
             closed: false,
             closing: false,
             closeReason: '',
-            stream: null,
+            viewers: new Map(),
+            everAttached: false,
+            cols,
+            rows,
             replay: [],
             replayBytes: 0,
             lastSequence: 0,
@@ -549,6 +1069,9 @@ export class WebttySessionManager {
             startupCancellation: '',
             startupFinished,
             finishStartup,
+            validationEpoch: 0,
+            targetValidation: null,
+            targetUndecidedSince: null,
             recordWritePromise: Promise.resolve(),
         };
         let subscriptionActive = false;
@@ -574,11 +1097,14 @@ export class WebttySessionManager {
                 subscriptionActive = false;
                 unsubscribe();
             };
+            this.assertCreationActive(attempt);
         } catch (error) {
+            try { session.unsubscribeAuth?.(); } catch (_) { }
             releaseQuota();
             throw error;
         }
         this.sessions.set(id, session);
+        this.pendingCreations.delete(id);
         subscriptionActive = true;
         worker.on('output', (message) => this.onOutput(session, message));
         worker.on('terminal-exit', (message) => {
@@ -598,6 +1124,8 @@ export class WebttySessionManager {
             const unproven = providerUnproven || message.category === 'cleanup-unproven';
             if (unproven) {
                 session.preserveRecord = true;
+                this.noteCleanupFailure(session, session.target.kind !== 'agent' ? 'global'
+                    : providerUnproven ? 'provider' : 'target');
                 if (session.target.kind === 'agent') {
                     if (providerUnproven) this.disableAgentProvider(message.category);
                     else this.quarantineAgentTarget(session.target, message.category);
@@ -669,6 +1197,10 @@ export class WebttySessionManager {
                             marker,
                             cols,
                             rows,
+                            ...(target.profile ? {
+                                translatedHome: target.home.translatedHome,
+                                profile: target.profile,
+                            } : {}),
                         });
                         this.assertStartupActive(session);
                         const markedStarting = await this.queueRecordWrite(session, () => {
@@ -726,7 +1258,16 @@ export class WebttySessionManager {
                     cwdRelative: target.directory.relativePath,
                     cols,
                     rows,
-                    shellEnv: buildShellEnvironment(process.env, { workspaceRoot: this.workspaceRoot }),
+                    shellEnv: buildShellEnvironment(process.env, {
+                        workspaceRoot: this.workspaceRoot,
+                        ...(target.profile ? {
+                            profile: { ...target.profile, home: target.home.translatedHome },
+                        } : {}),
+                    }),
+                    ...(target.profile ? {
+                        homeRelative: target.home.relativePath,
+                        homeIdentity: { dev: target.home.identity.dev, ino: target.home.identity.ino },
+                    } : {}),
                 });
                 this.assertStartupActive(session);
                 const identity = ready.processIdentity;
@@ -756,6 +1297,10 @@ export class WebttySessionManager {
                 this.assertStartupActive(session);
             }
             this.scheduleDetachedClose(session, 'stream_never_attached');
+            // Startup admission remains cancellable until readiness is durable.
+            // Thereafter browser authority belongs to individual viewers.
+            try { session.unsubscribeAuth?.(); } catch (_) { }
+            session.unsubscribeAuth = null;
             this.audit('webtty_session_created', {
                 id: this.auditId(id),
                 targetKind: target.kind,
@@ -763,8 +1308,11 @@ export class WebttySessionManager {
                 directory: target.directory.relativePath || '.',
                 access: target.access,
             });
+            const view = this.createView(session, attempt.owner.principal);
             return {
                 id,
+                role: 'owner',
+                state: 'detached',
                 cwd: target.directory.relativePath || '.',
                 cols,
                 rows,
@@ -775,6 +1323,11 @@ export class WebttySessionManager {
                     access: target.access,
                     cwdDisplay: target.cwdDisplay,
                 },
+                closePolicy: this.closePolicyOf(session),
+                pendingStopUntil: null,
+                profileLabel: this.profileLabel(session),
+                // The handler lifts `view` to the top level of its response.
+                view: { id: view.id },
             };
         } catch (error) {
             session.startupInProgress = false;
@@ -814,38 +1367,63 @@ export class WebttySessionManager {
         return crypto.createHash('sha256').update(this.routerEpoch).update(String(id)).digest('hex').slice(0, 16);
     }
 
-    async validateOwnership(req, routePlan, id, { validateAuth = true } = {}) {
+    async authorize(req, routePlan, id, need = 'watch') {
         const session = this.sessions.get(String(id || ''));
-        if (!session || session.closed || session.routerEpoch !== this.routerEpoch) return null;
-        if (!this.auth.requestMatchesLease(req, session.lease)) return null;
+        if (!session || session.closed || session.closing || session.startupInProgress
+            || session.routerEpoch !== this.routerEpoch) return null;
         let binding;
         try { binding = routeBinding(routePlan); } catch (_) { return null; }
         if (!bindingMatches(binding, session.binding)) return null;
-        if (session.routeLease?.isCurrent?.() !== true || routePlan?.lease?.commit?.() !== true) {
-            await this.closeSession(session, 'route_generation_changed');
-            return null;
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        const lease = this.auth.createLease(req);
+        const principal = browserPrincipal(lease.mode, lease.userId);
+        const result = await this.auth.validateLease(lease, { req });
+        if (!result.ok) {
+            if (result.reason === 'administrator_revoked') this.closePrincipal(principal);
+            throw errorWithCode(result.reason === 'provider_unavailable' ? 'WEBTTY_UNAVAILABLE'
+                : result.reason === 'administrator_revoked' ? 'WEBTTY_ADMIN_REQUIRED' : 'WEBTTY_AUTH_INVALID');
         }
-        if (validateAuth) {
-            // The request's own admission is reused; no second provider call.
-            const result = await this.auth.validateLease(session.lease, { req });
-            // An undecided provider denies this request but leaves the terminal.
-            if (!result.ok && result.reason === 'provider_unavailable') {
-                throw errorWithCode('WEBTTY_UNAVAILABLE');
-            }
-            if (!result.ok) {
-                await this.closeSession(session, `auth_${result.reason}`);
-                return null;
-            }
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        if (session.closed || session.closing || this.sessions.get(session.id) !== session) return null;
+        if (['input', 'resize', 'control'].includes(need) && principal !== session.owner.principal) {
+            throw errorWithCode('WEBTTY_OWNER_REQUIRED');
         }
-        // Authentication validation is asynchronous. The workspace route may
-        // be replaced while it is in flight, so the pre-await generation
-        // check cannot authorize a later SSE attachment or mutation.
-        if (session.routeLease?.isCurrent?.() !== true
-            || routePlan?.lease?.commit?.() !== true) {
-            await this.closeSession(session, 'route_generation_changed');
-            return null;
+        if (principal === session.owner.principal && ['input', 'attach'].includes(need)) {
+            session.owner.adminAdmittedAt = Math.max(session.owner.adminAdmittedAt, Number(lease.createdAt) || 0);
         }
         return session;
+    }
+
+    async validateOwnership(req, routePlan, id) {
+        return this.authorize(req, routePlan, id, 'input');
+    }
+
+    closePrincipal(principal) {
+        return Promise.allSettled([...this.ownerIndex.get(principal) || []]
+            .map(id => this.closeOwnerEntry(id, 'owner_admin_revoked')));
+    }
+
+    closeOwnerEntry(id, reason) {
+        const pending = this.pendingCreations.get(id);
+        if (pending) pending.cancellation ||= reason;
+        return this.closeSession(id, reason);
+    }
+
+    observeAuthenticatedRequest(decision) {
+        if (!this.ownerIndex.size) return;
+        if (!decision || !['local', 'sso'].includes(decision.authMode)
+            || typeof decision.userId !== 'string' || !decision.userId
+            || !Array.isArray(decision.roles) || decision.roles.some(role => typeof role !== 'string')
+            || decision.roles.some(role => role.trim().toLowerCase() === 'guest')
+            || isAdminUser({ roles: decision.roles })
+            || !Number.isSafeInteger(decision.decidedAt) || decision.decidedAt <= 0) return;
+        const principal = browserPrincipal(decision.authMode, decision.userId);
+        for (const id of [...this.ownerIndex.get(principal) || []]) {
+            const owned = this.sessions.get(id) || this.pendingCreations.get(id);
+            if (owned && decision.decidedAt > owned.owner.adminAdmittedAt) {
+                void this.closeOwnerEntry(id, 'owner_admin_revoked').catch(() => {});
+            }
+        }
     }
 
     touch(session) {
@@ -873,6 +1451,8 @@ export class WebttySessionManager {
     async resize(session, cols, rows) {
         if (!session || session.closed || session.closing) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
         await session.worker.resize(cols, rows);
+        session.cols = cols;
+        session.rows = rows;
         this.touch(session);
     }
 
@@ -880,32 +1460,69 @@ export class WebttySessionManager {
         return `${id == null ? '' : `id: ${id}\n`}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     }
 
-    writeStream(session, bytes) {
-        const stream = session.stream;
-        if (!stream) return true;
-        if (stream.writableEnded || stream.destroyed) {
-            session.stream = null;
-            this.scheduleDetachedClose(session, 'browser_stream_closed');
-            return false;
+    removeViewer(session, viewer, { event = '', reason = '', reconnect = false } = {}) {
+        if (session.viewers.get(viewer.id) !== viewer) return;
+        session.viewers.delete(viewer.id);
+        this.viewerCount -= 1;
+        const view = viewer.view;
+        if (view) {
+            view.streams = Math.max(0, view.streams - 1);
+            // The last stream of a non-ended view starts its reconnect gap.
+            if (!view.streams && !this.viewTerminal(view)) {
+                view.state = 'detached';
+                view.detachedAt = this.now();
+            }
         }
-        if (Number(stream.writableLength || 0) + Buffer.byteLength(bytes) > this.limits.sseWritableBytes) {
-            void this.closeSession(session, 'sse_backpressure');
-            return false;
-        }
+        clearTimeout(viewer.drainTimer);
+        viewer.req.removeListener?.('close', viewer.onClose);
+        viewer.res.removeListener?.('close', viewer.onClose);
+        viewer.res.removeListener?.('drain', viewer.onDrain);
+        try { viewer.unsubscribeAuth?.(); } catch (_) { }
+        viewer.queue.length = 0;
+        viewer.queuedBytes = 0;
         try {
-            if (stream.write(bytes) === false
-                && Number(stream.writableLength || 0) > this.limits.sseWritableBytes) {
-                void this.closeSession(session, 'sse_backpressure');
+            if (reconnect) viewer.res.write('retry: 1000\n\n');
+            else if (event) viewer.res.write(this.encodeSse(event, { reason }));
+        } catch (_) { }
+        try { viewer.res.end(); } catch (_) { }
+    }
+
+    enqueueViewer(session, viewer, encoded) {
+        if (!session.viewers.has(viewer.id)) return false;
+        viewer.queue.push(encoded);
+        viewer.queuedBytes += Buffer.byteLength(encoded);
+        if (viewer.queuedBytes > this.limits.viewerQueueBytes) {
+            this.removeViewer(session, viewer, { event: 'detached', reason: 'slow_viewer' });
+            return false;
+        }
+        return this.flushViewer(session, viewer);
+    }
+
+    flushViewer(session, viewer) {
+        if (viewer.waitingDrain) return true;
+        while (viewer.queue.length && session.viewers.has(viewer.id)) {
+            if (viewer.res.writableEnded || viewer.res.destroyed) {
+                this.removeViewer(session, viewer);
                 return false;
             }
-        } catch (_) {
-            if (session.stream === stream) {
-                session.stream = null;
-                this.scheduleDetachedClose(session, 'browser_stream_write_failed');
+            const encoded = viewer.queue.shift();
+            viewer.queuedBytes -= Buffer.byteLength(encoded);
+            try {
+                if (viewer.res.write(encoded) === false) {
+                    viewer.waitingDrain = true;
+                    viewer.drainDeadline = this.now() + this.limits.viewerDrainTimeoutMs;
+                    viewer.drainTimer = setTimeout(() => {
+                        this.removeViewer(session, viewer, { event: 'detached', reason: 'slow_viewer' });
+                    }, this.limits.viewerDrainTimeoutMs);
+                    viewer.drainTimer.unref?.();
+                    return true;
+                }
+            } catch (_) {
+                this.removeViewer(session, viewer);
+                return false;
             }
-            return false;
         }
-        return true;
+        return session.viewers.has(viewer.id);
     }
 
     onOutput(session, message) {
@@ -929,43 +1546,84 @@ export class WebttySessionManager {
             session.replayBytes -= removed.bytes;
         }
         this.touch(session);
-        this.writeStream(session, encoded);
+        for (const viewer of session.viewers.values()) this.enqueueViewer(session, viewer, encoded);
     }
 
-    attachStream(session, req, res, lastEventId = '') {
+    assertViewerQuota(session) {
+        if (session.viewers.size >= this.limits.viewersPerSession
+            || this.viewerCount >= this.limits.viewersGlobal) throw errorWithCode('WEBTTY_VIEWER_QUOTA');
+    }
+
+    attachStream(session, req, res, lastEventId = '', routePlan = session?.routePlan, viewId = '') {
         if (!session || session.closed || session.closing) return false;
         if (req.destroyed || req.aborted || res.writableEnded || res.destroyed) return false;
+        this.assertViewerQuota(session);
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        // Every stream binds to a server view of the same principal.
+        const view = this.streamView(session, req, viewId);
         const raw = String(lastEventId || '').trim();
         const requested = raw === '' ? 0 : Number(raw);
         const oldest = session.replay[0]?.sequence || (session.lastSequence + 1);
-        if (!Number.isSafeInteger(requested) || requested < 0
-            || requested > session.lastSequence
-            || requested < oldest - 1) {
+        if ((raw && !/^\d+$/.test(raw)) || !Number.isSafeInteger(requested) || requested < 0
+            || requested > session.lastSequence) {
             res.write(this.encodeSse('reset', { reason: 'replay_gap' }));
             res.end();
             return false;
         }
-        if (session.stream && session.stream !== res && !session.stream.writableEnded) {
-            try { session.stream.write(this.encodeSse('replaced', {})); } catch (_) { }
-            try { session.stream.end(); } catch (_) { }
-        }
-        clearTimeout(session.detachTimer);
-        session.detachTimer = null;
-        session.stream = res;
-        const detach = () => {
-            if (session.stream === res) {
-                session.stream = null;
-                this.scheduleDetachedClose(session, 'browser_stream_closed');
-            }
+        const lease = this.auth.createLease(req);
+        const principal = browserPrincipal(lease.mode, lease.userId);
+        const viewer = {
+            id: randomId(), req, res, lease, principal, view,
+            role: principal === session.owner.principal ? 'owner' : 'watcher',
+            routeLease: routePlan.lease, queue: [], queuedBytes: 0,
+            drainDeadline: null, drainTimer: null, waitingDrain: false,
         };
-        req.once('close', detach);
-        if (req.destroyed || req.aborted || res.writableEnded || res.destroyed) {
-            detach();
+        let admitted = false;
+        let invalidated = false;
+        const unsubscribe = this.auth.subscribeInvalidation(lease, (reason) => {
+            invalidated = true;
+            if (!admitted || session.viewers.get(viewer.id) !== viewer) return;
+            if (reason === 'administrator_revoked') this.closePrincipal(principal);
+            this.removeViewer(session, viewer, { event: 'detached', reason: `auth_${reason}` });
+        });
+        if (typeof unsubscribe !== 'function') throw errorWithCode('WEBTTY_AUTH_SUBSCRIPTION_INVALID');
+        if (invalidated) {
+            try { unsubscribe(); } catch (_) { }
             return false;
         }
-        if (!this.writeStream(session, ': connected\n\n')) return false;
+        viewer.unsubscribeAuth = unsubscribe;
+        viewer.onClose = () => this.removeViewer(session, viewer);
+        viewer.onDrain = () => {
+            clearTimeout(viewer.drainTimer);
+            viewer.waitingDrain = false;
+            viewer.drainDeadline = null;
+            this.flushViewer(session, viewer);
+        };
+        session.viewers.set(viewer.id, viewer);
+        this.viewerCount += 1;
+        view.streams += 1;
+        view.state = 'open';
+        view.detachedAt = null;
+        admitted = true;
+        req.once('close', viewer.onClose);
+        res.once?.('close', viewer.onClose);
+        res.on?.('drain', viewer.onDrain);
+        if (req.destroyed || req.aborted || res.writableEnded || res.destroyed) {
+            viewer.onClose();
+            return false;
+        }
+        if (!this.enqueueViewer(session, viewer, ': connected\n\n')) return false;
+        if (requested < oldest - 1) {
+            if (!this.enqueueViewer(session, viewer, this.encodeSse(raw ? 'resync' : 'replay-truncated', {}))) return false;
+        }
         for (const event of session.replay) {
-            if (event.sequence > requested && !this.writeStream(session, event.encoded)) return false;
+            if (event.sequence > requested && !this.enqueueViewer(session, viewer, event.encoded)) return false;
+        }
+        session.everAttached = true;
+        clearTimeout(session.detachTimer);
+        session.detachTimer = null;
+        if (viewer.role === 'owner') {
+            session.owner.adminAdmittedAt = Math.max(session.owner.adminAdmittedAt, Number(lease.createdAt) || 0);
         }
         this.touch(session);
         return true;
@@ -975,36 +1633,126 @@ export class WebttySessionManager {
         clearTimeout(session.detachTimer);
         session.detachTimer = setTimeout(() => {
             session.detachTimer = null;
-            if (!session.stream) void this.closeSession(session, reason);
+            if (!session.everAttached) void this.closeSession(session, reason);
         }, this.limits.streamDetachGraceMs);
         session.detachTimer.unref?.();
     }
 
+    // A close outcome starts `pending` and is retained until router restart
+    // unless it settles as `proven`, which keeps the usual short lifetime.
     addTombstone(session) {
         const now = this.now();
-        this.tombstones.set(session.id, {
-            expiresAt: now + this.limits.tombstoneLifetimeMs,
-            sessionFingerprint: session.lease.sessionFingerprint,
-            userId: session.lease.userId,
+        const tombstone = {
+            expiresAt: Infinity,
+            principal: session.owner.principal,
             binding: session.binding,
-        });
+            row: this.displayRow(session, session.owner.principal, now),
+            closure: 'pending',
+            closureScope: '',
+            recordCleanup: '',
+            // Internal only, never listed: the close reason and each view still
+            // eligible at retirement with its principal, so that a view whose
+            // stream was dropped before the close can learn its exit once it
+            // reconnects. Bounded by the per-session view cap.
+            closeReason: String(session.closeReason || ''),
+            retiredViews: new Map([...this.sessionViews(session).values()]
+                .filter(view => !this.viewTerminal(view))
+                .map(view => [view.id, view.principal])),
+        };
+        session.tombstone = tombstone;
+        this.tombstones.delete(session.id);
+        this.tombstones.set(session.id, tombstone);
+        this.trimTombstones(now);
+    }
+
+    trimTombstones(now = this.now()) {
+        if (this.tombstones.size <= this.limits.maxTombstones) return;
+        for (const [id, tombstone] of this.tombstones) {
+            if (now >= tombstone.expiresAt) this.tombstones.delete(id);
+        }
         while (this.tombstones.size > this.limits.maxTombstones) {
-            this.tombstones.delete(this.tombstones.keys().next().value);
+            let victim = null;
+            for (const entry of this.tombstones) {
+                if (entry[1].closure === 'proven') { victim = entry; break; }
+            }
+            if (!victim) {
+                victim = this.tombstones.entries().next().value;
+                this.safeAudit('webtty_tombstone_evicted', { id: this.auditId(victim[0]), closure: victim[1].closure });
+            }
+            this.tombstones.delete(victim[0]);
+        }
+    }
+
+    settleClosure(session, closure, { scope = '', recordCleanupFailed = false } = {}) {
+        const tombstone = session.tombstone;
+        if (!tombstone || tombstone.closure !== 'pending') return;
+        tombstone.closure = closure;
+        if (closure === 'unconfirmed' && CLEANUP_FAILURE_SCOPE_RANK[scope]) tombstone.closureScope = scope;
+        if (recordCleanupFailed) tombstone.recordCleanup = 'failed';
+        if (closure === 'proven') tombstone.expiresAt = this.now() + this.limits.tombstoneLifetimeMs;
+    }
+
+    // Records the widest safety scope this session's cleanup failure disabled.
+    noteCleanupFailure(session, scope) {
+        if ((CLEANUP_FAILURE_SCOPE_RANK[scope] || 0) > (CLEANUP_FAILURE_SCOPE_RANK[session.cleanupFailureScope] || 0)) {
+            session.cleanupFailureScope = scope;
         }
     }
 
     matchesTombstone(req, routePlan, id) {
         const tombstone = this.tombstones.get(String(id || ''));
         if (!tombstone) return false;
-        if (this.now() > tombstone.expiresAt) {
+        if (this.now() >= tombstone.expiresAt) {
             this.tombstones.delete(String(id || ''));
             return false;
         }
         const requestBinding = routeBinding(routePlan);
-        const requestSession = this.auth.createLease(req);
-        return tombstone.userId === requestSession.userId
-            && tombstone.sessionFingerprint === requestSession.sessionFingerprint
-            && bindingMatches(tombstone.binding, requestBinding);
+        this.auth.createLease(req);
+        return bindingMatches(tombstone.binding, requestBinding);
+    }
+
+    // The unexpired retained close outcome on this host-route that still
+    // holds the eligible view, or null.
+    retiredRecord(routePlan, id, viewId) {
+        const record = this.tombstones.get(String(id || ''));
+        if (!record?.retiredViews?.has(String(viewId || '')) || this.now() >= record.expiresAt) return null;
+        let binding;
+        try { binding = routeBinding(routePlan); } catch (_) { return null; }
+        return bindingMatches(record.binding, binding) ? record : null;
+    }
+
+    // Used only after live authorization found no session. A stream dropped
+    // for reconnect before its shell closed never received the exit event;
+    // its exact view may learn the stored close reason, authorized only as the
+    // principal recorded for that view and only with this request's current
+    // authentication. Returns an opaque candidate for the synchronous
+    // commitRetiredStreamOutcome, or null. Nothing is allocated or subscribed.
+    async retiredStreamOutcome(req, routePlan, sessionId, viewId) {
+        const id = String(sessionId || '');
+        const view = String(viewId || '');
+        const record = this.retiredRecord(routePlan, id, view);
+        if (!record) return null;
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        const lease = this.auth.createLease(req);
+        const principal = browserPrincipal(lease.mode, lease.userId);
+        if (record.retiredViews.get(view) !== principal) return null;
+        await this.revalidateLease(lease, undefined, { req });
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        if (this.retiredRecord(routePlan, id, view) !== record
+            || record.retiredViews.get(view) !== principal) return null;
+        return Object.freeze({ record, sessionId: id, viewId: view, principal });
+    }
+
+    // The final guard, called synchronously right before the response is
+    // written: the encoded exit event, or null when the outcome is gone. A
+    // disabled manager or a replaced route refuses as before.
+    commitRetiredStreamOutcome(routePlan, candidate) {
+        if (!this.availability().ok) throw errorWithCode('WEBTTY_UNAVAILABLE');
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
+        const record = this.retiredRecord(routePlan, candidate?.sessionId, candidate?.viewId);
+        if (!record || record !== candidate.record
+            || record.retiredViews.get(candidate.viewId) !== candidate.principal) return null;
+        return this.encodeSse('exit', { reason: record.closeReason });
     }
 
     disableForUnprovenCleanup(category = 'cleanup_unproven', primarySession = null) {
@@ -1064,8 +1812,15 @@ export class WebttySessionManager {
             if (session.closed) return true;
         }
         session.closing = true;
+        // A close of any kind owns cleanup; a pending tab-close stop never runs.
+        this.clearPendingStop(session);
+        session.validationEpoch += 1;
+        session.targetValidation?.controller.abort();
         session.closeReason = reason;
         this.sessions.delete(session.id);
+        const owned = this.ownerIndex.get(session.owner.principal);
+        owned?.delete(session.id);
+        if (!owned?.size) this.ownerIndex.delete(session.owner.principal);
         this.addTombstone(session);
         try { session.unsubscribeAuth?.(); } catch (_) {
             try {
@@ -1077,15 +1832,17 @@ export class WebttySessionManager {
         session.unsubscribeAuth = null;
         clearTimeout(session.detachTimer);
         session.detachTimer = null;
-        if (session.stream && !session.stream.writableEnded) {
-            try { session.stream.write(this.encodeSse('exit', { reason })); } catch (_) { }
-            try { session.stream.end(); } catch (_) { }
+        for (const viewer of session.viewers.values()) {
+            this.removeViewer(session, viewer, { event: 'exit', reason });
         }
-        session.stream = null;
         if (!workerExited) {
             try { await session.worker.close(); } catch (_) { }
         }
-        const exited = workerExited || await session.worker.waitForExit();
+        let exited = workerExited;
+        if (!exited) {
+            // A wait that throws is an unconfirmed exit and fails closed below.
+            try { exited = await session.worker.waitForExit(); } catch (_) { exited = false; }
+        }
         // A cleanup-error message and the process-exit notification can be
         // adjacent. Never recover or remove the same durable handle until the
         // ordered cleanup-evidence write has reached stable storage.
@@ -1096,6 +1853,7 @@ export class WebttySessionManager {
                 await recordWrite;
             } catch (_) {
                 session.preserveRecord = true;
+                this.noteCleanupFailure(session, 'global');
                 this.disableForUnprovenCleanup('recovery_record_write_failed', session);
             }
         } while (recordWrite !== session.recordWritePromise);
@@ -1160,11 +1918,18 @@ export class WebttySessionManager {
             }
         }
         const mustPreserve = preserveRecord || session.preserveRecord || !cleanupProven;
+        // The reported outcome follows the branch that actually ran: proven
+        // only after confirmed exit and proven reclamation, otherwise the
+        // scope that the existing fail-closed handling disabled.
+        let closure = 'unconfirmed';
+        let recordCleanupFailed = false;
         if (!exited) {
             session.preserveRecord = true;
             if (session.target.kind === 'agent') {
+                this.noteCleanupFailure(session, 'provider');
                 this.disableAgentProvider('worker_exit_unconfirmed');
             } else {
+                this.noteCleanupFailure(session, 'global');
                 this.disableForUnprovenCleanup('worker_exit_unconfirmed', session);
             }
         } else if ((session.recordHandle || session.initRequested) && mustPreserve) {
@@ -1174,32 +1939,50 @@ export class WebttySessionManager {
             session.preserveRecord = true;
             if (session.target.kind === 'agent') {
                 if (cleanupFailureScope === 'global') {
+                    this.noteCleanupFailure(session, 'global');
                     this.disableForUnprovenCleanup(category, session);
-                } else if (cleanupFailureScope === 'provider') this.disableAgentProvider(category);
-                else this.quarantineAgentTarget(session.target, category);
+                } else if (cleanupFailureScope === 'provider') {
+                    this.noteCleanupFailure(session, 'provider');
+                    this.disableAgentProvider(category);
+                } else {
+                    this.noteCleanupFailure(session, 'target');
+                    this.quarantineAgentTarget(session.target, category);
+                }
             } else {
+                this.noteCleanupFailure(session, 'global');
                 this.disableForUnprovenCleanup(category, session);
             }
-        } else if (session.recordHandle && !recordAlreadyRemoved) {
-            try {
-                const removed = await this.recordStore.remove(session.recordHandle);
-                if (removed !== true) {
+        } else {
+            if (session.recordHandle && !recordAlreadyRemoved) {
+                try {
+                    const removed = await this.recordStore.remove(session.recordHandle);
+                    if (removed !== true) {
+                        recordCleanupFailed = true;
+                        this.disableForRecordRemovalFailure(
+                            session,
+                            'recovery_record_remove_unconfirmed',
+                            'agent_record_remove_unconfirmed',
+                        );
+                    }
+                } catch (_) {
+                    recordCleanupFailed = true;
                     this.disableForRecordRemovalFailure(
                         session,
-                        'recovery_record_remove_unconfirmed',
-                        'agent_record_remove_unconfirmed',
+                        'recovery_record_remove_failed',
+                        'agent_record_remove_failed',
                     );
                 }
-            } catch (_) {
-                this.disableForRecordRemovalFailure(
-                    session,
-                    'recovery_record_remove_failed',
-                    'agent_record_remove_failed',
-                );
             }
+            // An earlier cleanup failure of this session (for example a
+            // worker cleanup-unproven report) still makes the stop unproven.
+            if (!session.cleanupFailureScope) closure = 'proven';
         }
+        this.settleClosure(session, closure, { scope: session.cleanupFailureScope, recordCleanupFailed });
         return true;
         } finally {
+            // Nothing leaves this path still `pending`: an unexpected failure
+            // is an unconfirmed stop.
+            this.settleClosure(session, 'unconfirmed', { scope: session.cleanupFailureScope });
             session.closed = true;
             session.closing = false;
             if (!session.released) {
@@ -1216,10 +1999,90 @@ export class WebttySessionManager {
         }
     }
 
-    async closeOwned(req, routePlan, id) {
-        const session = await this.validateOwnership(req, routePlan, id);
+    async closeAuthorized(req, routePlan, id) {
+        const session = await this.authorize(req, routePlan, id, 'stop');
         if (session) return this.closeSession(session, 'requested');
+        await this.validatedLease(req);
+        if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
         try { return this.matchesTombstone(req, routePlan, id); } catch (_) { return false; }
+    }
+
+    async closeOwned(req, routePlan, id) {
+        return this.closeAuthorized(req, routePlan, id);
+    }
+
+    async validateViewer(session, viewer, now) {
+        if (viewer.authPending) return;
+        viewer.authPending = true;
+        try {
+            const auth = await this.auth.validateLease(viewer.lease);
+            if (!session.viewers.has(viewer.id)) return;
+            if (auth.ok) {
+                viewer.authUndecidedSince = null;
+            } else if (auth.reason === 'provider_unavailable') {
+                if (!Number.isFinite(viewer.authUndecidedSince)) viewer.authUndecidedSince = now;
+                if (now - viewer.authUndecidedSince >= this.limits.authenticationOutageLimitMs) {
+                    this.removeViewer(session, viewer, { event: 'detached', reason: 'auth_provider_unavailable' });
+                }
+            } else {
+                if (auth.reason === 'administrator_revoked') await this.closePrincipal(viewer.principal);
+                this.removeViewer(session, viewer, { event: 'detached', reason: `auth_${auth.reason}` });
+            }
+        } catch (_) {
+            this.removeViewer(session, viewer, { event: 'detached', reason: 'auth_validation_failed' });
+        } finally {
+            viewer.authPending = false;
+        }
+    }
+
+    markTargetUndecided(session) {
+        if (!Number.isFinite(session.targetUndecidedSince)) session.targetUndecidedSince = this.now();
+    }
+
+    startTargetValidation(session) {
+        if (session.targetValidation || session.closed || session.closing || session.startupInProgress) return;
+        const epoch = ++session.validationEpoch;
+        const controller = new AbortController();
+        const validation = { controller, epoch, promise: null };
+        session.targetValidation = validation;
+        const current = () => this.sessions.get(session.id) === session
+            && !session.closed && !session.closing && session.validationEpoch === epoch;
+        const timer = setTimeout(() => {
+            if (!current()) return;
+            this.markTargetUndecided(session);
+            session.validationEpoch += 1;
+            controller.abort();
+        }, this.limits.targetValidationDeadlineMs);
+        timer.unref?.();
+        validation.promise = (async () => {
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+                if (!current()) return;
+                try {
+                    const plan = this.capturePlan ? this.capturePlan() : session.routePlan;
+                    await this.targetResolver.revalidateRunningAgent({
+                        routePlan: plan, target: session.target, signal: controller.signal,
+                        agentProviderAvailable: this.agentProviderReady,
+                    });
+                    if (current()) session.targetUndecidedSince = null;
+                    return;
+                } catch (error) {
+                    if (!current()) return;
+                    if (error?.code === 'WEBTTY_TARGET_GENERATION_STALE') continue;
+                    if (error?.code === 'WEBTTY_TARGET_IDENTITY_STALE') {
+                        void this.closeSession(session, 'target_identity_changed').catch(() => {});
+                    } else if (error?.code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') {
+                        this.disableAgentProvider('target_provider_unavailable');
+                    } else this.markTargetUndecided(session);
+                    return;
+                }
+            }
+            if (current()) this.markTargetUndecided(session);
+        })().finally(() => {
+            clearTimeout(timer);
+            controller.abort();
+            if (session.targetValidation === validation) session.targetValidation = null;
+        });
+        void validation.promise.catch(() => {});
     }
 
     async validateLiveSessions() {
@@ -1228,56 +2091,34 @@ export class WebttySessionManager {
         for (const sessionFingerprint of this.launchAuthSubscriptions.keys()) {
             this.cleanupLaunchSubscription(sessionFingerprint);
         }
-        await Promise.allSettled([...this.sessions.values()].map(async (session) => {
-            if (session.routeLease?.isCurrent?.() !== true) {
-                await this.closeSession(session, 'route_generation_changed');
-                return;
+        const sessions = [...this.sessions.values()];
+        const shortChecks = [];
+        for (const session of sessions) {
+            if (session.closed || session.closing || session.startupInProgress) continue;
+            let reason = '';
+            if (now - session.createdAt >= this.limits.absoluteLifetimeMs) reason = 'absolute_timeout';
+            else if (now - session.lastActivityAt >= this.limits.idleLifetimeMs) reason = 'idle_timeout';
+            else if (Number.isFinite(session.targetUndecidedSince)
+                && now - session.targetUndecidedSince >= this.limits.targetUndecidedLimitMs) reason = 'target_unverifiable';
+            if (reason) { shortChecks.push(this.closeSession(session, reason)); continue; }
+            for (const viewer of session.viewers.values()) {
+                if (viewer.routeLease?.isCurrent?.() !== true) {
+                    this.removeViewer(session, viewer, { reconnect: true });
+                } else if (viewer.waitingDrain && now >= viewer.drainDeadline) {
+                    this.removeViewer(session, viewer, { event: 'detached', reason: 'slow_viewer' });
+                } else if (Number.isFinite(viewer.authUndecidedSince)
+                    && now - viewer.authUndecidedSince >= this.limits.authenticationOutageLimitMs) {
+                    this.removeViewer(session, viewer, { event: 'detached', reason: 'auth_provider_unavailable' });
+                } else shortChecks.push(this.validateViewer(session, viewer, now));
             }
-            if (now - session.createdAt >= this.limits.absoluteLifetimeMs) {
-                await this.closeSession(session, 'absolute_timeout');
-                return;
-            }
-            if (now - session.lastActivityAt >= this.limits.idleLifetimeMs) {
-                await this.closeSession(session, 'idle_timeout');
-                return;
-            }
-            if (session.target.kind === 'agent') {
-                try {
-                    await this.revalidateTarget({
-                        routePlan: session.routePlan,
-                        target: session.target,
-                        agentProviderAvailable: this.agentProviderReady,
-                    });
-                } catch (_) {
-                    await this.closeSession(session, 'target_identity_changed');
-                    return;
-                }
-            }
-            const auth = await this.auth.validateLease(session.lease);
-            // Every request on the terminal still needs a decided admission,
-            // and logout, revocation or refusal closes it at once.
-            if (auth.ok) {
-                // Results are ordered by the start of their check: an older
-                // decided check does not end an outage a newer check observed.
-                session.authDecidedAt = Math.max(Number(session.authDecidedAt) || 0, now);
-                if (!Number.isFinite(session.authUndecidedSince) || now >= session.authUndecidedSince) {
-                    session.authUndecidedSince = null;
-                }
-                return;
-            }
-            if (auth.reason !== 'provider_unavailable') {
-                await this.closeSession(session, `auth_${auth.reason}`);
-                return;
-            }
-            // A provider outage keeps the terminal only for a bounded time,
-            // measured from the first undecided check after the last decided
-            // one. A check that started before a later decided check is stale.
-            if (now < (Number(session.authDecidedAt) || 0)) return;
-            if (!Number.isFinite(session.authUndecidedSince)) session.authUndecidedSince = now;
-            if (now - session.authUndecidedSince >= this.limits.authenticationOutageLimitMs) {
-                await this.closeSession(session, 'auth_provider_unavailable');
-            }
-        }));
+        }
+        const agents = sessions.filter(session => session.target.kind === 'agent');
+        for (let offset = 0; offset < agents.length; offset += 1) {
+            this.startTargetValidation(agents[(this.validationStartIndex + offset) % agents.length]);
+        }
+        if (agents.length) this.validationStartIndex = (this.validationStartIndex + 1) % agents.length;
+        // Target inspections never delay viewer generation/auth/lifetime checks.
+        await Promise.allSettled(shortChecks);
     }
 
     async closeAll(reason = 'router_shutdown') {
@@ -1286,10 +2127,12 @@ export class WebttySessionManager {
             this.ready = false;
             this.disabledCategory = 'shutting_down';
             clearInterval(this.leaseTimer);
+            for (const session of this.sessions.values()) this.clearPendingStop(session);
             for (const unsubscribe of this.launchAuthSubscriptions.values()) {
                 try { unsubscribe(); } catch (_) { }
             }
             this.launchAuthSubscriptions.clear();
+            for (const pending of this.pendingCreations.values()) pending.cancellation ||= reason;
         }
         const requested = [...this.sessions.values()].map((session) => (
             this.closeSession(session, reason)

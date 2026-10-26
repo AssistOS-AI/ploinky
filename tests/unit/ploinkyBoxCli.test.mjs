@@ -12,6 +12,7 @@ import {
     resolveBoxImageReference,
 } from '../../ploinky-box/constants.mjs';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
+import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createMemoryUpdateHostState, createUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { UPDATE_HANDOFF_ENV, createRelaunchHandoff } from '../../ploinky-box/update/relaunchHandoff.mjs';
 
@@ -978,13 +979,16 @@ test('tampered, replayed, stale, foreign and mismatched handoffs are refused bef
 test('durable handoff records are private host state files consumed by atomic rename', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-handoff-home-'));
     try {
-        const store = createUpdateHostState({ stateRoot: path.join(home, '.ploinky-box') });
+        const storeWorkspace = path.join(home, 'workspace');
+        fs.mkdirSync(storeWorkspace);
+        const storeIdentity = buildWorkspaceIdentity(storeWorkspace);
+        const store = createUpdateHostState({ identity: storeIdentity });
         const identity = { instance: 'ploinky-box-workspace-123456789abc', workspaceRoot: WORKSPACE_ROOT };
         const handoff = createRelaunchHandoff({
             store, argv: ['update'], request: { kind: 'all', folder: null, folderPath: null }, identity,
             scopeRoot: WORKSPACE_ROOT, host: hostUpdateRevisions(), parentPid: process.pid,
         });
-        const file = path.join(home, '.ploinky-box', 'update-handoffs', `${handoff.operationId}.json`);
+        const file = path.join(storeIdentity.hostStateRoot, 'update-handoffs', `${handoff.operationId}.json`);
         assert.equal(fs.statSync(file).mode & 0o777, 0o600);
         assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
         const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -1364,8 +1368,8 @@ test('destroy runs input-free marker recovery when the outer Box is already abse
 
 test('destroy prints the host operator records it removed, for both forms', async () => {
     const records = [
-        '/home/user/.ploinky-box/gpu-grants/ploinky-box-workspace-123456789abc.json',
-        '/home/user/.ploinky-box/hardware-limits/ploinky-box-workspace-123456789abc',
+        '/home/user/workspace/.ploinky-box/gpu-grants/ploinky-box-workspace-123456789abc.json',
+        '/home/user/workspace/.ploinky-box/hardware-limits/ploinky-box-workspace-123456789abc',
     ];
     for (const [argv, statusState, removedRecords, expected] of [
         [['destroy'], 'running-initialized', records, `host operator records removed: ${records.join(', ')}.`],
@@ -1413,6 +1417,12 @@ test('public help documents non-interactive destroy and explicit cache deletion'
     assert.match(output.value(), /destroy\s+Remove the outer Box without prompting/);
     assert.match(output.value(), /GPU grants and hardware-limits records/);
     assert.match(output.value(), /until ploinky destroy removes it/);
+    assert.match(output.value(), /ploinky unlock \[--force-holder PID@MACHINE\]/);
+    assert.match(output.value(), /\[--allow-host-process PID\]/);
+    assert.match(output.value(), /<workspace>\/\.ploinky-box/);
+    assert.match(output.value(), /never means deleting \.data\/, \.ploinky\/data\/ or \.env/);
+    assert.match(output.value(), /remove the directory\s+<workspace>\/\.ploinky-box/);
+    assert.doesNotMatch(output.value(), /saved outside the\s+workspace/);
     assert.doesNotMatch(output.value(), /only clears the saved (grant)|saved gate and stored limits (are) kept/);
     assert.match(output.value(), /docker\.io\/assistos\/ploinky-box:latest/);
     assert.match(output.value(), /PLOINKY_BOX_IMAGE/);

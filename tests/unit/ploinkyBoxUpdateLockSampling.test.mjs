@@ -13,6 +13,7 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 // Uses only public entry points that exist before and after the lock-time
 // sampling change, so it demonstrates the defect on the unchanged baseline.
@@ -46,6 +47,7 @@ function scenario(t, { before, whileWaiting }) {
         },
     });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership(),

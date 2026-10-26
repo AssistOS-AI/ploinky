@@ -33,7 +33,8 @@ test('sandbox PID ownership is isolated by exact runtime key and rejects stale i
         assert.equal(fs.statSync(aliasAFile).mode & 0o777, 0o600);
         assert.equal(fs.statSync(aliasBFile).mode & 0o777, 0o600);
         const aliasARecord = JSON.parse(fs.readFileSync(aliasAFile, 'utf8'));
-        assert.equal(aliasARecord.schemaVersion, 2);
+        assert.equal(aliasARecord.schemaVersion, 3);
+        assert.equal(aliasARecord.hostStateMasked, true);
         assert.equal(aliasARecord.instanceId, identityA.instanceId);
         assert.equal(aliasARecord.enableGeneration, identityA.enableGeneration);
 
@@ -107,7 +108,66 @@ test('sandbox PID ownership is isolated by exact runtime key and rejects stale i
         assert.equal(result.status, 0, result.stderr || result.stdout);
         const evidence = JSON.parse(result.stdout.trim());
         assert.notEqual(evidence.aliasA, evidence.aliasB);
-        assert.equal(evidence.schemaVersion, 2);
+        assert.equal(evidence.schemaVersion, 3);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+// Plan D3: a schema 2 record was written by an older Ploinky for an agent that
+// runs without the host state mask. It stays manageable (observed, stopped,
+// replaced as the predecessor) and is reported as unmasked; anything that is
+// neither an exact schema 2 nor an exact schema 3 record stays invalid.
+test('schema 2 launch records stay manageable as unmasked; malformed schema 3 records are invalid', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-schema-'));
+    const script = `
+        import assert from 'node:assert/strict';
+        import fs from 'node:fs';
+        const fleet = await import(${JSON.stringify(fleetModuleUrl)});
+        const identity = { instanceId: 'instance-old', enableGeneration: 'generation-old' };
+        const successor = { instanceId: 'instance-new', enableGeneration: 'generation-new' };
+        const key = 'ploinky_repo_agent_schema_workspace_deadbeef';
+        fleet.saveBwrapPid(key, process.pid, identity);
+        const file = fleet.BWRAP_PIDS_DIR + '/' + key + '.pid';
+        const v3 = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const { hostStateMasked, ...v2Fields } = v3;
+        assert.equal(hostStateMasked, true);
+        const write = (record) => fs.writeFileSync(file, JSON.stringify(record), { mode: 0o600 });
+
+        write({ ...v2Fields, schemaVersion: 2 });
+        const observed = fleet.observeSandboxRuntime(key, { expectedIdentity: identity });
+        assert.equal(observed.state, 'live-exact');
+        assert.equal(observed.record.schemaVersion, 2);
+        assert.equal(observed.record.hostStateMasked, false);
+        assert.equal(fleet.getBwrapPid(key, identity), process.pid);
+        assert.equal(fleet.isBwrapProcessRunning(key, identity), true);
+        assert.equal(fleet.resolveSandboxSlotForStart(key, { successor, expectedPredecessor: identity }).kind, 'predecessor');
+
+        for (const invalid of [
+            { ...v2Fields, schemaVersion: 3 },
+            { ...v2Fields, schemaVersion: 3, hostStateMasked: false },
+            { ...v2Fields, schemaVersion: 3, hostStateMasked: 'true' },
+            { ...v2Fields, schemaVersion: 2, hostStateMasked: false },
+            { ...v2Fields, schemaVersion: 1 },
+            { ...v3, schemaVersion: 4 },
+        ]) {
+            write(invalid);
+            assert.equal(fleet.observeSandboxRuntime(key).reason, 'invalid-record', JSON.stringify(invalid));
+            assert.throws(() => fleet.assertBwrapPidSlotAvailable(key), (error) => (
+                error?.code === 'PLOINKY_SANDBOX_PID_RECORD_INVALID' && /pre-v2/.test(error.message)
+            ));
+        }
+        fleet.clearBwrapPid(key);
+        console.log('ok');
+    `;
+    try {
+        const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+            cwd: workspace,
+            env: { ...process.env, PLOINKY_WORKSPACE_ROOT: workspace, PLOINKY_CWD: workspace },
+            encoding: 'utf8',
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.equal(result.stdout.trim(), 'ok');
     } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
     }
@@ -281,5 +341,28 @@ test('a PID slot that cannot be verified is never cleared or replaced, while a s
         }
         fleet.assertBwrapPidSlotAvailable(key);
         assert.equal(fs.existsSync(file), false, 'the stale record was removed by compare-and-delete');
+    `);
+});
+
+test('a zombie thread-group leader with a live thread is alive; only an all-Z/X task list is absent', () => {
+    runFleet(`
+        const key = 'ploinky_repo_agent_zombie_leader_workspace_deadbeef';
+        const identity = { instanceId: 'i', enableGeneration: 'g' };
+        const pid = child();
+        fleet.saveBwrapPid(key, pid, identity);
+        const recorded = JSON.parse(fs.readFileSync(fleet.BWRAP_PIDS_DIR + '/' + key + '.pid', 'utf8')).processIdentity;
+        // The leader reads as Z with the recorded start identity, on either platform.
+        const leaderZ = recorded.startsWith('linux-proc:')
+            ? { readProcStat: () => '1 (x) Z ' + Array.from({ length: 18 }, () => '0').join(' ') + ' ' + recorded.slice('linux-proc:'.length) + ' 0' }
+            : { readProcStat: () => { throw new Error('no procfs'); }, runPs: () => 'Z ' + recorded.slice('ps-lstart:'.length) };
+        const observe = (readTaskStates) => fleet.observeSandboxRuntime(key, { expectedIdentity: identity, ops: { ...leaderZ, readTaskStates } });
+
+        assert.equal(observe(() => ['Z', 'S']).state, 'live-exact', 'a live thread keeps the process alive');
+        assert.equal(observe(() => ['Z', '']).state, 'live-exact', 'an unparsable task state is never exited');
+        assert.equal(observe(() => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); }).state, 'unknown');
+        const exited = observe(() => ['Z', 'X', 'Z']);
+        assert.equal(exited.state, 'absent');
+        assert.equal(exited.reason, 'stale-record-zombie');
+        assert.equal(observe(() => { throw Object.assign(new Error('none'), { code: 'ENOENT' }); }).state, 'absent', 'no task list (macOS): the leader state decides');
     `);
 });

@@ -213,6 +213,17 @@ export function routeOuterCommand(parsed, options = {}) {
             all: parsed.limits.all,
         });
     }
+    // Lock recovery is host-only: it inspects and removes host state locks and
+    // never prepares a Box. There is nothing to preview without removing.
+    if (parsed.command === 'unlock') {
+        if (parsed.unlock?.help) return Object.freeze({ kind: 'help', topic: ['unlock'] });
+        if (parsed.dryRun) {
+            throw routeError('unlock has no --dry-run; it removes only locks whose holder is proven gone or named '
+                + 'with --force-holder, and lists everything else');
+        }
+        if (parsed.allowHostProcesses.length) throw routeError('unlock: --allow-host-process is not supported');
+        return Object.freeze({ kind: 'unlock', forceHolder: parsed.unlock.forceHolder });
+    }
     if (!parsed.command) {
         return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'repl', coreArgv: parsed.forwardingArgv });
     }

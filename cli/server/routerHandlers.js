@@ -1,6 +1,7 @@
 import http from 'http';
 import net from 'node:net';
 import path from 'node:path';
+import { pipeline } from 'node:stream';
 import { createHmac, randomUUID } from 'node:crypto';
 
 import { sendJson } from './authHandlers/index.js';
@@ -133,14 +134,34 @@ export function createLeaseCommittedAgent(beforeDial, { createConnection = net.c
 }
 
 function handleProxyError(res, error) {
+    if (res.destroyed || res.writableEnded) return;
     if (error?.code === 'EDGE_GENERATION_CHANGED') {
         rejectStaleLease(res);
         return;
     }
-    if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
+    if (res.headersSent) {
+        // Appending an error body would disguise a truncated stream as a
+        // complete response.
+        res.destroy();
+        return;
     }
+    res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'upstream error', detail: String(error) }));
+}
+
+// Ties the upstream request to the downstream response: a downstream close
+// before the response ends cancels the upstream work. Root routes keep their
+// previous timing; they add no idle or first-byte deadline, because agents
+// such as streaming chat responders may legitimately pause for minutes.
+function bindUpstreamToDownstream(res, upstream) {
+    res.once('close', () => {
+        if (!res.writableEnded) upstream.destroy();
+    });
+    if (res.destroyed && !res.writableEnded) upstream.destroy();
+    return upstreamRes => {
+        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+        pipeline(upstreamRes, res, () => {});
+    };
 }
 
 export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}, { beforeDial = null } = {}) {
@@ -161,14 +182,12 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
         method: req.method,
         headers,
         agent: createLeaseCommittedAgent(beforeDial),
-    }, upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-        upstreamRes.pipe(res, { end: true });
     });
 
     upstream.on('error', err => {
         handleProxyError(res, err);
     });
+    upstream.once('response', bindUpstreamToDownstream(res, upstream));
 
     req.on('aborted', () => {
         upstream.destroy();
@@ -216,14 +235,12 @@ export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHe
         method: req.method,
         headers: buildBufferedProxyHeaders(req, targetPort, body, extraHeaders),
         agent: createLeaseCommittedAgent(beforeDial),
-    }, upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
-        upstreamRes.pipe(res, { end: true });
     });
 
     upstream.on('error', err => {
         handleProxyError(res, err);
     });
+    upstream.once('response', bindUpstreamToDownstream(res, upstream));
 
     upstream.end(body);
     return upstream;

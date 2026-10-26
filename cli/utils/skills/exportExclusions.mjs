@@ -193,10 +193,12 @@ export function inheritedExcludes(identity, { git = runGit, env = process.env, g
 
 // One disposable fixture per process proves that this Git keeps worktree
 // config private to its worktree once extensions.worktreeConfig is enabled.
+// `stagingRoot` is where a host process that acts for a Box keeps it (the
+// masked `.ploinky-box/tmp/<rand>/`); every other caller uses `os.tmpdir()`.
 let capabilityCache = null;
-export function worktreeConfigCapability({ git = runGit } = {}) {
+export function worktreeConfigCapability({ git = runGit, stagingRoot = null } = {}) {
     if (capabilityCache) return capabilityCache;
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-worktree-config-'));
+    const base = fs.mkdtempSync(path.join(stagingRoot || os.tmpdir(), 'ploinky-worktree-config-'));
     const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(base, 'global') };
     fs.writeFileSync(env.GIT_CONFIG_GLOBAL, '');
     const run = (args, cwd) => {
@@ -495,7 +497,7 @@ function planGit(identity, patterns, options) {
         return deferred('git-directory-outside-boundary', `The Git metadata for ${identity.root} resolves outside ${options.gitDirBoundary}; nothing is written.`);
     }
     if (!options.heldGitLocks.includes(identity.commonDir)) return deferred('git-metadata-lock-missing', `The common Git configuration lock for ${identity.commonDir} is not held; exclusions are deferred.`);
-    const capability = options.capability({ git });
+    const capability = options.capability({ git, stagingRoot: options.stagingRoot ?? null });
     if (!capability.supported) return deferred('git-worktree-config-unsupported', `This Git cannot keep worktree configuration private (${capability.reason}); no shared rules are written.`);
     const commonConfig = path.join(identity.commonDir, 'config');
     const mainWorktreeConfig = path.join(identity.commonDir, 'config.worktree');
@@ -642,7 +644,7 @@ function planGit(identity, patterns, options) {
  * paths of verified owned output, computed by the transaction under its
  * locks; nothing here infers ownership from names or link targets.
  */
-export function createSkillExclusionPlanner({ authorizeComposition = false, nonGitBlock = false, git = runGit, env = process.env, capability = worktreeConfigCapability, containerExecutor = detectContainerExecutor(), gitDirBoundary = null } = {}) {
+export function createSkillExclusionPlanner({ authorizeComposition = false, nonGitBlock = false, git = runGit, env = process.env, capability = worktreeConfigCapability, containerExecutor = detectContainerExecutor(), gitDirBoundary = null, stagingRoot = null } = {}) {
     const boundary = gitDirBoundary ? fs.realpathSync(gitDirBoundary) : null;
     return {
         hostBoundary: boundary,
@@ -672,7 +674,7 @@ export function createSkillExclusionPlanner({ authorizeComposition = false, nonG
                 if (pattern) patterns.push(pattern); else unrepresentable.push(relative);
             }
             const planned = identity
-                ? planGit(identity, patterns, { git, env, authorizeComposition, capability, heldGitLocks, containerExecutor, gitDirBoundary: boundary })
+                ? planGit(identity, patterns, { git, env, authorizeComposition, capability, heldGitLocks, containerExecutor, gitDirBoundary: boundary, stagingRoot })
                 : planNonGit(root, patterns, { nonGitBlock });
             if (unrepresentable.length) planned.outcome.unrepresentable = unrepresentable;
             // The folder lets a host process act on a deferral from a container.

@@ -13,8 +13,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { HARDWARE_LIMITS_STATE_DIRECTORY } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
-import { ensurePrivateDirectory, fsyncDirectory, readPrivateFile, writePrivateFileAtomically } from './privateStateFiles.mjs';
+import { ensureStoreDirectories } from './hostState/stores.mjs';
+import { fsyncDirectory, readPrivateFile, writePrivateFileAtomically } from './privateStateFiles.mjs';
 import {
     beginDowngradeBarrier,
     hardwareStateRoot,
@@ -76,14 +78,13 @@ export function digestOf(value) {
 }
 
 // ---------------------------------------------------------------------------
-// Journal store: ~/.ploinky-box/hardware-limits/INSTANCE/transitions/
+// Journal store: <workspace>/.ploinky-box/hardware-limits/INSTANCE/transitions/
 
-export function createTransitionStore({ identity, homeDirectory = os.homedir(), fsApi = fs }) {
-    const directory = path.join(hardwareStateRoot(homeDirectory), identity.instance, 'transitions');
+export function createTransitionStore({ identity, fsApi = fs }) {
+    const directory = path.join(hardwareStateRoot(identity), identity.instance, 'transitions');
 
     function ensure() {
-        fsApi.mkdirSync(path.dirname(directory), { recursive: true, mode: 0o700 });
-        ensurePrivateDirectory(fsApi, directory, STATE_FILES);
+        ensureStoreDirectories(identity, [HARDWARE_LIMITS_STATE_DIRECTORY, identity.instance, 'transitions'], { fsApi, ...STATE_FILES });
     }
 
     function journalPath(operationId) {
@@ -194,9 +195,9 @@ export function validateJournal(value, identity = null) {
  * engine and host records, and the policy store paths. `faults` (tests only)
  * injects a process death or an I/O failure at named effect boundaries.
  */
-function contextFor({ identity, homeDirectory, transitionStore, effects, faults = {}, now = () => new Date() }) {
-    const store = transitionStore || createTransitionStore({ identity, homeDirectory });
-    const policyPaths = hardwareStorePaths({ identity, homeDirectory });
+function contextFor({ identity, transitionStore, effects, faults = {}, now = () => new Date() }) {
+    const store = transitionStore || createTransitionStore({ identity });
+    const policyPaths = hardwareStorePaths({ identity });
     function boundary(effect, side) {
         const fault = faults[`${effect}.${side}`];
         if (!fault) return;
@@ -213,7 +214,7 @@ function contextFor({ identity, homeDirectory, transitionStore, effects, faults 
         boundary(effect, 'after');
         return result;
     }
-    return { identity, homeDirectory, store, effects, policyPaths, boundary, act, now };
+    return { identity, store, effects, policyPaths, boundary, act, now };
 }
 
 function persist(ctx, journal, changes) {
@@ -254,13 +255,12 @@ export async function runHardwareDowngrade({
     oldGraphRunning,
     hostRecords,
     reapplyConfiguration = null,
-    homeDirectory = os.homedir(),
     transitionStore,
     effects,
     faults,
     now,
 }) {
-    const ctx = contextFor({ identity, homeDirectory, transitionStore, effects, faults, now });
+    const ctx = contextFor({ identity, transitionStore, effects, faults, now });
     if (!/^[a-f0-9]{12,64}$/.test(String(oldContainerId || ''))) {
         throw transitionError('a downgrade requires the exact immutable ID of the observed gate-on Box');
     }
@@ -552,8 +552,8 @@ async function rollback(ctx, journal) {
  * Fresh-process recovery of every pending downgrade, before the next outer
  * state-changing operation (caller holds the host workspace lock).
  */
-export async function recoverHardwareDowngrades({ identity, homeDirectory = os.homedir(), transitionStore, effects, faults, now }) {
-    const ctx = contextFor({ identity, homeDirectory, transitionStore, effects, faults, now });
+export async function recoverHardwareDowngrades({ identity, transitionStore, effects, faults, now }) {
+    const ctx = contextFor({ identity, transitionStore, effects, faults, now });
     const results = [];
     for (const journal of ctx.store.listPending()) {
         if (journal.phase === 'recovery-blocked') {
@@ -652,9 +652,9 @@ export function downgradeRecoveryAdvice(journal) {
 }
 
 /** Explicit destroy: record the aborted operation and remove its barrier. */
-export function abortHardwareDowngradesForDestroy({ identity, homeDirectory = os.homedir(), transitionStore }) {
-    const store = transitionStore || createTransitionStore({ identity, homeDirectory });
-    const policyPaths = hardwareStorePaths({ identity, homeDirectory });
+export function abortHardwareDowngradesForDestroy({ identity, transitionStore }) {
+    const store = transitionStore || createTransitionStore({ identity });
+    const policyPaths = hardwareStorePaths({ identity });
     const aborted = [];
     for (const journal of store.listPending()) {
         removeDowngradeBarrier({ paths: policyPaths, identity, operationId: journal.operationId, requireEmpty: false });

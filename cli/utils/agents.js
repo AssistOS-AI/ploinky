@@ -93,6 +93,12 @@ import {
 import { retireNoWaitRunMarkers } from '../commands/noWaitMarkerLifecycle.js';
 import { resolveManifestAuthMode } from './manifestAuth.js';
 import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
+import {
+    hasCompleteRuntimeTuple,
+    readRuntimePredecessor,
+    retireRuntimePredecessor,
+    writeRuntimePredecessor,
+} from '../sandbox/runtimePredecessorStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -440,6 +446,7 @@ function resolveAgentEnableInput({
         routerEndpoint,
         runtimeAdmission,
         runtimeKind,
+        selectedRuntime,
         shortAgentName,
     };
 }
@@ -691,6 +698,60 @@ function withdrawnReplacementEligible(plans, previousAgents, routing, policy) {
     return { plan, predecessor };
 }
 
+// Only a successor that launches as a host or none container can remove its
+// same-name predecessor through the exact receipt consumer (the unmanaged
+// branch of startAgentContainer). A managed (default/bridge) or native
+// successor never reaches it, so it is given no receipt it could not consume.
+// The selected profile's network decides, never the top-level manifest.
+// Eligibility only preserves proof for that potential removal; it does not
+// promise the launch reaches it. A present predecessor of another network
+// contract is still refused as foreign first, and its proof stays bound.
+function preparedPredecessorReceiptEligible(input) {
+    const mode = input?.profileResolution?.network?.mode;
+    return input?.runtimeKind === 'container'
+        && (input.selectedRuntime === 'podman' || input.selectedRuntime === 'docker')
+        && (mode === 'host' || mode === 'none');
+}
+
+function predecessorOwnershipError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
+
+// Read-only. The exact predecessor an inactive replacement of this plan must
+// prove before it rotates the registered tuple, or null when the plan has no
+// such predecessor or its successor cannot consume the proof. A receipt left
+// bound to the current record (a replacement stopped before it removed its
+// predecessor) is the only proof of the tuple that predecessor still carries:
+// it is carried forward, and a successor that could not consume it is refused
+// before anything is published.
+function resolvePreparedPredecessorOwnership(plan, input, previousAgents) {
+    const previous = previousAgents?.[plan.containerName];
+    if (previous?.type !== 'agent' || !hasCompleteRuntimeTuple(previous)) return null;
+    const bound = readRuntimePredecessor(plan.containerName, previous);
+    const predecessor = bound
+        ? { ...structuredClone(previous), ...structuredClone(bound.predecessor) }
+        : structuredClone(previous);
+    if (!preparedPredecessorReceiptEligible(input) || isSandboxRuntime(predecessor.runtime)) {
+        if (bound) {
+            throw predecessorOwnershipError(
+                'PLOINKY_RUNTIME_PREDECESSOR_PENDING',
+                `runtime '${plan.containerName}' still has a pending predecessor receipt that only a host or none container replacement can consume; replace it on that path or run a workspace start first`,
+            );
+        }
+        return null;
+    }
+    const recordedEngine = String(predecessor.runtime || '');
+    if (recordedEngine && recordedEngine !== input.selectedRuntime) {
+        throw predecessorOwnershipError(
+            'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS',
+            `runtime '${plan.containerName}' was recorded on the '${recordedEngine}' engine but its successor resolves to '${input.selectedRuntime}'; an enable does not migrate container engines`,
+        );
+    }
+    return { predecessor, priorReceipt: bound };
+}
+
 /**
  * Stage exact identities and target-less routes for a set of agents, then
  * compile one immutable generation before any of their processes start.
@@ -775,11 +836,21 @@ export function prepareAgentEnableBatch(requests, {
                     ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
                 });
             }
+            // Every predecessor proof is resolved, and every refusal raised,
+            // before anything below is withdrawn, retired, inactivated or written.
+            const predecessorOwnership = effectiveAvailabilityMode === 'replacement'
+                ? plans.map((plan, index) => resolvePreparedPredecessorOwnership(
+                    plan, resolvedRequests[index].input, previousAgents,
+                ))
+                : [];
             const policy = bootstrapPreparedMcpToolPolicy(routing.routes);
             const manifestBytes = Object.fromEntries(
                 plans.map((plan) => [plan.routeKey, plan.manifestBytes]),
             );
+            // A pending receipt is consumed only by the inactive replacement
+            // below, never beside a drained predecessor.
             const withdrawn = effectiveAvailabilityMode === 'replacement'
+                && !predecessorOwnership.some((ownership) => ownership?.priorReceipt)
                 ? withdrawnReplacementEligible(plans, previousAgents, routing, policy)
                 : null;
             let markersRetired = false;
@@ -817,9 +888,32 @@ export function prepareAgentEnableBatch(requests, {
             if (preparedGeneration) {
                 // Prepared beside the drained active predecessor.
             } else if (effectiveAvailabilityMode === 'replacement') {
+                // The rotated record names the predecessor's container ID and
+                // engine (never its tuple), so the launch can remove that
+                // container only by a receipt keyed by the rotated tuple. Make
+                // each receipt durable before anything is inactivated or the
+                // registry rotates; a failed write leaves both untouched.
+                const carriedReceipts = [];
+                for (const [index, plan] of plans.entries()) {
+                    const ownership = predecessorOwnership[index];
+                    if (!ownership) continue;
+                    writeRuntimePredecessor({
+                        containerName: plan.containerName,
+                        successor: plan.record,
+                        predecessor: ownership.predecessor,
+                    });
+                    if (ownership.predecessor.containerId) plan.record.containerId = ownership.predecessor.containerId;
+                    if (ownership.predecessor.runtime) plan.record.runtime = ownership.predecessor.runtime;
+                    if (ownership.priorReceipt) carriedReceipts.push(ownership.priorReceipt);
+                }
                 inactivateEdgeRoutingGeneration(`${reason}:source-stage`, { applyLockCapability });
                 if (!markersRetired) retireNoWaitMarkers(supersededNoWaitRecords);
                 saveAgents(map, { coordinate: false, applyLockCapability });
+                // The receipts just written now carry every earlier receipt's
+                // predecessor; the earlier ones bind no record any more.
+                for (const receipt of carriedReceipts) {
+                    try { retireRuntimePredecessor(receipt); } catch (_) {}
+                }
                 writeRoutingConfig(routing, { coordinate: false });
                 const policyFile = path.join(
                     PLOINKY_WORKSPACE_ROOT,

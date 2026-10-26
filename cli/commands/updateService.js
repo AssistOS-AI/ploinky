@@ -213,7 +213,7 @@ export async function updatePloinkySelf({
         lock = heldSourceLock.lock;
     } else {
         const manager = sourceLockManager || await createDefaultSourceLockManager();
-        lock = await acquireSourceLock(manager, source.lockIdentity);
+        lock = await acquireSourceLock(manager, source);
         owned = true;
     }
     let record;

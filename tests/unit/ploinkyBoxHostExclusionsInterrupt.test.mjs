@@ -64,6 +64,7 @@ const hostScript = `
     const { createMutationLockManager } = await import(${JSON.stringify(moduleUrl('ploinky-box/locks.mjs'))});
     const { createUpdateHostState } = await import(${JSON.stringify(moduleUrl('ploinky-box/update/hostState.mjs'))});
     const { agentLibFixture } = await import(${JSON.stringify(moduleUrl('tests/helpers/agentlibFixture.mjs'))});
+    const { PERMISSIVE_HOST_STATE_GUARD } = await import(${JSON.stringify(moduleUrl('tests/helpers/hostStateFixture.mjs'))});
     const writerScript = ${JSON.stringify(writerScript)};
     const root = process.env.FIXTURE_ROOT;
     const identity = buildWorkspaceIdentity(process.env.FIXTURE_WORKSPACE, { markerFound: true });
@@ -81,12 +82,13 @@ const hostScript = `
     const writers = [];
     const liveWriters = () => writers.filter(pid => { try { process.kill(-pid, 0); return true; } catch (_) { return false; } });
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
-        lockManager: createMutationLockManager({ homeDirectory: root }),
+        lockManager: createMutationLockManager(),
         discover: () => ownership(),
         env: process.env,
-        updateHostState: createUpdateHostState({ stateRoot: path.join(root, '.ploinky-box') }),
+        updateHostState: createUpdateHostState({ identity }),
         runner: {
             run() {},
             query: (_command, args) => (args[0] === 'ps'
@@ -284,7 +286,7 @@ function leftovers(folder) {
 const SETTLED = { configLock: null, exportLock: null, journal: null, staging: [], quarantine: false, gitLocks: [] };
 
 const intentFolders = ws => {
-    const directory = path.join(ws.root, '.ploinky-box', 'update-exclusions');
+    const directory = path.join(ws.workspace, '.ploinky-box', 'update-exclusions');
     return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(name => readJson(path.join(directory, name)).folders) : [];
 };
 const hostRecords = result => result.records.filter(record => record.id.startsWith('exclusions'))

@@ -13,6 +13,10 @@ import { normalizeRelayDescriptor, verifyInspectedContainer } from './confinemen
 
 const DEFAULT_CHANNEL_IDLE_TIMEOUT_MS = 30_000;
 const MAX_RELAY_STDERR_BYTES = 4096;
+// Raw bytes per DATA frame. Base64 and JSON framing keep a slice far below the
+// relay frame cap, and bounded slices let other streams on a pooled channel
+// interleave with a large body.
+const MAX_RELAY_DATA_SLICE_BYTES = 256 * 1024;
 export const RUNTIME_RELAY_CONTROL_DESTINATION = '/run/ploinky-health-probes';
 export const RUNTIME_RELAY_SOCKET_NAME = 'runtime-relay.sock';
 export const RUNTIME_RELAY_CONTROL_HOST_ROOT = HEALTH_PROBE_CONTROL_HOST_ROOT;
@@ -195,8 +199,14 @@ class RelayRequestStream extends EventEmitter {
         this.channel = channel;
         this.requestId = requestId;
         this.terminal = false;
+        this.cancelled = false;
         this.failure = null;
         this.failureDelivered = false;
+        // Frames not yet handed to the channel: DATA slices, then possibly
+        // HALF_CLOSE. CANCEL is never queued, so it cannot trail DATA.
+        this.outbound = [];
+        this.awaitingChannelDrain = false;
+        this.drainRequested = false;
     }
 
     on(eventName, listener) {
@@ -208,21 +218,89 @@ class RelayRequestStream extends EventEmitter {
         return result;
     }
 
+    // Returns false while slices are queued or the channel reports
+    // backpressure; 'drain' follows once both have cleared.
     write(data) {
-        if (this.terminal) throw new Error('runtimeRelay: request stream is terminal');
-        return this.channel._write({ type: 'DATA', requestId: this.requestId, data: Buffer.from(data) });
+        if (this.terminal || this.cancelled) throw new Error('runtimeRelay: request stream is terminal');
+        const bytes = Buffer.from(data);
+        let offset = 0;
+        do {
+            this.outbound.push({ type: 'DATA', data: bytes.subarray(offset, offset + MAX_RELAY_DATA_SLICE_BYTES) });
+            offset += MAX_RELAY_DATA_SLICE_BYTES;
+        } while (offset < bytes.length);
+        this._flushOutbound();
+        if (this.outbound.length || this.awaitingChannelDrain) {
+            this.drainRequested = true;
+            return false;
+        }
+        return true;
     }
 
     end(data) {
         if (data?.length) this.write(data);
-        if (!this.terminal) this.channel._write({ type: 'HALF_CLOSE', requestId: this.requestId });
+        if (this.terminal || this.cancelled) return;
+        if (this.outbound.length) this.outbound.push({ type: 'HALF_CLOSE' });
+        else this.channel._write({ type: 'HALF_CLOSE', requestId: this.requestId });
     }
 
     cancel() {
-        if (!this.terminal) this.channel._write({ type: 'CANCEL', requestId: this.requestId });
+        this._dropOutbound();
+        if (this.terminal) return;
+        this.cancelled = true;
+        this.channel._write({ type: 'CANCEL', requestId: this.requestId });
+    }
+
+    _flushOutbound() {
+        while (this.outbound.length && !this.awaitingChannelDrain) {
+            const frame = this.outbound.shift();
+            if (this.channel._write({ ...frame, requestId: this.requestId }) === false) {
+                this.awaitingChannelDrain = true;
+                this.channel._awaitDrain(this);
+            }
+        }
+    }
+
+    _channelDrained() {
+        this.awaitingChannelDrain = false;
+        if (this.terminal || this.cancelled) return;
+        try {
+            this._flushOutbound();
+        } catch (error) {
+            this._failFromDrain(error);
+            return;
+        }
+        if (!this.outbound.length && !this.awaitingChannelDrain && this.drainRequested) {
+            this.drainRequested = false;
+            this.emit('drain');
+        }
+    }
+
+    // A drain callback has no caller to throw to. Release the request like
+    // abandon() and report the failure on the stream.
+    _failFromDrain(error) {
+        if (this.terminal) return;
+        this._dropOutbound();
+        try { this.channel._write({ type: 'CANCEL', requestId: this.requestId }); } catch (_) {}
+        this.channel.streams.delete(this.requestId);
+        this.channel._scheduleIdleClose();
+        this._fail(error);
+    }
+
+    _dropOutbound() {
+        const writerWaiting = this.drainRequested;
+        this.outbound.length = 0;
+        this.drainRequested = false;
+        if (this.awaitingChannelDrain) {
+            this.awaitingChannelDrain = false;
+            this.channel._cancelDrainWait(this);
+        }
+        // Release a writer blocked on 'drain' instead of leaving its write
+        // callback pending forever; any later write fails on the stream.
+        if (writerWaiting) queueMicrotask(() => this.emit('drain'));
     }
 
     abandon() {
+        this._dropOutbound();
         if (this.terminal) return;
         try {
             this.channel._write({ type: 'CANCEL', requestId: this.requestId });
@@ -247,6 +325,7 @@ class RelayRequestStream extends EventEmitter {
             this._fail(error);
         }
         if (frame.type === 'END') {
+            this._dropOutbound();
             this.terminal = true;
             this.emit('end', frame);
         }
@@ -254,6 +333,7 @@ class RelayRequestStream extends EventEmitter {
 
     _fail(error) {
         if (this.terminal) return;
+        this._dropOutbound();
         this.terminal = true;
         this.failure = error;
         if (this.listenerCount('error')) {
@@ -274,6 +354,19 @@ class RuntimeRelayChannel extends EventEmitter {
         this.idleTimeoutMs = idleTimeoutMs;
         this.onClose = onClose;
         this.streams = new Map();
+        // One stdin 'drain' listener serves every stream with queued slices,
+        // in the order they hit backpressure.
+        this.drainWaiters = new Set();
+        this.drainListening = false;
+        this.onStdinDrain = () => {
+            this.drainListening = false;
+            const waiters = [...this.drainWaiters];
+            this.drainWaiters.clear();
+            for (const stream of waiters) {
+                // One stream's drain listener must not strand the others.
+                try { stream._channelDrained(); } catch (error) { stream._failFromDrain(error); }
+            }
+        };
         this.checkoutCount = 0;
         this.idleTimer = null;
         this.closed = false;
@@ -330,6 +423,19 @@ class RuntimeRelayChannel extends EventEmitter {
     _write(frame) {
         if (this.closed || !this.child.stdin.writable) throw new Error('runtimeRelay: channel is closed');
         return this.child.stdin.write(encodeRelayFrame(frame));
+    }
+
+    _awaitDrain(stream) {
+        if (this.closed) return;
+        this.drainWaiters.add(stream);
+        if (!this.drainListening) {
+            this.drainListening = true;
+            this.child.stdin.once('drain', this.onStdinDrain);
+        }
+    }
+
+    _cancelDrainWait(stream) {
+        this.drainWaiters.delete(stream);
     }
 
     async openRequest({ plan, bodyMode = 'none', bodyHash = '', headers = {} } = {}, { lease } = {}) {
@@ -392,6 +498,11 @@ class RuntimeRelayChannel extends EventEmitter {
         this.closed = true;
         clearTimeout(this.idleTimer);
         this.idleTimer = null;
+        this.drainWaiters.clear();
+        if (this.drainListening) {
+            this.drainListening = false;
+            this.child.stdin.off('drain', this.onStdinDrain);
+        }
         this.signingSecret?.fill?.(0);
         try { this.child.stdin.end(); } catch (_) {}
         try { this.child.kill(); } catch (_) {}

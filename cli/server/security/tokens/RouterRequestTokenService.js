@@ -24,6 +24,15 @@ export function normalizeActorCapabilities(kind, roles, capabilities) {
     return valid;
 }
 
+export const MAX_DISPLAY_NAME_LENGTH = 128;
+
+// Display-only name carried next to the identity; never an authorization input.
+// Only `user` actors may carry it; an empty result omits the claim.
+export function normalizeDisplayName(kind, value) {
+    if (kind !== 'user' || typeof value !== 'string') return '';
+    return value.trim().slice(0, MAX_DISPLAY_NAME_LENGTH).trim();
+}
+
 export function normalizeActor(actor) {
     if (!actor || typeof actor !== 'object') {
         return { kind: 'user', id: '', roles: [] };
@@ -37,6 +46,8 @@ export function normalizeActor(actor) {
     };
     const capabilities = normalizeActorCapabilities(kind, roles, actor.capabilities);
     if (capabilities) normalized.capabilities = capabilities;
+    const displayName = normalizeDisplayName(kind, actor.displayName);
+    if (displayName) normalized.displayName = displayName;
     return normalized;
 }
 
@@ -55,12 +66,15 @@ export function normalizeUserClaims(usr) {
     if (!usr || typeof usr !== 'object') return undefined;
     const id = String(usr.id || usr.sub || '').trim();
     if (!id) return undefined;
-    return {
+    const normalized = {
         id,
         username: String(usr.username || usr.preferred_username || '').trim(),
         email: String(usr.email || '').trim(),
         roles: Array.isArray(usr.roles) ? usr.roles.map((role) => String(role || '')).filter(Boolean) : [],
     };
+    const displayName = normalizeDisplayName('user', usr.displayName);
+    if (displayName) normalized.displayName = displayName;
+    return normalized;
 }
 
 export function normalizeScope(scope) {

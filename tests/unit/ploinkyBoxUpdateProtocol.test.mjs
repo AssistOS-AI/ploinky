@@ -12,6 +12,7 @@ import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeUpdateCore, verifiedRecord, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 const CONTAINER_ID = 'a'.repeat(64);
 
@@ -76,6 +77,7 @@ function scenario(t, {
         },
     };
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: {

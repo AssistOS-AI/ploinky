@@ -20,6 +20,9 @@ import { PUBLIC_ROUTER_HOSTS_ENV } from '../../cli/utils/publicRouterHosts.mjs';
 
 const MINIMAL_NODE_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
 const REPOSITORY_ROOT = path.resolve(import.meta.dirname, '../..');
+// Physical-host ports distinct from the Native Box tests' 19090-19096 / 17891-17898.
+const PRIVATE_ROUTING_HOST_PORT = 19099;
+const PRIVATE_ROUTING_MEDIA_HOST_PORT = 17899;
 
 function queryInBox(harness, containerId, argv, timeoutMs = 120_000) {
     return harness.runner.query('podman', [
@@ -99,8 +102,13 @@ test('one nested rootless-Podman container reaches the unpublished private liste
     };
 
     try {
+        // Isolated physical-host ports: the default 8080/7882 may be held by
+        // another Box on a shared host. The container-side surfaces stay 8080
+        // and 7882, which is what this test proves.
         const prepared = await harness.supervisor.prepareBoxForCommand({
             imageRef: candidateReference,
+            explicitPort: PRIVATE_ROUTING_HOST_PORT,
+            explicitMediaPort: PRIVATE_ROUTING_MEDIA_HOST_PORT,
         });
         const outerInspection = queryJson(harness.runner, 'podman', [
             'container', 'inspect', prepared.containerId,
@@ -139,9 +147,10 @@ test('one nested rootless-Podman container reaches the unpublished private liste
         assert.equal(observedLabels[BOX_AGENTLIB_LABELS.sourceRelativePath], 'image');
         assert.equal(observedLabels[BOX_AGENTLIB_LABELS.sourceIdHash],
             imageSourceIdHash(imageSourceIdentity(normalizeImageId(outerInspection?.Image))));
-        // This default Box has the loopback publication and no GPU grant, so it
-        // carries neither conditional label and trusts no outer Router hosts.
-        const conditionalLabels = [BOX_LABELS.routerBindAddress, BOX_LABELS.gpuGrant];
+        // This Box has the loopback publication, no GPU grant and the
+        // hardware-limits gate off, so it carries none of the conditional
+        // labels and trusts no outer Router hosts.
+        const conditionalLabels = [BOX_LABELS.routerBindAddress, BOX_LABELS.gpuGrant, BOX_LABELS.hardwareLimits];
         assert.deepEqual(
             Object.keys(observedLabels)
                 .filter((key) => key.startsWith('io.assistos.ploinky-box.'))
@@ -160,8 +169,10 @@ test('one nested rootless-Podman container reaches the unpublished private liste
             [`${BOX_ROUTER_CONTAINER_PORT}/tcp`]: {},
         });
         assert.deepEqual(evidence.outerBox.portBindings, {
-            '7882/udp': [{ HostIp: '0.0.0.0', HostPort: '7882' }],
-            '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }],
+            [`${BOX_MEDIA_PORT}/udp`]: [{ HostIp: '0.0.0.0', HostPort: String(PRIVATE_ROUTING_MEDIA_HOST_PORT) }],
+            [`${BOX_ROUTER_CONTAINER_PORT}/tcp`]: [{
+                HostIp: '127.0.0.1', HostPort: String(PRIVATE_ROUTING_HOST_PORT),
+            }],
         });
         assert.deepEqual(evidence.outerBox.sourceMount, {
             source: '<source-checkout>',

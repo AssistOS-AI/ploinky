@@ -143,6 +143,8 @@ test('public status renders the core workspace view without mutating Box state',
     const harness = createPodmanHarness(t, candidateReference);
     const prepared = await harness.supervisor.prepareBoxForCommand({
         explicitPort: await availableHostPort(),
+        // A media port no other Box test uses, so a Box on the default 7882 cannot block it.
+        explicitMediaPort: 17903,
         imageRef: candidateReference,
     });
     execInBox(harness.runner, prepared.containerId, [
@@ -164,13 +166,16 @@ test('public status renders the core workspace view without mutating Box state',
     const runtimeBefore = inBoxRuntimeInventory(prepared.containerId, harness);
     const environment = {
         ...process.env,
-        HOME: harness.lockHome,
         ...(harness.engineEnvironment.XDG_CONFIG_HOME
             ? { XDG_CONFIG_HOME: harness.engineEnvironment.XDG_CONFIG_HOME }
             : {}),
     };
     delete environment.NO_COLOR;
     delete environment.PLOINKY_COLOR;
+    // Importing the CLI config (through the native helpers) sets this to the
+    // test's own cwd, which would make the child inspect the checkout instead
+    // of the harness workspace it runs in.
+    delete environment.PLOINKY_WORKSPACE_ROOT;
     const status = spawnSync(path.join(repositoryRoot, 'bin/ploinky'), ['status'], {
         cwd: harness.child,
         encoding: 'utf8',

@@ -11,8 +11,8 @@ import { createOwnershipClient, PROCESS_OWNER_ENV } from './liveProcessOwnership
 import { assertRemoteArrival } from './liveRemote.mjs';
 import {
     HASH, HOST_RECORD_DIRECTORIES, ID, INSPECT, MAX_NESTED_LISTED, NESTED_CONTAINER_INSPECT, NESTED_LIST_FORMAT, absolute, artifactPathFor, assertWorkspace,
-    blocked, bounded, candidateEnv, checkedJson, commandTails, digest, hostRecordPaths, jsonDigest, keys, liveSourceDigest, nestedContainerEvidence,
-    observeEngineIdentity, receipt, foreignGuardInput, foreignWorkspaceProblem,
+    blocked, bounded, candidateEnv, checkedJson, commandTails, digest, hostRecordPaths, hostStateDirectory, jsonDigest, keys, liveSourceDigest, nestedContainerEvidence,
+    observeEngineIdentity, receipt, foreignGuardInput, foreignWorkspaceProblem, validateAllowHostProcesses, withHostProcessAllowance,
 } from './liveCommon.mjs';
 import { recordHostRecords, runOwnedCleanup } from './liveCleanup.mjs';
 import { validateC5BoxReceipts } from './liveBoxTransitionCustody.mjs';
@@ -74,7 +74,8 @@ export const LIVE_ACTIONS = Object.freeze(['provision', 'live', 'cleanup']);
 export function validateProfile(run, { partial = false } = {}) {
     validateRunManifest(run);
     const profile = run.target.execution;
-    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu', 'llm', 'model']);
+    keys(profile, ['protocol', 'host', 'node', 'candidate', 'engine', 'source', 'workspace', 'box', 'agents', 'cases'], 'execution profile', ['fixtures', 'provision', 'gpu', 'llm', 'model', 'allowHostProcesses']);
+    if (profile.allowHostProcesses !== undefined) validateAllowHostProcesses(profile.allowHostProcesses, 'execution allowHostProcesses');
     if (profile.fixtures !== undefined) {
         keys(profile.fixtures, [], 'fixtures', ['cpu', 'gpu', 'llm', 'availability', 'store']);
         for (const name of ['cpu', 'gpu', 'llm', 'availability', 'store']) {
@@ -190,8 +191,10 @@ export function validateExecutionProfile(run) {
 // cannot be cleaned and refuses the manifest.
 function validateOwnedPaths(run, profile) {
     const instance = profile.box?.instance || run.workspace?.instance;
-    const allowedRecords = instance && /^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance) ? hostRecordPaths(profile.host.home, instance) : [];
-    const allowedDirectories = HOST_RECORD_DIRECTORIES.map(directory => path.join(profile.host.home, '.ploinky-box', directory));
+    // The records live in the run's own workspace, whether it exists yet or is only proposed.
+    const workspaceRoot = profile.workspace?.path || profile.provision?.workspace?.path || null;
+    const allowedRecords = workspaceRoot && instance && /^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance) ? hostRecordPaths(workspaceRoot, instance) : [];
+    const allowedDirectories = workspaceRoot ? HOST_RECORD_DIRECTORIES.map(directory => path.join(hostStateDirectory(workspaceRoot), directory)) : [];
     const seen = new Set();
     for (const entry of run.ownedPaths) {
         if (!entry || seen.has(entry.path)) throw new Error('This executor cannot clean extra recorded processes or paths');
@@ -283,7 +286,7 @@ export function createLiveAdapter(profile, {
         if (['pressure', 'destroy-box'].includes(kind) && liveSourceDigest(profile.source.root) !== profile.source.digest) throw new Error('Candidate source changed');
         let op = null;
         if (journal) {
-            op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds: [profile.box.id], argvDigest: jsonDigest([binary, ...args]), resultArtifact: null };
+            op = { id: `live-${run.operations.length + 1}`, kind, state: 'intent', resourceIds: [profile.box.id], argvDigest: jsonDigest([binary, ...(processProvider.effectiveArgv?.(binary, args) ?? args)]), resultArtifact: null };
             if (run.operations.length >= 512 || Buffer.byteLength(JSON.stringify(run)) > 190000) throw new Error('Live journal bound exceeded');
             run.operations.push(op); persist();
         }
@@ -662,6 +665,7 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
     if (foreign) { report.limitations.push(foreign); return report; }
     let profile;
     try { profile = validateProfile(run, { partial: true }); } catch (error) { report.limitations.push(error.message); return report; }
+    processProvider = withHostProcessAllowance(processProvider, profile);
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
     if (problem) { report.limitations.push(problem); return report; }
     if (liveSourceDigest(profile.source.root) !== profile.source.digest) { report.limitations.push('Candidate source changed'); return report; }
@@ -692,7 +696,7 @@ export async function executeCleanupRun({ run, persist = () => {}, processProvid
             llmCleanupProof({ workspace: workspacePath, runId: run.runId, action: 'cleanup', write: artifacts });
         }
         assertModelGrantInventory(run, profile);
-        if (profile.model?.profile === 'apple-cpu') artifacts('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.host.home) });
+        if (profile.model?.profile === 'apple-cpu') artifacts('model-grants-after', { runId: run.runId, entries: modelGrantInventory(profile.workspace.path) });
         run.cleanup.state = 'complete'; run.state = 'complete';
     } catch (error) { run.cleanup.state = 'failed'; run.cleanup.failures.push(error.message); }
     finally { clearTimeout(timer); }
@@ -735,6 +739,7 @@ export async function executeLiveRun({ run, action = 'live', persist = () => {},
     if (foreign) { report.limitations.push(foreign); return prevented(); }
     let profile;
     try { profile = validateExecutionProfile(run); } catch (error) { report.limitations.push(error.message); return prevented(); }
+    processProvider = withHostProcessAllowance(processProvider, profile);
     if (run.cleanup.state !== 'not-started') { report.limitations.push('Cleanup has already started for this run; provision a new one'); return prevented(); }
     const problem = pinProblem(run, profile, hostIdentity, remoteArrival);
     if (problem) { report.limitations.push(problem); return prevented(); }

@@ -7,6 +7,10 @@ export const WEBTTY_AGENT_PROTOCOL_LIMITS = Object.freeze({
     maxWireBytes: 96 * 1024,
     maxTerminalIdBytes: 128,
     maxTranslatedCwdBytes: 4 * 1024,
+    // A translated profile HOME: a mount destination bounded like a cwd, one
+    // separator, and a relative path bounded like a cwd.
+    maxTranslatedHomeBytes: 4 * 1024 + 1 + 4 * 1024,
+    maxProfileLabelBytes: 128,
     maxTargetUserBytes: 128,
     maxInputBytes: 16 * 1024,
     maxOutputBytes: 64 * 1024,
@@ -82,6 +86,10 @@ const STARTUP_FIELDS = Object.freeze([
     'baselineExecIds',
     'containerInitProcess',
 ]);
+// A home profile adds exactly these keys to init-agent and to the startup
+// evidence, so pty-starting recovery rebuilds the exact Podman client argv.
+const PROFILE_FIELDS = Object.freeze(['translatedHome', 'profile']);
+const PROFILE_IDENTITY_FIELDS = Object.freeze(['provider', 'id', 'label']);
 const CONTAINER_INIT_FIELDS = Object.freeze([
     'pid',
     'startToken',
@@ -219,6 +227,44 @@ function translatedCwd(value) {
     return value;
 }
 
+function translatedHome(value) {
+    boundedString(value, {
+        min: 1,
+        max: WEBTTY_AGENT_PROTOCOL_LIMITS.maxTranslatedHomeBytes,
+        category: 'translated-home',
+    });
+    if (!path.posix.isAbsolute(value) || path.posix.normalize(value) !== value || value === '/'
+        || value.includes('\\') || value.split('/').includes('..')) {
+        throw agentWorkerProtocolError('translated-home');
+    }
+    return value;
+}
+
+function profileIdentity(value) {
+    exactObject(value, PROFILE_IDENTITY_FIELDS, 'profile-fields');
+    boundedString(value.provider, {
+        min: 1, max: 128, pattern: /^[A-Za-z0-9][A-Za-z0-9_.-]*$/, category: 'profile',
+    });
+    boundedString(value.id, {
+        min: 1, max: 128, pattern: /^[A-Za-z0-9][A-Za-z0-9._-]*$/, category: 'profile',
+    });
+    boundedString(value.label, {
+        min: 1,
+        max: WEBTTY_AGENT_PROTOCOL_LIMITS.maxProfileLabelBytes,
+        pattern: /^[^\u0000-\u001f\u007f]+$/,
+        category: 'profile',
+    });
+}
+
+function hasProfile(value) {
+    return Boolean(value) && typeof value === 'object' && Object.hasOwn(value, 'translatedHome');
+}
+
+function profileFields(value) {
+    translatedHome(value.translatedHome);
+    profileIdentity(value.profile);
+}
+
 function protocolEnvelope(message, fieldsByType, expectedTerminalId) {
     if (!message || typeof message !== 'object' || Array.isArray(message)) {
         throw agentWorkerProtocolError('message');
@@ -316,7 +362,12 @@ function execId(value, category = 'exec-id') {
 }
 
 export function validateAgentStartupEvidence(value) {
-    exactObject(value, STARTUP_FIELDS, 'startup-evidence-fields');
+    exactObject(
+        value,
+        hasProfile(value) ? [...STARTUP_FIELDS, ...PROFILE_FIELDS] : STARTUP_FIELDS,
+        'startup-evidence-fields',
+    );
+    if (hasProfile(value)) profileFields(value);
     if (value.backend !== WEBTTY_AGENT_BACKEND || value.runtime !== 'podman') {
         throw agentWorkerProtocolError('backend');
     }
@@ -366,7 +417,15 @@ export function validateRouterToAgentWorkerMessage(message, {
     closing = false,
     expectedTerminalId,
 } = {}) {
-    protocolEnvelope(message, ROUTER_FIELDS, expectedTerminalId);
+    const profileInit = Boolean(message) && typeof message === 'object'
+        && message.type === 'init-agent' && hasProfile(message);
+    protocolEnvelope(
+        message,
+        profileInit
+            ? { ...ROUTER_FIELDS, 'init-agent': [...ROUTER_FIELDS['init-agent'], ...PROFILE_FIELDS] }
+            : ROUTER_FIELDS,
+        expectedTerminalId,
+    );
     if (!initialized && !['init-agent', 'close'].includes(message.type)) {
         throw agentWorkerProtocolError('pre-init');
     }
@@ -379,6 +438,7 @@ export function validateRouterToAgentWorkerMessage(message, {
         translatedCwd(message.translatedCwd);
         marker(message.marker);
         dimensions(message.cols, message.rows);
+        if (profileInit) profileFields(message);
     } else if (message.type === 'input') {
         boundedString(message.data, {
             min: 1,

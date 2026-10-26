@@ -1,36 +1,34 @@
 (() => {
-  'use strict';
+    'use strict';
 
-  const launchPattern = /^[A-Za-z0-9_-]{32}$/;
-  const raw = String(window.location.hash || '').replace(/^#/, '');
-  let launch = '';
-  try {
-    const values = new URLSearchParams(raw);
-    const keys = [...values.keys()];
-    const candidate = values.get('launch') || '';
-    if (keys.length === 1 && keys[0] === 'launch' && launchPattern.test(candidate)) {
-      launch = candidate;
+    const tokenPattern = /^[A-Za-z0-9_-]{32}$/;
+    let handoff = null;
+    try {
+        const values = new URLSearchParams(String(window.location.hash || '').replace(/^#/, ''));
+        const keys = [...values.keys()];
+        const kind = keys[0];
+        const value = values.get(kind) || '';
+        // Exactly `#launch=<id>`, `#launch=<id>&close=stop` or `#attach=<id>`. The legacy
+        // `close=stop` hint is still accepted but ignored: every shell is created with Keep running.
+        const legacyStopHint = keys.length === 2 && kind === 'launch' && keys[1] === 'close'
+            && values.get('close') === 'stop';
+        if ((keys.length === 1 || legacyStopHint) && ['launch', 'attach'].includes(kind) && tokenPattern.test(value)) {
+            handoff = { kind, value };
+        }
+    } catch (_) {}
+    try {
+        window.history.replaceState(null, '', window.location.pathname || '/webtty/');
+    } catch (_) {
+        handoff = null;
     }
-  } catch (_) { }
-
-  let stripped = false;
-  try {
-    window.history.replaceState(null, '', window.location.pathname || '/webtty/');
-    stripped = true;
-  } catch (_) { }
-  if (!stripped) launch = '';
-
-  let consumed = false;
-  Object.defineProperty(window, '__ploinkyTakeWebttyLaunch', {
-    configurable: true,
-    enumerable: false,
-    value() {
-      if (consumed) return '';
-      consumed = true;
-      const value = launch;
-      launch = '';
-      try { delete window.__ploinkyTakeWebttyLaunch; } catch (_) { }
-      return value;
-    },
-  });
+    Object.defineProperty(window, '__ploinkyTakeWebttyHandoff', {
+        configurable: true,
+        enumerable: false,
+        value() {
+            const result = handoff;
+            handoff = null;
+            try { delete window.__ploinkyTakeWebttyHandoff; } catch (_) {}
+            return result;
+        },
+    });
 })();

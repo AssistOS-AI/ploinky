@@ -1,17 +1,18 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 import { PloinkyBoxError } from '../errors.mjs';
+import { HOST_STATE_UPDATE_KINDS, ensureHostStateSkeleton, identityHostStateRoot } from '../hostState/root.mjs';
 
 // Private host-side state for update transactions: admission journals,
 // pending-activation records, self-update relaunch handoffs and the folders
-// of a host exclusion refresh in progress. It lives in the host-owned state
-// root (`~/.ploinky-box`), never in the workspace that the Box mounts
-// read-write, so in-Box processes cannot author these records.
+// of a host exclusion refresh in progress. It lives in the workspace's
+// host-owned `.ploinky-box` directory (one `update-<kind>` directory per
+// record kind). The Box contract masks that directory read-only (a later step)
+// so that in-Box processes cannot author these records.
 
-export const UPDATE_STATE_KINDS = Object.freeze(['update-journals', 'update-pending', 'update-handoffs', 'update-recovery', 'update-exclusions']);
+export const UPDATE_STATE_KINDS = HOST_STATE_UPDATE_KINDS;
 const KIND_SET = new Set(UPDATE_STATE_KINDS);
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$/;
 export const UPDATE_STATE_MAX_BYTES = 256 * 1024;
@@ -39,15 +40,12 @@ function clone(value) {
 }
 
 /**
- * Durable store rooted at the host state directory. Every record is one
- * private (0600, owner-only, single-link, non-symlink) JSON file published by
- * an exclusive temporary file, fsync and rename.
+ * Durable store rooted at one workspace identity's host state directory. Every
+ * record is one private (0600, owner-only, single-link, non-symlink) JSON file
+ * published by an exclusive temporary file, fsync and rename.
  */
-export function createUpdateHostState({
-    stateRoot = path.join(os.homedir(), '.ploinky-box'),
-    fsApi = fs,
-} = {}) {
-    const root = path.resolve(stateRoot);
+export function createUpdateHostState({ identity, fsApi = fs } = {}) {
+    const root = identityHostStateRoot(identity, (message) => stateError(message));
 
     function assertPrivateDirectory(target) {
         const stat = fsApi.lstatSync(target);
@@ -59,13 +57,24 @@ export function createUpdateHostState({
             throw stateError(`Update state directory is not owned by the current user: ${target}`);
         }
         if ((stat.mode & 0o077) !== 0) {
-            throw stateError(`Update state directory must be private to the current user: ${target}`);
+            throw stateError(`Update state directory must be private to the current user: ${target}. After checking `
+                + `that it and its contents belong to you, run \`chmod 700 ${target}\`.`);
         }
     }
 
     function directoryFor(kind, { create = false } = {}) {
         assertKind(kind);
         const directory = path.join(root, kind);
+        // The skeleton (and so `.ploinky-box` itself) is created, never the
+        // workspace; a kind directory is then created one level below it.
+        if (create) {
+            try {
+                ensureHostStateSkeleton(identity.workspaceRoot, { fsApi });
+            } catch (error) {
+                if (error?.code === 'PLOINKY_BOX_HOST_STATE_INVALID') throw stateError(error.message, error);
+                throw error;
+            }
+        }
         for (const target of [root, directory]) {
             try {
                 assertPrivateDirectory(target);
@@ -211,9 +220,8 @@ export function createUpdateHostState({
 }
 
 /**
- * Process-local store for supervisors built with a custom lock manager that
- * exposes no host state root (unit fixtures). Production lock managers always
- * expose `stateRoot`, which selects the durable store.
+ * Process-local store for supervisors that are given no durable store (unit
+ * fixtures). The production supervisor builds a durable store per identity.
  */
 export function createMemoryUpdateHostState() {
     const records = new Map();
@@ -243,10 +251,4 @@ export function createMemoryUpdateHostState() {
             return clone(value);
         },
     });
-}
-
-export function updateHostStateForLockManager(lockManager) {
-    return lockManager?.stateRoot
-        ? createUpdateHostState({ stateRoot: lockManager.stateRoot })
-        : createMemoryUpdateHostState();
 }

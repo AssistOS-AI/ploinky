@@ -12,6 +12,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 import { fakeUpdateCore, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 const BUILD_COMMIT = 'a'.repeat(40);
 
@@ -22,9 +23,6 @@ function fixture(t, {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
     fs.mkdirSync(workspace);
-    // Destroy removes host operator records: keep them in a private home under the fixture.
-    const home = path.join(root, 'home');
-    fs.mkdirSync(home, { mode: 0o700 });
     const identity = buildWorkspaceIdentity(workspace, { markerFound: false });
     const bundle = {
         packageName: 'ploinky-agent-lib', packageVersion: '1.2.3',
@@ -43,9 +41,10 @@ function fixture(t, {
     let selections = [];
     let lockNumber = 0;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         checkHostPrerequisites: () => {}, env, platform: 'darwin',
-        gpuGrantStore: createGpuGrantStore({ homeDirectory: home }),
-        hardwareGateStore: createHardwareGateStore({ homeDirectory: home }),
+        gpuGrantStore: createGpuGrantStore(),
+        hardwareGateStore: createHardwareGateStore(),
         ...(repositoryRoot ? { repositoryRoot } : {}),
         resolveIdentity: () => identity, launchCwd: workspace,
         discover: () => ownership,

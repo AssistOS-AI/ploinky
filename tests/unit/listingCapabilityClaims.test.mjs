@@ -123,6 +123,33 @@ test('MCP minting signs the capabilities and they survive the AgentServer verifi
     assert.equal('capabilities' in authInfo.user, false, 'capabilities stay on the signed actor only');
 });
 
+test('MCP direct minting signs displayName for users only, never falls back to name, and never adds usr', () => {
+    const ctx = mcpContext({ user: sessionUser({ id: 'USER.3', username: 'alice' }) });
+    assert.equal(ctx.payload.actor.displayName, 'alice');
+    assert.equal('usr' in ctx.payload, false);
+    const verified = verifyMcp(ctx.token);
+    assert.equal(verified.ok, true, verified.reason);
+    const authInfo = authInfoFromInvocation(verified.payload, { invocationToken: verified.rawToken });
+    assert.equal(authInfo.user.displayName, 'alice');
+    assert.equal(authInfo.user.username, 'USER.3', 'username derivation is unchanged');
+    assert.equal('displayName' in authInfo.invocation.actor, false);
+
+    assert.equal('displayName' in mcpContext({ user: sessionUser({ username: '', name: 'Alice N' }) }).payload.actor, false, 'free-form name is never a displayName');
+    assert.equal('displayName' in mcpContext({ user: sessionUser({ username: '', name: '' }) }).payload.actor, false);
+    assert.equal('displayName' in mcpContext({ user: sessionUser({ roles: ['guest'] }) }).payload.actor, false);
+    const delegated = mcpContext({
+        user: sessionUser(),
+        delegatedAgentVerified: {
+            callerPrincipal: 'agent:fixtures/source',
+            userDelegation: {
+                user: { id: 'member-1', username: 'member', roles: ['user'] },
+                delegation: { jti: 'g', scope: ['robots:list'], sourceAgentId: 'agent:fixtures/source', targetAgentId: TARGET },
+            },
+        },
+    });
+    assert.equal('displayName' in delegated.payload.actor, false);
+});
+
 test('guest roles in any spelling, guest kinds and admin+guest never receive a claim on either path', () => {
     for (const roles of [['guest'], [' GUEST '], ['admin', 'guest'], ['admin', ' Guest']]) {
         const user = sessionUser({ roles, capabilities: ['explorer.access'] });
@@ -228,12 +255,14 @@ test('adversarial: wrong signature, audience, method, path, query, body, tool an
 
 test('worst-case claim size through both minting paths is measured, not truncated', () => {
     const capabilities = Array.from({ length: MAX_ACTOR_CAPABILITIES }, (_, i) => `${String(i).padStart(2, '0')}${'c'.repeat(126)}`);
-    const user = sessionUser({ id: 'u'.repeat(64), username: 'n'.repeat(64), email: `${'e'.repeat(50)}@example.test`, roles: ['user', 'admin'], capabilities });
+    const user = sessionUser({ id: 'u'.repeat(64), username: 'n'.repeat(128), email: `${'e'.repeat(50)}@example.test`, roles: ['user', 'admin'], capabilities });
     const header = httpHeaders(user)['x-ploinky-auth-info'];
     const verified = verifyHttp({ 'x-ploinky-auth-info': header });
     assert.equal(verified.ok, true, verified.reason);
     assert.equal(verified.payload.actor.capabilities.length, MAX_ACTOR_CAPABILITIES);
-    const mcpToken = mcpContext({ user }).token;
+    const mcpCtx = mcpContext({ user });
+    assert.equal(mcpCtx.payload.actor.displayName, 'n'.repeat(128), 'MCP worst case carries a 128-char displayName');
+    const mcpToken = mcpCtx.token;
     // Node's default maximum HTTP header size is 16 KiB for all headers.
     process.stdout.write(`# worst-case x-ploinky-auth-info bytes=${Buffer.byteLength(header)} mcp-bearer bytes=${Buffer.byteLength(`Bearer ${mcpToken}`)}\n`);
     assert.ok(Buffer.byteLength(header) < 16 * 1024);

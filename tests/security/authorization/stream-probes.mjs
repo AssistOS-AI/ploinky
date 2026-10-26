@@ -309,6 +309,7 @@ export async function runWorkspaceWriteMatrix(ctx, fixture, filename) {
 export async function runTerminalProbes(ctx, fixture) {
   let discoveryId;
   let terminalId;
+  let terminalViewId;
   let discoveryClosed = false;
   let terminalClosed = false;
   let launch;
@@ -363,14 +364,14 @@ export async function runTerminalProbes(ctx, fixture) {
   });
   // Use the real unconsumed administrator launch as the denied create resource.
   for (const actor of deniedActors) await ctx.check(`router:terminal-create-deny:${actor}`, async () => {
-    const response = await ctx.request(actor, { method: 'POST', path: '/webtty/sessions', body: { launch, cols: 80, rows: 24 } });
+    const response = await ctx.request(actor, { method: 'POST', path: '/webtty/sessions', body: { launch, cols: 80, rows: 24, closePolicy: 'keep' } });
     await containUnexpectedCreation(actor, response, 'session');
     assertDenied(response);
   });
   let terminalReady = false;
   let launchConsumed = false;
   await ctx.check('router:terminal-create-positive:admin', async () => {
-    const response = await ctx.request('admin', { method: 'POST', path: '/webtty/sessions', body: { launch, cols: 80, rows: 24 }, timeout: 30000 });
+    const response = await ctx.request('admin', { method: 'POST', path: '/webtty/sessions', body: { launch, cols: 80, rows: 24, closePolicy: 'keep' }, timeout: 30000 });
     if (response.status === 503) ctx.recordGap('router:terminal-backend', 'Administrator session creation returned 503; native runtime is unavailable.', { kind: 'positive-unavailable' });
     assert.equal(response.status, 201, 'Administrator must create the exact box terminal target');
     // Consuming a launch removes its whole discovery batch (cli/server/webtty/launchRecords.mjs, consume -> removeBatch).
@@ -386,13 +387,18 @@ export async function runTerminalProbes(ctx, fixture) {
       assert.ok([200, 404].includes(result.status), 'Only known disposable terminal may be absent after automatic detach cleanup');
       terminalClosed = true;
     });
+    // Every stream binds to the server-issued view returned by create. The
+    // created shell's cleanup is armed above, before this can fail.
+    terminalViewId = response.json?.view?.id;
+    assert.match(terminalViewId || '', /^[A-Za-z0-9_-]{32}$/);
+    ctx.secrets.add(terminalViewId);
     terminalReady = true;
   });
   if (!terminalReady) {
     ctx.recordGap('router:terminal-existing-session-probes', 'Positive session creation failed; no existing terminal is available to prove stream/input/resize/delete denials.', { kind: 'positive-unavailable' });
     return;
   }
-  const streamPath = `/webtty/sessions/${terminalId}/stream`;
+  const streamPath = `/webtty/sessions/${terminalId}/stream?view=${terminalViewId}`;
   async function livePositiveStream() {
     const response = await ctx.request('admin', { path: streamPath, stream: true });
     assert.equal(response.status, 200, 'Administrator must still own a live terminal before negative probe');

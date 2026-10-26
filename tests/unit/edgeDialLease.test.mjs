@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,7 +18,7 @@ import { serveAgentStaticRequest } from '../../cli/server/static/index.js';
 function responseCapture() {
     let resolve;
     const completed = new Promise((done) => { resolve = done; });
-    return {
+    return Object.assign(new EventEmitter(), {
         headersSent: false,
         statusCode: 0,
         headers: {},
@@ -33,7 +34,7 @@ function responseCapture() {
             this.body += Buffer.isBuffer(value) ? value.toString('utf8') : String(value || '');
             resolve();
         },
-    };
+    });
 }
 
 test('lease guard runs synchronously inside the actual connection factory', async () => {

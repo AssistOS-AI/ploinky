@@ -7,6 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
+import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { consumeRelaunchHandoff, UPDATE_HANDOFF_ENV } from '../../ploinky-box/update/relaunchHandoff.mjs';
 import { createUpdateBoxScenario } from '../helpers/updateBoxScenario.mjs';
@@ -30,9 +31,9 @@ for (const [label, childOutcome, expectedCode] of [['succeeds', 'verified', 0], 
         const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-relaunch-')));
         t.after(() => fs.rmSync(root, { recursive: true, force: true }));
         const workspace = path.join(root, 'workspace');
-        const stateRoot = path.join(root, 'state');
+        fs.mkdirSync(workspace);
         const resultFile = path.join(root, 'child-result.json');
-        const store = createUpdateHostState({ stateRoot });
+        const store = createUpdateHostState({ identity: buildWorkspaceIdentity(workspace) });
         const parent = createUpdateBoxScenario({ root: path.join(root, 'parent'), workspace, store });
         const launches = [];
         let childStdout = '';
@@ -44,7 +45,6 @@ for (const [label, childOutcome, expectedCode] of [['succeeds', 'verified', 0], 
                 PLOINKY_WORKSPACE_ROOT: workspace,
                 FIXTURE_ROOT: root,
                 FIXTURE_WORKSPACE: workspace,
-                FIXTURE_STATE_ROOT: stateRoot,
                 FIXTURE_RESULT: resultFile,
                 FIXTURE_CHILD_OUTCOME: childOutcome,
             },
@@ -100,3 +100,41 @@ for (const [label, childOutcome, expectedCode] of [['succeeds', 'verified', 0], 
         }), /no pending handoff exists/);
     });
 }
+
+test('without an injected store the outer CLI keeps the relaunch handoff in the workspace host state, never in the home directory', async (t) => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-relaunch-default-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(workspace);
+    const home = path.join(root, 'home');
+    fs.mkdirSync(home, { mode: 0o700 });
+    const savedHome = process.env.HOME;
+    process.env.HOME = home;
+    t.after(() => { if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome; });
+    const identity = buildWorkspaceIdentity(workspace);
+    const parent = createUpdateBoxScenario({ root: path.join(root, 'parent'), workspace, store: createUpdateHostState({ identity }) });
+    const handoffDirectory = path.join(identity.hostStateRoot, 'update-handoffs');
+    const seen = [];
+    const code = await runOuterCli(['update'], {
+        env: { HOME: home, PLOINKY_WORKSPACE_ROOT: workspace },
+        cwd: () => workspace,
+        input: { isTTY: false },
+        output: sink(),
+        errorOutput: sink(),
+        supervisor: parent.supervisor,
+        detectInsideBox: () => false,
+        updateHostSource: async () => ({
+            updated: true, repoPath: '/host/ploinky', before: '1'.repeat(40), after: '2'.repeat(40),
+        }),
+        relaunch: async () => {
+            seen.push(fs.readdirSync(handoffDirectory).map((name) => ({ name, mode: fs.statSync(path.join(handoffDirectory, name)).mode & 0o777 })));
+            return 0;
+        },
+    });
+    assert.equal(code, 0);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].length, 1, 'the handoff was written under <workspace>/.ploinky-box/update-handoffs');
+    assert.equal(seen[0][0].mode, 0o600);
+    assert.deepEqual(fs.readdirSync(handoffDirectory), [], 'an unconsumed handoff is discarded afterwards');
+    assert.deepEqual(fs.readdirSync(home), [], 'nothing is created under the home directory');
+});

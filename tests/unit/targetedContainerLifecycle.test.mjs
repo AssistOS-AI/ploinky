@@ -8,7 +8,9 @@ import {
     drainTargetedContainer,
 } from '../../cli/sandbox/docker/targetedContainerLifecycle.js';
 
-function fixture({ runningChecks = [true, false], exitCode = 0 } = {}) {
+const PREDECESSOR_ID = 'a'.repeat(64);
+
+function fixture({ runningChecks = [true, false], exitCode = 0, oomKilled = false, inspectedId = PREDECESSOR_ID } = {}) {
     const events = [];
     let index = 0;
     let exists = true;
@@ -29,7 +31,7 @@ function fixture({ runningChecks = [true, false], exitCode = 0 } = {}) {
             },
             retireControlSocket: (name) => { events.push(['retire-relay', name]); },
             signal: (_runtime, name) => { events.push(['signal', name]); return { status: 0 }; },
-            inspect: () => ({ State: { ExitCode: exitCode, OOMKilled: false, Error: '' } }),
+            inspect: () => ({ Id: inspectedId, State: { Running: false, ExitCode: exitCode, OOMKilled: oomKilled, Error: '' } }),
             now: () => time,
             sleep: (ms) => { time += ms; events.push(['wait', ms]); },
             remove: (_runtime, name) => { events.push(['remove', name]); exists = false; return { status: 0 }; },
@@ -112,6 +114,88 @@ test('targeted drain bound is fixed and rejects attempts to extend it', () => {
             timeoutMs: TARGETED_DRAIN_TIMEOUT_MS + 1,
         }),
         (error) => error?.code === 'TARGETED_DRAIN_INVALID',
+    );
+    assert.deepEqual(state.events, []);
+});
+
+test('an absent predecessor has nothing left to drain or acknowledge once its selectors are proved inactive', () => {
+    const state = fixture();
+    state.options.exists = () => false;
+    assert.deepEqual(drainAndRemoveTargetedContainer('ploinky_agent', state.options), {
+        state: 'absent',
+        containerName: 'ploinky_agent',
+        affectedSelectors: ['service:route/editor'],
+        removed: false,
+    });
+    assert.deepEqual(state.events.map(([event]) => event), ['selector-check']);
+});
+
+test('an operator-accepted failed drain replaces only the exact already-stopped predecessor without signaling it', () => {
+    for (const refusal of [{ exitCode: 143 }, { exitCode: 137, oomKilled: true }]) {
+        const state = fixture({ runningChecks: [false], ...refusal });
+        const result = drainAndRemoveTargetedContainer('ploinky_agent', {
+            ...state.options,
+            acceptedFailedDrain: { containerId: PREDECESSOR_ID },
+        });
+        assert.deepEqual(result, {
+            state: 'accepted-failed-drain',
+            containerName: 'ploinky_agent',
+            containerId: PREDECESSOR_ID,
+            exitCode: refusal.exitCode,
+            oomKilled: refusal.oomKilled === true,
+            affectedSelectors: ['service:route/editor'],
+            removed: true,
+        });
+        assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'remove']);
+    }
+});
+
+test('an accepted failed drain never signals, kills, or removes a running predecessor', () => {
+    const state = fixture({ runningChecks: [true, true] });
+    assert.throws(
+        () => drainAndRemoveTargetedContainer('ploinky_agent', {
+            ...state.options,
+            acceptedFailedDrain: { containerId: PREDECESSOR_ID },
+        }),
+        (error) => error?.code === 'TARGETED_DRAIN_ACCEPTANCE_REFUSED'
+            && /applies only to an already-stopped predecessor/.test(error.message),
+    );
+    assert.deepEqual(state.events.map(([event]) => event), ['selector-check']);
+});
+
+test('an accepted failed drain names one exact container and refuses any other stopped runtime', () => {
+    const state = fixture({ runningChecks: [false], exitCode: 143, inspectedId: 'b'.repeat(64) });
+    assert.throws(
+        () => drainAndRemoveTargetedContainer('ploinky_agent', {
+            ...state.options,
+            acceptedFailedDrain: { containerId: PREDECESSOR_ID },
+        }),
+        (error) => error?.code === 'TARGETED_DRAIN_ACCEPTANCE_REFUSED'
+            && error.message.includes(`not the accepted predecessor ${PREDECESSOR_ID}`),
+    );
+    assert.deepEqual(state.events.map(([event]) => event), ['selector-check']);
+});
+
+test('an accepted failed drain must name the full immutable predecessor container ID', () => {
+    for (const acceptedFailedDrain of [{ containerId: PREDECESSOR_ID.slice(0, 12) }, { containerId: PREDECESSOR_ID.toUpperCase() }, {}, PREDECESSOR_ID]) {
+        const state = fixture({ runningChecks: [false], exitCode: 143 });
+        assert.throws(
+            () => drainTargetedContainer('ploinky_agent', { ...state.options, acceptedFailedDrain }),
+            (error) => error?.code === 'TARGETED_DRAIN_INVALID',
+        );
+        assert.deepEqual(state.events, []);
+    }
+});
+
+test('an accepted failed drain still requires the exact affected selectors to be inactive', () => {
+    const state = fixture({ runningChecks: [false], exitCode: 143 });
+    state.options.assertSelectorsInactive = () => false;
+    assert.throws(
+        () => drainAndRemoveTargetedContainer('ploinky_agent', {
+            ...state.options,
+            acceptedFailedDrain: { containerId: PREDECESSOR_ID },
+        }),
+        (error) => error?.code === 'TARGETED_SELECTOR_ACTIVE',
     );
     assert.deepEqual(state.events, []);
 });

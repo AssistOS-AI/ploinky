@@ -377,8 +377,8 @@ export async function collectRuntimeDiagnostics({ identity, repositoryRoot, env,
         if (!exported) return;
         const ownership = discoverBoxOwnership(fixture, { runner, env, platform });
         if (ownership.state !== 'absent') throw new Error('Temporary diagnostic workspace is not unambiguously absent');
-        fs.mkdirSync(path.join(scratch, 'state'), { mode: 0o700 });
-        lock = await createMutationLockManager({ homeDirectory: path.join(scratch, 'state') }).acquire(fixture.instance);
+        // The fixture's lock lives inside the fixture workspace, like any workspace lock.
+        lock = await createMutationLockManager().acquire(fixture.instance, { workspaceRoot: fixture.workspaceRoot });
         const wrapped = {
             ...runner,
             run(file, args, options) {
@@ -398,6 +398,10 @@ export async function collectRuntimeDiagnostics({ identity, repositoryRoot, env,
                 }),
                 explicitPort: await unusedPort(), explicitMediaPort: await unusedPort(true),
                 imageRef: imageId, imagePolicy: 'preserve', stdout: silent, stderr: silent,
+                // The throwaway fixture workspace is exempt from the
+                // quiescence gate: the workspace that holds it may have a
+                // running Box, which binds the fixture's ancestor.
+                quiescence: false,
             });
             ownedId = result.ownership.handles.container.id;
             result.finalize();
@@ -480,8 +484,8 @@ export async function diagnoseWorkspace({
     discover = discoverBoxOwnership, checkPublications = preflightPublications,
     bindingStore = createRouterBindingStore(), admitCurrentBox = validateCurrentBox,
     inspectionOnly = false, repairAssessments = collectRepairAssessments,
-    homeDirectory, fsApi = fs, uid = process.getuid?.(),
-    hardwareGateStore = createHardwareGateStore(homeDirectory ? { homeDirectory } : {}),
+    fsApi = fs, uid = process.getuid?.(),
+    hardwareGateStore = createHardwareGateStore(),
 } = {}) {
     const checks = [], commands = [];
     const runner = createDiagnosticRunner(suppliedRunner || createProcessRunner({ env: buildEngineProcessEnvironment(env) }), commands, { progress });
@@ -601,7 +605,7 @@ export async function diagnoseWorkspace({
     }
     if (identity) {
         try {
-            checks.push(...await repairAssessments({ identity, host, runner, env, platform, homeDirectory, fsApi, uid }));
+            checks.push(...await repairAssessments({ identity, host, runner, env, platform, fsApi, uid }));
         } catch (error) {
             checks.push({ id: 'repair.assessment', label: 'Assess automatic user repairs', status: 'fail',
                 detail: failureDetail(error), next: 'Inspect this assessment failure before attempting any automatic repair.' });

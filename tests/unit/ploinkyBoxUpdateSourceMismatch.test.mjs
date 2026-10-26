@@ -14,6 +14,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { createMemoryUpdateHostState, UPDATE_STATE_KINDS } from '../../ploinky-box/update/hostState.mjs';
 import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 // Never read the global, system or XDG Git policy of the machine running this.
 const isolation = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-source-mismatch-env-')));
@@ -125,6 +126,7 @@ function hostCli(f, discover) {
     const output = sink();
     const errorOutput = sink();
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => f.identity,
         launchCwd: f.workspace,
         repositoryRoot: f.host,
@@ -151,7 +153,7 @@ function hostCli(f, discover) {
             return updateHostPloinkySource({
                 ...options,
                 boxMarkerPath: path.join(f.root, 'not-a-box'),
-                lockManager: { async acquire() { return { assertHeld() {}, release() {} }; } },
+                lockManager: { async acquireAt() { return { assertHeld() {}, release() {} }; } },
             });
         },
         relaunch() { events.push('relaunch'); return 0; },
@@ -211,6 +213,7 @@ test('workspace Ploinky and AgentLib selection mutate no checkout before the loc
     const events = [];
     let held = false;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => f.identity,
         launchCwd: f.workspace,
         repositoryRoot: outside,

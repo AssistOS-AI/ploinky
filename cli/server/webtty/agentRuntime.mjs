@@ -1,4 +1,4 @@
-import { WEBTTY_SHELL_PROMPT } from '../../../core-services/webtty/environment.mjs';
+import { WEBTTY_PROFILE_INPUTRC, WEBTTY_SHELL_PROMPT } from '../../../core-services/webtty/environment.mjs';
 
 export { WEBTTY_SHELL_PROMPT };
 
@@ -98,6 +98,30 @@ export function fixedAgentInteractiveShellArgv(shellPath = '/bin/bash') {
     return shell.interactive;
 }
 
+// A home profile adds exactly HOME, INPUTRC (the system readline file, so the
+// shell loads nothing from the profile HOME by itself) and the three generic
+// profile variables to the exec, and only to the exec: the host-side launcher
+// keeps its own fixed environment. Without a profile the argv is unchanged.
+function profileEnvArgv(spec) {
+    if (spec?.translatedHome === undefined && spec?.profile === undefined) return [];
+    if (typeof spec.translatedHome !== 'string' || !spec.translatedHome.startsWith('/')
+        || !spec.profile || typeof spec.profile !== 'object') {
+        throw new Error('agent profile is invalid');
+    }
+    return [
+        '--env',
+        `HOME=${spec.translatedHome}`,
+        '--env',
+        `INPUTRC=${WEBTTY_PROFILE_INPUTRC}`,
+        '--env',
+        `PLOINKY_WEBTTY_PROFILE_PROVIDER=${spec.profile.provider}`,
+        '--env',
+        `PLOINKY_WEBTTY_PROFILE_ID=${spec.profile.id}`,
+        '--env',
+        `PLOINKY_WEBTTY_PROFILE_LABEL=${spec.profile.label}`,
+    ];
+}
+
 export function fixedAgentPodmanArgv(spec, shellPath = '/bin/bash') {
     return Object.freeze([
         'container',
@@ -114,6 +138,7 @@ export function fixedAgentPodmanArgv(spec, shellPath = '/bin/bash') {
         `PS1=${WEBTTY_SHELL_PROMPT}`,
         '--env',
         `PLOINKY_WEBTTY_MARKER=${spec.marker}`,
+        ...profileEnvArgv(spec),
         spec.containerId,
         ...fixedAgentShellWrapperArgv(spec.marker, shellPath),
     ]);

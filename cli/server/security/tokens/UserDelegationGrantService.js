@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
 import { JwsCodec } from './JwsCodec.js';
+import { MAX_DISPLAY_NAME_LENGTH } from './RouterRequestTokenService.js';
 
 const DEFAULT_MAX_TTL_SECONDS = 8 * 60 * 60;
 
@@ -38,12 +39,18 @@ function normalizeUser(user = {}) {
     if (!user || typeof user !== 'object') return null;
     const id = String(user.id || user.sub || '').trim().replace(/^user:/i, '');
     if (!id) return null;
-    return {
+    const normalized = {
         id,
         username: String(user.username || user.preferred_username || '').trim(),
         email: String(user.email || '').trim(),
         roles: normalizeStringList(user.roles),
     };
+    // Display-only; omitted when empty. Never an authorization input.
+    const displayName = typeof user.displayName === 'string'
+        ? user.displayName.trim().slice(0, MAX_DISPLAY_NAME_LENGTH).trim()
+        : '';
+    if (displayName) normalized.displayName = displayName;
+    return normalized;
 }
 
 function buildStableSubject(user) {

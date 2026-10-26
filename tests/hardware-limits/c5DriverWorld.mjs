@@ -39,6 +39,7 @@ import { C5_INTENT_KIND, createC5Intent, exactContainerHandle, productEngineDige
 import { DRIVER_BOUNDS, driverParams, runDriver } from './liveStoreTransition.mjs';
 import { describeMutation } from './c5Mutation.mjs';
 import { INSPECT, OWNER_MARKER, engineIdentityDigest, jsonDigest, liveSourceDigest } from './liveCommon.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD, hostStateFixtureMounts } from '../helpers/hostStateFixture.mjs';
 
 export const REPOSITORY = fs.realpathSync(new URL('../..', import.meta.url).pathname);
 const AGENT_REF = `${FIXTURE_REPOSITORY}/s`;
@@ -103,6 +104,7 @@ export function completeHandle(box, hardware, { id = 'e'.repeat(64), imageId = '
                 { type: 'bind', name: '', source: box.root, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: box.identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: box.identity.workspaceRoot, destination: box.identity.workspaceRoot, rw: true },
+                ...hostStateFixtureMounts(box.identity.workspaceRoot, box.root),
                 ...agentLibFixtureMounts(box.agentLib, box.identity.workspaceRoot),
                 ...(hardware ? hardware.mounts.map(mount => ({ type: 'bind', name: '', source: mount.source, destination: mount.destination, rw: mount.rw })) : []),
             ].sort((left, right) => left.destination.localeCompare(right.destination)),
@@ -162,10 +164,10 @@ export function createDowngradeWorld({
     const identity = givenIdentity ?? buildWorkspaceIdentity(workspace.path);
     const previousHome = process.env.HOME;
     process.env.HOME = home;
-    const gateStore = createHardwareGateStore({ homeDirectory: home });
+    const gateStore = createHardwareGateStore();
     const lockFor = { assertHeld: instance => { if (instance !== identity.instance) throw new Error('lock instance'); } };
     if (!reuseState) gateStore.write(identity, true, lockFor);
-    const wiring = resolveDesiredHardwareWiring({ identity, enabled: true, homeDirectory: home, initializeStore });
+    const wiring = resolveDesiredHardwareWiring({ identity, enabled: true, initializeStore });
     const boxRoot = repositoryRoot ?? path.join(root, 'repository');
     fs.mkdirSync(boxRoot, { recursive: true });
     const box = completeBoxFixture({ root: boxRoot, identity, linkProduct });
@@ -190,7 +192,7 @@ export function createDowngradeWorld({
     }));
     const die = () => { persistState(); process.kill(process.pid, 'SIGKILL'); };
     const onStep = name => { if (killAt === `step:${name}`) die(); };
-    const paths = hardwareStorePaths({ identity, homeDirectory: home });
+    const paths = hardwareStorePaths({ identity });
     const adminCalls = [];
     let createFailed = false;
 
@@ -314,6 +316,7 @@ export function createDowngradeWorld({
     // The real supervisor over the stub runner it is given (the driver passes its decorated production runner).
     function makeSupervisor(decorated) {
         return createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
             env: { PLOINKY_BOX_HARDWARE_LIMITS: 'off' }, resolveIdentity: () => identity, launchCwd: identity.workspaceRoot, repositoryRoot: box.root,
             lockManager: lockManager(), discover: () => ownership(), runner: decorated,
             selectAgentLib: async () => ({ selection: box.agentLib, mode: 'local' }),
@@ -325,7 +328,7 @@ export function createDowngradeWorld({
             runUpdateCore: fakeUpdateCore({ onCall: () => {} }),
             startCore: async () => { events.push('start-core'); }, healthCheck: async () => {}, revalidateAgentLibSource: () => {}, commitAgentLibSelection: () => {},
             validateExistingImage: () => ({ immutableId: `sha256:${'d'.repeat(64)}` }), validateContainer: () => {},
-            hardwareGateStore: gateStore, gpuGrantStore: createGpuGrantStore({ homeDirectory: home }),
+            hardwareGateStore: gateStore, gpuGrantStore: createGpuGrantStore(),
             prepareHardwareGeneration: async () => { events.push('prepare'); return { structurallyPrepared: true }; },
             stdout: { write() { return true; } }, stderr: { write: text => { events.push(`stderr:${String(text).trim().slice(0, 120)}`); return true; } },
         });
@@ -336,7 +339,7 @@ export function createDowngradeWorld({
         // The product resolves host state from HOME; an in-process caller sets it only while the world runs.
         async withHome(fn) { const before = process.env.HOME; process.env.HOME = home; try { return await fn(); } finally { process.env.HOME = before; } },
         engineIdentityDigest: engineIdentityDigest(info, null), oldHandle: old, onStep, persistState,
-        transitionIds: () => createTransitionStore({ identity, homeDirectory: home }).listPending().map(journal => journal.operationId),
+        transitionIds: () => createTransitionStore({ identity }).listPending().map(journal => journal.operationId),
     };
 }
 
@@ -387,7 +390,8 @@ export async function runScenario(name, options = {}) {
     const context = standalone(options.world ?? {});
     const { world, run } = context;
     // Test controls: a profile whose pinned engine digest is wrong, a recorded stamp that is not the store's.
-    const profile = options.engineDigestOverride ? { ...context.profile, engine: { identityDigest: options.engineDigestOverride } } : context.profile;
+    const pinned = options.engineDigestOverride ? { ...context.profile, engine: { identityDigest: options.engineDigestOverride } } : context.profile;
+    const profile = options.allowHostProcesses ? { ...pinned, allowHostProcesses: options.allowHostProcesses } : pinned;
     context.profile = profile;
     const receiptPath = path.join(context.root, `c5-transition-driver-${'1'.repeat(32)}_claude.json`);
     const token = readStoreSnapshot({ paths: world.paths, identity: world.identity }).token;
@@ -416,15 +420,16 @@ export async function runScenario(name, options = {}) {
     // A stepping clock makes the boundary ceiling deterministic: every reading of the time advances it, wall time never matters.
     let clock = 0;
     const now = options.steppingClockMs ? () => (clock += options.steppingClockMs) : undefined;
-    const result = await runDriver(params, { baseRunner: world.runner, supervisor: world.makeSupervisor, programRoot: REPOSITORY, onStep: world.onStep, ...(now ? { now } : {}) });
+    const supervisorCalls = [];
+    const result = await runDriver(params, { baseRunner: world.runner, supervisor: (runner, supervisorOptions) => { supervisorCalls.push({ allowHostProcesses: [...supervisorOptions.allowHostProcesses] }); return world.makeSupervisor(runner); }, programRoot: REPOSITORY, onStep: world.onStep, ...(now ? { now } : {}) });
     let receipt = null;
     if (name === 'transition') receipt = readPrivateC5File(receiptPath);
     const after = readStoreSnapshot({ paths: world.paths, identity: world.identity });
     return {
-        scenario: name, exitCode: result.exitCode, summary: result.summary, receipt, root: context.root, boxId: world.boxId,
+        scenario: name, exitCode: result.exitCode, summary: result.summary, supervisorCalls, receipt, root: context.root, boxId: world.boxId,
         engineEvents: world.events, containers: [...world.containers.entries()].map(([id, entry]) => ({ id, running: entry.handle.runtime.running, gateOn: Boolean(entry.handle.labels[BOX_LABELS.hardwareLimits]) })),
         gate: world.gateStore.read(world.identity)?.enabled ?? null, store: { token: after.token, count: after.agents.size, barrier: readBarrier({ paths: world.paths }) },
-        before, adminCalls: world.adminCalls, transitions: createTransitionStore({ identity: world.identity, homeDirectory: world.home }).listPending().map(journal => ({ id: journal.operationId, phase: journal.phase })),
+        before, adminCalls: world.adminCalls, transitions: createTransitionStore({ identity: world.identity }).listPending().map(journal => ({ id: journal.operationId, phase: journal.phase })),
         intentKind: C5_INTENT_KIND,
         mutation: process.env.C5_MUTATION ? describeMutation(JSON.parse(process.env.C5_MUTATION)) : null,
     };

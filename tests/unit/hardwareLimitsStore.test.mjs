@@ -39,8 +39,9 @@ function fixture(t) {
     fs.mkdirSync(workspaceRoot);
     const identity = Object.freeze({
         instance: 'ploinky-box-demo-0123456789ab', pathHash: '0123456789ab', workspaceRoot, dataPaths: {},
+        hostStateRoot: path.join(workspaceRoot, '.ploinky-box'),
     });
-    const paths = hardwareStorePaths({ identity, homeDirectory: home });
+    const paths = hardwareStorePaths({ identity });
     return { home, identity, paths };
 }
 
@@ -97,7 +98,7 @@ test('S.host-clear-race', (t) => {
         paths: context.paths, identity: context.identity, agentRef: 'demo/agent', lockOptions: { deadlineMs: 60 },
     }), 'store_busy');
     held.release();
-    const cleared = runLimitsClear({ identity: context.identity, lock: lockedHost(context.identity), agentRef: 'demo/agent', homeDirectory: context.home });
+    const cleared = runLimitsClear({ identity: context.identity, lock: lockedHost(context.identity), agentRef: 'demo/agent' });
     assert.equal(cleared.cleared, true);
     // The router's token predates the host clear and cannot win.
     rejectsCode(() => set(context, routerToken, { cpus: 4 }), 'revision_conflict');
@@ -108,8 +109,7 @@ test('S.host-clear-race', (t) => {
 function deadHolderLock(context, { hostname = os.hostname(), domain = 'host' } = {}) {
     const exited = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
     const directory = path.join(context.paths.storeRoot, 'write.lock');
-    fs.mkdirSync(directory, { mode: 0o700 });
-    fs.writeFileSync(path.join(directory, 'owner.json'), `${JSON.stringify({
+    fs.writeFileSync(directory, `${JSON.stringify({
         token: 'd'.repeat(32), pid: exited.pid, hostname, domain, operation: 'crashed-writer', acquiredAt: new Date().toISOString(),
     })}\n`, { mode: 0o600 });
     return directory;
@@ -120,7 +120,7 @@ const RUNNING = () => ({ state: 'running' });
 
 function hostClear(context, extra = {}) {
     return runLimitsClear({
-        identity: context.identity, lock: lockedHost(context.identity), all: true, homeDirectory: context.home,
+        identity: context.identity, lock: lockedHost(context.identity), all: true,
         lockOptions: { deadlineMs: 50 }, ...extra,
     });
 }
@@ -177,7 +177,7 @@ test('S.stale-lock-never-stolen-unproven', (t) => {
     fs.rmSync(foreign, { recursive: true });
     // An ownerless lock is never proof of death: preserved and reported.
     const ownerless = path.join(context.paths.storeRoot, 'write.lock');
-    fs.mkdirSync(ownerless, { mode: 0o700 });
+    fs.writeFileSync(ownerless, '', { mode: 0o600 });
     assert.throws(() => hostClear(context, { inspectBox: ABSENT }), (error) => {
         assert.equal(error.code, 'store_busy');
         assert.match(error.message, /has no valid owner \(lock has no owner record\); an ownerless lock is never removed automatically/);
@@ -304,7 +304,7 @@ test('S.unknown-key', (t) => {
 test('S.selective-corrupt-refused', (t) => {
     const context = initialized(t);
     fs.writeFileSync(context.paths.policyPath, '{not json', { mode: 0o600 });
-    assert.throws(() => runLimitsClear({ identity: context.identity, lock: lockedHost(context.identity), agentRef: 'demo/agent', homeDirectory: context.home }),
+    assert.throws(() => runLimitsClear({ identity: context.identity, lock: lockedHost(context.identity), agentRef: 'demo/agent' }),
         /Selective clear cannot preserve the other entries/);
     assert.equal(fs.readFileSync(context.paths.policyPath, 'utf8'), '{not json', 'nothing changed');
 });
@@ -313,7 +313,7 @@ test('S.reset-new-epoch', (t) => {
     const context = initialized(t);
     const before = readStoreSnapshot({ paths: context.paths, identity: context.identity });
     fs.writeFileSync(context.paths.policyPath, '{not json', { mode: 0o600 });
-    const reset = runLimitsClear({ identity: context.identity, lock: lockedHost(context.identity), all: true, homeDirectory: context.home });
+    const reset = runLimitsClear({ identity: context.identity, lock: lockedHost(context.identity), all: true });
     assert.equal(reset.reset, true);
     assert.equal(reset.token.revision, 1);
     assert.notEqual(reset.token.epoch, before.token.epoch);
@@ -388,14 +388,26 @@ test('S.audit-dedup', (t) => {
 
 test('S.private-path-overlap', (t) => {
     const context = fixture(t);
-    const state = path.join(context.home, '.ploinky-box', 'hardware-limits');
+    const { identity } = context;
+    const state = path.join(identity.hostStateRoot, 'hardware-limits');
     fs.mkdirSync(state, { recursive: true });
-    for (const workspaceRoot of [context.home, path.join(context.home, '.ploinky-box'), path.join(state, 'x')]) {
-        assert.throws(() => assertHardwareStateConfined({ workspaceRoot, homeDirectory: context.home }), /overlaps writable Box source/);
+    // The workspace root contains the host state directory by design; a cache
+    // path may neither be it, contain it, nor lie inside it.
+    for (const cache of [path.dirname(identity.workspaceRoot), identity.hostStateRoot, state, path.join(state, 'x')]) {
+        assert.throws(() => assertHardwareStateConfined({ identity: { ...identity, dataPaths: { cache } } }),
+            /overlaps writable Box source/, cache);
     }
-    assert.throws(() => assertHardwareStateConfined({ workspaceRoot: context.identity.workspaceRoot, dataPaths: { cache: state }, homeDirectory: context.home }),
-        /overlaps writable Box source/);
-    assert.equal(assertHardwareStateConfined({ workspaceRoot: context.identity.workspaceRoot, homeDirectory: context.home }), true);
+    assert.equal(assertHardwareStateConfined({ identity }), true);
+    assert.equal(assertHardwareStateConfined({ identity: { ...identity, dataPaths: { cache: path.join(identity.workspaceRoot, '.ploinky', 'box') } } }), true);
+    // `.ploinky-box` must stay a directory of its own workspace.
+    fs.rmSync(identity.hostStateRoot, { recursive: true });
+    fs.symlinkSync(identity.workspaceRoot, identity.hostStateRoot);
+    assert.throws(() => assertHardwareStateConfined({ identity }), /overlaps writable Box source/);
+    fs.unlinkSync(identity.hostStateRoot);
+    const outside = path.join(context.home, 'outside');
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, identity.hostStateRoot);
+    assert.throws(() => assertHardwareStateConfined({ identity }), /does not resolve inside its workspace/);
 });
 
 test('S.orphan-clear', (t) => {
@@ -579,18 +591,29 @@ vectorCases('structure', [
     ['pool field', rejects(() => validate({ pool: { cpus: 4 } }), 'invalid_limits')],
 ]);
 
+function vectorIdentity(root, { exact = false } = {}) {
+    const workspaceRoot = exact ? root : path.join(root, 'workspace');
+    if (!exact) fs.mkdirSync(workspaceRoot);
+    return {
+        instance: 'ploinky-box-demo-0123456789ab', pathHash: '0123456789ab', workspaceRoot, dataPaths: {},
+        hostStateRoot: path.join(workspaceRoot, '.ploinky-box'),
+    };
+}
+
 vectorCases('private-paths', [
     ['exact store', (t) => {
-        const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-vec-')));
-        t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-        const store = path.join(home, '.ploinky-box', 'hardware-limits', 'ploinky-box-demo-0123456789ab', 'store');
+        const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-vec-')));
+        t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+        const identity = vectorIdentity(root);
+        const store = path.join(identity.hostStateRoot, 'hardware-limits', identity.instance, 'store');
         fs.mkdirSync(store, { recursive: true });
-        assert.throws(() => assertHardwareStateConfined({ workspaceRoot: store, homeDirectory: home }), /overlaps writable Box source/);
+        assert.throws(() => assertHardwareStateConfined({ identity: { ...identity, dataPaths: { cache: store } } }), /overlaps writable Box source/);
     }],
     ['store ancestor', (t) => {
-        const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-vec-')));
-        t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-        assert.throws(() => assertHardwareStateConfined({ workspaceRoot: path.join(home, '.ploinky-box'), homeDirectory: home }), /overlaps/);
+        const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-vec-')));
+        t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+        const identity = vectorIdentity(root);
+        assert.throws(() => assertHardwareStateConfined({ identity: { ...identity, dataPaths: { cache: identity.hostStateRoot } } }), /overlaps/);
     }],
     ['relative escape', (t) => {
         const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-vec-')));
@@ -607,13 +630,13 @@ vectorCases('private-paths', [
         fs.symlinkSync(outside, path.join(workspace, 'alias'));
         assert.equal(isManagedManifestVolumeSource('alias', { workspaceRoot: workspace }), false);
     }],
-    ['MPS pipe as workspace root', rejects(() => assertHardwareStateConfined({ workspaceRoot: '/run/ploinky-mps-pipe', homeDirectory: os.tmpdir() }), 'identity_changed')],
+    ['MPS pipe as workspace root', rejects(() => assertHardwareStateConfined({ identity: vectorIdentity('/run/ploinky-mps-pipe', { exact: true }) }), 'identity_changed')],
     ['valid disjoint', (t) => {
         const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-vec-')));
         t.after(() => fs.rmSync(home, { recursive: true, force: true }));
         const workspace = path.join(home, 'projects', 'ws');
         fs.mkdirSync(workspace, { recursive: true });
-        assert.equal(assertHardwareStateConfined({ workspaceRoot: workspace, homeDirectory: home }), true);
+        assert.equal(assertHardwareStateConfined({ identity: vectorIdentity(workspace, { exact: true }) }), true);
         assert.equal(isManagedManifestVolumeSource('data/models', { workspaceRoot: workspace }), true);
     }],
 ]);

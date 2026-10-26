@@ -1,3 +1,7 @@
+// Builders called without a workspace root plan the guards (and create the
+// host state skeleton) in the default workspace: keep it private, never the
+// checkout the test runs from.
+import '../helpers/isolatedWorkspaceRoot.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -15,7 +19,6 @@ import {
     resolveBwrapNodeRuntime,
 } from '../../cli/sandbox/bwrap/bwrapServiceManager.js';
 import { AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
-import { PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 import { agentLibFixture, writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
 // This file runs real login shells on purpose (production `sh -lc` code under test): it opts in to the unit-test spawn guard's name-only login-shell reading.
@@ -97,12 +100,14 @@ test('bwrap appends final read-only opacity guards for broad workspace binds', (
         fs.mkdirSync(path.join(root, '.ploinky', 'data'), { recursive: true });
         const args = ['--bind', root, '/workspace'];
         const targets = appendControllerStateGuards(args, { workspaceRoot: root });
-        assert.deepEqual(targets.map(entry => entry.target), ['/workspace/.ploinky/data']);
+        assert.deepEqual(targets.map(entry => entry.target).sort(), ['/workspace/.ploinky-box', '/workspace/.ploinky/data']);
         for (const target of targets) {
-            assert.equal(args.at(-3), '--ro-bind');
-            assert.equal(args.at(-1), targets.at(-1).target);
-            assert.notEqual(args.at(-2), target.protectedHostPath);
+            const index = args.lastIndexOf(target.target);
+            assert.equal(args[index - 2], '--ro-bind', target.target);
+            assert.notEqual(args[index - 1], target.protectedHostPath);
+            assert.ok(index > args.lastIndexOf('--bind'));
         }
+        assert.equal(args.at(-1), '/workspace/.ploinky/data');
         assert.ok(args.lastIndexOf('--ro-bind') > args.lastIndexOf('--bind'));
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
@@ -118,7 +123,9 @@ test('bwrap keeps a missing state root absent by protecting its existing parent'
         appendControllerStateGuards(args, { workspaceRoot: root });
         assert.ok(hasRoBind(args, fs.realpathSync(controllerDir), '/workspace/.ploinky'));
         assert.equal(args.includes('/workspace/.ploinky/data'), false);
-        assert.equal(args.at(-1), '/workspace/.ploinky');
+        // The host state mask is the one child: its skeleton is created first.
+        assert.equal(args.at(-1), '/workspace/.ploinky-box');
+        assert.equal(args.at(-3), '--ro-bind');
         assert.equal(fs.existsSync(path.join(controllerDir, 'data')), false);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
@@ -192,12 +199,17 @@ test('bwrap normalizes guard-parent matching and orders logical parents before c
 });
 
 test('bwrap rejects a project bind sourced below protected controller state', () => {
-    const source = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'data', 'router-security');
-    const args = ['--bind', source, '/project'];
-    assert.throws(
-        () => appendControllerStateGuards(args),
-        error => error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION',
-    );
+    // A private workspace: guard planning creates the host state skeleton in
+    // the workspace it is given, never in the checkout the test runs from.
+    const root = tempDir('bwrap-protected-source-');
+    try {
+        const source = path.join(root, '.ploinky', 'data', 'router-security');
+        const args = ['--bind', source, '/project'];
+        assert.throws(
+            () => appendControllerStateGuards(args, { workspaceRoot: root }),
+            error => error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION',
+        );
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('global bwrap preserves writable project source and protects code and dependency grants', () => {

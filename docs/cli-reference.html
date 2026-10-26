@@ -159,7 +159,7 @@ enable agent demo as demo2           # second container with alias "demo2"</code
                         </div>
 
                         <h3>reinstall agent</h3>
-                        <p>Stops, removes, and re-creates the agent's container. This is a destructive operation that ensures the agent starts from a clean state. This command only has an effect if the agent's container is currently running.</p>
+                        <p>Stops, removes, and re-creates the agent's container. This is a destructive operation that ensures the agent starts from a clean state. It is refused, before anything is removed, while the agent's route is draining after a refused targeted drain; use <code>restart &lt;agentName&gt; --accept-failed-drain &lt;container-id&gt;</code> instead.</p>
                         <pre><code>reinstall &lt;agentName&gt;
 # Example
 reinstall demo  # stop, remove, and re-create the container for the 'demo' agent</code></pre>
@@ -203,7 +203,7 @@ ploinky [--port &lt;hostPort&gt;] start [staticAgent] [branch-options...]</code>
                             </tr>
                             <tr>
                                 <td><code>--branch &lt;branch&gt;</code></td>
-                                <td>Candidate branch for all repos involved in this start</td>
+                                <td>Candidate branch for all repos involved in this start. It also governs the <code>link-install</code> repositories of every enabled agent, including no-wait agents and agents this start leaves stopped, before anything launches: a missing repository is cloned at the requested branch and an existing workspace checkout is checked without being modified, so the start stops when it is not on the requested branch (a detached HEAD does not count). Restart, enable and update are unchanged</td>
                             </tr>
                             <tr>
                                 <td><code>--repo-branch &lt;repo=branch&gt;</code></td>
@@ -211,7 +211,7 @@ ploinky [--port &lt;hostPort&gt;] start [staticAgent] [branch-options...]</code>
                             </tr>
                             <tr>
                                 <td><code>--branch-fallback</code></td>
-                                <td><code>default</code> (keep configured branch when candidate is missing) or <code>fail</code> (abort when the targeted branch is missing or cannot be refreshed). Default: <code>default</code></td>
+                                <td><code>default</code> (keep configured branch when candidate is missing) or <code>fail</code> (abort when the targeted branch is missing or cannot be refreshed). Default: <code>default</code>. For <code>link-install</code> repositories, <code>default</code> clones the remote default branch or accepts the existing checkout as is (logging whether the branch was absent or the remote could not be queried), and <code>fail</code> aborts when the remote lacks the branch or cannot be queried</td>
                             </tr>
                             <tr>
                                 <td><code>--reset-repos</code></td>
@@ -272,11 +272,14 @@ Routing configuration (.ploinky/routing.json):
   demo -&gt; agent=demo method=- hostPort=-</code></pre>
 
                         <h3>restart</h3>
-                        <p>Restarts services. If an agent name is provided, it performs a non-destructive stop and start of that agent's container, preserving the container ID. This only affects running containers. If no agent name is provided, it restarts all agents and the router.</p>
-                        <pre><code>restart [agentName]</code></pre>
+                        <p>Restarts services. If no agent name is provided, it restarts all agents and the router. If an agent name is provided, it replaces that agent's runtime under the same instance identity and reopens its route only after the successor passes readiness. For a managed container with a route this is a targeted drain: Ploinky withdraws the route, sends SIGTERM and replaces the container only after the application exits with status 0 within 35 seconds. Any other exit status (including 143), an OOM kill or a timeout refuses the replacement and keeps the route draining, which also blocks the container monitor, <code>start</code> and <code>reinstall</code> for that agent.</p>
+                        <p>Once the refused container has stopped, <code>--accept-failed-drain</code> with its full 64-hex container ID (the <code>containerId</code> of its record in <code>.ploinky/agents.json</code>) replaces it and reopens the route, accepting that data the container did not persist may be lost. The flag never signals or replaces a running container and is not available for GPU/MPS clients or Bubblewrap/Seatbelt runtimes.</p>
+                        <pre><code>restart [agentName [--accept-failed-drain &lt;container-id&gt;]]</code></pre>
                         <pre><code># Examples
 restart          # Restart all agents and the router
-restart MyAPI    # Stop and then start the existing container for MyAPI</code></pre>
+restart MyAPI    # Drain and replace the runtime of MyAPI
+restart MyAPI --accept-failed-drain &lt;container-id&gt;
+                 # Replace the stopped container whose drain was refused</code></pre>
                     </div>
 
                     <div class="doc-section" id="variables">
@@ -458,8 +461,18 @@ MCP ping succeeded.</code></pre>
                         <pre><code>shutdown</code></pre>
 
                         <h3>destroy</h3>
-                        <p>In the Ploinky REPL, <code>destroy</code> removes workspace runtimes and regenerated dependencies while leaving the outer Box and <code>.data/</code> homes in place. From a host terminal, <code>ploinky destroy</code> removes the exact managed outer Box and discards its nested runtime layer and inner volumes, then removes this workspace's host GPU-grant and hardware-limits records from <code>~/.ploinky-box</code>, so the next start begins from manifest defaults. Workspace files, persistent agent homes and the saved Router binding remain; regenerated dependency and image caches are removed only when the corresponding cache-deletion option selects them.</p>
+                        <p>In the Ploinky REPL, <code>destroy</code> removes workspace runtimes and regenerated dependencies while leaving the outer Box and <code>.data/</code> homes in place. From a host terminal, <code>ploinky destroy</code> removes the exact managed outer Box and discards its nested runtime layer and inner volumes, then removes this workspace's host GPU-grant and hardware-limits records from <code>&lt;workspace&gt;/.ploinky-box</code>, so the next start begins from manifest defaults. Workspace files, persistent agent homes (<code>.data/</code>), <code>.ploinky/data/</code>, <code>.env</code> and the saved Router binding remain; regenerated dependency and image caches are removed only when the corresponding cache-deletion option selects them.</p>
+                        <p>Upgrading has no backward compatibility: a Box created by an older Ploinky fails the compatibility check, so run <code>ploinky destroy</code> and then <code>ploinky start</code>. State in the old <code>~/.ploinky-box</code> is ignored; re-apply <code>ploinky bind</code>, <code>ploinky gpu grant</code> or <code>ploinky gpu revoke</code> and hardware limits afterwards. If an older Ploinky already destroyed the old Box before this version ever ran, remove <code>&lt;workspace&gt;/.ploinky-box</code> (host state only) before the first start. This never means deleting <code>.data/</code>, <code>.ploinky/data/</code> or <code>.env</code>: they hold user data and keys, and <code>destroy</code> and <code>destroy --delete-cache</code> keep them.</p>
                         <pre><code>destroy</code></pre>
+
+                        <h3>unlock</h3>
+                        <p>From a host terminal, <code>ploinky unlock [--force-holder PID@MACHINE]</code> removes a workspace lock, its reclaim guard or the hardware store lock that a command no longer running left behind in <code>&lt;workspace&gt;/.ploinky-box</code>. It removes a lock only when its holder is gone; a holder that cannot be checked needs the exact <code>--force-holder PID@MACHINE</code> value printed by the busy error, which must name only a holder that is really gone (naming one that is still running can let two commands hold the lock at once), and a holder classified as running is never removed. Locks with leftover contents, no or a malformed owner record, or that are not private directories are listed with manual steps and never removed, and the command exits 1. It does not wait for the lock it is recovering and does not accept <code>--allow-host-process</code>. Unlock commands for one workspace run one at a time under <code>.ploinky-box/locks/unlock.lock</code>: a second one waits up to 2 seconds, then refuses and names the running one. The lock of an unlock that is no longer running is taken over automatically; a stuck <code>.ploinky-box/locks/unlock.lock.reclaim</code> is never removed by unlock, which lists it with the <code>rm -r</code> step to run by hand.</p>
+                        <pre><code>ploinky unlock
+ploinky unlock --force-holder 4242@0123456789abcdef0123456789abcdef</code></pre>
+
+                        <h3>--allow-host-process</h3>
+                        <p>Box creation, recreation and data-path creation are refused while a host-runtime agent or a container can write the workspace. <code>ploinky --allow-host-process PID &lt;command&gt;</code> excuses one running process that does not write the workspace (repeatable; its start time is verified again). Stop what the refusal lists otherwise.</p>
+                        <pre><code>ploinky --allow-host-process 4242 start</code></pre>
 
                         <h3>clean</h3>
                         <p>This unprefixed REPL command runs the same workspace-runtime removal and dependency-cache cleanup without explicitly stopping the Router first. Use <code>destroy</code> when the Router must also be stopped.</p>

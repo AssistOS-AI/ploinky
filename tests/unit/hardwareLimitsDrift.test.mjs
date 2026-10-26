@@ -573,13 +573,18 @@ test('D.private-mount-boundaries', (t) => {
     // A workspace alias (symlink) to a private path is not a managed source.
     fs.symlinkSync('/run', path.join(box.root, 'run-alias'));
     assert.throws(() => admit(box, { ...UNLIMITED, volumes: { 'run-alias/ploinky/hardware-limits': '/data' } }), /unsupported|outside|host mount|hostMounts/i);
-    // The host control state never overlaps a writable workspace/cache source.
-    const home = path.join(box.root, 'home');
-    fs.mkdirSync(path.join(home, '.ploinky-box'), { recursive: true });
-    assert.throws(() => assertHardwareStateConfined({ workspaceRoot: home, homeDirectory: home }), /overlaps writable Box source/);
-    assert.throws(() => assertHardwareStateConfined({ workspaceRoot: path.join(box.root, 'ws'), dataPaths: { cache: path.join(home, '.ploinky-box', 'hardware-limits', 'x') }, homeDirectory: home }), /overlaps writable Box source/);
-    assert.throws(() => assertHardwareStateConfined({ workspaceRoot: '/run/ploinky-mps-pipe', homeDirectory: home }), /reserved MPS pipe path/);
-    assert.equal(assertHardwareStateConfined({ workspaceRoot: path.join(box.root, 'ws'), homeDirectory: home }), true);
+    // The host control state never overlaps a writable cache source; the workspace root holds it by design.
+    const workspace = path.join(box.root, 'ws');
+    fs.mkdirSync(path.join(workspace, '.ploinky-box'), { recursive: true });
+    const identityOf = (workspaceRoot, dataPaths = {}) => ({
+        instance: 'ploinky-box-demo-0123456789ab', pathHash: '0123456789ab', workspaceRoot, dataPaths,
+        hostStateRoot: path.join(workspaceRoot, '.ploinky-box'),
+    });
+    assert.throws(() => assertHardwareStateConfined({ identity: identityOf(workspace, { cache: path.dirname(workspace) }) }), /overlaps writable Box source/);
+    assert.throws(() => assertHardwareStateConfined({ identity: identityOf(workspace, { cache: path.join(workspace, '.ploinky-box') }) }), /overlaps writable Box source/);
+    assert.throws(() => assertHardwareStateConfined({ identity: identityOf(workspace, { cache: path.join(workspace, '.ploinky-box', 'hardware-limits', 'x') }) }), /overlaps writable Box source/);
+    assert.throws(() => assertHardwareStateConfined({ identity: identityOf('/run/ploinky-mps-pipe') }), /reserved MPS pipe path/);
+    assert.equal(assertHardwareStateConfined({ identity: identityOf(workspace) }), true);
 });
 
 function refusalFrom(fn) {

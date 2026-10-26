@@ -1,7 +1,7 @@
 // Host-owned hardware-limits gate (plan §3 U1/U9/U16, §5.5, §6.1).
 //
-// The saved gate lives in ~/.ploinky-box/hardware-limits/INSTANCE.json and is
-// never mounted. Only start, restart and update apply
+// The saved gate lives in <workspace>/.ploinky-box/hardware-limits/INSTANCE.json
+// and is never mounted. Only start, restart and update apply
 // PLOINKY_BOX_HARDWARE_LIMITS; omitting it keeps the saved value. Every other
 // command uses the saved state and says when an environment value is ignored.
 
@@ -14,11 +14,12 @@ import {
     BOX_HARDWARE_MARKER_PATH,
     BOX_HARDWARE_STORE_PATH,
     BOX_LABELS,
+    HARDWARE_LIMITS_STATE_DIRECTORY,
+    HOST_STATE_DIRECTORY_NAME,
 } from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
+import { ensureStoreDirectories, inspectStoreDirectories } from './hostState/stores.mjs';
 import {
-    assertPrivateDirectoryIfPresent,
-    ensurePrivateDirectory,
     readPrivateFile,
     writePrivateFileAtomically,
 } from './privateStateFiles.mjs';
@@ -27,6 +28,7 @@ import {
     assertHardwareStateConfined,
     clearAgentLimits,
     clearAllLimits,
+    guardHostPath,
     hardwareStateRoot,
     hardwareStorePaths,
     readBarrier,
@@ -35,7 +37,7 @@ import {
 import {
     readStoreLockOwner,
     recoverStaleStoreLock,
-    STORE_LOCK_DIRECTORY,
+    STORE_LOCK_NAME,
     withStaleStoreLockRecovery,
 } from '../cli/sandbox/hardwareLimits/storeLock.mjs';
 import { createTransitionStore, downgradeRecoveryAdvice } from './hardwareLimitsTransition.mjs';
@@ -59,7 +61,8 @@ function exactIdentity(identity) {
     const instance = String(identity?.instance || '');
     if (!/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance)
         || !/^[a-f0-9]{12}$/.test(String(identity?.pathHash || ''))
-        || !path.isAbsolute(String(identity?.workspaceRoot || ''))) {
+        || !path.isAbsolute(String(identity?.workspaceRoot || ''))
+        || identity?.hostStateRoot !== path.join(identity.workspaceRoot, HOST_STATE_DIRECTORY_NAME)) {
         throw gateError('Hardware-limits state requires the exact workspace identity', 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
     }
     return identity;
@@ -78,16 +81,19 @@ export function parseHardwareGateValue(value) {
     throw gateError(`${HARDWARE_GATE_ENV} must be on, off, 1, 0, true or false; got '${String(value).slice(0, 64)}'. No change was made.`);
 }
 
-export function createHardwareGateStore({ homeDirectory = os.homedir(), fsApi = fs } = {}) {
-    const root = hardwareStateRoot(homeDirectory);
+export function createHardwareGateStore({ fsApi = fs } = {}) {
+    function rootFor(identity) {
+        return hardwareStateRoot(exactIdentity(identity));
+    }
 
     function recordPath(identity) {
-        return path.join(root, `${exactIdentity(identity).instance}.json`);
+        return path.join(rootFor(identity), `${exactIdentity(identity).instance}.json`);
     }
 
     function read(identity) {
-        assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
+        assertRouterBindingStateConfined(identity, { fsApi });
         const target = recordPath(identity);
+        if (!inspectStoreDirectories(identity, [HARDWARE_LIMITS_STATE_DIRECTORY], { fsApi, ...STATE_FILES })) return null;
         const bytes = readPrivateFile(fsApi, target, MAX_GATE_BYTES, 'Saved hardware-limits gate', STATE_FILES);
         if (bytes === null) return null;
         let record;
@@ -109,13 +115,12 @@ export function createHardwareGateStore({ homeDirectory = os.homedir(), fsApi = 
             throw gateError('Changing the hardware-limits gate requires the workspace mutation lock', 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
         }
         lock.assertHeld(identity.instance);
-        assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
+        assertRouterBindingStateConfined(identity, { fsApi });
     }
 
     function write(identity, enabled, lock, { now = () => new Date() } = {}) {
         requireLock(identity, lock);
-        fsApi.mkdirSync(path.dirname(root), { recursive: true, mode: 0o700 });
-        ensurePrivateDirectory(fsApi, root, STATE_FILES);
+        const root = ensureStoreDirectories(identity, [HARDWARE_LIMITS_STATE_DIRECTORY], { fsApi, ...STATE_FILES });
         const target = recordPath(identity);
         const record = { schema: 1, enabled: Boolean(enabled), savedAt: now().toISOString() };
         writePrivateFileAtomically(fsApi, root, target, `${JSON.stringify(record, null, 2)}\n`, () => {}, STATE_FILES);
@@ -167,16 +172,17 @@ export function createHardwareGateStore({ homeDirectory = os.homedir(), fsApi = 
      */
     function planInstanceTeardown(identity, lock, { inspectBox = null } = {}) {
         requireLock(identity, lock);
-        assertHardwareStateConfined({ workspaceRoot: identity.workspaceRoot, dataPaths: identity.dataPaths, homeDirectory, fsApi });
+        assertHardwareStateConfined({ identity, fsApi });
+        const root = rootFor(identity);
         const empty = Object.freeze({ identity, recordPath: null, instanceDir: null, dirStat: null, entries: Object.freeze([]) });
-        if (!assertPrivateDirectoryIfPresent(fsApi, root, STATE_FILES)) return empty;
+        if (!inspectStoreDirectories(identity, [HARDWARE_LIMITS_STATE_DIRECTORY], { fsApi, ...STATE_FILES })) return empty;
         const record = recordPath(identity);
         const recordStat = lstatOrNull(record);
         if (recordStat && !recordStat.isFile() && !recordStat.isSymbolicLink()) {
             throw gateError(`Refusing to remove a non-regular hardware-limits gate path: ${record}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
         }
         const instanceDir = path.join(root, identity.instance);
-        if (!assertPrivateDirectoryIfPresent(fsApi, instanceDir, STATE_FILES)) {
+        if (!inspectStoreDirectories(identity, [HARDWARE_LIMITS_STATE_DIRECTORY, identity.instance], { fsApi, ...STATE_FILES })) {
             return Object.freeze({ ...empty, recordPath: recordStat ? record : null });
         }
         if (fsApi.realpathSync.native(instanceDir) !== path.join(fsApi.realpathSync.native(root), identity.instance)) {
@@ -202,7 +208,7 @@ export function createHardwareGateStore({ homeDirectory = os.homedir(), fsApi = 
             const storeRoot = path.join(instanceDir, 'store');
             if (inspectBox) recoverStaleStoreLock({ storeRoot, hostLock: lock, instance: identity.instance, inspectBox, fsApi });
             if (readStoreLockOwner(storeRoot, { fsApi })) {
-                throw gateError(`Hardware policy store lock ${path.join(storeRoot, STORE_LOCK_DIRECTORY)} is still held`, 'PLOINKY_BOX_HARDWARE_STORE_BUSY');
+                throw gateError(`Hardware policy store lock ${path.join(storeRoot, STORE_LOCK_NAME)} is still held`, 'PLOINKY_BOX_HARDWARE_STORE_BUSY');
             }
         }
         return Object.freeze({
@@ -252,7 +258,7 @@ export function createHardwareGateStore({ homeDirectory = os.homedir(), fsApi = 
     }
 
     return Object.freeze({
-        homeDirectory, root, recordPath, read, write, clear, restore, planInstanceTeardown, removeInstanceState,
+        rootFor, recordPath, read, write, clear, restore, planInstanceTeardown, removeInstanceState,
     });
 }
 
@@ -312,7 +318,7 @@ export function selectHardwareGate({ identity, gateStore, env = process.env, ope
  * hardware state: a saved on gate, an initialized store, or proven entries.
  * Unreadable or contradictory existing metadata is unknown and conservative.
  */
-export function readHardwareStateClass({ identity, gateStore, homeDirectory = gateStore?.homeDirectory, fsApi = fs }) {
+export function readHardwareStateClass({ identity, gateStore, fsApi = fs }) {
     let saved;
     try {
         saved = gateStore.read(identity);
@@ -320,7 +326,7 @@ export function readHardwareStateClass({ identity, gateStore, homeDirectory = ga
         return Object.freeze({ hasHardwareState: true, unknown: true, reason: `saved gate is unreadable: ${error.message}` });
     }
     if (saved?.enabled === true) return Object.freeze({ hasHardwareState: true, unknown: false, reason: 'saved gate is on' });
-    const paths = hardwareStorePaths({ identity, homeDirectory });
+    const paths = hardwareStorePaths({ identity });
     let snapshot;
     try {
         snapshot = readStoreSnapshot({ paths, identity, fsApi });
@@ -376,7 +382,6 @@ export function readLimitsStatus({
     identity,
     gateStore,
     env = process.env,
-    homeDirectory = gateStore?.homeDirectory,
     fsApi = fs,
     observedBox = null,
     hostFacts = null,
@@ -390,7 +395,7 @@ export function readLimitsStatus({
     } catch (error) {
         savedProblem = error.message;
     }
-    const paths = hardwareStorePaths({ identity, homeDirectory });
+    const paths = hardwareStorePaths({ identity });
     let snapshot;
     try {
         snapshot = readStoreSnapshot({ paths, identity, fsApi });
@@ -402,7 +407,7 @@ export function readLimitsStatus({
     let journals = [];
     let journalProblem = null;
     try {
-        journals = createTransitionStore({ identity, homeDirectory, fsApi }).listPending().map((journal) => Object.freeze({
+        journals = createTransitionStore({ identity, fsApi }).listPending().map((journal) => Object.freeze({
             operationId: journal.operationId,
             operation: journal.operation,
             phase: journal.phase,
@@ -411,7 +416,16 @@ export function readLimitsStatus({
     } catch (error) {
         journalProblem = String(error?.message || error).slice(0, 512);
     }
-    const lockOwner = snapshot.status === 'absent-never-initialized' ? null : readStoreLockOwner(paths.storeRoot, { fsApi });
+    let lockOwner = null;
+    if (snapshot.status !== 'absent-never-initialized') {
+        try {
+            // Never read the lock record through a linked store component.
+            guardHostPath(fsApi, paths, paths.storeRoot);
+            lockOwner = readStoreLockOwner(paths.storeRoot, { fsApi });
+        } catch (error) {
+            lockOwner = { malformed: true, reason: `the store lock cannot be read safely: ${String(error?.message || error).slice(0, 200)}` };
+        }
+    }
     const envValue = env?.[HARDWARE_GATE_ENV];
     return Object.freeze({
         identity: identity.instance,
@@ -560,16 +574,16 @@ export function observeHostLimitsFacts({ engine, containerId = null, query, veri
  * workspace mutation lock (supplied by the caller) and needs no router.
  */
 export function runLimitsClear({
-    identity, lock, agentRef = null, all = false, homeDirectory = os.homedir(), fsApi = fs, actor, inspectBox = null, lockOptions,
+    identity, lock, agentRef = null, all = false, fsApi = fs, actor, inspectBox = null, lockOptions,
 }) {
     exactIdentity(identity);
     if (typeof lock?.assertHeld !== 'function') {
         throw gateError('Clearing hardware limits requires the workspace mutation lock', 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
     }
     lock.assertHeld(identity.instance);
-    assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
-    assertHardwareStateConfined({ workspaceRoot: identity.workspaceRoot, dataPaths: identity.dataPaths, homeDirectory, fsApi });
-    const paths = hardwareStorePaths({ identity, homeDirectory });
+    assertRouterBindingStateConfined(identity, { fsApi });
+    assertHardwareStateConfined({ identity, fsApi });
+    const paths = hardwareStorePaths({ identity });
     const hostActor = actor || { id: 'host', name: os.userInfo().username };
     // A stale store lock is recovered only with its holder proven dead and
     // the exact Box observed stopped or absent (§5.2); otherwise store_busy.
@@ -610,12 +624,12 @@ function directoryIdentity(fsApi, target) {
     return { dev: String(stat.dev), ino: String(stat.ino) };
 }
 
-export function hardwareGenerationDirectory(identity, fingerprint, homeDirectory = os.homedir()) {
+export function hardwareGenerationDirectory(identity, fingerprint) {
     exactIdentity(identity);
     if (!/^[a-f0-9]{64}$/.test(String(fingerprint))) {
         throw gateError('hardware wiring fingerprint is invalid', 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
     }
-    return path.join(hardwareStateRoot(homeDirectory), identity.instance, fingerprint);
+    return path.join(hardwareStateRoot(identity), identity.instance, fingerprint);
 }
 
 /**
@@ -628,15 +642,14 @@ export function resolveDesiredHardwareWiring({
     identity,
     enabled,
     hostKind = 'native-linux',
-    homeDirectory = os.homedir(),
     fsApi = fs,
     initializeStore,
 }) {
     if (!enabled) return null;
     exactIdentity(identity);
-    assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
-    assertHardwareStateConfined({ workspaceRoot: identity.workspaceRoot, dataPaths: identity.dataPaths, homeDirectory, fsApi });
-    const paths = hardwareStorePaths({ identity, homeDirectory });
+    assertRouterBindingStateConfined(identity, { fsApi });
+    assertHardwareStateConfined({ identity, fsApi });
+    const paths = hardwareStorePaths({ identity });
     const snapshot = initializeStore({ paths, identity, fsApi });
     if (snapshot.status !== 'valid') {
         throw gateError(`The hardware policy store cannot be read safely: ${snapshot.diagnostic}`, 'PLOINKY_BOX_HARDWARE_STATE_INVALID');
@@ -653,10 +666,11 @@ export function resolveDesiredHardwareWiring({
     };
     const bytes = `${canonicalJson(marker)}\n`;
     const fingerprint = crypto.createHash('sha256').update(bytes).digest('hex');
-    const generation = hardwareGenerationDirectory(identity, fingerprint, homeDirectory);
-    fsApi.mkdirSync(path.dirname(generation), { recursive: true, mode: 0o700 });
-    ensurePrivateDirectory(fsApi, path.dirname(generation), STATE_FILES);
-    ensurePrivateDirectory(fsApi, generation, STATE_FILES);
+    const generation = ensureStoreDirectories(
+        identity,
+        [HARDWARE_LIMITS_STATE_DIRECTORY, identity.instance, fingerprint],
+        { fsApi, ...STATE_FILES },
+    );
     const markerPath = path.join(generation, 'marker.json');
     const existing = readPrivateFile(fsApi, markerPath, 4096, 'Hardware-limits marker', STATE_FILES);
     if (existing === null) {
@@ -697,7 +711,7 @@ function wiringObservationError(message) {
  * mounts. A gate-off Box carries neither; any hardware mount without the label
  * (or the reverse) is incompatible.
  */
-export function observeContainerHardwareWiring(containerHandle, { homeDirectory = os.homedir(), identity = null } = {}) {
+export function observeContainerHardwareWiring(containerHandle, { identity = null } = {}) {
     const labels = containerHandle?.labels || {};
     const runtime = containerHandle?.runtime || {};
     const mounts = (Array.isArray(runtime.mounts) ? runtime.mounts : [])
@@ -720,7 +734,7 @@ export function observeContainerHardwareWiring(containerHandle, { homeDirectory 
         throw wiringObservationError('Owned Box hardware-limits store is not a read-write bind');
     }
     if (identity) {
-        const generation = hardwareGenerationDirectory(identity, fingerprint, homeDirectory);
+        const generation = hardwareGenerationDirectory(identity, fingerprint);
         if (marker.source !== path.join(generation, 'marker.json')) {
             throw wiringObservationError('Owned Box hardware-limits marker is not its generation marker');
         }

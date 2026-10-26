@@ -8,8 +8,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
-import { routerInventory, routerInventoryBaseline, routerSourceDrift } from './router-inventory.mjs';
+import { routerInventoryHistorical as routerInventory, routerInventoryBaseline, routerSourceDrift } from './router-inventory.mjs';
 import {
   assertRouterInventoryObligations,
   assertRouterReferenceMaps,
@@ -59,12 +62,40 @@ test('router source drift: mutated checkout bytes in several files are all repor
     assert.notDeepEqual(mutated, bytes, 'the mutation must change the bytes');
     return mutated;
   };
-  const drift = collectRouterSourceDrift({ rows: routerInventoryBaseline, readSource });
+  const drift = routerSourceDrift({ readSource });
   const familyRows = routerInventoryBaseline.filter(isFamily);
   assert.deepEqual([...new Set(familyRows.map(fileOf))].sort(), Object.keys(registry.files).sort(), 'every registered family has inventory rows');
   for (const row of familyRows) assert.ok(drift.includes(`UNREVIEWED_ROUTER_SOURCE: ${fileOf(row)} ${row.id} ${sha256(readSource(fileOf(row)))}`), row.id);
   assert.ok(drift.includes(`ROUTER_ANCHOR_NOT_ON_LINE: ${anchoredFile} ${anchoredId} line ${lineOf(anchored)}`));
   assert.ok(drift.length >= familyRows.length + 1, 'all mismatches come from one call');
+});
+
+test('router source drift: importing drifted source retains aggregated failures and refuses the Live Sessions overlay', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-drift-'));
+  try {
+    const harness = 'tests/security/authorization';
+    const files = new Set(routerInventoryBaseline.map(fileOf));
+    for (const file of ['router-inventory.mjs', 'router-source-references.mjs',
+      'router-live-sessions-inventory.mjs', 'router-reference-obligations.json']) files.add(`${harness}/${file}`);
+    for (const file of files) {
+      const target = path.join(root, file);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, realBytes(file));
+    }
+    const driftedFiles = ['cli/server/RoutingServer.js', 'cli/server/handlers/webtty.js'];
+    for (const file of driftedFiles) fs.appendFileSync(path.join(root, file), '\n');
+    const imported = await import(pathToFileURL(path.join(root, harness, 'router-inventory.mjs')).href);
+    assert.equal(imported.routerInventoryHistorical.length, 128);
+    assert.equal(imported.routerInventory, imported.routerInventoryHistorical, 'unreviewed source cannot produce a current overlay');
+    const drift = imported.routerSourceDrift();
+    for (const file of driftedFiles) {
+      const expected = routerInventoryBaseline.filter(row => fileOf(row) === file);
+      assert.equal(drift.filter(entry => entry.startsWith(`UNREVIEWED_ROUTER_SOURCE: ${file} `)).length, expected.length);
+    }
+    assert.equal(drift.length, routerInventoryBaseline.filter(row => driftedFiles.includes(fileOf(row))).length);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // One registered family with a statement and an anchor mismatch, a file whose

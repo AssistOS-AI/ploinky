@@ -40,6 +40,7 @@ import {
     PLOINKY_SKILL_SCOPE_ENV
 } from '../../utils/config.js';
 import { openSandboxLogHandle, readSandboxCrashLog } from '../sandboxLogFiles.js';
+import { acquireHostLaunchExclusion, ensureHostLaunchSkeleton, runHostInteractiveSession } from '../hostLaunchExclusion.js';
 import { sanitizeDiagnosticText } from '../../utils/diagnosticText.js';
 import { guardSpawnedChild } from '../../utils/childSpawn.js';
 import {
@@ -514,6 +515,9 @@ function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, 
 }
 
 function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
+    // The guards always mask `.ploinky-box`, so its skeleton exists before
+    // they are planned; a launch that cannot create it fails here.
+    ensureHostLaunchSkeleton(workspaceRoot);
     const bindings = [];
     const remainder = [];
     let insertionIndex = 0;
@@ -946,20 +950,26 @@ function sanitizeHistoryName(value) {
     return String(value || 'agent').replace(/[^A-Za-z0-9_.-]/g, '_');
 }
 
+// The session runs in the foreground; the workspace lock is held only until
+// the sandbox has settled (runHostInteractiveSession).
 function spawnBwrapInteractive(bwrapArgs, options = {}) {
     const usePty = options.usePty === true;
     const scriptPath = '/usr/bin/script';
+    const session = { workspaceRoot: PLOINKY_WORKSPACE_ROOT, label: options.label, spawnImpl: spawn };
     if (usePty && fs.existsSync(scriptPath)) {
         const command = buildShellCommand([BWRAP_PATH, ...bwrapArgs]);
-        return spawnSync(scriptPath, ['-qfec', command, '/dev/null'], { stdio: 'inherit' });
+        return runHostInteractiveSession(scriptPath, ['-qfec', command, '/dev/null'], {}, session);
     }
-    return spawnSync(BWRAP_PATH, bwrapArgs, { stdio: 'inherit' });
+    return runHostInteractiveSession(BWRAP_PATH, bwrapArgs, {}, session);
 }
 
 /**
  * Start a bwrap-sandboxed agent process.
  */
 function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
+    // The host state skeleton exists before any launch; a launch that cannot
+    // create it fails.
+    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agentSnapshot = loadAgentsMap();
@@ -1109,7 +1119,14 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
     });
     let child;
+    let launchExclusion = null;
     try {
+        // Spawn and record under the workspace lock, after the caller's start
+        // lease: a Box transaction never runs between this launch and its record.
+        launchExclusion = acquireHostLaunchExclusion({
+            workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+            label: `bwrap launch of ${containerName}`,
+        });
         child = spawn(BWRAP_PATH, bwrapArgs, {
             detached: true,
             stdio: logHandle.stdio
@@ -1154,6 +1171,8 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         logHandle.discard();
         if (!child?.pid) dependencies.prepared?.release();
         throw error;
+    } finally {
+        launchExclusion?.release();
     }
     if (dependencies.prepared) {
         try {
@@ -1405,7 +1424,9 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
  * but runs the given command instead of the agent server.
  * Uses --die-with-parent so the session is cleaned up when the parent exits.
  */
-function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCommand, options = {}) {
+async function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCommand, options = {}) {
+    // The skeleton exists before the sandbox arguments are built.
+    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agents = loadAgentsMap();
@@ -1536,7 +1557,10 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
             containerName,
         });
         options.onReady?.();
-        const result = spawnBwrapInteractive(bwrapArgs, { usePty: process.stdin.isTTY });
+        const result = await spawnBwrapInteractive(bwrapArgs, {
+            usePty: process.stdin.isTTY,
+            label: `interactive bwrap session of ${containerName}`,
+        });
         return result.status ?? 0;
     } finally {
         try {

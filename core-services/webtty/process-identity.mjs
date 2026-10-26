@@ -259,3 +259,253 @@ export async function waitForPtyProcessExit(record, {
     }
     return false;
 }
+
+const MAX_SESSION_ENTRIES = 8_192;
+const MAX_PROC_BYTES = 64 * 1024;
+export const PTY_SESSION_CLEANUP_MS = 1_500;
+const TERM_PHASE_MS = 750;
+const EMPTY_SCAN_INTERVAL_MS = 25;
+
+function sessionIdentity(value, sessionId) {
+    positiveInteger(value?.pid, 'session-pid');
+    positiveInteger(value?.sessionId, 'session-id');
+    if (value.sessionId !== sessionId
+        || typeof value.startToken !== 'string'
+        || !/^linux-proc:[1-9][0-9]*$/.test(value.startToken)
+        || typeof value.state !== 'string' || !/^[RSDZTtXxKWPI]$/.test(value.state)) {
+        throw processIdentityError('session-identity');
+    }
+    return Object.freeze({
+        pid: value.pid, startToken: value.startToken, sessionId: value.sessionId,
+        state: value.state,
+    });
+}
+
+function sameSessionIdentity(current, expected) {
+    return current.pid === expected.pid && current.startToken === expected.startToken
+        && current.sessionId === expected.sessionId && current.state !== 'Z';
+}
+
+function checkDeadline(deadlineAt, nowImpl) {
+    if (!Number.isFinite(deadlineAt) || nowImpl() >= deadlineAt) {
+        throw processIdentityError('session-deadline');
+    }
+}
+
+function readSessionSignalIdentity(pid) {
+    positiveInteger(pid, 'pid');
+    let descriptor;
+    try {
+        descriptor = fs.openSync(`/proc/${pid}/stat`, 'r');
+        const buffer = Buffer.alloc(MAX_PROC_BYTES + 1);
+        const bytes = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+        if (bytes > MAX_PROC_BYTES) throw processIdentityError('proc-file-limit');
+        return parseLinuxProcessStat(buffer.subarray(0, bytes).toString('utf8'), pid);
+    } catch (error) {
+        if (error?.code?.startsWith('WEBTTY_PROCESS_IDENTITY_')) throw error;
+        throw processIdentityError('process-not-readable', {
+            stale: ['ENOENT', 'ESRCH'].includes(error?.code),
+        });
+    } finally {
+        if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+}
+
+async function beforeDeadline(operation, deadlineAt, nowImpl) {
+    checkDeadline(deadlineAt, nowImpl);
+    let timer;
+    try {
+        const result = await Promise.race([
+            operation(),
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(processIdentityError('session-deadline')), deadlineAt - nowImpl());
+            }),
+        ]);
+        checkDeadline(deadlineAt, nowImpl);
+        return result;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function readSessionProcess(pid, { fsApi, deadlineAt, nowImpl }) {
+    positiveInteger(pid, 'pid');
+    let handle;
+    try {
+        // The operation owns even a late open, so timeout cannot leak its handle.
+        return await beforeDeadline(async () => {
+            handle = await fsApi.open(`/proc/${pid}/stat`, 'r');
+            try {
+                checkDeadline(deadlineAt, nowImpl);
+                const buffer = Buffer.alloc(MAX_PROC_BYTES + 1);
+                const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+                checkDeadline(deadlineAt, nowImpl);
+                if (bytesRead > MAX_PROC_BYTES) throw processIdentityError('proc-file-limit');
+                return parseLinuxProcessStat(buffer.subarray(0, bytesRead).toString('utf8'), pid);
+            } finally {
+                await handle.close();
+            }
+        }, deadlineAt, nowImpl);
+    } catch (error) {
+        if (error?.code?.startsWith('WEBTTY_PROCESS_IDENTITY_')) throw error;
+        throw processIdentityError('process-not-readable', {
+            stale: ['ENOENT', 'ESRCH'].includes(error?.code),
+        });
+    }
+}
+
+export async function capturePtySessionSnapshot(record, {
+    anchors = [record],
+    fsApi = fs.promises,
+    deadlineAt = Date.now() + PTY_SESSION_CLEANUP_MS,
+    nowImpl = Date.now,
+    maxEntries = MAX_SESSION_ENTRIES,
+    readIdentityImpl = (pid) => readSessionProcess(pid, { fsApi, deadlineAt, nowImpl }),
+} = {}) {
+    const sessionId = positiveInteger(record?.sessionId, 'session-id');
+    if (!Array.isArray(anchors) || anchors.length > MAX_SESSION_ENTRIES
+        || !Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > MAX_SESSION_ENTRIES) {
+        throw processIdentityError('session-anchors');
+    }
+    const trusted = anchors.map((anchor) => sessionIdentity({ state: 'S', ...anchor }, sessionId));
+    const read = (pid) => beforeDeadline(() => readIdentityImpl(pid), deadlineAt, nowImpl);
+    let anchor;
+    for (const expected of trusted) {
+        try {
+            const current = await read(expected.pid);
+            if (sameSessionIdentity(sessionIdentity(current, current.sessionId), expected)) {
+                anchor = expected;
+                break;
+            }
+        } catch (error) {
+            if (error?.code !== 'WEBTTY_PROCESS_IDENTITY_STALE') throw error;
+        }
+    }
+    const members = [];
+    const opening = fsApi.opendir('/proc');
+    let directory;
+    try {
+        directory = await beforeDeadline(() => opening, deadlineAt, nowImpl);
+    } catch (error) {
+        void opening.then((late) => late.close()).catch(() => {});
+        throw error;
+    }
+    try {
+        let entries = 0;
+        while (true) {
+            const entry = await beforeDeadline(() => directory.read(), deadlineAt, nowImpl);
+            if (!entry) break;
+            if (++entries > maxEntries) throw processIdentityError('proc-scan-limit');
+            if (!entry.isDirectory() || !/^[1-9][0-9]*$/.test(entry.name)) continue;
+            const pid = positiveInteger(Number(entry.name), 'proc-pid');
+            try {
+                const current = await read(pid);
+                const member = sessionIdentity(current, current.sessionId);
+                if (member.sessionId === sessionId && member.state !== 'Z') members.push(member);
+            } catch (error) {
+                if (error?.code !== 'WEBTTY_PROCESS_IDENTITY_STALE') throw error;
+            }
+        }
+    } finally {
+        // Closing an outstanding directory read remains owned by this scan;
+        // cleanup itself must not wait past the shared transaction deadline.
+        void directory.close().catch(() => {});
+    }
+    if (members.length) {
+        if (!anchor || !members.some((member) => sameSessionIdentity(member, anchor))) {
+            throw processIdentityError('session-anchor-missing');
+        }
+        const after = await read(anchor.pid);
+        if (!sameSessionIdentity(sessionIdentity(after, after.sessionId), anchor)) {
+            throw processIdentityError('session-anchor-changed');
+        }
+    }
+    checkDeadline(deadlineAt, nowImpl);
+    return Object.freeze(members);
+}
+
+export function signalExactPtySessionSnapshot(snapshot, signal, {
+    deadlineAt,
+    nowImpl = Date.now,
+    readIdentityImpl = readSessionSignalIdentity,
+    killImpl = process.kill.bind(process),
+} = {}) {
+    if (!['SIGTERM', 'SIGKILL'].includes(signal) || !Array.isArray(snapshot)
+        || snapshot.length > MAX_SESSION_ENTRIES) throw processIdentityError('session-signal');
+    const expectedMembers = snapshot.map((member) => sessionIdentity(member, member?.sessionId));
+    if (expectedMembers.some((member) => member.sessionId !== expectedMembers[0]?.sessionId)) {
+        throw processIdentityError('session-snapshot');
+    }
+    for (const expected of expectedMembers) {
+        checkDeadline(deadlineAt, nowImpl);
+        let current;
+        try {
+            current = readIdentityImpl(expected.pid);
+        } catch (error) {
+            if (error?.code === 'WEBTTY_PROCESS_IDENTITY_STALE') continue;
+            throw error;
+        }
+        current = sessionIdentity(current, current.sessionId);
+        if (current.state === 'Z') continue;
+        if (!sameSessionIdentity(current, expected)) throw processIdentityError('session-member-changed');
+        checkDeadline(deadlineAt, nowImpl);
+        // Revalidate synchronously and signal only this positive PID. No await
+        // or logging may separate that identity proof from the signal.
+        try { killImpl(current.pid, signal); } catch (error) {
+            if (error?.code !== 'ESRCH') throw error;
+        }
+    }
+}
+
+export async function cleanupPtySession(record, {
+    nowImpl = Date.now,
+    delayImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    snapshotImpl = capturePtySessionSnapshot,
+    signalImpl = signalExactPtySessionSnapshot,
+} = {}) {
+    const started = nowImpl();
+    const deadlineAt = started + PTY_SESSION_CLEANUP_MS;
+    const termDeadlineAt = started + TERM_PHASE_MS;
+    let anchors = [record];
+    let emptyAt = null;
+    const terminated = new Set();
+    while (nowImpl() < deadlineAt) {
+        const snapshot = await beforeDeadline(() => snapshotImpl(record, {
+            anchors, deadlineAt, nowImpl,
+        }), deadlineAt, nowImpl);
+        if (!Array.isArray(snapshot)) throw processIdentityError('session-snapshot');
+        if (!snapshot.length) {
+            if (emptyAt !== null && nowImpl() - emptyAt >= EMPTY_SCAN_INTERVAL_MS) return true;
+            emptyAt ??= nowImpl();
+        } else {
+            emptyAt = null;
+            anchors = snapshot;
+            const signal = nowImpl() < termDeadlineAt ? 'SIGTERM' : 'SIGKILL';
+            const targets = signal === 'SIGTERM'
+                ? snapshot.filter((member) => !terminated.has(`${member.pid}:${member.startToken}`))
+                : snapshot;
+            // Keep the original shell alive until its other observed members
+            // have received the signal, preserving continuity as long as possible.
+            const ordered = [...targets].sort((a, b) => Number(a.pid === record.pid) - Number(b.pid === record.pid));
+            if (ordered.length) {
+                try {
+                    signalImpl(ordered, signal, {
+                        deadlineAt: signal === 'SIGTERM' ? termDeadlineAt : deadlineAt, nowImpl,
+                    });
+                } catch (error) {
+                    if (signal !== 'SIGTERM'
+                        || error?.code !== 'WEBTTY_PROCESS_IDENTITY_UNPROVEN'
+                        || error?.category !== 'session-deadline'
+                        || nowImpl() < termDeadlineAt || nowImpl() >= deadlineAt) throw error;
+                    // TERM's cutoff can interrupt even a partially signaled
+                    // snapshot. Re-establish ownership before KILL, retaining
+                    // the original transaction deadline.
+                    continue;
+                }
+            }
+            for (const member of targets) terminated.add(`${member.pid}:${member.startToken}`);
+        }
+        await beforeDeadline(() => delayImpl(EMPTY_SCAN_INTERVAL_MS), deadlineAt, nowImpl);
+    }
+    return false;
+}

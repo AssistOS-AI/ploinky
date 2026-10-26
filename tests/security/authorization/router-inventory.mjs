@@ -5,6 +5,7 @@
  */
 import fs from 'node:fs';
 import { collectRouterSourceDrift, hasRouterSourceReference, normalizeRouterInventory, resolveRouterSourceReference } from './router-source-references.mjs';
+import { buildLiveSessionsRouterInventory } from './router-live-sessions-inventory.mjs';
 
 const access = {
   public: { anonymous: 'allow', selfRegistered: 'allow', user: 'allow', admin: 'allow' },
@@ -139,7 +140,7 @@ const sourceFiles = new Map();
 // not need a resolved reference still run. A row that cannot be resolved stays
 // the unchanged frozen baseline row, without `sourceBlobSha256`; the failure is
 // reported by routerSourceDrift() and by the tests that need the reference.
-export const routerInventory = Object.freeze(routerInventoryBaseline.map(row => {
+export const routerInventoryHistorical = Object.freeze(routerInventoryBaseline.map(row => {
   if (!hasRouterSourceReference(row)) return row;
   try {
     const [file] = row.source.split(':');
@@ -149,6 +150,16 @@ export const routerInventory = Object.freeze(routerInventoryBaseline.map(row => 
     return row;
   }
 }));
+// Keep source-independent checks loadable when either historical references or
+// the Live Sessions overlay drift. The mandatory check below reports failure;
+// overlay tests also reject this historical-only fallback.
+export const routerInventory = (() => {
+  try {
+    return buildLiveSessionsRouterInventory(routerInventoryHistorical, readRouterSource('cli/server/handlers/webtty.js'));
+  } catch {
+    return routerInventoryHistorical;
+  }
+})();
 
 /**
  * Every mismatch between the reviewed registry and the checkout's real source
@@ -156,8 +167,17 @@ export const routerInventory = Object.freeze(routerInventoryBaseline.map(row => 
  * files on each call, so the result is never stale. An empty array means the
  * checkout matches the reviewed registry.
  */
-export function routerSourceDrift() {
-  return collectRouterSourceDrift({ rows: routerInventoryBaseline, readSource: readRouterSource });
+export function routerSourceDrift({ readSource = readRouterSource } = {}) {
+  const drift = collectRouterSourceDrift({ rows: routerInventoryBaseline, readSource });
+  if (!drift.length) {
+    try {
+      const historical = routerInventoryBaseline.map(row => resolveRouterSourceReference(row, readSource(row.source.split(':')[0])));
+      buildLiveSessionsRouterInventory(historical, readSource('cli/server/handlers/webtty.js'));
+    } catch (error) {
+      drift.push(`LIVE_SESSIONS_SOURCE_DRIFT: ${String(error?.message ?? error).split('\n')[0]}`);
+    }
+  }
+  return drift;
 }
 
 export const routerAuthorizationOrder = Object.freeze([

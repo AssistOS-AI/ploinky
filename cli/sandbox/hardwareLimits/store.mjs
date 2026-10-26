@@ -4,16 +4,20 @@
 //   limits.json     policy document with {epoch, revision} CAS token
 //   audit.log       append-only bounded audit (rotated, four generations)
 //   transition.json downgrade write barrier (coordination data only)
-//   write.lock/     the one portable store lock
+//   write.lock      the one portable store lock (a single file holding the owner record)
+// Every host path under the store is one component below it and is opened,
+// created or removed without following a link, so the Box cannot steer a host
+// operation out of the store.
 // Every read is bounded and no-follow; every commit is an atomic private
 // rename with directory fsync; a policy change and its audit event commit
 // together through a one-event outbox.
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
+import { HOST_STATE_DIRECTORY_NAME } from '../../../ploinky-box/constants.mjs';
+import { ensureStoreDirectories } from '../../../ploinky-box/hostState/stores.mjs';
 import { isHardwareRef } from './errors.mjs';
 import {
     LimitResolutionError,
@@ -117,24 +121,36 @@ function exactKeys(value, keys, label, { code = 'store_unreadable' } = {}) {
 // ---------------------------------------------------------------------------
 // Paths
 
-export function hardwareStateRoot(homeDirectory = os.homedir()) {
-    return path.join(path.resolve(homeDirectory), '.ploinky-box', HARDWARE_STATE_DIRECTORY);
+function hostStateRootOf(identity) {
+    const workspaceRoot = String(identity?.workspaceRoot || '');
+    if (!path.isAbsolute(workspaceRoot) || identity?.hostStateRoot !== path.join(workspaceRoot, HOST_STATE_DIRECTORY_NAME)) {
+        fail('hardware store paths require the exact workspace identity', { code: 'identity_changed' });
+    }
+    return identity.hostStateRoot;
+}
+
+/** `<workspace>/.ploinky-box/hardware-limits` for one exact identity. */
+export function hardwareStateRoot(identity) {
+    return path.join(hostStateRootOf(identity), HARDWARE_STATE_DIRECTORY);
 }
 
 /**
  * Fixed store paths for a validated identity. Host and Box roots are derived,
- * never supplied by a request.
+ * never supplied by a request. A host path also names `hostStateRoot`, the base
+ * of the symlink-free walk (`guardHostPath`) every host access to the
+ * Box-writable store goes through.
  */
-export function hardwareStorePaths({ identity, context = 'host', homeDirectory = os.homedir(), boxRoot = BOX_STORE_ROOT } = {}) {
+export function hardwareStorePaths({ identity, context = 'host', boxRoot = BOX_STORE_ROOT } = {}) {
     const instance = String(identity?.instance || '');
     if (!/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(instance)) {
         fail('hardware store paths require the exact workspace identity', { code: 'identity_changed' });
     }
     const storeRoot = context === 'box'
         ? path.resolve(boxRoot)
-        : path.join(hardwareStateRoot(homeDirectory), instance, 'store');
+        : path.join(hardwareStateRoot(identity), instance, 'store');
     return Object.freeze({
         context,
+        hostStateRoot: context === 'box' ? null : hostStateRootOf(identity),
         storeRoot,
         identityPath: path.join(storeRoot, 'identity.json'),
         policyPath: path.join(storeRoot, 'limits.json'),
@@ -143,10 +159,54 @@ export function hardwareStorePaths({ identity, context = 'host', homeDirectory =
     });
 }
 
+/**
+ * D1 store write rule. The Box writes `hardware-limits/<inst>/store` by design,
+ * so a host read or write there must not be steered elsewhere by a planted
+ * link. `O_NOFOLLOW` only covers the last component, so every component from
+ * `.ploinky-box` down to `target` is first checked with `lstat`: an existing
+ * component must be a real directory (the final one may be any non-symlink),
+ * and a symlink anywhere is refused. A component that does not exist yet ends
+ * the walk; creation is the caller's. Box-context paths are the bound mount
+ * and are left alone.
+ */
+export function guardHostPath(fsApi, paths, target) {
+    if (paths.context !== 'host') return target;
+    const relative = path.relative(paths.hostStateRoot, target);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+        fail('the hardware store path is outside the host state directory', { code: 'store_unreadable' });
+    }
+    const parts = relative.split(path.sep);
+    let current = paths.hostStateRoot;
+    for (let index = -1; index < parts.length; index += 1) {
+        if (index >= 0) current = path.join(current, parts[index]);
+        let stat;
+        try {
+            stat = fsApi.lstatSync(current);
+        } catch (error) {
+            if (error?.code === 'ENOENT') return target;
+            throw error;
+        }
+        if (stat.isSymbolicLink()) fail(`the hardware store path has a symlinked component: ${current}`, { code: 'store_unreadable' });
+        if (index < parts.length - 1 && !stat.isDirectory()) {
+            fail(`the hardware store path has a non-directory component: ${current}`, { code: 'store_unreadable' });
+        }
+    }
+    return target;
+}
+
 // ---------------------------------------------------------------------------
 // Bounded private reads and atomic commits
 
-function readBoundedPrivate(fsApi, target, maxBytes, label) {
+// With `paths`, the host store path is walked for links first (D1); a refusal
+// is reported like any other unreadable file, so callers keep their handling.
+function readBoundedPrivate(fsApi, target, maxBytes, label, paths = null) {
+    if (paths) {
+        try {
+            guardHostPath(fsApi, paths, target);
+        } catch (error) {
+            return { problem: `${label} is not readable: ${String(error?.message || error)}` };
+        }
+    }
     let descriptor;
     try {
         descriptor = fsApi.openSync(target, fsApi.constants.O_RDONLY | fsApi.constants.O_NOFOLLOW | fsApi.constants.O_NONBLOCK);
@@ -218,7 +278,8 @@ function atomicPrivateWrite(fsApi, target, document, faults = {}, faultPrefix = 
     }
 }
 
-function assertPrivateStoreDirectory(fsApi, storeRoot) {
+function assertPrivateStoreDirectory(fsApi, paths) {
+    const storeRoot = guardHostPath(fsApi, paths, paths.storeRoot);
     let stat;
     try {
         stat = fsApi.lstatSync(storeRoot);
@@ -367,16 +428,16 @@ function parseJson(bytes, label) {
  */
 export function readStoreSnapshot({ paths, identity = null, fsApi = fs } = {}) {
     try {
-        const present = assertPrivateStoreDirectory(fsApi, paths.storeRoot);
+        const present = assertPrivateStoreDirectory(fsApi, paths);
         if (!present) {
             if (paths.context === 'box') fail('the bound hardware store is missing', { code: 'store_unreadable' });
             return Object.freeze({ status: 'absent-never-initialized', token: null, agents: new Map(), storeId: null, diagnostic: null });
         }
-        const identityRead = readBoundedPrivate(fsApi, paths.identityPath, MAX_IDENTITY_BYTES, 'identity.json');
+        const identityRead = readBoundedPrivate(fsApi, paths.identityPath, MAX_IDENTITY_BYTES, 'identity.json', paths);
         if (identityRead.missing) fail('identity.json is missing from an existing store directory', { code: 'store_unreadable' });
         if (identityRead.problem) fail(identityRead.problem, { code: 'store_unreadable' });
         const identityDocument = validateIdentityDocument(parseJson(identityRead.bytes, 'identity.json'), identity);
-        const policyRead = readBoundedPrivate(fsApi, paths.policyPath, MAX_STORE_BYTES, 'limits.json');
+        const policyRead = readBoundedPrivate(fsApi, paths.policyPath, MAX_STORE_BYTES, 'limits.json', paths);
         if (policyRead.missing) fail('limits.json is missing from an initialized store', { code: 'store_unreadable' });
         if (policyRead.problem) fail(policyRead.problem, { code: 'store_unreadable' });
         const { document, agents } = validateStoreDocument(parseJson(policyRead.bytes, 'limits.json'), { identityDocument });
@@ -406,7 +467,14 @@ export function readStoreSnapshot({ paths, identity = null, fsApi = fs } = {}) {
 
 export function initializeStore({ paths, identity, fsApi = fs, now = () => new Date() } = {}) {
     if (paths.context !== 'host') fail('only the host initializes the hardware store', { code: 'store_unreadable' });
-    fsApi.mkdirSync(path.dirname(paths.storeRoot), { recursive: true, mode: 0o700 });
+    // The skeleton, `hardware-limits/` and `<instance>/` are created one level
+    // at a time; the store directory itself is created (never re-moded) below.
+    ensureStoreDirectories(identity, [HARDWARE_STATE_DIRECTORY, identity.instance], {
+        fsApi,
+        subject: 'hardware-limits state',
+        stateError: (message) => new HardwareStoreError(message, { code: 'store_unreadable' }),
+    });
+    guardHostPath(fsApi, paths, paths.storeRoot);
     try {
         fsApi.mkdirSync(paths.storeRoot, { mode: 0o700 });
     } catch (error) {
@@ -415,10 +483,10 @@ export function initializeStore({ paths, identity, fsApi = fs, now = () => new D
         if (snapshot.status === 'valid') return snapshot;
         fail(`the existing hardware store cannot be read safely: ${snapshot.diagnostic}`, { code: 'store_unreadable' });
     }
-    assertPrivateStoreDirectory(fsApi, paths.storeRoot);
+    assertPrivateStoreDirectory(fsApi, paths);
     const storeId = randomHex();
     const initializedAt = now().toISOString();
-    atomicPrivateWrite(fsApi, paths.identityPath, {
+    atomicPrivateWrite(fsApi, guardHostPath(fsApi, paths, paths.identityPath), {
         schema: 1,
         instance: identity.instance,
         pathHash: identity.pathHash,
@@ -426,7 +494,7 @@ export function initializeStore({ paths, identity, fsApi = fs, now = () => new D
         storeId,
         initializedAt,
     });
-    atomicPrivateWrite(fsApi, paths.policyPath, {
+    atomicPrivateWrite(fsApi, guardHostPath(fsApi, paths, paths.policyPath), {
         schema: STORE_SCHEMA,
         instance: identity.instance,
         storeId,
@@ -501,8 +569,14 @@ function auditTailContains(fsApi, auditPath, transactionId) {
     if (!stat) return false;
     const length = Math.min(stat.size, 64 * 1024);
     const buffer = Buffer.alloc(length);
-    const descriptor = fsApi.openSync(auditPath, fsApi.constants.O_RDONLY | fsApi.constants.O_NOFOLLOW);
+    const descriptor = fsApi.openSync(auditPath, fsApi.constants.O_RDONLY | fsApi.constants.O_NOFOLLOW | fsApi.constants.O_NONBLOCK);
     try {
+        // The path was checked before it was opened: re-check what was opened.
+        const opened = fsApi.fstatSync(descriptor);
+        const uid = currentUid();
+        if (!opened.isFile() || opened.nlink !== 1 || (uid !== null && opened.uid !== uid)) {
+            fail('audit.log is not a single regular file', { code: 'audit_pending' });
+        }
         fsApi.readSync(descriptor, buffer, 0, length, stat.size - length);
     } finally {
         fsApi.closeSync(descriptor);
@@ -517,7 +591,8 @@ function appendAudit(fsApi, auditPath, event) {
         | fsApi.constants.O_CREAT | fsApi.constants.O_NOFOLLOW, 0o600);
     try {
         const opened = fsApi.fstatSync(descriptor);
-        if (!opened.isFile() || opened.nlink !== 1 || (opened.mode & 0o077) !== 0) {
+        const uid = currentUid();
+        if (!opened.isFile() || opened.nlink !== 1 || (opened.mode & 0o077) !== 0 || (uid !== null && opened.uid !== uid)) {
             fail('audit.log is not a private single regular file', { code: 'audit_pending' });
         }
         fsApi.writeSync(descriptor, `${JSON.stringify(event)}\n`);
@@ -536,9 +611,9 @@ export function recoverAuditOutbox({ paths, snapshot, fsApi = fs, faults = {}, n
     if (!document?.auditOutbox) return { auditPending: false, document };
     const event = document.auditOutbox;
     try {
-        if (!auditTailContains(fsApi, paths.auditPath, event.transactionId)) {
+        if (!auditTailContains(fsApi, guardHostPath(fsApi, paths, paths.auditPath), event.transactionId)) {
             faults.duringAuditFlush?.();
-            appendAudit(fsApi, paths.auditPath, event);
+            appendAudit(fsApi, guardHostPath(fsApi, paths, paths.auditPath), event);
         }
         faults.beforeOutboxClear?.();
         const next = {
@@ -546,7 +621,7 @@ export function recoverAuditOutbox({ paths, snapshot, fsApi = fs, faults = {}, n
             auditOutbox: null,
             auditReceipt: { transactionId: event.transactionId, lastFlushedAt: now().toISOString() },
         };
-        atomicPrivateWrite(fsApi, paths.policyPath, next);
+        atomicPrivateWrite(fsApi, guardHostPath(fsApi, paths, paths.policyPath), next);
         return { auditPending: false, document: next };
     } catch (error) {
         return { auditPending: true, document, error };
@@ -568,7 +643,7 @@ export function validateBarrier(value) {
 // null when absent; {malformed:true} when present but invalid (blocks
 // mutations, never reads or admission).
 export function readBarrier({ paths, fsApi = fs }) {
-    const read = readBoundedPrivate(fsApi, paths.barrierPath, MAX_BARRIER_BYTES, 'transition.json');
+    const read = readBoundedPrivate(fsApi, paths.barrierPath, MAX_BARRIER_BYTES, 'transition.json', paths);
     if (read.missing) return null;
     if (read.problem) return { malformed: true, reason: read.problem };
     try {
@@ -671,7 +746,10 @@ export function parseLimitsRequestBody(buffer) {
 // ---------------------------------------------------------------------------
 // Mutations
 
-function lockOptions(paths, operation, options) {
+// The store lock is a directory inside the store: a host process must not
+// create it through a linked component, so the path is walked first.
+function lockOptions(paths, operation, options, fsApi = fs) {
+    guardHostPath(fsApi, paths, paths.storeRoot);
     return {
         storeRoot: paths.storeRoot,
         operation,
@@ -714,7 +792,7 @@ function commitPolicy({ paths, snapshot, agents, event, fsApi, faults, now }) {
     if (Buffer.byteLength(`${JSON.stringify(next, null, 2)}\n`) > MAX_STORE_BYTES) {
         fail(`limits.json would exceed ${MAX_STORE_BYTES} bytes`, { code: 'invalid_limits' });
     }
-    atomicPrivateWrite(fsApi, paths.policyPath, next, faults);
+    atomicPrivateWrite(fsApi, guardHostPath(fsApi, paths, paths.policyPath), next, faults);
     const token = Object.freeze({ epoch: next.epoch, revision: next.revision });
     const flushed = recoverAuditOutbox({ paths, snapshot: { document: next }, fsApi, faults, now });
     return { token, auditPending: flushed.auditPending };
@@ -734,7 +812,7 @@ function committedResult(result, extra = {}) {
 
 function recordRefusedAttempt({ paths, fsApi, now, actor, action, ref, reason }) {
     try {
-        appendAudit(fsApi, paths.auditPath, auditEvent({ action: `refused-${action}`, ref, actor, now, result: 'refused', reason }));
+        appendAudit(fsApi, guardHostPath(fsApi, paths, paths.auditPath), auditEvent({ action: `refused-${action}`, ref, actor, now, result: 'refused', reason }));
     } catch (_) {
         // The refusal itself is returned to the caller; an unavailable audit
         // destination is reported by status, never silently treated as clean.
@@ -760,7 +838,7 @@ export function setAgentLimits({
     installedRefs, capabilities, envelope, fsApi = fs, faults = {}, now = () => new Date(), lockOptions: lockOverrides,
     beforeCommit = () => true, admitProposed = () => {},
 } = {}) {
-    const lock = acquireStoreLock(lockOptions(paths, 'set_agent_limits', { lockOptions: lockOverrides }));
+    const lock = acquireStoreLock(lockOptions(paths, 'set_agent_limits', { lockOptions: lockOverrides }, fsApi));
     try {
         const snapshot = prepareMutation({ paths, identity, expectedToken, fsApi, now });
         if (beforeCommit() !== true) fail('The authenticated authority changed while waiting for the policy lock.', { code: 'identity_changed' });
@@ -790,7 +868,7 @@ export function clearAgentLimits({
     beforeCommit = () => true,
 } = {}) {
     validateAgentRef(agentRef);
-    const lock = acquireStoreLock(lockOptions(paths, 'clear_agent_limits', { lockOptions: lockOverrides }));
+    const lock = acquireStoreLock(lockOptions(paths, 'clear_agent_limits', { lockOptions: lockOverrides }, fsApi));
     try {
         const snapshot = prepareMutation({ paths, identity, expectedToken, fsApi, now });
         if (beforeCommit() !== true) fail('The authenticated authority changed while waiting for the policy lock.', { code: 'identity_changed' });
@@ -814,10 +892,10 @@ export function clearAllLimits({
     paths, identity, actor = null, fsApi = fs, faults = {}, now = () => new Date(), lockOptions: lockOverrides,
 } = {}) {
     if (paths.context !== 'host') fail('clear --all is a host recovery command', { code: 'unknown_action' });
-    const present = assertPrivateStoreDirectory(fsApi, paths.storeRoot);
+    const present = assertPrivateStoreDirectory(fsApi, paths);
     if (!present) return Object.freeze({ committed: false, token: null, reset: false, absent: true });
     assertNoBarrier(paths, fsApi);
-    const lock = acquireStoreLock(lockOptions(paths, 'clear_all', { lockOptions: lockOverrides }));
+    const lock = acquireStoreLock(lockOptions(paths, 'clear_all', { lockOptions: lockOverrides }, fsApi));
     try {
         const snapshot = readStoreSnapshot({ paths, identity, fsApi });
         if (snapshot.status === 'valid') {
@@ -846,14 +924,14 @@ export function clearAllLimits({
             });
             return committedResult(commitPolicy({ paths, snapshot: current, agents: new Map(), event, fsApi, faults, now }), { reset: false });
         }
-        const identityRead = readBoundedPrivate(fsApi, paths.identityPath, MAX_IDENTITY_BYTES, 'identity.json');
+        const identityRead = readBoundedPrivate(fsApi, paths.identityPath, MAX_IDENTITY_BYTES, 'identity.json', paths);
         if (identityRead.missing || identityRead.problem) {
             fail(`identity.json cannot be read safely (${identityRead.problem || 'missing'}); restore it or destroy this workspace's Box state`, { code: 'store_unreadable' });
         }
         const identityDocument = validateIdentityDocument(parseJson(identityRead.bytes, 'identity.json'), identity);
         let quarantined = null;
         try {
-            const stat = fsApi.lstatSync(paths.policyPath);
+            const stat = fsApi.lstatSync(guardHostPath(fsApi, paths, paths.policyPath));
             const uid = currentUid();
             if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && (uid === null || stat.uid === uid)) {
                 quarantined = `${paths.policyPath}.corrupt-${now().getTime()}-${randomHex(4)}`;
@@ -868,7 +946,7 @@ export function clearAllLimits({
         const event = auditEvent({ action: 'reset', ref: null, before: null, after: {}, actor, now, result: 'committed',
             reason: quarantined ? `quarantined ${path.basename(quarantined)}` : 'limits.json was missing',
             token: { epoch, revision: 1 } });
-        atomicPrivateWrite(fsApi, paths.policyPath, {
+        atomicPrivateWrite(fsApi, guardHostPath(fsApi, paths, paths.policyPath), {
             schema: STORE_SCHEMA,
             instance: identityDocument.instance,
             storeId: identityDocument.storeId,
@@ -891,9 +969,9 @@ export function clearAllLimits({
  * store. Unknown or unreadable contents are a failure, never zero.
  */
 export function assertGateOffStoreEmpty({ paths, identity, fsApi = fs, lockOptions: lockOverrides } = {}) {
-    const present = assertPrivateStoreDirectory(fsApi, paths.storeRoot);
+    const present = assertPrivateStoreDirectory(fsApi, paths);
     if (!present) return Object.freeze({ storeId: null, token: null, count: 0, initialized: false });
-    const lock = acquireStoreLock(lockOptions(paths, 'gate_off_guard', { lockOptions: lockOverrides }));
+    const lock = acquireStoreLock(lockOptions(paths, 'gate_off_guard', { lockOptions: lockOverrides }, fsApi));
     try {
         const snapshot = readStoreSnapshot({ paths, identity, fsApi });
         if (snapshot.status !== 'valid') {
@@ -931,7 +1009,7 @@ export function beginDowngradeBarrier({
     paths, identity, operationId, expectedEmptyToken, fsApi = fs, lockOptions: lockOverrides,
 } = {}) {
     if (!HEX32.test(String(operationId))) fail('downgrade operation ID must be 128-bit hex', { code: 'invalid_limits' });
-    const lock = acquireStoreLock(lockOptions(paths, 'downgrade_barrier', { lockOptions: lockOverrides }));
+    const lock = acquireStoreLock(lockOptions(paths, 'downgrade_barrier', { lockOptions: lockOverrides }, fsApi));
     try {
         const snapshot = requireValid(readStoreSnapshot({ paths, identity, fsApi }));
         if (snapshot.agents.size > 0) fail(U9_MESSAGE(snapshot.agents.size), { code: 'stored_limits_present' });
@@ -950,7 +1028,7 @@ export function beginDowngradeBarrier({
             toEnabled: false,
             policyToken: { epoch: snapshot.token.epoch, revision: snapshot.token.revision },
         });
-        atomicPrivateWrite(fsApi, paths.barrierPath, barrier);
+        atomicPrivateWrite(fsApi, guardHostPath(fsApi, paths, paths.barrierPath), barrier);
         return Object.freeze({ barrier, token: snapshot.token });
     } finally {
         lock.release();
@@ -961,7 +1039,7 @@ export function beginDowngradeBarrier({
 export function removeDowngradeBarrier({
     paths, identity, operationId, requireEmpty = true, fsApi = fs, lockOptions: lockOverrides,
 } = {}) {
-    const lock = acquireStoreLock(lockOptions(paths, 'downgrade_barrier_remove', { lockOptions: lockOverrides }));
+    const lock = acquireStoreLock(lockOptions(paths, 'downgrade_barrier_remove', { lockOptions: lockOverrides }, fsApi));
     try {
         const existing = readBarrier({ paths, fsApi });
         if (!existing) return Object.freeze({ removed: false });
@@ -972,7 +1050,7 @@ export function removeDowngradeBarrier({
             const snapshot = requireValid(readStoreSnapshot({ paths, identity, fsApi }));
             if (snapshot.agents.size > 0) fail(U9_MESSAGE(snapshot.agents.size), { code: 'stored_limits_present' });
         }
-        fsApi.unlinkSync(paths.barrierPath);
+        fsApi.unlinkSync(guardHostPath(fsApi, paths, paths.barrierPath));
         fsyncDirectory(fsApi, paths.storeRoot);
         return Object.freeze({ removed: true });
     } finally {
@@ -1007,16 +1085,24 @@ function realpathNearest(target, fsApi) {
     }
 }
 
-export function assertHardwareStateConfined({ workspaceRoot, dataPaths = {}, homeDirectory = os.homedir(), fsApi = fs } = {}) {
-    const protectedRoot = realpathNearest(hardwareStateRoot(homeDirectory), fsApi);
-    const boxRoot = path.dirname(protectedRoot);
-    for (const source of [workspaceRoot, ...Object.values(dataPaths)]) {
+export function assertHardwareStateConfined({ identity, fsApi = fs } = {}) {
+    const stateRoot = hostStateRootOf(identity);
+    const protectedRoot = realpathNearest(hardwareStateRoot(identity), fsApi);
+    const boxRoot = realpathNearest(stateRoot, fsApi);
+    const workspaceRoot = identity.workspaceRoot;
+    // The workspace root contains the host state directory by design; every
+    // other writable source must stay clear of it in both directions.
+    for (const source of [workspaceRoot, ...Object.values(identity.dataPaths || {})]) {
         if (!source) continue;
         const writable = realpathNearest(source, fsApi);
-        if (containsPath(writable, protectedRoot) || containsPath(protectedRoot, writable)
-            || containsPath(writable, boxRoot) || containsPath(boxRoot, writable)) {
+        const isWorkspace = source === workspaceRoot;
+        if (containsPath(protectedRoot, writable) || containsPath(boxRoot, writable)
+            || (!isWorkspace && (containsPath(writable, protectedRoot) || containsPath(writable, boxRoot)))) {
             fail(`Hardware state ${protectedRoot} overlaps writable Box source ${source}; choose workspace and cache paths outside the host control-state directory`, { code: 'identity_changed', status: 409 });
         }
+    }
+    if (!containsPath(realpathNearest(workspaceRoot, fsApi), boxRoot) || realpathNearest(workspaceRoot, fsApi) === boxRoot) {
+        fail(`Hardware state ${stateRoot} does not resolve inside its workspace ${workspaceRoot}`, { code: 'identity_changed', status: 409 });
     }
     if (workspaceRoot && path.resolve(workspaceRoot) === MPS_PIPE_TARGET) {
         fail(`The workspace root may not be the reserved MPS pipe path ${MPS_PIPE_TARGET}`, { code: 'identity_changed', status: 409 });

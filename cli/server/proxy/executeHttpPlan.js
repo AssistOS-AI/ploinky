@@ -48,8 +48,11 @@ export class RelayDuplex extends Duplex {
 
     _write(chunk, _encoding, callback) {
         try {
+            // The relay stream slices large chunks and queues what the
+            // channel cannot take yet; its own 'drain' means every slice of
+            // this chunk has been handed to the channel.
             const accepted = this.relayStream.write(chunk);
-            if (accepted === false) this.relayStream.channel.child.stdin.once('drain', callback);
+            if (accepted === false) this.relayStream.once('drain', callback);
             else callback();
         } catch (error) {
             callback(error);

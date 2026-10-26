@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+import { onAuthenticatedRequestDecision } from '../../cli/server/auth/authenticatedRequestEvents.mjs';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-invoker-'));
 const originalCwd = process.cwd();
@@ -61,9 +62,15 @@ function makeInvoker(authorizer = shareAllow) {
         registry,
         auditLog: new PolicyAuditLog(),
         getSession: (cookie) => (
-            cookie === 'admin' ? { user: { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] }, _jwtPayload: { chn: 'cli' } }
+            cookie === 'admin' ? { user: { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] },
+                createdAt: 1_000_000, _jwtPayload: { chn: 'cli', usr: { roles: ['user', 'admin'] } } }
                 : cookie === 'old-browser' ? { user: { id: 'local:admin', roles: ['admin'] } }
-                : cookie === 'cli' ? { user: { id: 'local:admin', roles: ['admin'] }, _jwtPayload: { chn: 'cli' } }
+                : cookie === 'cli' ? { user: { id: 'local:admin', roles: ['admin'] },
+                    createdAt: 2_000_000, _jwtPayload: { chn: 'cli', usr: { roles: ['admin'] } } }
+                : cookie === 'cli-demoted' ? { user: { id: 'local:admin', roles: [] },
+                    createdAt: 3_000_000, _jwtPayload: { chn: 'cli', usr: { roles: [] } } }
+                : cookie === 'cli-incomplete' ? { user: { id: 'local:admin', roles: ['user'] },
+                    createdAt: 3_000_000, _jwtPayload: { chn: 'cli', usr: {} } }
                 : cookie === 'user' ? { user: { id: 'local:bob', username: 'bob', roles: ['user'] } }
                     : null
         ),
@@ -101,8 +108,10 @@ class MockResponse {
     end(chunk = '') { this.body += chunk ? String(chunk) : ''; }
 }
 
-function makeRequest({ method = 'POST', cookie = '', body, proof = 'valid', origin = 'http://localhost', host = 'localhost', forwarded = false } = {}) {
-    const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')];
+function makeRequest({ method = 'POST', cookie = '', body, rawBody, proof = 'valid', origin = 'http://localhost', host = 'localhost', forwarded = false } = {}) {
+    const chunks = rawBody === undefined
+        ? (body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')])
+        : [Buffer.from(rawBody)];
     const req = Readable.from(chunks);
     req.method = method;
     req.url = '/policy/command';
@@ -294,4 +303,40 @@ test('provider administrator can manage policy with session-bound proof', async 
     assert.equal(allowed.status, 200);
     const denied = await call({ cookie: 'provider-admin', proof: 'missing', body: { command: 'mcp.policy.set', agent: 'app', tool: 'demo', access: 'public' } });
     assert.equal(denied.status, 403);
+});
+
+test('policy publishes selected local and provider roles before administrator denial', async t => {
+    const decisions = [];
+    t.after(onAuthenticatedRequestDecision(decision => decisions.push(decision)));
+    for (const [cookie, expected] of [
+        ['cli-demoted', { authMode: 'local', userId: 'local:admin', roles: [], decidedAt: 3_000_000 }],
+        ['provider-user', { authMode: 'sso', userId: 'provider-member', roles: ['selfregistered'] }],
+    ]) {
+        decisions.length = 0;
+        const before = Date.now();
+        const result = await call({ cookie, body: { command: 'mcp.policy.list' } });
+        assert.equal(result.status, 403);
+        assert.equal(result.json.error.code, 'ADMIN_REQUIRED');
+        assert.equal(decisions.length, 1);
+        const actual = decisions[0];
+        assert.deepEqual(actual, { ...expected, decidedAt: expected.decidedAt ?? actual.decidedAt });
+        if (cookie === 'provider-user') assert.ok(actual.decidedAt >= before && actual.decidedAt <= Date.now());
+    }
+});
+
+test('malformed authenticated policy body publishes before the existing 400 response', async t => {
+    const decisions = [];
+    t.after(onAuthenticatedRequestDecision(decision => decisions.push(decision)));
+    const result = await call({ cookie: 'cli', rawBody: '{ invalid json', body: {} });
+    assert.equal(result.status, 400);
+    assert.equal(result.json.error.code, 'UNKNOWN_COMMAND');
+    assert.deepEqual(decisions, [{ authMode: 'local', userId: 'local:admin', roles: ['admin'], decidedAt: 2_000_000 }]);
+});
+
+test('policy absent authentication and incomplete signed local roles publish nothing', async t => {
+    const decisions = [];
+    t.after(onAuthenticatedRequestDecision(decision => decisions.push(decision)));
+    assert.equal((await call({ body: { command: 'mcp.policy.list' } })).status, 401);
+    assert.equal((await call({ cookie: 'cli-incomplete', body: { command: 'mcp.policy.list' } })).status, 403);
+    assert.deepEqual(decisions, []);
 });

@@ -40,6 +40,8 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
+import { hostStateFixtureMounts } from '../helpers/hostStateFixture.mjs';
 
 const DATA_FINGERPRINTS = Object.freeze({ dependencies: 'd'.repeat(64), images: 'f'.repeat(64) });
 const TMPFS_CREATE_ARGUMENT = `${BOX_TMPFS.destination}:${BOX_TMPFS.options.join(',')}`;
@@ -62,9 +64,12 @@ function wildcard(hostPort = 8083, hosts = LAN_HOSTS) {
 }
 
 function fixture(t) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-bind-'));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const workspace = path.join(root, 'workspace');
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-bind-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    // The checkout (`root`) is a sibling of the workspace (D6).
+    const root = path.join(base, 'checkout');
+    fs.mkdirSync(root);
+    const workspace = path.join(base, 'workspace');
     const lockPath = path.join(root, 'lock');
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
     fs.mkdirSync(lockPath);
@@ -162,6 +167,7 @@ function containerHandle(state, {
                 { type: 'bind', name: '', source: state.root, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: state.identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: state.identity.workspaceRoot, destination: state.identity.workspaceRoot, rw: true },
+                ...hostStateFixtureMounts(state.identity.workspaceRoot, state.root),
                 ...agentLibFixtureMounts(state.agentLib, state.identity.workspaceRoot),
             ],
         },
@@ -278,6 +284,7 @@ function harness(state, {
         retireStartLock() {},
         retireEdgePreparation() {},
         token: (kind) => (kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24)),
+        quiescence: () => [],
     };
     return { runner, seams, calls, current: () => current };
 }
@@ -680,6 +687,7 @@ function boxWorkspace(t, {
 
 function bindSupervisor(box, events, overrides = {}) {
     return createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         checkHostPrerequisites: () => {},
         env: {},
         platform: 'linux',
@@ -1385,16 +1393,28 @@ test('the public CLI dispatches bind and its dry run only to the host supervisor
     assert.match(help.value(), /plain HTTP/);
 });
 
-const GOLDEN_DEFAULT_ARGS = JSON.parse(fs.readFileSync(
+const GOLDEN_BASE_ARGS = JSON.parse(fs.readFileSync(
     new URL('../fixtures/box-create-args/default-7882-base-02efe682.json', import.meta.url),
     'utf8',
 ));
+// The one change since that baseline is the Box contract's read-only mask over
+// the host state directory, right after the workspace bind.
+const GOLDEN_DEFAULT_ARGS = (() => {
+    const bind = GOLDEN_BASE_ARGS.indexOf('<root>/workspace:<root>/workspace');
+    assert.equal(GOLDEN_BASE_ARGS[bind - 1], '--volume');
+    return [...GOLDEN_BASE_ARGS.slice(0, bind + 1),
+        '--volume', '<root>/workspace/.ploinky-box/empty:<root>/workspace/.ploinky-box:ro',
+        ...GOLDEN_BASE_ARGS.slice(bind + 1)];
+})();
 
 // The golden file was produced by the create arguments of origin/master
 // 02efe682 with this exact input. The workspace-specific values are replaced by
 // placeholders so the comparison holds in any temporary directory.
 function normalizedCreateArgs(state, args) {
+    // The checkout is a sibling of the workspace (D6), so the workspace is
+    // mapped to the golden's `<root>/workspace` before the checkout root.
     return args.map((value) => value
+        .split(state.identity.workspaceRoot).join('<root>/workspace')
         .split(state.root).join('<root>')
         .split(state.identity.instance).join('<instance>')
         .split(state.identity.pathHash).join('<pathHash>')

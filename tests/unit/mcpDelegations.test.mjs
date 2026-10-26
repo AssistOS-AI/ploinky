@@ -96,6 +96,8 @@ test('buildMcpDelegationsForUserCall mints verifiable grants for non-guest users
         expectedTool: 'dpu_secret_put',
     });
     assert.equal(verified.user.id, 'local:admin');
+    assert.equal(verified.user.displayName, 'admin');
+    assert.equal(verified.user.username, 'admin');
     assert.deepEqual(verified.delegation.scope, ['secret:write', 'secret:grant']);
 
     const guestReq = { user: { id: 'guest-1', username: 'guest', roles: ['guest'] } };

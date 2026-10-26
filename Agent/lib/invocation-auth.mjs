@@ -108,7 +108,9 @@ export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
       id: claimedIdentity?.id || String(userClaims.id || userClaims.sub || ''),
       username: String(userClaims.username || userClaims.preferred_username || claimedIdentity?.username || ''),
       email: String(userClaims.email || ''),
-      roles: normalizeRoles(userClaims.roles)
+      roles: normalizeRoles(userClaims.roles),
+      // Display-only; never an authorization input.
+      displayName: String(userClaims.displayName || '')
     };
     if (userClaims.principalId || claimedIdentity?.principalId) {
       out.principalId = String(userClaims.principalId || claimedIdentity.principalId);
@@ -121,7 +123,9 @@ export function authInfoFromInvocation(grant, { invocationToken = '' } = {}) {
         id: identity.id,
         username: identity.username,
         email: '',
-        roles: normalizeRoles(actor?.roles)
+        roles: normalizeRoles(actor?.roles),
+        // Display-only; never an authorization input.
+        displayName: String(actor?.displayName || '')
       };
     }
   }

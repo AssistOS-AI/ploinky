@@ -12,6 +12,7 @@ import { FIXTURE_REPOSITORY, fixtureContainerName, fixtureManifest, fixturePlan,
 import { C3_AGENTS, C3V_AGENTS, D4_REASON_CODE, ROUTER_CONTROLS_PORTS, STORED_OVERRIDE, UNENFORCEABLE_CODE, VARIANT_III_EVIDENCE, assertBlockedBy, assertControllersUnchanged, assertNestedStates,
     assertReady, assertRefused, assertRoutes, assertSetterRefused, assertStaticTerminal, d4Manifest, parseNestedStates, withEnable } from '../hardware-limits/liveAvailabilityCommands.mjs';
 import { createFakeAvailability } from '../hardware-limits/fakeLiveAvailability.mjs';
+import { assertAuthDisabledAnswer } from '../hardware-limits/liveCommon.mjs';
 import { BOX_IMAGE, exists, free, world } from '../hardware-limits/executorWorld.mjs';
 
 const C3 = 'apparatus-availability';
@@ -87,7 +88,9 @@ test('X4.c3-manifest-and-summary-name-the-spec-rows-the-edits-the-bounds-and-the
                 'builds no manifest-aware check in the setter route']) assert.ok(summary.includes(text), text);
             assert.ok(w.run.target.plan.live.some(entry => entry.id === 'C3-variant-iii' && entry.action.includes(VARIANT_III_EVIDENCE)));
         } else {
-            for (const text of ['C3V-http-static', 'C3V-http-login', 'C3V-limits-clear', 'distinct from 18080/17882', 'Whole restarts | 1', 'own Box, own workspace']) assert.ok(summary.includes(text), text);
+            for (const text of ['C3V-http-static', 'C3V-http-login', 'C3V-limits-clear', 'distinct from 18080/17882', 'Whole restarts | 1', 'own Box, own workspace',
+                '/auth/login: HTTP 404 JSON {ok:false,error:"auth_disabled"}', '/auth/login the auth-less fixture\'s HTTP 404 auth_disabled JSON; administrator API 200']) assert.ok(summary.includes(text), text);
+            for (const text of ['/auth/login 200', '/auth/login: HTTP 200', 'GET /auth/login answers 200']) assert.equal(summary.includes(text), false, text);
         }
         // Every candidate command passes the real outer parser, and a restart carries no port option.
         const operations = candidateOperationsOf(w.run);
@@ -266,7 +269,9 @@ test('X4.c3v-passes-in-a-dedicated-workspace-with-its-own-ports-and-the-box-is-d
     assert.equal(result.report.verdict, 'PASS'); assert.equal(result.report.cleanup.state, 'complete');
     const evidence = result.case.evidence;
     assert.deepEqual([evidence.ports, evidence['static-route'].status, evidence['static-route'].error, evidence['static-route'].code, evidence['auth-login'].status, evidence['admin-api'].status, evidence['admin-api'].availability],
-        [{ tcp: 18090, udp: 17892 }, 503, 'AGENT_HARDWARE_UNAVAILABLE', 'hardware_refused', 303, 200, 'refused']);
+        [{ tcp: 18090, udp: 17892 }, 503, 'AGENT_HARDWARE_UNAVAILABLE', 'hardware_refused', 404, 200, 'refused']);
+    // The auth-less fixture's Router answers /auth/login with its own refusal; the administrator API still answers 200.
+    assert.deepEqual(evidence['auth-login'], { status: 404, contentType: 'application/json', ok: false, error: 'auth_disabled' });
     assert.deepEqual([evidence['limits-status'], evidence['limits-clear']], [{ status: 0 }, { status: 0 }]);
     // The probes went to the dedicated pair, the host commands ran in the workspace with the exact argv, and the override is gone.
     assert.ok(fake.model.httpCalls.every(call => call.port === 18090));
@@ -283,7 +288,14 @@ test('X4.c3v-passes-in-a-dedicated-workspace-with-its-own-ports-and-the-box-is-d
 const c3vFailures = [
     ['the static route is a startup page', { staticAnswer: 'startup-page' }, /did not answer a terminal 503 JSON \(HTTP 200/],
     ['the static route does not answer', { staticAnswer: 'unreachable' }, /did not answer a terminal 503 JSON \(HTTP null/],
-    ['the login page does not answer 303', { loginStatus: 200 }, /\/auth\/login answered HTTP 200, not 303/],
+    // The fixture declares no authentication: only the Router's own 404 auth_disabled JSON passes.
+    ['the login page answers 200', { loginAnswer: { status: 200, contentType: 'text/html', body: '<html>login</html>', truncated: false } },
+        /^The dedicated Box's Router answered \/auth\/login with HTTP 200, not the auth-less fixture's HTTP 404 auth_disabled$/],
+    ['the login page answers another 404', { loginAnswer: { status: 404, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'not_found' }), truncated: false } },
+        /^The dedicated Box's \/auth\/login answer is not the Router's auth_disabled refusal \(ok false, error "not_found"\)$/],
+    ['the login page answer is not json', { loginAnswer: { status: 404, contentType: 'text/html', body: '<html>Not Found</html>', truncated: false } },
+        /^The dedicated Box's \/auth\/login answer is not JSON \(content type text\/html\)$/],
+    ['the login page does not answer', { loginAnswer: { status: null, error: 'ECONNREFUSED' } }, /^The dedicated Box's Router did not answer \/auth\/login \(ECONNREFUSED\)$/],
     ['the host limits status fails', { limitsStatusExit: 2 }, /`ploinky limits status` did not exit 0/],
     ['the host limits clear fails', { limitsClearExit: 1 }, /`ploinky limits clear --agent` did not exit 0/],
     ['the host clear leaves the override', { clearKeepsOverride: true }, /The host clear left the stored override/],
@@ -316,6 +328,11 @@ test('X4.c3v-the-router-answers-are-judged-by-their-own-evaluators', () => {
     const withBody = patch => ({ ...good, body: JSON.stringify({ ...JSON.parse(good.body), ...patch }) });
     for (const bad of [null, { ...good, status: 200 }, { ...good, status: 502 }, { ...good, contentType: 'text/html' }, { ...good, body: 'not json' }, withBody({ error: 'other' }), withBody({ code: 'startup' }), withBody({ reason: '' }), withBody({ fix: '' })]) assert.throws(() => assertStaticTerminal(bad));
     assert.doesNotThrow(() => assertStaticTerminal(withBody({ code: 'hardware_blocked' })));
+    // The /auth/login validator is LIVE-C5's: only the subject differs, and LIVE-C5 keeps its replacement-Box wording by default.
+    const authDisabled = { status: 404, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'auth_disabled' }), truncated: false };
+    assert.equal(assertAuthDisabledAnswer(authDisabled, 'The dedicated Box\'s'), null);
+    assert.equal(assertAuthDisabledAnswer({ ...authDisabled, status: 200 }, 'The dedicated Box\'s'), 'The dedicated Box\'s Router answered /auth/login with HTTP 200, not the auth-less fixture\'s HTTP 404 auth_disabled');
+    assert.equal(assertAuthDisabledAnswer({ ...authDisabled, truncated: true }), 'The replacement Box\'s /auth/login answer was truncated');
     assert.equal(C3V_AGENTS.join(), 's'); assert.equal(BOX_IMAGE.startsWith('docker.io/assistos/ploinky-box@sha256:'), true);
 });
 

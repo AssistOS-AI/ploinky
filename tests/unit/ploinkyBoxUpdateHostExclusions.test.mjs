@@ -19,6 +19,7 @@ import {
 import { createMemoryUpdateHostState, createUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore, verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
+import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 // Never read the global, system or XDG Git policy of the machine running this.
 const isolation = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-host-exclusions-env-')));
@@ -87,6 +88,68 @@ test('a deferred Git export folder becomes privately excluded on the host throug
         'exclusions only: no skill publication');
     const [again] = await refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
     assert.equal(again.outcome, 'unchanged');
+});
+
+// The Git configuration copy edited during a host refresh is workspace-derived
+// data: the host stages it in the masked `.ploinky-box/tmp/<rand>/` it was
+// given, and the default (in-Box and non-Box callers) stays os.tmpdir().
+function recordMkdtemp(t) {
+    const created = [];
+    const real = fs.mkdtempSync;
+    t.mock.method(fs, 'mkdtempSync', (prefix, ...rest) => {
+        const directory = real.call(fs, prefix, ...rest);
+        created.push({ prefix, directory });
+        return directory;
+    });
+    return created;
+}
+const configStaging = created => created.filter(entry => path.basename(entry.prefix).startsWith('skill-export-config-'));
+
+test('the host refresh stages its Git config copy under .ploinky-box/tmp, never in os.tmpdir()', async (t) => {
+    const w = workspace(t);
+    const created = recordMkdtemp(t);
+    const [record] = await refreshDeferredHostExclusions({ folders: [w.boxProject], identity: w.identity });
+    assert.equal(record.outcome, 'changed');
+    const staged = configStaging(created);
+    assert.ok(staged.length > 0, 'the refresh edited a staged Git config copy');
+    for (const entry of staged) {
+        const parent = path.dirname(entry.prefix);
+        assert.equal(path.dirname(parent), path.join(w.identity.hostStateRoot, 'tmp'), `${entry.prefix} is under the host staging directory`);
+        assert.notEqual(parent, os.tmpdir());
+    }
+    assert.deepEqual(fs.readdirSync(path.join(w.identity.hostStateRoot, 'tmp')), [], 'the host staging directory is gone');
+    assert.deepEqual(staged.filter(entry => fs.existsSync(entry.directory)), [], 'no staged copy is left');
+});
+
+test('an explicit stagingRoot reaches the Git config staging and the capability probe through the planner', t => {
+    const w = workspace(t);
+    const stagingRoot = path.join(w.root, 'explicit-staging');
+    fs.mkdirSync(stagingRoot, { mode: 0o700 });
+    const probes = [];
+    const planner = createSkillExclusionPlanner({
+        gitDirBoundary: w.identity.workspaceRoot, containerExecutor: false, stagingRoot,
+        capability: options => { probes.push(options.stagingRoot); return { supported: true }; },
+    });
+    const created = recordMkdtemp(t);
+    const refreshed = tx.refreshSkillExportExclusions(w.project, { exclusions: planner, stagingRoot });
+    assert.equal(refreshed.exclusions.status, 'published');
+    assert.ok(probes.length > 0, 'the capability was probed');
+    assert.deepEqual([...new Set(probes)], [stagingRoot], 'the capability probe is told where to stage its fixture');
+    const staged = configStaging(created);
+    assert.ok(staged.length > 0);
+    assert.deepEqual([...new Set(staged.map(entry => path.dirname(entry.prefix)))], [stagingRoot]);
+});
+
+test('without a stagingRoot the Git config staging stays in os.tmpdir() (control)', t => {
+    const w = workspace(t);
+    const created = recordMkdtemp(t);
+    const refreshed = tx.refreshSkillExportExclusions(w.project, {
+        exclusions: createSkillExclusionPlanner({ gitDirBoundary: w.identity.workspaceRoot, containerExecutor: false, capability: () => ({ supported: true }) }),
+    });
+    assert.equal(refreshed.exclusions.status, 'published');
+    const staged = configStaging(created);
+    assert.ok(staged.length > 0);
+    assert.deepEqual([...new Set(staged.map(entry => path.dirname(entry.prefix)))], [os.tmpdir()]);
 });
 
 test('a live external excludes policy stays deferred with its code', async (t) => {
@@ -162,6 +225,7 @@ function supervisorFor(t, w, { folders, refresh = undefined, store = createMemor
     });
     let lockHeld = false;
     const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         resolveIdentity: () => w.identity,
         launchCwd: w.identity.workspaceRoot,
         lockManager: {
@@ -668,8 +732,7 @@ test('recovery releases only the exact lock it observed, never one another write
 
 // A durable record whose file cannot be opened once (EMFILE), then can.
 function flakyStore(w) {
-    const stateRoot = path.join(w.root, 'host-state');
-    const record = path.join(stateRoot, HOST_EXCLUSIONS_INTENT_KIND, `${w.identity.instance}.json`);
+    const record = path.join(w.identity.hostStateRoot, HOST_EXCLUSIONS_INTENT_KIND, `${w.identity.instance}.json`);
     const control = { failures: 0 };
     const fsApi = { ...fs, constants: fs.constants, openSync(file, ...rest) {
         if (control.failures > 0 && file === record) {
@@ -678,7 +741,7 @@ function flakyStore(w) {
         }
         return fs.openSync(file, ...rest);
     } };
-    const store = createUpdateHostState({ stateRoot, fsApi });
+    const store = createUpdateHostState({ identity: w.identity, fsApi });
     const intent = {
         read: () => store.read(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance),
         write: value => store.write(HOST_EXCLUSIONS_INTENT_KIND, w.identity.instance, value),

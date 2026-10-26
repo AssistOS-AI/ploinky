@@ -1,8 +1,8 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
+import { HOST_STATE_DIRECTORY_NAME } from './constants.mjs';
 import { diagnoseWorkspace, formatDiagnosticCommand } from './diagnose.mjs';
 import { annotateRemediations, formatRemediationActions } from './diagnose/remediations.mjs';
 import { distributionFamily } from './hostPrerequisites.mjs';
@@ -21,11 +21,17 @@ const AUTOMATIC_REPAIRS = Object.freeze({
     'start-podman-machine': startSelectedMachine,
 });
 
-function assertSafeLockParents(homeDirectory, fsApi, uid) {
-    for (const directory of [path.resolve(homeDirectory), path.join(homeDirectory, '.ploinky-box'), path.join(homeDirectory, '.ploinky-box', 'locks')]) {
+// The workspace lock lives in `<workspace>/.ploinky-box/locks`. The lock
+// manager only validates existing skeleton directories, but a repair checks
+// them before taking the lock so that it never builds on untrusted state.
+function assertSafeLockParents(workspaceRoot, fsApi, uid) {
+    const root = fsApi.statSync(workspaceRoot);
+    if (!root.isDirectory()) throw new Error(`Repair workspace is not a directory: ${workspaceRoot}.`);
+    const hostState = path.join(workspaceRoot, HOST_STATE_DIRECTORY_NAME);
+    for (const directory of [hostState, path.join(hostState, 'locks')]) {
         let stat;
         try { stat = fsApi.lstatSync(directory); } catch (error) {
-            if (error.code === 'ENOENT' && directory !== path.resolve(homeDirectory)) return;
+            if (error.code === 'ENOENT') return;
             throw error;
         }
         if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o022) !== 0) {
@@ -92,10 +98,10 @@ export function formatRepairReport(report) {
 /** Apply only named, locally implemented user repairs; diagnostic prose is never executable. */
 export async function repairWorkspace({
     env = process.env, cwd = process.cwd(), repositoryRoot = path.resolve(import.meta.dirname, '..'),
-    platform = process.platform, uid = process.getuid?.(), homeDirectory = os.homedir(), fsApi = fs,
+    platform = process.platform, uid = process.getuid?.(), fsApi = fs,
     explicitPort, explicitMediaPort, dryRun = false, progress = () => {},
     runner = createProcessRunner({ env: buildEngineProcessEnvironment(env) }),
-    diagnose = diagnoseWorkspace, lockManager = createMutationLockManager({ homeDirectory, fsApi }),
+    diagnose = diagnoseWorkspace, lockManager = createMutationLockManager({ fsApi }),
     executors = AUTOMATIC_REPAIRS,
 } = {}) {
     const context = { packageFamily: platform === 'linux' ? distributionFamily(fsApi) : '' };
@@ -107,7 +113,7 @@ export async function repairWorkspace({
         ], commands: [] }, { context });
         return resultReport({ before: report, outcomes: [], dryRun });
     }
-    const options = { env, cwd, repositoryRoot, platform, uid, homeDirectory, fsApi,
+    const options = { env, cwd, repositoryRoot, platform, uid, fsApi,
         explicitPort, explicitMediaPort, runner, progress };
     progress('Inspecting user-repair preconditions');
     const before = annotateRemediations(await diagnose({ ...options, inspectionOnly: true }), { context });
@@ -123,11 +129,10 @@ export async function repairWorkspace({
         try {
             const resolveIdentity = () => resolveWorkspaceIdentity({ env, cwd: () => typeof cwd === 'function' ? cwd() : cwd });
             const identity = resolveIdentity();
-            assertRouterBindingStateConfined(identity, { homeDirectory, fsApi });
-            // The normal lock manager tightens existing directory modes. A
-            // repair must not hide previously untrusted state as a side effect.
-            assertSafeLockParents(homeDirectory, fsApi, uid);
-            lock = await lockManager.acquire(identity.instance);
+            assertRouterBindingStateConfined(identity, { fsApi });
+            // A repair must not build on previously untrusted lock state.
+            assertSafeLockParents(identity.workspaceRoot, fsApi, uid);
+            lock = await lockManager.acquire(identity.instance, { workspaceRoot: identity.workspaceRoot });
             for (const action of candidates) {
                 progress(`Repairing: ${action.title}`);
                 try {

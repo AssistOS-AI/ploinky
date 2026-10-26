@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
 
 import { ANY_GUEST_SET_COOKIE } from '../helpers/guestCookies.mjs';
 
@@ -69,6 +70,7 @@ const { createBrowserSessionLease } = await import('../../cli/server/webtty/auth
 const { handleUserAdminRoutes } = await import('../../cli/server/authHandlers/userAdminRoutes.js');
 const { handleMarketplaceRoutes } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
 const { policy } = await import('../../cli/server/policy/index.js');
+const { registerAuthenticatedRequestMatrix } = await import('../helpers/authenticatedRequestMatrix.mjs');
 
 test.after(() => {
     process.chdir(previous.cwd);
@@ -106,8 +108,10 @@ class MockResponse {
     }
 }
 
-function request({ method = 'GET', url, cookie, host = 'localhost', body, headers = {} }) {
-    const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
+function request({ method = 'GET', url, cookie, host = 'localhost', body, rawBody, headers = {} }) {
+    const req = Readable.from(rawBody === undefined
+        ? (body === undefined ? [] : [Buffer.from(JSON.stringify(body))])
+        : [Buffer.from(rawBody)]);
     req.method = method;
     req.url = url;
     req.headers = {
@@ -288,6 +292,15 @@ function registerTerminal(manager, req, routePlan) {
         closing: false,
         routerEpoch: manager.routerEpoch,
         lease: createBrowserSessionLease(req),
+        owner: {
+            principal: createHash('sha256').update(`${req.authMode}\0${req.user.id}`).digest('hex'),
+            userId: req.user.id, label: req.user.username,
+            adminAdmittedAt: req.session.createdAt || Date.now(),
+        },
+        viewers: new Map(),
+        routePlan,
+        replay: [], replayBytes: 0, lastSequence: 0,
+        validationEpoch: 0,
         binding: Object.freeze({
             host: routePlan.host,
             hostRouteKey: routePlan.hostSelection.record.routeKey,
@@ -300,6 +313,7 @@ function registerTerminal(manager, req, routePlan) {
         lastActivityAt: Date.now(),
     };
     manager.sessions.set(id, session);
+    manager.ownerIndex.set(session.owner.principal, new Set([id]));
     return session;
 }
 
@@ -342,8 +356,9 @@ test('a WebTTY request does not reuse an admission after logout and keeps fresh 
     assert.equal(admitted.ok, true);
     await authService.logout(sessionId, {});
     const before = providerCalls;
-    assert.equal(await manager.validateOwnership(req, routePlan, terminal.id), null);
-    assert.deepEqual(closed, ['auth_missing_or_expired']);
+    await assert.rejects(manager.validateOwnership(req, routePlan, terminal.id), { code: 'WEBTTY_AUTH_INVALID' });
+    assert.deepEqual(closed, [], 'logout invalidates request authority without terminating the owned shell');
+    assert.equal(manager.sessions.get(terminal.id), terminal);
     assert.equal(providerCalls - before, 0, 'a logged-out session needs no provider call to be refused');
     // Periodic checks never reuse a request admission.
     const live = await login();
@@ -413,9 +428,14 @@ async function clockedTerminal(sessionId, clock) {
     const terminal = registerTerminal(manager, owner.req, routePlan);
     terminal.createdAt = clock.now;
     terminal.lastActivityAt = clock.now;
+    const viewerRes = new MockResponse();
+    // Every stream binds to a server-issued view of its own principal.
+    const view = manager.createView(terminal, terminal.owner.principal);
+    assert.equal(manager.attachStream(terminal, owner.req, viewerRes, '', routePlan, view.id), true);
+    terminal.lastActivityAt = clock.now;
     const closed = [];
     manager.closeSession = async (session, reason) => { closed.push(reason); session.closed = true; manager.sessions.delete(session.id); return true; };
-    return { manager, closed };
+    return { manager, closed, terminal, viewerRes };
 }
 
 async function periodicChecksUntil(manager, clock, untilMs, stepMs = WEBTTY_SESSION_LIMITS.authenticationIntervalMs) {
@@ -430,42 +450,52 @@ test('the WebTTY outage bound is a named 60 s limit above the restart window', (
     assert.ok(WEBTTY_SESSION_LIMITS.authenticationOutageLimitMs < WEBTTY_SESSION_LIMITS.idleLifetimeMs);
 });
 
-test('a provider outage shorter than the bound keeps the terminal, and a decided check restarts the bound', async () => {
+test('a provider outage shorter than the bound keeps the viewer, and a decided check restarts the bound', async () => {
     const clock = { now: 1_000_000 };
     const sessionId = await login();
-    const { manager, closed } = await clockedTerminal(sessionId, clock);
+    const { manager, closed, terminal, viewerRes } = await clockedTerminal(sessionId, clock);
     const start = clock.now;
     provider(() => { throw unavailable(); });
-    // Undecided checks from start + 5 s through start + 60 s: 55 s of outage.
-    await periodicChecksUntil(manager, clock, start + 60_000);
+    // Recover before the existing outage deadline, which is checked before admission.
+    await periodicChecksUntil(manager, clock, start + 55_000);
     assert.deepEqual(closed, [], 'an outage shorter than the bound keeps the terminal');
+    assert.equal(terminal.viewers.size, 1, viewerRes.body);
     provider((providerSession) => described(providerSession));
-    await periodicChecksUntil(manager, clock, start + 65_000);
+    await periodicChecksUntil(manager, clock, start + 60_000);
     provider(() => { throw unavailable(); });
-    // A new outage is measured from its own first undecided check (start + 70 s).
-    await periodicChecksUntil(manager, clock, start + 125_000);
+    // A new outage is measured from its own first undecided check (start + 65 s).
+    await periodicChecksUntil(manager, clock, start + 120_000);
     assert.deepEqual(closed, [], 'the bound restarted at the decided check');
-    await periodicChecksUntil(manager, clock, start + 130_000);
-    assert.deepEqual(closed, ['auth_provider_unavailable']);
-    assert.ok(authService.getSession(sessionId), 'closing the terminal does not end the login');
+    assert.equal(terminal.viewers.size, 1, viewerRes.body);
+    await periodicChecksUntil(manager, clock, start + 125_000);
+    assert.deepEqual(closed, [], 'an authentication outage never closes the owned shell');
+    assert.equal(terminal.viewers.size, 0);
+    assert.match(viewerRes.body, /auth_provider_unavailable/);
+    assert.equal(viewerRes.writableEnded, true);
+    assert.equal(manager.sessions.get(terminal.id), terminal);
+    assert.ok(authService.getSession(sessionId), 'detaching the viewer does not end the login');
 });
 
-test('a provider outage longer than the bound closes the terminal; a refusal still closes at once', async () => {
+test('a provider outage detaches the viewer at the bound; refusal and logout detach at once', async () => {
     const clock = { now: 2_000_000 };
     const sessionId = await login();
-    const { manager, closed } = await clockedTerminal(sessionId, clock);
+    const { manager, closed, terminal, viewerRes } = await clockedTerminal(sessionId, clock);
     const start = clock.now;
     provider(() => { throw unavailable(); });
     await periodicChecksUntil(manager, clock, start + 60_000);
     assert.deepEqual(closed, [], 'first undecided check at +5 s; +60 s is 55 s of outage');
     await periodicChecksUntil(manager, clock, start + 65_000);
-    assert.deepEqual(closed, ['auth_provider_unavailable'], '60 s of continuous outage closes the terminal');
+    assert.deepEqual(closed, [], '60 s of continuous outage preserves the shell');
+    assert.equal(terminal.viewers.size, 0);
+    assert.match(viewerRes.body, /auth_provider_unavailable/);
 
     const refused = await login();
     const second = await clockedTerminal(refused, clock);
     provider(() => { throw Object.assign(new Error('session_revoked'), { code: 'session_revoked', statusCode: 401 }); });
     await periodicChecksUntil(second.manager, clock, clock.now + 5_000);
-    assert.deepEqual(second.closed, ['auth_missing_or_expired'], 'a refusal closes on the first check');
+    assert.deepEqual(second.closed, [], 'a refusal preserves the shell');
+    assert.equal(second.terminal.viewers.size, 0, 'a refusal detaches on the first check');
+    assert.match(second.viewerRes.body, /auth_validation_failed/);
 
     const loggedOut = await login();
     const third = await clockedTerminal(loggedOut, clock);
@@ -473,7 +503,9 @@ test('a provider outage longer than the bound closes the terminal; a refusal sti
     await periodicChecksUntil(third.manager, clock, clock.now + 5_000);
     await authService.logout(loggedOut, {});
     await periodicChecksUntil(third.manager, clock, clock.now + 5_000);
-    assert.deepEqual(third.closed, ['auth_missing_or_expired'], 'logout closes during an outage without waiting for the bound');
+    assert.deepEqual(third.closed, [], 'logout preserves the shell');
+    assert.equal(third.terminal.viewers.size, 0, 'logout detaches during an outage without waiting for the bound');
+    assert.equal(third.viewerRes.writableEnded, true);
 });
 
 test('WebTTY target discovery reuses its admission and revalidates once after discovery', async () => {
@@ -570,3 +602,10 @@ for (const [surface, refusalStatus, call] of adminSurfaces) {
         assert.equal(authService.getSession(sessionId), null);
     });
 }
+
+registerAuthenticatedRequestMatrix({
+    authHandlers, handleMarketplaceRoutes, authService, policy, provider, described, unavailable,
+    login, request, MockResponse, controlPlan, webttyPlan, adminSurfaces,
+    protectedRoute, admitWebtty, webttyManager, registerTerminal,
+    getProviderCalls: () => providerCalls,
+});

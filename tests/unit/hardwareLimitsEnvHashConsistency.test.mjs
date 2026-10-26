@@ -38,10 +38,8 @@ const originalEnv = Object.fromEntries(['PLOINKY_WORKSPACE_ROOT', 'PLOINKY_ROUTE
     .map((key) => [key, process.env[key]]));
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-envhash-')));
 const workspace = path.join(root, 'workspace');
-const home = path.join(root, 'home');
 const fakeBin = path.join(root, 'fakebin');
 fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
-fs.mkdirSync(home);
 fs.mkdirSync(fakeBin);
 process.chdir(workspace);
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
@@ -305,7 +303,7 @@ function compositeFs(fake) {
 }
 // The wiring of the gate one start selected (the default is an on gate).
 function boxContext({ enabled = true } = {}) {
-    const wiring = resolveDesiredHardwareWiring({ identity, enabled, hostKind: 'podman-machine', homeDirectory: home, initializeStore });
+    const wiring = resolveDesiredHardwareWiring({ identity, enabled, hostKind: 'podman-machine', initializeStore });
     resetHardwareContextCacheForTests();
     const fake = preparedCgroupFs({ controllers: ['cpu', 'memory', 'pids'] });
     return readBoxHardwareContext({
@@ -391,7 +389,7 @@ async function runningLabels({ network = 'managed', limits = true }) {
 // The saved-gate store of the workspace: the first start saved its gate, so a
 // later start with no environment value selects the saved one (selectHardwareGate,
 // the repository's own selection). The gate-off world (limits false) has no gate.
-const gateStore = createHardwareGateStore({ homeDirectory: home });
+const gateStore = createHardwareGateStore();
 const gateLock = { assertHeld() {} };
 
 test('EH.managed-repeat-start-reuses-every-unchanged-agent-on-the-environment-gate-and-the-saved-gate', async () => {
