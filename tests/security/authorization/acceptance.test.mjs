@@ -95,7 +95,7 @@ function acceptedRun() {
         const commit = entry.repo === 'ploinky' ? pins.ploinky.commit : pins.repositories.find(r => r.name === entry.repo).commit;
         return { sidecar: { repo: entry.repo, file: entry.file, commit, clean: true, exitCode: 0, tapSha256: sha(tap) }, tap };
     });
-    return { report, exitCode: 2, offline, pins, pinsSha256: 'f'.repeat(64), derivedRuntimes: clone(expectedRuntimes), ...inputs };
+    return { report, exitCode: 2, offline, pins, pinsSha256: 'f'.repeat(64), derivedRuntimes: clone(expectedRuntimes), routerSourceDrift: [], ...inputs };
 }
 
 const evaluate = run => evaluateScopedAcceptance(run);
@@ -352,6 +352,46 @@ test('REJECT: run health, pins binding, principals and offline evidence', () => 
     webchat.sidecar.tapSha256 = sha(webchat.tap);
     expectReject(missingName, 'OFFLINE_TEST_MISSING', 'named regression missing');
     assert.deepEqual(parseTap('ok 1 - a # SKIP x\n# skipped 1\n').results[0].directive, 'SKIP');
+});
+
+test("REJECT: Router source drift rejects through the mandatory offline drift TAP and the comparator's own recomputation", () => {
+    const file = 'tests/security/authorization/router-source-drift.test.mjs';
+    const titles = [
+        'router source drift: every Router inventory row matches the reviewed registry at the checkout bytes, with all mismatches reported together',
+        'router source drift: the resolved Router inventory retains every prior obligation',
+        'router source drift: mutated checkout bytes in several files are all reported in one list',
+    ];
+    const entry = mandatory.checks.find(c => c.kind === 'offline' && c.file === file);
+    assert.ok(entry, 'the drift file is a mandatory offline check');
+    assert.deepEqual(entry.tests, titles);
+    // A failing drift TAP: not ok, a failed summary and a non-zero exit, with the hash recomputed.
+    const failing = acceptedRun();
+    const evidence = failing.offline.find(o => o.sidecar.file === file);
+    evidence.tap = tapFor(entry).replace('ok 1 - ', 'not ok 1 - ').replace('# pass 3', '# pass 2').replace('# fail 0', '# fail 1');
+    evidence.sidecar.tapSha256 = sha(evidence.tap);
+    evidence.sidecar.exitCode = 1;
+    const failed = evaluate(failing);
+    assert.equal(failed.decision, 'REJECT');
+    for (const code of ['OFFLINE_EXIT', 'OFFLINE_NOT_OK', 'OFFLINE_SUMMARY', 'OFFLINE_TEST_MISSING']) assert.ok(failed.reasons.some(r => r.startsWith(`${code}: ${entry.id}`)), `${code}: ${failed.reasons.slice(0, 6).join(' | ')}`);
+    // No drift TAP at all.
+    const missing = acceptedRun();
+    missing.offline = missing.offline.filter(o => o.sidecar.file !== file);
+    assert.ok(evaluate(missing).reasons.includes(`OFFLINE_MISSING: ${entry.id}`));
+    // The comparator's own recomputation: a drift list rejects each entry, and a missing value rejects too.
+    // The two codes share a prefix, so each case checks the exact reason and the absence of the other.
+    const drifted = acceptedRun();
+    drifted.routerSourceDrift = ['UNREVIEWED_ROUTER_SOURCE: x'];
+    const driftResult = evaluate(drifted);
+    assert.equal(driftResult.decision, 'REJECT');
+    assert.ok(driftResult.reasons.includes('ROUTER_SOURCE_DRIFT: UNREVIEWED_ROUTER_SOURCE: x'), driftResult.reasons.join(' | '));
+    assert.ok(!driftResult.reasons.some(r => r.startsWith('ROUTER_SOURCE_DRIFT_NOT_EVALUATED')));
+    const unevaluated = acceptedRun();
+    unevaluated.routerSourceDrift = undefined;
+    const unevaluatedResult = evaluate(unevaluated);
+    assert.equal(unevaluatedResult.decision, 'REJECT');
+    assert.ok(unevaluatedResult.reasons.some(r => r.startsWith('ROUTER_SOURCE_DRIFT_NOT_EVALUATED')), unevaluatedResult.reasons.join(' | '));
+    assert.ok(!unevaluatedResult.reasons.some(r => r.startsWith('ROUTER_SOURCE_DRIFT: ')));
+    assert.deepEqual(evaluate(acceptedRun()).reasons, [], 'an empty drift list rejects nothing');
 });
 
 test('REJECT: runtime set empty, duplicated, extra, missing or not running', () => {
@@ -1099,7 +1139,7 @@ test('Router workspace-write matrix: all 68 checks are mandatory, counted once a
         assert.ok(['admin', 'userA'].includes(positive.actor), 'the positive is an entitled actor');
     }
     assert.equal(denials.filter(r => r.operation === 'sink-upload').every(r => r.positiveControl === 'router:workspace-upload-owner-positive:admin'), true);
-    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 806, offline: 10 });
+    assert.deepEqual({ live: mandatory.counts.live, offline: mandatory.counts.offline }, { live: 806, offline: 11 });
 });
 
 test('Router workspace-write matrix: no row can be satisfied as an expected gap, and an unavailable denial rejects twice', () => {

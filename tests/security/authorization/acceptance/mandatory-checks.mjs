@@ -127,6 +127,11 @@ export const OFFLINE = Object.freeze([
     { repo: 'ploinky', file: 'tests/security/authorization/lease-readonly.test.mjs', boundary: 'U7', tests: [
         'request-path lease commit() writes nothing to the workspace',
     ] },
+    { repo: 'ploinky', file: 'tests/security/authorization/router-source-drift.test.mjs', boundary: 'router', source: 'Router source drift gate (2026-10-26)', tests: [
+        'router source drift: every Router inventory row matches the reviewed registry at the checkout bytes, with all mismatches reported together',
+        'router source drift: the resolved Router inventory retains every prior obligation',
+        'router source drift: mutated checkout bytes in several files are all reported in one list',
+    ] },
 ]);
 
 export function expandTemplate(template, values) {
@@ -201,7 +206,7 @@ export function enumerateMandatoryChecks({ expectedRuntimes, expectedGaps }) {
         for (const values of expansions) add(expandTemplate(template, values), { boundary: module.replace('-probes.mjs', ''), source: `tests/security/authorization/${module}`, positiveControlAnyOf: positives });
     }
     for (const definition of [...templateCheckDefinitions(), ...marketplaceCheckDefinitions(), ...webchatCheckDefinitions(), ...capabilityCheckDefinitions(capabilities), ...workspaceWriteCheckDefinitions(), ...webmeetAdminToolCheckDefinitions(), ...webAssistGuestCheckDefinitions(), ...roboflowCheckDefinitions(), ...roboteamCheckDefinitions()]) add(definition.id, definition);
-    for (const offline of OFFLINE) add(`offline:${offline.repo}:${offline.file}`, { kind: 'offline', boundary: offline.boundary, repo: offline.repo, file: offline.file, tests: offline.tests, source: 'plan rev3 mandatory-check table (unchanged in rev4)' });
+    for (const offline of OFFLINE) add(`offline:${offline.repo}:${offline.file}`, { kind: 'offline', boundary: offline.boundary, repo: offline.repo, file: offline.file, tests: offline.tests, source: offline.source ?? 'plan rev3 mandatory-check table (unchanged in rev4)' });
 
     const list = [...checks.values()].sort((a, b) => a.id.localeCompare(b.id));
     for (const entry of list) {

@@ -6,13 +6,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { routerInventory, routerInventoryBaseline } from './router-inventory.mjs';
-import { resolveRouterSourceReference, assertRouterInventoryObligations, assertRouterReferenceMaps } from './router-source-references.mjs';
+import { hasRouterSourceReference, resolveRouterSourceReference, assertRouterInventoryObligations, assertRouterReferenceMaps } from './router-source-references.mjs';
 import { inspectMarketplaceAuthorization, routerProbes, runRouterProbes, validateRouterAllowedResponse, validateRouterPrincipal } from './router-probes.mjs';
 import { assertNoWorkspaceDisclosure, markerCommand, runWebchatUploadDenialProof, runWorkspaceWriteMatrix, terminalFixtureNames, workspaceWriteCheckDefinitions, workspaceWriteMatrix, workspaceWriteRequest } from './stream-probes.mjs';
 
 test('Router inventory identities are unique and every source reference is a real executable line', () => {
   assert.equal(new Set(routerInventory.map(row => row.id)).size, routerInventory.length);
   for (const row of routerInventory) {
+    // A row of a registered family that could not be resolved is the unchanged
+    // baseline row; it must not pass for a reviewed source reference.
+    if (hasRouterSourceReference(row)) assert.ok(row.sourceBlobSha256, `UNRESOLVED_ROUTER_SOURCE: ${row.id}`);
     const [file, line] = row.source.split(':');
     const source = fs.readFileSync(fileURLToPath(new URL(`../../../${file}`, import.meta.url)), 'utf8');
     assert.ok(/^\d+$/.test(String(line)) && Number(line) > 0 && Number(line) <= source.split('\n').length, row.source);

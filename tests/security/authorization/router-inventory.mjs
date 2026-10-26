@@ -4,7 +4,7 @@
  * A row is an inventory obligation, not a claim that a live test passed.
  */
 import fs from 'node:fs';
-import { hasRouterSourceReference, normalizeRouterInventory, resolveRouterSourceReference, assertRouterInventoryObligations } from './router-source-references.mjs';
+import { collectRouterSourceDrift, hasRouterSourceReference, normalizeRouterInventory, resolveRouterSourceReference } from './router-source-references.mjs';
 
 const access = {
   public: { anonymous: 'allow', selfRegistered: 'allow', user: 'allow', admin: 'allow' },
@@ -133,14 +133,32 @@ add('unix-authority-create', 'POST', '/authority-attestations', 'cli/server/rout
 add('unix-authority-read', 'GET', '/authority-attestations/:nonce', 'cli/server/routerAuthorityAttestationRegistry.js:317', 'private', 'Detailed-health Unix listener only; fetch live authority observation for registered nonce. No public route.', { transport: 'private-unix', gap: 'Not exercised on deployed private Unix surface.' });
 
 export const routerInventoryBaseline = Object.freeze(normalizeRouterInventory(rows).map(row => Object.freeze(row)));
+const readRouterSource = file => fs.readFileSync(new URL(`../../../${file}`, import.meta.url));
 const sourceFiles = new Map();
+// Module load never throws for source or registry drift, so the tests that do
+// not need a resolved reference still run. A row that cannot be resolved stays
+// the unchanged frozen baseline row, without `sourceBlobSha256`; the failure is
+// reported by routerSourceDrift() and by the tests that need the reference.
 export const routerInventory = Object.freeze(routerInventoryBaseline.map(row => {
   if (!hasRouterSourceReference(row)) return row;
-  const [file] = row.source.split(':');
-  if (!sourceFiles.has(file)) sourceFiles.set(file, fs.readFileSync(new URL(`../../../${file}`, import.meta.url)));
-  return Object.freeze(resolveRouterSourceReference(row, sourceFiles.get(file)));
+  try {
+    const [file] = row.source.split(':');
+    if (!sourceFiles.has(file)) sourceFiles.set(file, readRouterSource(file));
+    return Object.freeze(resolveRouterSourceReference(row, sourceFiles.get(file)));
+  } catch {
+    return row;
+  }
 }));
-assertRouterInventoryObligations(routerInventory);
+
+/**
+ * Every mismatch between the reviewed registry and the checkout's real source
+ * bytes, sorted and unique (see collectRouterSourceDrift). Computed from the
+ * files on each call, so the result is never stale. An empty array means the
+ * checkout matches the reviewed registry.
+ */
+export function routerSourceDrift() {
+  return collectRouterSourceDrift({ rows: routerInventoryBaseline, readSource: readRouterSource });
+}
 
 export const routerAuthorizationOrder = Object.freeze([
   'Exact Host + origin-form request target; select public/managed interface and immutable edge snapshot.',

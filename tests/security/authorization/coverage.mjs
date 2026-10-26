@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { agentCatalog, agentInventory, inventoryBaseline } from './agent-inventory.mjs';
-import { routerInventory } from './router-inventory.mjs';
+import { routerInventory, routerSourceDrift } from './router-inventory.mjs';
 import { artifactDestination } from './core.mjs';
 
 export const inventoryRows = [...routerInventory.map(row => ({ repo: 'ploinky', ...row })), ...agentInventory];
@@ -61,5 +61,9 @@ export async function writeCoverage(outputRoot, report = { requests: [], checks:
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
     assert.equal(process.argv[2], '--out', 'Usage: node coverage.mjs --out /absolute/evidence-directory');
     assert.ok(path.isAbsolute(process.argv[3] || ''));
+    // The export lists Router rows with their reviewed source references; refuse it while the checkout drifted.
+    // writeCoverage itself stays unguarded because run.mjs and the tests call it directly.
+    const drift = routerSourceDrift();
+    assert.deepEqual(drift, [], `ROUTER_SOURCE_DRIFT: ${drift.length} mismatches\n${drift.join('\n')}`);
     console.log(JSON.stringify(await writeCoverage(process.argv[3])));
 }
