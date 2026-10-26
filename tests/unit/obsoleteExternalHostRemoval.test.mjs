@@ -33,9 +33,11 @@ const REMOVED_FILES = [
 
 const SEARCH_ROOTS = ['cli', 'ploinky-box', 'tests/unit', 'README.md'];
 
-// sha256 of these files at 7ff252cb, the base the external-host work started from.
+// sha256 at 7ff252cb, except the reviewed authentication event wiring below.
 const BASE_FILES = {
-    'cli/server/authHandlers/authContext.js': 'ab9aa91e3cf533d803bec329667c3841433f1d0a2b7c997b2c821c2ab38e2147',
+    // 8c0eec56 adds only the authenticated-request event import and publication;
+    // the removed admission logic has not returned. Keep the exact-file guard.
+    'cli/server/authHandlers/authContext.js': '3304ae9c746b1cec40c3525e9c69b877db4b62fef262496f6182406241877850',
     'ploinky-box/cloudflared/runtime.mjs': 'bb50780910dfe09c237f1930eb034947752adc1bb701d6fd5126a5945f886a2a',
     'ploinky-box/cloudflared/status.mjs': '34e5055dddf9073890e5643ada17176295014225b5a9d183439f4cb94636b2a0',
     'ploinky-box/cloudflared/journal.mjs': '4969c853c230668265cc05f7276d95e3ee677ae2e77de969881295de7622799a',
@@ -80,7 +82,7 @@ test('no source, test or README reference to the external-host admission remains
     assert.deepEqual(hits, []);
 });
 
-test('files the admission had changed are byte-identical to their base', () => {
+test('files the admission had changed match their reviewed fingerprints', () => {
     for (const [file, digest] of Object.entries(BASE_FILES)) {
         const actual = crypto.createHash('sha256').update(fs.readFileSync(path.join(REPO_ROOT, file))).digest('hex');
         assert.equal(actual, digest, file);

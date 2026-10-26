@@ -15,6 +15,7 @@ const manager = await import('../../cli/sandbox/docker/agentServiceManager.js');
 const { removeExactRegisteredContainer } = await import('../../cli/sandbox/docker/containerFleet.js');
 const { loadAgentsMap } = await import('../../cli/sandbox/docker/common.js');
 const { readRuntimeCandidate, retireRuntimeCandidate } = await import('../../cli/sandbox/runtimeCandidateStore.js');
+const { readRuntimePredecessor, writeRuntimePredecessor, retireRuntimePredecessor } = await import('../../cli/sandbox/runtimePredecessorStore.js');
 const { NETWORK_LABELS, workspaceNetworkIdentity } = await import('../../cli/sandbox/networkIdentity.js');
 const { NETWORK_SCHEMA_VERSION } = await import('../../cli/sandbox/networkContract.js');
 
@@ -33,11 +34,17 @@ assert.ok(removalStart >= 0 && removalEnd > removalStart);
 // removal real. Replace only the engine calls along the removal path. The
 // subsequent installer/readiness boundaries record whether recovery unblocked
 // the retry without launching containers or a real server.
-function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = false, absent = false } = {}) {
+function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = false, absent = false, rotatedPredecessor = false } = {}) {
     const record = { type: 'agent', agentName: 'failed', repoName: 'Example', runtime: 'podman',
         instanceId: 'old-instance', enableGeneration: 'old-generation', alias: 'chosen-name',
         config: { binds: [] } };
-    fs.writeFileSync(path.join(workspace, '.ploinky/agents.json'), JSON.stringify({ [NAME]: record }));
+    const registeredRecord = rotatedPredecessor
+        ? { ...record, instanceId: 'rotated-instance', enableGeneration: 'rotated-generation' }
+        : record;
+    const predecessorReceipt = rotatedPredecessor
+        ? writeRuntimePredecessor({ containerName: NAME, successor: registeredRecord, predecessor: record })
+        : null;
+    fs.writeFileSync(path.join(workspace, '.ploinky/agents.json'), JSON.stringify({ [NAME]: registeredRecord }));
     const calls = [];
     const errors = [];
     let mutationHeld = false;
@@ -66,6 +73,7 @@ function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = f
     };
     const removalContext = {
         loadAgentsMap, readRuntimeCandidate, retireRuntimeCandidate,
+        readRuntimePredecessor, retireRuntimePredecessor, structuredClone,
         getRuntime: () => 'podman',
         clearLivenessState: (name) => calls.push(['clear-liveness', name]),
         removeExactRegisteredContainer(name, input, options) {
@@ -138,6 +146,8 @@ function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = f
             removeAgentContainerForRecreate,
             async ensureAgentService(name, manifest, agentPath, options) {
                 assert.equal(current, null, 'failed container must be gone before retrying installation');
+                assert.equal(readRuntimePredecessor(NAME, registeredRecord), null,
+                    'spent predecessor proof must be retired before retrying installation');
                 assert.equal(name, 'failed');
                 assert.equal(options.containerName, NAME);
                 assert.equal(options.forceRecreate, true);
@@ -176,7 +186,8 @@ function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = f
             calls.push(['collect', options.reason]);
         },
     };
-    return { run: vm.runInNewContext(`(${reinstallAgent.toString()})`, context), calls, errors,
+    return { run: vm.runInNewContext(`(${reinstallAgent.toString()})`, context), calls, errors, predecessorReceipt,
+        get predecessor() { return readRuntimePredecessor(NAME, registeredRecord); },
         get current() { return current; } };
 }
 
@@ -218,3 +229,32 @@ test('reinstall can retry an already-absent failed runtime without attempting a 
     assert.equal(state.calls.some(([step]) => step === 'remove-exact'), false);
     assert.equal(state.calls.some(([step]) => step === 'activate'), true);
 });
+
+for (const absent of [false, true]) {
+    test(`reinstall recovers a rotated predecessor tuple and retires its proof when ${absent ? 'absent' : 'removed'}`, async (t) => {
+        const state = fixture({ rotatedPredecessor: true, absent });
+        t.after(() => retireRuntimePredecessor(state.predecessorReceipt));
+        assert.deepEqual(state.predecessor, state.predecessorReceipt);
+        await state.run('chosen-name');
+        assert.equal(state.calls.some(([step]) => step === 'remove-exact'), !absent);
+        assert.equal(state.calls.some(([step]) => step === 'activate'), true);
+        assert.equal(state.current.Id, NEW_ID);
+        assert.equal(state.predecessor, null);
+        assert.deepEqual(state.errors, []);
+    });
+}
+
+for (const [option, refusal] of [
+    ['foreign', /inactiveManifestReplacement.*exact managed ownership labels/],
+    ['removeFails', /inactiveManifestReplacement.*exact container removal/],
+]) {
+    test(`reinstall preserves the rotated predecessor proof after ${option}`, async (t) => {
+        const state = fixture({ rotatedPredecessor: true, [option]: true });
+        t.after(() => retireRuntimePredecessor(state.predecessorReceipt));
+        await assert.rejects(state.run('chosen-name'), refusal);
+        assert.equal(state.current.Id, ID);
+        assert.deepEqual(state.predecessor, state.predecessorReceipt);
+        assert.equal(state.calls.some(([step]) => step === 'remove-exact'), option === 'removeFails');
+        assert.equal(state.calls.some(([step]) => step === 'retry-install' || step === 'activate'), false);
+    });
+}

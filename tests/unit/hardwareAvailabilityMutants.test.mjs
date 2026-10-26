@@ -318,7 +318,7 @@ export const AVAILABILITY_MUTANTS = Object.freeze({
     'ms35a-the-latcher-stop-is-removed-from-the-router': latcherMutant('ms35a-the-latcher-stop-is-removed-from-the-router', [
         { from: '            hardwareAvailabilityLatcher.stop();\n', to: '' }], { file: ROUTER, leaf: 'NW1\\.S-the-latcher-is-wired' }),
     'ms35b-the-latcher-stop-is-not-the-first-statement-of-before-close': latcherMutant('ms35b-the-latcher-stop-is-not-the-first-statement-of-before-close', [
-        { from: '            hardwareAvailabilityLatcher.stop();\n            await webttySessionManager.closeAll();\n', to: '            await webttySessionManager.closeAll();\n            hardwareAvailabilityLatcher.stop();\n' }], { file: ROUTER, leaf: 'NW1\\.S-the-latcher-is-wired' }),
+        { from: '            hardwareAvailabilityLatcher.stop();\n            stopObservingAuthenticatedRequests();\n            await webttySessionManager.closeAll();\n', to: '            stopObservingAuthenticatedRequests();\n            await webttySessionManager.closeAll();\n            hardwareAvailabilityLatcher.stop();\n' }], { file: ROUTER, leaf: 'NW1\\.S-the-latcher-is-wired' }),
     'ms42-a-latcher-attempt-runs-inline-inside-a-capture': latcherMutant('ms42-a-latcher-attempt-runs-inline-inside-a-capture', [
         { from: '        if (!started || now() < blockedUntil) return;\n        schedule(0);', to: '        if (!started || now() < blockedUntil) return;\n        attempt();' }]),
     'ms43-recovery-required-or-network-busy-stops-the-latcher': latcherMutant('ms43-recovery-required-or-network-busy-stops-the-latcher', [
