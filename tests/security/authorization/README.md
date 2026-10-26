@@ -24,7 +24,7 @@ The live suite runs only against an exact, pushed and deployed candidate describ
 node tests/security/authorization/acceptance/evidence-capture.mjs --pins /abs/pins.json --pins-sha256 <hex> --out /abs/new-evidence-dir
 ```
 
-4. Run the focused offline tests at the pinned commit with TAP bound to that commit (`acceptance/offline-tap.mjs`, one TAP and sidecar per file; the AchillesIDE DPU test runs from the pinned AchillesIDE checkout with `--repo-name AchillesIDE`).
+4. Run the focused offline tests at the pinned commit with TAP bound to that commit (`acceptance/offline-tap.mjs`, one TAP and sidecar per file; the AchillesIDE DPU test runs from the pinned AchillesIDE checkout with `--repo-name AchillesIDE`). The list includes `router-source-drift.test.mjs`, which fails with one sorted list of every mismatch between the Router source files and the reviewed registry `router-reference-obligations.json`.
 5. Run the full suite through the A7 wrapper, which captures the raw exit code itself and then evaluates the scoped gate:
 
 ```sh
@@ -38,7 +38,7 @@ export AUTHZ_PINS=/abs/pins.json AUTHZ_PINS_SHA256=<hex>
 node tests/security/authorization/acceptance/run-acceptance.mjs --offline-dir /abs/offline-tap-dir
 ```
 
-`npm run test:authorization` still runs the unchanged full suite with the same environment; it refuses to start without `AUTHZ_PINS` and `AUTHZ_PINS_SHA256`, and records a setup error with no registration request when the pins, the running checkout, the policy digest or the Box identity differ.
+`npm run test:authorization` still runs the unchanged full suite with the same environment; it refuses to start without `AUTHZ_PINS` and `AUTHZ_PINS_SHA256`, and records a setup error with no registration request when the pins, the running checkout, the policy digest or the Box identity differ. Before it reads the pins it also records the setup error `ROUTER_SOURCE_DRIFT: <n> mismatches`, followed by the list, when the Router source in the running checkout differs from the reviewed registry; `npm run authorization:inventory` refuses in the same way.
 
 `pins.json` (`authz-acceptance-pins/1`): `ploinky` `{commit, branch, upstream}`; `ploinkyCheckout` (absolute real path of the checkout mounted at `/opt/ploinky`, from which the suite must run); `workspace`; `repositories[]` `{name, path (workspace-relative), commit, branch, upstream}` for every repository in `acceptance/policy.json` `inventoryRepositories`; `policyDigest` (`node tests/security/authorization/acceptance/digest.mjs`); `box` `{id, name, startedAt, imageId, imageDigest}`; `agentlib` `{mode: image|local, sourceRelativePath?}`.
 
@@ -69,7 +69,7 @@ Exit `1` means an assertion, setup, cleanup, interruption or ownership error. Ex
 
 ## Scoped A6 acceptance
 
-The raw suite result is never reinterpreted: exit 2 stays `NO_FAILURES_WITH_GAPS`. `acceptance/verify-acceptance.mjs` separately returns ACCEPT or REJECT with every reason. It ACCEPTs only when the raw exit code (captured by the wrapper) matches `report.verdict` and is 2; FAIL and ERROR are 0; there is no setup error or interruption; every cleanup, `finalOwnership` and the lock release passed; the report is bound to the reviewed pins hash, policy digest, Box identity and repository commits; the four principals have their reviewed roles; the live runtime set equals `acceptance/expected-runtimes.json` exactly; every entry of `acceptance/mandatory-checks.json` occurs the expected number of times, all PASS, with a passing positive control; every offline mandatory TAP was produced at the pinned commit on a clean tree with nothing failed, skipped, cancelled or todo; and the gap list equals `acceptance/expected-gaps.json` exactly by identity and typed evidence.
+The raw suite result is never reinterpreted: exit 2 stays `NO_FAILURES_WITH_GAPS`. `acceptance/verify-acceptance.mjs` separately returns ACCEPT or REJECT with every reason. It ACCEPTs only when the raw exit code (captured by the wrapper) matches `report.verdict` and is 2; FAIL and ERROR are 0; there is no setup error or interruption; every cleanup, `finalOwnership` and the lock release passed; the report is bound to the reviewed pins hash, policy digest, Box identity and repository commits; the four principals have their reviewed roles; the live runtime set equals `acceptance/expected-runtimes.json` exactly; every entry of `acceptance/mandatory-checks.json` occurs the expected number of times, all PASS, with a passing positive control; every offline mandatory TAP was produced at the pinned commit on a clean tree with nothing failed, skipped, cancelled or todo; and the gap list equals `acceptance/expected-gaps.json` exactly by identity and typed evidence. The comparator also recomputes the Router source drift against its own checkout and rejects every mismatch as `ROUTER_SOURCE_DRIFT: <entry>`, or with `ROUTER_SOURCE_DRIFT_NOT_EVALUATED` when that comparison was not computed. The drift TAP above is mandatory like every other offline file: a missing, failed or renamed `router-source-drift.test.mjs` test rejects it.
 
 | File | Content |
 | --- | --- |

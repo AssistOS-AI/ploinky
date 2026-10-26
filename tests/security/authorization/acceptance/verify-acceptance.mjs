@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { runVerdict } from '../core.mjs';
 import { routerProbes } from '../router-probes.mjs';
-import { routerInventory } from '../router-inventory.mjs';
+import { routerInventory, routerSourceDrift } from '../router-inventory.mjs';
 import { agentInventory, inventoryBaseline } from '../agent-inventory.mjs';
 import { agentDiscoveryMethods } from '../agent-probes.mjs';
 import { ACCEPTANCE_DIR, policyDigest } from './digest.mjs';
@@ -161,7 +161,7 @@ function matchGapEvidence(entry, gap, report, checks) {
     }
 }
 
-export function evaluateScopedAcceptance({ report, exitCode, mandatory, expectedGaps, expectedRuntimes, derivedRuntimes, policy, offline = [], pins, pinsSha256, acceptanceDigest, baseline = inventoryBaseline }) {
+export function evaluateScopedAcceptance({ report, exitCode, mandatory, expectedGaps, expectedRuntimes, derivedRuntimes, routerSourceDrift, policy, offline = [], pins, pinsSha256, acceptanceDigest, baseline = inventoryBaseline }) {
     const reasons = [];
     const reject = (code, detail = '') => reasons.push(`${code}${detail ? `: ${detail}` : ''}`);
     if (!report || typeof report !== 'object') return { decision: 'REJECT', reasons: ['REPORT_MISSING'] };
@@ -174,6 +174,11 @@ export function evaluateScopedAcceptance({ report, exitCode, mandatory, expected
     } catch (error) { reject('MANDATORY_FILE_DRIFT', String(error?.message || error)); }
     if (!derivedRuntimes) reject('RUNTIME_GRAPH_NOT_VERIFIED', 'expected runtimes were not re-derived from the pinned manifests');
     else if (JSON.stringify(derivedRuntimes) !== JSON.stringify(expectedRuntimes)) reject('RUNTIME_GRAPH_DRIFT', 'expected-runtimes.json differs from the graph derived at the pinned commits');
+    // Likewise the comparator's own checkout is compared with the reviewed Router source registry. The mandatory
+    // offline drift TAP is bound to the pinned commit; this leg covers the tree the comparator itself reads. A
+    // missing value is a rejection, so a caller that forgets to compute it cannot ACCEPT.
+    if (!Array.isArray(routerSourceDrift)) reject('ROUTER_SOURCE_DRIFT_NOT_EVALUATED', 'the Router source was not compared with the reviewed registry');
+    else for (const entry of routerSourceDrift) reject('ROUTER_SOURCE_DRIFT', entry);
     const expected = new Map((expectedGaps.gaps || []).map(g => [g.id, g]));
     const mandatoryLive = (mandatory.checks || []).filter(c => c.kind === 'live');
     const mandatoryIds = new Set((mandatory.checks || []).map(c => c.id));
@@ -325,7 +330,9 @@ export function verifyFromFiles({ reportFile, exitCodeFile, offlineDir, pinsFile
     const inputs = loadAcceptanceInputs();
     let derivedRuntimes;
     try { derivedRuntimes = deriveExpectedRuntimes({ policy: inputs.policy, source: gitSource(repositoriesFromPins(pins, inputs.policy)) }); } catch { derivedRuntimes = undefined; }
-    return evaluateScopedAcceptance({ report, exitCode: raw.exitCode, offline: readOfflineEvidence(offlineDir), pins, pinsSha256: pinsHash, derivedRuntimes, ...inputs });
+    let drift;
+    try { drift = routerSourceDrift(); } catch { drift = undefined; }
+    return evaluateScopedAcceptance({ report, exitCode: raw.exitCode, offline: readOfflineEvidence(offlineDir), pins, pinsSha256: pinsHash, derivedRuntimes, routerSourceDrift: drift, ...inputs });
 }
 
 function parseArgs(argv) {

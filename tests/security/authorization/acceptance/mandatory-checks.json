@@ -12,7 +12,7 @@
   ],
   "counts": {
     "live": 806,
-    "offline": 10
+    "offline": 11
   },
   "checks": [
     {
@@ -4374,6 +4374,21 @@
         "request-path lease commit() writes nothing to the workspace"
       ],
       "source": "plan rev3 mandatory-check table (unchanged in rev4)"
+    },
+    {
+      "id": "offline:ploinky:tests/security/authorization/router-source-drift.test.mjs",
+      "kind": "offline",
+      "count": 1,
+      "positiveControlAnyOf": null,
+      "boundary": "router",
+      "repo": "ploinky",
+      "file": "tests/security/authorization/router-source-drift.test.mjs",
+      "tests": [
+        "router source drift: every Router inventory row matches the reviewed registry at the checkout bytes, with all mismatches reported together",
+        "router source drift: the resolved Router inventory retains every prior obligation",
+        "router source drift: mutated checkout bytes in several files are all reported in one list"
+      ],
+      "source": "Router source drift gate (2026-10-26)"
     },
     {
       "id": "offline:ploinky:tests/security/authorization/webchat-interaction-isolation.test.mjs",

@@ -9,6 +9,7 @@ import { setupPrincipals } from './principals.mjs';
 import { runAccountProbes, runSessionProbes } from './account-probes.mjs';
 import { runStreamProbes } from './stream-probes.mjs';
 import { writeCoverage } from './coverage.mjs';
+import { routerSourceDrift } from './router-inventory.mjs';
 import { createMutationLockManager } from '../../../ploinky-box/locks.mjs';
 import { armExitDeadline, installInterruptHandlers, runOwnedCleanup } from './run-cleanup.mjs';
 import { closeAllOpenStreams } from './webchat-probes.mjs';
@@ -71,7 +72,12 @@ const ctx = {
 };
 installInterruptHandlers(ctx);
 try {
-    // Frozen pins first: file hash, schema, exact pushed source and policy
+    // Router source drift first. This source-only check observes no deployment
+    // and makes no request; it reads the checkout bytes this suite runs from and
+    // refuses to run against Router source the reviewed registry does not name.
+    const drift = routerSourceDrift();
+    assert.deepEqual(drift, [], `ROUTER_SOURCE_DRIFT: ${drift.length} mismatches\n${drift.join('\n')}`);
+    // Frozen pins next: file hash, schema, exact pushed source and policy
     // digest. Nothing is observed, and no request is made, before they pass.
     const loaded = loadPins(config.pins, config.pinsSha256);
     ctx.report.pins = { sha256: loaded.sha256, policyDigest: verifyCandidate(loaded.pins, sourceRoot) };
