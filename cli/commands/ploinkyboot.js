@@ -14,9 +14,8 @@ function repoNameFromAgentRef(agentRef) {
 }
 
 // The global --branch reaches every default boot repo, like every manifest
-// dependency repo: a boot repo can also be a dependency of the static agent
-// (AchillesCLI for explorer), and the manifest traversal keeps a checkout that
-// already exists. A repo without the branch falls back (and logs it) or aborts
+// dependency repo: manifest traversal keeps a checkout that already exists.
+// A repo without the branch falls back (and logs it) or aborts
 // under --branch-fallback fail.
 function policyForBootRepo(repoName, branchPolicy) {
     if (!branchPolicy) return null;

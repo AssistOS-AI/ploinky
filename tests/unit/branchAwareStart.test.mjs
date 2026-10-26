@@ -606,7 +606,6 @@ function headBranch(repoPath) {
 test('bootstrap: global branch policy reaches every default boot repo, not only the static repo', () => {
     resetDefaultBootRepos();
     const idePath = initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
-    const cliPath = initManagedRepo('AchillesCLI', { branches: ['feature-start'] });
     const copilotPath = initManagedRepo('copilot-agents', { branches: ['feature-start'] });
 
     assert.doesNotThrow(() => bootstrap({
@@ -620,7 +619,6 @@ test('bootstrap: global branch policy reaches every default boot repo, not only 
     }));
 
     assert.equal(headBranch(idePath), 'feature-start');
-    assert.equal(headBranch(cliPath), 'feature-start');
     assert.equal(headBranch(copilotPath), 'feature-start');
 });
 
@@ -629,7 +627,6 @@ test('bootstrap: a bare static agent name gets the global branch once, and boot 
     // The manifest is on both branches, so findAgent('explorer') still resolves
     // AchillesIDE after the loop switched it and the bare-name follow-up runs.
     const idePath = initManagedRepoWithAgent('AchillesIDE', 'explorer', { branches: ['feature-start'] });
-    const cliPath = initManagedRepo('AchillesCLI', { branches: ['feature-start'] });
     const copilotPath = initManagedRepo('copilot-agents');
 
     const logged = [];
@@ -644,8 +641,6 @@ test('bootstrap: a bare static agent name gets the global branch once, and boot 
     t.mock.restoreAll();
 
     assert.equal(headBranch(idePath), 'feature-start');
-    // AchillesCLI is a boot repo that is not the static repo: it gets the branch too.
-    assert.equal(headBranch(cliPath), 'feature-start');
     // copilot-agents has no such branch: it keeps its branch and says so.
     assert.equal(headBranch(copilotPath), 'main');
     assert.ok(
@@ -659,7 +654,6 @@ test('bootstrap: a bare static agent name gets the global branch once, and boot 
         prepared.map(({ name, action, branch }) => [name, action, branch]),
         [
             ['AchillesIDE', 'switched', 'feature-start'],
-            ['AchillesCLI', 'switched', 'feature-start'],
             ['copilot-agents', 'fallback', 'main'],
         ],
     );
@@ -668,7 +662,6 @@ test('bootstrap: a bare static agent name gets the global branch once, and boot 
 test('bootstrap: a bare static agent from a repo that is not a boot repo still gets the global branch', (t) => {
     resetDefaultBootRepos();
     initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
-    initManagedRepo('AchillesCLI', { branches: ['feature-start'] });
     initManagedRepo('copilot-agents', { branches: ['feature-start'] });
     const staticPath = initManagedRepoWithAgent('bareStaticRepo', 'bareStaticApp', { branches: ['feature-start'] });
     t.after(() => fs.rmSync(staticPath, { recursive: true, force: true }));
@@ -683,7 +676,6 @@ test('bootstrap: a bare static agent from a repo that is not a boot repo still g
         prepared.map(({ name, action, branch }) => [name, action, branch]),
         [
             ['AchillesIDE', 'switched', 'feature-start'],
-            ['AchillesCLI', 'switched', 'feature-start'],
             ['copilot-agents', 'switched', 'feature-start'],
             ['bareStaticRepo', 'switched', 'feature-start'],
         ],
@@ -693,60 +685,55 @@ test('bootstrap: a bare static agent from a repo that is not a boot repo still g
 test('bootstrap: strict fallback aborts when a boot repo other than the static repo lacks the branch', () => {
     resetDefaultBootRepos();
     const idePath = initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
-    const cliPath = initManagedRepo('AchillesCLI');
-    initManagedRepo('copilot-agents', { branches: ['feature-start'] });
+    const copilotPath = initManagedRepo('copilot-agents');
 
     assert.throws(
         () => bootstrap({
             staticAgent: 'AchillesIDE/explorer',
             branchPolicy: { branch: 'feature-start', repoBranches: {}, fallback: 'fail', resetRepos: false },
         }),
-        /Branch 'feature-start' does not exist locally or on remote for repo 'AchillesCLI'\. Aborting/,
+        /Branch 'feature-start' does not exist locally or on remote for repo 'copilot-agents'\. Aborting/,
     );
     assert.equal(headBranch(idePath), 'feature-start');
-    assert.equal(headBranch(cliPath), 'main');
+    assert.equal(headBranch(copilotPath), 'main');
 });
 
 test('bootstrap: --repo-branch overrides the global branch for a boot repo', () => {
     resetDefaultBootRepos();
     const idePath = initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
-    const cliPath = initManagedRepo('AchillesCLI', { branches: ['feature-start', 'cli-only'] });
-    const copilotPath = initManagedRepo('copilot-agents', { branches: ['feature-start'] });
+    const copilotPath = initManagedRepo('copilot-agents', { branches: ['feature-start', 'copilot-only'] });
 
     bootstrap({
         staticAgent: 'AchillesIDE/explorer',
         branchPolicy: {
             branch: 'feature-start',
-            repoBranches: { AchillesCLI: 'cli-only' },
+            repoBranches: { 'copilot-agents': 'copilot-only' },
             fallback: 'fail',
             resetRepos: false,
         },
     });
 
     assert.equal(headBranch(idePath), 'feature-start');
-    assert.equal(headBranch(cliPath), 'cli-only');
-    assert.equal(headBranch(copilotPath), 'feature-start');
+    assert.equal(headBranch(copilotPath), 'copilot-only');
 });
 
 test('bootstrap: without a global branch only repos named by --repo-branch move', () => {
     resetDefaultBootRepos();
     const idePath = initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
-    const cliPath = initManagedRepo('AchillesCLI', { branches: ['cli-only'] });
-    const copilotPath = initManagedRepo('copilot-agents', { branches: ['feature-start'] });
+    const copilotPath = initManagedRepo('copilot-agents', { branches: ['copilot-only'] });
 
     bootstrap({
         staticAgent: 'explorer',
         branchPolicy: {
             branch: null,
-            repoBranches: { AchillesCLI: 'cli-only' },
+            repoBranches: { 'copilot-agents': 'copilot-only' },
             fallback: 'fail',
             resetRepos: false,
         },
     });
 
     assert.equal(headBranch(idePath), 'main');
-    assert.equal(headBranch(cliPath), 'cli-only');
-    assert.equal(headBranch(copilotPath), 'main');
+    assert.equal(headBranch(copilotPath), 'copilot-only');
 });
 
 test('applyManifestDirectives: strict branch policy aborts manifest repo fallback', async () => {

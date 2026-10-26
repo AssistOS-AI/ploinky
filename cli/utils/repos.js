@@ -143,7 +143,7 @@ const PREDEFINED_REPOS = {
     PloinkySkills: { url: 'https://github.com/AssistOS-AI/PloinkySkills.git', description: 'Skills for developing the Ploinky application', kind: 'skills' }
 };
 
-const BOOT_REPO_NAMES = ['AchillesIDE', 'AchillesCLI', 'copilot-agents'];
+const BOOT_REPO_NAMES = ['AchillesIDE', 'copilot-agents'];
 
 export function getDefaultBootRepos() {
     return BOOT_REPO_NAMES
