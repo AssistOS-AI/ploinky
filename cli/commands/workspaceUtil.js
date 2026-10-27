@@ -104,6 +104,7 @@ import {
 } from '../server/routingFile.js';
 import {
   abortEdgeRoutingPreparation,
+  assertActiveEdgeRoutingSourcesCurrent,
   commitAdditiveEdgeRoutingGeneration,
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
@@ -4339,7 +4340,20 @@ async function reinstallAgent(agentName) {
             const short = resolved.shortAgentName;
             const agentPath = path.dirname(resolved.manifestPath);
             const edgeSelection = readEdgeRoutingSelection();
-            const stageAlongsidePredecessor = edgeSelection.selector.state === 'active';
+            // An additive candidate must reproduce its active predecessor's
+            // sources exactly. After an operator edits a routed manifest the
+            // sources have drifted, so the reinstall takes the replacement
+            // path, which recaptures every source, instead of failing.
+            const activeSourcesCurrent = () => {
+              try {
+                assertActiveEdgeRoutingSourcesCurrent();
+                return true;
+              } catch (error) {
+                if (error?.code === 'EDGE_GENERATION_SOURCE_CHANGED') return false;
+                throw error;
+              }
+            };
+            const stageAlongsidePredecessor = edgeSelection.selector.state === 'active' && activeSourcesCurrent();
             if (!stageAlongsidePredecessor) {
               retireAbandonedAgentPreparation(containerName, { workspaceMutationLease, networkLifecycleCapability });
             }

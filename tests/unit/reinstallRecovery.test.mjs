@@ -7,7 +7,8 @@ import { reinstallAgent } from '../../cli/commands/workspaceUtil.js';
 // Execute the command body with runtime boundaries replaced, so recovery can
 // be tested without installing agents or mutating a real workspace.
 function fixture({ runtime = 'docker', running = false, active = true, failure, enabled = true, changedRegistration = false,
-    routerRunning = true, routerFailure = null, ambiguous = false, settlementFailure = false, applied = true, draining = false } = {}) {
+    routerRunning = true, routerFailure = null, ambiguous = false, settlementFailure = false, applied = true, draining = false,
+    sourcesCurrent = true } = {}) {
     let resolutions = 0;
     let routerReady = routerRunning;
     const calls = [];
@@ -97,7 +98,7 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
                 assert.equal(options.routerEndpoint, endpoint);
                 assert.equal(options.runtimeAdmission, 'admitted');
                 assert.equal(options.networkLifecycleCapability, capability);
-                assert.equal(options.stageAlongsidePredecessor, active);
+                assert.equal(options.stageAlongsidePredecessor, active && sourcesCurrent);
                 if (failure === 'install') throw new Error('install failed');
                 return result;
             },
@@ -118,6 +119,12 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
         },
         withNetworkLifecycleLock: async callback => callback(capability),
         readEdgeRoutingSelection: () => ({ selector: { state: active ? 'active' : 'inactive' } }),
+        assertActiveEdgeRoutingSourcesCurrent() {
+            if (sourcesCurrent) return {};
+            throw Object.assign(new Error('edge routing sources changed since the active generation was selected'), {
+                code: 'EDGE_GENERATION_SOURCE_CHANGED',
+            });
+        },
         buildRelayReadinessRoute: ({ route }) => route,
         waitForManifestReadiness: async ({ route }) => {
             calls.push(['readiness', route.container]);
@@ -169,6 +176,15 @@ for (const runtime of ['docker', 'bwrap', 'seatbelt']) {
         });
     }
 }
+
+test('reinstall after a routed manifest edit replaces the runtime instead of staging it beside the active generation', async () => {
+    const { run, calls, errors } = fixture({ active: true, sourcesCurrent: false });
+    await run('chosen-name');
+    assert.deepEqual(calls, [
+        ['remove', 'workspace-example'], ['prepare', 'example'], ['readiness', 'replacement-example'], ['activate', 'replacement-example'],
+    ]);
+    assert.deepEqual(errors, []);
+});
 
 test('reinstall still recreates an already running agent', async () => {
     const { run, calls } = fixture({ running: true });
