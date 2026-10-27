@@ -10,6 +10,7 @@ import {
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
+import { HOLD_SLICE_MS, MAX_HOLD_INACTIVE_MS } from '../utils/testFaultHooks.js';
 
 const ROUTING_LOCK_FILE = `${ROUTING_FILE}.lock`;
 
@@ -31,6 +32,22 @@ function publicationCarry(publicationPredecessor, publicationPredecessorInactiva
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Sleep in short slices so the activating hook can end the hold early.
+async function holdInactive(totalMs, holdContinues) {
+    const deadline = performance.now() + totalMs;
+    while (performance.now() < deadline) {
+        await sleep(Math.min(HOLD_SLICE_MS, Math.max(1, deadline - performance.now())));
+        if (typeof holdContinues === 'function' && performance.now() < deadline) {
+            let go = false;
+            try { go = holdContinues() === true; } catch (_) {}
+            if (!go) {
+                console.warn('[test-fault-hook] inactive hold ended early: the hook file is gone or no longer active');
+                return;
+            }
+        }
+    }
 }
 
 async function acquireRoutingLock({ timeoutMs = 10000, intervalMs = 50 } = {}) {
@@ -128,6 +145,10 @@ async function mergeRoutingConfig(mutator, {
     validateActiveGeneration,
     captureExpectedGeneration,
     networkLifecycleCapability,
+    // Test-only (see utils/testFaultHooks.js): only a caller that holds an
+    // activated fault hook passes this; it is absent from every production call.
+    holdInactiveMs,
+    holdContinues,
 } = {}) {
     const mutate = async (applyLockCapability = undefined, liveNetworkLifecycleCapability = undefined) => {
         let validatedActiveGeneration;
@@ -158,6 +179,10 @@ async function mergeRoutingConfig(mutator, {
             if (!coordinate) return (await mutate()).next;
             return await withEdgeGenerationApplyLock(async (applyLockCapability) => {
                 const { next, expectedGeneration, carry } = await mutate(applyLockCapability, liveNetworkLifecycleCapability);
+                if (Number.isInteger(holdInactiveMs) && holdInactiveMs > 0) {
+                    // The selector is inactive here; completing the apply is what reactivates it.
+                    await holdInactive(Math.min(holdInactiveMs, MAX_HOLD_INACTIVE_MS), holdContinues);
+                }
                 await applyEdgeRoutingGeneration({
                     reason,
                     preparationLease,

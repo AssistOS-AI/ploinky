@@ -375,3 +375,77 @@ test('a refused drain blocks admission until the operator accepts that exact pre
     assert.equal(fixture.registry[fixture.containerName].instanceId, 'onlyoffice-instance');
     assert.doesNotThrow(() => assertAgentServiceNotDraining(fixture.containerName, { loadRouting }));
 });
+
+function faultRequest(fixture) {
+    return {
+        containerName: fixture.containerName,
+        routeKey: 'onlyOffice',
+        repoName: 'AssistOSExplorer',
+        shortAgentName: 'onlyOffice',
+        record: fixture.registry[fixture.containerName],
+        networkLifecycleCapability: Object.freeze({ fixture: true }),
+    };
+}
+
+test('test fault hooks: an inert hook leaves the real fallback merge options untouched', async () => {
+    const fixture = restartFixture();
+    const mergeOptions = [];
+    let withdrawCalls = 0;
+    let reopenCalls = 0;
+    const dependencies = {
+        ...fixture.dependencies,
+        mergeRouting: async (mutator, options) => { mergeOptions.push(options); return fixture.dependencies.mergeRouting(mutator, options); },
+        withdrawRoute: async () => { withdrawCalls += 1; throw new Error('unprovable'); },
+        reopenRoute: async () => { reopenCalls += 1; throw new Error('unprovable'); },
+        faultHooks: () => null,
+    };
+    const request = faultRequest(fixture);
+    const transition = await prepareTargetedAgentRestart(request, dependencies);
+    assert.equal(withdrawCalls, 1);
+    assert.equal(mergeOptions.length, 1);
+    assert.equal('holdInactiveMs' in mergeOptions[0], false);
+    await commitTargetedAgentRestart({
+        transition,
+        result: { containerName: fixture.containerName, hostPort: 1, registryRecord: { ...request.record } },
+        agentPath: '/workspace/agent',
+        networkLifecycleCapability: request.networkLifecycleCapability,
+    }, { ...dependencies, retireEntriesAfterApply: async () => {} });
+    assert.equal(reopenCalls, 1);
+    assert.equal(mergeOptions.length, 2);
+    assert.equal('holdInactiveMs' in mergeOptions[1], false);
+});
+
+test('test fault hooks: forced unprovable withdrawal and reopen take the merge fallback with the hold', async () => {
+    const fixture = restartFixture();
+    const mergeOptions = [];
+    let withdrawCalls = 0;
+    let reopenCalls = 0;
+    const stillActive = () => true;
+    const hooks = { forceUnprovableWithdrawal: true, forceUnprovableReopen: true, holdInactiveMs: 1234 };
+    Object.defineProperty(hooks, 'stillActive', { value: stillActive, enumerable: false });
+    const dependencies = {
+        ...fixture.dependencies,
+        mergeRouting: async (mutator, options) => { mergeOptions.push(options); return fixture.dependencies.mergeRouting(mutator, options); },
+        withdrawRoute: async () => { withdrawCalls += 1; return {}; },
+        reopenRoute: async () => { reopenCalls += 1; return {}; },
+        retireEntriesAfterApply: async () => {},
+        faultHooks: () => hooks,
+    };
+    const request = faultRequest(fixture);
+    const transition = await prepareTargetedAgentRestart(request, dependencies);
+    assert.equal(withdrawCalls, 0);
+    assert.equal(fixture.routing.routes.onlyOffice.draining, true);
+    assert.equal(mergeOptions[0].holdInactiveMs, 1234);
+    await commitTargetedAgentRestart({
+        transition,
+        result: { containerName: fixture.containerName, hostPort: 1, registryRecord: { ...request.record } },
+        agentPath: '/workspace/agent',
+        networkLifecycleCapability: request.networkLifecycleCapability,
+    }, dependencies);
+    assert.equal(reopenCalls, 0);
+    assert.equal(mergeOptions.length, 2);
+    assert.equal(mergeOptions[1].holdInactiveMs, 1234);
+    assert.strictEqual(mergeOptions[0].holdContinues, stillActive);
+    assert.strictEqual(mergeOptions[1].holdContinues, stillActive);
+    assert.equal(fixture.routing.routes.onlyOffice.draining, undefined);
+});

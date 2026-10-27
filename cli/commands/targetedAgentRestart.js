@@ -20,6 +20,7 @@ import {
 } from '../server/routingFile.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import { retireSameTupleAfterApply } from './hardwareAvailabilityRetirement.js';
+import { loadRestartFaultHooks } from '../utils/testFaultHooks.js';
 
 export const ACCEPT_FAILED_DRAIN_FLAG = '--accept-failed-drain';
 const RESTART_USAGE = `Usage: restart [router | <agent> [${ACCEPT_FAILED_DRAIN_FLAG} <container-id>]]`;
@@ -136,6 +137,16 @@ function assertAcceptedFailedDrain({ acceptedFailedDrain, record, currentRecord,
   }
 }
 
+// The inactive merge's hold, present only while a test fault hook asks for it.
+function holdOption(hooks) {
+  return hooks?.holdInactiveMs > 0
+    ? {
+      holdInactiveMs: hooks.holdInactiveMs,
+      ...(typeof hooks.stillActive === 'function' ? { holdContinues: hooks.stillActive } : {}),
+    }
+    : {};
+}
+
 // Withdraw the route from the active generation by an operator drain (W8,
 // D3): the selector stays active and every other route stays served. Returns
 // the route as it was before the drain.
@@ -228,7 +239,9 @@ export async function prepareTargetedAgentRestart({
   loadActive = loadActiveEdgeRoutingGeneration,
   loadAgents = workspaceSvc.loadAgents,
   withdrawRoute = withdrawTargetedRoute,
+  faultHooks = loadRestartFaultHooks,
 } = {}) {
+  const hooks = faultHooks();
   const containerName = text(containerNameInput);
   const routeKey = text(routeKeyInput);
   const repoName = text(repoNameInput || record?.repoName);
@@ -241,6 +254,8 @@ export async function prepareTargetedAgentRestart({
   let predecessorRoute = null;
 
   try {
+    // Test-only: an unprovable withdrawal takes the same fallback as a real one.
+    if (hooks?.forceUnprovableWithdrawal) throw new Error('test fault hook: withdrawal forced unprovable');
     predecessorRoute = await withdrawRoute({ containerName, routeKey, repoName, shortAgentName, identity, record, acceptedFailedDrain });
   } catch (error) {
     // An invalid acceptance must never fall through to another mutation path.
@@ -271,6 +286,7 @@ export async function prepareTargetedAgentRestart({
   }, {
     reason: `manual-targeted-restart-drain:${containerName}`,
     networkLifecycleCapability,
+    ...holdOption(hooks),
   });
 
   const active = loadActive();
@@ -331,7 +347,9 @@ export async function commitTargetedAgentRestart({
   retireEntriesAfterApply = retireSameTupleAfterApply,
   reportRetirementFailure = (error) => console.warn(`[edge] published targeted restart candidate receipt could not be retired: ${error?.message || error}`),
   reopenRoute = reopenTargetedRoute,
+  faultHooks = loadRestartFaultHooks,
 } = {}) {
+  const hooks = faultHooks();
   if (!transition || !result?.containerName || !result?.registryRecord) {
     throw new Error('targeted agent restart commit requires its transition and exact ready runtime');
   }
@@ -360,11 +378,13 @@ export async function commitTargetedAgentRestart({
   // proven takes the inactive merge below (D7).
   const mergeRouting = async (mutator, options) => {
     try {
+      // Test-only: an unprovable reopen takes the same fallback as a real one.
+      if (hooks?.forceUnprovableReopen) throw new Error('test fault hook: reopen forced unprovable');
       return await reopenRoute(transition, restoredRoute, result);
     } catch (error) {
       if (edgeWithdrawalRefusalDisposition(error) === 'defer') throw error;
     }
-    return mergeRoutingDependency(mutator, options);
+    return mergeRoutingDependency(mutator, { ...options, ...holdOption(hooks) });
   };
 
   await mergeRouting((routing) => {
