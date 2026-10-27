@@ -34,10 +34,9 @@ import { ALLOW_HOST_PROCESSES_ENV, allowHostProcessesFromEnv } from '../helpers/
 // PLOINKY_BIND_PUBLICATION_TEST_IMAGE=sha256:... node --test <this file>
 // This exercises real Box reconciliation and publication with a tiny HTTP/UDP
 // fixture. It does not start an agent graph or claim full Router/Explorer E2E.
-// Each Box creation passes the real quiescence gate. On a desktop host whose
-// helpers hold `/` mounted writable (for example snapd-desktop-integration),
-// name those processes explicitly after checking they do not write the test
-// workspace: PLOINKY_TEST_ALLOW_HOST_PROCESSES=<pid>[,<pid>...] (positive
+// Each Box creation passes the real quiescence gate. To excuse a process a
+// launch record of the test workspace names, after checking it is not that
+// agent, name it explicitly: PLOINKY_TEST_ALLOW_HOST_PROCESSES=<pid>[,<pid>...] (positive
 // integers, no spaces; anything else fails the setup). They are forwarded as
 // `ploinky --allow-host-process PID` would forward them, and the gate still
 // re-verifies each process's start time. Unset means no allowance.

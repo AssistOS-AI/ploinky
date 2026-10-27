@@ -112,23 +112,22 @@ async function world(t, { old = 'running', dataPaths = false, prepare = () => {}
     return { base, outside, workspace, identity, lock, calls, seams, options, current: () => current };
 }
 
-// A host bwrap agent of the workspace, seen through a fake Linux /proc.
+// A running host bwrap agent of the workspace: its launch record, and a fake
+// /proc/41/stat with the start identity the record holds.
 function hostAgentGate(workspace) {
-    const real = fs.realpathSync(workspace);
-    const own = `21 1 0:40 / / rw - ext4 /dev/root rw\n22 21 0:50 ${real} ${real} rw - ext4 /dev/w rw`;
-    const agent = `900 899 0:40 / / ro - ext4 /dev/root rw\n901 900 0:50 ${real} ${real} rw - ext4 /dev/w rw`;
+    const directory = path.join(workspace, '.ploinky', 'bwrap-pids');
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, 'agent.pid'), JSON.stringify({
+        schemaVersion: 3, hostStateMasked: true, pid: 41, runtimeKey: 'agent', processIdentity: 'linux-proc:4100',
+    }));
     const fsApi = {
         ...fs,
-        readdirSync: (target, ...rest) => (target === '/proc' ? ['41'] : fs.readdirSync(target, ...rest)),
         readFileSync(target, ...rest) {
-            if (target === '/proc/self/mountinfo') return own;
-            if (target === '/proc/41/status') return 'Uid:\t1000\t1000\t1000\t1000\n';
-            if (target === '/proc/41/mountinfo') return agent;
-            if (target === '/proc/41/cmdline') return 'bwrap\0--bind\0';
+            if (target === '/proc/41/stat') return `41 (bwrap) S ${Array(18).fill('0').join(' ')} 4100 0 0`;
             return fs.readFileSync(target, ...rest);
         },
     };
-    return createQuiescenceGate({ platform: 'linux', fsApi, uid: 1000, selfPid: 10 });
+    return createQuiescenceGate({ platform: 'linux', fsApi, kill: () => {} });
 }
 
 test('I5: a running host agent refuses `restart` while the old Box still runs; it is never stopped', async (t) => {
@@ -140,7 +139,7 @@ test('I5: a running host agent refuses `restart` while the old Box still runs; i
     };
     await assert.rejects(reconcileBoxContainer(w.options({ recoverDataPaths: true }), w.seams), (error) => {
         assert.equal(error.cause?.code, 'PLOINKY_BOX_HOST_RUNTIME_ACTIVE');
-        assert.match(error.message, /process 41 \(bwrap --bind\)/);
+        assert.match(error.message, /process 41: its launch record .*agent\.pid names a running agent/);
         assert.equal(error.boxRollback.action, 'preserved');
         assert.equal(error.boxRollback.oldStopAttempted, false, 'no recovery is needed: the Box was never stopped');
         return true;

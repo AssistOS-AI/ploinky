@@ -133,17 +133,15 @@ of trusting it; nothing is deleted. stop, destroy, limits clear and unlock never
 do this.
 
 Creating, recreating or adopting a Box, and creating its data paths, is refused
-while anything else can write the workspace: a host-runtime agent of it or a
-container with a read-write bind of it. Linux checks the mount table of every
-process of the invoking user, with rootless Podman's own infrastructure exempt;
-any other process that has the workspace (or a directory containing it, such as
-the home directory) mounted read-write blocks, for example a snap or Flatpak
-helper. macOS checks the workspace's launch records and ps for command lines that
-name the workspace; a host agent started by an older Ploinky whose launch records
-were erased is not detected and is unsupported. Stop what is listed, or put
---allow-host-process PID before the command to excuse one process that does not
-write the workspace (repeatable; its start time is checked again, and on macOS
-an agent that an older Ploinky started without the mask cannot be excused).
+while another Ploinky runtime of the workspace still runs: a running container
+labelled for it (its Box, or a host agent container of an older Ploinky), or a
+host-runtime agent whose launch record under .ploinky/bwrap-pids names a process
+that still runs with the recorded start time. Other processes and containers,
+such as snap or Flatpak desktop apps, are not inspected. A host agent whose launch
+record was erased is not detected. Stop what is listed, or put
+--allow-host-process PID before the command to excuse one listed process that is
+not that agent (repeatable; its start time is checked again, and an agent that an
+older Ploinky started without the mask cannot be excused).
 
 Upgrading has no backward compatibility. A Box made by an older Ploinky fails the
 compatibility check: run ploinky destroy, then ploinky start. If an older Ploinky

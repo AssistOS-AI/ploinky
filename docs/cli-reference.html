@@ -471,7 +471,7 @@ MCP ping succeeded.</code></pre>
 ploinky unlock --force-holder 4242@0123456789abcdef0123456789abcdef</code></pre>
 
                         <h3>--allow-host-process</h3>
-                        <p>Box creation, recreation and data-path creation are refused while a host-runtime agent or a container can write the workspace. <code>ploinky --allow-host-process PID &lt;command&gt;</code> excuses one running process that does not write the workspace (repeatable; its start time is verified again). Stop what the refusal lists otherwise.</p>
+                        <p>Box creation, recreation and data-path creation are refused while another Ploinky runtime of the workspace still runs: a container labelled for it, or a host agent whose launch record names a running process. Unrelated host processes are not inspected. <code>ploinky --allow-host-process PID &lt;command&gt;</code> excuses one listed process that is not that agent (repeatable; its start time is verified again). Stop what the refusal lists otherwise.</p>
                         <pre><code>ploinky --allow-host-process 4242 start</code></pre>
 
                         <h3>clean</h3>

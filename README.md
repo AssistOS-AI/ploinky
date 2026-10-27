@@ -292,7 +292,7 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky repair [--dry-run] [--json]` | Apply supported normal-user fixes, verify with diagnostics, and list remaining manual and sudo-required actions; `--dry-run` only inspects and previews |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
 | `ploinky unlock [--force-holder PID@MACHINE]` | Remove a workspace lock, its reclaim guard or the hardware store lock that a command no longer running left behind; see [Box host state, upgrading and recovery](#box-host-state-upgrading-and-recovery) |
-| `ploinky --allow-host-process PID <command>` | Excuse one running host process (repeatable) from the check that refuses Box creation while something else can write the workspace; its start time is verified again; see the same section |
+| `ploinky --allow-host-process PID <command>` | Excuse one listed host process (repeatable) from the check that refuses Box creation while another Ploinky runtime of the workspace runs; its start time is verified again; see the same section |
 | `ploinky update` / `ploinky update all [PATH]` | Update Ploinky (only when its checkout is inside the selected folder or the command is run from inside that checkout), AgentLib, registered and discovered repositories, and skills with verified fast-forward-only Git updates, then restart an already configured running workspace when every required input verified. `PATH` must be inside the workspace. Dirty, conflicted, diverged, detached, or operation-in-progress checkouts are preserved and reported as named skips; nothing is stashed, rebased, or reset. Dependency caches are not touched |
 | `ploinky update repos` / `ploinky update repo <name>` | Update only registered repositories (or one) under the same workspace transaction; activation is recorded as pending rather than restarting the whole graph — run `ploinky restart` when ready |
 | `ploinky destroy` | Without prompting, stop nested agents and remove the outer container, then this workspace's GPU-grant and hardware-limits records in `<workspace>/.ploinky-box`; retain the host workspace, `.data`, `.ploinky/data`, `.env`, `.ploinky/box` and the saved Router binding |
@@ -414,14 +414,16 @@ If `.ploinky-box` already holds anything other than its own skeleton when the fi
 
 ### Refusals that protect host state
 
-Creating or recreating a Box, adopting a workspace and creating a Box data path are refused while anything other than the command itself can write the workspace. A running container with a read-write bind of the workspace, of a directory containing it or of a directory inside it blocks, and so does a host-runtime agent:
+Creating or recreating a Box, adopting a workspace and creating a Box data path are refused while another Ploinky runtime of the workspace still runs, since it could write `.ploinky-box` meanwhile. Only Ploinky's own evidence is checked, the same way on Linux and macOS:
 
-| Platform | What is checked |
+| Evidence | Blocks when |
 | --- | --- |
-| Linux | The mount table of every process of the invoking user that is outside the command's own mount namespace. A process that has the workspace, or a directory containing it such as the home directory, mounted read-write blocks; so does a process whose mount table cannot be read. Snap and Flatpak desktop helpers that have the home directory mounted writable fall under this rule. Rootless Podman's own infrastructure (its pause process, `conmon`, `pasta` and the like, found through the user's `pause.pid`) is exempt when that can be proven |
-| macOS | The workspace's launch records under `.ploinky/bwrap-pids` plus a `ps` scan for command lines that name the workspace. The residual: a host agent started by an older Ploinky whose launch records were erased is not detected, and that case is unsupported |
+| Running containers | A container is labelled as this workspace's Box (`io.assistos.ploinky-box.path-hash`) or as one of its host agent containers (`io.assistos.ploinky.managed=1` with this workspace's `io.assistos.ploinky.workspace` hash) |
+| Launch records under `.ploinky/bwrap-pids` | A record names a process that still runs with the start time the record holds, or the record cannot be read |
 
-Stop what the refusal lists (`ploinky stop` for a Box of this workspace), or excuse one process that does not write the workspace by naming it before the command, for example `ploinky --allow-host-process 4242 start`. The option is repeatable, holds only for that exact process (its start time is read at the scan and verified again before the check passes), and does not excuse an agent that an older Ploinky started without the host-state mask (macOS launch records). `ploinky unlock` does not accept it.
+Other processes and containers are not inspected: a snap or Flatpak desktop app, or a container that merely mounts the home directory, does not block. A host agent whose launch record was erased is not detected.
+
+Stop what the refusal lists (`ploinky stop` for a Box of this workspace), or excuse one listed process that is not that agent by naming it before the command, for example `ploinky --allow-host-process 4242 start`. The option is repeatable, holds only for that exact process (its start time is read at the check and verified again before the check passes), and does not excuse an agent that an older Ploinky started without the host-state mask. `ploinky unlock` does not accept it.
 
 Other refusals and protections:
 

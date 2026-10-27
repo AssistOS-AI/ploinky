@@ -1,8 +1,7 @@
-// Integration tests that run the real quiescence gate on a desktop Linux host
-// can meet host processes that hold `/` (and so the test workspace) mounted
-// writable but never write it, such as `snapd-desktop-integration`. The gate
-// rightly refuses them. `PLOINKY_TEST_ALLOW_HOST_PROCESSES` names such
-// processes explicitly, as a comma-separated list of PIDs; the test forwards
+// Integration tests run the real quiescence gate, which refuses while a launch
+// record of the test workspace names a running process. When such a process
+// is known not to be that agent, `PLOINKY_TEST_ALLOW_HOST_PROCESSES` names it
+// explicitly, as a comma-separated list of PIDs; the test forwards
 // them exactly as `ploinky --allow-host-process PID` would (the supervisor's
 // and host-state guard's `allowHostProcesses`), and the product re-verifies
 // each process's start time as usual. Nothing is detected or defaulted: unset

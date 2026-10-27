@@ -124,8 +124,8 @@ export function requirePodmanCandidate(t, env = process.env) {
     return `docker.io/assistos/ploinky-box@${digest}`;
 }
 
-// The supervisor options of the native fixtures. A desktop Linux host can run processes that hold `/` mounted
-// writable (for example `snapd-desktop-integration`) and the real quiescence gate refuses them. The explicit
+// The supervisor options of the native fixtures. The real quiescence gate refuses while a launch record of the
+// workspace names a running process; to excuse one that is not that agent, the explicit
 // PLOINKY_TEST_ALLOW_HOST_PROCESSES list is forwarded as the supervisor's own `allowHostProcesses`, exactly as
 // `ploinky --allow-host-process PID` would; the product re-verifies each start time. Unset means no allowance.
 export function nativeSupervisorOptions({ runner, lockManager, resolveIdentity, workspace, output, env = process.env }) {
