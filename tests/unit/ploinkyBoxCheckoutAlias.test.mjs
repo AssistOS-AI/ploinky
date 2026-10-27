@@ -258,7 +258,7 @@ test('A8: a Box without the mask gets the existing incompatible guidance; stop a
         hostStateGuard: createHostStateGuard({
             repositoryRoot: checkout,
             observeEngine: view,
-            gate: createQuiescenceGate({ platform: 'darwin', uid: 501, selfPid: 1, execFile: () => '', kill: () => {} }),
+            gate: createQuiescenceGate({ platform: 'darwin', execFile: () => '', kill: () => {} }),
         }),
         resolveIdentity: () => identity,
         launchCwd: workspace,

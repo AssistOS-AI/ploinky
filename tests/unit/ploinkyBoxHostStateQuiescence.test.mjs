@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
+import { workspaceNetworkIdentity } from '../../cli/sandbox/networkIdentity.js';
 import {
     agentWorkspaceHash,
     containerBlockers,
@@ -106,7 +107,7 @@ test('launch records: a gone PID, or a PID now held by another process, does not
     assert.deepEqual(launchRecordBlockers(workspace, { fsApi: hostFs({ 700: '12' }), kill: alive([700]), execFile: noPs }), []);
 });
 
-test('launch records: an unreadable start identity is taken as the agent; ps-lstart identities are compared too', (t) => {
+test('launch records: an unreadable start identity is taken as the agent; a different ps-lstart text still blocks', (t) => {
     const { workspace } = realWorkspace(t);
     writeRecords(workspace, { 'a.pid': record(700) });
     assert.equal(launchRecordBlockers(workspace, { fsApi: hostFs(), kill: alive([700]), execFile: noPs }).length, 1);
@@ -117,7 +118,13 @@ test('launch records: an unreadable start identity is taken as the agent; ps-lst
         return `S    ${start}\n`;
     };
     assert.equal(launchRecordBlockers(workspace, { fsApi: hostFs(), kill: alive([701]), execFile: ps('Tue Oct 27  09:00:00 2026') }).length, 1);
-    assert.deepEqual(launchRecordBlockers(workspace, { fsApi: hostFs(), kill: alive([701]), execFile: ps('Tue Oct 27 10:00:00 2026') }), []);
+    // Another locale or time zone renders the same start differently, so a
+    // different text is no proof that the PID was reused.
+    assert.equal(launchRecordBlockers(workspace, { fsApi: hostFs(), kill: alive([701]), execFile: ps('Di. 27 Okt. 09:00:00 2026') }).length, 1);
+    assert.equal(launchRecordBlockers(workspace, { fsApi: hostFs(), kill: alive([701]), execFile: ps('Tue Oct 27 07:00:00 2026') }).length, 1);
+    // A linux-proc record read where only ps answers names an in-Box PID.
+    writeRecords(workspace, { 'c.pid': record(702) });
+    assert.deepEqual(launchRecordBlockers(workspace, { fsApi: hostFs(), kill: alive([702]), execFile: () => 'S Tue Oct 27 09:00:00 2026' }), []);
 });
 
 test('launch records: a record that cannot be parsed blocks, naming the file to inspect', (t) => {
@@ -158,22 +165,21 @@ test('--allow-host-process excuses exactly a masked agent seen by the check; an 
 test('containers: a running Box or host agent container of this workspace blocks; others do not', (t) => {
     const { workspace } = realWorkspace(t);
     const identity = buildWorkspaceIdentity(workspace);
-    const real = fs.realpathSync(workspace);
     const container = (labels, { running = true, id = 'c'.repeat(64), name = 'other' } = {}) => ({
         id, name, running, labels, mounts: [{ type: 'bind', source: workspace, destination: '/w', rw: true }],
     });
     const box = { [BOX_LABELS.pathHash]: identity.pathHash, [BOX_LABELS.role]: 'box' };
     const agent = (hash) => ({ 'io.assistos.ploinky.managed': '1', 'io.assistos.ploinky.workspace': hash });
-    assert.equal(agentWorkspaceHash(real), agentWorkspaceHash(fs.realpathSync(workspace)));
-    assert.match(containerBlockers(identity, real, [container(box)])[0].reason, /a Box of this workspace/);
-    assert.match(containerBlockers(identity, real, [container(agent(agentWorkspaceHash(real)))])[0].reason,
+    assert.equal(agentWorkspaceHash(workspace), workspaceNetworkIdentity(workspace).hash);
+    assert.match(containerBlockers(identity, [container(box)])[0].reason, /a Box of this workspace/);
+    assert.match(containerBlockers(identity, [container(agent(agentWorkspaceHash(workspace)))])[0].reason,
         /a Ploinky agent container of this workspace/);
-    assert.equal(containerBlockers(identity, real, [container(box, { running: false })]).length, 0, 'a stopped Box');
-    assert.equal(containerBlockers(identity, real, [container({ [BOX_LABELS.pathHash]: 'f'.repeat(12) })]).length, 0, 'another workspace\'s Box');
-    assert.equal(containerBlockers(identity, real, [container(agent('0'.repeat(12)))]).length, 0, 'another workspace\'s agent');
-    assert.equal(containerBlockers(identity, real, [container({ ...agent(agentWorkspaceHash(real)), 'io.assistos.ploinky.managed': '0' })]).length, 0,
+    assert.equal(containerBlockers(identity, [container(box, { running: false })]).length, 0, 'a stopped Box');
+    assert.equal(containerBlockers(identity, [container({ [BOX_LABELS.pathHash]: 'f'.repeat(12) })]).length, 0, 'another workspace\'s Box');
+    assert.equal(containerBlockers(identity, [container(agent('0'.repeat(12)))]).length, 0, 'another workspace\'s agent');
+    assert.equal(containerBlockers(identity, [container({ ...agent(agentWorkspaceHash(workspace)), 'io.assistos.ploinky.managed': '0' })]).length, 0,
         'an unmanaged container');
-    assert.equal(containerBlockers(identity, real, [container({})]).length, 0, 'an unlabelled container binding the workspace');
+    assert.equal(containerBlockers(identity, [container({})]).length, 0, 'an unlabelled container binding the workspace');
     assert.throws(() => gate(hostFs()).assert(identity, { view: [container(box, { name: 'box' })] }),
         /container box: it is a Box of this workspace/);
 });

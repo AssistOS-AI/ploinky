@@ -6,7 +6,6 @@ import path from 'node:path';
 import { BOX_LABELS } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createLockLiveness } from '../lockLiveness.mjs';
-import { realpathOfNearestExisting } from './paths.mjs';
 
 // Quiescence gate (plan D3). A transaction that adopts a workspace, creates or
 // recreates its Box, or creates a Box data path first proves that no other
@@ -41,14 +40,20 @@ function activeError(message, blockers) {
     });
 }
 
-/** The workspace hash of host agent container labels: the first 12 hex digits of SHA-256 of the real path. */
-export function agentWorkspaceHash(workspaceReal) {
-    return crypto.createHash('sha256').update(String(workspaceReal)).digest('hex').slice(0, 12);
+/**
+ * The workspace hash of host agent container labels, computed as
+ * `workspaceNetworkIdentity` does: the first 12 hex digits of SHA-256 of the
+ * native real path (its canonical letter case on macOS).
+ */
+export function agentWorkspaceHash(workspaceRoot) {
+    let canonical = path.resolve(workspaceRoot);
+    try { canonical = fs.realpathSync.native(canonical); } catch (_) {}
+    return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 12);
 }
 
 /** Running containers of this workspace: its Box, or a host agent container. */
-export function containerBlockers(identity, workspaceReal, view, { excludeContainerIds = [] } = {}) {
-    const agentHash = agentWorkspaceHash(workspaceReal);
+export function containerBlockers(identity, view, { excludeContainerIds = [] } = {}) {
+    const agentHash = agentWorkspaceHash(identity.workspaceRoot);
     const blockers = [];
     for (const container of view || []) {
         if (!container.running || excludeContainerIds.includes(container.id)) continue;
@@ -124,10 +129,17 @@ export function launchRecordBlockers(workspaceRoot, { fsApi = fs, execFile = exe
         } catch (error) {
             if (error?.code === 'ESRCH') continue;
         }
-        // A PID that now belongs to another process is not the recorded agent.
+        // A PID that now belongs to another process is not the recorded agent:
+        // `linux-proc` start ticks prove that, as does a token of the other
+        // kind (the record of an agent inside the Box, read on a macOS host).
+        // `ps-lstart` text depends on the locale and time zone of the process
+        // that ran ps, so a mismatch there proves nothing and still blocks.
         // A start identity that cannot be read is taken as the agent.
         const current = processIdentity(record.pid, fsApi, execFile);
-        if (record.identity && current && current !== record.identity) continue;
+        if (record.identity && current && current !== record.identity) {
+            const kind = (token) => token.slice(0, token.indexOf(':') + 1);
+            if (kind(current) !== kind(record.identity) || current.startsWith('linux-proc:')) continue;
+        }
         if (record.masked) {
             blockers.push({ kind: 'process', pid: record.pid, reason: `its launch record ${record.file} names a running agent` });
             continue;
@@ -167,9 +179,8 @@ export function createQuiescenceGate({
     // before it stops the old Box: that Box is not counted. The full check
     // after the stop decides.
     function assert(identity, { view = [], excludeContainerIds = [] } = {}) {
-        const workspaceReal = realpathOfNearestExisting(identity.workspaceRoot, fsApi);
         const found = [
-            ...containerBlockers(identity, workspaceReal, view, { excludeContainerIds }),
+            ...containerBlockers(identity, view, { excludeContainerIds }),
             ...launchRecordBlockers(identity.workspaceRoot, { fsApi, execFile, kill }),
         ];
         const blocking = [];
