@@ -562,7 +562,7 @@ function createAgentClient(baseUrl, options = {}) {
                 stopTaskPoller(taskId);
                 callback({
                     id: taskId,
-                    status: 'failed',
+                    status: 'not_found',
                     error: 'task not found'
                 });
                 return;
@@ -578,7 +578,7 @@ function createAgentClient(baseUrl, options = {}) {
                 const status = typeof task.status === 'string' ? task.status : null;
                 const logSeqValue = Number(task?.logSeq);
                 const logSeq = Number.isFinite(logSeqValue) ? logSeqValue : null;
-                const isTerminal = status === 'completed' || status === 'failed';
+                const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'not_found';
                 const statusChanged = poller.lastStatus !== status;
                 const logChanged = poller.lastLogSeq !== logSeq;
                 if (statusChanged) {
@@ -910,9 +910,10 @@ function createAgentClient(baseUrl, options = {}) {
                 const status = typeof task.status === 'string' ? task.status.toLowerCase() : '';
                 if (status === 'completed') {
                     resolve(task);
-                } else if (status === 'failed') {
-                    const error = new Error(task.error || 'Task failed');
+                } else if (status === 'failed' || status === 'cancelled' || status === 'not_found') {
+                    const error = new Error(task.error || (status === 'failed' ? 'Task failed' : `Task ${task.id || 'execution'} ${status}`));
                     error.task = task;
+                    error.taskStatus = status;
                     reject(error);
                 }
             }, { statusPath: statusAgent ? `/${statusAgent}/task` : undefined });
