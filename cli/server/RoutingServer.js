@@ -112,6 +112,7 @@ import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { WebttySessionManager } from './webtty/sessionManager.mjs';
 import { WebttyHomeProfileProvider } from './webtty/homeProfileProvider.mjs';
 import { captureEdgeRoutingLease } from '../sandbox/edgeGeneration.js';
+import { refusalHeaders, routeRefusalCause } from './proxy/refusalMarker.js';
 import { onAuthenticatedRequestDecision } from './auth/authenticatedRequestEvents.mjs';
 import { buildAgentWorkerEnvironment } from './webtty/agentWorkerEnvironment.mjs';
 import {
@@ -363,7 +364,7 @@ async function handleRoutedAggregateAgentCard(req, res, routePlan) {
         return;
     }
     if (!routePlan?.lease?.commit?.()) {
-        sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+        sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
         return;
     }
     const apiRoutes = routePlan.lease.snapshot?.routing?.routes || {};
@@ -384,7 +385,7 @@ async function handleRoutedAggregateAgentCard(req, res, routePlan) {
     const agents = [];
     const errors = [];
     if (results.some((result) => result?.generationChanged)) {
-        sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+        sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' }); // unmarked: the fan-out above may already have dialed other agents
         return;
     }
     for (const result of results) {
@@ -449,13 +450,18 @@ async function processRequest(req, res) {
             res,
             routePlan.status || 404,
             { error: routePlan.code || 'route_denied' },
-            { 'Cache-Control': 'no-store', ...proofHeaders, ...(routePlan.retryAfterSeconds ? { 'Retry-After': String(routePlan.retryAfterSeconds) } : {}) },
+            {
+                'Cache-Control': 'no-store',
+                ...refusalHeaders('route', routeRefusalCause(routePlan.code)),
+                ...proofHeaders,
+                ...(routePlan.retryAfterSeconds ? { 'Retry-After': String(routePlan.retryAfterSeconds) } : {}),
+            },
         );
         return;
     }
     if (routePlan.kind === 'mount-redirect') {
         if (!commitRoutePlan(routePlan)) {
-            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
             return;
         }
         res.writeHead(302, { Location: routePlan.location, 'Cache-Control': 'no-store', 'Content-Length': 0 });
@@ -652,7 +658,7 @@ async function processRequest(req, res) {
             return;
         }
         if (!commitRoutePlan(routePlan)) {
-            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
             return;
         }
         try {
@@ -714,7 +720,7 @@ async function processRequest(req, res) {
             return;
         }
         if (!commitRouteGeneration(routePlan)) {
-            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
             return;
         }
     }
@@ -870,7 +876,7 @@ async function processPrivateRequest(req, res) {
     }
     if (routePlan.kind === 'private-operation' && routePlan.operation === 'turn-credentials') {
         if (!commitRoutePlan(routePlan)) {
-            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
             return;
         }
         try {
@@ -907,7 +913,7 @@ async function processPrivateRequest(req, res) {
     }
     if (routePlan.kind === 'private-operation' && routePlan.operation === 'workspace-metrics') {
         if (!commitRoutePlan(routePlan)) {
-            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
             return;
         }
         streamWorkspaceMetrics(res, { isAuthorized: () => routePlan.lease?.isCurrent?.() === true });
@@ -915,7 +921,7 @@ async function processPrivateRequest(req, res) {
     }
     if (routePlan.kind === 'private-operation' && routePlan.operation === 'workspace-logs') {
         if (!commitRoutePlan(routePlan)) {
-            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
             return;
         }
         try {

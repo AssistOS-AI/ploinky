@@ -112,8 +112,15 @@ function poolError(code, message, extra = {}) {
     return error;
 }
 
+// `dispatched: false` is set here for a refusal raised before any attempt of
+// this request reached post() (a session open or the synchronous check ahead of
+// http.request). request() clears it when an earlier attempt of the same
+// request already POSTed, so a later stale lease on the retry path never
+// claims that nothing was dispatched.
 function generationChanged() {
-    return poolError(EDGE_GENERATION_CHANGED, 'edge routing generation changed before upstream connection');
+    return poolError(EDGE_GENERATION_CHANGED, 'edge routing generation changed before upstream connection', {
+        dispatched: false,
+    });
 }
 
 function isJsonContentType(headers) {
@@ -664,6 +671,7 @@ export function createUpstreamSessionPool({
             const authorization = typeof supplied?.authorization === 'string' ? supplied.authorization : '';
             const id = entry.nextId++;
             counters.requests += 1;
+            refusal.posted = true;
             const response = await post(entry, { jsonrpc: '2.0', id, method, params: params ?? {} }, {
                 sessionId: entry.sessionId,
                 authorization,
@@ -718,9 +726,10 @@ export function createUpstreamSessionPool({
         }
         const effectiveTimeoutMs = parsePositiveInt(timeoutMs, upstreamTimeoutForMethod(method));
         claimSlot(key);
+        let reachedPost = false;
         for (let attemptIndex = 0; ; attemptIndex += 1) {
             assertOpen();
-            const refusal = { byCaller: false };
+            const refusal = { byCaller: false, posted: false };
             try {
                 return await attempt({
                     key,
@@ -734,6 +743,10 @@ export function createUpstreamSessionPool({
                     timeoutMs: effectiveTimeoutMs,
                 });
             } catch (error) {
+                if (refusal.posted) reachedPost = true;
+                // A stale lease after an earlier attempt's POST must not claim
+                // that this request was never dispatched.
+                if (reachedPost && error?.code === EDGE_GENERATION_CHANGED) delete error.dispatched;
                 if (refusal.byCaller) throw error;
                 assertOpen();
                 if (!error?.retryable || attemptIndex >= 1) throw error;

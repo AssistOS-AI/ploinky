@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Readable } from 'node:stream';
+import http from 'node:http';
+import { PassThrough, Readable } from 'node:stream';
 
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { signAgentAssertion } from '../../Agent/lib/agentAssertion.mjs';
@@ -135,7 +136,11 @@ function makeJsonResponse() {
     return {
         statusCode: null,
         headers: null,
+        set: {},
         body: '',
+        setHeader(name, value) {
+            this.set[String(name).toLowerCase()] = value;
+        },
         writeHead(statusCode, headers) {
             this.statusCode = statusCode;
             this.headers = headers;
@@ -333,6 +338,36 @@ test('delegated task cancellation refuses to dial after its edge generation chan
     assert.equal(beforeDialCalls, 1);
     assert.equal(res.statusCode, 503);
     assert.deepEqual(JSON.parse(res.body), { error: 'edge_generation_changed' });
+    assert.equal(res.set['x-ploinky-refusal'], 'v=1; stage=relay; cause=edge-generation-changed');
+});
+
+test('delegated task cancellation never forwards an upstream marker', async (t) => {
+    const taskId = 'task-cancel-forged-marker';
+    const upstream = http.createServer((request, response) => {
+        request.resume();
+        response.writeHead(200, { 'Content-Type': 'application/json', 'X-Ploinky-Refusal': 'v=1; stage=route; cause=edge-generation-inactive' });
+        response.end('{"ok":true}');
+    });
+    await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    t.after(() => upstream.close());
+    const assertion = signAgentAssertion({
+        method: 'POST', path: '/task/cancel', targetAgent: TARGET_ROUTE, tool: '__task_cancel__',
+        argumentsObj: { taskId }, env: envFor(SOURCE_AGENT),
+    });
+    const req = makeJsonRequest({ assertion, body: { taskId } });
+    const res = new PassThrough();
+    const captured = { statusCode: 0, headers: {}, body: '' };
+    res.writeHead = (statusCode, headers) => { captured.statusCode = statusCode; captured.headers = headers; };
+    res.setHeader = () => {};
+    const finished = new Promise(resolve => res.on('end', resolve));
+    res.on('data', chunk => { captured.body += chunk; });
+    await handleDelegatedAgentTaskCancel({
+        req, res, route: { hostPort: upstream.address().port }, agentName: TARGET_ROUTE, beforeDial: () => true,
+    });
+    await finished;
+    assert.equal(captured.statusCode, 200);
+    assert.equal(Object.keys(captured.headers).some(name => name.toLowerCase() === 'x-ploinky-refusal'), false);
+    assert.equal(captured.body, '{"ok":true}');
 });
 
 test('mcp proxy rejects a valid grant from the wrong source agent', () => {

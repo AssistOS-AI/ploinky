@@ -592,7 +592,9 @@ export class RuntimeRelayManager {
         const totalLimit = limits.concurrentStreamsTotal || this.totalLimit;
         const agentCount = this.agentActive.get(agentId) || 0;
         if (this.totalActive >= totalLimit || agentCount >= perAgentLimit) {
-            throw new Error('runtimeRelay: concurrency limit exceeded');
+            const error = new Error('runtimeRelay: concurrency limit exceeded');
+            error.code = 'RELAY_BUSY';
+            throw error;
         }
         this.totalActive += 1;
         this.agentActive.set(agentId, agentCount + 1);

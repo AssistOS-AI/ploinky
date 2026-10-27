@@ -6,6 +6,7 @@ import { measureHeaderBytes, sanitizeRequestHeaders } from './sanitizeRequestHea
 import { sanitizeResponseHeaders } from './sanitizeResponseHeaders.js';
 import { recordProxyOutcome } from './recordProxyOutcome.js';
 import { createRelayHttpAgent, proxyErrorStatus, RelayDuplex } from './executeHttpPlan.js';
+import { RELAY_PHASE, relayRefusalFor } from './refusalMarker.js';
 
 export class WebSocketFrameLimitTransform extends Transform {
     constructor({ frameBytes, messageBytes } = {}) {
@@ -86,9 +87,12 @@ export class WebSocketFrameLimitTransform extends Transform {
     }
 }
 
-function rejectSocket(socket, status = 403) {
+function rejectSocket(socket, status = 403, refusal = null) {
     const reason = http.STATUS_CODES[status] || 'Request Failed';
-    try { socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n`); } catch (_) {}
+    const marker = refusal
+        ? Object.entries(refusal).map(([name, value]) => `${name}: ${value}\r\n`).join('')
+        : '';
+    try { socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nCache-Control: no-store\r\n${marker}\r\n`); } catch (_) {}
 }
 
 function assertWebSocketOrigin(req, plan) {
@@ -133,6 +137,8 @@ export async function executeWebSocketPlan({
     let clientFrames;
     let targetFrames;
     let leaseOutcome = 'uncommitted';
+    // Dispatch position for the refusal marker (see refusalMarker.js).
+    let relayPhase = RELAY_PHASE.PREPARE;
     // Node leaves an upgraded socket flowing with no 'error' listener, so a
     // client reset during any await below would be uncaught. This listener
     // only absorbs the event; teardown is owned by the paths below.
@@ -151,14 +157,17 @@ export async function executeWebSocketPlan({
         if (measureHeaderBytes(headers) > finalized.limits.requestHeaderBytes) {
             throw Object.assign(new Error('proxy: request header limit exceeded'), { code: 'REQUEST_TOO_LARGE' });
         }
+        relayPhase = RELAY_PHASE.CHECKOUT;
         channel = await relayManager.checkout({ plan: finalized, lease, authorized: true });
         leaseOutcome = 'committed';
+        relayPhase = RELAY_PHASE.OPEN;
         const relayStream = await channel.openRequest({
             plan: { ...finalized, transport: 'websocket' },
             bodyMode: 'stream',
             bodyHash: '',
             headers,
         });
+        relayPhase = RELAY_PHASE.OPENED;
         const connection = new RelayDuplex(relayStream);
         relayAgent = createRelayHttpAgent(connection);
         await new Promise((resolve, reject) => {
@@ -301,7 +310,7 @@ export async function executeWebSocketPlan({
         });
         channel?.close();
         lease?.release?.();
-        rejectSocket(socket, proxyErrorStatus(error));
+        rejectSocket(socket, proxyErrorStatus(error), relayRefusalFor(error, relayPhase));
         return false;
     }
 }

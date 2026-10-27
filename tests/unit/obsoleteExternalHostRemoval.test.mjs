@@ -37,7 +37,9 @@ const SEARCH_ROOTS = ['cli', 'ploinky-box', 'tests/unit', 'README.md'];
 const BASE_FILES = {
     // 8c0eec56 adds only the authenticated-request event import and publication;
     // the removed admission logic has not returned. Keep the exact-file guard.
-    'cli/server/authHandlers/authContext.js': '3304ae9c746b1cec40c3525e9c69b877db4b62fef262496f6182406241877850',
+    // The pre-forward refusal marker adds one import and one header line on the
+    // stale-lease refusal; it adds no admission logic.
+    'cli/server/authHandlers/authContext.js': '9843fbf7ab346e5f94e678545c688deef80ce775b121a14449faf27def73b421',
     'ploinky-box/cloudflared/runtime.mjs': 'bb50780910dfe09c237f1930eb034947752adc1bb701d6fd5126a5945f886a2a',
     'ploinky-box/cloudflared/status.mjs': '34e5055dddf9073890e5643ada17176295014225b5a9d183439f4cb94636b2a0',
     'ploinky-box/cloudflared/journal.mjs': '4969c853c230668265cc05f7276d95e3ee677ae2e77de969881295de7622799a',

@@ -16,6 +16,7 @@ import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { ROUTING_FILE } from '../utils/config.js';
 import { deriveSubkey } from '../utils/security/masterKey.js';
 import { mintUserDelegationGrant } from './mcp-proxy/userDelegationGrant.js';
+import { refusalHeaders, stripUpstreamRefusalMarker } from './proxy/refusalMarker.js';
 import { createMcpSessionOwner, inspectMcpSession, matchesMcpSessionOwner } from './mcp-proxy/sessionOwnership.mjs';
 
 const ROUTER_PROTOCOL_VERSION = '2025-06-18';
@@ -52,7 +53,7 @@ export function postJsonToAgent(targetPort, payload, res, agentPath, extraHeader
             }
         };
         const upstream = http.request(opts, upstreamRes => {
-            res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+            res.writeHead(upstreamRes.statusCode || 200, stripUpstreamRefusalMarker(upstreamRes.headers));
             upstreamRes.pipe(res, { end: true });
         });
         upstream.on('error', err => {
@@ -80,7 +81,7 @@ export function proxyMcpPassthrough(req, res, targetPort, agentPath) {
     };
 
     const upstream = http.request(opts, upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+        res.writeHead(upstreamRes.statusCode || 200, stripUpstreamRefusalMarker(upstreamRes.headers));
         upstreamRes.pipe(res, { end: true });
     });
 
@@ -100,7 +101,13 @@ export function proxyMcpPassthrough(req, res, targetPort, agentPath) {
 
 function rejectStaleLease(res) {
     if (!res.headersSent) {
-        res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        // The lease check runs in createConnection, before any socket exists:
+        // nothing of this request was dispatched.
+        res.writeHead(503, {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store',
+            ...refusalHeaders('relay', 'edge-generation-changed'),
+        });
     }
     res.end(JSON.stringify({ error: 'edge_generation_changed' }));
 }
@@ -159,7 +166,7 @@ function bindUpstreamToDownstream(res, upstream) {
     });
     if (res.destroyed && !res.writableEnded) upstream.destroy();
     return upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+        res.writeHead(upstreamRes.statusCode || 200, stripUpstreamRefusalMarker(upstreamRes.headers));
         pipeline(upstreamRes, res, () => {});
     };
 }
@@ -592,7 +599,7 @@ export function proxyApi(req, res, targetPort, identityHeaders = {}) {
             }
         };
         const upstream = http.request(opts, upstreamRes => {
-            res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+            res.writeHead(upstreamRes.statusCode || 200, stripUpstreamRefusalMarker(upstreamRes.headers));
             upstreamRes.pipe(res, { end: true });
         });
         upstream.on('error', err => {
@@ -1301,7 +1308,14 @@ export async function handleRouterMcp(req, res, routePlan) {
                 }
             } : null;
             const { statusCode, body } = await executeRouterCommand(command, payload, req, routePlan, beforeDispatch);
-            res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+            // EDGE_GENERATION_CHANGED reaches this body only from a lease check
+            // that runs before the command's non-idempotent upstream request
+            // (a tool call or resource read) is sent. Read-only discovery calls
+            // to other agents may already have been sent.
+            const refusal = statusCode === 503 && body?.error === 'edge_generation_changed'
+                ? refusalHeaders('relay', 'edge-generation-changed')
+                : {};
+            res.writeHead(statusCode, { 'Content-Type': 'application/json', ...refusal });
             res.end(JSON.stringify(body));
         } catch (err) {
             const message = err && err.message ? err.message : String(err || 'unknown error');

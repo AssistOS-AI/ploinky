@@ -23,6 +23,7 @@ import { policy } from '../policy/index.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
 import { MCP_SESSION_INVALID_ERROR } from './sessionErrors.js';
+import { REFUSAL_HEADER, refusalHeaders, refusalHeaderValue, stripUpstreamRefusalMarker } from '../proxy/refusalMarker.js';
 import { createMcpSessionOwner, inspectMcpSession, matchesMcpSessionOwner, readMcpSessionHeader } from './sessionOwnership.mjs';
 
 const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
@@ -606,6 +607,8 @@ export async function handleDelegatedAgentTaskCancel({
             path: TASK_CANCEL_PATH,
         });
         if (beforeDial && await Promise.resolve(beforeDial()) !== true) {
+            // beforeDial runs before http.request below: nothing was dispatched.
+            res.setHeader?.(REFUSAL_HEADER, refusalHeaderValue('relay', 'edge-generation-changed'));
             sendJson(res, 503, { error: 'edge_generation_changed' });
             return;
         }
@@ -622,7 +625,7 @@ export async function handleDelegatedAgentTaskCancel({
                 authorization: `Bearer ${context.token}`,
             },
         }, (response) => {
-            res.writeHead(response.statusCode || 502, response.headers);
+            res.writeHead(response.statusCode || 502, stripUpstreamRefusalMarker(response.headers));
             response.pipe(res);
         });
         upstream.on('error', () => sendJson(res, 502, { error: 'task_cancel_upstream_failed' }));
@@ -668,12 +671,12 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
         return headers;
     };
 
-    const sendResponse = (statusCode, body, sessionId) => {
+    const sendResponse = (statusCode, body, sessionId, extraHeaders = {}) => {
         if (sessionId && !matchesMcpSessionOwner(agentSessionStore.get(sessionId), owner)) {
             body = { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } };
             sessionId = null;
         }
-        res.writeHead(statusCode, { 'Content-Type': 'application/json', ...headersForSession(sessionId) });
+        res.writeHead(statusCode, { 'Content-Type': 'application/json', ...headersForSession(sessionId), ...extraHeaders });
         res.end(JSON.stringify(body));
     };
 
@@ -824,7 +827,12 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
         const messageText = err?.notReady
             ? `Agent '${agentName}' is still starting. Try again in a moment.`
             : (err && err.message ? err.message : String(err || 'unknown error'));
-        sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32000, message: messageText } }, sessionIdHeader);
+        // Marked only for a stale lease the pool proved was refused before the
+        // request's own POST (`dispatched === false`); an unknown or true
+        // dispatch state is never marked, so a caller must not resend.
+        const staleBeforeDispatch = err?.code === 'EDGE_GENERATION_CHANGED' && err.dispatched === false;
+        sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32000, message: messageText } }, sessionIdHeader,
+            staleBeforeDispatch ? refusalHeaders('relay', 'edge-generation-changed') : {});
     } finally {
         await upstream.close();
     }

@@ -7,6 +7,7 @@ import { finalizePlanAfterAdmission } from './RoutePlan.js';
 import { measureHeaderBytes, sanitizeRequestHeaders } from './sanitizeRequestHeaders.js';
 import { sanitizeResponseHeaders } from './sanitizeResponseHeaders.js';
 import { recordProxyOutcome } from './recordProxyOutcome.js';
+import { RELAY_PHASE, relayRefusalFor } from './refusalMarker.js';
 
 const READ_ONLY = new Set(['GET', 'HEAD', 'OPTIONS']);
 const ABANDONED_REQUEST_CLOSE_GRACE_MS = 1_000;
@@ -206,7 +207,17 @@ export function proxyErrorStatus(error) {
     return 502;
 }
 
-function sendError(res, error, { abandonedRequest } = {}) {
+// Body for a Router-authored relay refusal. Chosen by error code only; the
+// message regexes in proxyErrorStatus never select a body or a marker cause.
+function proxyErrorBody(error, status) {
+    if (error?.code === 'EDGE_GENERATION_CHANGED') return 'edge_generation_changed';
+    if (error?.code === 'RELAY_BUSY') return 'relay_busy';
+    return status === 403 ? 'request_rejected'
+        : status === 413 ? 'request_too_large'
+            : status === 504 ? 'upstream_timeout' : 'upstream_unavailable';
+}
+
+function sendError(res, error, { abandonedRequest, refusal } = {}) {
     let closeTimer;
     const closeRequest = () => {
         clearTimeout(closeTimer);
@@ -224,7 +235,7 @@ function sendError(res, error, { abandonedRequest } = {}) {
         return;
     }
     const status = proxyErrorStatus(error);
-    const headers = { 'content-type': 'application/json', 'cache-control': 'no-store' };
+    const headers = { 'content-type': 'application/json', 'cache-control': 'no-store', ...(refusal || {}) };
     if (abandonedRequest && !abandonedRequest.complete && !abandonedRequest.destroyed) {
         headers.connection = 'close';
         res.shouldKeepAlive = false;
@@ -232,10 +243,7 @@ function sendError(res, error, { abandonedRequest } = {}) {
         closeTimer.unref?.();
     }
     res.writeHead(status, headers);
-    const responseError = status === 403 ? 'request_rejected'
-        : status === 413 ? 'request_too_large'
-            : status === 504 ? 'upstream_timeout' : 'upstream_unavailable';
-    res.end(JSON.stringify({ error: responseError }), closeRequest);
+    res.end(JSON.stringify({ error: proxyErrorBody(error, status) }), closeRequest);
 }
 
 export async function executeHttpPlan({
@@ -256,6 +264,9 @@ export async function executeHttpPlan({
     let upstream;
     let bodyReader;
     let leaseOutcome = 'uncommitted';
+    // Dispatch position for the refusal marker: only failures before OPEN is
+    // written can be Router-authored pre-forward refusals.
+    let relayPhase = RELAY_PHASE.PREPARE;
     let requestBytes = 0;
     let responseBytes = 0;
     let responseStatus = 0;
@@ -375,16 +386,19 @@ export async function executeHttpPlan({
             throw Object.assign(new Error('proxy: request header limit exceeded'), { code: 'REQUEST_TOO_LARGE' });
         }
         throwIfInterrupted();
+        relayPhase = RELAY_PHASE.CHECKOUT;
         channel = await awaitSetup(
             relayManager.checkout({ plan: finalized, lease, authorized: true }),
             { onLateResolve: closeCheckout },
         );
         leaseOutcome = 'committed';
         throwIfInterrupted();
+        relayPhase = RELAY_PHASE.OPEN;
         const relayStream = await awaitSetup(
             channel.openRequest({ plan: finalized, bodyMode, bodyHash, headers }),
             { onLateResolve: () => closeCheckout(channel) },
         );
+        relayPhase = RELAY_PHASE.OPENED;
         throwIfInterrupted();
         const connection = new RelayDuplex(relayStream);
         relayAgent = createRelayHttpAgent(connection);
@@ -516,6 +530,7 @@ export async function executeHttpPlan({
         lease?.release?.();
         sendError(res, error, {
             abandonedRequest: bodyReader?.shouldCloseAfterResponse() ? req : undefined,
+            refusal: relayRefusalFor(error, relayPhase),
         });
         return false;
     } finally {

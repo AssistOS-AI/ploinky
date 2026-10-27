@@ -329,6 +329,42 @@ function newPool(t, options = {}) {
     return pool;
 }
 
+test('a stale lease on the retry path after this request was POSTed is not marked dispatched:false', async (t) => {
+    // Attempt 0 POSTs the tools/call on a dropped session (the agent answers 404);
+    // attempt 1 reopens the session and the lease is stale by then.
+    const upstream = await startFakeUpstream(t, {
+        onRpc: ({ res, message }) => {
+            if (message?.method !== 'tools/call') return false;
+            res.writeHead(404, { 'content-type': 'text/plain' });
+            res.end('no session');
+            return true;
+        },
+    });
+    const pool = newPool(t);
+    // Two checks open the session, one guards the first attempt's POST; the rest are stale.
+    let dials = 0;
+    const beforeDial = () => (++dials <= 3);
+    await assert.rejects(
+        pool.request({ key: 'retry-key', hostPort: upstream.port, method: 'tools/call', params: { name: 'x' }, beforeDial, timeoutMs: 2000 }),
+        (error) => {
+            assert.equal(error.code, 'EDGE_GENERATION_CHANGED');
+            assert.notEqual(error.dispatched, false, 'the request was already sent once');
+            return true;
+        },
+    );
+    assert.equal(upstream.log.filter((row) => row.rpc === 'tools/call').length, 1, 'the call reached the upstream');
+});
+
+test('a stale lease before any attempt POSTed keeps dispatched:false', async (t) => {
+    const upstream = await startFakeUpstream(t);
+    const pool = newPool(t);
+    await assert.rejects(
+        pool.request({ key: 'first-key', hostPort: upstream.port, method: 'tools/call', params: { name: 'x' }, beforeDial: () => false, timeoutMs: 2000 }),
+        (error) => error.code === 'EDGE_GENERATION_CHANGED' && error.dispatched === false,
+    );
+    assert.equal(upstream.log.filter((row) => row.rpc === 'tools/call').length, 0);
+});
+
 test('poolKeyForRoutePlan requires every key part and ignores the caller', () => {
     const plan = {
         routeKey: 'echoAgent',
@@ -843,13 +879,14 @@ async function proxyCall(proxy, { route, routePlan, sessionId, body, pool, waitF
     const done = new Promise((resolve) => { finish = resolve; });
     const res = {
         statusCode: 0,
+        headers: {},
         body: '',
-        writeHead(statusCode) { this.statusCode = statusCode; },
+        writeHead(statusCode, headers = {}) { this.statusCode = statusCode; this.headers = headers; },
         end(chunk = '') { this.body += String(chunk); finish(); },
     };
     await proxy.handleAgentMcpRequest(req, res, route, agentName, { beforeDial, routePlan, pool, waitForAgentReady });
     await done;
-    return { status: res.statusCode, json: JSON.parse(res.body), sessionStoreSize: proxy.agentSessionStore.size };
+    return { status: res.statusCode, headers: res.headers, json: JSON.parse(res.body), sessionStoreSize: proxy.agentSessionStore.size };
 }
 
 function proxyToolPayload(json) {
@@ -1367,6 +1404,37 @@ test('proxy: a generation change before the pooled POST fails closed and sends n
     assert.match(stale.json.error?.message || '', /edge routing generation changed/);
     assert.ok(checks >= 1);
     assert.equal(count(forwarder.log, (row) => row.rpc === 'tools/call'), callsBefore);
+    // The pool proved the lease check ran before the request's POST, so the
+    // refusal is marked; the JSON-RPC body is unchanged.
+    assert.equal(stale.headers['X-Ploinky-Refusal'], 'v=1; stage=relay; cause=edge-generation-changed');
+    assert.equal(stale.json.error.code, -32000);
+});
+
+test('proxy: a stale-lease error is marked only when the pool reports dispatched === false', async (t) => {
+    const { proxy, audience, secret } = await loadProxyFixture();
+    const { forwarder } = await startEchoAgentBehindForwarder(t, { secret, audience });
+    const readiness = readinessSpy(true);
+    const { route, routePlan } = proxyRoute(forwarder.port, 'lease-marker-states');
+    const sessionId = openRouterSession(proxy);
+    const poolThrowing = (extra) => ({
+        usesFallback: () => false,
+        isReady: () => true,
+        request: async () => {
+            throw Object.assign(new Error('edge routing generation changed'), { code: 'EDGE_GENERATION_CHANGED', ...extra });
+        },
+    });
+    for (const [label, extra, marked] of [
+        ['dispatched false', { dispatched: false }, true],
+        ['dispatched true', { dispatched: true }, false],
+        ['dispatched unknown', {}, false],
+    ]) {
+        const answer = await proxyCall(proxy, {
+            route, routePlan, sessionId, pool: poolThrowing(extra), waitForAgentReady: readiness.fn, body: toolsCall(label),
+        });
+        assert.equal(answer.json.error?.code, -32000, label);
+        assert.equal(answer.headers['X-Ploinky-Refusal'],
+            marked ? 'v=1; stage=relay; cause=edge-generation-changed' : undefined, label);
+    }
 });
 
 // ---------------------------------------------------------------------------

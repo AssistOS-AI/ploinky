@@ -11,6 +11,7 @@ import {
     createLeaseCommittedAgent,
     stripRouterIdentityHeaders,
 } from './routerHandlers.js';
+import { REFUSAL_HEADER, refusalHeaders, routeRefusalCause } from './proxy/refusalMarker.js';
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 
@@ -48,7 +49,15 @@ function statusLine(statusCode, statusMessage, headers = {}) {
     return `${lines.join('\r\n')}\r\n\r\n`;
 }
 
-function closeSocket(socket, status, message = http.STATUS_CODES[status] || 'Request Failed', headers = {}) {
+// An upstream never speaks for the Router: every x-ploinky-* header is dropped
+// from the forwarded 101, as sanitizeResponseHeaders does for proxied HTTP.
+function withoutRouterNamespaceHeaders(headers = {}) {
+    return Object.fromEntries(Object.entries(headers)
+        .filter(([name]) => !String(name).toLowerCase().startsWith('x-ploinky-')));
+}
+
+function closeSocket(socket, status, message, headers = {}) {
+    message ||= http.STATUS_CODES[status] || 'Request Failed';
     try { socket.write(statusLine(status, message, headers)); } catch (_) {}
     try { socket.destroy(); } catch (_) {}
 }
@@ -70,7 +79,7 @@ export async function handleAgentRootUpgrade({
         : resolveEdgeRoutePlan({ req, parsedUrl, listener, transport: 'websocket' });
     if (!plan?.matched) return false;
     if (!plan.ok || plan.kind !== 'agent-root') {
-        closeSocket(socket, plan?.status || 404);
+        closeSocket(socket, plan?.status || 404, undefined, refusalHeaders('route', routeRefusalCause(plan?.code)));
         return true;
     }
 
@@ -83,7 +92,8 @@ export async function handleAgentRootUpgrade({
         { routePlan: plan },
     );
     if (!access?.ok) {
-        closeSocket(socket, captured.statusCode || 403);
+        const authMarker = captured.getHeader(REFUSAL_HEADER.toLowerCase());
+        closeSocket(socket, captured.statusCode || 403, undefined, authMarker ? { [REFUSAL_HEADER]: authMarker } : {});
         return true;
     }
 
@@ -97,7 +107,7 @@ export async function handleAgentRootUpgrade({
     };
     const targetPort = Number(plan.target?.hostPort || 0);
     if (!Number.isSafeInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
-        closeSocket(socket, 503);
+        closeSocket(socket, 503, undefined, refusalHeaders('route', 'route-denied'));
         return true;
     }
     headers.host = `127.0.0.1:${targetPort}`;
@@ -135,7 +145,7 @@ export async function handleAgentRootUpgrade({
             upstreamResponse.statusCode || 101,
             upstreamResponse.statusMessage || 'Switching Protocols',
             {
-                ...upstreamResponse.headers,
+                ...withoutRouterNamespaceHeaders(upstreamResponse.headers),
                 ...(captured.getHeader('set-cookie')
                     ? { 'set-cookie': captured.getHeader('set-cookie') }
                     : {}),
@@ -168,7 +178,14 @@ export async function handleAgentRootUpgrade({
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        closeSocket(socket, error?.code === 'EDGE_GENERATION_CHANGED' ? 503 : 502);
+        // Only the lease check in createLeaseCommittedAgent, which runs before
+        // a socket exists, carries this code; every other failure stays unmarked.
+        closeSocket(
+            socket,
+            error?.code === 'EDGE_GENERATION_CHANGED' ? 503 : 502,
+            undefined,
+            error?.code === 'EDGE_GENERATION_CHANGED' ? refusalHeaders('relay', 'edge-generation-changed') : {},
+        );
     });
     upstream.end();
     return true;

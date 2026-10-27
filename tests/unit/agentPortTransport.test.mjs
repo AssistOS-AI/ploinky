@@ -378,7 +378,10 @@ test('a stale per-OPEN generation lease returns HTTP 503 without upstream constr
     });
     assert.equal(handled, false);
     assert.equal(response.statusCode, 503);
-    assert.deepEqual(JSON.parse(response.body.toString('utf8')), { error: 'upstream_unavailable' });
+    // Intentional contract change: a stale lease is no longer folded into
+    // upstream_unavailable; the Router names it and marks the refusal.
+    assert.deepEqual(JSON.parse(response.body.toString('utf8')), { error: 'edge_generation_changed' });
+    assert.equal(response.headers['X-Ploinky-Refusal'], 'v=1; stage=relay; cause=edge-generation-changed');
     assert.equal(released, true);
 });
 
@@ -414,6 +417,7 @@ test('a stale per-OPEN generation lease rejects a WebSocket upgrade with 503', a
     });
     assert.equal(handled, false);
     assert.match(socket.body.toString('utf8'), /^HTTP\/1\.1 503 Service Unavailable\r\n/);
+    assert.match(socket.body.toString('utf8'), /\r\nX-Ploinky-Refusal: v=1; stage=relay; cause=edge-generation-changed\r\n/);
     assert.equal(released, true);
 });
 

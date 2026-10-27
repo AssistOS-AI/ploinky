@@ -18,6 +18,7 @@ import { manifestWebchatDeclaration, webchatRouteProvenance } from '../webchat/c
 import { edgeHostServiceRoutes, edgeWebchatTargets } from '../../sandbox/edgeGeneration.js';
 import { admitPublicMcpTarget } from '../mcp-proxy/sessionOwnership.mjs';
 import { isAgentRootPlan } from '../edgeRoutePlan.js';
+import { REFUSAL_HEADER, refusalHeaderValue } from '../proxy/refusalMarker.js';
 import { isSsoProviderUnavailable, recordSsoAdmission } from '../auth/ssoAdmission.js';
 import {
     appendLog,
@@ -1027,6 +1028,8 @@ function finalizeAuthenticatedRequest(req, res, parsedUrl, authContext, options,
 
 async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, options = {}) {
     if (options.routePlan?.lease?.commit && options.routePlan.lease.commit() !== true) {
+        // Auth-stage stale lease: refused before any upstream byte exists.
+        res.setHeader?.(REFUSAL_HEADER, refusalHeaderValue('auth', 'edge-generation-changed'));
         sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
         return { ok: false, error: 'edge_generation_changed' };
     }
