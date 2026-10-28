@@ -649,13 +649,25 @@ function collectStrictManifestPolicyEntries(routing, manifests) {
 }
 
 function collectWorkspaceLogConsumers(routing, manifests, agents) {
+    return collectRouterAccessConsumers(routing, manifests, agents, 'workspaceLogs');
+}
+
+// Agents whose manifest sets routerAccess.agentExec may run processes in global-mode agent containers
+// through the private agent-exec route (RoboTeam runs robot phases there). The callers are derived
+// from the verified generation's own routing, manifests and agents when a request arrives, not stored
+// in compiled.security, so generations saved before this capability still verify unchanged.
+export function agentExecConsumersOf(generation) {
+    return collectRouterAccessConsumers(generation?.routing || {}, generation?.manifests || {}, generation?.agents || {}, 'agentExec');
+}
+
+function collectRouterAccessConsumers(routing, manifests, agents, field) {
     const consumers = [];
     for (const [routeKey, route] of Object.entries(routing.routes || {})) {
         if (!route || route.disabled) continue;
-        const value = manifests?.[routeKey]?.routerAccess?.workspaceLogs;
+        const value = manifests?.[routeKey]?.routerAccess?.[field];
         if (value === undefined || value === null || value === false) continue;
         if (value !== true) {
-            throw edgeError(`manifest(${routeKey}).routerAccess.workspaceLogs must be a boolean`);
+            throw edgeError(`manifest(${routeKey}).routerAccess.${field} must be a boolean`);
         }
         consumers.push(resolveEnabledIdentity({
             routeKey,

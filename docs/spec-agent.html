@@ -173,6 +173,10 @@
                                 <td>Boolean capability for the generation-bound private Router/Policy log-file operation. It does not publish a route or grant arbitrary filesystem access.</td>
                             </tr>
                             <tr>
+                                <td><code>routerAccess.agentExec</code></td>
+                                <td>Boolean capability for the private agent-exec route: the agent may run non-interactive processes inside running global-mode agent containers, without their environment or credentials and with a writable workspace cwd at the same path (RoboTeam robot phases).</td>
+                            </tr>
+                            <tr>
                                 <td><code>providesConfig</code> / <code>configProviders</code></td>
                                 <td>Declares or selects generic host-side startup config providers. Outputs are allowlisted and persisted by Ploinky before final-graph enablement; providers cannot own edge publication, topology, or Router credentials.</td>
                             </tr>

@@ -323,3 +323,38 @@ test('TURN broker resolves only the captured encrypted-store handle', () => {
         rateLimiter: createTurnCredentialRateLimiter(),
     }), (error) => error.code === 'TURN_SECRET_STORE_UNAVAILABLE' && error.status === 503);
 });
+
+test('agent exec admits only callers compiled from routerAccess.agentExec, on its exact paths', () => {
+    const plan = (pathname, search = '') => ({
+        ok: true,
+        listener: 'private',
+        kind: 'private-operation',
+        operation: 'agent-exec',
+        pathname,
+        parsedUrl: new URL(`http://host.containers.internal${pathname}${search}`),
+        snapshot: snapshot(),
+    });
+    const start = plan('/api/edge/agent-exec');
+    const body = Buffer.from('{}');
+    assert.throws(() => authorizePrivateRoutePlan({
+        req: signedRequest(start, body), plan: start, body, assertionCache: createMemoryReplayCache(),
+    }), (error) => error.code === 'PRIVATE_CALLER_DENIED');
+    // The callers come from the generation's manifests, not from a stored compiled field.
+    const granted = (value) => {
+        value.snapshot.routing = { routes: { beta: { repo: 'fixtures', agent: 'beta', container: 'beta-container' } } };
+        value.snapshot.manifests = { beta: { routerAccess: { agentExec: true } } };
+        return value;
+    };
+    assert.equal(authorizePrivateRoutePlan({
+        req: signedRequest(start, body), plan: granted(start), body, assertionCache: createMemoryReplayCache(),
+    }).agentId, caller.agentId);
+    const stream = granted(plan(`/api/edge/agent-exec/${'a'.repeat(32)}/stream`, '?from=3'));
+    assert.equal(authorizePrivateRoutePlan({
+        req: signedRequest(stream, Buffer.alloc(0), { method: 'GET' }), plan: stream, body: Buffer.alloc(0),
+        assertionCache: createMemoryReplayCache(),
+    }).agentId, caller.agentId);
+    const put = granted(plan('/api/edge/agent-exec'));
+    assert.throws(() => authorizePrivateRoutePlan({
+        req: signedRequest(put, body, { method: 'PUT' }), plan: put, body, assertionCache: createMemoryReplayCache(),
+    }), (error) => error.code === 'PRIVATE_CALLER_DENIED');
+});

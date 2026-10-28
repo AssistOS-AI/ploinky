@@ -927,6 +927,8 @@ async function processPrivateRequest(req, res) {
         }
         return;
     }
+    // Loaded lazily so the reviewed Router reference lines keep their positions.
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'agent-exec') return (await import('./agentExec/agentExecRoute.js')).handleAgentExecRequest({ req, res, routePlan, body, commitRoutePlan });
     req.edgeBufferedBody = body;
     if (routePlan.kind === 'agent-port') {
         await executeHttpPlan({

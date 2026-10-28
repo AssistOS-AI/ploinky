@@ -321,7 +321,7 @@ export function terminalTargetRouteBinding(routePlan) {
     return Object.freeze({ host, hostRouteKey, generation, activationId });
 }
 
-function exactCandidate(containerName, record, supportedRuntimes) {
+export function exactCandidate(containerName, record, supportedRuntimes) {
     const runtime = exactText(record?.runtime);
     const containerId = exactText(record?.containerId);
     const instanceId = exactText(record?.instanceId);
@@ -374,7 +374,7 @@ function safeAgentDisplay(candidate, mapping) {
     });
 }
 
-function assertOwnedInspection(candidate, raw, workspaceHash) {
+export function assertOwnedInspection(candidate, raw, workspaceHash) {
     const inspected = raw?.id && raw?.labels && Array.isArray(raw?.mounts)
         ? raw
         : projectTerminalContainerInspect(raw);

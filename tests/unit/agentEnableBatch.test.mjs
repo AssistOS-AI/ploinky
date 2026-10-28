@@ -544,3 +544,16 @@ test('a host re-enable makes its predecessor proof durable before the rotated re
     }
     assert.deepEqual(predecessorReceiptFiles(), []);
 });
+
+test('re-enabling an agent registered under a staged replacement name replaces that runtime instead of starting a second one', () => {
+    const canonicalName = 'ploinky_demo_scout_work_abcd1234';
+    const candidate = `${canonicalName}__candidate_6f7f2b34560c`;
+    const record = { type: 'agent', agentName: 'scout', repoName: 'demo', runMode: 'isolated' };
+    const options = { canonicalName, shortAgentName: 'scout', repoName: 'demo' };
+    assert.equal(agents.registeredEnableContainerName({ [candidate]: record }, options), candidate);
+    assert.equal(agents.registeredEnableContainerName({ [canonicalName]: record }, options), canonicalName);
+    assert.equal(agents.registeredEnableContainerName({}, options), canonicalName);
+    assert.equal(agents.registeredEnableContainerName({ [candidate]: { ...record, repoName: 'other' } }, options), canonicalName);
+    assert.equal(agents.registeredEnableContainerName({ [candidate]: record }, { ...options, alias: 'second' }), canonicalName);
+    assert.equal(agents.registeredEnableContainerName({ [`${canonicalName}x__candidate_6f7f2b34560c`]: record }, options), canonicalName);
+});

@@ -15,6 +15,7 @@ import {
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { derivePrivateAgentRequestSecret } from '../utils/security/masterKey.js';
 import { commitRoutePlan } from './edgeRoutePlan.js';
+import { agentExecConsumersOf } from '../sandbox/edgeGeneration.js';
 import { identityHardwareUnavailable, identityLeaseHardwareUnavailable } from './hardwareAvailability.mjs';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
@@ -139,6 +140,16 @@ function callerAclForPlan(plan) {
                 callers: security.workspaceLogConsumers || [],
                 methods: ['POST'],
                 paths: ['/api/edge/workspace-logs'],
+            };
+        }
+        if (plan.operation === 'agent-exec') {
+            let callers = [];
+            try { callers = agentExecConsumersOf(plan.snapshot); } catch (_) { callers = []; }
+            return {
+                operation: plan.operation,
+                callers,
+                methods: ['POST', 'GET', 'DELETE'],
+                paths: ['/api/edge/agent-exec', '/api/edge/agent-exec/*'],
             };
         }
         if (plan.operation === 'turn-credentials') {

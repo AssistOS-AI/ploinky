@@ -451,6 +451,18 @@ function resolveAgentEnableInput({
     };
 }
 
+// The container name a (re-)enable uses: the canonical name, unless the registry holds this agent under
+// a staged replacement name of it (NAME__candidate_<12 hex>), which is then the runtime it replaces.
+export function registeredEnableContainerName(map, { canonicalName, alias = '', shortAgentName, repoName }) {
+    if (alias) return canonicalName;
+    const staged = Object.keys(map || {}).find((key) => {
+        const value = map[key];
+        return value?.type === 'agent' && !value.alias && value.agentName === shortAgentName && value.repoName === repoName
+            && key !== canonicalName && key.replace(/__candidate_[a-f0-9]{12}$/i, '') === canonicalName;
+    });
+    return staged || canonicalName;
+}
+
 function planAgentEnable({
     agentName,
     mode,
@@ -484,7 +496,14 @@ function planAgentEnable({
         }
     }
     const containerBaseName = alias || shortAgentName;
-    const containerName = getAgentContainerName(containerBaseName, repoName);
+    // A staged runtime replacement keeps running under NAME__candidate_<12 hex> (see
+    // replacementCandidateContainerName), and the registry keeps that key. Re-enabling the agent,
+    // for example in another mode, must name that registered runtime as its predecessor: a fresh
+    // canonical name would leave it running on the route's host port and the new container could
+    // not bind it.
+    const containerName = registeredEnableContainerName(map, {
+        canonicalName: getAgentContainerName(containerBaseName, repoName), alias, shortAgentName, repoName,
+    });
     const routeKey = alias || shortAgentName;
     const instanceName = alias || shortAgentName;
     const manifestAuthMode = resolveManifestAuthMode(manifest);

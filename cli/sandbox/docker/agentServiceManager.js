@@ -242,6 +242,7 @@ import {
 
 import { readRuntimeCandidate, writeRuntimeCandidate, retireRuntimeCandidate } from '../runtimeCandidateStore.js';
 import { readRuntimePredecessor, retireRuntimePredecessor } from '../runtimePredecessorStore.js';
+import { PROC_UNMASK_LABEL, procUnmaskArgs, procUnmaskReuseReason } from './procUnmask.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2038,6 +2039,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (containerSecurityArgs.length) {
         args.splice(1, 0, ...containerSecurityArgs);
     }
+    const unmaskArgs = procUnmaskArgs({ runtime, runMode: launchRecord.runMode || 'isolated', descriptor: runtimeAdmission.descriptor });
+    if (unmaskArgs.length) args.splice(1, 0, ...unmaskArgs);
     const runtimePolicyArgs = renderRuntimePolicyArgs(runtimeAdmission.descriptor, { runtime });
     if (runtimePolicyArgs.length) {
         args.splice(1, 0, ...runtimePolicyArgs);
@@ -4302,6 +4305,18 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (dependencyProblem) {
             debugLog(`[ensureAgentService] ${agentName}: ${dependencyProblem}, recreating container`);
             recreateReason ||= 'dependencyGenerationChanged';
+        }
+    }
+
+    // Global-mode containers run without Podman's /proc masks (see procUnmask.js); a container
+    // created before that, or after a run-mode change, is replaced.
+    if (existingRuntimeAtEntry && runtime === 'podman') {
+        const unmaskReason = procUnmaskReuseReason({ runtime, runMode: launchRecord.runMode || 'isolated',
+            descriptor: serviceAdmission.descriptor }, getContainerLabel(containerName, PROC_UNMASK_LABEL));
+        if (unmaskReason) {
+            debugLog(`[ensureAgentService] ${agentName}: /proc mask mode changed, recreating container`);
+            if (!recreateReason) recreateDetail = 'proc mask mode changed';
+            recreateReason ||= unmaskReason;
         }
     }
 

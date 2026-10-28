@@ -877,6 +877,35 @@ export function resolveEdgeRoutePlan({
                 snapshot,
             };
         }
+        if (pathname === AGENT_EXEC_PATH || pathname.startsWith(`${AGENT_EXEC_PATH}/`)) {
+            // POST /api/edge/agent-exec starts a process; /<id>/stream (GET ?from=<seq>), /<id>/input (POST)
+            // and /<id> (DELETE) read, feed and stop it.
+            const rest = pathname.slice(AGENT_EXEC_PATH.length);
+            const method = String(req?.method || '').toUpperCase();
+            const match = /^\/([a-f0-9]{32})(\/stream|\/input)?$/.exec(rest);
+            const valid = rest === ''
+                ? method === 'POST' && !url.search
+                : Boolean(match) && (match[2] === '/stream'
+                    ? method === 'GET' && (!url.search || /^\?from=[0-9]{1,15}$/.test(url.search))
+                    : match[2] === '/input' ? method === 'POST' && !url.search : method === 'DELETE' && !url.search);
+            if (!valid) return deny(400, 'AGENT_EXEC_REQUEST_INVALID', { lease, hostSelection });
+            return {
+                matched: true,
+                ok: true,
+                kind: 'private-operation',
+                operation: 'agent-exec',
+                agentExec: rest === '' ? { action: 'start' }
+                    : { action: match[2] === '/stream' ? 'stream' : match[2] === '/input' ? 'input' : 'kill', execId: match[1],
+                        from: url.search ? Number(url.search.slice('?from='.length)) : 0 },
+                listener,
+                host,
+                hostSelection,
+                pathname,
+                parsedUrl: url,
+                lease,
+                snapshot,
+            };
+        }
         return deny(404, 'PRIVATE_ROUTE_SURFACE_DENIED', { lease, hostSelection });
     }
     // Before any public surface or agent selection.
@@ -1071,6 +1100,8 @@ export default {
 // Imported here, not with the others above, so the reviewed Router reference
 // lines of this file keep their positions.
 import { EDGE_DENIAL_RETRY_AFTER_SECONDS } from './edgeRetryAfter.js';
+
+export const AGENT_EXEC_PATH = '/api/edge/agent-exec';
 
 // Denials that end when the next generation activates or a drained agent's
 // replacement is committed. Clients may retry them after a short delay.
