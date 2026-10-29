@@ -21,6 +21,8 @@ const SKIPPED_DIRECTORIES = new Set(['node_modules', '.ploinky', '.git']);
 const NEW_MODULES = Object.freeze([
     'cli/server/executionTarget/declaration.mjs',
     'cli/server/executionTarget/contract.mjs',
+    'cli/server/executionTarget/discovery.mjs',
+    'cli/server/security/tokens/targetHelperTicketMinter.mjs',
     'cli/utils/runtime/sourceProtectionStore.mjs',
     'cli/utils/runtime/sourceProtectionInterlock.mjs',
     'cli/sandbox/legacyAgentAdoptionGuard.mjs',
@@ -31,10 +33,16 @@ const NEW_TESTS = Object.freeze([
     'tests/unit/legacyAgentAdoptionGuard.test.mjs',
     'tests/unit/executionTargetPreservation.test.mjs',
     'tests/unit/executionTargetCommonVectors.test.mjs',
+    'tests/unit/executionTargetDiscovery.test.mjs',
+    'tests/unit/executionTargetHelperTicket.test.mjs',
     'tests/unit/legacyAgentMaskCompleteness.test.mjs',
 ]);
 // The pure guard names the legacy markers only to detect them.
 const GUARD = 'cli/sandbox/legacyAgentAdoptionGuard.mjs';
+
+// `contract` and `declaration` are common words; `discovery` appears in unrelated production code (model and agent
+// discovery). The `executionTarget/` path test and the exported operation names still catch a real importer of them.
+const BASENAME_EXEMPT = new Set(['contract', 'declaration', 'discovery']);
 
 function* files(relative, { anyExtension = false } = {}) {
     const absolute = path.join(REPO_ROOT, relative);
@@ -122,7 +130,7 @@ test('T1-10 / T1-11 the new generic modules have no production importer and regi
         'reserveWritableResources', 'prepareSourceTransition', 'releaseWritableReservation', 'acknowledgeSourceStore',
         'advanceWorkerGeneration', 'openSourceProtectionStore', 'createSourceProtectionInterlock',
         'evaluateLegacyAgentAdoption', 'evaluateInterimLegacyMarkers', 'validateExecutionTargetDeclaration',
-        'readExecutionTargetDeclaration',
+        'readExecutionTargetDeclaration', 'discoverExecutionTargets', 'createTargetHelperTicketMinter',
     ];
     const importers = [];
     for (const relative of productionFiles()) {
@@ -146,7 +154,11 @@ test('T1-10 / T1-11 the new generic modules have no production importer and regi
         }
         // Nothing in production may switch the full predicate on per call.
         if (text.includes('legacyAgentLifecycleGuard')) assert.doesNotMatch(text, /\bactive:\s*true\b/, relative);
-        if (/executionTarget\//.test(text) || newNames.some((name) => name !== 'contract' && name !== 'declaration' && text.includes(name))) {
+        // A sibling inside executionTarget/ (or anywhere) importing the exempt-named modules by specifier is an importer.
+        if (/['"][^'"]*\btargetHelperTicketMinter\.mjs['"]/.test(text)) importers.push(relative);
+        // ploinky-box has its own unrelated engine/discovery.mjs, so the bare specifier is only checked beside the module.
+        if (relative.startsWith('cli/server/executionTarget/') && /['"]\.\/discovery\.mjs['"]/.test(text)) importers.push(relative);
+        if (/executionTarget\//.test(text) || newNames.some((name) => !BASENAME_EXEMPT.has(name) && text.includes(name))) {
             importers.push(relative);
         }
         if (operationNames.some((name) => text.includes(name))) importers.push(relative);
@@ -155,7 +167,7 @@ test('T1-10 / T1-11 the new generic modules have no production importer and regi
     // Among tests, only the new T1 tests reach them.
     const testImporters = [...files('tests')].filter((relative) => (
         !relative.startsWith('tests/unit/fixtures/')
-        && (/executionTarget\/|sourceProtection(Store|Interlock)|legacyAgentAdoptionGuard/.test(read(relative)))
+        && (/executionTarget\/|sourceProtection(Store|Interlock)|legacyAgentAdoptionGuard|targetHelperTicketMinter/.test(read(relative)))
     ));
     assert.deepEqual(testImporters.sort(), [...NEW_TESTS].sort());
     for (const relative of NEW_MODULES) assert.equal(fs.existsSync(path.join(REPO_ROOT, relative)), true, relative);
