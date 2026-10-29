@@ -21,6 +21,7 @@ test.after(() => {
 });
 const { applyHardwareLimits, reconcileExactHardwareInstance, captureExactHardwareInstances } = await import('../../cli/sandbox/hardwareLimits/reconcile.mjs');
 const { coordinateMpsLifecycle, ensureMpsGraphAgentService } = await import('../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs');
+const { syntheticLifecyclePreflight } = await import('./helpers/legacyAgentLifecycleHarness.mjs');
 const { readMpsLaunch } = await import('../../cli/sandbox/hardwareLimits/mpsLaunch.mjs');
 const { HardwareStoreError } = await import('../../cli/sandbox/hardwareLimits/store.mjs');
 
@@ -64,6 +65,7 @@ test('W7.a-check-between-two-steps-is-not-credited-to-the-step-that-just-finishe
     ]) {
         let armed = false;
         const deps = {
+        inspectLegacy: syntheticLifecyclePreflight,
             loadPlan: () => { if (arm === 'plan') armed = true; return cpuPlan; },
             readiness: async () => { if (arm === 'readiness') armed = true; },
             policyCheck: () => { if (armed) throw policyFailure(); return { token }; },
@@ -103,6 +105,7 @@ const coordinationWorld = ({ loadPlan, oldClients = [] } = {}) => {
     const defaults = { smPercent: 25, memoryMiB: 1024, deviceUuid: share.deviceUuid, driverVersion: share.driverVersion, wiringFingerprint: share.wiringFingerprint };
     let state = oldClients.length ? { schema: 1, status: 'ready', daemon: { pid: 1 }, daemonGeneration: 'd0', configurationGeneration: 'c0', pipeDirectory: `/run/ploinky/mps/pipe-${'a'.repeat(32)}`, serverDefault: defaults, pendingClients: [], oldClients, drainedClients: [] } : null;
     const dependencies = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [], readContext: () => ({ storeToken: token, overrides: new Map([['demo/a', { gpu: { ...share, smPercent: 50 } }]]), gpu: { eligible: true, grant: { mps: {} } } }),
         loadRegistry: () => reg, readApplied: () => null, loadPlan, prepareImage: () => {}, inspectImage: () => ({ Id: 'a'.repeat(64), Config: { User: '1000:1000' } }),
         resolveShare: policy => policy, policyCheck: () => {}, store: { read: () => clone(state), write: value => { state = clone(value); } },
@@ -137,6 +140,7 @@ test('W8.a-plan-failure-of-a-client-being-drained-is-the-drain-step', async () =
 test('W8.a-plan-failure-in-the-graph-launch-is-planning', async () => {
     const options = { networkLifecycleCapability: {}, preparedRegistryRecord: record, hardwareInstanceKey: 'exact' };
     await assert.rejects(ensureMpsGraphAgentService('worker', {}, '/ws/.ploinky/repos/demo/worker', options, {
+        inspectLegacy: syntheticLifecyclePreflight, store: { read: () => null }, loadRegistry: () => ({}),
         assertCapability: () => {}, readContext: () => ({ storeToken: token, overrides: new Map([['demo/worker', { gpu: share }]]), gpu: { eligible: true } }), policyCheck: () => {},
         resolveShare: policy => policy, loadPlan: () => { throw new Error('graph plan unreadable'); },
     }), error => error.applyStep === 'planning' && /graph plan unreadable/.test(error.message));

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { inspectInterimAgentLifecycle, isLegacyAgentLifecycleRefusal } from '../legacyAgentLifecycleGuard.mjs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -193,6 +194,7 @@ export async function reconcileExactHardwareInstance(captured, {
     loadRouting = readRoutingConfig, publishUnavailable = mergeRoutingConfig,
     withdrawUnavailable = withdrawUnavailableRuntime,
     retireUnavailable = retireExactAgentRuntimePredecessor,
+    inspectLegacy = inspectInterimAgentLifecycle,
 } = {}) {
     // Only an operator's CLI restart may accept a refused drain; Apply and the
     // GPU/MPS cohort never carry that acceptance.
@@ -213,6 +215,7 @@ export async function reconcileExactHardwareInstance(captured, {
     const maintain = hasMpsLaunch(mpsLaunch) && networkLifecycleCapability ? (_key, _options, callback) => callback() : maintenance;
     return maintain(captured.key, { operation: origin === 'apply' ? 'hardware-apply' : 'restart' }, () => network(async (capability) => {
         check();
+        inspectLegacy({ containerName: captured.key, registryRecord: captured.record, runtime: getRuntime });
         let result = null;
         let transition = null;
         let plan = null;
@@ -276,6 +279,7 @@ export async function reconcileExactHardwareInstance(captured, {
             await acknowledgeMpsRuntimeReady(result);
             return Object.defineProperty({ key: captured.key, observedKey: result.containerName, instanceId: result.registryRecord?.instanceId, enableGeneration: result.registryRecord?.enableGeneration, containerId: result.containerId, state: 'applied', problem: null }, 'runtimeResult', { value: result });
         } catch (error) {
+            if (isLegacyAgentLifecycleRefusal(error)) throw error;
             markApplyStep(error, phase);
             releaseMpsRuntimeOwner(result);
             if (transition) cleanupTargeted(result, error);
@@ -313,6 +317,7 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
     isUnchanged = hardwareApplyIsUnchanged, reconcile = reconcileExactHardwareInstance,
     onPlan = () => {}, onResult = () => {}, operationTimeoutMs = 15 * 60 * 1000,
     authorize = () => true, isCancelled = () => false, operationDeadline = null,
+    inspectLegacy = inspectInterimAgentLifecycle,
 } = {}) {
     const token = validateStoreToken(expectedToken);
     const deadline = operationDeadline ?? Date.now() + operationTimeoutMs;
@@ -328,6 +333,8 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
         captureExactHardwareInstances(registry, requested);
         const keys = expandHardwareRecoveryKeys(requested, registry, loadRouting());
         const captured = captureExactHardwareInstances(registry, keys);
+        for (const instance of captured) inspectLegacy({ containerName: instance.key,
+            registryRecord: instance.record, runtime: getRuntime });
         const expandedContainers = keys.filter((key) => !requested.includes(key));
         onPlan({ containers: keys, expandedContainers });
         const results = [];
@@ -353,6 +360,7 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
                     : await reconcile(instance, { origin: 'apply', expectedToken: token, deadline, authorize, isCancelled, onMpsPlan, onMpsResult: recordResult });
                 recordResult(result);
             } catch (error) {
+                if (isLegacyAgentLifecycleRefusal(error)) throw error;
                 // GPU coordination finished its target but did not recreate
                 // some peers: a partial result (207) whose per-agent results
                 // name the pending and refused clients. The target is not

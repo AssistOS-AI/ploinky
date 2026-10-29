@@ -16,6 +16,8 @@ import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { derivePrivateAgentRequestSecret } from '../utils/security/masterKey.js';
 import { commitRoutePlan } from './edgeRoutePlan.js';
 import { identityHardwareUnavailable, identityLeaseHardwareUnavailable } from './hardwareAvailability.mjs';
+import { admitCoordinatorRequest, coordinatorCallerAcl } from './executionProvider/coordinatorHop.mjs';
+import { coordinatorRouteForPlan, isUpgradeRequest } from './executionProvider/coordinatorRoutes.mjs';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
 const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;
@@ -152,6 +154,10 @@ function callerAclForPlan(plan) {
         return null;
     }
     if (plan.kind === 'agent-port' && plan.access?.access === 'authenticated') {
+        // A provider's declared coordinator scope admits exactly its declared
+        // coordinator principals; any other spelling of the scope has no ACL.
+        const coordinator = coordinatorRouteForPlan(plan);
+        if (coordinator.matched) return coordinator.entry ? coordinatorCallerAcl(plan, coordinator.entry) : null;
         return {
             routeKey: plan.routeKey,
             callers: [],
@@ -199,7 +205,14 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
         || String(untrusted?.enableGeneration || '') !== current.enableGeneration) {
         throw unauthorized('private assertion instance or generation is stale');
     }
-    if (!acl.anyCurrentCaller && !(acl.callers || []).some((entry) => exactCaller(entry, current))) {
+    if (acl.coordinator) {
+        if (isUpgradeRequest(req)) {
+            throw forbidden('coordinator routes do not accept upgrades', 'COORDINATOR_ROUTE_UNAVAILABLE');
+        }
+        if (!acl.callerPrincipals.includes(current.agentId)) {
+            throw forbidden('private assertion caller is not a declared coordinator', 'COORDINATOR_CALLER_DENIED');
+        }
+    } else if (!acl.anyCurrentCaller && !(acl.callers || []).some((entry) => exactCaller(entry, current))) {
         throw forbidden('private assertion caller is not in the exact ACL');
     }
     const rch = computeRchHttp({
@@ -243,6 +256,16 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
         throw unauthorized('private assertion request binding mismatch');
     }
     delete req.headers[PRIVATE_ASSERTION_HEADER];
+    if (acl.coordinator) {
+        // Owner evidence is verified only for the verified caller, and the
+        // forward is signed from these facts alone (coordinatorHop.mjs).
+        req.coordinatorAdmission = admitCoordinatorRequest({
+            req,
+            plan,
+            entry: coordinatorRouteForPlan(plan).entry,
+            callerIdentity: current,
+        });
+    }
     req.privateAgentIdentity = Object.freeze({ ...current });
     return req.privateAgentIdentity;
 }

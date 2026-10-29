@@ -10,6 +10,10 @@ import { fileURLToPath } from 'url';
 import { isDeepStrictEqual } from 'node:util';
 import { retireNoWaitRunMarker } from '../../commands/noWaitMarkerLifecycle.js';
 import {
+    assertLegacyAgentConfinement, assertInterimLifecycleMutation,
+    inspectInterimAgentLifecycle, isLegacyAgentLifecycleRefusal,
+} from '../legacyAgentLifecycleGuard.mjs';
+import {
     assertManifestEnvProfileCompleteness,
     buildEnvMap,
     buildEnvFlags,
@@ -163,6 +167,7 @@ import {
     resolveManifestRuntimeProfile
 } from '../../utils/runtime/profileService.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../../utils/runtime/startupReadiness.js';
+import { assertExecutionProviderPublication } from '../../server/executionProvider/publication.mjs';
 import {
     getAgentWorkDir,
     getAgentCodePath,
@@ -351,6 +356,7 @@ function consumeCandidateCleanupReceipt(receipt, expected = {}) {
 }
 
 function attachRestartCandidate(error, candidate) {
+    if (isLegacyAgentLifecycleRefusal(error)) return error;
     const failure = error && typeof error === 'object'
         ? error
         : new Error(String(error || 'managed runtime launch failed'));
@@ -902,6 +908,7 @@ function appendEnvFlagsFromMap(envFlags, envMap) {
 function removeContainerForRecreate(runtime, containerName, label, record = null) {
     let exactRecord = record || loadAgentsMap()[containerName];
     try {
+        const legacy = inspectInterimAgentLifecycle({ containerName, registryRecord: exactRecord, runtime });
         // A prepared replacement rotated this record's tuple before launch and
         // first made the predecessor's own tuple durable in a receipt keyed by
         // the rotated one. Only that receipt proves the container still
@@ -922,7 +929,9 @@ function removeContainerForRecreate(runtime, containerName, label, record = null
             }
             exactRecord = { ...exactRecord, ...pending.registryRecord };
         }
-        const result = removeExactRegisteredContainer(containerName, exactRecord, { runtime, recoverIncompleteIdentity: true });
+        const result = removeExactRegisteredContainer(containerName, { ...exactRecord, runMode: legacy.runMode }, {
+            runtime, recoverIncompleteIdentity: true, assertBeforeMutation: assertInterimLifecycleMutation,
+        });
         if (result?.removed !== true && result?.state !== 'absent') {
             throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
         }
@@ -933,6 +942,7 @@ function removeContainerForRecreate(runtime, containerName, label, record = null
         clearLivenessState(containerName);
         return result;
     } catch (cause) {
+        if (isLegacyAgentLifecycleRefusal(cause)) throw cause;
         const error = new Error(
             `[${label}] preserved container '${containerName}' because exact immutable ownership/removal was not proven: ${cause?.message || cause}`,
             { cause },
@@ -1538,12 +1548,19 @@ export function selectLaunchImages({ resolvedImage, launch = null } = {}) {
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // Host Podman launches create the host state skeleton first and fail if
     // they cannot; in-Box (nested) launches skip it.
-    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const managedControlEnv = buildManagedControlEnv(manifest);
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
+    const legacy = inspectInterimAgentLifecycle({ containerName,
+        registryRecord: options.predecessorRegistryRecord || existingRecord, runtime: getRuntimeForAgent(manifest) });
+    const assertExistingAgent = ({ record, containerId, containerName: name }) => assertLegacyAgentConfinement({
+        runtime: legacy.runtime, runMode: legacy.runMode, containerName: name,
+        containerId: legacy.containerId || containerId, record,
+        registryRecord: options.predecessorRegistryRecord || existingRecord,
+    });
+    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
     const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
         existingRecord,
         options,
@@ -2504,6 +2521,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 },
             };
         } catch (error) {
+            if (isLegacyAgentLifecycleRefusal(error)) throw error;
             return { adopted: false, reason: `descriptor-invalid:${error?.code || error?.message || 'unknown'}` };
         }
     };
@@ -2752,6 +2770,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     containerName,
                     runtimeIdentity,
                     inspectAdoption: inspectGeneratedRouterAdoption,
+                    assertExistingAgent,
                     networkLockWaitMs: options.networkLockWaitMs,
                         networkLifecycleCapability: options.networkLifecycleCapability,
                         beforeDestructiveWork: options.beforeHardwareMutation,
@@ -2827,6 +2846,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         },
     });
     } catch (error) {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         let exactCleanupPerformed = error?.ploinkyContainerTransaction?.exactCleanupPerformed === true;
         launchedContainerId ||= String(error?.ploinkyContainerTransaction?.containerId || '');
         if (!runtimeNetworkPlan.requiresManagedNetwork && launchedContainerId) {
@@ -2917,6 +2937,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }),
     });
     const cleanupExactLaunch = (error) => {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         let exactCleanupPerformed = false;
         let finalCleanupReceipt = cleanupReceipt;
         try {
@@ -3149,6 +3170,16 @@ function resolvePublishedPortMappings(containerName, portMappings) {
             ? { ...mapping, hostPort: resolvedHostPort }
             : mapping;
     });
+}
+
+// The launch environment as the later launch code resolves it, or null when it
+// cannot be resolved yet; the static profile value is then used instead.
+function resolveLaunchEnvForPort(manifest, profileConfig, context) {
+    try {
+        return buildEnvMap(manifest, profileConfig, { ...context, forRuntime: true });
+    } catch (_) {
+        return null;
+    }
 }
 
 function resolveImplicitAgentServerPort(profileConfig = {}, resolvedEnv = null) {
@@ -3733,6 +3764,23 @@ export function admitAgentServicePreflight(agentName, manifest, agentPath, optio
         persistedProfileName: preflightRecord.profile,
         path: `manifest(${preflightRepoName}/${agentName})`,
     });
+    // A provider declaration is refused here, in the read-only preflight that
+    // every launch runs first: before the early GPU hand-off (which drains an
+    // MPS cohort), the network lifecycle lock, the registry and any container
+    // or sandbox runtime. The resolved AgentServer port is read only when a
+    // declaration is present.
+    assertExecutionProviderPublication({
+        manifest,
+        routeKey: hardwareAlias || agentName,
+        profileConfig: preflightProfile.profileConfig,
+        networkMode: preflightProfile.network.mode,
+        portMappings: () => parseManifestPorts(manifest, preflightProfile.profileConfig).portMappings,
+        registryPorts: preflightRecord.config?.ports,
+        agentServerPort: () => resolveImplicitAgentServerPort(preflightProfile.profileConfig, resolveLaunchEnvForPort(
+            manifest, preflightProfile.profileConfig,
+            { agentName, repoName: preflightRepoName, profileName: preflightProfile.resolvedProfileName },
+        )),
+    });
     assertManifestStorageAdmission(manifest, preflightProfile.profileConfig);
     // Reject manifest-declared capabilities before even selecting a backend.
     // A second admission below adds the read-only catalog selection.
@@ -3816,6 +3864,12 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         hardwareInstanceKey,
     } = admitAgentServicePreflight(agentName, manifest, agentPath, options);
     const mpsRecord = loadAgentsMap()[options.containerName || getAgentContainerName(agentName, preflightRepoName)];
+    inspectInterimAgentLifecycle({ containerName: options.containerName || getAgentContainerName(agentName, preflightRepoName),
+        registryRecord: options.predecessorRegistryRecord || mpsRecord, runtime: preflightAgentRuntime });
+    if (options.replacementPredecessor) inspectInterimAgentLifecycle({
+        containerName: options.replacementPredecessor.containerName,
+        registryRecord: options.replacementPredecessor.registryRecord, runtime: preflightAgentRuntime,
+    });
     const appliedMps = mpsRecord?.containerId ? readAppliedObservation(options.containerName || getAgentContainerName(agentName, preflightRepoName), mpsRecord.containerId) : null;
     if (!hasMpsLaunch(options.mpsLaunch) && (preflightAdmission.descriptor.hardwareGpu || appliedMps?.mpsGeneration)) {
         return import('../hardwareLimits/mpsLifecycle.mjs').then(({ ensureMpsAgentService }) => ensureMpsAgentService(agentName, manifest, agentPath, options));
@@ -4346,11 +4400,17 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // reuse, start, or replacement decision. Only creation/replacement for
     // default/bridge enters the managed-network transaction below.
     const networkLifecycle = createNetworkLifecycleAdapter({ runtime });
+    const legacy = inspectInterimAgentLifecycle({ containerName, registryRecord: existingRecord, runtime });
+    const assertExistingAgent = ({ record, containerId, containerName: name }) => assertLegacyAgentConfinement({
+        runtime, runMode: legacy.runMode, containerName: name, containerId: legacy.containerId || containerId, record,
+        registryRecord: existingRecord,
+    });
     let inspectedContainerId = null;
     let managedReconciliationPreparationLease = options.preparationLease;
     let adoptManagedRuntimeOnly = false;
     if (existingRuntimeAtEntry) {
         const contractInspection = networkLifecycle.inspectContainerContract(containerName, manifestNetwork, agentName, {
+            assertExistingAgent,
             instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
             contractHash: networkContractHash(manifestNetwork),
             instanceId: existingRecord.instanceId,
@@ -4379,6 +4439,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         debugLog(`[ensureAgentService] ${agentName}: container exists, checking if running...`);
         let canReuseExisting = true;
         const reuseInspection = networkLifecycle.inspectContainerContract(containerName, manifestNetwork, agentName, {
+            assertExistingAgent,
             instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
             contractHash: networkContractHash(manifestNetwork),
             instanceId: existingRecord.instanceId,
@@ -4435,6 +4496,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 canReuseExisting = false;
                 recreateReason ||= 'dependencyMountDrifted';
             }
+            assertExistingAgent({ record: inspectedRecords[0], containerId: reuseInspection.id, containerName });
             if (!canReuseExisting) debugLog(`[ensureAgentService] ${agentName}: host/none reuse rejected (${recreateReason})`);
         }
         if (canReuseExisting) {
@@ -4562,6 +4624,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 replacementPredecessor,
             });
         } catch (error) {
+            if (isLegacyAgentLifecycleRefusal(error)) throw error;
             throw attachRestartCandidate(error, {
                 containerName: runtimeIdentity.candidateContainerName,
                 runtimeNetwork: structuredClone(manifestNetwork),
@@ -4791,6 +4854,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 : {}),
         };
     } catch (error) {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         if (error?.code === 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH'
             && runtimeNetworkPlan.requiresManagedNetwork
             && (!runtimeIdentity.preparationLease
@@ -4874,12 +4938,14 @@ function removeExactGenerationCandidate({
     containerId,
     network,
     record,
+    assertExistingAgent = null,
 } = {}) {
     const cleanup = createNetworkLifecycleAdapter({ runtime: getRuntime() }).removeExactContainer(
         containerName,
         network,
         record.agentName,
         {
+            assertExistingAgent,
             expectedContainerId: containerId,
             instanceKey: effectiveInstanceKey(record.repoName, record.agentName, record.alias || ''),
             contractHash: networkContractHash(network),
@@ -4908,11 +4974,16 @@ export function retireExactAgentRuntimePredecessor(predecessor, {
         || !String(record.enableGeneration || '').trim()) {
         throw new Error('exact predecessor retirement requires its name, immutable ID, network, and registry identity');
     }
+    const legacy = inspectInterimAgentLifecycle({ containerName, registryRecord: record, runtime: getRuntime });
     return removeExactGenerationCandidate({
         containerName,
         containerId,
         network: predecessor.runtimeNetwork,
         record,
+        assertExistingAgent: ({ record: inspected }) => assertLegacyAgentConfinement({
+            runtime: legacy.runtime, runMode: legacy.runMode, containerName, containerId, record: inspected,
+            registryRecord: record,
+        }),
     });
 }
 
@@ -5145,6 +5216,7 @@ export function cleanupFailedServiceCandidate(error, {
     removeCandidate = removeExactGenerationCandidate,
     retireCandidate = retireRuntimeCandidate,
 } = {}) {
+    if (isLegacyAgentLifecycleRefusal(error)) throw error;
     let exactCleanupPerformed = error?.ploinkyRestartCandidate?.exactCleanupPerformed === true;
     const cleanupReceipt = started?.cleanupReceipt
         || error?.ploinkyRestartCandidate?.cleanupReceipt;

@@ -21,6 +21,8 @@ import {
 import * as workspaceSvc from '../utils/workspace.js';
 import { retireSameTupleAfterApply } from './hardwareAvailabilityRetirement.js';
 import { loadRestartFaultHooks } from '../utils/testFaultHooks.js';
+import { getRuntime } from '../sandbox/docker/common.js';
+import { inspectInterimAgentLifecycle, isLegacyAgentLifecycleRefusal } from '../sandbox/legacyAgentLifecycleGuard.mjs';
 
 export const ACCEPT_FAILED_DRAIN_FLAG = '--accept-failed-drain';
 const RESTART_USAGE = `Usage: restart [router | <agent> [${ACCEPT_FAILED_DRAIN_FLAG} <container-id>]]`;
@@ -240,6 +242,7 @@ export async function prepareTargetedAgentRestart({
   loadAgents = workspaceSvc.loadAgents,
   withdrawRoute = withdrawTargetedRoute,
   faultHooks = loadRestartFaultHooks,
+  inspectLegacy = inspectInterimAgentLifecycle,
 } = {}) {
   const hooks = faultHooks();
   const containerName = text(containerNameInput);
@@ -251,6 +254,7 @@ export async function prepareTargetedAgentRestart({
   }
   const identity = exactRuntimeIdentity(record);
   const acceptedFailedDrain = normalizeAcceptedFailedDrain(acceptedFailedDrainInput);
+  inspectLegacy({ containerName, registryRecord: record, runtime: getRuntime });
   let predecessorRoute = null;
 
   try {
@@ -258,6 +262,7 @@ export async function prepareTargetedAgentRestart({
     if (hooks?.forceUnprovableWithdrawal) throw new Error('test fault hook: withdrawal forced unprovable');
     predecessorRoute = await withdrawRoute({ containerName, routeKey, repoName, shortAgentName, identity, record, acceptedFailedDrain });
   } catch (error) {
+    if (isLegacyAgentLifecycleRefusal(error)) throw error;
     // An invalid acceptance must never fall through to another mutation path.
     if (error?.code === 'TARGETED_DRAIN_INVALID') throw error;
     // Contention is the caller's to retry; a withdrawal that cannot be proven
@@ -454,6 +459,7 @@ export async function commitTargetedAgentRestart({
 export function cleanupFailedTargetedAgentRestart(result, error, {
   cleanupCandidate = cleanupExactAgentRuntimeCandidate,
 } = {}) {
+  if (isLegacyAgentLifecycleRefusal(error)) return false;
   if (!result || result.exactCleanupPerformed === true || result.createdByThisLaunch === false) return false;
   if (!result.containerName || !result.containerId || !result.registryRecord || !result.cleanupReceipt) return false;
   try {

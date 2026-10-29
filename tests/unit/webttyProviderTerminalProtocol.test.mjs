@@ -79,9 +79,9 @@ test('control frames enforce exhaustive fields, direction, UTF-8 and byte bounds
     assert.throws(() => decodeTerminalControl(' '.repeat(16385)));
     assert.throws(() => encodeTerminalControl({ v: 1, type: 'launch', ...launch,
         launchEvidence: 'x'.repeat(12288), project: { selection: 'x'.repeat(1024), relativePath: 'x'.repeat(4096) } }));
-    const hello = encodeTerminalControl({ v: 1, type: 'hello', label: 'é'.repeat(64) });
+    const hello = encodeTerminalControl({ v: 1, type: 'hello', label: 'é'.repeat(64), helloToken: 'a.b.c' });
     assert.equal(JSON.parse(hello).label.length, 64);
-    assert.throws(() => encodeTerminalControl({ v: 1, type: 'hello', label: 'é'.repeat(65) }));
+    assert.throws(() => encodeTerminalControl({ v: 1, type: 'hello', label: 'é'.repeat(65), helloToken: 'a.b.c' }));
 });
 
 test('project selection stays opaque; relative root is empty and traversal is refused', () => {
@@ -91,4 +91,30 @@ test('project selection stays opaque; relative root is empty and traversal is re
     for (const relativePath of ['/etc', '../x', 'x/../y', './x', 'a\\b', 'bad\npath']) {
         assert.throws(() => terminalLaunchHash({ ...launch, project: { selection: 'opaque', relativePath } }));
     }
+});
+
+test('hello and reattach require helloToken; extra keys refused; size bounded; label stays optional', () => {
+    const reattach = { v: 1, type: 'reattach', ownershipSessionId: ID, workerGeneration: GEN, proof: NONCE };
+    // label remains optional, helloToken is not.
+    assert.doesNotThrow(() => encodeTerminalControl({ v: 1, type: 'hello', helloToken: 'a.b.c' }));
+    assert.doesNotThrow(() => encodeTerminalControl({ v: 1, type: 'hello', label: 'diag', helloToken: 'a.b.c' }));
+    assert.doesNotThrow(() => encodeTerminalControl({ ...reattach, helloToken: 'a.b.c' }));
+    assert.throws(() => encodeTerminalControl({ v: 1, type: 'hello' }));
+    assert.throws(() => encodeTerminalControl({ v: 1, type: 'hello', label: 'diag' }));
+    assert.throws(() => encodeTerminalControl(reattach));
+    // exhaustive fields
+    assert.throws(() => encodeTerminalControl({ v: 1, type: 'hello', helloToken: 'a.b.c', extra: true }));
+    assert.throws(() => encodeTerminalControl({ ...reattach, helloToken: 'a.b.c', extra: true }));
+    // type and byte bounds (same 12 KiB as launchEvidence)
+    for (const helloToken of ['', 7, null, 'a\u0000b', 'x'.repeat(12 * 1024 + 1)]) {
+        assert.throws(() => encodeTerminalControl({ v: 1, type: 'hello', helloToken }));
+        assert.throws(() => encodeTerminalControl({ ...reattach, helloToken }));
+    }
+    assert.doesNotThrow(() => encodeTerminalControl({ v: 1, type: 'hello', helloToken: 'x'.repeat(12 * 1024) }));
+    // Decoding enforces the same schema.
+    assert.throws(() => decodeTerminalControl('{"v":1,"type":"hello"}', 'router'));
+    assert.deepEqual(
+        decodeTerminalControl('{"v":1,"type":"hello","helloToken":"a.b.c"}', 'router'),
+        { v: 1, type: 'hello', helloToken: 'a.b.c' },
+    );
 });

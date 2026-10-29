@@ -8,8 +8,8 @@ export const U64_MAX = (1n << 64n) - 1n;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ENDED = new Set(['supersession', 'shutdown', 'lease-expiry', 'generation-end', 'exit', 'unclaimed']);
 const ROUTER = {
-    hello: ['label?'],
-    reattach: ['ownershipSessionId', 'workerGeneration', 'proof'],
+    hello: ['label?', 'helloToken'],
+    reattach: ['ownershipSessionId', 'workerGeneration', 'proof', 'helloToken'],
     heartbeat: [],
     launch: ['operationId', 'targetId', 'project', 'cols', 'rows', 'launchEvidence'],
     attach: ['ptySessionId', 'afterOutputSequence'],
@@ -109,6 +109,8 @@ function validateControl(value, direction) {
     }
     if (Object.hasOwn(value, 'cols')) dimensions(value);
     if (Object.hasOwn(value, 'label')) text(value.label, 128);
+    // Router-service hello token (a JWS); same byte bound as launchEvidence.
+    if (Object.hasOwn(value, 'helloToken')) text(value.helloToken, 12 * 1024);
     if (value.type === 'launch') {
         validateTerminalLaunch(launchFields(value));
         text(value.launchEvidence, 12 * 1024);

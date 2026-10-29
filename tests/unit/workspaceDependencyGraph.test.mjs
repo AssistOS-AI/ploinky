@@ -67,10 +67,10 @@ const {
     bindNoWaitLaunchScheduleIdentity,
     computeRetainedManagedEnvHash,
     deduplicateAgentRegistry,
-    ensureGraphNodesEnabled,
+    ensureGraphNodesEnabled: ensureGraphNodesEnabledProduct,
     isRegistryRuntimeRunning,
-    removeGraphContainerForRecreate,
-    reprepareGraphAfterStartupProviders,
+    removeGraphContainerForRecreate: removeGraphContainerForRecreateProduct,
+    reprepareGraphAfterStartupProviders: reprepareGraphAfterStartupProvidersProduct,
     reinstallAgent,
     resolveStaticRouterContainerName,
     resolveGraphNodeExecutionRecord,
@@ -80,6 +80,18 @@ const {
     waitForReadinessEntries,
     writeNoWaitSpawnFailure,
 } = await import(`${workspaceUtilModuleUrl.href}${moduleSuffix}`);
+const { syntheticLifecyclePreflight } = await import('./helpers/legacyAgentLifecycleHarness.mjs');
+// These graph fixtures inject the runtime below the graph boundary. Supply
+// the corresponding read-only inspection so no guard can reach a real engine.
+const ensureGraphNodesEnabled = (graph, registry, options = {}) => ensureGraphNodesEnabledProduct(graph, registry, {
+    inspectLegacy: syntheticLifecyclePreflight, ...options,
+});
+const removeGraphContainerForRecreate = (name, reason, record, options = {}) => removeGraphContainerForRecreateProduct(name, reason, record, {
+    inspectLegacy: syntheticLifecyclePreflight, ...options,
+});
+const reprepareGraphAfterStartupProviders = (graph, registry, prepared, options = {}) => reprepareGraphAfterStartupProvidersProduct(graph, registry, prepared, {
+    ensureGraphNodesEnabledImpl: ensureGraphNodesEnabled, ...options,
+});
 const noWaitWorkerModuleUrl = new URL('../../cli/commands/noWaitWorker.js', import.meta.url);
 const {
     waitForNoWaitStatusBarrier,

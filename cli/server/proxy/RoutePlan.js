@@ -55,6 +55,11 @@ export function finalizePlanAfterAdmission(plan) {
     if (plan?.surfaceKind === 'agent-primary') {
         return finalizeRoutePlan(plan, { targetPath: plan.unmatchedSuffix || '/', query: plan.query || '' });
     }
+    // A provider endpoint's target is the declared path plus its fixed
+    // operation suffix; it is finalized only after the adapter authorizes.
+    if (plan?.surfaceKind === 'provider-endpoint') {
+        return finalizeRoutePlan(plan, { targetPath: plan.unmatchedSuffix, query: plan.query || '' });
+    }
     throw new Error('RoutePlan: unsupported route surface');
 }
 

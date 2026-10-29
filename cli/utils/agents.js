@@ -18,7 +18,8 @@ import {
     ensureAgentService
 } from '../sandbox/docker/index.js';
 import { findAgent } from './utils.js';
-import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
+import { getRuntime, getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
+import { inspectInterimAgentLifecycle, isLegacyAgentLifecycleRefusal } from '../sandbox/legacyAgentLifecycleGuard.mjs';
 import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
 import {
     isBwrapProcessRunning,
@@ -38,6 +39,8 @@ import {
     waitForAgentReady,
 } from '../server/utils/agentReadiness.js';
 import { InMemoryPolicyStateStore } from '../server/policy/InMemoryPolicyStateStore.js';
+import { assertExecutionProviderPublication } from '../server/executionProvider/publication.mjs';
+import { assertWebchatDelegationsManifest } from '../server/mcp-proxy/mcpDelegations.js';
 import { FileSystemPolicyStateStore } from '../server/policy/FileSystemPolicyStateStore.js';
 import { McpToolPolicy } from '../server/policy/McpToolPolicy.js';
 import { PolicyStateRepository } from '../server/policy/PolicyStateRepository.js';
@@ -532,6 +535,20 @@ function planAgentEnable({
         projectPath = PLOINKY_WORKSPACE_ROOT;
     }
 
+    // `webchat.delegations` is a manifest declaration: invalid is an error.
+    assertWebchatDelegationsManifest({
+        manifest,
+        repoName,
+        agentName: shortAgentName,
+        label: `manifest(${repoName}/${shortAgentName})`,
+    });
+    // A provider declaration is validated before any record is written.
+    assertExecutionProviderPublication({
+        manifest,
+        routeKey,
+        profileConfig: profileResolution.profileConfig,
+        networkMode: profileResolution.network.mode,
+    });
     // Capture only ports the selected execution/network contract can own. The
     // runtime will later replace dynamic host-port zeros in one coordinated
     // final generation after every prepared process has launched.
@@ -765,6 +782,7 @@ export function prepareAgentEnableBatch(requests, {
     hardwareAdmission = 'strict',
     hardwareContext,
     boxMarkerOptions,
+    inspectLegacy = inspectInterimAgentLifecycle,
 } = {}) {
     if (!Array.isArray(requests)) {
         throw new Error('prepare agent enable batch: requests must be an array');
@@ -811,6 +829,8 @@ export function prepareAgentEnableBatch(requests, {
         for (const { request, input } of resolvedRequests) {
             plans.push(planAgentEnable(request, map, routing, input));
         }
+        for (const plan of plans) inspectLegacy({ containerName: plan.containerName,
+            registryRecord: previousAgents[plan.containerName], runtime: getRuntime });
         const effectiveAvailabilityMode = availabilityMode === 'additive'
             && plans.some((plan) => previousAgents?.[plan.containerName]?.type === 'agent')
             ? 'replacement'
@@ -951,6 +971,7 @@ export function prepareAgentEnableBatch(requests, {
             }
         });
     } catch (error) {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         try {
             if (preparedGeneration?.preparationLease) {
                 abortEdgeRoutingPreparation(preparedGeneration.preparationLease, {
@@ -989,9 +1010,11 @@ export function previewAgentEnable(request, {
 export async function withMpsEnablePreparation(request, stage, {
     network = withNetworkLifecycleLock, preview = previewAgentEnable,
     loadMps = () => import('../sandbox/hardwareLimits/mpsLifecycle.mjs'),
+    inspectLegacy = inspectInterimAgentLifecycle,
 } = {}) {
     return network(async (networkLifecycleCapability) => {
         const { plan, predecessor } = preview(request);
+        inspectLegacy({ containerName: plan.containerName, registryRecord: predecessor, runtime: getRuntime });
         const mps = await loadMps();
         const mpsLaunch = await mps.prepareMpsClientLaunch({ key: plan.containerName, record: predecessor || plan.record }, {
             desiredRecord: plan.record, networkLifecycleCapability,
@@ -1133,6 +1156,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
         });
     } catch (error) {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         const failedCandidate = started || error?.ploinkyRestartCandidate || null;
         if (failedCandidate?.containerName
             && failedCandidate?.cleanupReceipt

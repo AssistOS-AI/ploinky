@@ -1,4 +1,5 @@
 import { buildInvocationContextForProviderCall } from '../../mcp-proxy/index.js';
+import { routeDeclaresWebchatDelegations } from '../../mcp-proxy/mcpDelegations.js';
 
 export function normalizeWebchatPresentation(raw) {
     return { visible: raw?.visible !== false };
@@ -69,11 +70,17 @@ export function sanitizeWebchatReferencesForEnvelope(references = []) {
     return out;
 }
 
+// Router-written envelope events. Only the Router sets `event`: it is never
+// read from a browser envelope, and it is part of the signed arguments, so an
+// agent recomputing them refuses an unsigned or altered event.
+export const WEBCHAT_RUNTIME_OPEN_EVENT = 'runtime-open';
+const ROUTER_ENVELOPE_EVENTS = new Set([WEBCHAT_RUNTIME_OPEN_EVENT]);
+
 // The signed `__webchat_message__` arguments. A principal-scoped runtime adds
 // `runtimeScope: "principal"`, taken only from the manifest-derived config, so
 // an agent that requires it rejects tokens from a router without per-user
-// runtimes.
-export function buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanceId, envelope }) {
+// runtimes. A Router-written envelope adds its `event`.
+export function buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanceId, envelope, event = '' }) {
     const args = {
         surface: 'webchat',
         tabId: String(tabId || ''),
@@ -84,10 +91,14 @@ export function buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanc
         presentation: normalizeWebchatPresentation(envelope?.presentation),
     };
     if (effectiveConfig?.runtimeScope === 'principal') args.runtimeScope = 'principal';
+    if (event) {
+        if (!ROUTER_ENVELOPE_EVENTS.has(event)) throw new Error(`unsupported WebChat envelope event '${event}'`);
+        args.event = event;
+    }
     return args;
 }
 
-function buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope }) {
+function buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope, event = '' }) {
     const agentName = String(effectiveConfig?.agentName || '').trim();
     if (!agentName) return '';
     try {
@@ -95,7 +106,7 @@ function buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstance
             req,
             agentName,
             toolName: '__webchat_message__',
-            toolArgs: buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanceId, envelope })
+            toolArgs: buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanceId, envelope, event })
         });
         return invocation?.token || '';
     } catch (_) {
@@ -124,7 +135,7 @@ export function resolveRequestPublicOrigin(req) {
     }
 }
 
-export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, pageInstanceId = '', envelope, fallbackText = '' }) {
+export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, pageInstanceId = '', envelope, fallbackText = '', event = '' }) {
     const sanitizedReferences = sanitizeWebchatReferencesForEnvelope(envelope?.references);
     const publicBaseUrl = resolveRequestPublicOrigin(req);
     const payload = {
@@ -138,9 +149,46 @@ export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, 
     };
     if (publicBaseUrl) payload.origin = { publicBaseUrl };
     if (sanitizedReferences.length) payload.references = sanitizedReferences;
-    const token = buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope: payload });
+    if (event) payload.event = event;
+    const token = buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope: payload, event });
     if (token) payload.invocation = { token };
     return JSON.stringify(payload);
+}
+
+// The hidden `runtime-open` envelope: written once per runtime creation, after
+// the runtime reports ready, signed for the user of the stream request that
+// created it, and only for an agent whose admitted manifest declares
+// `webchat.delegations` and whose configuration forwards envelopes. It carries
+// no text and is never shown; the agent may use it only to look up and
+// subscribe to that user's own persisted work.
+export function shouldAnnounceWebchatRuntimeOpen(effectiveConfig) {
+    const agentName = String(effectiveConfig?.agentName || '').trim();
+    return effectiveConfig?.forwardEnvelope === true
+        && Boolean(agentName)
+        && routeDeclaresWebchatDelegations({ routeKey: agentName });
+}
+
+export function serializeWebchatRuntimeOpenEnvelope({ req, effectiveConfig, tabId, pageInstanceId = '' }) {
+    return serializeWebchatEnvelopeForAgent({
+        req,
+        effectiveConfig,
+        tabId,
+        pageInstanceId,
+        envelope: { text: '', attachments: [], references: [], presentation: { visible: false } },
+        event: WEBCHAT_RUNTIME_OPEN_EVENT,
+    });
+}
+
+// Returns the runtime's startup-state observer. It writes the envelope at most
+// once, on the first `ready`; `starting` and `failed` write nothing. A runtime
+// without a startup protocol reports `ready` when it is created.
+export function createWebchatRuntimeOpenAnnouncer({ req, effectiveConfig, tabId, pageInstanceId = '', write }) {
+    let announced = !shouldAnnounceWebchatRuntimeOpen(effectiveConfig);
+    return (state) => {
+        if (announced || state !== 'ready') return false;
+        announced = true;
+        return write(`${serializeWebchatRuntimeOpenEnvelope({ req, effectiveConfig, tabId, pageInstanceId })}\n`) !== false;
+    };
 }
 
 function isTruthyQueryValue(value) {

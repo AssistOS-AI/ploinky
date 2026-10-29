@@ -6,12 +6,14 @@ import { signHmacJwt } from '../../Agent/lib/jwtSign.mjs';
 import { computeRch } from '../../Agent/lib/requestHash.mjs';
 import { verifyRouterRequestToken } from '../../Agent/lib/requestSignedTokens.mjs';
 import {
+    EXECUTION_PROVIDER_TERMINAL_HELLO_PURPOSE,
     EXECUTION_PROVIDER_TERMINAL_PURPOSE,
     ROUTER_SERVICE_AUTH_INFO_KEY,
     computeRouterServiceRch,
     createRouterServiceReplayCache,
     readRouterServiceTokenFromHeaders,
     verifyRouterServiceToken,
+    verifyRouterServiceTokenFromFrame,
     verifyRouterServiceTokenFromHeaders,
 } from '../../Agent/lib/routerServiceToken.mjs';
 import { RouterRequestTokenService, RouterServiceTokenService } from '../../cli/server/security/tokens/index.js';
@@ -20,6 +22,10 @@ const PROVIDER = 'agent:robots/robo-worker';
 const OTHER = 'agent:robots/other-worker';
 const TERMINAL_PATH = '/terminals';
 const PURPOSE = EXECUTION_PROVIDER_TERMINAL_PURPOSE;
+const HELLO = EXECUTION_PROVIDER_TERMINAL_HELLO_PURPOSE;
+// Distinct 32-byte connection nonces, base64url (43 characters).
+const N1 = Buffer.alloc(32, 1).toString('base64url');
+const N2 = Buffer.alloc(32, 2).toString('base64url');
 // Whole-second instant so iat * 1000 equals the clock reading at mint time.
 const T0 = Date.UTC(2026, 9, 27, 12, 0, 0);
 const IAT = T0 / 1000;
@@ -69,6 +75,14 @@ function verifyOptions(overrides = {}) {
         replayCache: createRouterServiceReplayCache(),
         ...overrides,
     };
+}
+
+function helloOptions(overrides = {}) {
+    return verifyOptions({ purpose: HELLO, expectedNonce: N1, ...overrides });
+}
+
+function forgeHello(overrides = {}, options) {
+    return forge({ purpose: HELLO, nonce: N1, ...overrides }, options);
 }
 
 function atTime(t, ms = T0) {
@@ -254,14 +268,24 @@ test('verifier refuses a wrong purpose, aud, method, path, rch or issuer', (t) =
     assertRefused(() => verifyRouterServiceToken(foreign, verifyOptions()), /signature invalid/);
 });
 
-test('verifier refuses iat before the generation start, compared in whole seconds', (t) => {
+// Contract change (Revision 9): the previous test accepted a generation start
+// up to T0 + 999 ms after iat (whole-second comparison), which let a
+// pre-restart token issued in the same second as the new generation pass. The
+// upgrade floor is now exact: iat * 1000 >= generationStartMs.
+test('upgrade token generation floor is exact: T0 accepted, T0 + 1 refused', (t) => {
     atTime(t);
-    // Generation started within the same second as iat: accepted.
     assert.equal(
-        verifyRouterServiceToken(forge(), verifyOptions({ generationStartMs: T0 + 999 })).payload.iat,
+        verifyRouterServiceToken(forge(), verifyOptions({ generationStartMs: T0 })).payload.iat,
         IAT,
     );
-    // Generation started in the next second: refused.
+    assertRefused(
+        () => verifyRouterServiceToken(forge(), verifyOptions({ generationStartMs: T0 + 1 })),
+        /issued before the current worker generation/,
+    );
+    assertRefused(
+        () => verifyRouterServiceToken(forge(), verifyOptions({ generationStartMs: T0 + 999 })),
+        /issued before the current worker generation/,
+    );
     assertRefused(
         () => verifyRouterServiceToken(forge(), verifyOptions({ generationStartMs: T0 + 1000 })),
         /issued before the current worker generation/,
@@ -270,6 +294,208 @@ test('verifier refuses iat before the generation start, compared in whole second
         () => verifyRouterServiceToken(forge({ iat: IAT - 1, exp: IAT + 29 }), verifyOptions({ generationStartMs: T0 })),
         /issued before the current worker generation/,
     );
+});
+
+test('hello token is not subject to the generation floor', (t) => {
+    atTime(t);
+    for (const generationStartMs of [T0 + 1, T0 + 1000, T0 + 3_600_000, undefined]) {
+        const { payload } = verifyRouterServiceToken(forgeHello(), helloOptions({ generationStartMs }));
+        assert.equal(payload.nonce, N1);
+    }
+});
+
+test('hello mint emits the exact claim set plus nonce', (t) => {
+    atTime(t);
+    const { token, payload } = minter().mintWithPayloadSync({
+        targetAgentId: PROVIDER, path: TERMINAL_PATH, purpose: HELLO, nonce: N1,
+    });
+    assert.equal(payload.purpose, 'execution-provider-terminal-hello');
+    assert.equal(payload.nonce, N1);
+    assert.deepEqual(
+        Object.keys(payload).sort(),
+        ['aud', 'exp', 'iat', 'iss', 'jti', 'method', 'nonce', 'path', 'purpose', 'rch', 'typ'],
+    );
+    assert.equal(payload.rch, computeRch({ method: 'GET', path: TERMINAL_PATH }));
+    assert.equal(verifyRouterServiceToken(token, helloOptions()).payload.nonce, N1);
+
+    const service = minter();
+    for (const nonce of [undefined, '', N1.slice(0, 42), `${N1}A`, 'A'.repeat(43) + '=', 123]) {
+        assert.throws(
+            () => service.mintWithPayloadSync({ targetAgentId: PROVIDER, path: TERMINAL_PATH, purpose: HELLO, nonce }),
+            /hello purpose requires/,
+        );
+    }
+    // 43 characters that do not re-encode to the same 32 bytes (non-canonical last char).
+    const nonCanonical = `${N1.slice(0, 42)}B`;
+    assert.equal(nonCanonical.length, 43);
+    assert.notEqual(Buffer.from(nonCanonical, 'base64url').toString('base64url'), nonCanonical);
+    assert.throws(
+        () => service.mintWithPayloadSync({ targetAgentId: PROVIDER, path: TERMINAL_PATH, purpose: HELLO, nonce: nonCanonical }),
+        /hello purpose requires/,
+    );
+    // nonce is refused for the upgrade purpose.
+    assert.throws(
+        () => service.mintWithPayloadSync({ targetAgentId: PROVIDER, path: TERMINAL_PATH, nonce: N1 }),
+        /nonce is only valid for the hello purpose/,
+    );
+});
+
+test('hello verification refuses a missing, short, long or non-canonical nonce, and an upgrade token carrying nonce', (t) => {
+    atTime(t);
+    const cache = createRouterServiceReplayCache();
+    assertRefused(
+        () => verifyRouterServiceToken(forgeHello({}, { remove: ['nonce'] }), helloOptions({ replayCache: cache })),
+        /nonce is missing or malformed/,
+    );
+    for (const nonce of [N1.slice(0, 42), `${N1}A`, `${N1.slice(0, 42)}B`, 7, '']) {
+        assertRefused(
+            () => verifyRouterServiceToken(forgeHello({ nonce }), helloOptions({ replayCache: cache })),
+            /nonce is missing or malformed/,
+        );
+    }
+    assertRefused(
+        () => verifyRouterServiceToken(forge({ nonce: N1 }), verifyOptions({ replayCache: cache })),
+        /unexpected claim 'nonce'/,
+    );
+    assert.equal(cache.size(), 0, 'refused tokens consume no jti');
+});
+
+test('hello positive control: the current connection nonce is accepted', (t) => {
+    atTime(t);
+    const cache = createRouterServiceReplayCache();
+    const { token } = minter().mintWithPayloadSync({
+        targetAgentId: PROVIDER, path: TERMINAL_PATH, purpose: HELLO, nonce: N2,
+    });
+    const { payload } = verifyRouterServiceToken(token, helloOptions({ expectedNonce: N2, replayCache: cache }));
+    assert.equal(payload.purpose, HELLO);
+    assert.equal(payload.nonce, N2);
+    assert.equal(cache.size(), 1);
+
+    // The same positive control through the frame-level entry point (no header).
+    const env = { PLOINKY_AGENT_ID: PROVIDER, PLOINKY_AGENT_SECRET: secret.toString('hex') };
+    const second = minter().mintWithPayloadSync({
+        targetAgentId: PROVIDER, path: TERMINAL_PATH, purpose: HELLO, nonce: N1,
+    }).token;
+    const frameCache = createRouterServiceReplayCache();
+    const result = verifyRouterServiceTokenFromFrame(second, {
+        env, purpose: HELLO, path: TERMINAL_PATH, expectedNonce: N1, replayCache: frameCache,
+    });
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(result.payload.nonce, N1);
+    assert.equal(frameCache.size(), 1);
+    const replay = verifyRouterServiceTokenFromFrame(second, {
+        env, purpose: HELLO, path: TERMINAL_PATH, expectedNonce: N1, replayCache: frameCache,
+    });
+    assert.equal(replay.ok, false);
+    assert.equal(replay.code, 'ROUTER_SERVICE_TOKEN_REPLAYED');
+    assert.equal(verifyRouterServiceTokenFromFrame('', { env, purpose: HELLO, path: TERMINAL_PATH, expectedNonce: N1, replayCache: frameCache }).ok, false);
+});
+
+test('hello with the wrong nonce is refused before its jti is consumed', (t) => {
+    atTime(t);
+    const cache = createRouterServiceReplayCache();
+    const token = forgeHello({ nonce: N1 });
+    assertRefused(
+        () => verifyRouterServiceToken(token, helloOptions({ expectedNonce: N2, replayCache: cache })),
+        /nonce does not match this connection/,
+    );
+    assert.equal(cache.size(), 0, 'a nonce mismatch consumes no jti');
+    // The same token is still usable on the connection it was minted for.
+    verifyRouterServiceToken(token, helloOptions({ expectedNonce: N1, replayCache: cache }));
+    assert.equal(cache.size(), 1);
+});
+
+test('a hello token consumed in one cache is refused for another connection nonce after a same-second restart', (t) => {
+    atTime(t);
+    const service = minter();
+    const { token } = service.mintWithPayloadSync({
+        targetAgentId: PROVIDER, path: TERMINAL_PATH, purpose: HELLO, nonce: N1,
+    });
+    const cacheA = createRouterServiceReplayCache();
+    verifyRouterServiceToken(token, helloOptions({ expectedNonce: N1, replayCache: cacheA }));
+    assert.equal(cacheA.size(), 1);
+
+    // Worker restart within the same second: fresh cache, generation start
+    // equal to iat, and a new connection with a new nonce.
+    const cacheB = createRouterServiceReplayCache();
+    assertRefused(
+        () => verifyRouterServiceToken(token, helloOptions({ expectedNonce: N2, replayCache: cacheB, generationStartMs: T0 })),
+        /nonce does not match this connection/,
+    );
+    assert.equal(cacheB.size(), 0);
+});
+
+test('hello replay after exp, within skew, with the same nonce is refused by the jti', (t) => {
+    atTime(t, T0);
+    const cache = createRouterServiceReplayCache();
+    const { token } = minter().mintWithPayloadSync({
+        targetAgentId: PROVIDER, path: TERMINAL_PATH, purpose: HELLO, nonce: N1,
+    });
+    verifyRouterServiceToken(token, helloOptions({ replayCache: cache }));
+    for (const offset of [1_000, 31_000, 59_000, 60_000]) {
+        t.mock.timers.setTime(T0 + offset);
+        assertRefused(() => verifyRouterServiceToken(token, helloOptions({ replayCache: cache })), /already been consumed/);
+    }
+    t.mock.timers.setTime(T0 + 61_000);
+    assertRefused(() => verifyRouterServiceToken(token, helloOptions({ replayCache: cache })), /token expired/);
+});
+
+test('cross-purpose tokens are refused both ways and the header carrier follows the verifier purpose', (t) => {
+    atTime(t);
+    const service = minter();
+    const upgrade = service.mintWithPayloadSync({ targetAgentId: PROVIDER, path: TERMINAL_PATH }).token;
+    const hello = service.mintWithPayloadSync({
+        targetAgentId: PROVIDER, path: TERMINAL_PATH, purpose: HELLO, nonce: N1,
+    }).token;
+    const cache = createRouterServiceReplayCache();
+    // Upgrade token presented as a hello token.
+    assertRefused(() => verifyRouterServiceToken(upgrade, helloOptions({ replayCache: cache })), /purpose mismatch/);
+    // Hello token presented as an upgrade token (its nonce claim is refused first).
+    assertRefused(() => verifyRouterServiceToken(hello, verifyOptions({ replayCache: cache })), /unexpected claim 'nonce'/);
+    // Hello token in the header, verified for the upgrade purpose.
+    const env = { PLOINKY_AGENT_ID: PROVIDER, PLOINKY_AGENT_SECRET: secret.toString('hex') };
+    const viaHeader = verifyRouterServiceTokenFromHeaders(
+        { 'x-ploinky-auth-info': JSON.stringify({ routerServiceToken: hello }) },
+        { env, purpose: PURPOSE, path: TERMINAL_PATH, generationStartMs: T0 - 5000, replayCache: cache },
+    );
+    assert.equal(viaHeader.ok, false);
+    assert.match(viaHeader.reason, /unexpected claim 'nonce'/);
+    assert.equal(cache.size(), 0);
+
+    // expectedNonce is required exactly for the hello purpose.
+    for (const [overrides, pattern] of [
+        [{ purpose: HELLO, expectedNonce: undefined }, /expectedNonce/],
+        [{ purpose: HELLO, expectedNonce: 'short' }, /expectedNonce/],
+        [{ purpose: HELLO, expectedNonce: `${N1.slice(0, 42)}B` }, /expectedNonce/],
+        [{ purpose: PURPOSE, expectedNonce: N1 }, /only valid for the hello purpose/],
+    ]) {
+        assert.throws(() => verifyRouterServiceToken(hello, verifyOptions(overrides)), (error) => {
+            assert.match(error.message, pattern);
+            assert.equal(error.code, 'ROUTER_SERVICE_VERIFIER_MISCONFIGURED');
+            return true;
+        });
+    }
+});
+
+test('a router-request token presented as a hello token is refused by type', async (t) => {
+    atTime(t);
+    const routerRequest = new RouterRequestTokenService({ resolveAgentSecret: () => secret });
+    const { token } = await routerRequest.mintWithPayload({
+        targetAgentId: PROVIDER,
+        sub: 'user:alice',
+        actor: { kind: 'user', id: 'user:alice', roles: ['admin'] },
+        method: 'GET',
+        path: TERMINAL_PATH,
+        tool: '__http_route__',
+        rch: computeRouterServiceRch({ method: 'GET', path: TERMINAL_PATH }),
+    });
+    const cache = createRouterServiceReplayCache();
+    assertRefused(() => verifyRouterServiceToken(token, helloOptions({ replayCache: cache })), /token type is not router-service/);
+    assertRefused(
+        () => verifyRouterServiceToken(forgeHello({ typ: 'router-request' }), helloOptions({ replayCache: cache })),
+        /token type is not router-service/,
+    );
+    assert.equal(cache.size(), 0);
 });
 
 test('verifier refuses an expired token, a lifetime over 30 s and non-integer times', (t) => {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { syntheticLifecyclePreflight } from './helpers/legacyAgentLifecycleHarness.mjs';
 import { prepareMpsGraph } from '../../cli/sandbox/hardwareLimits/mpsGraph.mjs';
 import { drainTargetedContainer } from '../../cli/sandbox/docker/targetedContainerLifecycle.js';
 import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
@@ -17,6 +18,7 @@ function fixture({ changed = true, stopped = false, absent = false } = {}) {
     const selection = { state: 'inactive', generation: 'prepared', selectorDigest: 'digest' };
     const events = [];
     const deps = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [],
         readContext: () => context, loadRegistry: () => registry, readApplied: (key) => ({ ...registry[key], gpuShare: share, mpsGeneration: 'old:config' }),
         store: { read: () => structuredClone(state), write: (next) => { state = structuredClone(next); events.push('journal'); } },
@@ -112,6 +114,7 @@ test('MG.real graph batch rotates drained cohort once and retains authoritative 
     const preparation = await f.run();
     const events = [];
     const dependencies = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [],
         inactivateGeneration: () => events.push('inactive'), loadRouting: () => routing,
         saveRouting: () => events.push('targetless'), saveAgents: () => events.push('save'), retireNoWaitMarkers: () => {},
@@ -227,6 +230,7 @@ async function interruptedAliasWorld(t, { alias = 'router', store: makeStore = m
     const context = { gate: 'on', storeToken: { epoch: 'e'.repeat(32), revision: 1 }, overrides: new Map([['repo/gpu', { gpu: aliasShare(50) }]]), gpu: { grant: { mps: {} } } };
     const events = []; let registry = { [key]: structuredClone(record) };
     const deps = { readContext: () => context, loadRegistry: () => structuredClone(registry), readApplied: () => ({ ...record, gpuShare: aliasShare(25), mpsGeneration: 'old:config' }), loadPlan: () => ({ runtime: 'podman', image: 'image:tag', profile: { network: f.network } }), prepareImage: () => {}, inspectImage: () => ({ Id: 'c'.repeat(64), Config: { User: '1000:1000' } }), store, backend: { observe: () => ({ state: 'owned' }), verify: () => true }, network: (callback) => callback({}), assertCapability: () => {}, policyCheck: () => {}, resolveShare: (value) => value, observeClients: () => [], drainClient: () => { throw Error('crash-before-first-drain'); } };
+    deps.inspectLegacy = syntheticLifecyclePreflight;
     await assert.rejects(coordinateMpsLifecycle({ target: { key, record }, options: {}, launchTarget: () => { throw Error('unexpected launch'); } }, deps), /crash-before-first-drain/);
     const nodes = [{ key, node: { manifest: { container: 'node:22-alpine', network: { mode: 'default' } }, agentRef: 'repo/gpu' } }];
     const graphDeps = { ...deps, runtime: () => 'podman', readSelection: () => ({ selector: { state: 'inactive', generation: 'graph', selectorDigest: 'digest' } }),

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { isLegacyAgentLifecycleRefusal } from '../legacyAgentLifecycleGuard.mjs';
 import { MpsError } from './mpsEligibility.mjs';
 import { isMpsClientAlias, mpsServerDefaultMemoryMiB, sameMpsServerDefault, validateMpsDefault, verifyDetail } from './mps.mjs';
 import { findHardwareOutcome } from './errors.mjs';
@@ -187,6 +188,7 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
                 if (client.share) { const verified = verifyDetail(backend, state); if (!verified.ok) throw new MpsError(`MPS daemon defaults changed before client create${verified.reason ? ` (${verified.reason})` : ''}`); }
                 result = yield () => inApplyStep('client-launch', () => recreate(client, readyState, input.capability));
             } catch (error) {
+                if (isLegacyAgentLifecycleRefusal(error)) throw error;
                 // One client's failure is its own terminal outcome; the rest
                 // of the cohort is still recreated. A cancelled, expired or
                 // unauthorized operation still stops the whole transition.
@@ -225,6 +227,7 @@ function* transitionSteps(input, { assertCapability, store, backend, drain, recr
             save();
         }
     } catch (error) {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         // The exact lifecycle may have recorded a created candidate before
         // readiness failed. Retain that newer identity for crash recovery.
         const observedState = store.read();

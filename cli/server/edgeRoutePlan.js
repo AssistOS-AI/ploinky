@@ -70,7 +70,7 @@ export function normalizeExactHost(hostHeader) {
     return normalizedHostName(hostHeader);
 }
 
-function exactRoute(routes, routeKey) {
+export function exactRoute(routes, routeKey) {
     const key = String(routeKey || '');
     const route = routes?.[key];
     return route && !route.disabled && !route.draining ? { routeKey: key, route } : null;
@@ -120,7 +120,7 @@ function snapshotPolicy(snapshot) {
     });
 }
 
-function exactAgentRuntime(snapshot, routeKey, route) {
+export function exactAgentRuntime(snapshot, routeKey, route) {
     const containerName = String(route?.container || '').trim();
     const record = snapshot.agents?.[containerName];
     if (!containerName || !record || record.type !== 'agent') return null;
@@ -264,6 +264,12 @@ export function agentPortPlan({
             });
         }
         throw error;
+    }
+    // A provider's whole private port and its declared coordinator paths are
+    // never relayed to a request-derived caller, whatever the listener.
+    const providerDenial = providerAgentPortDenial({ snapshot, routeKey: selected.routeKey, route: selected.route, selector, listener, transport, req });
+    if (providerDenial) {
+        return deny(providerDenial.status, providerDenial.code, { matched: true, listener, lease, hostSelection });
     }
     // The agent's own relay opt-out applies to every caller, before any
     // access decision: private loopback services stay private even to admins.
@@ -668,6 +674,10 @@ function agentRootPlan({
 }) {
     const agent = resolveAgentPath(pathname, routes, selectedRoot) || (selectedRoot ? null : resolveDrainingAgentPath(pathname, routes));
     if (!agent) return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
+    const providerDenial = providerAgentRootDenial({
+        snapshot, routeKey: agent.routeKey, route: agent.route, upstreamPath: agent.upstreamPath,
+    });
+    if (providerDenial) return deny(providerDenial.status, providerDenial.code, { matched: true, lease, hostSelection });
     const policy = snapshotPolicy(snapshot);
     if (!policy) return deny(503, 'POLICY_GENERATION_INVALID', {
         matched: true,
@@ -790,6 +800,10 @@ export function resolveEdgeRoutePlan({
     if (hostSelection.kind === 'inactive-public') {
         return deny(503, 'HOST_SELECTOR_INACTIVE', { lease, hostSelection });
     }
+
+    // The reserved task-reference mount precedes every other dispatch.
+    const taskReferenceMount = taskReferenceRoutePlan({ req, pathname, listener, transport, host, hostSelection, lease, snapshot, parsedUrl: url, forwarding: () => canonicalForwardingMetadata({ snapshot, host, listener, hostSelection }) });
+    if (taskReferenceMount) return taskReferenceMount.ok ? taskReferenceMount : deny(taskReferenceMount.status, taskReferenceMount.code, { matched: true, lease, hostSelection });
 
     const conventionPlan = agentPortPlan({
         req,
@@ -1071,6 +1085,11 @@ export default {
 // Imported here, not with the others above, so the reviewed Router reference
 // lines of this file keep their positions.
 import { EDGE_DENIAL_RETRY_AFTER_SECONDS } from './edgeRetryAfter.js';
+import {
+    providerAgentPortDenial,
+    providerAgentRootDenial,
+} from './executionProvider/routing.mjs';
+import { taskReferenceRoutePlan } from './executionProvider/taskReferenceTarget.mjs';
 
 // Denials that end when the next generation activates or a drained agent's
 // replacement is committed. Clients may retry them after a short delay.

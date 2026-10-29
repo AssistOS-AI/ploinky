@@ -10,6 +10,13 @@ import { agentServerIdentityInputs, createAgentServerCodeIdentity, formatIdentit
 import { createAgentServerCodeIdentityThread } from './toolCodeIdentityThread.mjs';
 import { preserveJsonSchemaToolListings } from './inputSchema.mjs';
 import { getConfiguredToolInputSchema } from './toolInputSchemaCache.mjs';
+import { sanitizeContextForLog, sanitizePayloadForLog, sanitizeValueForLog } from './logRedaction.mjs';
+import {
+    parseTaskReferenceAdmission,
+    readTaskRefOrigin,
+    readTaskReferenceDeclaration,
+    taskReferenceAnnotation,
+} from './taskReferenceTool.mjs';
 import { createBoundedReplayCache, legacyMinRetentionMs } from '../lib/replayCache.mjs';
 import {
     hasInvocationTokenHeader,
@@ -991,70 +998,6 @@ async function handleOpenAiModels(req, res) {
     res.end(data);
 }
 
-function sanitizeAuthInfoForLog(authInfo = null) {
-    if (!authInfo || typeof authInfo !== 'object') return null;
-    const github = authInfo.github && typeof authInfo.github === 'object'
-        ? {
-            provider: authInfo.github.provider || '',
-            tokenType: authInfo.github.tokenType || '',
-            scope: authInfo.github.scope || '',
-            hasAccessToken: Boolean(authInfo.github.accessToken),
-            user: authInfo.github.user || null
-        }
-        : null;
-    return {
-        ...authInfo,
-        github
-    };
-}
-
-function sanitizeInvocationForLog(invocation = null) {
-    if (!invocation || typeof invocation !== 'object') return null;
-    return {
-        iss: invocation.iss,
-        sub: invocation.sub,
-        aud: invocation.aud,
-        tool: invocation.tool,
-        scope: invocation.scope,
-        workspace_id: invocation.workspace_id,
-        iat: invocation.iat,
-        exp: invocation.exp,
-        hasUserClaims: Boolean(invocation.user)
-    };
-}
-
-function shouldRedactLogField(key) {
-    return /authorization|cookie|jwt|token|secret|password|credential|access[_-]?key|api[_-]?key|^value$|^task$|prompt|messages?|resources?|content|base64|stdin|payload/i.test(String(key || ''));
-}
-
-function sanitizeValueForLog(value, key = '') {
-    if (value == null) return value;
-    if (shouldRedactLogField(key)) return '[redacted]';
-    if (Array.isArray(value)) {
-        return value.map((entry) => sanitizeValueForLog(entry));
-    }
-    if (typeof value === 'object') {
-        const out = {};
-        for (const [entryKey, entryValue] of Object.entries(value)) {
-            out[entryKey] = sanitizeValueForLog(entryValue, entryKey);
-        }
-        return out;
-    }
-    return value;
-}
-
-function sanitizeContextForLog(context = {}) {
-    if (!context || typeof context !== 'object') return context;
-    const sanitized = sanitizeValueForLog(context);
-    return {
-        ...sanitized,
-        requestInfo: sanitizeValueForLog(context.requestInfo || null),
-        invocationToken: context.invocationToken ? '[redacted]' : context.invocationToken,
-        authInfo: sanitizeAuthInfoForLog(context.authInfo || null),
-        invocation: sanitizeInvocationForLog(context.invocation || null)
-    };
-}
-
 function rejectInvocation(helpers, reason) {
     const ErrorCtor = helpers?.McpError || Error;
     const code = helpers?.ErrorCode?.InvalidRequest ?? -32600;
@@ -1075,14 +1018,6 @@ function requireVerifiedInvocation({ requestHeaders, method, path, tool, argumen
     };
 }
 
-function sanitizePayloadForLog(payload = {}) {
-    if (!payload || typeof payload !== 'object') return payload;
-    return {
-        ...payload,
-        input: sanitizeValueForLog(payload.input || {}),
-        metadata: sanitizeContextForLog(payload.metadata || {})
-    };
-}
 
 const initialConfigResult = getConfigResult();
 const initialConfig = initialConfigResult ? initialConfigResult.config : {};
@@ -1313,6 +1248,10 @@ async function registerFromConfig(server, config, helpers) {
                 title: tool.title,
                 description: tool.description
             };
+            // Interface §2.2: a task-reference tool is advertised with its
+            // provider and runs as a bounded synchronous admission.
+            const taskReference = readTaskReferenceDeclaration(tool);
+            if (taskReference) definition.annotations = taskReferenceAnnotation(taskReference);
 
             const isAsync = tool.async === true;
             const asyncTimeout = Number.isFinite(tool.timeoutMs)
@@ -1344,6 +1283,11 @@ async function registerFromConfig(server, config, helpers) {
                     context,
                     helpers
                 });
+                if (taskReference) {
+                    // The Router origin token for this forwarded call, if any.
+                    const taskRefOrigin = readTaskRefOrigin(requestHeaders);
+                    context = { ...context, ...(taskRefOrigin ? { taskRefOrigin } : {}) };
+                }
                 const debugToolLogs = process.env.PLOINKY_AGENT_TOOL_DEBUG_LOGS === '1';
                 if (debugToolLogs) {
                     console.log(`[AgentServer/MCP] Tool '${name}' args:`, sanitizeValueForLog(args));
@@ -1386,6 +1330,29 @@ async function registerFromConfig(server, config, helpers) {
                         throw new helpers.McpError(helpers.ErrorCode.InternalError, message);
                     }
                     throw new Error(message);
+                }
+                if (taskReference) {
+                    let admission;
+                    try {
+                        admission = parseTaskReferenceAdmission(result.stdout, {
+                            provider: taskReference.provider,
+                            originRequestId: args?.originRequestId,
+                        });
+                    } catch (error) {
+                        if (helpers && helpers.McpError && helpers.ErrorCode) {
+                            throw new helpers.McpError(helpers.ErrorCode.InternalError, error.message);
+                        }
+                        throw error;
+                    }
+                    return {
+                        content: [{ type: 'text', text: JSON.stringify(admission) }],
+                        metadata: {
+                            agent: process.env.AGENT_NAME || name,
+                            taskRef: admission.taskRef,
+                            originRequestId: admission.originRequestId,
+                            state: admission.state,
+                        },
+                    };
                 }
                 const textOut = result.stdout?.length ? result.stdout : '(no output)';
                 const content = [{ type: 'text', text: textOut }];

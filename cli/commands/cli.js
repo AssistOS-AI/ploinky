@@ -45,6 +45,7 @@ import {
     ensureAgentService
 } from '../sandbox/docker/index.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
+import { preflightInterimAgentLifecycles } from '../sandbox/legacyAgentLifecycleGuard.mjs';
 import { isBwrapProcessRunning, registeredRuntimeTuple } from '../sandbox/bwrap/bwrapFleet.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import { handleSystemCommand, handleInvalidCommand, resetLlmInvokerCache } from './llmSystemCommands.js';
@@ -665,6 +666,9 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     throw new Error('restart: start is not configured. Run: start <staticAgent> <port>');
                 }
                 resolvePersistedRouterPort();
+                preflightInterimAgentLifecycles(Object.entries(workspaceSvc.loadAgents()).map(([containerName, registryRecord]) => ({
+                    containerName, registryRecord, runtime: getRuntime,
+                })));
                 await settleWorkspaceBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');
                 console.log('[restart] Stopping Router and configured agents...');

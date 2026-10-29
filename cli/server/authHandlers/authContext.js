@@ -643,8 +643,22 @@ function resolveControlBrowserProofAuthContext(parsedUrl, options = {}) {
     return inheritedContext.error ? null : inheritedContext;
 }
 
+// The generic task-reference surface belongs to no agent route: a browser
+// caller authenticates with the workspace's own user session, whatever
+// `routing.static` names. Without a configured session provider it falls back
+// to the Router-surface owner (host owner or static agent), and without one of
+// those only the separately authenticated local CLI session is admitted.
+function resolveTaskReferenceAuthContext(routePlan, options) {
+    if (authService.isConfigured()) {
+        return { routeKey: null, mode: 'sso', policy: { mode: 'sso' }, record: null };
+    }
+    const owner = resolveRouterSurfaceOwner(routePlan, options);
+    return owner ? owner.context : unconfiguredSurfaceOwnerContext();
+}
+
 export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAuth = false } = {}) {
     const snapshot = snapshotFromOptions({ routePlan });
+    if (routePlan?.kind === 'task-reference') return resolveTaskReferenceAuthContext(routePlan, { snapshot, routePlan });
     const selectedRouteKey = routePlanSelectedRouteKey(routePlan);
     if (routePlan?.kind === 'router-surface' && routePlan?.surface === 'webtty' && selectedRouteKey) {
         return {

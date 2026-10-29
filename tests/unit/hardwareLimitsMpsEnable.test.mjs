@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { enableAgent, previewAgentEnable, withMpsEnablePreparation } from '../../cli/utils/agents.js';
+import { isLegacyAgentLifecycleRefusal } from '../../cli/sandbox/legacyAgentLifecycleGuard.mjs';
 
 const predecessor = { type: 'agent', repoName: 'demo', agentName: 'a', instanceId: 'old-i', enableGeneration: 'old-g', containerId: 'a'.repeat(64) };
 const desired = { type: 'agent', repoName: 'demo', agentName: 'a', instanceId: 'new-i', enableGeneration: 'new-g', profile: 'gpu' };
@@ -68,6 +69,7 @@ function realEnableWithDependencies(f, { failReadiness = false } = {}) {
     const lease = { mode: 'additive' };
     const started = { containerName: 'a', containerId: 'b'.repeat(64), registryRecord: { ...desired, containerId: 'b'.repeat(64) } };
     const bindings = {
+        isLegacyAgentLifecycleRefusal,
         // enableAgent runs under the workspace lease it holds or acquires; the lease is not what this lifecycle test observes.
         withHeldOrAcquiredWorkspaceMutationLease: async (_options, callback) => callback({}),
         registeredRuntimeTuple: () => null,

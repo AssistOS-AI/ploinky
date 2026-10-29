@@ -218,7 +218,10 @@ test('WebChat transport open is not agent readiness and fatal startup is termina
     assert.deepEqual(fixture.answers, []);
 });
 
-test('WebChat CLI exit after readiness stays terminal and cannot hide its error banner', (t) => {
+// Plan Revision 9 §12 replaces the former "CLI exit after readiness stays
+// terminal" expectation: a runtime that closes after readiness is recoverable
+// under the bounded backoff, while a failed startup stays terminal.
+test('WebChat runtime close after readiness reconnects once under the bounded backoff; a failed close stays terminal', (t) => {
     const fixture = browserFixture(t);
     const source = fixture.sources[0];
     source.onopen();
@@ -227,10 +230,59 @@ test('WebChat CLI exit after readiness stays terminal and cannot hide its error 
     assert.equal(fixture.connected(), 1);
     assert.equal(fixture.statusEl.textContent, 'online');
     source.emit('close', { state: 'closed' });
+    assert.equal(source.closed, true, 'the closed stream is released');
+    // The server then ends the stream; its trailing error must not schedule a
+    // second reconnect.
+    source.onerror();
+    assert.equal(fixture.statusEl.textContent, 'offline');
+    assert.match(fixture.banners.at(-1), /Reconnecting in 1s \(attempt 1\/6\)/);
+    t.mock.timers.tick(999);
+    assert.equal(fixture.sources.length, 1, 'no reconnect before the first backoff delay');
+    t.mock.timers.tick(1);
+    assert.equal(fixture.sources.length, 2, 'exactly one reconnect');
+    t.mock.timers.tick(120000);
+    assert.equal(fixture.sources.length, 2, 'the trailing error scheduled nothing');
+    assert.equal(fixture.banners.some((banner) => /Agent session closed/.test(banner)), false);
+
+    // The reconnected runtime then fails its startup: terminal, no retry.
+    const next = fixture.sources[1];
+    next.onopen();
+    next.emit('startup-state', { state: 'ready' });
+    next.emit('close', { state: 'failed' });
+    next.onerror();
+    t.mock.timers.tick(120000);
+    assert.equal(fixture.sources.length, 2);
+    assert.match(fixture.banners.at(-1), /Agent startup failed/);
+});
+
+test('WebChat close before readiness stays terminal even when its state is closed', (t) => {
+    const fixture = browserFixture(t);
+    const source = fixture.sources[0];
+    source.onopen();
+    source.emit('close', { state: 'closed' });
     source.onerror();
     t.mock.timers.tick(120000);
     assert.equal(fixture.sources.length, 1);
-    assert.match(fixture.banners.at(-1), /Agent session closed/);
+    assert.match(fixture.banners.at(-1), /Agent startup failed/);
+});
+
+test('WebChat reconnects after a closed runtime count against the same finite budget', (t) => {
+    const fixture = browserFixture(t);
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+        const source = fixture.sources.at(-1);
+        source.onopen();
+        source.emit('startup-state', { state: 'ready' });
+        source.emit('close', { state: 'closed' });
+        t.mock.timers.tick(1000 * (2 ** attempt));
+        assert.equal(fixture.sources.length, attempt + 2);
+    }
+    const last = fixture.sources.at(-1);
+    last.onopen();
+    last.emit('startup-state', { state: 'ready' });
+    last.emit('close', { state: 'closed' });
+    t.mock.timers.tick(120000);
+    assert.equal(fixture.sources.length, 7);
+    assert.match(fixture.banners.at(-1), /Unable to reconnect/);
 });
 
 test('WebChat repeated stream opens retain exponential backoff and exhaust a finite budget', (t) => {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { syntheticLifecyclePreflight } from './helpers/legacyAgentLifecycleHarness.mjs';
 import { applyHardwareLimits, reconcileExactHardwareInstance, captureExactHardwareInstances } from '../../cli/sandbox/hardwareLimits/reconcile.mjs';
 import { coordinateMpsLifecycle } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { readMpsLaunch, createMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
@@ -25,6 +26,7 @@ function world({ old = false, nextShare = share, fail = {}, tools = {}, backendS
     let state = old ? daemonState() : null;
     const make = (name) => { if (fail[name]) throw fail[name](); };
     const dependencies = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => { make('inventory'); return []; },
         readContext: () => ({ storeToken: token, overrides: new Map([['demo/a', { gpu: nextShare }]]), gpu: { eligible: true, grant: { mps: tools } } }),
         loadRegistry: () => registry,
@@ -115,6 +117,7 @@ function reconcileWorld({ ensure, readiness = async () => {}, activate = async (
     const registry = { exact: record };
     const created = { containerName: 'exact', containerId: 'd'.repeat(64), registryRecord: record, ...(mpsReadiness ? { mpsReadiness } : {}) };
     const dependencies = {
+        inspectLegacy: syntheticLifecyclePreflight,
         loadRegistry: () => registry, loadRouting: () => ({}), readPolicy: () => ({ token }), policyCheck: () => ({ token }),
         loadPlan: () => ({ runtime: 'podman', profileResolution: {}, manifest: {}, agentPath: '/fixture', routerEndpoint: null, runtimeAdmission: { descriptor: { hardwareGpu: gpu ? share : null } } }),
         maintenance: async (_key, _options, callback) => callback(), network: async (callback) => callback({}),
@@ -175,6 +178,7 @@ test('AC.a-peer-that-was-not-recreated-reports-its-cause-in-the-partial-result',
     const applied = (key) => ({ instanceId: registry[key].instanceId, enableGeneration: registry[key].enableGeneration, gpuShare: share, mpsGeneration: 'old:config' });
     const nextShare = { ...share, smPercent: 50 };
     const dependencies = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [], readContext: () => ({ storeToken: token, overrides: new Map([['demo/a', { gpu: nextShare }], ['demo/b', { gpu: share }]]), gpu: { eligible: true, grant: { mps: {} } } }),
         loadRegistry: () => registry, readApplied: (key) => applied(key),
         loadPlan: () => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }), prepareImage: () => {}, inspectImage: () => ({ Id: imageId, Config: { User: '1000:1000' } }),

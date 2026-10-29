@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { syntheticLifecyclePreflight } from './helpers/legacyAgentLifecycleHarness.mjs';
 import { ensureMpsGraphAgentService, acknowledgeMpsRuntimeReady, verifyMpsRuntimeReady, finalizeMpsGraph } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { readMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
 import { resolveMpsServerDefault } from '../../cli/sandbox/hardwareLimits/mpsTransition.mjs';
@@ -25,6 +26,7 @@ function fixture({ state: initial = null, policies = [['demo/a', { gpu: share() 
         start: (value, { onState }) => { events.push('start'); const next = { ...ready(value), daemonGeneration: 'new' }; onState(next); return next; },
     };
     const deps = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [],
         readContext: () => context, loadRegistry: () => registry, store, backend,
         loadPlan: () => ({ runtime: 'podman', image: 'mutable:tag', profile: { network: { mode: 'default' } } }),

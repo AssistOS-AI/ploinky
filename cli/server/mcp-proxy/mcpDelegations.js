@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { loadRoutingConfig } from '../routingState.js';
+import { loadActiveRoutingState, loadRoutingConfig } from '../routingState.js';
 import { mintUserDelegationGrant, resolveMaxTtlSeconds } from './userDelegationGrant.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
@@ -129,14 +129,91 @@ export function resolveMcpToolDelegations({ routeKey, toolName, routes } = {}) {
     return normalizeMcpDelegationEntries(tool.delegations, { route, toolName: String(toolName || ''), sourceAgentId });
 }
 
-export function buildMcpDelegationsForUserCall({ req, routeKey, toolName, routes, now = new Date() } = {}) {
+// The WebChat message pseudo-tool. Its delegations are declared by the
+// manifest key `webchat.delegations`, never by `mcp-config.json`.
+export const WEBCHAT_MESSAGE_TOOL = '__webchat_message__';
+
+function isPlainManifestObject(value) {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Presence is the own property of a `webchat` object, whatever its value.
+export function readWebchatDelegationDeclaration(manifest) {
+    const webchat = isPlainManifestObject(manifest) && isPlainManifestObject(manifest.webchat) ? manifest.webchat : null;
+    if (!webchat || !Object.hasOwn(webchat, 'delegations')) return { present: false };
+    return { present: true, entries: webchat.delegations };
+}
+
+// Manifest admission: a present `webchat.delegations` must be a non-empty
+// array that the MCP-tool delegation normalizer accepts. An invalid value is a
+// manifest error, never an absent declaration.
+export function normalizeWebchatDelegations(manifest, { repoName = '', agentName = '' } = {}) {
+    const read = readWebchatDelegationDeclaration(manifest);
+    if (!read.present) return [];
+    if (!Array.isArray(read.entries) || read.entries.length === 0) {
+        throw new Error(`Invalid MCP tool delegations for '${WEBCHAT_MESSAGE_TOOL}': webchat.delegations must be a non-empty array`);
+    }
+    let sourceAgentId = '';
+    try {
+        sourceAgentId = repoName && agentName ? deriveAgentPrincipalId(repoName, agentName) : '';
+    } catch {
+        sourceAgentId = '';
+    }
+    return normalizeMcpDelegationEntries(read.entries, {
+        route: { repo: repoName },
+        toolName: WEBCHAT_MESSAGE_TOOL,
+        sourceAgentId,
+    });
+}
+
+export function assertWebchatDelegationsManifest({ manifest, repoName, agentName, label = '' } = {}) {
+    try {
+        normalizeWebchatDelegations(manifest, { repoName, agentName });
+    } catch (error) {
+        throw new Error(`${label ? `${label}: ` : ''}${error.message}`);
+    }
+}
+
+function activeGenerationSnapshot() {
+    try {
+        return loadActiveRoutingState().snapshot || null;
+    } catch {
+        return null;
+    }
+}
+
+// The WebChat delegations of a route, read only from the admitted manifest of
+// the active edge generation (or the caller's lease snapshot). Without an
+// active generation, or for an invalid value, nothing is minted.
+export function resolveWebchatDelegations({ routeKey, snapshot } = {}) {
+    const activeSnapshot = snapshot || activeGenerationSnapshot();
+    const key = String(routeKey || '').trim();
+    const route = activeSnapshot?.routing?.routes?.[key];
+    if (!key || !route || route.disabled) return [];
+    const repo = String(route.repo || '').trim();
+    const agent = String(route.agent || '').trim();
+    if (!repo || !agent) return [];
+    try {
+        return normalizeWebchatDelegations(activeSnapshot.manifests?.[key], { repoName: repo, agentName: agent });
+    } catch {
+        return [];
+    }
+}
+
+export function routeDeclaresWebchatDelegations({ routeKey, snapshot } = {}) {
+    return resolveWebchatDelegations({ routeKey, snapshot }).length > 0;
+}
+
+export function buildMcpDelegationsForUserCall({ req, routeKey, toolName, routes, snapshot, now = new Date() } = {}) {
     const user = req?.user && typeof req.user === 'object' ? req.user : null;
     if (!user || !String(user.id || '').trim()) return undefined;
     const roles = Array.isArray(user.roles)
         ? user.roles.map((role) => String(role || '').trim().toLowerCase())
         : [];
     if (roles.includes('guest')) return undefined;
-    const specs = resolveMcpToolDelegations({ routeKey, toolName, routes });
+    const specs = String(toolName || '') === WEBCHAT_MESSAGE_TOOL
+        ? resolveWebchatDelegations({ routeKey, snapshot })
+        : resolveMcpToolDelegations({ routeKey, toolName, routes });
     if (!specs.length) return undefined;
     const signingSecret = deriveSubkey('router-user-delegation', 32);
     const out = {};
@@ -169,8 +246,12 @@ export function buildMcpDelegationsForUserCall({ req, routeKey, toolName, routes
 }
 
 export default {
+    assertWebchatDelegationsManifest,
     buildMcpDelegationsForUserCall,
     deriveDelegationKey,
     normalizeMcpDelegationEntries,
+    normalizeWebchatDelegations,
     resolveMcpToolDelegations,
+    resolveWebchatDelegations,
+    routeDeclaresWebchatDelegations,
 };

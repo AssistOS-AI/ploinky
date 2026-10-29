@@ -19,6 +19,7 @@ import {
     workspaceNetworkIdentity,
 } from './networkIdentity.js';
 import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
+import { isLegacyAgentLifecycleRefusal } from './legacyAgentLifecycleGuard.mjs';
 
 export { NETWORK_LABELS, physicalNetworkName, workspaceNetworkIdentity } from './networkIdentity.js';
 
@@ -112,8 +113,8 @@ function expectedAgentLabels(workspaceHash, contractHash, runtimeIdentity) {
 
 function firstRecord(raw, description) {
     let parsed;
-    try { parsed = JSON.parse(String(raw || '')); } catch (error) {
-        throw new Error(`${description} inspection returned malformed JSON: ${error.message}`);
+    try { parsed = JSON.parse(String(raw || '')); } catch (_) {
+        throw new Error(`${description} inspection returned malformed JSON`);
     }
     const record = Array.isArray(parsed) ? parsed[0] : parsed;
     if (!record || typeof record !== 'object') throw new Error(`${description} inspection returned no record`);
@@ -1073,6 +1074,7 @@ export function createNetworkLifecycleAdapter({
         networkLifecycleCapability,
         commandPrefix = [],
         beforeDestructiveWork = null,
+        assertExistingAgent = null,
     }) {
         if (typeof createContainer !== 'function') throw new Error('managed container transaction requires createContainer');
         if (inspectAdoption !== null && typeof inspectAdoption !== 'function') {
@@ -1105,6 +1107,7 @@ export function createNetworkLifecycleAdapter({
             if (previous) {
                 assertRequiredLabels(containerName, labelsOf(previous), ownershipLabels);
                 previousId = containerRecordId(previous, containerName);
+                assertExistingAgent?.({ record: previous, containerId: previousId, containerName });
             }
             let candidateCreationAttempted = false;
             let candidateId = '';
@@ -1131,6 +1134,7 @@ export function createNetworkLifecycleAdapter({
                     const finalRecord = inspectContainer(previousId);
                     if (!finalRecord) throw new Error(`managed adoption candidate '${containerName}' disappeared`);
                     assertManagedContainerRecord(finalRecord, containerName, plan, agentLabels, previousId);
+                    assertExistingAgent?.({ record: finalRecord, containerId: previousId, containerName });
                     if (!(finalRecord?.State?.Running === true || finalRecord?.State?.Status === 'running')) {
                         throw new Error(`managed adoption candidate '${containerName}' stopped during final inspection`);
                     }
@@ -1148,6 +1152,7 @@ export function createNetworkLifecycleAdapter({
                         throw new Error(`resource '${containerName}' changed identity before managed replacement`);
                     }
                     assertRequiredLabels(containerName, labelsOf(current), ownershipLabels);
+                    assertExistingAgent?.({ record: current, containerId: previousId, containerName });
                     const previousDescriptor = captureGeneratedRouterDescriptorArtifact(current);
                     if (previous?.State?.Running === true || previous?.State?.Status === 'running') {
                         beforeDestructiveWork?.({ kind: 'stop', containerName, containerId: previousId });
@@ -1171,6 +1176,12 @@ export function createNetworkLifecycleAdapter({
                             );
                         }
                     }
+                    const beforeRemoval = inspectContainer(previousId);
+                    if (!beforeRemoval || containerRecordId(beforeRemoval, containerName) !== previousId) {
+                        throw new Error(`resource '${containerName}' changed identity before managed removal`);
+                    }
+                    assertRequiredLabels(containerName, labelsOf(beforeRemoval), ownershipLabels);
+                    assertExistingAgent?.({ record: beforeRemoval, containerId: previousId, containerName });
                     beforeDestructiveWork?.({ kind: 'remove', containerName, containerId: previousId });
                     const removed = execute(['rm', '-f', previousId]);
                     if (!removed.ok && !missing(removed)) {
@@ -1229,6 +1240,7 @@ export function createNetworkLifecycleAdapter({
                 if (finalizeLaunch) finalizeLaunch({ plan, launch, containerId, record: finalRecord });
                 return { ...plan, containerId, launch };
             } catch (error) {
+                if (isLegacyAgentLifecycleRefusal(error)) throw error;
                 let candidate = null;
                 let candidateInspectionComplete = false;
                 let launchArtifactCleanupSafe = false;
@@ -1300,6 +1312,7 @@ export function createNetworkLifecycleAdapter({
         containerName,
         runtimeIdentity,
         inspectAdoption,
+        assertExistingAgent = null,
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
         networkLifecycleCapability,
     }) {
@@ -1311,6 +1324,10 @@ export function createNetworkLifecycleAdapter({
             if (!['default', 'bridge'].includes(checked.mode)) {
                 throw new Error(`managed container adoption cannot run network mode '${checked.mode}'`);
             }
+            const initial = inspectContainer(containerName);
+            if (!initial) return Object.freeze({ adopted: false, reason: 'absent' });
+            assertRequiredLabels(containerName, labelsOf(initial), expectedAgentOwnershipLabels(identity.hash, networkContractHash(network)));
+            assertExistingAgent?.({ record: initial, containerId: containerRecordId(initial, containerName), containerName });
             const plan = prepareFromPreflight(checked);
             try {
                 const expectedLabels = expectedAgentLabels(
@@ -1318,8 +1335,6 @@ export function createNetworkLifecycleAdapter({
                     networkContractHash(network),
                     runtimeIdentity,
                 );
-                const initial = inspectContainer(containerName);
-                if (!initial) return Object.freeze({ adopted: false, reason: 'absent' });
                 const containerId = assertManagedContainerRecord(
                     initial,
                     containerName,
@@ -1340,12 +1355,14 @@ export function createNetworkLifecycleAdapter({
                 const finalRecord = inspectContainer(containerId);
                 if (!finalRecord) throw new Error(`managed adoption candidate '${containerName}' disappeared`);
                 assertManagedContainerRecord(finalRecord, containerName, plan, expectedLabels, containerId);
+                assertExistingAgent?.({ record: finalRecord, containerId, containerName });
                 if (!(finalRecord?.State?.Running === true || finalRecord?.State?.Status === 'running')) {
                     throw new Error(`managed adoption candidate '${containerName}' stopped during final inspection`);
                 }
                 if (typeof adoption.finalize === 'function') adoption.finalize(finalRecord);
                 return Object.freeze({ ...plan, adopted: true, containerId, adoption });
             } catch (error) {
+                if (isLegacyAgentLifecycleRefusal(error)) throw error;
                 rollbackResources(plan, error);
                 throw error;
             }
@@ -1417,6 +1434,7 @@ export function createNetworkLifecycleAdapter({
         instanceId = '',
         enableGeneration = '',
         requireRuntimeIdentity = false,
+        assertExistingAgent = null,
     } = {}) {
         const record = inspectContainer(containerName);
         if (!record) return { state: 'absent', id: null };
@@ -1430,6 +1448,7 @@ export function createNetworkLifecycleAdapter({
         try { id = containerRecordId(record, containerName); } catch (_) {
             return { state: 'foreign', id: null };
         }
+        assertExistingAgent?.({ record, containerId: id, containerName });
         if (requireRuntimeIdentity) {
             const expectedInstanceId = String(instanceId || '').trim();
             const expectedEnableGeneration = String(enableGeneration || '').trim();
@@ -1542,12 +1561,14 @@ export function createNetworkLifecycleAdapter({
         contractHash,
         instanceId,
         enableGeneration,
+        assertExistingAgent = null,
     } = {}) {
         const exactContainerId = String(expectedContainerId || '').trim();
         if (!exactContainerId) {
             throw new Error(`exact cleanup for '${containerName}' requires an immutable container ID`);
         }
         const inspection = inspectContainerContract(exactContainerId, network, canonicalAgentId, {
+            assertExistingAgent,
             instanceKey,
             contractHash,
             instanceId,
@@ -1569,6 +1590,8 @@ export function createNetworkLifecycleAdapter({
         if (!exactRecord || containerRecordId(exactRecord, containerName) !== exactContainerId) {
             return { removed: false, state: 'identity-drift', id: exactContainerId, reason: 'immutable-id-mismatch' };
         }
+        assertRequiredLabels(containerName, labelsOf(exactRecord), expectedAgentLabels(identity.hash, contractHash, { instanceId, enableGeneration }));
+        assertExistingAgent?.({ record: exactRecord, containerId: exactContainerId, containerName });
         const descriptorArtifact = captureGeneratedRouterDescriptorArtifact(exactRecord);
         const removed = execute(['rm', '-f', exactContainerId]);
         if (!removed.ok && !missing(removed)) {

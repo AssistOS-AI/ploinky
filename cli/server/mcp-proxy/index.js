@@ -16,6 +16,7 @@ import {
     verifyAgentAssertion
 } from './invocationMinter.js';
 import { buildMcpDelegationsForUserCall } from './mcpDelegations.js';
+import { findToolListing, taskReferenceOriginHeaders } from '../executionProvider/originToken.mjs';
 import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
@@ -228,6 +229,14 @@ function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, beforeDispatch
     };
 }
 
+async function agentToolListing(agentName, agentClient, toolName) {
+    try {
+        return findToolListing(await getToolSchemasForAgent(agentName, agentClient), toolName);
+    } catch (_) {
+        return null;
+    }
+}
+
 async function canonicalizeToolArguments(agentName, agentClient, toolName, args) {
     try {
         const tools = await getToolSchemasForAgent(agentName, agentClient);
@@ -237,6 +246,9 @@ async function canonicalizeToolArguments(agentName, agentClient, toolName, args)
     }
 }
 
+// Unused: nothing in this tree calls this helper (verified 2026-10-28). It is
+// kept, with the same origin-token delivery as the MCP proxy, for callers
+// that may adopt it; it has no dedicated test.
 export async function invokeAuthenticatedAgentTool({
     req,
     route,
@@ -275,8 +287,15 @@ export async function invokeAuthenticatedAgentTool({
             toolName,
             toolArgs: args,
         });
-        const toolClient = createAgentClient(baseUrl, context?.token
-            ? { requestHeaders: { authorization: `Bearer ${context.token}` } }
+        const requestHeaders = {
+            ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
+            ...taskReferenceOriginHeaders({
+                req, agentName, toolName, toolArgs: args,
+                toolListing: await agentToolListing(agentName, agentClient, toolName),
+            }),
+        };
+        const toolClient = createAgentClient(baseUrl, Object.keys(requestHeaders).length
+            ? { requestHeaders }
             : undefined);
         try {
             return await toolClient.callTool(toolName, args);
@@ -461,7 +480,7 @@ export function buildInvocationContextForProviderCall({
             const displayName = String(req.user?.username || '').trim();
             if (displayName) actor.displayName = displayName;
         }
-        const delegations = buildMcpDelegationsForUserCall({ req, routeKey: agentName, toolName });
+        const delegations = buildMcpDelegationsForUserCall({ req, routeKey: agentName, toolName, snapshot });
         const { token, payload } = buildRouterRequest({
             targetAgentId,
             sub,
@@ -722,7 +741,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
         return;
     }
 
-    function buildRequestHeadersForToolCall(toolName, toolArgs) {
+    function buildRequestHeadersForToolCall(toolName, toolArgs, toolListing = null) {
         const ctx = buildInvocationContextForProviderCall({
             req,
             agentName,
@@ -730,10 +749,20 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
             toolArgs: toolArgs || {},
             snapshot,
         });
-        if (ctx?.token) {
-            return { authorization: `Bearer ${ctx.token}` };
-        }
-        return null;
+        // A task-reference tool (its Router listing names a declared provider)
+        // also receives a fresh Router origin token for that provider.
+        const headers = {
+            ...(ctx?.token ? { authorization: `Bearer ${ctx.token}` } : {}),
+            ...taskReferenceOriginHeaders({
+                req,
+                agentName,
+                toolName,
+                toolArgs: toolArgs || {},
+                toolListing,
+                snapshot,
+            }),
+        };
+        return Object.keys(headers).length ? headers : null;
     }
 
     const upstream = createUpstreamMcpCaller({
@@ -785,6 +814,10 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
                     ? { ...argPayload }
                     : {};
                 const canonicalArgs = await canonicalizeToolArguments(agentName, upstream, name, args);
+                // The serving agent's own listing (cached or fetched now, so a
+                // call needs no preceding caller tools/list) decides whether
+                // the call carries a Router origin token.
+                const toolListing = await agentToolListing(agentName, upstream, name);
                 if (!stateless && !isOwned()) {
                     sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } }, null);
                     break;
@@ -793,7 +826,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
                 // Mint a router-signed invocation token scoped to this tool call,
                 // once per upstream attempt, and send it only in that request.
                 const result = await upstream.callTool(name, canonicalArgs,
-                    () => buildRequestHeadersForToolCall(name, canonicalArgs));
+                    () => buildRequestHeadersForToolCall(name, canonicalArgs, toolListing));
                 sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result }, sessionIdHeader);
                 break;
             }

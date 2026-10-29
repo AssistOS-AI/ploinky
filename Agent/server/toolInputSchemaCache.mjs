@@ -1,5 +1,6 @@
 import { zod } from 'mcp-sdk';
 import { buildJsonSchema, isJsonSchema } from './inputSchema.mjs';
+import { readTaskReferenceDeclaration, taskReferenceInputSchema } from './taskReferenceTool.mjs';
 
 const { z } = zod;
 // Only loaded configuration and its declared tool objects can populate this
@@ -26,17 +27,21 @@ export function getConfiguredToolInputSchema(config, tool) {
     const existing = entries.get(tool);
     if (existing) return existing;
 
-    const configured = tool.inputSchema !== undefined;
+    // A task-reference tool always has a strict JSON schema with the injected
+    // `originRequestId` (taskReferenceTool.mjs), configured or not.
+    const taskReference = readTaskReferenceDeclaration(tool);
+    const configured = tool.inputSchema !== undefined || taskReference !== null;
     let schema = null;
     let jsonSchema = null;
     if (configured) {
         try {
-            if (!tool.inputSchema || typeof tool.inputSchema !== 'object' || Array.isArray(tool.inputSchema)) {
+            const source = taskReference ? taskReferenceInputSchema(tool, { isJsonSchema }) : tool.inputSchema;
+            if (!source || typeof source !== 'object' || Array.isArray(source)) {
                 throw new Error('inputSchema must be an object');
             }
             // Refinements can retain references to enum values. Snapshot only
             // the configuration-derived spec so later callers cannot alter it.
-            const spec = freezeSchemaSpec(structuredClone(tool.inputSchema));
+            const spec = freezeSchemaSpec(structuredClone(source));
             const standard = isJsonSchema(spec);
             schema = standard ? buildJsonSchema(spec) : buildZodObjectSchema(spec);
             if (standard) jsonSchema = spec;

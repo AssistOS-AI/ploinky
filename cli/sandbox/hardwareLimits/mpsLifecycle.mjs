@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { inspectInterimAgentLifecycle, isLegacyAgentLifecycleRefusal, interimReceiptRegistryRecord } from '../legacyAgentLifecycleGuard.mjs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
@@ -94,11 +95,13 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         ? inspectMpsClient(candidate, { runtime: plan.runtime, network: plan.profile.network, alias: candidate.alias })
         : inspectMpsClientPresence(candidate, { runtime: getRuntime() })),
     removeCandidate = (candidate, plan, capability) => retireExactAgentRuntimePredecessor({ containerName: candidate.key, containerId: candidate.containerId,
-        registryRecord: mpsCandidateRecord(candidate), runtimeNetwork: plan.profile.network }, { networkLifecycleCapability: capability }),
+        registryRecord: interimReceiptRegistryRecord(mpsCandidateRecord(candidate), loadRegistry()[candidate.key]),
+        runtimeNetwork: plan.profile.network }, { networkLifecycleCapability: capability }),
     ownerState = mpsOwnerState, markUnavailable = (outcome, capability) => markMpsPeerUnavailable(outcome, capability, { loadRegistry }),
     engineRun = undefined,
     inspectRecorded = (client, record) => inspectRecordedMpsClient(client, { runtime: recordRuntime(record), run: engineRun }),
     stopRecorded = (client, record) => stopRecordedMpsClient(client, { runtime: recordRuntime(record), ...(engineRun ? { run: engineRun } : {}) }),
+    inspectLegacy = inspectInterimAgentLifecycle,
 } = {}) {
     return network(async (capability) => {
         const context = readContext();
@@ -111,6 +114,19 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         };
         check();
         const registry = loadRegistry();
+        const legacyRecords = new Map(Object.entries(registry).filter(([, record]) => record?.type === 'agent'));
+        legacyRecords.set(target.key, target.record);
+        for (const [key, record] of legacyRecords) {
+            const applied = record.containerId ? readApplied(key, record.containerId) : null;
+            if (key === target.key || applied?.mpsGeneration) {
+                inspectLegacy({ containerName: key, registryRecord: record, runtime: getRuntime });
+            }
+        }
+        const savedLegacyState = store.read();
+        for (const client of [...(savedLegacyState?.oldClients || []), ...createdMpsCandidates(savedLegacyState, registry)]) {
+            inspectLegacy({ containerName: client.key,
+                registryRecord: interimReceiptRegistryRecord(mpsCandidateRecord(client), registry[client.key]), runtime: getRuntime });
+        }
         // A created candidate whose readiness failed (or whose process died)
         // is settled through its own exact tuple and immutable ID before any
         // planning; the registry still names its predecessor. A candidate
@@ -154,6 +170,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                     images.set(key, inspected.imageId);
                 }
             } catch (error) {
+                if (isLegacyAgentLifecycleRefusal(error)) throw error;
                 // A peer's unresolved manifest or ineligible image is that
                 // peer's own refusal: it stays an old client, is not recreated
                 // here, and never refuses the selected target. If the cohort
@@ -178,6 +195,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                 inApplyStep('image-preparation', () => inspectMpsImage({ image: plan.image, networkMode: plan.profile.network.mode }, { inspectImage: (image) => inspectImage(image, { runtime: plan.runtime }) }));
                 configuredPolicies.push({ share });
             } catch (error) {
+                if (isLegacyAgentLifecycleRefusal(error)) throw error;
                 if (ref === `${target.record.repoName}/${target.record.agentName}`) throw error;
             }
         }
@@ -188,6 +206,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         const refusedResults = [];
         let result;
         let partial = null;
+        let terminalRefusal = false;
         try {
         result = await runMpsTransitionAsync({ oldClients, desiredClients, configuredPolicies, selectedKeys: [target.key], capability, origin: options.origin || 'lifecycle',
             preservedPending: inFlight, refusedClients: peerRefusals }, {
@@ -195,6 +214,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             drain: async (client) => {
                 check();
                 const record = loadRegistry()[client.key];
+                inspectLegacy({ containerName: client.key, registryRecord: record, runtime: getRuntime });
                 // A journaled client whose agent left the registry (disabled)
                 // is drained once its immutable container is proven absent,
                 // as graph preparation settles it; a present one is refused.
@@ -273,6 +293,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             onResult: (value) => { if (value?.state === 'refused' && value.problem && peerRefusals.some(({ client }) => client.key === value.key)) refusedResults.push(value); options.onMpsResult?.(value); },
         });
         } catch (error) {
+            if (isLegacyAgentLifecycleRefusal(error)) { terminalRefusal = true; throw error; }
             if (error?.code === 'mps_peer_unretirable' && error.peerOutcome) {
                 // Fail closed with every agent's outcome: the peer is refused
                 // and the target stays pending with the reason.
@@ -290,7 +311,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
             partial = error;
             result = { state: error.mpsTransitionState };
         } finally {
-            for (const value of refusedResults) {
+            for (const value of terminalRefusal ? [] : refusedResults) {
                 try { await markUnavailable(value.problem, capability); }
                 catch (error) { console.warn(`[hardware-limits] ${value.key} is refused, but its routes could not be marked unavailable: ${String(error?.message || error).slice(0, 256)}`); }
             }
@@ -333,6 +354,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     store = createMpsStateStore(), backend = createMpsDaemonBackend(), ensure = ensureAgentService,
     assertCapability = assertNetworkLifecycleCapability, policyCheck = assertHardwareApplyInputs,
     resolveShare = resolveStoredGpuShare, observeClients = assertKnownMpsClients,
+    inspectLegacy = inspectInterimAgentLifecycle,
 } = {}) {
     assertCapability(options.networkLifecycleCapability);
     const context = readContext();
@@ -342,6 +364,12 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     const repoName = resolveAgentRepositoryName(agentPath);
     const key = options.hardwareInstanceKey || options.containerName || getAgentContainerName(agentName, repoName);
     const record = options.preparedRegistryRecord || loadRegistry()[key];
+    inspectLegacy({ containerName: key, registryRecord: record, runtime: getRuntime });
+    const priorState = store.read();
+    for (const client of [...(priorState?.oldClients || []), ...createdMpsCandidates(priorState, loadRegistry())]) {
+        inspectLegacy({ containerName: client.key,
+            registryRecord: interimReceiptRegistryRecord(mpsCandidateRecord(client), loadRegistry()[client.key]), runtime: getRuntime });
+    }
     if (!record?.instanceId || !record?.enableGeneration) throw new MpsError('Prepared GPU target has no exact graph identity');
     const ref = `${repoName}/${agentName}`;
     const policy = context.overrides?.get(ref)?.gpu;
@@ -400,6 +428,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     let result;
     try { result = await inApplyStep('client-launch', () => ensure(agentName, manifest, agentPath, { ...options, mpsLaunch })); }
     catch (error) {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         if (share) {
             // The daemon was verified just above: this is one client's own
             // failure (plan 11.3, partial transition failure), journaled as a
@@ -441,6 +470,7 @@ async function acknowledgeMpsRuntimeReadyStrict(result, { store = createMpsState
 }
 
 function typedMpsFailure(error, target) {
+    if (isLegacyAgentLifecycleRefusal(error)) return error;
     if (['identity_changed', 'revision_conflict', 'apply_timeout', 'hardware_limits_transition'].includes(error?.code)) return error;
     if (!(error instanceof MpsError) && error?.code !== 'gpu_sharing_unavailable' && error?.code !== 'image_preparation_required') return error;
     const ref = `${target.record.repoName}/${target.record.agentName}`;
@@ -461,6 +491,7 @@ export async function coordinateMpsLifecycle(input, dependencies) {
 export async function ensureMpsAgentService(agentName, manifest, agentPath, options = {}) {
     try { return await ensureMpsAgentServiceImpl(agentName, manifest, agentPath, options); }
     catch (error) {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         const targetResult = targetOfPartialFailure(error);
         if (targetResult) return targetResult;
         const repoName = resolveAgentRepositoryName(agentPath);
@@ -511,6 +542,7 @@ export async function prepareMpsClientLaunch(target, options = {}) {
             return { containerName: target.key, containerId: null, registryRecord: target.record };
         } });
     } catch (error) {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         if (!targetOfPartialFailure(error) || !launch) throw error;
     }
     return launch;

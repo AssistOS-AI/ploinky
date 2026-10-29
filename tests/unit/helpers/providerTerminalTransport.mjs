@@ -8,7 +8,10 @@ export const PTY = '11111111-1111-4111-8111-111111111111';
 export const OTHER = '22222222-2222-4222-8222-222222222222';
 export const OPERATION = '33333333-3333-4333-8333-333333333333';
 export const SECRET = Buffer.alloc(32, 17).toString('base64url');
-export const NONCE = Buffer.alloc(32, 33).toString('base64url');
+// Distinct 32-byte challenge nonce per transport (index 0 is NONCE), so a hello
+// token minted for one connection can never satisfy another.
+export const nonceFor = (index) => Buffer.alloc(32, 33 + index).toString('base64url');
+export const NONCE = nonceFor(0);
 export const fields = (extra = {}) => ({ operationId: OPERATION, targetId: 'target_1', project: null,
     cols: 80, rows: 24, ...extra });
 export const flush = async () => {
@@ -52,6 +55,7 @@ export class ScriptedTerminalTransport extends EventEmitter {
         this.callbacks = [];
         this.autoCallback = true;
         this.closed = 0;
+        this.nonce = NONCE;
     }
     send(data, options, callback) {
         this.sent.push({ data: Buffer.isBuffer(data) ? Buffer.from(data) : data, binary: options.binary });
@@ -92,6 +96,7 @@ export function harness(options = {}) {
         openTransport: async (request) => {
             openings.push(request);
             const transport = new ScriptedTerminalTransport();
+            transport.nonce = nonceFor(transports.length);
             transports.push(transport);
             if (options.open) await options.open(transport);
             return transport;
@@ -114,7 +119,7 @@ export async function connect(h) {
     const promise = h.client.connect({ lease: h.lease });
     await flush();
     const transport = h.transports.at(-1);
-    transport.peer('challenge', { nonce: NONCE });
+    transport.peer('challenge', { nonce: transport.nonce });
     await flush();
     transport.peer('hello-ok', { ownershipSessionId: OWNER, workerGeneration: GENERATION,
         leaseExpiresAt: 12, secret: SECRET });
@@ -133,7 +138,7 @@ export async function startRotation(h) {
     const promise = h.client.rotate({ lease: h.lease });
     await flush();
     const transport = h.transports.at(-1);
-    transport.peer('challenge', { nonce: NONCE });
+    transport.peer('challenge', { nonce: transport.nonce });
     await flush();
     return { promise, transport };
 }

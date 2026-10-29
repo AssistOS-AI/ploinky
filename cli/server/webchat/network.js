@@ -536,8 +536,10 @@ export function createNetwork({
             showBanner('Starting agent…');
         };
 
-        es.onerror = () => {
-            if (!isCurrent()) return;
+        // Drops this source and retries under the bounded exponential backoff.
+        // `es = null` first, so the trailing error of the ended stream is not
+        // current and cannot schedule a second reconnect.
+        const reconnectWithBackoff = () => {
             setInputReady(false);
             hideTypingIndicator(true);
             setConnectionStatus('offline');
@@ -573,6 +575,11 @@ export function createNetwork({
                     dlog('SSE restart error', error);
                 }
             }, totalDelay);
+        };
+
+        es.onerror = () => {
+            if (!isCurrent()) return;
+            reconnectWithBackoff();
         };
 
         es.onmessage = (event) => {
@@ -631,8 +638,17 @@ export function createNetwork({
 
         es.addEventListener('close', (event) => {
             if (!isCurrent()) return;
-            let failed = !runtimeReady;
-            try { failed = failed || JSON.parse(event.data)?.state === 'failed'; } catch (_) { }
+            let state = '';
+            try { state = String(JSON.parse(event.data)?.state || ''); } catch (_) { }
+            // A runtime that was ready and then closed (for example its agent
+            // restarted) is recoverable: reconnecting creates a new runtime.
+            // A failed startup, or a close before readiness, stays terminal.
+            if (runtimeReady && state === 'closed') {
+                dlog('SSE runtime closed after ready; reconnecting');
+                reconnectWithBackoff();
+                return;
+            }
+            const failed = !runtimeReady || state === 'failed';
             terminalConnection(failed
                 ? 'Agent startup failed. Reload to retry.'
                 : 'Agent session closed. Reload to reconnect.');

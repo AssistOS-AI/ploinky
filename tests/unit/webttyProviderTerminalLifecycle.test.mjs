@@ -5,7 +5,7 @@ import { ProviderTerminalChannel } from '../../cli/server/webtty/providerTermina
 import { ProviderTerminalClient } from '../../cli/server/webtty/providerTerminalClient.mjs';
 import {
     harness, connect, launch, startRotation, finishRotation, flush, fields, ManualClock,
-    ScriptedTerminalTransport, OWNER, GENERATION, PTY, OTHER, OPERATION, SECRET, NONCE,
+    ScriptedTerminalTransport, OWNER, GENERATION, PTY, OTHER, OPERATION, SECRET,
 } from './helpers/providerTerminalTransport.mjs';
 
 function cleaned(h) {
@@ -72,9 +72,9 @@ test('handshake timeout, wrong first frame, invalid secret and malformed ready f
         if (scenario === 'timeout') await h.clock.advance(200);
         else if (scenario === 'wrong-first') transport.peer('heartbeat-ok', { leaseExpiresAt: 12 });
         else if (scenario === 'wrong-direction') transport.peer('hello');
-        else if (scenario === 'extra-key') transport.peer('challenge', { nonce: NONCE, password: SECRET });
+        else if (scenario === 'extra-key') transport.peer('challenge', { nonce: transport.nonce, password: SECRET });
         else {
-            transport.peer('challenge', { nonce: NONCE });
+            transport.peer('challenge', { nonce: transport.nonce });
             await flush();
             transport.peer('hello-ok', { ownershipSessionId: OWNER, workerGeneration: GENERATION,
                 leaseExpiresAt: 12, secret: 'not-a-secret' });
@@ -278,7 +278,7 @@ test('buffered supersession during activation rejects rotation instead of report
     await flush();
     const transport = h.transports.at(-1);
     transport.autoCallback = false;
-    transport.peer('challenge', { nonce: NONCE });
+    transport.peer('challenge', { nonce: transport.nonce });
     await flush();
     transport.peer('reattach-ok', { leaseExpiresAt: 12, ptys: [] });
     transport.peer('superseded-connection');

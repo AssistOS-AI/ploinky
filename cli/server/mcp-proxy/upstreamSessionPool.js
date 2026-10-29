@@ -446,7 +446,7 @@ export function createUpstreamSessionPool({
         }
     }
 
-    function post(entry, body, { sessionId = '', authorization = '', timeoutMs }) {
+    function post(entry, body, { sessionId = '', authorization = '', authInfo = '', timeoutMs }) {
         assertOpen();
         return new Promise((resolve, reject) => {
             const payload = Buffer.from(JSON.stringify(body), 'utf8');
@@ -456,6 +456,10 @@ export function createUpstreamSessionPool({
                 'content-length': String(payload.length),
             };
             if (authorization) headers.authorization = authorization;
+            // The trusted per-call Router header (e.g. a task-reference origin
+            // token): minted for this attempt by the caller, sent only on this
+            // POST and never stored on the shared session entry.
+            if (authInfo) headers['x-ploinky-auth-info'] = authInfo;
             if (sessionId) {
                 headers['mcp-session-id'] = sessionId;
                 headers['mcp-protocol-version'] = entry.protocolVersion;
@@ -669,12 +673,14 @@ export function createUpstreamSessionPool({
             }
             const supplied = typeof headers === 'function' ? headers() : headers;
             const authorization = typeof supplied?.authorization === 'string' ? supplied.authorization : '';
+            const authInfo = typeof supplied?.['x-ploinky-auth-info'] === 'string' ? supplied['x-ploinky-auth-info'] : '';
             const id = entry.nextId++;
             counters.requests += 1;
             refusal.posted = true;
             const response = await post(entry, { jsonrpc: '2.0', id, method, params: params ?? {} }, {
                 sessionId: entry.sessionId,
                 authorization,
+                authInfo,
                 timeoutMs: Math.max(1, deadline - Date.now()),
             });
             const message = interpretRpcResponse(response, id, { dispatched: true });
@@ -696,7 +702,8 @@ export function createUpstreamSessionPool({
     /**
      * Send one JSON-RPC request on the pooled session for `key`.
      * `headers` is an object or a function called once per attempt; only its
-     * `authorization` value is forwarded. `beforeDispatch`, when given, runs
+     * `authorization` and `x-ploinky-auth-info` values are forwarded, on that
+     * attempt's request alone. `beforeDispatch`, when given, runs
      * synchronously in each attempt after `beforeDial()` and before the mint
      * and POST (never during a session open); a throw refuses this request
      * only. `ensureReady` is awaited before the single permitted retry and must

@@ -28,6 +28,8 @@ import {
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
 import { inspectExactContainer, removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
+import { inspectInterimAgentLifecycle, assertInterimLifecycleMutation,
+  isLegacyAgentLifecycleRefusal, interimReceiptRegistryRecord } from '../sandbox/legacyAgentLifecycleGuard.mjs';
 import { observeSandboxRuntime, registeredRuntimeTuple } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { MAX_NO_WAIT_BARRIER_ENTRIES, MAX_NO_WAIT_WAVE_INDEX } from './noWaitWorker.js';
@@ -1105,7 +1107,11 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
   retireRuntimePredecessorImpl = retireRuntimePredecessor,
   inspectExactContainerImpl = inspectExactContainer,
   removeExactSandboxPredecessorImpl = removeExactSandboxPredecessor,
+  inspectLegacy = inspectInterimAgentLifecycle,
 } = {}) {
+  const legacy = inspectLegacy({ containerName, registryRecord: predecessorReceipt
+    ? interimReceiptRegistryRecord(predecessorReceipt.predecessor, predecessorRecord)
+    : predecessorRecord, runtime: getRuntimeImpl });
   // The predecessor record's own runtime selects how it is observed and
   // removed, whatever backend its successor resolves to. A native predecessor
   // has no container: only its exact PID record and process identity count.
@@ -1196,9 +1202,11 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
     }
     result = removeExactRegisteredContainerImpl(
       containerName,
-      receipt ? { ...predecessorRecord, ...receipt.registryRecord } : predecessorRecord,
+      receipt ? interimReceiptRegistryRecord(receipt.registryRecord, predecessorRecord)
+        : { ...predecessorRecord, runMode: legacy.runMode },
       {
         runtime: getRuntimeImpl(),
+        assertBeforeMutation: assertInterimLifecycleMutation,
         ...(unpublished && !receipt ? { recoverIncompleteIdentity: true } : {}),
       },
     );
@@ -1208,6 +1216,7 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
     if (receipt) retireRuntimeCandidateImpl(receipt);
     clearLivenessStateImpl(containerName);
   } catch (cause) {
+    if (isLegacyAgentLifecycleRefusal(cause)) throw cause;
     const error = new Error(
       `[${label}] preserved container '${containerName}' because exact immutable ownership/removal was not proven`,
       { cause },
@@ -1269,6 +1278,23 @@ function sandboxOwnershipUnknown(containerName, reason) {
   );
   error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
   return error;
+}
+
+function preflightGraphLegacyAgent(node, existing, {
+  observeImpl = observeSandboxRuntime,
+  readReceiptImpl = readRuntimePredecessor,
+  getRuntimeForAgentImpl = getRuntimeForAgent,
+  probeContainerRuntimeImpl = probeContainerRuntime,
+  inspectLegacy = inspectInterimAgentLifecycle,
+} = {}) {
+  const backend = resolvePredecessorBackend(node, existing, {
+    observeImpl, readReceiptImpl, getRuntimeForAgentImpl, probeContainerRuntimeImpl,
+  });
+  // A staged native record may not yet name its backend. Resolve the exact
+  // predecessor before the OCI guard is allowed to select an engine.
+  const registryRecord = isSandboxRuntime(backend) ? { ...existing.rec, runtime: backend } : existing.rec;
+  inspectLegacy({ containerName: existing.key, registryRecord, runtime: getRuntime });
+  return backend;
 }
 
 // Liveness for the graph: an unknown observation is never "stopped".
@@ -2007,12 +2033,23 @@ function ensureGraphNodesEnabled(graph, reg, {
   writeRuntimePredecessorImpl = writeRuntimePredecessor,
   retireRuntimePredecessorImpl = retireRuntimePredecessor,
   observeSandboxRuntimeImpl = observeSandboxRuntime,
+  inspectLegacy = inspectInterimAgentLifecycle,
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
     ...(Array.isArray(additionalNodes) ? additionalNodes : []),
   ]
     .sort((a, b) => a.id.localeCompare(b.id));
+  const predecessorBackends = new Map();
+  for (const node of nodes) {
+    const existing = findRegistryEntryForGraphNode(reg, node, dockerSvc.getAgentContainerName);
+    if (existing) predecessorBackends.set(existing.key, preflightGraphLegacyAgent(node, existing, {
+      observeImpl: observeSandboxRuntimeImpl, readReceiptImpl: readRuntimePredecessorImpl,
+      getRuntimeForAgentImpl: runtimeReplacementOptions?.getRuntimeForAgentImpl,
+      probeContainerRuntimeImpl: runtimeReplacementOptions?.probeContainerRuntimeImpl,
+      inspectLegacy,
+    }));
+  }
 
   // Resolve and validate every retained record before removing anything. If a
   // later devel target is invalid, the complete existing stack is left alone.
@@ -2046,11 +2083,7 @@ function ensureGraphNodesEnabled(graph, reg, {
     const executionDifferences = executionChanged
       ? executionRecordDifferences(existing.rec, expectedExecution)
       : [];
-    const predecessorBackend = resolvePredecessorBackend(node, existing, {
-      observeImpl: observeSandboxRuntimeImpl,
-      readReceiptImpl: readRuntimePredecessorImpl,
-      getRuntimeForAgentImpl: runtimeReplacementOptions?.getRuntimeForAgentImpl,
-    });
+    const predecessorBackend = predecessorBackends.get(existing.key);
     const preliminary = {
       node, existing, expectedExecution, executionChanged, profileChanged, predecessorBackend,
     };
@@ -2086,8 +2119,12 @@ function ensureGraphNodesEnabled(graph, reg, {
     const priorPredecessorReceipt = executionChanged || profileChanged || runtimeReason
       ? readRuntimePredecessorImpl(existing.key, existing.rec)
       : null;
+    // Resolve mode provenance against the original staged record before
+    // replacing its tuple. A merged tuple would falsely make the successor's
+    // mode look like evidence about the predecessor itself.
     const predecessorRecord = priorPredecessorReceipt
-      ? { ...structuredClone(existing.rec), ...structuredClone(priorPredecessorReceipt.predecessor) }
+      ? { ...structuredClone(existing.rec),
+          ...interimReceiptRegistryRecord(structuredClone(priorPredecessorReceipt.predecessor), existing.rec) }
       : structuredClone(existing.rec);
     // A runtime-less record proven native names its kind from here on, so the
     // receipt and the removal take the native path.
@@ -2301,6 +2338,7 @@ function ensureGraphNodesEnabled(graph, reg, {
       );
     }
   } catch (error) {
+    if (isLegacyAgentLifecycleRefusal(error)) throw error;
     try {
       inactivateGeneration('workspace-graph-runtime-removal-failed', {
         preserveSelectedGeneration: true,
@@ -2762,6 +2800,7 @@ export function cleanupFailedPreparedRuntime(
     abortPreparation = abortEdgeRoutingPreparation,
   } = {},
 ) {
+  if (isLegacyAgentLifecycleRefusal(error)) return;
   const failedResult = result || error?.ploinkyRestartCandidate || null;
   if (!failedResult) return;
   // The launching operation is over: a GPU share or share-less readiness
@@ -2972,6 +3011,10 @@ async function startWorkspace(staticAgentArg, portArg, {
       .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
   }
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  for (const node of [...lockedStart.graph.nodes.values(), ...lockedStart.additionalNodes]) {
+    const existing = findRegistryEntryForGraphNode(lockedStart.registry, node, dockerSvc.getAgentContainerName);
+    if (existing) preflightGraphLegacyAgent(node, existing);
+  }
   // `--branch` reaches link-install repositories here, for the whole admitted
   // graph including no-wait agents, before any mutation, wave or worker.
   preflightStartLinkedRepositories(lockedStart, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, branchPolicy });
@@ -3643,6 +3686,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     printStartResultSummary(startResult);
     return startResult;
   } catch (e) {
+    if (isLegacyAgentLifecycleRefusal(e)) throw e;
     const cleanedCandidateIds = new Set();
     for (const candidate of workspaceRuntimeCandidates.reverse()) {
       const candidateId = String(candidate?.containerId || '');
@@ -4332,6 +4376,7 @@ async function reinstallAgent(agentName) {
             }
             // A refused targeted drain keeps its stopped predecessor for the
             // operator's explicit recovery; refuse before any request or removal.
+            inspectInterimAgentLifecycle({ containerName, registryRecord: registryRecord.record, runtime: agentRuntime });
             dockerSvc.assertAgentServiceNotDraining(containerName);
             // One exact logical registration gets a persistent desired rebuild
             // request (reused while it is still pending or failed). Its runtime
@@ -4464,6 +4509,7 @@ async function reinstallAgent(agentName) {
             console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
             reportDependencyCollection(collectDependencyObjectsAfterAdmission({ lease: workspaceMutationLease, reason: 'reinstall' }));
             } catch (error) {
+              if (isLegacyAgentLifecycleRefusal(error)) throw error;
               // Activation is already committed. Report failure without
               // destroying the admitted replacement or claiming a rollback.
               if (runtimeAdmitted) throw error;

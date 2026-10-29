@@ -148,6 +148,7 @@ export class RouterRequestTokenService {
         rch,
         delegation,
         delegations,
+        originKey,
         ttlSeconds,
     }) {
         const target = String(targetAgentId || '').trim();
@@ -183,6 +184,8 @@ export class RouterRequestTokenService {
         if (normalizedDelegation) payload.delegation = normalizedDelegation;
         const normalizedDelegations = normalizeDelegations(delegations);
         if (normalizedDelegations) payload.delegations = normalizedDelegations;
+        // The Router-computed direct-caller key of a task-reference lookup.
+        if (typeof originKey === 'string' && originKey) payload.originKey = originKey;
         return { target, payload };
     }
 

@@ -8,6 +8,7 @@ import { sendJson } from './authHandlers/index.js';
 import { createAgentClient } from './AgentClient.js';
 import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
 import { buildRouterRequest } from './mcp-proxy/invocationMinter.js';
+import { taskReferenceOriginHeaders } from './executionProvider/originToken.mjs';
 import { deriveDelegationKey } from './mcp-proxy/mcpDelegations.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
 import { policy } from './policy/index.js';
@@ -802,20 +803,27 @@ function canonicalCommand(command) {
     }
 }
 
-function buildToolRequestHeaders(req, agentName, toolName, toolArgs) {
+function buildToolRequestHeaders(req, agentName, toolName, toolArgs, { toolListing = null, snapshot } = {}) {
     const invocation = buildInvocationContextForProviderCall({
         req: req || { headers: {} },
         agentName,
         toolName,
         toolArgs: toolArgs || {}
     });
-    if (!invocation?.token) return null;
-    return { authorization: `Bearer ${invocation.token}` };
+    // A task-reference tool in the serving agent's listing also receives a
+    // Router origin token (interface §2.3), as on the per-agent MCP path.
+    const headers = {
+        ...(invocation?.token ? { authorization: `Bearer ${invocation.token}` } : {}),
+        ...(toolListing ? taskReferenceOriginHeaders({
+            req: req || { headers: {} }, agentName, toolName, toolArgs: toolArgs || {}, toolListing, snapshot,
+        }) : {}),
+    };
+    return Object.keys(headers).length ? headers : null;
 }
 
-async function callEntryTool(entry, toolName, args, req) {
+async function callEntryTool(entry, toolName, args, req, { toolListing = null, snapshot } = {}) {
     entry.beforeDispatch?.();
-    const requestHeaders = buildToolRequestHeaders(req, entry.agentName, toolName, args);
+    const requestHeaders = buildToolRequestHeaders(req, entry.agentName, toolName, args, { toolListing, snapshot });
     if (!requestHeaders) {
         return await entry.client.callTool(toolName, args);
     }
@@ -971,7 +979,10 @@ async function executeRouterCommand(command, payload = {}, req = null, routePlan
                 if (!aggDecision.allow) {
                     return { statusCode: aggDecision.status || 403, body: { error: 'access_denied', code: aggDecision.code } };
                 }
-                const response = await callEntryTool(resolved.entry, toolName, args, req);
+                const response = await callEntryTool(resolved.entry, toolName, args, req, {
+                    toolListing: resolved.tool,
+                    snapshot: routePlan?.lease?.snapshot || routePlan?.snapshot,
+                });
                 return {
                     statusCode: 200,
                     body: {

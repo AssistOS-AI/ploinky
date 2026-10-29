@@ -233,6 +233,7 @@ function removeExactContainerAndDescriptorOnce(name, record, runtime, {
     retireRelay = retireRuntimeRelaySocket,
     recoverIncompleteIdentity = false,
     onRecoveredIdentity = null,
+    assertBeforeMutation = null,
 } = {}, progress) {
     let expectedId = String(record?.containerId || '').trim();
     const incompleteId = !IMMUTABLE_CONTAINER_ID.test(expectedId);
@@ -293,6 +294,7 @@ function removeExactContainerAndDescriptorOnce(name, record, runtime, {
         }
         let exactRecord = record;
         assertExactContainerOwnership(name, record, inspected, expectedId, workspaceHash);
+        assertBeforeMutation?.({ record, inspected, containerId: expectedId, containerName: name, runtime });
         if (incompleteId) assertRecoveryAgentIdentity(name, record, inspected);
         let artifact = captureRecordedGeneratedRouterDescriptor(record);
         let recoveredDescriptor = false;
@@ -310,6 +312,7 @@ function removeExactContainerAndDescriptorOnce(name, record, runtime, {
             const current = inspect(runtime, expectedId);
             if (!current) return null;
             assertExactContainerOwnership(name, exactRecord, current, expectedId, workspaceHash);
+            assertBeforeMutation?.({ record: exactRecord, inspected: current, containerId: expectedId, containerName: name, runtime });
             if (recoveredIdentity) assertRecoveryAgentIdentity(name, exactRecord, current);
             assertExactDescriptorMount(name, current, artifact);
             assertDescriptorUnchanged(name, artifact);

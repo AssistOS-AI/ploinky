@@ -39,7 +39,9 @@ const BASE_FILES = {
     // the removed admission logic has not returned. Keep the exact-file guard.
     // The pre-forward refusal marker adds one import and one header line on the
     // stale-lease refusal; it adds no admission logic.
-    'cli/server/authHandlers/authContext.js': '9843fbf7ab346e5f94e678545c688deef80ce775b121a14449faf27def73b421',
+    // S3a adds only `resolveTaskReferenceAuthContext` and its one dispatch line
+    // (the task-reference surface uses the workspace session); no admission logic.
+    'cli/server/authHandlers/authContext.js': '6439a734fcd6f7f1b7d7875487f812b441e4376e886cafbbf01ad0096899d156',
     'ploinky-box/cloudflared/runtime.mjs': 'bb50780910dfe09c237f1930eb034947752adc1bb701d6fd5126a5945f886a2a',
     'ploinky-box/cloudflared/status.mjs': '34e5055dddf9073890e5643ada17176295014225b5a9d183439f4cb94636b2a0',
     'ploinky-box/cloudflared/journal.mjs': '4969c853c230668265cc05f7276d95e3ee677ae2e77de969881295de7622799a',

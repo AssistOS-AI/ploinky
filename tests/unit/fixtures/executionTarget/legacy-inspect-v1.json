@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "notice": "Synthetic security records for the generic T1 legacy adoption guard. They are not runtime observations: Docker/Podman field availability, null spellings, effective OCI paths and mount overrides remain to be confirmed by the G-L observation gate and G7. All identities are synthetic.",
+  "workspaceHash": "0f1e2d3c4b5a",
+  "expectedIdentity": {
+    "containerId": null,
+    "workspaceHash": "0f1e2d3c4b5a",
+    "instanceId": "instance-fixture-1",
+    "enableGeneration": "enable-fixture-1",
+    "configIdentity": "config-fixture-1"
+  },
+  "baselines": {
+    "docker": {
+      "runtimeFamily": "docker",
+      "runtimeVersion": "synthetic-docker-1",
+      "configIdentity": "config-fixture-1",
+      "profileDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "maskedPaths": ["/proc/acpi", "/proc/asound", "/proc/interrupts", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/sched_debug", "/proc/scsi", "/proc/timer_list", "/proc/timer_stats", "/sys/devices/virtual/powercap", "/sys/firmware"],
+      "readonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"]
+    },
+    "podman": {
+      "runtimeFamily": "podman",
+      "runtimeVersion": "synthetic-podman-1",
+      "configIdentity": "config-fixture-1",
+      "profileDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "maskedPaths": ["/proc/acpi", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/sched_debug", "/proc/scsi", "/proc/timer_list", "/proc/timer_stats", "/sys/dev/block", "/sys/devices/virtual/powercap", "/sys/firmware", "/sys/fs/selinux"],
+      "readonlyPaths": ["/proc/asound", "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"]
+    }
+  },
+  "adapters": {
+    "docker": {
+      "runtimeFamily": "docker",
+      "runtimeVersion": "synthetic-docker-1",
+      "configIdentity": "config-fixture-1",
+      "nullMeansEmpty": { "securityOpt": true, "maskedPaths": false, "readonlyPaths": false },
+      "oci": null
+    },
+    "podman": {
+      "runtimeFamily": "podman",
+      "runtimeVersion": "synthetic-podman-1",
+      "configIdentity": "config-fixture-1",
+      "nullMeansEmpty": { "securityOpt": false, "maskedPaths": false, "readonlyPaths": false },
+      "oci": {
+        "containerId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "configIdentity": "config-fixture-1",
+        "maskedPaths": ["/proc/acpi", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/sched_debug", "/proc/scsi", "/proc/timer_list", "/proc/timer_stats", "/sys/dev/block", "/sys/devices/virtual/powercap", "/sys/firmware", "/sys/fs/selinux"],
+        "readonlyPaths": ["/proc/asound", "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
+        "mounts": [{ "destination": "/code", "readOnly": true }, { "destination": "/data", "readOnly": false }]
+      }
+    }
+  },
+  "records": {
+    "dockerComplete": {
+      "Id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "Name": "/ploinky_fixture_agent",
+      "Config": {
+        "Labels": {
+          "io.assistos.ploinky.managed": "1",
+          "io.assistos.ploinky.resource": "agent",
+          "io.assistos.ploinky.network-schema": "2",
+          "io.assistos.ploinky.workspace": "0f1e2d3c4b5a",
+          "io.assistos.ploinky.network-contract": "contract-fixture",
+          "io.assistos.ploinky.instance-id": "instance-fixture-1",
+          "io.assistos.ploinky.enable-generation": "enable-fixture-1"
+        },
+        "CreateCommand": ["docker", "create", "--not-security-proof"]
+      },
+      "HostConfig": {
+        "Init": true,
+        "Privileged": false,
+        "SecurityOpt": null,
+        "MaskedPaths": ["/proc/asound", "/proc/acpi", "/proc/interrupts", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi", "/sys/firmware", "/sys/devices/virtual/powercap"],
+        "ReadonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"]
+      },
+      "Mounts": [
+        { "Type": "bind", "Source": "/workspace/code", "Destination": "/code", "RW": false },
+        { "Type": "bind", "Source": "/workspace/data", "Destination": "/data", "RW": true }
+      ],
+      "State": { "Running": true, "Status": "running" }
+    },
+    "podmanComplete": {
+      "Id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "Name": "ploinky_fixture_agent",
+      "Config": {
+        "Labels": {
+          "io.assistos.ploinky.managed": "1",
+          "io.assistos.ploinky.resource": "agent",
+          "io.assistos.ploinky.network-schema": "2",
+          "io.assistos.ploinky.workspace": "0f1e2d3c4b5a",
+          "io.assistos.ploinky.network-contract": "contract-fixture",
+          "io.assistos.ploinky.instance-id": "instance-fixture-1",
+          "io.assistos.ploinky.enable-generation": "enable-fixture-1"
+        },
+        "CreateCommand": ["podman", "create", "--not-security-proof"]
+      },
+      "HostConfig": {
+        "Init": true,
+        "Privileged": false,
+        "SecurityOpt": []
+      },
+      "Mounts": [
+        { "Type": "bind", "Source": "/workspace/code", "Destination": "/code", "RW": false },
+        { "Type": "bind", "Source": "/workspace/data", "Destination": "/data", "RW": true }
+      ],
+      "State": { "Running": true, "Status": "running" }
+    },
+    "historicalNetworkOnly": {
+      "Id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "Name": "ploinky_fixture_agent",
+      "Config": {
+        "Labels": {
+          "io.assistos.ploinky.managed": "1",
+          "io.assistos.ploinky.resource": "agent",
+          "io.assistos.ploinky.network-schema": "2",
+          "io.assistos.ploinky.workspace": "0f1e2d3c4b5a",
+          "io.assistos.ploinky.network-contract": "contract-fixture",
+          "io.assistos.ploinky.instance-id": "instance-fixture-1",
+          "io.assistos.ploinky.enable-generation": "enable-fixture-1"
+        },
+        "CreateCommand": ["podman", "create", "--arbitrary-history"]
+      },
+      "HostConfig": {
+        "Init": true,
+        "HostsFile": "none",
+        "ExtraHosts": ["host.containers.internal:host-gateway"]
+      },
+      "NetworkSettings": { "Networks": {} },
+      "State": { "Running": false, "Status": "configured" }
+    },
+    "foreignExactName": {
+      "Id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "Name": "ploinky_fixture_agent",
+      "Config": { "Labels": { "com.example.owner": "someone-else" } },
+      "HostConfig": { "Privileged": false, "SecurityOpt": [] },
+      "State": { "Running": true, "Status": "running" }
+    },
+    "bwrapNative": {
+      "pid": 4242,
+      "runtime": "bwrap",
+      "agentName": "fixture-agent",
+      "hostStateMasked": true
+    }
+  }
+}

@@ -45,6 +45,12 @@ import {
     sweepHardwareAvailabilityTemps,
 } from './hardwareAvailabilityStore.mjs';
 import { resolveEffectiveHardwareAvailability } from '../server/hardwareAvailabilityResolver.mjs';
+import { TASK_REFERENCE_ROUTE_KEY } from '../server/executionProvider/declaration.mjs';
+import {
+    assertExecutionProviderRoute,
+    assertExecutionProviderRootApplication,
+} from '../server/executionProvider/publication.mjs';
+import { assertWebchatDelegationsManifest } from '../server/mcp-proxy/mcpDelegations.js';
 import {
     edgeGenerationPublicationSemantics,
     publicationSemanticDigest,
@@ -882,11 +888,14 @@ function normalizeDrainOwner(value, label = 'drain owner') {
     };
 }
 
-function validateRoutingShape(routing, manifests) {
+function validateRoutingShape(routing, manifests, agents = {}) {
     assertObject(routing, 'routing state');
     const routes = routing.routes === undefined ? {} : assertObject(routing.routes, 'routing.routes');
     for (const [routeKey, route] of Object.entries(routes)) {
         if (!routeKey || RESERVED_OBJECT_KEYS.has(routeKey)) throw edgeError(`routing route key '${routeKey}' is invalid`);
+        if (routeKey === TASK_REFERENCE_ROUTE_KEY) {
+            throw edgeError(`routing route key '${routeKey}' is reserved for the task-reference surface`);
+        }
         assertObject(route, `routing route '${routeKey}'`);
         if (route.hostPort !== undefined) normalizeServicePort(route.hostPort, `routing.routes.${routeKey}.hostPort`);
         if (route.hardwareAvailability !== undefined) {
@@ -908,6 +917,18 @@ function validateRoutingShape(routing, manifests) {
         const manifest = manifests[routeKey];
         if (manifest) {
             assertObject(manifest, `manifest(${routeKey})`);
+            // An active route may not publish an invalid provider declaration
+            // or an invalid `webchat.delegations` declaration.
+            if (route.disabled !== true) {
+                try {
+                    assertExecutionProviderRoute({ routeKey, route, manifest, record: agents[String(route.container || '')] });
+                    assertWebchatDelegationsManifest({
+                        manifest, repoName: route.repo, agentName: route.agent, label: `manifest(${routeKey})`,
+                    });
+                } catch (error) {
+                    throw edgeError(error.message);
+                }
+            }
             if (Object.prototype.hasOwnProperty.call(manifest, 'httpServices')) {
                 throw edgeError(`manifest(${routeKey}).httpServices is unsupported; use routerAccess.httpRoutes with agent-port convention paths`);
             }
@@ -1313,7 +1334,7 @@ export function edgeHostServiceRoutes(generation, host) {
 
 function compileGeneration({ routing, policy, desired, agents, manifests }) {
     validatePolicy(policy);
-    validateRoutingShape(routing, manifests);
+    validateRoutingShape(routing, manifests, agents && typeof agents === 'object' ? agents : {});
     assertObject(agents, 'agents registry');
     const normalizedDesired = normalizeDesired(desired);
     const hostNetworkCapabilities = collectManifestHostNetworkCapabilities(routing, manifests, agents);
@@ -1361,6 +1382,21 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
         const rootApplicationRouteKey = entry.rootApplication
             ? resolveRootApplicationRoute(entry.rootApplication, selectedRoute.routeKey, routing, hostname)
             : '';
+        if (rootApplicationRouteKey) {
+            try {
+                assertExecutionProviderRootApplication({
+                    hostname,
+                    rootApplication: entry.rootApplication,
+                    routeKey: rootApplicationRouteKey,
+                    manifest: manifests[rootApplicationRouteKey],
+                    routes: routing.routes,
+                    manifests,
+                    agents,
+                });
+            } catch (error) {
+                throw edgeError(error.message);
+            }
+        }
         // A root application's own closure joins the owner's; a host without
         // one compiles exactly as before.
         const dependencyRouteKeys = [...new Set([

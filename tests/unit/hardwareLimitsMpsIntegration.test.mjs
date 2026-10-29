@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { syntheticLifecyclePreflight } from './helpers/legacyAgentLifecycleHarness.mjs';
 import { coordinateMpsLifecycle } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { createMpsLaunch, readMpsLaunch, verifyMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
 import { reconcileExactHardwareInstance } from '../../cli/sandbox/hardwareLimits/reconcile.mjs';
@@ -21,6 +22,7 @@ function fixture({ old = true, nextShare = share, peer = false } = {}) {
     let state = old ? daemon() : null;
     const plans = () => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' });
     const dependencies = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [],
         readContext: () => ({ storeToken: { epoch: 'e'.repeat(32), revision: 1 }, overrides: policies, gpu: { eligible: true, grant: { mps: {} } } }),
         loadRegistry: () => registry,
@@ -192,6 +194,7 @@ function cohortWorld({ keys = ['a', 'b', 'c'], nextSm = 50, fail = {}, peerPlan 
         return { key, state: 'applied', containerId: next.containerId };
     };
     const dependencies = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [], readContext: () => ({ storeToken: token, overrides: policies, gpu: { grant: { mps: {} } } }),
         loadRegistry: () => clone(registry), readApplied: (key, containerId) => (applied[key]?.containerId === containerId ? clone(applied[key]) : null),
         loadPlan: peerPlan || (() => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' })),
@@ -337,6 +340,7 @@ test('MI.graph-start-after-client-only-failure-keeps-the-daemon', async () => {
         readContext: () => ({ gate: 'on', overrides: f.policies, storeToken: { epoch: '0'.repeat(32), revision: 1 }, gpu: {} }),
         loadRegistry: () => clone(f.registry), readApplied: (key, containerId) => (f.registry[key]?.containerId === containerId && key !== 'b' ? { instanceId: f.registry[key].instanceId, enableGeneration: f.registry[key].enableGeneration, gpuShare: f.policies.get(`demo/${key}`).gpu, mpsGeneration: `${journal.daemonGeneration}:${journal.configurationGeneration}` } : null),
         store: { read: () => clone(state), write: (value) => { state = clone(value); } },
+        inspectLegacy: syntheticLifecyclePreflight,
         backend: { observe: () => ({ state: 'owned' }), verify: () => true }, assertCapability: () => {}, observeClients: () => [],
         readSelection: () => ({ selector: { state: 'inactive' } }), resolveShare: (policy) => policy, runtime: () => 'podman',
         inspect: (client) => ({ state: 'exact', id: client.containerId, running: true }), inspectPresence: () => ({ state: 'absent', id: null }),
@@ -368,6 +372,7 @@ test('MI.graph-launch-failure-then-lifecycle-retry-recreates-only-the-failed-cli
         start: () => { events.push('start'); alive = true; return { ...state, status: 'ready', daemon: { pid: 10, startTime: '2' }, daemonGeneration: 'd1', configurationGeneration: 'c1' }; } };
     const context = { gate: 'on', storeToken: { epoch: 'e'.repeat(32), revision: 1 }, overrides: policies, gpu: { grant: { mps: {} } } };
     const failure = await ensureMpsGraphAgentService('b', {}, '/fixture/demo/b', { containerName: 'b', preparationLease: { transactionId: 'g1' }, networkLifecycleCapability: {}, preparedRegistryRecord: clone(registry.b) }, {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [], readContext: () => context, loadRegistry: () => clone(registry), store, backend,
         loadPlan: () => ({ runtime: 'podman', image: 'img', profile: { network: { mode: 'default' } } }), prepareImage: () => {}, inspectImage: () => ({ Id: `sha256:${imageId}`, Config: { User: '1000:1000' } }),
         assertCapability: () => {}, policyCheck: () => {}, resolveShare: (policy) => policy,
@@ -382,6 +387,7 @@ test('MI.graph-launch-failure-then-lifecycle-retry-recreates-only-the-failed-cli
     // The lifecycle retry (watchdog restart or CLI restart) recreates b alone.
     const replace = (key, launch) => { events.push(`create:${key}`); const next = record(key); registry[key] = next; applied[key] = { ...next, gpuShare: clone(launch.share), mpsGeneration: `${launch.state.daemonGeneration}:${launch.state.configurationGeneration}` }; return { key, state: 'applied', containerId: next.containerId }; };
     const deps = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [], readContext: () => context, loadRegistry: () => clone(registry), readApplied: (key, containerId) => (applied[key]?.containerId === containerId ? clone(applied[key]) : null),
         loadPlan: () => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'img' }), prepareImage: () => {}, inspectImage: () => ({ Id: `sha256:${imageId}`, Config: { User: '1000:1000' } }),
         resolveShare: (policy) => policy, policyCheck: () => {}, store, backend, network: async (callback) => callback({}), assertCapability: () => {},
@@ -445,6 +451,7 @@ function recordedPeerWorld({ labels = {}, init = true, healthyPeer = false, unpr
         return { ok: false, status: 125, stdout: '', stderr: 'no such container' };
     };
     const dependencies = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [], readContext: () => ({ storeToken: token, overrides: policies, gpu: { grant: { mps: {} } } }),
         loadRegistry: () => clone(registry), readApplied: (key, containerId) => (applied[key]?.containerId === containerId ? clone(applied[key]) : null),
         loadPlan: (ref) => { if (ref === 'demo/b' || ref === 'demo/c') throw new Error(`Agent ${ref} not found`); return { runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }; },

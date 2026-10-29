@@ -3120,6 +3120,123 @@
             "anchor": null,
             "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
           }
+        },
+        "3c3b3a3322c631e134620c708cda9afef99243128518cb553804622b8c4a99f4": {
+          "root.get": {
+            "line": 816,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "root-index.get": {
+            "line": 816,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "health.get": {
+            "line": 686,
+            "anchor": null,
+            "statement": "if (pathname === '/health') {"
+          },
+          "agent-card.get": {
+            "line": 776,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-card-slash.get": {
+            "line": 776,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "mcp-browser-client.get": {
+            "line": 508,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 508,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 777,
+            "anchor": null,
+            "statement": "} else if (agentName && isActiveAgentRootPlan(routePlan)) {"
+          },
+          "agent-mcp.post": {
+            "line": 786,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.get": {
+            "line": 786,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.delete": {
+            "line": 786,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-task-status.get": {
+            "line": 646,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-status-alias.get": {
+            "line": 646,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-cancel.post": {
+            "line": 587,
+            "anchor": null,
+            "statement": "} else if (isDelegatedAgentTaskCancelRoute) {"
+          },
+          "agent-openai.post": {
+            "line": 793,
+            "anchor": null,
+            "statement": "return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath, {"
+          },
+          "agent-root-websocket.get": {
+            "line": 1083,
+            "anchor": null,
+            "statement": "const handled = await handleAgentRootUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 1045,
+            "anchor": null,
+            "statement": "if (routePlan.kind === 'agent-port') {"
+          },
+          "internal-agent-control.*": {
+            "line": 523,
+            "anchor": null,
+            "statement": "if (hasInternalAgentSegment(pathname)) {"
+          },
+          "reserved--metrics.*": {
+            "line": 828,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--health-internal.*": {
+            "line": 828,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin.*": {
+            "line": 828,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin-*.*": {
+            "line": 828,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "unix-health.get": {
+            "line": 996,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          }
         }
       },
       "candidate": "27fb848deaa7824177c9fb16cc265da2b9bb9cc919021fcaacb18580026596a9"
@@ -4619,6 +4736,28 @@
             "anchor": null,
             "statement": "if (pathname === '/interaction' && req.method === 'POST') {"
           }
+        },
+        "20ae2046864f43cfb14359ae4307f05e0cb9ecb43cf31cc3bd0d82602be5c123": {
+          "webchat-stream.get": {
+            "line": 120,
+            "anchor": null,
+            "statement": "if (pathname === '/stream') {"
+          },
+          "webchat-input.post": {
+            "line": 300,
+            "anchor": null,
+            "statement": "if (pathname === '/input' && req.method === 'POST') {"
+          },
+          "webchat-control.post": {
+            "line": 376,
+            "anchor": null,
+            "statement": "if (pathname === '/control' && req.method === 'POST') {"
+          },
+          "webchat-interaction.post": {
+            "line": 405,
+            "anchor": null,
+            "statement": "if (pathname === '/interaction' && req.method === 'POST') {"
+          }
         }
       },
       "candidate": "894d28dbcd19dc51b2393a7f34b0a06d9c4e40804cb4a81460ff65f5131ed17f"
@@ -4703,6 +4842,60 @@
           },
           "private-turn-credentials.post": {
             "line": 865,
+            "anchor": "pathname === '/api/edge/turn-credentials'",
+            "statement": "if (pathname === '/api/edge/turn-credentials') {"
+          }
+        },
+        "0fd2eab9a31846961a1854827128ce61152ec7a99f52b11cb727ea85ac86f353": {
+          "agent-additional-http.*": {
+            "line": 196,
+            "anchor": "function agentPortPlan({",
+            "statement": "export function agentPortPlan({"
+          },
+          "private-workspace-logs.post": {
+            "line": 822,
+            "anchor": "pathname === '/api/edge/workspace-logs'",
+            "statement": "if (pathname === '/api/edge/workspace-logs') {"
+          },
+          "private-workspace-metrics.get": {
+            "line": 840,
+            "anchor": "pathname === '/api/edge/workspace-metrics'",
+            "statement": "if (pathname === '/api/edge/workspace-metrics') {"
+          },
+          "private-runtime-origins.get": {
+            "line": 858,
+            "anchor": "pathname === '/api/edge/runtime-origins'",
+            "statement": "if (pathname === '/api/edge/runtime-origins') {"
+          },
+          "private-turn-credentials.post": {
+            "line": 879,
+            "anchor": "pathname === '/api/edge/turn-credentials'",
+            "statement": "if (pathname === '/api/edge/turn-credentials') {"
+          }
+        },
+        "aa6096ea892dff2000d3e904e8610a0dda5ecbf924dbfbab1e125b56e298d924": {
+          "agent-additional-http.*": {
+            "line": 196,
+            "anchor": "function agentPortPlan({",
+            "statement": "export function agentPortPlan({"
+          },
+          "private-workspace-logs.post": {
+            "line": 822,
+            "anchor": "pathname === '/api/edge/workspace-logs'",
+            "statement": "if (pathname === '/api/edge/workspace-logs') {"
+          },
+          "private-workspace-metrics.get": {
+            "line": 840,
+            "anchor": "pathname === '/api/edge/workspace-metrics'",
+            "statement": "if (pathname === '/api/edge/workspace-metrics') {"
+          },
+          "private-runtime-origins.get": {
+            "line": 858,
+            "anchor": "pathname === '/api/edge/runtime-origins'",
+            "statement": "if (pathname === '/api/edge/runtime-origins') {"
+          },
+          "private-turn-credentials.post": {
+            "line": 879,
             "anchor": "pathname === '/api/edge/turn-credentials'",
             "statement": "if (pathname === '/api/edge/turn-credentials') {"
           }

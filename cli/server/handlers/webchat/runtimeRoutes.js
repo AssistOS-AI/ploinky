@@ -2,6 +2,7 @@ import crypto from 'crypto';
 
 import { getSession } from './browserSession.js';
 import {
+    createWebchatRuntimeOpenAnnouncer,
     parseInputEnvelope,
     serializeWebchatEnvelopeForAgent,
     shouldForwardWebchatEnvelope
@@ -175,11 +176,16 @@ export function handleRuntimeRoute({
                 tty.onOutput((data) => {
                     routeWorkspaceRuntimeOutput(appState, tab, data);
                 });
+                const announceRuntimeOpen = createWebchatRuntimeOpenAnnouncer({
+                    req, effectiveConfig, tabId, pageInstanceId, write: (line) => writeRuntimeInput(tab, line),
+                });
                 tty.onStartupState?.(({ state }) => {
                     if (!['starting', 'ready', 'failed'].includes(state)) return;
                     tab.startupState = state;
                     writeOrBufferSseEvent(tab, serializeStartupState(state));
+                    announceRuntimeOpen(state);
                 });
+                if (typeof tty.onStartupState !== 'function') announceRuntimeOpen('ready');
                 tty.onClose(() => {
                     const state = tab.startupState === 'starting' || tab.startupState === 'failed'
                         ? 'failed' : 'closed';

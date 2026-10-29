@@ -4,6 +4,7 @@
 // control channel and the whole of Apply, the MPS lifecycle and the backend's start are the product's own code.
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { syntheticLifecyclePreflight } from './helpers/legacyAgentLifecycleHarness.mjs';
 import { applyHardwareLimits } from '../../cli/sandbox/hardwareLimits/reconcile.mjs';
 import { coordinateMpsLifecycle } from '../../cli/sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { readMpsLaunch } from '../../cli/sandbox/hardwareLimits/mpsLaunch.mjs';
@@ -56,6 +57,7 @@ function world({ replies = {}, share: desired = share, display = null } = {}) {
     const registry = { a: record };
     let state = null;
     const dependencies = {
+        inspectLegacy: syntheticLifecyclePreflight,
         observeClients: () => [], readContext: () => ({ storeToken: token, overrides: new Map([['demo/a', { gpu: desired }]]), gpu: { eligible: true, grant: { mps: host.descriptors } } }),
         loadRegistry: () => registry, readApplied: () => null,
         loadPlan: () => ({ runtime: 'podman', manifest: {}, profile: { network: { mode: 'default' } }, image: 'prepared:tag' }),

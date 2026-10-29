@@ -5,8 +5,11 @@ import { inspect } from 'node:util';
 
 import {
     harness, connect, launch, startRotation, finishRotation, flush, fields,
-    OWNER, GENERATION, PTY, OTHER, OPERATION, SECRET, NONCE,
+    OWNER, GENERATION, PTY, OTHER, OPERATION, SECRET,
 } from './helpers/providerTerminalTransport.mjs';
+
+const claims = (jws) => JSON.parse(Buffer.from(jws.split('.')[1], 'base64url').toString('utf8'));
+const upgradeClaims = (opening) => claims(JSON.parse(opening.headers['x-ploinky-auth-info']).routerServiceToken);
 
 function cleaned(h) {
     assert.equal(h.clock.timers.size, 0);
@@ -30,7 +33,7 @@ test('fresh token per connection, exact possession proof, make-before-break and 
     const rotation = await startRotation(h);
     assert.equal(old.closed, 0);
     assert.equal(rotation.transport.controls('hello').length, 0);
-    const parts = [NONCE, OWNER, GENERATION].map((item) => {
+    const parts = [rotation.transport.nonce, OWNER, GENERATION].map((item) => {
         const length = Buffer.alloc(4);
         length.writeUInt32BE(Buffer.byteLength(item));
         return Buffer.concat([length, Buffer.from(item)]);
@@ -38,6 +41,23 @@ test('fresh token per connection, exact possession proof, make-before-break and 
     const proof = createHmac('sha256', Buffer.from(SECRET, 'base64url')).update(Buffer.concat(parts)).digest('base64url');
     assert.equal(rotation.transport.controls('reattach')[0].proof === proof, true);
     assert.equal(h.openings[0].headers['x-ploinky-auth-info'] === h.openings[1].headers['x-ploinky-auth-info'], false);
+    // Hello tokens are minted after `challenge`, bound to that transport's own
+    // nonce, fresh per connection, and present in both hello and reattach.
+    assert.notEqual(old.nonce, rotation.transport.nonce);
+    const helloToken = old.controls('hello')[0].helloToken;
+    const reattachToken = rotation.transport.controls('reattach')[0].helloToken;
+    assert.equal(typeof helloToken, 'string');
+    assert.equal(typeof reattachToken, 'string');
+    const helloClaims = claims(helloToken);
+    const reattachClaims = claims(reattachToken);
+    assert.equal(helloClaims.purpose, 'execution-provider-terminal-hello');
+    assert.equal(reattachClaims.purpose, 'execution-provider-terminal-hello');
+    assert.equal(helloClaims.nonce, old.nonce);
+    assert.equal(reattachClaims.nonce, rotation.transport.nonce);
+    assert.equal(upgradeClaims(h.openings[0]).purpose, 'execution-provider-terminal');
+    assert.equal(Object.hasOwn(upgradeClaims(h.openings[0]), 'nonce'), false);
+    const jtis = [helloClaims.jti, reattachClaims.jti, upgradeClaims(h.openings[0]).jti, upgradeClaims(h.openings[1]).jti];
+    assert.equal(new Set(jtis).size, 4);
     await finishRotation(rotation, [{ ptySessionId: PTY, inputNext: '1', outputLast: '1' }]);
     assert.equal(old.closed, 1);
     lateHandler(JSON.stringify({ v: 1, type: 'ended', ptySessionId: PTY, cause: 'exit' }), false);
@@ -137,6 +157,105 @@ test('stale leases during token mint and open cannot publish or send hello', asy
     assert.equal(other.transports[0].sent.length, 0);
     await other.client.shutdown();
     cleaned(other);
+});
+
+test('stale lease during the hello mint sends no hello and leaves a later connect possible', async () => {
+    let resolveHello;
+    const minted = [];
+    const service = {
+        mint: (input) => {
+            minted.push(input);
+            if (input.purpose) return new Promise((resolve) => { resolveHello = resolve; });
+            return Promise.resolve('synthetic-upgrade-token');
+        },
+    };
+    const h = harness({ service });
+    const first = assert.rejects(h.client.connect({ lease: h.lease }), /connect_failed/);
+    await flush();
+    const transport = h.transports[0];
+    assert.equal(minted.length, 1, 'no hello token is minted before challenge');
+    transport.peer('challenge', { nonce: transport.nonce });
+    await flush();
+    assert.equal(minted.length, 2);
+    assert.equal(minted[1].purpose, 'execution-provider-terminal-hello');
+    assert.equal(minted[1].nonce, transport.nonce);
+    assert.equal(transport.sent.length, 0, 'nothing is sent while the mint is pending');
+    h.lease.current = false;
+    resolveHello('synthetic-hello-token');
+    await first;
+    assert.equal(transport.sent.length, 0);
+    assert.equal(transport.controls('hello').length, 0);
+    // No hello was sent, so the latch is unset and a fresh lease may connect.
+    h.lease.current = true;
+    const second = assert.rejects(h.client.connect({ lease: h.lease }), /connect_failed/);
+    await flush();
+    assert.equal(h.openings.length, 2);
+    await h.client.shutdown();
+    await second;
+    cleaned(h);
+});
+
+test('hello mint failure after challenge sends nothing and a later connect is allowed', async () => {
+    let failHello = true;
+    const h = harness({ service: {
+        mint: async (input) => {
+            if (input.purpose && failHello) throw new Error('mint failed');
+            return input.purpose ? `hello-token-${input.nonce}` : 'synthetic-upgrade-token';
+        },
+    } });
+    const failed = assert.rejects(h.client.connect({ lease: h.lease }), /connect_failed/);
+    await flush();
+    const first = h.transports[0];
+    first.peer('challenge', { nonce: first.nonce });
+    await failed;
+    assert.equal(first.sent.length, 0);
+    failHello = false;
+    const second = await connect(h);
+    assert.equal(h.transports.length, 2);
+    assert.equal(second.controls('hello')[0].helloToken, `hello-token-${second.nonce}`);
+    assert.equal(first.controls('hello').length, 0);
+    await h.client.shutdown();
+    cleaned(h);
+});
+
+test('a minted hello token the frame schema rejects sends nothing and a later connect still succeeds', async () => {
+    for (const bad of ['', 42, 'x'.repeat(12 * 1024 + 1)]) {
+        let useBad = true;
+        const h = harness({ service: {
+            mint: async (input) => {
+                if (!input.purpose) return 'synthetic-upgrade-token';
+                return useBad ? bad : `hello-token-${input.nonce}`;
+            },
+        } });
+        const failed = assert.rejects(h.client.connect({ lease: h.lease }), /connect_failed/);
+        await flush();
+        const first = h.transports[0];
+        first.peer('challenge', { nonce: first.nonce });
+        await failed;
+        assert.equal(first.sent.length, 0);
+        useBad = false;
+        const second = await connect(h);
+        assert.equal(h.transports.length, 2);
+        assert.equal(second.controls('hello')[0].helloToken, `hello-token-${second.nonce}`);
+        await h.client.shutdown();
+        cleaned(h);
+    }
+});
+
+test('hello mint that outlasts handshakeMs fails the connect without sending', async () => {
+    const h = harness({ service: {
+        mint: (input) => (input.purpose ? new Promise(() => {}) : Promise.resolve('synthetic-upgrade-token')),
+    } });
+    const failed = assert.rejects(h.client.connect({ lease: h.lease }), /connect_failed/);
+    await flush();
+    const transport = h.transports[0];
+    transport.peer('challenge', { nonce: transport.nonce });
+    await flush();
+    await h.clock.advance(200);
+    await failed;
+    assert.equal(transport.sent.length, 0);
+    await h.client.shutdown();
+    cleaned(h);
 });
 
 test('routing staleness blocks caller actions but established heartbeat maintains ownership', async () => {

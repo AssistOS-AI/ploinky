@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { inspectInterimAgentLifecycle, assertLegacyAgentConfinement, isLegacyAgentLifecycleRefusal,
+    interimReceiptRegistryRecord } from '../legacyAgentLifecycleGuard.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
@@ -38,8 +40,10 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     inspect = (client, network, engine) => inspectMpsClient(client, { network, runtime: engine }),
     inspectPresence = (client, engine) => inspectMpsClientPresence(client, { runtime: engine }),
     removeCandidate = (candidate, network, capability) => retireExactAgentRuntimePredecessor({ containerName: candidate.key, containerId: candidate.containerId,
-        registryRecord: mpsCandidateRecord(candidate), runtimeNetwork: network }, { networkLifecycleCapability: capability }),
+        registryRecord: interimReceiptRegistryRecord(mpsCandidateRecord(candidate), loadRegistry()[candidate.key]),
+        runtimeNetwork: network }, { networkLifecycleCapability: capability }),
     drain = drainTargetedContainer, observeClients = assertKnownMpsClients, ownerState = mpsOwnerState,
+    inspectLegacy = inspectInterimAgentLifecycle,
 } = {}, progress = {}) {
     assertCapability(networkLifecycleCapability);
     const context = readContext();
@@ -47,8 +51,14 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     if (context.gate !== 'on') return { replacedKeys };
     const registry = loadRegistry();
     const members = new Map(nodes.map((entry) => [entry.key, entry]));
+    for (const { key } of nodes) inspectLegacy({ containerName: key, registryRecord: registry[key], runtime });
     let saved;
     try { saved = store.read(); } catch (_) { throw new MpsError('The private MPS state cannot be read safely', 'mps_backend_unavailable'); }
+    // Journal entries retain exact identities but not their original run mode.
+    for (const client of [...(saved?.oldClients || []), ...createdMpsCandidates(saved, registry)]) {
+        inspectLegacy({ containerName: client.key,
+            registryRecord: interimReceiptRegistryRecord(mpsCandidateRecord(client), registry[client.key]), runtime });
+    }
     const networkOf = (key, ref) => {
         const member = members.get(key);
         return member ? resolveManifestRuntimeProfile(member.node.manifest, { agentName: ref, profileName: registry[key]?.profile || undefined }).network : null;
@@ -167,6 +177,7 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     }
     for (const { client, observed, engine } of toDrain) {
         check();
+        inspectLegacy({ containerName: client.key, registryRecord: registry[client.key], runtime: engine });
         if (!sameRecord(client, loadRegistry()[client.key])) throw new MpsError('MPS graph predecessor identity changed before drain');
         if (observed.state !== 'absent' && observed.running !== false) {
             const inspectExact = () => {
@@ -176,6 +187,10 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
                 try { records = JSON.parse(reply.stdout || ''); } catch (_) {}
                 if (reply.error || reply.status !== 0 || !Array.isArray(records) || records.length !== 1
                     || (records[0].Id || records[0].ID) !== client.containerId) throw new MpsError('Exact MPS predecessor inspection failed during graph drain');
+                const exactRegistry = interimReceiptRegistryRecord(mpsCandidateRecord(client), registry[client.key]);
+                assertLegacyAgentConfinement({ runtime: engine, runMode: exactRegistry.runMode,
+                    containerName: client.key, containerId: client.containerId, record: records[0],
+                    registryRecord: exactRegistry });
                 return { State: records[0].State };
             };
             drain(client.key, { runtime: engine, acknowledgement: TARGETED_DRAIN_ACKNOWLEDGEMENT,
@@ -195,6 +210,7 @@ export async function prepareMpsGraph(input, dependencies = {}) {
     const progress = {};
     try { return await prepareMpsGraphImpl(input, dependencies, progress); }
     catch (error) {
+        if (isLegacyAgentLifecycleRefusal(error)) throw error;
         // Before any effect, an MPS failure refuses only the GPU-share agents
         // of this graph and leaves the daemon untouched; CPU-only agents and
         // Explorer start (U10, §9.1). The graph transaction's own checks and

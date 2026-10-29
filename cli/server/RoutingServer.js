@@ -725,6 +725,9 @@ async function processRequest(req, res) {
         }
     }
 
+    if (routePlan.ok && routePlan.kind === 'task-reference') {
+        return handleTaskReferenceRequest({ req, res, plan: routePlan, relayManager: runtimeRelayManager, toolPolicy: policy.mcpToolPolicy, auditSink: event => appendLog(event.event, event) });
+    }
     if (routePlan.ok && routePlan.kind === 'agent-port') {
         return executeHttpPlan({
             req,
@@ -866,6 +869,12 @@ async function processPrivateRequest(req, res) {
         sendJsonResponse(res, routePlan.status || 404, { error: routePlan.code || 'private_route_denied' }, { 'Cache-Control': 'no-store' });
         return;
     }
+    // The task-reference handler authenticates its own agent assertion and
+    // reads at most 64 KiB of body.
+    if (routePlan.kind === 'task-reference') {
+        await handleTaskReferenceRequest({ req, res, plan: routePlan, relayManager: runtimeRelayManager, toolPolicy: policy.mcpToolPolicy, auditSink: event => appendLog(event.event, event) });
+        return;
+    }
     let body;
     try {
         body = await readPrivateRequestBody(req);
@@ -943,6 +952,7 @@ async function processPrivateRequest(req, res) {
             relayManager: runtimeRelayManager,
             authorized: true,
             prebufferedBody: body,
+            trustedHeadersFactory: privateForwardTrustedHeadersFactory({ req, plan: routePlan }),
             auditSink: event => appendLog(event.event, event),
         });
         return;
@@ -1272,3 +1282,8 @@ server.listen(port, '0.0.0.0', () => {
         clearInterval(memoryMonitor);
     });
 });
+
+// Imported here, not with the others above, so the reviewed Router reference
+// lines of this file keep their positions.
+import { privateForwardTrustedHeadersFactory } from './executionProvider/coordinatorHop.mjs';
+import { handleTaskReferenceRequest } from './executionProvider/taskReferenceRoutes.mjs';

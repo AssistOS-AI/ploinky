@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { syntheticLifecyclePreflight } from './helpers/legacyAgentLifecycleHarness.mjs';
 import { writeAppliedObservation, readAppliedObservation } from '../../cli/sandbox/hardwareLimits/runtimeState.mjs';
 import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
@@ -51,6 +52,7 @@ function world(t, { policy = 50, journal = null } = {}) {
     const removed = [];
     const exactById = (candidate) => (live.has(candidate.containerId) ? { state: 'exact', id: candidate.containerId, running: true } : { state: 'absent', id: null });
     const deps = {
+        inspectLegacy: syntheticLifecyclePreflight,
         readContext: () => ({ gate: 'on', storeToken: null, overrides: new Map([['repo/x', { gpu: { smPercent: policy, vramPercent: policy } }]]), gpu: { grant: { mps: {} } } }),
         loadRegistry: () => structuredClone(registry), readApplied: (key, containerId) => readAppliedObservation(key, containerId, { root: applied }),
         loadPlan: () => ({ runtime: 'podman', image: 'img', profile: { network: { mode: 'default' } } }), prepareImage: () => {},
@@ -63,6 +65,7 @@ function world(t, { policy = 50, journal = null } = {}) {
         removeCandidate: (candidate) => { removed.push(candidate.containerId); live.delete(candidate.containerId); return { removed: true, state: 'removed' }; },
     };
     const graphDeps = {
+        inspectLegacy: syntheticLifecyclePreflight,
         readContext: () => ({ gate: 'on', overrides: new Map([['repo/x', { gpu: { smPercent: policy, vramPercent: policy } }]]), storeToken: { epoch: '0'.repeat(32), revision: 1 }, gpu: {} }),
         loadRegistry: () => structuredClone(registry), readApplied: deps.readApplied, store,
         backend: { observe: () => ({ state: alive ? 'owned' : 'gone' }), verify: () => alive }, assertCapability: () => {}, observeClients: () => [],
@@ -244,6 +247,7 @@ function inflightWorld(t, { owner = undefined, zPolicy = 25, lShareCleared = fal
     const remove = (candidate) => { removed.push(candidate.containerId); live.delete(candidate.containerId); return { state: 'removed' }; };
     const w = { zPolicy, registry, live, events, removed, store, get state() { return state; } };
     w.deps = {
+        inspectLegacy: syntheticLifecyclePreflight,
         readContext: () => ({ gate: 'on', storeToken: null, overrides: policies(), gpu: { grant: { mps: {} } } }),
         loadRegistry: () => structuredClone(registry), readApplied: (key, containerId) => readAppliedObservation(key, containerId, { root: applied }),
         loadPlan: () => ({ runtime: 'podman', image: 'img', profile: { network: { mode: 'default' } } }), prepareImage: () => {},
@@ -257,6 +261,7 @@ function inflightWorld(t, { owner = undefined, zPolicy = 25, lShareCleared = fal
         inspectCandidate: (candidate) => exactById(candidate), removeCandidate: remove, markUnavailable: async () => {},
     };
     w.graphDeps = {
+        inspectLegacy: syntheticLifecyclePreflight,
         readContext: () => ({ gate: 'on', overrides: policies(), storeToken: { epoch: '0'.repeat(32), revision: 1 }, gpu: {} }),
         loadRegistry: () => structuredClone(registry), readApplied: w.deps.readApplied, store,
         backend: { observe: () => ({ state: 'owned' }), verify: () => true }, assertCapability: () => {}, observeClients: () => [],

@@ -1,9 +1,10 @@
 import { EventEmitter } from 'node:events';
 
 import { ProviderTerminalChannel, TerminalTasks } from './providerTerminalChannel.mjs';
+import { EXECUTION_PROVIDER_TERMINAL_HELLO_PURPOSE } from '../../../Agent/lib/routerServiceToken.mjs';
 import { ProviderTerminalState } from './providerTerminalState.mjs';
 import {
-    encodeTerminalData, terminalError, terminalPossessionProof, terminalSequence, U64_MAX,
+    encodeTerminalControl, encodeTerminalData, terminalError, terminalPossessionProof, terminalSequence, U64_MAX,
 } from './providerTerminalProtocol.mjs';
 
 export const PROVIDER_TERMINAL_LIMIT_NAMES = Object.freeze([
@@ -138,14 +139,29 @@ export class ProviderTerminalClient extends EventEmitter {
             const challenge = await channel.wait('challenge');
             const ownership = this.#ownership;
             if (ownership && ownership.deadline <= this.#deps.now()) throw terminalError('expired');
-            const response = channel.wait(ownership ? 'reattach-ok' : 'hello-ok');
+            // Mint the hello token for this connection's nonce within handshakeMs,
+            // then recheck the lease and closed state. Only after that is the
+            // frame committed: a mint failure or stale lease sends nothing and
+            // leaves #helloSent unset, so a later connect() remains possible.
+            const helloToken = await this.#tasks.call(() => this.#deps.routerServiceTokenService.mint({
+                targetAgentId: provider, path, purpose: EXECUTION_PROVIDER_TERMINAL_HELLO_PURPOSE,
+                nonce: challenge.nonce,
+            }), this.#limits.handshakeMs, 'token');
+            this.#lease(lease);
+            if (this.#closed || channel.closed) throw terminalError('closed');
+            if (ownership && ownership.deadline <= this.#deps.now()) throw terminalError('expired');
             const fields = ownership ? {
                 ownershipSessionId: ownership.ownershipSessionId, workerGeneration: ownership.workerGeneration,
-                proof: terminalPossessionProof({ ...ownership, nonce: challenge.nonce }),
-            } : {};
+                proof: terminalPossessionProof({ ...ownership, nonce: challenge.nonce }), helloToken,
+            } : { helloToken };
+            // Encode (schema-validate, including helloToken) before the latch: a
+            // minter result the frame rejects must send nothing and leave
+            // reconnect possible. Nothing between the latch and send can throw.
+            const frameType = ownership ? 'reattach' : 'hello';
+            const wire = encodeTerminalControl({ v: 1, type: frameType, ...fields });
+            const response = channel.wait(ownership ? 'reattach-ok' : 'hello-ok');
             if (!ownership) this.#helloSent = true;
-            const [reply] = await Promise.all([response,
-                channel.sendControl(ownership ? 'reattach' : 'hello', fields)]);
+            const [reply] = await Promise.all([response, channel.send(wire, false, () => {}, true)]);
             this.#lease(lease);
             if (this.#closed || channel.closed) throw terminalError('closed');
             if (ownership) this.#state.reconcile(reply.ptys);
