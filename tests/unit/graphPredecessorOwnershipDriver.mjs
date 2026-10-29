@@ -121,7 +121,7 @@ async function run() {
             const removals = [];
             try {
                 const staged = ensureGraphNodesEnabled(graph, registry, {
-                    additionalNodes: resolveExtraEnabledRuntimeNodes(graph, registry),
+                    additionalNodes: resolveExtraEnabledRuntimeNodes(graph, registry).nodes,
                     saveAgents(map, options) {
                         if (argument.killBeforeRegistrySave) process.kill(process.pid, 'SIGKILL');
                         return workspaceSvc.saveAgents(map, options);

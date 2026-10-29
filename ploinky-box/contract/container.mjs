@@ -49,6 +49,7 @@ import {
     boxWorkspaceEnvironment,
     boxWorkspaceMount,
 } from './workspace-root.mjs';
+import { REPOS_SOURCE_ENV, REPOS_SOURCE_PROD, REPOS_SOURCE_DEV } from '../../cli/utils/reposSource.mjs';
 
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
 export const BOX_SOURCE_MISMATCH = 'PLOINKY_BOX_SOURCE_MISMATCH';
@@ -267,6 +268,28 @@ export function observeContainerRouterBinding(containerHandle) {
     return Object.freeze({ address, hosts });
 }
 
+/**
+ * The repository source an owned Box records. The default `dev` source carries
+ * no variable, so default Boxes stay byte-identical; `prod` is the only value
+ * the variable may hold.
+ *
+ * @returns {'dev'|'prod'}
+ */
+export function observeContainerReposSource(containerHandle) {
+    const environment = containerHandle?.runtime?.environment || {};
+    if (!Object.hasOwn(environment, REPOS_SOURCE_ENV)) return REPOS_SOURCE_DEV;
+    if (environment[REPOS_SOURCE_ENV] !== REPOS_SOURCE_PROD) {
+        throw publicationError(`Owned Box ${REPOS_SOURCE_ENV} is invalid${INCOMPATIBLE_BOX_GUIDANCE}`);
+    }
+    return REPOS_SOURCE_PROD;
+}
+
+export function reposSourceEnvironment(reposSource) {
+    if (reposSource === REPOS_SOURCE_PROD) return { [REPOS_SOURCE_ENV]: REPOS_SOURCE_PROD };
+    if (reposSource === REPOS_SOURCE_DEV) return {};
+    throw publicationError(`Unsupported Box repository source ${String(reposSource)}`);
+}
+
 // The media UDP publication targets the same in-Box port as the host port.
 // Strict validation (create, restore, reuse of a known shape) requires exactly
 // that. Discovery callers pass `observeLegacyMedia` so that a Box created before
@@ -394,6 +417,9 @@ export function validateContainerConfiguration(containerHandle, {
     // Same contract for the hardware-limits wiring: null means gate off and
     // rejects the label, marker and store bind.
     hardware = undefined,
+    // undefined: trust the repository source the Box records; otherwise the
+    // exact source ('dev' or 'prod').
+    reposSource = undefined,
 }) {
     assertRouterBindingStateConfined(identity);
     const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
@@ -497,6 +523,9 @@ export function validateContainerConfiguration(containerHandle, {
         ...(publication.mediaContainerPort !== BOX_MEDIA_PORT
             ? { [BOX_MEDIA_PORT_ENV]: String(publication.mediaContainerPort) }
             : {}),
+        ...reposSourceEnvironment(reposSource === undefined
+            ? observeContainerReposSource(containerHandle)
+            : reposSource),
     };
     const observedEnvironment = { ...runtime.environment };
     const runtimeHostname = observedEnvironment.HOSTNAME;

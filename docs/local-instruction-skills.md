@@ -40,7 +40,7 @@ Automatic workspace discovery excludes repositories containing AchillesAgentLib 
 
 ## Shared repository installation
 
-Repository discovery, Marketplace, agent resolution and link-install prefer workspace Git checkouts, including a unique checkout matching the registered Git origin, before `.ploinky/repos`. Discovery never pulls a checkout. `GET /api/marketplace/list-repos` returns `repositories` with `name`, `source`, `origin`, `kind` and discovery warnings. Typed AchillesAgentLib repositories are excluded from Anthropic skill recommendations.
+Repository discovery, Marketplace, agent resolution and link-install prefer workspace Git checkouts, including a unique checkout matching the registered Git origin, before `.ploinky/repos`. With `PLOINKY_REPOS_SOURCE=prod`, discovery, Marketplace, agent resolution and skill recommendations ignore workspace checkouts and use only `.ploinky/repos`; link-install repositories remain workspace checkouts. Discovery never pulls a checkout. `GET /api/marketplace/list-repos` returns `repositories` with `name`, `source`, `origin`, `kind` and discovery warnings. Typed AchillesAgentLib repositories are excluded from Anthropic skill recommendations.
 
 `POST /api/marketplace/repos` with `"action":"install"` accepts a mixed batch:
 

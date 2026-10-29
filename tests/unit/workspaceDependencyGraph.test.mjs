@@ -2617,6 +2617,19 @@ test('resolveWorkspaceDependencyGraph fails closed when a dependency entry canno
         () => resolveWorkspaceDependencyGraph({ staticAgentRef: 'demo/app-with-missing-dep' }),
         /Failed to resolve dependency 'missing-agent'/
     );
+
+    // start and restart pass this handler: the missing dependency is reported
+    // and dropped, and the parent still resolves.
+    const reported = [];
+    const graph = resolveWorkspaceDependencyGraph({
+        staticAgentRef: 'demo/app-with-missing-dep',
+        onUnresolvedDependency: (report) => reported.push(report),
+    });
+    assert.equal(reported.length, 1);
+    assert.equal(reported[0].rawDependency, 'missing-agent');
+    assert.equal(reported[0].parentRef, 'demo/app-with-missing-dep');
+    assert.equal(graph.nodes.has('demo/app-with-missing-dep'), true);
+    assert.equal([...graph.nodes.keys()].some((id) => id.endsWith('/missing-agent')), false);
 });
 
 test('parseEnableDirective strips no-wait modifier from any position', () => {

@@ -17,10 +17,17 @@ import {
     normalizeBoxAgentLib,
 } from '../contract/agentlib.mjs';
 import {
+    observeContainerReposSource,
     observeContainerRouterBinding,
     validateContainerConfiguration,
     validateContainerPublications,
 } from '../contract/container.mjs';
+import {
+    parseReposSource,
+    REPOS_SOURCE_ENV,
+    REPOS_SOURCE_PROD,
+    REPOS_SOURCE_DEV,
+} from '../../cli/utils/reposSource.mjs';
 import {
     inspectAndValidateExistingImage,
     inspectAndValidateImage,
@@ -121,6 +128,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
     // (and a failure can restore) exactly the Box that exists.
     const gpu = observeContainerGpuWiring(container, { identity });
     const hardware = observeContainerHardwareWiring(container, { identity });
+    const reposSource = observeContainerReposSource(container);
     // Discovery: a legacy `N:7882` Box is observed with its own container port
     // so it can be reported and replaced; create and restore stay strict.
     const { mediaContainerPort } = validateContainerPublications(
@@ -138,6 +146,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         routerBinding,
         gpu,
         hardware,
+        reposSource,
         imageRef,
         imageId,
         repositoryRoot,
@@ -195,6 +204,7 @@ async function createAndStart({
     routerBinding,
     gpu = null,
     hardware = null,
+    reposSource = REPOS_SOURCE_DEV,
     repositoryRoot,
     agentLib,
     runner,
@@ -248,6 +258,7 @@ async function createAndStart({
         networkMode,
         gpu,
         hardware,
+        reposSource,
     });
     // D1: again immediately before create, every writable bind is confined
     // and the data sources still resolve as they did when prepared.
@@ -279,6 +290,7 @@ async function createAndStart({
         routerBinding,
         gpu,
         hardware,
+        reposSource,
         imageId: image.immutableId,
         imageRef,
         repositoryRoot,
@@ -331,6 +343,7 @@ async function restoreOldContainer({
         routerBinding: old.routerBinding,
         gpu: old.gpu,
         hardware: old.hardware ?? null,
+        reposSource: old.reposSource,
         repositoryRoot: old.repositoryRoot,
         agentLib: old.agentLib,
         restoring: true,
@@ -367,6 +380,11 @@ export async function reconcileBoxContainer({
     // Same for the hardware-limits wiring: undefined keeps the Box's own,
     // null selects gate off, a wiring selects gate on exactly.
     hardware = undefined,
+    // PLOINKY_REPOS_SOURCE: undefined keeps an existing Box's own source (a
+    // new Box takes `env`'s, else 'dev'); 'dev' or 'prod'
+    // selects it exactly. A change replaces the Box, since Podman cannot
+    // change a container's environment in place.
+    reposSource = undefined,
     assertGateOffRestore = null,
     imageRef = BOX_IMAGE_REFERENCE,
     imagePolicy = 'pull',
@@ -500,6 +518,12 @@ export async function reconcileBoxContainer({
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
     const desiredGpu = gpu === undefined ? (old?.gpu ?? null) : gpu;
     const desiredHardware = hardware === undefined ? (old?.hardware ?? null) : hardware;
+    const desiredReposSource = reposSource
+        ?? old?.reposSource
+        ?? (parseReposSource(env?.[REPOS_SOURCE_ENV]) || REPOS_SOURCE_DEV);
+    if (![REPOS_SOURCE_DEV, REPOS_SOURCE_PROD].includes(desiredReposSource)) {
+        throw transactionError(`Unsupported Box repository source ${String(desiredReposSource)}`);
+    }
     let oldImage = null;
     if (old) {
         oldImage = dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
@@ -554,6 +578,8 @@ export async function reconcileBoxContainer({
         // Turning the gate on or off, or replacing the store directory,
         // changes the hardware-limits binds and label.
         || !sameHardwareWiring(old.hardware, desiredHardware)
+        // The repository source is Box environment every in-Box process inherits.
+        || old.reposSource !== desiredReposSource
         || old.imageRef !== imageRef
         || dataPathsChanged
         // A changed source directory, mode, identity, or fingerprint must never
@@ -771,6 +797,7 @@ export async function reconcileBoxContainer({
             routerBinding: desiredBinding,
             gpu: desiredGpu,
             hardware: desiredHardware,
+            reposSource: desiredReposSource,
             repositoryRoot,
             agentLib: desiredAgentLib,
             runner,

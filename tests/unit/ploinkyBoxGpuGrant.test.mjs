@@ -2364,6 +2364,34 @@ test('D14 scan: installed repos and workspace checkouts declare GPU access throu
     fs.symlinkSync(path.join(root, 'elsewhere.json'), path.join(root, '.ploinky/repos/tools/linked/manifest.json'));
     assert.deepEqual([...declaredGpuAgents(root)], ['checkout/gpu-agent', 'local-llms/local-llm']);
     assert.deepEqual([...declaredGpuAgents('relative/path')], []);
+    // PLOINKY_REPOS_SOURCE=prod: workspace checkouts are not agent sources.
+    assert.deepEqual([...declaredGpuAgents(root, { includeWorkspace: false })], ['local-llms/local-llm']);
+});
+
+test('D14 scan follows PLOINKY_REPOS_SOURCE: a prod Box never reads workspace manifests', async (t) => {
+    const box = graphBox(t);
+    const scans = [];
+    const scanGpuAgents = (_root, options) => { scans.push(options.includeWorkspace); return []; };
+    const status = (env) => gpuSupervisor(box, [], { env, scanGpuAgents }).inspectGpuGrant();
+    // The Box's own source decides, whatever the command environment says.
+    status({});
+    status({ PLOINKY_REPOS_SOURCE: 'prod' });
+    box.container.runtime.environment.PLOINKY_REPOS_SOURCE = 'prod';
+    status({});
+    status({ PLOINKY_REPOS_SOURCE: 'dev' });
+    // An invalid recorded value fails closed to the prod scan.
+    box.container.runtime.environment.PLOINKY_REPOS_SOURCE = 'bogus';
+    status({});
+    assert.deepEqual(scans, [true, true, false, false, false]);
+    // Without a Box, the source a new Box would take from the environment.
+    const absent = { ...box, ownership: { state: 'absent', engine: box.ownership.engine, handles: {} } };
+    const absentScans = [];
+    for (const env of [{}, { PLOINKY_REPOS_SOURCE: 'prod' }]) {
+        gpuSupervisor(absent, [], {
+            env, scanGpuAgents: (_root, options) => { absentScans.push(options.includeWorkspace); return []; },
+        }).inspectGpuGrant();
+    }
+    assert.deepEqual(absentScans, [true, false]);
 });
 
 test('D14 status names each GPU agent with its source, the denies and the workspace revoke', async () => {

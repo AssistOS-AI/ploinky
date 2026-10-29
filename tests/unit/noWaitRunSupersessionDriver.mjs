@@ -106,7 +106,7 @@ async function run() {
                 staged = ensureGraphNodesEnabled(graph, registry, {
                     supersededNoWaitRuns: superseded,
                     // Enabled agents outside the graph, exactly as startWorkspace stages them.
-                    additionalNodes: resolveExtraEnabledRuntimeNodes(graph, registry),
+                    additionalNodes: resolveExtraEnabledRuntimeNodes(graph, registry).nodes,
                     // Stands in for the production runtime check finding the
                     // runtime current (running, same env hash), which the fake
                     // engine does not model: then only supersession rotates.

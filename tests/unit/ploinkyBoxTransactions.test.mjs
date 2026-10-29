@@ -113,6 +113,8 @@ function containerHandle({
     running = true,
     dataFingerprints = DATA_FINGERPRINTS,
     agentLib,
+    // PLOINKY_REPOS_SOURCE as the Box environment records it (null: unset).
+    reposSourceEnv = null,
 }) {
     const mediaEnv = boxMediaPortEnv === 'auto'
         ? (Number(mediaContainerPort) === 7882 ? null : String(mediaContainerPort))
@@ -154,6 +156,7 @@ function containerHandle({
                 PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
                 PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET,
                 ...(mediaEnv === null ? {} : { PLOINKY_BOX_MEDIA_PORT: mediaEnv }),
+                ...(reposSourceEnv === null ? {} : { PLOINKY_REPOS_SOURCE: reposSourceEnv }),
                 HOSTNAME: id.slice(0, 12),
             },
             publications: [
@@ -420,6 +423,8 @@ function harness(state, {
                         .split(':')[2].split('/')[0]),
                     boxMediaPortEnv: (args.find((value) => value.startsWith('PLOINKY_BOX_MEDIA_PORT='))
                         ?? '').slice('PLOINKY_BOX_MEDIA_PORT='.length) || null,
+                    reposSourceEnv: (args.find((value) => value.startsWith('PLOINKY_REPOS_SOURCE='))
+                        ?? '').slice('PLOINKY_REPOS_SOURCE='.length) || null,
                     id: cid,
                     running: false,
                     dataFingerprints: {
@@ -1812,6 +1817,57 @@ test('native pasta migration replaces a legacy Box, verifies IPv4 mode, and then
     }, h.seams);
     assert.equal(reused.action, 'reused');
     assert.equal(h.calls.slice(callsBefore).some((call) => call.includes('create') || call.includes('stop')), false);
+});
+
+test('PLOINKY_REPOS_SOURCE is Box environment: a change replaces the Box, unset keeps it, an invalid value is refused', async (t) => {
+    const state = fixture(t);
+    const initial = lifecycleContainer(state);
+    const h = harness(state, { initial });
+    const args = { ...reconciliationArguments(state, h, initial), imagePolicy: 'preserve', env: {} };
+    const replaced = await reconcileBoxContainer({ ...args, reposSource: 'prod' }, h.seams);
+    assert.equal(replaced.action, 'replaced');
+    const create = h.calls.find((call) => call.includes('create'));
+    assert.ok(create.includes('PLOINKY_REPOS_SOURCE=prod'));
+    assert.equal(h.current().runtime.environment.PLOINKY_REPOS_SOURCE, 'prod');
+    replaced.finalize();
+    const owned = () => ({ state: 'owned', handles: { container: h.current() } });
+    // Unset keeps the Box's own source; an explicit equal source reuses it.
+    for (const reposSource of [undefined, 'prod']) {
+        const reused = await reconcileBoxContainer({ ...args, ownership: owned(), reposSource }, h.seams);
+        assert.equal(reused.action, 'reused');
+    }
+    // A targeted command never replaces the Box to change the source.
+    await assert.rejects(reconcileBoxContainer({
+        ...args, ownership: owned(), reposSource: 'dev', allowReplacement: false,
+    }, h.seams), /cannot be reused/);
+    // An invalid recorded value is an incompatible Box, never 'dev'.
+    const tampered = structuredClone(h.current());
+    tampered.runtime.environment.PLOINKY_REPOS_SOURCE = 'dev';
+    await assert.rejects(reconcileBoxContainer({
+        ...args, ownership: { state: 'owned', handles: { container: tampered } },
+    }, h.seams), /PLOINKY_REPOS_SOURCE is invalid/);
+});
+
+test('a new Box takes PLOINKY_REPOS_SOURCE from the environment and a failed switch restores the old source', async (t) => {
+    const state = fixture(t);
+    const created = harness(state);
+    const fresh = await reconcileBoxContainer({
+        ...reconciliationArguments(state, created, null), imagePolicy: 'preserve',
+        env: { PLOINKY_REPOS_SOURCE: 'prod' },
+    }, created.seams);
+    assert.equal(fresh.action, 'created');
+    assert.equal(created.current().runtime.environment.PLOINKY_REPOS_SOURCE, 'prod');
+
+    const initial = lifecycleContainer(state);
+    const h = harness(state, { initial, failCandidateReady: true });
+    await assert.rejects(reconcileBoxContainer({
+        ...reconciliationArguments(state, h, initial), imagePolicy: 'preserve', env: {}, reposSource: 'prod',
+    }, h.seams), /ready timeout/);
+    const creates = h.calls.filter((call) => call.includes('create'));
+    assert.equal(creates.length, 2);
+    assert.ok(creates[0].includes('PLOINKY_REPOS_SOURCE=prod'));
+    assert.equal(creates[1].some((value) => String(value).startsWith('PLOINKY_REPOS_SOURCE=')), false);
+    assert.equal(Object.hasOwn(h.current().runtime.environment, 'PLOINKY_REPOS_SOURCE'), false);
 });
 
 test('a failed native pasta migration restores the exact legacy network contract', async (t) => {

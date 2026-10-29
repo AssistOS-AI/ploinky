@@ -269,6 +269,21 @@ For example, when Ploinky runs in `work`, it can use `work/AssistOSExplorer` for
 
 A matching folder named after the registered repository takes priority; otherwise Ploinky matches Git origins among direct workspace children containing agent manifests. With no local match, it uses `.ploinky/repos`. Automatic preparation reuses the local checkout without switching its branch. An explicit repository update can pull into that checkout; uninstalling it unregisters it while preserving its files. Already running instances retain their selected source until a lifecycle transition creates a new runtime. See [repository selection and lifecycle details](docs/operations.html#workspace-agent-repositories).
 
+#### Use only `.ploinky/repos` in production
+
+In production, a workspace checkout is a risk: agents with workspace access (for example globally enabled agents, which see the whole workspace read-write at its host path) could modify it, and the next restart would run the modified code. Set `PLOINKY_REPOS_SOURCE=prod` to make Ploinky ignore workspace checkouts for every agent and skill repository:
+
+```sh
+PLOINKY_REPOS_SOURCE=prod ploinky restart   # or start, update
+```
+
+- `prod`: only the managed copies under `.ploinky/repos/<repository>` are resolved, listed, installed and run. Installation clones into `.ploinky/repos` even when a matching workspace checkout exists, and uninstalling removes the managed copy.
+- `dev` (the default): workspace checkouts take precedence, as described above.
+- Any other value is refused before anything changes.
+- The values are independent of manifest profiles (`ploinky profile`): `prod` here selects only where repositories come from.
+
+The host records the value in the Box environment, which every in-Box process (commands, Router, Watchdog) inherits, so it takes effect only after `ploinky start`, `ploinky restart` or `ploinky update` recreates the Box; the running agents are then restarted from the new source. The setting is kept: later commands without the variable keep the Box's current source, and `PLOINKY_REPOS_SOURCE=dev ploinky restart` switches back. Other commands never change it and print a note when the variable differs from the running Box. Only the host environment selects it: the value in the workspace `.env` or in secrets is ignored. Repositories declared with `link-install` are workspace checkouts by design and are not affected. The GPU wiring follows the same source: only manifests under `.ploinky/repos` can declare `containerSecurity.gpu`. A Box created after `ploinky destroy` takes the variable from the environment of the command that creates it.
+
 | Invocation | Documented effect |
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
@@ -285,6 +300,7 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky gpu status` | Show the saved grant, host GPU discovery, and the Box's GPU wiring without mutation |
 | `PLOINKY_BOX_HARDWARE_LIMITS=on ploinky start` (or `restart`, `update`) | Turn hardware limits on for this workspace and save the gate; the Box is recreated with the hardware wiring and prepared before graph work |
 | `PLOINKY_BOX_HARDWARE_LIMITS=off ploinky restart` (or `start`, `update`) | Turn hardware limits off and save the gate; refused while agents still have stored limits |
+| `PLOINKY_REPOS_SOURCE=prod ploinky restart` (or `start`, `update`) | Recreate the Box so that every agent and skill repository comes only from `.ploinky/repos`, ignoring workspace checkouts; kept until `PLOINKY_REPOS_SOURCE=dev` is applied the same way |
 | `ploinky limits status` | Show the saved gate, hardware state, transition, Box state, host engine facts and stored per-agent limits without mutation; unobserved in-Box facts print as `unknown` |
 | `ploinky limits clear --agent REPO/AGENT` / `ploinky limits clear --all` | Remove one agent's stored limits, or reset the whole policy store, on the host without a running Router |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
@@ -955,7 +971,10 @@ the host NVIDIA GPU in either of two ways:
 
 - Its manifest declares it at the root, next to `nestedPodman`:
   `"containerSecurity": { "gpu": true }`. Any installed repo or workspace
-  checkout can do this, and the agent then needs no host step. It gets the
+  checkout can do this, and the agent then needs no host step. With
+  `PLOINKY_REPOS_SOURCE=prod` only the installed repos under
+  `.ploinky/repos` count: workspace checkouts are not agent sources then, so
+  their manifests never declare the GPU. It gets the
   device when the Box's wiring names it; otherwise it still starts, without the
   device, and its container gets `PLOINKY_GPU_STATUS=unavailable` and
   `PLOINKY_GPU_REASON`, which says what to run on the host. So it never fails on

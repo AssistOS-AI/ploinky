@@ -49,6 +49,7 @@ import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
 import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
+import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../utils/publicRouterHosts.mjs';
 import {
@@ -287,8 +288,9 @@ export function buildRouterEnv({ managedBox } = {}) {
   try { secrets = readSecretsFile() || {}; } catch (_) { secrets = {}; }
   // Trusted outer-host aliases come only from the host-created Box environment.
   // Workspace .env and secret files are writable through agent workspace mounts.
-  const { [PUBLIC_ROUTER_HOSTS_ENV]: _envFileHosts, ...fileEnvironment } = envFile;
-  const { [PUBLIC_ROUTER_HOSTS_ENV]: _secretHosts, ...secretEnvironment } = secrets;
+  // Likewise the repository source: only the process (Box) environment selects it.
+  const { [PUBLIC_ROUTER_HOSTS_ENV]: _envFileHosts, [REPOS_SOURCE_ENV]: _envFileSource, ...fileEnvironment } = envFile;
+  const { [PUBLIC_ROUTER_HOSTS_ENV]: _secretHosts, [REPOS_SOURCE_ENV]: _secretSource, ...secretEnvironment } = secrets;
   return sanitizeRouterEnvironment(
     { ...fileEnvironment, ...secretEnvironment, ...process.env },
     { managedBox },
@@ -1486,20 +1488,32 @@ function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = doc
     const existing = findRegistryEntryForGraphNode(reg, node, getAgentContainerName);
     if (existing) graphRegistryNames.add(existing.key);
   }
-  return Object.entries(reg || {})
+  const skipped = [];
+  const nodes = Object.entries(reg || {})
     .filter(([containerName, record]) => (
       containerName !== '_config'
       && record?.type === 'agent'
       && !graphRegistryNames.has(containerName)
     ))
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([containerName, record]) => {
+    .flatMap(([containerName, record]) => {
       const ref = record.repoName
         ? `${record.repoName}/${record.agentName}`
         : record.agentName;
-      const resolved = utils.findAgent(ref);
+      // An enabled agent whose source is missing (its repository was never
+      // installed, or PLOINKY_REPOS_SOURCE=prod hides the workspace checkout it
+      // ran from) must not stop the whole restart. It is reported and left out
+      // of this start; its registry record stays, so installing the repository
+      // brings it back on the next restart.
+      let resolved;
+      try {
+        resolved = utils.findAgent(ref);
+      } catch (error) {
+        skipped.push({ ref, containerName, error: String(error?.message || error).slice(0, 512) });
+        return [];
+      }
       const manifest = JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
-      return {
+      return [{
         id: `extra:${containerName}`,
         agentRef: ref,
         agentPath: path.dirname(resolved.manifestPath),
@@ -1509,8 +1523,9 @@ function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = doc
         profile: record.profile || '',
         repoName: resolved.repo,
         shortAgentName: resolved.shortAgentName,
-      };
+      }];
     });
+  return { nodes, skipped };
 }
 
 function loadRegistryManifest(record) {
@@ -2879,11 +2894,13 @@ export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { har
     workspaceSvc.loadAgents(),
     dockerSvc.getAgentContainerName,
   );
+  const unresolvedDependencies = [];
   const graph = resolveWorkspaceDependencyGraph({
     staticAgentRef: staticAgent,
     registry,
+    onUnresolvedDependency: (report) => unresolvedDependencies.push(report),
   });
-  const additionalNodes = resolveExtraEnabledRuntimeNodes(
+  const { nodes: additionalNodes, skipped: skippedEnabledAgents } = resolveExtraEnabledRuntimeNodes(
     graph,
     registry,
     dockerSvc.getAgentContainerName,
@@ -2894,7 +2911,7 @@ export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { har
     ...(hardwareContext !== undefined ? { hardwareContext } : {}),
     ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
   });
-  return Object.freeze({ graph, registry, additionalNodes, admissions });
+  return Object.freeze({ graph, registry, additionalNodes, skippedEnabledAgents, unresolvedDependencies, admissions });
 }
 
 // Exact refusal/block counts and the overall state; never "all ready" while
@@ -2972,6 +2989,15 @@ async function startWorkspace(staticAgentArg, portArg, {
       .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
   }
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  // A missing source is reported once and skipped; it never stops the restart.
+  // The registry record of a skipped enabled agent is kept, so installing its
+  // repository brings it back on the next restart.
+  for (const skipped of lockedStart.skippedEnabledAgents || []) {
+    console.error(`[start] Skipping enabled agent '${skipped.ref}': ${skipped.error}`);
+  }
+  for (const unresolved of lockedStart.unresolvedDependencies || []) {
+    console.error(`[start] Skipping dependency '${unresolved.rawDependency}' of '${unresolved.parentRef}': ${unresolved.message}`);
+  }
   // `--branch` reaches link-install repositories here, for the whole admitted
   // graph including no-wait agents, before any mutation, wave or worker.
   preflightStartLinkedRepositories(lockedStart, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, branchPolicy });

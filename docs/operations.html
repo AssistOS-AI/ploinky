@@ -57,6 +57,21 @@
                         <tr><td>Uninstall repository</td><td>Disable and unregister the local repository while preserving its files. Explicit installation registers it again. Uninstalling a managed-only repository removes its managed directory.</td></tr>
                     </tbody></table>
                     <p>An existing runtime retains the source paths admitted for its generation. Adding or removing a local checkout does not redirect an already running instance. Use a lifecycle action such as restart or reinstall to select the source for a new runtime; teardown and routing still refer to the exact existing runtime identity.</p>
+                    <h3 id="repos-source-prod">Use only managed repositories (production)</h3>
+                    <p>Agents with workspace access, such as globally enabled agents that see the whole workspace read-write at its host path, can modify a workspace checkout; the next restart would then run the modified code. <code>PLOINKY_REPOS_SOURCE=prod</code> disables workspace checkouts for every agent and skill repository, so only <code>.ploinky/repos/&lt;repository&gt;</code> is used:</p>
+                    <pre><code>PLOINKY_REPOS_SOURCE=prod ploinky restart</code></pre>
+                    <table class="command-table"><thead><tr><th>Value</th><th>Effect</th></tr></thead><tbody>
+                        <tr><td><code>dev</code> (default)</td><td>The priority above: a matching workspace checkout first, then the managed repository.</td></tr>
+                        <tr><td><code>prod</code></td><td>Workspace checkouts are never discovered, listed, installed or run. Installation and startup preparation clone into <code>.ploinky/repos</code> even when a matching checkout exists; uninstalling removes the managed copy; repository updates and skill recommendations use only the managed copy.</td></tr>
+                    </tbody></table>
+                    <ul>
+                        <li>Any other value is refused before any change. The values are independent of manifest profiles (<code>ploinky profile</code>): they select only where repositories come from.</li>
+                        <li>The host records the value in the Box environment, which every in-Box process (commands, Router, Watchdog) inherits. It takes effect only when <code>ploinky start</code>, <code>ploinky restart</code> or <code>ploinky update</code> recreates the Box, which also restarts the configured graph from the new source.</li>
+                        <li>The setting is kept: those commands without the variable keep the Box's current source; <code>PLOINKY_REPOS_SOURCE=dev ploinky restart</code> switches back. Other commands never change it and print a note when the variable differs from the running Box. A new Box (for example after <code>ploinky destroy</code>) takes the variable from the command that creates it.</li>
+                        <li>Only the host environment selects the source: the variable is ignored in the workspace <code>.env</code> and in secrets, because agents can write them.</li>
+                        <li>Repositories declared with <code>link-install</code> are workspace checkouts by design and are not affected.</li>
+                        <li>The host-side GPU wiring follows the same source: with <code>prod</code>, only manifests under <code>.ploinky/repos</code> can declare <code>containerSecurity.gpu</code>, so a manifest written into a workspace checkout cannot give the GPU to the installed agent of the same name.</li>
+                    </ul>
                 </div>
                 <div class="doc-section" id="webtty">
                     <h2>Recover WebTTY terminals</h2>

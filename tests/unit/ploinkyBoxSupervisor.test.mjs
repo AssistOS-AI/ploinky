@@ -2061,3 +2061,40 @@ test('two concurrent destroys serialize on the real workspace lock; the second s
     assert.deepEqual(second.removedRecords, []);
     assert.ok(fs.existsSync(seeded.binding));
 });
+
+test('restart passes PLOINKY_REPOS_SOURCE to Box reconciliation, keeps the Box source when unset, and refuses typos first', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const sentinel = new Error('reconcile sentinel');
+    const run = async (env) => {
+        const requested = [];
+        const supervisor = createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+            ...state.stores,
+            env,
+            resolveIdentity: () => identity,
+            launchCwd: identity.workspaceRoot,
+            lockManager: fakeLockManager(fs.mkdtempSync(path.join(state.root, 'locks-')), []),
+            discover: () => owned(identity),
+            runner: { run() {} },
+            selectAgentLib: async () => ({ selection: agentLibFixture(identity.workspaceRoot), mode: 'local' }),
+            captureCoreStartArgv: () => Object.freeze(['start', 'explorer', '8080']),
+            scanGpuAgents: (_root, options) => { requested.push(`scan:${options.includeWorkspace}`); return []; },
+            reconcile: async (options) => { requested.push(options.reposSource); throw sentinel; },
+        });
+        await assert.rejects(supervisor.runRestartTransaction(['restart']), (error) => {
+            if (error === sentinel || error?.cause === sentinel || String(error?.message).includes(sentinel.message)) return true;
+            requested.push(error);
+            return true;
+        });
+        return requested;
+    };
+    // The GPU manifest scan follows the source this restart applies.
+    assert.deepEqual(await run({ PLOINKY_REPOS_SOURCE: 'prod' }), ['scan:false', 'prod']);
+    assert.deepEqual(await run({}), ['scan:true', undefined]);
+    const [refusal, ...rest] = await run({ PLOINKY_REPOS_SOURCE: 'production' });
+    assert.equal(rest.length, 0, 'an invalid value never reaches reconciliation');
+    assert.equal(refusal.code, 'PLOINKY_BOX_ARGUMENT_INVALID');
+    assert.match(refusal.message, /PLOINKY_REPOS_SOURCE must be/);
+});

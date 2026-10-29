@@ -3,6 +3,7 @@ import { SECRETS_FILE } from '../config.js';
 import { readSecretsFile } from './encryptedSecretsFile.js';
 import { findEnvFile, loadEnvFile } from './masterKey.js';
 import { debugLog } from '../utils.js';
+import { REPOS_SOURCE_ENV } from '../reposSource.mjs';
 
 /**
  * Load secrets from the .ploinky/data/.secrets file.
@@ -206,6 +207,8 @@ export function formatMissingSecretsError(missingSecrets, profileName) {
  */
 export function injectSecretsToEnv(secrets) {
     for (const [name, value] of Object.entries(secrets)) {
+        // Secrets never select the repository source; only the process environment does.
+        if (name === REPOS_SOURCE_ENV) continue;
         if (value !== undefined && value !== null) {
             process.env[name] = String(value);
         }

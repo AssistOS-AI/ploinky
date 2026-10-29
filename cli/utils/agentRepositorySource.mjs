@@ -5,6 +5,7 @@ import { repositoryEntries, repositoryIdentity, repositoryOrigin, workspaceRepos
 import { PLOINKY_WORKSPACE_ROOT, REPOS_DIR } from './config.js';
 import { getPredefinedRepos, getRepoSources } from './repos.js';
 import { memoizeRepositoryRead } from './repositoryResolutionScope.mjs';
+import { workspaceCheckoutsAllowed } from './reposSource.mjs';
 export { runWithRepositoryResolutionScope } from './repositoryResolutionScope.mjs';
 
 const directoryEntries = repositoryEntries;
@@ -24,7 +25,10 @@ function workspaceRepositories() {
 }
 
 // Registered aliases retain their identity even when the checkout has a different name.
+// With PLOINKY_REPOS_SOURCE=prod no workspace checkout is ever a source, so
+// every caller falls back to the managed copy under `.ploinky/repos`.
 export function workspaceAgentRepositoryPath(name, { url = null } = {}) {
+    if (!workspaceCheckoutsAllowed()) return null;
     return workspaceRepositoryPath(name, { workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         url: url || registeredSources()[name]?.url, accept: hasAgents });
 }
@@ -45,7 +49,7 @@ function readAgentRepositoryNames() {
         .filter(entry => entry.isDirectory() || entry.isSymbolicLink())
         .map(entry => entry.name));
     const sources = registeredSources();
-    for (const entry of workspaceRepositories()) {
+    for (const entry of workspaceCheckoutsAllowed() ? workspaceRepositories() : []) {
         const identity = originIdentity(entry.directory);
         const aliases = identity ? Object.entries(sources)
             .filter(([, source]) => repositoryIdentity(source.url) === identity)

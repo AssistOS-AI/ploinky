@@ -699,11 +699,16 @@ function directoryNames(fsApi, directory, limit) {
  * manifests are agent-writable workspace files: a symlinked `manifest.json`,
  * anything that is not a small regular JSON file, and names that are not
  * REPO/AGENT selectors count as not declared.
+ *
+ * `includeWorkspace: false` (PLOINKY_REPOS_SOURCE=prod) scans only the
+ * installed repos: workspace checkouts are then never an agent's source, so
+ * their manifests must not grant the GPU to the installed agent of that name.
  */
 export function declaredGpuAgents(workspaceRoot, {
     fsApi = fs,
     maxBytes = GPU_WORKSPACE_FILE_MAX_BYTES,
     maxEntries = 256,
+    includeWorkspace = true,
 } = {}) {
     const root = String(workspaceRoot || '');
     if (!path.isAbsolute(root)) return [];
@@ -722,7 +727,9 @@ export function declaredGpuAgents(workspaceRoot, {
         }
     };
     for (const repo of directoryNames(fsApi, reposDirectory, maxEntries)) scanRepo(repo, path.join(reposDirectory, repo));
-    for (const repo of directoryNames(fsApi, root, maxEntries)) scanRepo(repo, path.join(root, repo));
+    if (includeWorkspace !== false) {
+        for (const repo of directoryNames(fsApi, root, maxEntries)) scanRepo(repo, path.join(root, repo));
+    }
     return Object.freeze([...declared].sort().slice(0, MAX_DECLARED_GPU_AGENTS));
 }
 

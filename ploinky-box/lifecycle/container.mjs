@@ -21,7 +21,7 @@ import {
     boxImageIdEnv,
     normalizeBoxAgentLib,
 } from '../contract/agentlib.mjs';
-import { validateContainerConfiguration } from '../contract/container.mjs';
+import { reposSourceEnvironment, validateContainerConfiguration } from '../contract/container.mjs';
 import { checkoutShadowArgs, checkoutShadowMount } from '../contract/checkoutAlias.mjs';
 import { normalizeImageId } from '../contract/image-id.mjs';
 import { PASTA_IPV4_NETWORK } from '../contract/network.mjs';
@@ -114,10 +114,13 @@ export function containerCreateArgs({
     networkMode = null,
     gpu = null,
     hardware = null,
+    // Where in-Box processes resolve agent and skill repositories from.
+    reposSource = 'dev',
 }) {
     assertRouterBindingStateConfined(identity);
     const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
     const source = path.resolve(repositoryRoot);
+    const reposSourceEnv = reposSourceEnvironment(reposSource);
     // The grant adds only explicit device nodes, read-only binds and one label;
     // never privileged mode, capabilities, a CDI spec directory, or Box env.
     const gpuArgs = gpuWiringCreateArgs(gpu);
@@ -215,6 +218,9 @@ export function containerCreateArgs({
         ...(Number(mediaHostPort) !== BOX_MEDIA_PORT
             ? ['--env', `${BOX_MEDIA_PORT_ENV}=${String(mediaHostPort)}`]
             : []),
+        // PLOINKY_REPOS_SOURCE=prod only; the default source carries no
+        // variable. Every in-Box process (commands, Router, Watchdog) inherits it.
+        ...Object.entries(reposSourceEnv).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
         ...Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
         '--cidfile', cidfile,
         imageId,

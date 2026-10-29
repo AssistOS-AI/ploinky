@@ -16,6 +16,7 @@ import {
 } from './agentlib-source.mjs';
 import { AGENTLIB_ERROR_CODES, agentLibError, agentLibIdentity } from '../agentlib/contract.mjs';
 import { PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV } from '../cli/commands/ploinkyUpdateScope.js';
+import { parseReposSource, REPOS_SOURCE_ENV, REPOS_SOURCE_PROD, REPOS_SOURCE_DEV } from '../cli/utils/reposSource.mjs';
 import {
     fingerprintSource,
     sourceIdEquals,
@@ -46,6 +47,7 @@ import {
 } from './contract/agentlib.mjs';
 import {
     assertBoxPloinkySource,
+    observeContainerReposSource,
     observeContainerRouterBinding,
     validateContainerConfiguration,
     validateContainerPublications,
@@ -484,11 +486,11 @@ export function createBoxSupervisor({
     // start, restart and update rediscovers the host driver, so a driver update
     // replaces the Box with regenerated wiring, and a failed discovery wires
     // only a stale-grant marker instead of stopping the whole workspace.
-    function selectSavedGpuWiring(identity, mpsEnabled = hardwareGateStore.read(identity)?.enabled === true) {
+    function selectSavedGpuWiring(identity, mpsEnabled = hardwareGateStore.read(identity)?.enabled === true, scope = {}) {
         const saved = gpuGrantStore.read(identity);
         // D14: manifests of the installed repos may declare GPU access; the
         // operator's grants and denies apply on top.
-        const declared = scanGpuAgents(identity.workspaceRoot);
+        const declared = scanDeclaredGpuAgents(identity, scope);
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,
             ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
@@ -510,6 +512,41 @@ export function createBoxSupervisor({
             }
         }
         return Object.freeze({ saved, desired, declared });
+    }
+
+    // The repository source the GPU manifest scan follows: the one this
+    // command applies, else the Box's own, else (no Box) the one a new Box
+    // takes from the environment. An unreadable source fails closed to
+    // 'prod', which only ever declares fewer agents.
+    function gpuScanReposSource(identity, { reposSource, ownership } = {}) {
+        if (reposSource) return reposSource;
+        let observed = ownership;
+        if (!observed) {
+            try { observed = inspect(identity); } catch { return REPOS_SOURCE_PROD; }
+        }
+        const container = observed?.state === 'owned' ? observed.handles?.container : null;
+        try {
+            if (container) return observeContainerReposSource(container);
+            return parseReposSource(env?.[REPOS_SOURCE_ENV]) || REPOS_SOURCE_DEV;
+        } catch {
+            return REPOS_SOURCE_PROD;
+        }
+    }
+
+    function scanDeclaredGpuAgents(identity, scope = {}) {
+        const includeWorkspace = gpuScanReposSource(identity, scope) !== REPOS_SOURCE_PROD;
+        return scanGpuAgents(identity.workspaceRoot, { includeWorkspace });
+    }
+
+    // PLOINKY_REPOS_SOURCE as start, restart and full update apply it: parsed
+    // before any mutation; unset keeps the Box's own source (a new Box takes
+    // 'dev'), and a change replaces the Box with the new environment.
+    function requestedReposSource() {
+        try {
+            return parseReposSource(env?.[REPOS_SOURCE_ENV]);
+        } catch (error) {
+            throw supervisorError(error.message, 'PLOINKY_BOX_ARGUMENT_INVALID');
+        }
     }
 
     // The saved hardware-limits gate (plan §6.1). An environment value is
@@ -753,7 +790,7 @@ export function createBoxSupervisor({
             operation,
             oldContainerId: container.id,
             oldConfiguration: JSON.parse(JSON.stringify(oldConfiguration)),
-            desiredConfiguration: JSON.parse(JSON.stringify({ ...oldConfiguration, hardware: null, gpu: selectSavedGpuWiring(identity, false).desired })),
+            desiredConfiguration: JSON.parse(JSON.stringify({ ...oldConfiguration, hardware: null, gpu: selectSavedGpuWiring(identity, false, { reposSource: oldConfiguration.reposSource }).desired })),
             graphSnapshot: { schema: 1, coreArgv: coreArgv ? [...coreArgv] : [], skillScopeEnv: readGraphSkillScope(identity) || null },
             oldWasRunning,
             oldGraphRunning,
@@ -895,6 +932,15 @@ export function createBoxSupervisor({
                 parseHardwareGateValue(env[HARDWARE_GATE_ENV]);
                 stderr?.write?.(`[ploinky] Note: ${HARDWARE_GATE_ENV} is set; only start, restart and update apply it\n`);
             }
+            // An existing Box keeps its repository source; only start, restart and
+            // update replace it with the requested one.
+            const requestedSource = requestedReposSource();
+            const existingContainer = ownership.handles?.container;
+            if (requestedSource && existingContainer
+                && observeContainerReposSource(existingContainer) !== requestedSource) {
+                stderr?.write?.(`[ploinky] Note: ${REPOS_SOURCE_ENV}=${requestedSource} differs from the running Box; `
+                    + 'only start, restart and update apply it\n');
+            }
             const hardwareState = readHardwareStateClass({
                 identity, gateStore: hardwareGateStore,
             });
@@ -911,7 +957,7 @@ export function createBoxSupervisor({
             // restore it. Only a Box created here takes the saved grant.
             const gpu = ownership.handles?.container
                 ? undefined
-                : selectSavedGpuWiring(identity).desired;
+                : selectSavedGpuWiring(identity, undefined, { ownership }).desired;
             // The source is selected before Box reconciliation so the mount
             // contract can be part of the Box's immutable identity.
             const { selection } = await selectAgentLib({
@@ -1290,6 +1336,8 @@ export function createBoxSupervisor({
             const existing = requiredId === null ? null
                 : observeBoxConfiguration(identity, ownership, repositoryRoot, ownership.engine);
             await assertNoUpdateRecoveryBarrier(identity, ownership);
+            // A start that must reuse an exact existing Box keeps its source.
+            const reposSource = existing ? undefined : requestedReposSource();
             const hardwareGate = existing ? null : selectHardwareGateForOperation(identity, 'start', lock);
             if (!existing) ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'start');
             const hardware = existing ? existing.hardware : hardwareWiringFor(identity, hardwareGate.enabled, ownership);
@@ -1302,7 +1350,7 @@ export function createBoxSupervisor({
                 options.explicitPort,
             );
             const { saved: savedGpuGrant, desired: gpu } = existing
-                ? { saved: null, desired: existing.gpu } : selectSavedGpuWiring(identity, hardwareGate.enabled);
+                ? { saved: null, desired: existing.gpu } : selectSavedGpuWiring(identity, hardwareGate.enabled, { reposSource, ownership });
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -1322,6 +1370,7 @@ export function createBoxSupervisor({
                 routerBinding,
                 gpu,
                 hardware,
+                reposSource,
                 imageRef: options.imageRef || existing?.imageRef || resolveBoxImageReference(env),
                 requireExistingContainerId: requiredId,
                 allowReplacement: requiredId === null,
@@ -1409,6 +1458,7 @@ export function createBoxSupervisor({
     async function runRestartTransaction(coreArgs = ['restart'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             await assertNoUpdateRecoveryBarrier(identity, ownership);
+            const reposSource = requestedReposSource();
             const hardwareGate = selectHardwareGateForOperation(identity, 'restart', lock);
             ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'restart');
             const hardware = hardwareWiringFor(identity, hardwareGate.enabled, ownership);
@@ -1416,7 +1466,7 @@ export function createBoxSupervisor({
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
             const { desired: routerBinding } = selectSavedRouterBinding(identity);
-            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled);
+            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled, { reposSource, ownership });
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -1433,6 +1483,7 @@ export function createBoxSupervisor({
                 routerBinding,
                 gpu,
                 hardware,
+                reposSource,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
                 // Restart is the command that recreates a Box whose data
                 // directory went missing while it ran (N1).
@@ -2168,6 +2219,8 @@ export function createBoxSupervisor({
         const plan = updatePlan(coreArgs, options);
         return lockedMutation(async (identity, lock, ownership) => {
             const barrierWarnings = await assertNoUpdateRecoveryBarrier(identity, ownership);
+            // Only the full form may replace the Box, so only it applies a new repository source.
+            const reposSource = plan.request.kind === 'all' ? requestedReposSource() : undefined;
             // The folder is re-resolved under the lock before anything is settled or changed, as master does: a scope that
             // fails here must not leave a settled gate-on to gate-off transition behind.
             const scope = lockedUpdateScope(identity, plan);
@@ -2181,7 +2234,7 @@ export function createBoxSupervisor({
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const activity = sampleGraphActivity(identity, ownership);
             const unresolvedAdmissions = listUnresolvedAdmissions(updateStore(identity), identity);
-            const context = { identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity, hardwareGate };
+            const context = { identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity, hardwareGate, reposSource };
             // Locks that an interrupted host exclusion refresh left are
             // released, when provably its own, before the in-Box step meets them.
             const exclusionRecovery = recoverHostExclusions({ intent: exclusionsIntent(identity), identity, env });
@@ -2209,12 +2262,12 @@ export function createBoxSupervisor({
         });
     }
 
-    async function runFullUpdate({ identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity, hardwareGate }) {
+    async function runFullUpdate({ identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity, hardwareGate, reposSource }) {
         const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
         const priorSkillScopeEnv = readGraphSkillScope(identity);
         const hardware = hardwareWiringFor(identity, hardwareGate.enabled, ownership);
         const { desired: routerBinding } = selectSavedRouterBinding(identity);
-        const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled);
+        const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity, hardwareGate.enabled, { reposSource, ownership });
         let workspacePloinky;
         try {
             workspacePloinky = await updateWorkspacePloinky({
@@ -2256,6 +2309,7 @@ export function createBoxSupervisor({
             routerBinding,
             gpu,
             hardware,
+            reposSource,
             imageRef: plan.imageRef,
             platform,
             env,
@@ -2495,7 +2549,7 @@ export function createBoxSupervisor({
             : selectSavedRouterBinding(identity).desired;
         const gpu = ownership.handles?.container
             ? undefined
-            : selectSavedGpuWiring(identity, hardwareGate.enabled).desired;
+            : selectSavedGpuWiring(identity, hardwareGate.enabled, { ownership }).desired;
         const { selection } = await selectAgentLib({
             workspaceRoot: identity.workspaceRoot,
             branchPolicy: null,
@@ -2821,7 +2875,7 @@ export function createBoxSupervisor({
                     routerBinding,
                     // Bind changes only the publication: an existing Box keeps
                     // its GPU wiring, and only a new Box takes the saved grant.
-                    gpu: container ? undefined : selectSavedGpuWiring(identity).desired,
+                    gpu: container ? undefined : selectSavedGpuWiring(identity, undefined, { ownership }).desired,
                     // Likewise the hardware-limits wiring follows the saved gate.
                     hardware: container ? undefined : savedHardwareWiring(identity, ownership, lock).hardware,
                     imageRef,
@@ -3038,7 +3092,7 @@ export function createBoxSupervisor({
         const untouched = Object.freeze({ gpuReapplied: null, generation: null });
         let selected;
         try {
-            selected = selectSavedGpuWiring(identity);
+            selected = selectSavedGpuWiring(identity, undefined, { ownership: prepared?.ownership });
         } catch (error) {
             stderr?.write?.(`[ploinky] Could not re-check the GPU agents: ${error.message}\n`);
             return untouched;
@@ -3339,7 +3393,7 @@ export function createBoxSupervisor({
                 denied: (saved?.denied || []).filter((agent) => !requested.includes(agent)),
                 workspaceDenied: requested.length ? saved?.workspaceDenied === true : false,
             });
-            const declared = scanGpuAgents(identity.workspaceRoot);
+            const declared = scanDeclaredGpuAgents(identity, { ownership });
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
                 ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
@@ -3374,7 +3428,7 @@ export function createBoxSupervisor({
                 denied: saved?.denied || [],
                 workspaceDenied: true,
             });
-            const declared = scanGpuAgents(identity.workspaceRoot);
+            const declared = scanDeclaredGpuAgents(identity, { ownership });
             const gpu = resolveDesiredGpuWiring(identity, next, declared, {
                 discover: discoverGpuDevices,
                 ...(discoverGpuMpsTools ? { discoverMps: discoverGpuMpsTools } : {}),
@@ -3442,7 +3496,7 @@ export function createBoxSupervisor({
             host = Object.freeze({ available: false, reason: error.message,
                 ...(vulkanFallbackOf(error) ? { vulkanReason: vulkanFallbackOf(error) } : {}) });
         }
-        const declared = scanGpuAgents(identity.workspaceRoot);
+        const declared = scanDeclaredGpuAgents(identity, { ownership });
         const access = effectiveGpuAccess(saved, declared);
         const desired = resolveDesiredGpuWiring(identity, saved, declared, {
             discover: discoverGpuDevices,

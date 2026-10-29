@@ -2,16 +2,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { workspaceRepositoryPath } from './repositorySource.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from './config.js';
+import { workspaceCheckoutsAllowed } from './reposSource.mjs';
 
 // Recommendations use the workspace checkout before a managed repository.
 // This is discovery only: never clone, pull, or modify either source here.
+// With PLOINKY_REPOS_SOURCE=prod only the managed repository is considered.
 export function resolveSkillRepositorySource(name, url, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name || '')) return { source: url, origin: 'remote' };
     const workspace = fs.realpathSync(workspaceRoot);
-    for (const [origin, candidate] of [
-        ['workspace', workspaceRepositoryPath(name, { workspaceRoot: workspace, url }) || path.join(workspace, name)],
+    const candidates = [
+        ...(workspaceCheckoutsAllowed()
+            ? [['workspace', workspaceRepositoryPath(name, { workspaceRoot: workspace, url }) || path.join(workspace, name)]]
+            : []),
         ['installed', path.join(workspace, '.ploinky', 'repos', name)],
-    ]) {
+    ];
+    for (const [origin, candidate] of candidates) {
         try {
             const source = fs.realpathSync(candidate);
             if (!source.startsWith(`${workspace}${path.sep}`) || !fs.statSync(source).isDirectory()) continue;
@@ -61,6 +66,7 @@ function hasAgentLibDescriptors(directory) {
 }
 
 export function listWorkspaceSkillRepositories({ workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
+    if (!workspaceCheckoutsAllowed()) return [];
     const workspace = fs.realpathSync(workspaceRoot);
     const repositories = [];
     for (const entry of fs.readdirSync(workspace, { withFileTypes: true })) {

@@ -360,7 +360,7 @@ async function run() {
                     const registry = readJson(agentsFile);
                     const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: argument.staticAgent, registry });
                     const staged = ensureGraphNodesEnabled(graph, registry, {
-                        additionalNodes: resolveExtraEnabledRuntimeNodes(graph, registry),
+                        additionalNodes: resolveExtraEnabledRuntimeNodes(graph, registry).nodes,
                         logLine: (line) => lines.push(line),
                     });
                     const published = {};

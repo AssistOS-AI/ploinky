@@ -26,14 +26,14 @@ function checkout(root, name, origin) {
     return directory;
 }
 
-function resolve(root, alias) {
+function resolve(root, alias, extraEnv = {}) {
     return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
         const source = await import(${JSON.stringify(sourceUrl)});
         const { findAgent } = await import(${JSON.stringify(utilsUrl)});
         let result;
         try { result = findAgent('explorer'); } catch (error) { result = { error: error.message }; }
         console.log(JSON.stringify({ owner: source.resolveAgentRepositoryName(source.resolveAgentRepositoryPath(${JSON.stringify(alias)}) + '/explorer'), names: source.listAgentRepositoryNames(), path: source.resolveAgentRepositoryPath(${JSON.stringify(alias)}), result }));
-    `], { encoding: 'utf8', cwd: root, env: { ...process.env, PLOINKY_WORKSPACE_ROOT: root } }));
+    `], { encoding: 'utf8', cwd: root, env: { ...process.env, PLOINKY_REPOS_SOURCE: '', PLOINKY_WORKSPACE_ROOT: root, ...extraEnv } }));
 }
 
 test('registered alias uses the workspace origin and does not duplicate the agent', t => {
@@ -152,4 +152,41 @@ test('empty repository lists require no managed cache directory', t => {
     const root = fixture(t);
     fs.rmdirSync(path.join(root, '.ploinky/repos'));
     assert.deepEqual(query(root, '({ installed: repos.getInstalledRepos(), active: repos.getActiveRepos() })'), { installed: [], active: [] });
+});
+
+test('PLOINKY_REPOS_SOURCE=prod ignores matching workspace checkouts', t => {
+    const root = fixture(t);
+    const installed = checkout(root, '.ploinky/repos/AchillesIDE');
+    checkout(root, 'AssistOSExplorer', 'git@github.com:AssistOS-AI/AssistOSExplorer.git');
+    const result = resolve(root, 'AchillesIDE', { PLOINKY_REPOS_SOURCE: 'prod' });
+    assert.deepEqual(result.names, ['AchillesIDE']);
+    assert.equal(result.path, installed);
+    assert.equal(result.result.manifestPath, path.join(installed, 'explorer/manifest.json'));
+    const workspace = resolve(root, 'AchillesIDE', { PLOINKY_REPOS_SOURCE: 'dev' });
+    assert.equal(workspace.path, path.join(root, 'AssistOSExplorer'));
+});
+
+test('PLOINKY_REPOS_SOURCE rejects unsupported values instead of meaning dev', async () => {
+    const { parseReposSource, activeReposSource } = await import('../../cli/utils/reposSource.mjs');
+    assert.equal(parseReposSource(undefined), undefined);
+    assert.equal(parseReposSource('  '), undefined);
+    assert.equal(parseReposSource('prod'), 'prod');
+    assert.throws(() => parseReposSource('installed'), /PLOINKY_REPOS_SOURCE must be 'dev' or 'prod'/);
+    assert.equal(activeReposSource({}), 'dev');
+    assert.throws(() => parseReposSource('Prod'), /PLOINKY_REPOS_SOURCE must be/);
+    assert.throws(() => activeReposSource({ PLOINKY_REPOS_SOURCE: 'production' }), /PLOINKY_REPOS_SOURCE must be/);
+});
+
+test('the agent-writable workspace .env never selects the repository source for the Router', t => {
+    const root = fixture(t);
+    fs.writeFileSync(path.join(root, '.env'), 'PLOINKY_REPOS_SOURCE=prod\nREPOS_SOURCE_FIXTURE=kept\n');
+    const workspaceUtilUrl = new URL('../../cli/commands/workspaceUtil.js', import.meta.url).href;
+    const env = { ...process.env, PLOINKY_WORKSPACE_ROOT: root };
+    delete env.PLOINKY_REPOS_SOURCE;
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+        const { buildRouterEnv } = await import(${JSON.stringify(workspaceUtilUrl)});
+        const routerEnv = buildRouterEnv();
+        console.log(JSON.stringify({ source: routerEnv.PLOINKY_REPOS_SOURCE ?? null, kept: routerEnv.REPOS_SOURCE_FIXTURE ?? null }));
+    `], { encoding: 'utf8', cwd: root, env }).trim().split('\n').at(-1));
+    assert.deepEqual(result, { source: null, kept: 'kept' });
 });

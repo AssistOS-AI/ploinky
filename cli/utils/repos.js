@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { workspaceRepositories } from './repositorySource.mjs';
+import { workspaceCheckoutsAllowed } from './reposSource.mjs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { listWorkspaceSkillRepositories, resolveSkillRepositorySource } from './skillRepositorySource.js';
@@ -974,7 +975,9 @@ export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback 
 export function listRepositorySources() {
     const registered = { ...PREDEFINED_REPOS, ...getRepoSources() };
     const names = new Set([...Object.keys(registered), ...getInstalledRepos(), ...listAgentRepositoryNames(),
-        ...workspaceRepositories(PLOINKY_WORKSPACE_ROOT, candidate => fs.existsSync(path.join(candidate, '.git'))).map(entry => entry.name)]);
+        ...(workspaceCheckoutsAllowed()
+            ? workspaceRepositories(PLOINKY_WORKSPACE_ROOT, candidate => fs.existsSync(path.join(candidate, '.git'))).map(entry => entry.name)
+            : [])]);
     const skills = new Map(getSkillRepositoryRecommendations().map(repo => [repo.name, repo]));
     return [...names].sort().map(name => {
         const url = registered[name]?.url || '';

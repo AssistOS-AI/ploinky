@@ -145,9 +145,14 @@ function resolveWorkspaceDependencyGraph({
     onCycle = null,
     // Opt-in: called for a no-wait dependency that cannot be resolved. The
     // dependency and everything only it reached leave the graph and the
-    // parent still resolves. Without it every unresolvable dependency fails
-    // the whole graph, as `start` requires.
+    // parent still resolves. Without a handler every unresolvable dependency
+    // fails the whole graph.
     onUnresolvedNoWait = null,
+    // Opt-in: the same tolerance for every dependency, blocking or no-wait.
+    // `start` and `restart` pass it so one missing source is reported and
+    // skipped instead of stopping the whole graph. The static agent itself is
+    // still required.
+    onUnresolvedDependency = null,
 } = {}) {
     if (!staticAgentRef || typeof staticAgentRef !== 'string') {
         throw new Error('Missing static agent reference.');
@@ -272,7 +277,8 @@ function resolveWorkspaceDependencyGraph({
         const nextStack = [...stack, nodeId];
         const enableList = manifestEnableEntries(node.manifest, node.profile);
         for (const rawDependency of enableList) {
-            const knownNodeIds = typeof onUnresolvedNoWait === 'function' ? new Set(nodes.keys()) : null;
+            const knownNodeIds = (typeof onUnresolvedNoWait === 'function' || typeof onUnresolvedDependency === 'function')
+                ? new Set(nodes.keys()) : null;
             try {
                 const parsedDependency = parseEnableDirective(rawDependency);
                 if (!parsedDependency) continue;
@@ -322,8 +328,8 @@ function resolveWorkspaceDependencyGraph({
                     else console.error(warning);
                     continue;
                 }
-                let tolerated = false;
-                if (knownNodeIds) {
+                let tolerated = typeof onUnresolvedDependency === 'function' && knownNodeIds !== null;
+                if (!tolerated && knownNodeIds) {
                     try { tolerated = parseEnableDirective(rawDependency)?.noWait === true; } catch (_) { /* malformed entries stay blocking */ }
                 }
                 if (tolerated) {
@@ -336,7 +342,9 @@ function resolveWorkspaceDependencyGraph({
                     for (const remaining of nodes.values()) {
                         for (const nodeKey of dropped) remaining.dependents.delete(nodeKey);
                     }
-                    onUnresolvedNoWait({ rawDependency, parentRef: node.agentRef, message });
+                    const report = { rawDependency, parentRef: node.agentRef, message };
+                    if (typeof onUnresolvedDependency === 'function') onUnresolvedDependency(report);
+                    else onUnresolvedNoWait(report);
                     continue;
                 }
                 throw new Error(`[manifest enable] Failed to resolve dependency '${rawDependency}' for '${node.agentRef}': ${message}`);
