@@ -11,7 +11,9 @@ import { discoverExecutionTargets } from '../../cli/server/executionTarget/disco
 import {
     BOX_TARGETS_DIRECTORY,
     HELPER_LAUNCH_FILE,
+    HELPER_SECRET_FILE,
     PROVISIONING_ERROR_CODES as E,
+    ROUTER_SECRET_FILE,
     TARGET_CONTROL_PATH,
     TARGET_HELPER_EXECUTABLE,
     TARGET_JOURNAL_PATH,
@@ -105,6 +107,27 @@ function provision(env, helper, overrides = {}) {
 }
 
 const mode = (target) => fs.lstatSync(target).mode & 0o777;
+const inside = (parent, child) => {
+    const relative = path.relative(parent, child);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+};
+// The shared helper/Ploinky literal vector: incarnation 16 x 0x02, secret 32 x 0x11.
+const VECTOR_TEXT = 'version=1\nhelperIncarnation=AgICAgICAgICAgICAgICAg\nkid=hti1.AgICAgICAgICAgICAgICAg\nsecret=ERERERERERERERERERERERERERERERERERERERERERE\n';
+// Records every drawn secret (a copy) and the buffer handed over, which provisioning must zero.
+function secretSpy() {
+    const drawn = [];
+    const handed = [];
+    const draw = (n) => {
+        const bytes = crypto.randomBytes(n);
+        drawn.push(Buffer.from(bytes));
+        handed.push(bytes);
+        return bytes;
+    };
+    return { drawn, handed, draw };
+}
+function encodings(secret) {
+    return [secret.toString('base64url'), secret.toString('base64'), secret.toString('hex'), secret.toString('hex').toUpperCase()];
+}
 
 test('P3 ordinary agents are untouched: no executionTarget key plans nothing, whatever else the manifest declares', () => {
     for (const manifest of [
@@ -396,4 +419,187 @@ test('P3 an identity-preserving targeted restart of an execution target refuses 
     const lockAt = body.indexOf('return withNetworkLifecycleLock(');
     assert.ok(refuseAt > 0 && refuseAt < lockAt && refuseAt < drainAt, 'refusal precedes the lock and every drain');
     assert.match(body.slice(0, refuseAt), /if \(targetedRestart && planExecutionTargetLaunch\(\{ manifest,/);
+});
+
+test('P4 each helper start gets one 32-byte ticket secret in exactly two 0600 copies, the Router copy outside every bind source', (t) => {
+    const env = workspace(t);
+    const spy = secretSpy();
+    const result = provision(env, fakeHelper(), { secretRandomBytes: spy.draw });
+    assert.equal(spy.drawn.length, 1);
+    const secret = spy.drawn[0];
+    assert.equal(secret.length, 32);
+    assert.ok(spy.handed[0].equals(Buffer.alloc(32)), 'the drawn buffer is zeroed once written');
+
+    const key = instanceKey({ principal: PRINCIPAL, containerName: 'ploinky_rwrepo_rwtarget_abc', instanceId: 'inst-1', enableGeneration: 'egen-1' });
+    const instance = instancePaths(env.boxTmpRoot, key);
+    const control = result.binds[2].source;
+    assert.equal(instance.secret, path.join(control, HELPER_SECRET_FILE));
+    assert.equal(instance.routerSecret, path.join(path.dirname(control), ROUTER_SECRET_FILE));
+    const expected = `version=1\nhelperIncarnation=${result.helperIncarnation}\nkid=hti1.${result.helperIncarnation}\nsecret=${secret.toString('base64url')}\n`;
+    for (const file of [instance.secret, instance.routerSecret]) {
+        assert.equal(mode(file), 0o600, file);
+        assert.ok(fs.lstatSync(file).isFile());
+        assert.equal(fs.readFileSync(file, 'utf8'), expected, file);
+    }
+    // The launch file keeps its exact three lines: the secret never passes through launcher variables.
+    assert.equal(fs.readFileSync(instance.launch, 'utf8'),
+        `version=1\njournalStoreIdentity=${result.journalStoreIdentity}\nhelperIncarnation=${result.helperIncarnation}\n`);
+    // The Router copy is never under a bind source; the helper copy is only in the bound control directory.
+    for (const bind of result.binds) assert.equal(inside(bind.source, instance.routerSecret), false, bind.source);
+    assert.deepEqual(result.binds.filter((bind) => inside(bind.source, instance.secret)).map((bind) => bind.target), [TARGET_CONTROL_PATH]);
+    // Neither the return value nor the controller-private record carries the secret in any encoding.
+    assert.deepEqual(Object.keys(result).sort(), ['binds', 'helperIncarnation', 'instanceKey', 'journalStoreIdentity']);
+    const returned = JSON.stringify(result);
+    const recordText = fs.readFileSync(targetStatePaths(env.controllerStateDir, PRINCIPAL).record, 'utf8');
+    for (const text of encodings(secret)) {
+        assert.equal(returned.includes(text), false);
+        assert.equal(recordText.includes(text), false);
+    }
+    assert.deepEqual(Object.keys(JSON.parse(recordText).current).sort(),
+        ['containerName', 'enableGeneration', 'helperIncarnation', 'instanceId', 'instanceKey', 'issuedAtMs']);
+});
+
+test('P4 both secret copies match the shared literal vector byte for byte', (t) => {
+    const env = workspace(t);
+    const result = provision(env, fakeHelper(), { randomBytes: () => Buffer.alloc(16, 2), secretRandomBytes: () => Buffer.alloc(32, 0x11) });
+    assert.equal(result.helperIncarnation, 'AgICAgICAgICAgICAgICAg');
+    const instance = instancePaths(env.boxTmpRoot, result.instanceKey);
+    assert.deepEqual(fs.readFileSync(instance.secret), Buffer.from(VECTOR_TEXT, 'utf8'));
+    assert.deepEqual(fs.readFileSync(instance.routerSecret), Buffer.from(VECTOR_TEXT, 'utf8'));
+});
+
+test('P4 a secret draw that is not exactly 32 bytes refuses before any instance directory or record exists', (t) => {
+    const env = workspace(t);
+    for (const bad of [() => Buffer.alloc(31, 1), () => Buffer.alloc(33, 1), () => Buffer.alloc(0), () => 'x'.repeat(32),
+        () => new Uint8Array(32), () => null]) {
+        assert.equal(code(() => provision(env, fakeHelper(), { secretRandomBytes: bad })), E.stateInvalid);
+        assert.equal(fs.existsSync(path.join(env.boxTmpRoot, BOX_TARGETS_DIRECTORY)), false);
+        assert.equal(readProvisioningRecord({ controllerStateDir: env.controllerStateDir, principal: PRINCIPAL }), null);
+    }
+    // A reused incarnation refuses before any secret is drawn.
+    const fixed = () => Buffer.alloc(16, 9);
+    provision(env, fakeHelper(), { randomBytes: fixed });
+    let draws = 0;
+    assert.equal(code(() => provision(env, fakeHelper(), { instanceId: 'inst-2', randomBytes: fixed,
+        secretRandomBytes: (n) => { draws += 1; return crypto.randomBytes(n); } })), E.incarnationReused);
+    assert.equal(draws, 0);
+});
+
+test('P4 a set-aside left-over instance keeps no launch file and no secret copy', (t) => {
+    const env = workspace(t);
+    const key = instanceKey({ principal: PRINCIPAL, containerName: 'ploinky_rwrepo_rwtarget_abc', instanceId: 'inst-1', enableGeneration: 'egen-1' });
+    const left = instancePaths(env.boxTmpRoot, key);
+    fs.mkdirSync(left.mailbox, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(left.control, { mode: 0o700 });
+    fs.writeFileSync(path.join(left.mailbox, 'stale.sock'), '');
+    for (const file of [left.launch, left.secret, left.routerSecret]) fs.writeFileSync(file, 'old secret material\n', { mode: 0o600 });
+    const spy = secretSpy();
+    provision(env, fakeHelper(), { secretRandomBytes: spy.draw });
+    const parked = fs.readdirSync(left.parent).filter((name) => name.startsWith(`${key}.stale-`));
+    assert.equal(parked.length, 1);
+    const stale = path.join(left.parent, parked[0]);
+    assert.deepEqual(fs.readdirSync(path.join(stale, 'mailbox')), ['stale.sock']);
+    assert.deepEqual(fs.readdirSync(path.join(stale, 'control')), []);
+    assert.deepEqual(fs.readdirSync(stale).sort(), ['control', 'mailbox']);
+    // The new instance has fresh copies.
+    assert.ok(fs.readFileSync(left.routerSecret, 'utf8').includes(spy.drawn[0].toString('base64url')));
+    assert.ok(fs.readFileSync(left.secret, 'utf8').includes(spy.drawn[0].toString('base64url')));
+});
+
+test('P4 a left-over whose secret path cannot be removed, or whose control path is a symlink, refuses before the set-aside', (t) => {
+    const env = workspace(t);
+    const key = instanceKey({ principal: PRINCIPAL, containerName: 'ploinky_rwrepo_rwtarget_abc', instanceId: 'inst-1', enableGeneration: 'egen-1' });
+    const left = instancePaths(env.boxTmpRoot, key);
+    fs.mkdirSync(left.control, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(left.secret);
+    assert.equal(code(() => provision(env, fakeHelper())), E.stateInvalid);
+    assert.deepEqual(fs.readdirSync(left.parent), [key], 'nothing set aside');
+    assert.equal(readProvisioningRecord({ controllerStateDir: env.controllerStateDir, principal: PRINCIPAL }), null);
+
+    fs.rmSync(left.control, { recursive: true });
+    const elsewhere = path.join(env.root, 'elsewhere');
+    fs.mkdirSync(elsewhere);
+    fs.writeFileSync(path.join(elsewhere, HELPER_LAUNCH_FILE), 'keep');
+    fs.writeFileSync(path.join(elsewhere, HELPER_SECRET_FILE), 'keep');
+    fs.symlinkSync(elsewhere, left.control);
+    assert.equal(code(() => provision(env, fakeHelper())), E.stateInvalid);
+    assert.deepEqual(fs.readdirSync(elsewhere).sort(), [HELPER_LAUNCH_FILE, HELPER_SECRET_FILE].sort(), 'never unlinks through a symlink');
+    assert.deepEqual(fs.readdirSync(left.parent), [key]);
+});
+
+test('P4 adopting the provisioned instance draws no secret and leaves both copies and the record byte-identical', (t) => {
+    const env = workspace(t);
+    const helper = fakeHelper();
+    const first = provision(env, helper);
+    const instance = instancePaths(env.boxTmpRoot, first.instanceKey);
+    const recordPath = targetStatePaths(env.controllerStateDir, PRINCIPAL).record;
+    const before = [instance.secret, instance.routerSecret, instance.launch, recordPath].map((file) => fs.readFileSync(file));
+    const noDraw = () => assert.fail('no secret is drawn on adoption');
+    provision(env, helper, { secretRandomBytes: noDraw });
+    provision(env, { runner: () => assert.fail('no journal-init on adoption') }, { adoptOnly: true, secretRandomBytes: noDraw });
+    assert.deepEqual([instance.secret, instance.routerSecret, instance.launch, recordPath].map((file) => fs.readFileSync(file)), before);
+    // A helper that already consumed its copy does not get a new one from a re-derivation.
+    fs.rmSync(instance.secret);
+    provision(env, helper, { secretRandomBytes: noDraw });
+    assert.equal(fs.existsSync(instance.secret), false);
+});
+
+test('P4 a new incarnation changes secret and kid and retires the previous Router copy; the predecessor dirs stay', (t) => {
+    const env = workspace(t);
+    const helper = fakeHelper();
+    const spy = secretSpy();
+    const first = provision(env, helper, { secretRandomBytes: spy.draw });
+    const second = provision(env, helper, { containerName: 'ploinky_rwrepo_rwtarget_candidate', instanceId: 'inst-2', enableGeneration: 'egen-2',
+        secretRandomBytes: spy.draw });
+    assert.equal(spy.drawn.length, 2);
+    assert.equal(spy.drawn[0].equals(spy.drawn[1]), false);
+    const old = instancePaths(env.boxTmpRoot, first.instanceKey);
+    const now = instancePaths(env.boxTmpRoot, second.instanceKey);
+    assert.equal(fs.existsSync(old.routerSecret), false, 'the superseded Router copy is retired');
+    assert.ok(fs.existsSync(old.mailbox) && fs.existsSync(old.control), 'the predecessor may still be running');
+    const text = fs.readFileSync(now.routerSecret, 'utf8');
+    assert.ok(text.includes(`kid=hti1.${second.helperIncarnation}\n`) && text.includes(spy.drawn[1].toString('base64url')));
+    assert.notEqual(first.helperIncarnation, second.helperIncarnation);
+});
+
+test('P4 a lost instance directory of the same identity is re-provisioned without retiring the fresh copy', (t) => {
+    const env = workspace(t);
+    const helper = fakeHelper();
+    const first = provision(env, helper);
+    const instance = instancePaths(env.boxTmpRoot, first.instanceKey);
+    fs.rmSync(instance.root, { recursive: true });
+    const spy = secretSpy();
+    const again = provision(env, helper, { secretRandomBytes: spy.draw });
+    assert.equal(again.instanceKey, first.instanceKey);
+    assert.notEqual(again.helperIncarnation, first.helperIncarnation);
+    assert.equal(mode(instance.routerSecret), 0o600);
+    assert.ok(fs.readFileSync(instance.routerSecret, 'utf8').includes(`kid=hti1.${again.helperIncarnation}\nsecret=${spy.drawn[0].toString('base64url')}\n`));
+});
+
+test('P4 retiring the previous Router copy is best effort: an unremovable copy or an unreadable root never fails the start', (t) => {
+    const env = workspace(t);
+    const helper = fakeHelper();
+    const first = provision(env, helper);
+    const old = instancePaths(env.boxTmpRoot, first.instanceKey);
+    // An unlink that fails with something other than ENOENT (EISDIR here).
+    fs.rmSync(old.routerSecret);
+    fs.mkdirSync(old.routerSecret);
+    const second = provision(env, helper, { containerName: 'ploinky_rwrepo_rwtarget_b', instanceId: 'inst-2', enableGeneration: 'egen-2' });
+    assert.equal(readProvisioningRecord({ controllerStateDir: env.controllerStateDir, principal: PRINCIPAL }).current.helperIncarnation,
+        second.helperIncarnation);
+    assert.ok(fs.lstatSync(old.routerSecret).isDirectory(), 'left in place');
+    assert.ok(fs.existsSync(instancePaths(env.boxTmpRoot, second.instanceKey).routerSecret));
+    // An lstat of the previous root that throws (not ENOENT).
+    const prev = instancePaths(env.boxTmpRoot, second.instanceKey);
+    const failingFs = {
+        ...fs,
+        lstatSync: (target, ...rest) => {
+            if (target === prev.root) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+            return fs.lstatSync(target, ...rest);
+        },
+    };
+    const third = provision(env, helper, { containerName: 'ploinky_rwrepo_rwtarget_c', instanceId: 'inst-3', enableGeneration: 'egen-3', fsApi: failingFs });
+    assert.equal(readProvisioningRecord({ controllerStateDir: env.controllerStateDir, principal: PRINCIPAL }).current.helperIncarnation,
+        third.helperIncarnation);
+    assert.ok(fs.existsSync(prev.routerSecret), 'not retired when its root cannot be inspected');
 });

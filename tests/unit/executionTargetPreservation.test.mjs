@@ -30,6 +30,7 @@ const NEW_MODULES = Object.freeze([
     'cli/sandbox/legacyAgentAdoptionGuard.mjs',
     'cli/server/executionTarget/provisioning.mjs',
     'cli/server/executionTarget/liveScope.mjs',
+    'cli/server/executionTarget/helperTicketSecrets.mjs',
 ]);
 const NEW_TESTS = Object.freeze([
     'tests/unit/executionTargetDeclaration.test.mjs',
@@ -43,6 +44,7 @@ const NEW_TESTS = Object.freeze([
     'tests/unit/legacyAgentMaskCompleteness.test.mjs',
     'tests/unit/executionTargetProvisioning.test.mjs',
     'tests/unit/executionTargetLiveScope.test.mjs',
+    'tests/unit/executionTargetHelperTicketSecrets.test.mjs',
 ]);
 // The pure guard names the legacy markers only to detect them.
 const GUARD = 'cli/sandbox/legacyAgentAdoptionGuard.mjs';

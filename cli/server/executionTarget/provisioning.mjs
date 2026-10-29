@@ -10,7 +10,11 @@
 //     filesystem on which AF_UNIX sockets work, never the agent's fuse-overlayfs root and never the workspace bind);
 //   - mints a fresh helper incarnation for this helper start, refuses one already recorded, and hands it to the
 //     target's launcher only through a single-use launch file in the control directory (never env or argv of the
-//     container, so a reused or restarted container can never present it again).
+//     container, so a reused or restarted container can never present it again);
+//   - mints one fresh 32-byte HS256 ticket secret per helper incarnation with exactly two holders: the helper (a separate
+//     single-use `control/helper-secret` file it reads and unlinks itself) and a controller-private Router copy
+//     (`router-ticket-secret` in the instance root on the Box tmpfs, a sibling of the bound directories and never itself
+//     a bind source). Neither the return value nor the record carries it; a new incarnation retires the previous copy.
 // The binds it returns are the only new mounts of the target; they are rendered by the caller after the
 // controller-state guards. Their sources are exactly the directories created here (asserted again before return).
 //
@@ -37,6 +41,12 @@ export const TARGET_CONTROL_PATH = `${TARGET_RUNTIME_ROOT}/control`;
 // The fixed helper path inside every target image; a declaration cannot move it.
 export const TARGET_HELPER_EXECUTABLE = '/usr/libexec/ploinky-target/rw-target-helper';
 export const HELPER_LAUNCH_FILE = 'helper-launch';
+// Per-incarnation ticket secret: the helper's single-use copy (in the bound control directory) and the Router's copy
+// (in the unbound instance root). Both hold identical text; see ticketSecretFilePrefix.
+export const HELPER_SECRET_FILE = 'helper-secret';
+export const ROUTER_SECRET_FILE = 'router-ticket-secret';
+export const TICKET_KID_PREFIX = 'hti1.';
+export const TICKET_SECRET_BYTES = 32;
 export const RECORD_FILE = 'target.json';
 export const JOURNAL_ROOT_DIRECTORY = 'journal-root';
 // Directory names below the controller state directory and below the Box tmpfs.
@@ -112,6 +122,8 @@ export function instancePaths(boxTmpRoot, key) {
         mailbox: path.join(root, 'mailbox'),
         control: path.join(root, 'control'),
         launch: path.join(root, 'control', HELPER_LAUNCH_FILE),
+        secret: path.join(root, 'control', HELPER_SECRET_FILE),
+        routerSecret: path.join(root, ROUTER_SECRET_FILE),
     });
 }
 
@@ -284,6 +296,61 @@ function launchFileText(journalStoreIdentity, helperIncarnation) {
     return `version=1\njournalStoreIdentity=${journalStoreIdentity}\nhelperIncarnation=${helperIncarnation}\n`;
 }
 
+/** Key id of one helper incarnation's ticket secret. */
+export function ticketKid(helperIncarnation) {
+    return `${TICKET_KID_PREFIX}${helperIncarnation}`;
+}
+
+/** The fixed header of a v1 ticket-secret file of one incarnation; the canonical base64url secret and `\n` follow. */
+export function ticketSecretFilePrefix(helperIncarnation) {
+    return `version=1\nhelperIncarnation=${helperIncarnation}\nkid=${ticketKid(helperIncarnation)}\nsecret=`;
+}
+
+function ticketSecretFileBytes(helperIncarnation, secret) {
+    return Buffer.from(`${ticketSecretFilePrefix(helperIncarnation)}${secret.toString('base64url')}\n`, 'utf8');
+}
+
+function unlinkIfPresent(fsApi, target) {
+    try {
+        fsApi.unlinkSync(target);
+    } catch (error) {
+        if (error?.code !== 'ENOENT') refuse('an execution-target secret file could not be removed', E.stateInvalid);
+    }
+}
+
+// A left-over instance directory is set aside, never reused. It must not carry a launch file or either secret copy
+// into `.stale-*`: remove them first, and only through real directories (a symlinked root or control directory is
+// never traversed; a non-directory root holds nothing to scrub and is renamed as it is).
+function scrubLeftoverInstance(fsApi, instance) {
+    const root = lstatOrNull(fsApi, instance.root);
+    if (!root || root.isSymbolicLink() || !root.isDirectory()) return;
+    unlinkIfPresent(fsApi, instance.routerSecret);
+    const control = lstatOrNull(fsApi, instance.control);
+    if (control) {
+        if (control.isSymbolicLink() || !control.isDirectory()) {
+            refuse('a left-over execution-target control path is not a real directory', E.stateInvalid);
+        }
+        unlinkIfPresent(fsApi, instance.launch);
+        unlinkIfPresent(fsApi, instance.secret);
+    }
+}
+
+// After a new incarnation is recorded, the previous instance's Router copy is retired (the previous helper holds its key
+// only in memory). Only a real previous instance directory other than the new one is touched. Best effort: the record
+// already names the new incarnation, so the provider refuses the previous copy whether or not it is removed, and a
+// failure here never fails the start.
+function retireRouterSecret(fsApi, boxTmpRoot, previousKey, currentKey) {
+    try {
+        if (!previousKey || previousKey === currentKey) return;
+        const previous = instancePaths(boxTmpRoot, previousKey);
+        const root = lstatOrNull(fsApi, previous.root);
+        if (!root || root.isSymbolicLink() || !root.isDirectory()) return;
+        unlinkIfPresent(fsApi, previous.routerSecret);
+    } catch (_) {
+        // The superseded copy stays inert on the private Box tmpfs until the Box restarts.
+    }
+}
+
 function bindsFor(paths, instance) {
     return Object.freeze([
         Object.freeze({ source: instance.mailbox, target: TARGET_MAILBOX_PATH }),
@@ -299,9 +366,11 @@ function bindsFor(paths, instance) {
  * Inputs: `plan` from planExecutionTargetLaunch; `principal` (`agent:repo/agent`); the exact `containerName`,
  * `instanceId` and `enableGeneration` of the instance being created; `image` (exact target image reference);
  * `controllerStateDir` (the workspace `.ploinky/data`); `boxTmpRoot` (the Box tmpfs); `runJournalInit(args)` which
- * runs the container runtime with `journalInitRunArgs(...)` and returns `{status, stdout, error}`.
+ * runs the container runtime with `journalInitRunArgs(...)` and returns `{status, stdout, error}`. `secretRandomBytes(n)`
+ * draws the ticket secret (separate from the incarnation's `randomBytes`); it must return a fresh Buffer, which
+ * is zeroed once both copies are written.
  *
- * Returns `{binds, helperIncarnation, journalStoreIdentity, instanceKey}`.
+ * Returns `{binds, helperIncarnation, journalStoreIdentity, instanceKey}` (never the ticket secret).
  */
 export function provisionExecutionTarget({
     plan,
@@ -316,6 +385,7 @@ export function provisionExecutionTarget({
     runJournalInit,
     fsApi = fs,
     randomBytes = crypto.randomBytes,
+    secretRandomBytes = crypto.randomBytes,
     clock = Date.now,
     euid = typeof process.geteuid === 'function' ? process.geteuid() : null,
 } = {}) {
@@ -393,22 +463,38 @@ export function provisionExecutionTarget({
     const helperIncarnation = Buffer.from(randomBytes(16)).toString('base64url');
     if (!isId(helperIncarnation)) refuse('helper incarnation minting failed', E.stateInvalid);
     if (history.includes(helperIncarnation)) refuse('a helper incarnation was minted twice', E.incarnationReused);
-
-    // 4. Per-instance mailbox and control directories on the Box tmpfs. A directory left by an earlier attempt of the
-    //    same instance identity is set aside (never reused, never deleted here).
-    existingDirectory(fsApi, path.resolve(boxTmpRoot));
-    privateDirectory(fsApi, instance.parent, euid);
-    if (lstatOrNull(fsApi, instance.root)) {
-        fsApi.renameSync(instance.root, `${instance.root}.stale-${crypto.randomBytes(6).toString('hex')}`);
+    // 3b. A fresh ticket secret for exactly this incarnation, zeroed in memory once both copies are written.
+    const secret = secretRandomBytes(TICKET_SECRET_BYTES);
+    if (!Buffer.isBuffer(secret) || secret.length !== TICKET_SECRET_BYTES) refuse('helper ticket secret minting failed', E.stateInvalid);
+    let secretFile = null;
+    try {
+        // 4. Per-instance mailbox and control directories on the Box tmpfs. A directory left by an earlier attempt of
+        //    the same instance identity is scrubbed of its launch and secret files and set aside (never reused, never
+        //    deleted here).
+        existingDirectory(fsApi, path.resolve(boxTmpRoot));
+        privateDirectory(fsApi, instance.parent, euid);
+        if (lstatOrNull(fsApi, instance.root)) {
+            scrubLeftoverInstance(fsApi, instance);
+            fsApi.renameSync(instance.root, `${instance.root}.stale-${crypto.randomBytes(6).toString('hex')}`);
+        }
+        for (const directory of [instance.root, instance.mailbox, instance.control]) {
+            fsApi.mkdirSync(directory, { mode: 0o700 });
+            privateDirectory(fsApi, directory, euid);
+        }
+        writeExclusive(fsApi, instance.launch, launchFileText(reported.journalStoreIdentity, helperIncarnation));
+        // The two holders of the secret: the helper's single-use copy and the Router's copy beside the bound dirs.
+        secretFile = ticketSecretFileBytes(helperIncarnation, secret);
+        writeExclusive(fsApi, instance.secret, secretFile);
+        writeExclusive(fsApi, instance.routerSecret, secretFile);
+        fsyncDirectory(fsApi, instance.control);
+        fsyncDirectory(fsApi, instance.root);
+    } finally {
+        secret.fill(0);
+        secretFile?.fill(0);
     }
-    for (const directory of [instance.root, instance.mailbox, instance.control]) {
-        fsApi.mkdirSync(directory, { mode: 0o700 });
-        privateDirectory(fsApi, directory, euid);
-    }
-    writeExclusive(fsApi, instance.launch, launchFileText(reported.journalStoreIdentity, helperIncarnation));
-    fsyncDirectory(fsApi, instance.control);
 
     // 5. Record identities before the target can use them.
+    const previousKey = current?.instanceKey ?? null;
     history.push(helperIncarnation);
     const next = {
         version: PROVISIONING_RECORD_VERSION,
@@ -426,6 +512,9 @@ export function provisionExecutionTarget({
     };
     if (!validRecord(next, principal)) refuse('execution-target record would be invalid', E.stateInvalid);
     writeRecord(fsApi, paths, next);
+    // The record now names the new incarnation, so the provider already refuses the previous one; also retire its copy
+    // (best effort, never before the record is written).
+    retireRouterSecret(fsApi, boxTmpRoot, previousKey, key);
 
     const binds = bindsFor(paths, instance);
     // The binds name exactly the directories provisioned above.
