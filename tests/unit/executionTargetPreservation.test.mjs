@@ -23,6 +23,8 @@ const NEW_MODULES = Object.freeze([
     'cli/server/executionTarget/contract.mjs',
     'cli/server/executionTarget/discovery.mjs',
     'cli/server/security/tokens/targetHelperTicketMinter.mjs',
+    'cli/server/executionTarget/sourceProtectionService.mjs',
+    'cli/utils/runtime/sourceProtectionGate.mjs',
     'cli/utils/runtime/sourceProtectionStore.mjs',
     'cli/utils/runtime/sourceProtectionInterlock.mjs',
     'cli/sandbox/legacyAgentAdoptionGuard.mjs',
@@ -35,6 +37,7 @@ const NEW_TESTS = Object.freeze([
     'tests/unit/executionTargetCommonVectors.test.mjs',
     'tests/unit/executionTargetDiscovery.test.mjs',
     'tests/unit/executionTargetHelperTicket.test.mjs',
+    'tests/unit/executionTargetSourceProtectionWiring.test.mjs',
     'tests/unit/legacyAgentMaskCompleteness.test.mjs',
 ]);
 // The pure guard names the legacy markers only to detect them.
@@ -43,6 +46,14 @@ const GUARD = 'cli/sandbox/legacyAgentAdoptionGuard.mjs';
 // `contract` and `declaration` are common words; `discovery` appears in unrelated production code (model and agent
 // discovery). The `executionTarget/` path test and the exported operation names still catch a real importer of them.
 const BASENAME_EXEMPT = new Set(['contract', 'declaration', 'discovery']);
+
+// P5: the reviewed lifecycle call sites of the source-protection gate. Each imports exactly the synchronous
+// `assertSourceSetFixed` and nothing else of the new modules; the gate is inert for a workspace without a store.
+const GATE_CALL_SITES = Object.freeze({
+    'cli/utils/repos.js': "import { assertSourceSetFixed } from './runtime/sourceProtectionGate.mjs';",
+    'cli/utils/linkInstall.mjs': "import { assertSourceSetFixed } from './runtime/sourceProtectionGate.mjs';",
+    'cli/utils/workspaceStructure.js': "import { assertSourceSetFixed } from './runtime/sourceProtectionGate.mjs';",
+});
 
 function* files(relative, { anyExtension = false } = {}) {
     const absolute = path.join(REPO_ROOT, relative);
@@ -124,7 +135,7 @@ test('A1.1 step 2 the outer Box unmask=ALL baseline is present, unchanged and th
     assert.ok(boxOccurrences.includes(`${lifecycle}:177:'--security-opt', '${UNMASK}=ALL',`));
 });
 
-test('T1-10 / T1-11 the new generic modules have no production importer and register no route', () => {
+test('T1-10 / T1-11 the new generic modules have no production importer except the reviewed gate call sites, and register no route', () => {
     const newNames = NEW_MODULES.map((relative) => path.basename(relative, '.mjs'));
     const operationNames = [
         'reserveWritableResources', 'prepareSourceTransition', 'releaseWritableReservation', 'acknowledgeSourceStore',
@@ -152,6 +163,11 @@ test('T1-10 / T1-11 the new generic modules have no production importer and regi
                 ["import { readContainerId } from './legacyAgentAdoptionGuard.mjs';"]);
             text = text.replaceAll('legacyAgentAdoptionGuard', '');
         }
+        if (Object.hasOwn(GATE_CALL_SITES, relative)) {
+            assert.deepEqual(text.match(/^import .*sourceProtectionGate.*$/gm), [GATE_CALL_SITES[relative]], relative);
+            assert.equal(text.match(/\bassertSourceSetFixed\(/g).length >= 1, true, relative);
+            text = text.replaceAll(GATE_CALL_SITES[relative], '');
+        }
         // Nothing in production may switch the full predicate on per call.
         if (text.includes('legacyAgentLifecycleGuard')) assert.doesNotMatch(text, /\bactive:\s*true\b/, relative);
         // A sibling inside executionTarget/ (or anywhere) importing the exempt-named modules by specifier is an importer.
@@ -171,6 +187,15 @@ test('T1-10 / T1-11 the new generic modules have no production importer and regi
     ));
     assert.deepEqual(testImporters.sort(), [...NEW_TESTS].sort());
     for (const relative of NEW_MODULES) assert.equal(fs.existsSync(path.join(REPO_ROOT, relative)), true, relative);
+});
+
+test('P5 the agent-side source-protection transport is a library for worker hosts: no production file imports it', () => {
+    const transport = 'Agent/lib/sourceProtectionTransport.mjs';
+    assert.equal(fs.existsSync(path.join(REPO_ROOT, transport)), true);
+    const importers = productionFiles().filter((relative) => relative !== transport && read(relative).includes('sourceProtectionTransport'));
+    assert.deepEqual(importers, []);
+    const text = read(transport);
+    assert.doesNotMatch(text, /executionTarget\/|sourceProtection(Store|Interlock|Gate|Service)/);
 });
 
 test('the new modules take faults and trust through injection, never through environment variables or network', () => {

@@ -17,6 +17,7 @@ import { derivePrivateAgentRequestSecret } from '../utils/security/masterKey.js'
 import { commitRoutePlan } from './edgeRoutePlan.js';
 import { identityHardwareUnavailable, identityLeaseHardwareUnavailable } from './hardwareAvailability.mjs';
 import { admitCoordinatorRequest, coordinatorCallerAcl } from './executionProvider/coordinatorHop.mjs';
+import { readExecutionProviderDeclaration } from './executionProvider/declaration.mjs';
 import { coordinatorRouteForPlan, isUpgradeRequest } from './executionProvider/coordinatorRoutes.mjs';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
@@ -112,6 +113,23 @@ function pathAllowed(pathname, allowed) {
     });
 }
 
+// The exact current instances of the agents whose effective manifest carries a valid execution-provider
+// declaration: the source-reservation holders (T0 A3). Nothing else may call the source-protection operation.
+export function sourceProtectionHolderCallers(snapshot) {
+    const callers = [];
+    for (const record of Object.values(snapshot?.agents || {})) {
+        if (!record || record.type !== 'agent') continue;
+        const current = currentEnabledAgentIdentity(snapshot,
+            `agent:${String(record.repoName || '').trim()}/${String(record.agentName || '').trim()}`);
+        if (!current || !current.enableGeneration) continue;
+        const read = readExecutionProviderDeclaration(snapshot?.manifests?.[current.routeKey], { routeKey: current.routeKey });
+        if (read.present && read.valid) {
+            callers.push({ agentId: current.agentId, instanceId: current.instanceId, enableGeneration: current.enableGeneration });
+        }
+    }
+    return callers;
+}
+
 function callerAclForPlan(plan) {
     const security = plan.snapshot?.compiled?.security || {};
     if (plan.kind === 'private-operation') {
@@ -141,6 +159,15 @@ function callerAclForPlan(plan) {
                 callers: security.workspaceLogConsumers || [],
                 methods: ['POST'],
                 paths: ['/api/edge/workspace-logs'],
+            };
+        }
+        if (plan.operation === 'source-protection') {
+            // Only current agents that declare an execution provider may call (the source-reservation holders).
+            return {
+                operation: plan.operation,
+                callers: sourceProtectionHolderCallers(plan.snapshot),
+                methods: ['POST'],
+                paths: ['/api/edge/source-protection'],
             };
         }
         if (plan.operation === 'turn-credentials') {

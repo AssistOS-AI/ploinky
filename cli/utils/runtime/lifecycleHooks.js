@@ -371,6 +371,8 @@ export function runProfileLifecycle(agentName, profileName, options = {}) {
         }
         steps.push({ step: 2, name: 'symlinks', success: true });
     } catch (err) {
+        // A protected source set refuses the link change; do not continue as if the step had only failed softly.
+        if (err?.code === 'source_transition_blocked') throw err;
         steps.push({ step: 2, name: 'symlinks', success: false, error: err.message });
         errors.push(`Symlink creation failed: ${err.message}`);
     }
@@ -503,6 +505,7 @@ export function runPreContainerLifecycle(agentName, repoName, agentPath, profile
         createAgentSymlinks(agentName, repoName, agentPath);
         createAgentWorkDir(agentName);
     } catch (err) {
+        if (err?.code === 'source_transition_blocked') throw err;
         errors.push(`Symlink creation failed: ${err.message}`);
     }
 

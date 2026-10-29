@@ -655,6 +655,8 @@ function createPreparedWorkspaceStructure(plan) {
         createAgentWorkDir(plan.instanceName);
         createAgentSymlinks(plan.shortAgentName, plan.repoName, plan.agentPath);
     } catch (error) {
+        // A protected source set refuses the link change; the enable must not continue as if it had succeeded.
+        if (error?.code === 'source_transition_blocked') throw error;
         console.error(`Warning: Failed to create workspace structure for ${plan.shortAgentName}: ${error.message}`);
     }
 }

@@ -3,6 +3,7 @@ import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import path from 'path';
 import { PLOINKY_WORKSPACE_ROOT, PLOINKY_DIR, AGENTS_DATA_DIR, CODE_DIR, SKILLS_DIR, REPOS_DIR } from './config.js';
 import { ensureAgentDataDirectory, resolveAgentDataPath } from './runtime/agentDataPathPolicy.js';
+import { assertSourceSetFixed } from './runtime/sourceProtectionGate.mjs';
 
 /**
  * Initialize the workspace directory structure.
@@ -24,6 +25,18 @@ export function initWorkspaceStructure(workspacePath = PLOINKY_WORKSPACE_ROOT) {
         }
     }
     ensureAgentDataDirectory(path.join(workspacePath, '.data', 'shared'), { workspaceRoot: workspacePath });
+}
+
+// True when `linkPath` does not already hold a symlink to `target` (a null target means the link should be absent).
+function sourceLinkWouldChange(linkPath, target) {
+    let current = null;
+    try {
+        current = fs.lstatSync(linkPath).isSymbolicLink() ? fs.readlinkSync(linkPath) : undefined;
+    } catch (_) {
+        current = null;
+    }
+    if (current === undefined) return false; // a real file or directory is never replaced here
+    return target === null ? current !== null : current !== target;
 }
 
 /**
@@ -52,6 +65,14 @@ export function createAgentSymlinks(agentName, repoName, agentPath) {
 
     // If no code subfolder exists, link to the agent directory itself
     const actualCodeTarget = fs.existsSync(codeTargetPath) ? codeTargetPath : agentPath;
+
+    // A workspace with an execution target fixes its protected source set: a link that would point elsewhere than it
+    // does now is a source-selection change and must pass the source-protection interlock. Re-creating an identical
+    // link, and any workspace without a source-protection store, are unaffected.
+    if (sourceLinkWouldChange(codeSymlinkPath, actualCodeTarget)
+        || sourceLinkWouldChange(path.join(skillsDir, agentName), fs.existsSync(path.join(agentPath, 'skills')) ? path.join(agentPath, 'skills') : null)) {
+        assertSourceSetFixed({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, kind: 'agent-link' });
+    }
 
     // Remove existing symlink if it exists, warn if blocked by real directory
     let codeBlocked = false;

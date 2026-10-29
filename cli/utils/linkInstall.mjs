@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { workspaceRepositories } from './repositorySource.mjs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { assertSourceSetFixed } from './runtime/sourceProtectionGate.mjs';
 
 function repository(value) {
     if (typeof value !== 'string' || !value.trim()) throw new Error('link-install entries must be Git URLs');
@@ -45,6 +46,8 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
     const requestedBranch = branchPolicy?.branch || null;
     const strict = branchPolicy?.fallback === 'fail';
     const root = fs.realpathSync(workspaceRoot);
+    // A writable link-install alias of a source checkout changes the protected source set (inert without a store).
+    if (writable) assertSourceSetFixed({ workspaceRoot: root, kind: 'link-install-writable' });
     const git = args => execFile('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 120000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
     const origin = directory => {
@@ -91,6 +94,7 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
                 throw new Error(`link-install target ${repo.name} exists but has a different or missing Git origin`);
             }
             if (!create) throw new Error(`link-install repository ${repo.name} is missing from the workspace`);
+            assertSourceSetFixed({ workspaceRoot: root, kind: 'link-install-clone' });
             const cloneBranch = branchFor(repo, 'falling back to default branch');
             const temporary = fs.mkdtempSync(path.join(root, '.ploinky-link-install-'));
             try {

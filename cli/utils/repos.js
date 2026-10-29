@@ -11,6 +11,7 @@ import { runGitCommand, sanitizeGitDiagnostic } from './gitCommand.js';
 import { createOperationRecord } from '../commands/updateOutcome.js';
 import { throwUnlessVerified, updateCheckoutFastForward } from './git/verifiedUpdate.js';
 import { assessGeneratedCheckoutState } from './git/generatedState.js';
+import { assertSourceSetFixed } from './runtime/sourceProtectionGate.mjs';
 
 export const REPO_SOURCES_FILE = path.join(PLOINKY_DIR, 'repo_sources.json');
 export const ENABLED_REPOS_FILE = path.join(PLOINKY_DIR, 'enabled_repos.json');
@@ -339,6 +340,7 @@ export function addRepo(name, url, branch = null, { stdio = 'inherit' } = {}) {
         return { status: 'exists', path: repoPath, branch: actualBranch };
     }
     if (!actualUrl) throw new Error(`Missing repository URL for '${name}'.`);
+    assertSourceSetFixed({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, kind: 'repository-install' });
     const args = ['clone'];
     if (actualBranch) args.push('--branch', actualBranch);
     args.push(actualUrl, repoPath);
@@ -381,6 +383,7 @@ function saveEnabledRepos(repoNames) {
 }
 
 export function enableRepo(name, { branch = null, branchPolicy = null, stdio = 'inherit' } = {}) {
+    assertSourceSetFixed({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, kind: 'repository-enable' });
     const repoName = normalizeRepoName(name);
     const source = resolveRepoSource(repoName, null, branch);
     const result = ensureRepoInstalled(repoName, source?.url || null, {
@@ -402,6 +405,7 @@ export function enableRepo(name, { branch = null, branchPolicy = null, stdio = '
 }
 
 export function disableRepo(name) {
+    assertSourceSetFixed({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, kind: 'repository-disable' });
     const repoName = normalizeRepoName(name);
     const enabled = loadEnabledRepos();
     const next = enabled.filter(entry => entry !== repoName);
@@ -579,6 +583,7 @@ export function updateRegisteredRepository(name, {
     checkoutOptions = {},
 } = {}) {
     if (!name) throw new Error('Missing repository name.');
+    assertSourceSetFixed({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, kind: 'repository-update' });
     if (isAgentRepositoryUnregistered(name)) throw new Error(`Repository '${name}' is not installed.`);
     const localPath = workspaceAgentRepositoryPath(name);
     const repoPath = resolveAgentRepositoryPath(name);
@@ -707,6 +712,7 @@ export function updateWorkspaceRepository(repoPath, {
     assessGeneratedState = assessGeneratedCheckoutState,
     checkoutOptions = {},
 } = {}) {
+    assertSourceSetFixed({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, kind: 'repository-update' });
     return updateCheckoutFastForward({
         ...checkoutOptions,
         repoPath,
@@ -873,6 +879,8 @@ export function ensureRepoInstalled(name, url, { branchPolicy, branch, stdio = '
 
     if (!actualUrl) throw new Error(`Missing repository URL for '${name}'.`);
 
+    assertSourceSetFixed({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, kind: 'repository-install' });
+
     let cloneBranch = resolvedBranch;
     if (cloneBranch && !remoteBranchExists(actualUrl, cloneBranch)) {
         if (branchPolicy?.fallback === 'fail') {
@@ -911,6 +919,8 @@ export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback 
             );
         }
     }
+
+    assertSourceSetFixed({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, kind: 'repository-branch' });
 
     try {
         const fetchArgs = ['-C', repoPath, 'fetch', '--prune'];
