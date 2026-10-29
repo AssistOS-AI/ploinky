@@ -19,6 +19,9 @@ import { identityHardwareUnavailable, identityLeaseHardwareUnavailable } from '.
 import { admitCoordinatorRequest, coordinatorCallerAcl } from './executionProvider/coordinatorHop.mjs';
 import { readExecutionProviderDeclaration } from './executionProvider/declaration.mjs';
 import { coordinatorRouteForPlan, isUpgradeRequest } from './executionProvider/coordinatorRoutes.mjs';
+import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
+import { createLiveBoxScopeProvider } from './executionTarget/liveScope.mjs';
+import { createSourceProtectionService } from './executionTarget/sourceProtectionService.mjs';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
 const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;
@@ -500,6 +503,74 @@ export function sendRuntimeRouterOrigins(res, {
     return true;
 }
 
+/**
+ * The Box scope the source-protection service compares against: the workspace hash, the versionless semantic Box
+ * name (derived by the same Box identity module that names the container, from the workspace path the Box binds at
+ * its own absolute path) and the exact Box container ID read from the engine mount. Outside a Box, or when the
+ * engine evidence is missing or inconsistent, it is null and the service answers `source_unavailable`.
+ */
+export function createRouterLiveScope({ workspaceRoot, insideBox, scopeSources = {} } = {}) {
+    return async () => {
+        let expectedBoxName;
+        try {
+            expectedBoxName = buildWorkspaceIdentity(workspaceRoot).instance;
+        } catch (_) {
+            return null;
+        }
+        return createLiveBoxScopeProvider({ ...scopeSources, workspaceRoot, expectedBoxName, insideBox: insideBox === true })();
+    };
+}
+
+/**
+ * Reply to an already authorized and committed source-protection request. `authorizePrivateRoutePlan` has verified
+ * the caller's private agent assertion and held it to the exact execution-provider holder ACL, and the caller has
+ * committed the route plan; the service performs no authentication of its own and sees only the verified identity.
+ */
+export async function sendSourceProtection(res, {
+    plan,
+    body = Buffer.alloc(0),
+    callerIdentity = null,
+    workspaceRoot,
+    insideBox,
+    scopeSources,
+    audit = () => {},
+} = {}) {
+    if (!plan?.ok || plan.listener !== 'private' || plan.kind !== 'private-operation'
+        || plan.operation !== 'source-protection') {
+        sendPrivateError(res, forbidden('source protection requires the private operation plan', 'PRIVATE_LISTENER_REQUIRED'));
+        return false;
+    }
+    const holders = sourceProtectionHolderCallers(plan.snapshot);
+    const callerAgentId = String(callerIdentity?.agentId || '');
+    let answer;
+    try {
+        answer = await createSourceProtectionService({
+            workspaceRoot,
+            liveScope: createRouterLiveScope({ workspaceRoot, insideBox, scopeSources }),
+            isSourceReservationHolder: async (principal) => ({
+                status: holders.some((entry) => entry.agentId === principal) ? 'holder' : 'not-holder',
+            }),
+        }).handle({ identity: callerIdentity, body });
+    } catch (_) {
+        audit('source_protection_rejected', { callerAgentId, code: 'SOURCE_PROTECTION_FAILED' });
+        sendPrivateError(res, Object.assign(new Error('source protection failed'), { status: 500, code: 'SOURCE_PROTECTION_FAILED' }));
+        return false;
+    }
+    const payload = Buffer.from(JSON.stringify(answer.body));
+    res.writeHead(answer.status, {
+        'Content-Type': 'application/json',
+        'Content-Length': payload.length,
+        'Cache-Control': 'no-store',
+    });
+    res.end(payload);
+    audit('source_protection_answered', {
+        callerAgentId,
+        status: answer.status,
+        code: answer.body?.error?.code || (typeof answer.body?.error === 'string' ? answer.body.error : null),
+    });
+    return true;
+}
+
 export {
     PRIVATE_ASSERTION_HEADER,
     RUNTIME_ORIGINS_PATH,
@@ -514,4 +585,5 @@ export default {
     readPrivateRequestBody,
     sendPrivateError,
     sendRuntimeRouterOrigins,
+    sendSourceProtection,
 };

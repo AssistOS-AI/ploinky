@@ -5,9 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
+import { isOpaqueIdentity } from '../../cli/server/executionTarget/contract.mjs';
 import { discoverExecutionTargets } from '../../cli/server/executionTarget/discovery.mjs';
 import { createLiveBoxScopeProvider, readLiveBoxScope, workspaceScopeId } from '../../cli/server/executionTarget/liveScope.mjs';
 import { createSourceProtectionService } from '../../cli/server/executionTarget/sourceProtectionService.mjs';
+import { createRouterLiveScope } from '../../cli/server/privateRouter.js';
 import { createTargetHelperTicketMinter } from '../../cli/server/security/tokens/targetHelperTicketMinter.mjs';
 
 const BOX_NAME = 'ploinky-box-ws-0123456789ab';
@@ -112,4 +115,53 @@ test('P3 the scope feeds discovery, the helper-ticket minter and the source-prot
     const answer = await service.handle({ identity, body: Buffer.from(JSON.stringify({ version: 1, op: 'describe', workerGeneration: null })) });
     assert.equal(answer.status, 200);
     assert.equal(answer.body.ok, true);
+});
+
+// The Router resolves the expected Box name from the workspace path the Box binds at its own absolute path, with the
+// same identity module that names the container. The evidence files are injected; nothing here touches the engine.
+test('P3 Router live scope: the real derived scope in a Box-like fixture, null outside a Box or on any inconsistency', async (t) => {
+    const env = fixture(t);
+    const { workspaceRoot } = env.options;
+    fs.mkdirSync(workspaceRoot, { recursive: true });
+    const name = buildWorkspaceIdentity(workspaceRoot).instance;
+    assert.match(name, /^ploinky-box-[a-z0-9-]+-[0-9a-f]{12}$/);
+    assert.equal(isOpaqueIdentity(name), true);
+    const scopeSources = { containerEnvPath: env.containerEnvPath, mountInfoPath: env.mountInfoPath };
+    const live = (insideBox, sources = scopeSources) => createRouterLiveScope({ workspaceRoot, insideBox, scopeSources: sources })();
+
+    assert.deepEqual(await live(true), {
+        workspaceId: `workspace:${crypto.createHash('sha256').update(path.resolve(workspaceRoot)).digest('hex')}`,
+        boxIdentity: name,
+        boxGeneration: BOX_ID,
+    });
+    // A populated engine record must name this Box; one that names another Box or another container is refused.
+    fs.writeFileSync(env.containerEnvPath, engineRecord(name));
+    assert.equal((await live(true)).boxIdentity, name);
+    fs.writeFileSync(env.containerEnvPath, engineRecord(BOX_NAME));
+    assert.equal(await live(true), null, 'the fixture name of another Box');
+    fs.writeFileSync(env.containerEnvPath, engineRecord(name, 'd'.repeat(64)));
+    assert.equal(await live(true), null, 'a record naming another container');
+    fs.writeFileSync(env.containerEnvPath, '');
+
+    // Outside a Box, even with Box-like evidence present, there is no scope; only an explicit true counts.
+    for (const outside of [false, undefined, null, 'true', 1]) assert.equal(await live(outside), null, String(outside));
+    // Missing evidence and an unusable workspace path fail closed instead of throwing.
+    assert.equal(await live(true, { ...scopeSources, mountInfoPath: path.join(env.root, 'absent') }), null);
+    for (const bad of [undefined, null, '', 'relative/ws']) {
+        assert.equal(await createRouterLiveScope({ workspaceRoot: bad, insideBox: true, scopeSources })(), null, String(bad));
+    }
+    // The test seam cannot override the identity facts the Router derives itself.
+    assert.equal(await createRouterLiveScope({
+        workspaceRoot, insideBox: false,
+        scopeSources: { ...scopeSources, insideBox: true, expectedBoxName: BOX_NAME, workspaceRoot: path.join(env.root, 'other') },
+    })(), null);
+    assert.equal((await createRouterLiveScope({
+        workspaceRoot, insideBox: true,
+        scopeSources: { ...scopeSources, expectedBoxName: BOX_NAME, workspaceRoot: path.join(env.root, 'other') },
+    })()).boxIdentity, name);
+    // Every call re-reads the files: a recreated Box is a new generation.
+    const provider = createRouterLiveScope({ workspaceRoot, insideBox: true, scopeSources });
+    assert.equal((await provider()).boxGeneration, BOX_ID);
+    fs.writeFileSync(env.mountInfoPath, mountInfo('e'.repeat(64)));
+    assert.equal((await provider()).boxGeneration, 'e'.repeat(64));
 });

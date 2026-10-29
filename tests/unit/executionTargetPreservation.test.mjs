@@ -58,6 +58,19 @@ const PROVISIONING_CALL_SITE = Object.freeze({
     line: "import { planExecutionTargetLaunch, provisionExecutionTarget, JOURNAL_INIT_TIMEOUT_MS, TARGET_RUNTIME_ROOT } from '../../server/executionTarget/provisioning.mjs';",
 });
 
+// P5: the one Router call site of the private source-protection operation. privateRouter.js imports exactly these two
+// modules of the new tree (the service and the live-scope provider), calls each exactly once, and RoutingServer.js
+// reaches them only through its `sendSourceProtection` import (pinned by the wiring test).
+const ROUTER_GLUE = Object.freeze({
+    file: 'cli/server/privateRouter.js',
+    imports: Object.freeze([
+        "import { createLiveBoxScopeProvider } from './executionTarget/liveScope.mjs';",
+        "import { createSourceProtectionService } from './executionTarget/sourceProtectionService.mjs';",
+    ]),
+    // The injected live-scope key of the service call; the provider is the Router's own wrapper around the module's.
+    liveScopeKey: 'liveScope: createRouterLiveScope(',
+});
+
 // P5: the reviewed lifecycle call sites of the source-protection gate. Each imports exactly the synchronous
 // `assertSourceSetFixed` and nothing else of the new modules; the gate is inert for a workspace without a store.
 const GATE_CALL_SITES = Object.freeze({
@@ -182,6 +195,15 @@ test('T1-10 / T1-11 the new generic modules have no production importer except t
             assert.equal(text.match(/\bprovisionExecutionTarget\(/g).length, 1, relative);
             text = text.replaceAll(PROVISIONING_CALL_SITE.line, '');
         }
+        if (relative === ROUTER_GLUE.file) {
+            assert.deepEqual(text.match(/^import .*executionTarget\/.*$/gm), ROUTER_GLUE.imports, relative);
+            assert.equal(text.match(/\bcreateSourceProtectionService\(/g).length, 1, relative);
+            assert.equal(text.match(/\bcreateLiveBoxScopeProvider\(/g).length, 1, relative);
+            assert.equal(text.split(ROUTER_GLUE.liveScopeKey).length - 1, 1, relative);
+            for (const line of ROUTER_GLUE.imports) text = text.replaceAll(line, '');
+            text = text.replaceAll('createSourceProtectionService(', '').replaceAll('createLiveBoxScopeProvider(', '')
+                .replaceAll(ROUTER_GLUE.liveScopeKey, 'createRouterLiveScope(');
+        }
         if (Object.hasOwn(GATE_CALL_SITES, relative)) {
             assert.deepEqual(text.match(/^import .*sourceProtectionGate.*$/gm), [GATE_CALL_SITES[relative]], relative);
             assert.equal(text.match(/\bassertSourceSetFixed\(/g).length >= 1, true, relative);
@@ -206,6 +228,23 @@ test('T1-10 / T1-11 the new generic modules have no production importer except t
     ));
     assert.deepEqual(testImporters.sort(), [...NEW_TESTS].sort());
     for (const relative of NEW_MODULES) assert.equal(fs.existsSync(path.join(REPO_ROOT, relative)), true, relative);
+});
+
+test('P5 the Router glue names have exactly one production caller: RoutingServer.js through its reviewed import', () => {
+    const names = /\b(sendSourceProtection|createRouterLiveScope)\b/;
+    assert.deepEqual(productionFiles().filter((relative) => names.test(read(relative))).sort(), [
+        'cli/server/RoutingServer.js', 'cli/server/privateRouter.js',
+    ]);
+    const router = read('cli/server/RoutingServer.js');
+    assert.deepEqual(router.match(/^import .*sendSourceProtection.*$/gm), ["import { sendSourceProtection } from './privateRouter.js';"]);
+    assert.equal(router.match(/\bsendSourceProtection\(/g).length, 1);
+    assert.doesNotMatch(router, /createRouterLiveScope/);
+    // privateRouter.js: the two definitions, the one use of the live-scope provider and the default-export entry.
+    const glue = read(ROUTER_GLUE.file);
+    assert.equal(glue.match(/\bsendSourceProtection\b/g).length, 2);
+    assert.equal(glue.match(/\bcreateRouterLiveScope\b/g).length, 2);
+    assert.match(glue, /^export async function sendSourceProtection\(/m);
+    assert.match(glue, /^export function createRouterLiveScope\(/m);
 });
 
 test('P5 the agent-side source-protection transport is a library for worker hosts: no production file imports it', () => {

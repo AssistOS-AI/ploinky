@@ -4,16 +4,27 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import test from 'node:test';
 
+import { signPrivateRouterAssertion } from '../../Agent/lib/agentAssertion.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { postSourceProtection } from '../../Agent/lib/sourceProtectionTransport.mjs';
 import { resourcesDigestOf, targetDigest } from '../../cli/server/executionTarget/contract.mjs';
 import { createSourceProtectionService } from '../../cli/server/executionTarget/sourceProtectionService.mjs';
-import { authorizePrivateRoutePlan, sourceProtectionHolderCallers } from '../../cli/server/privateRouter.js';
+import { commitRoutePlan, resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
+import {
+    authorizePrivateRoutePlan,
+    readPrivateRequestBody,
+    sendPrivateError,
+    sendSourceProtection,
+    sourceProtectionHolderCallers,
+} from '../../cli/server/privateRouter.js';
 import { derivePrivateAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
 import { linkInstallDeclarations, prepareLinkedRepositories } from '../../cli/utils/linkInstall.mjs';
 import { aliasCoverageDigest } from '../../cli/utils/runtime/sourceProtectionInterlock.mjs';
+import { MockResponse } from '../helpers/routerOriginsWorkspace.mjs';
+import { domainFixture } from './directDomainFixtures.mjs';
 import {
     SourceTransitionRefused,
     abortSourceTransition,
@@ -752,6 +763,218 @@ test('P5 transport fails closed without a descriptor or identity and never reuse
     await assert.rejects(() => failing({ env: {}, loadDescriptor: DESCRIPTOR }), (error) => error.code === 'SOURCE_PROTECTION_TRANSPORT_UNAVAILABLE');
     await assert.rejects(() => postSourceProtection(Buffer.alloc(1024 * 1024 + 1), { env: {}, loadDescriptor: DESCRIPTOR }), (error) => error.code === 'SOURCE_PROTECTION_TRANSPORT_UNAVAILABLE');
     await assert.rejects(() => failing({ env: agentEnv(WORKER, WORKER_INSTANCE, WORKER_ENABLE), loadDescriptor: () => ({ payload: { internalRouterUrl: 'https://127.0.0.1:8081' } }) }), (error) => error.code === 'SOURCE_PROTECTION_TRANSPORT_UNAVAILABLE');
+});
+
+// ---------------------------------------------------------------- the registered Router route
+
+const ROUTE = '/api/edge/source-protection';
+const BOX_ID = 'c'.repeat(64);
+const PROVIDER_AGENT = 'agent:fixtures/explorer';
+const providerDeclaration = { version: 1, port: 7300, taskReferences: { path: '/explorer/task-refs' } };
+
+// The registry and generation of the shared edge fixture, with `explorer` declaring an execution provider.
+function routerWorld(t, { declare = true } = {}) {
+    const world = domainFixture(t);
+    if (declare) {
+        const file = path.join(world.root, 'fixtures', 'explorer', 'manifest.json');
+        const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+        manifest.executionProvider = providerDeclaration;
+        fs.writeFileSync(file, JSON.stringify(manifest, null, 2));
+        world.apply();
+    }
+    return world;
+}
+
+const callerEnv = (name) => agentEnv(`agent:fixtures/${name}`, `${name}-instance`, `${name}-enable`);
+
+function privateRequest({ method = 'POST', url = ROUTE, body = envelope('describe', null), env = callerEnv('explorer'), signedPath = ROUTE, headers = {} } = {}) {
+    const bytes = Buffer.from(body);
+    const req = Readable.from(bytes.length ? [bytes] : []);
+    return Object.assign(req, {
+        method,
+        url,
+        ploinkyListenerClass: 'private',
+        headers: {
+            host: '127.0.0.1:8081',
+            ...(env ? { 'ploinky-agent-assertion': signPrivateRouterAssertion({ method, path: signedPath, body: bytes, env }) } : {}),
+            ...headers,
+        },
+    });
+}
+
+// RoutingServer's private pipeline for this operation: exact route plan, bounded body, caller authorization, route
+// plan commit, then the reply. The Router branch itself is pinned by the source test below.
+async function throughPrivateListener(world, request, serving) {
+    const res = new MockResponse();
+    const parsedUrl = new URL(request.url, `http://${request.headers.host}`);
+    const plan = resolveEdgeRoutePlan({ req: request, parsedUrl, listener: 'private' });
+    if (!plan.ok) {
+        res.writeHead(plan.status || 404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: plan.code }));
+        return { plan, res };
+    }
+    const body = await readPrivateRequestBody(request);
+    try {
+        authorizePrivateRoutePlan({ req: request, plan, body });
+    } catch (error) {
+        sendPrivateError(res, error);
+        return { plan, res };
+    }
+    assert.equal(commitRoutePlan(plan), true);
+    await sendSourceProtection(res, { plan, body, callerIdentity: request.privateAgentIdentity, ...serving });
+    return { plan, res };
+}
+
+// A Box-like scope: the engine mount names this container and the evidence files are injected.
+function boxScopeSources(t, workspaceRoot, { id = BOX_ID, record = '' } = {}) {
+    const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'p5-box-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const mountInfoPath = path.join(dir, 'mountinfo');
+    const containerEnvPath = path.join(dir, '.containerenv');
+    fs.writeFileSync(mountInfoPath, [
+        '7300 7290 0:70 / / rw,relatime - overlay overlay rw',
+        `7388 7390 0:73 /containers/overlay-containers/${id}/userdata/.containerenv /run/.containerenv rw,nosuid,nodev,relatime - tmpfs tmpfs rw,mode=700`,
+        '',
+    ].join('\n'));
+    fs.writeFileSync(containerEnvPath, record);
+    return { mountInfoPath, containerEnvPath };
+}
+
+test('P5 route: /api/edge/source-protection resolves only as the exact private POST operation', (t) => {
+    routerWorld(t);
+    const plan = (url, { method = 'POST', listener = 'private', host } = {}) => resolveEdgeRoutePlan({
+        req: { url, method, headers: { host: host || (listener === 'private' ? '127.0.0.1:8081' : '127.0.0.1:8080') }, ploinkyListenerClass: listener },
+        listener,
+    });
+    const served = plan(ROUTE);
+    assert.equal(served.ok, true);
+    assert.equal(served.kind, 'private-operation');
+    assert.equal(served.operation, 'source-protection');
+    assert.equal(served.pathname, ROUTE);
+    assert.equal(typeof served.lease?.isCurrent, 'function');
+    // Exact method and raw target: no other method, query (even an empty one), fragment, alias or encoded spelling.
+    // A fragment is refused earlier as a malformed selector.
+    assert.equal(plan(`${ROUTE}#x`).ok, false);
+    for (const [url, method] of [[ROUTE, 'GET'], [ROUTE, 'PUT'], [ROUTE, 'DELETE'], [`${ROUTE}?`, 'POST'], [`${ROUTE}?a=1`, 'POST']]) {
+        const refused = plan(url, { method });
+        assert.equal(refused.ok, false, `${method} ${url}`);
+        assert.equal(refused.code, 'SOURCE_PROTECTION_REQUEST_INVALID', `${method} ${url}`);
+    }
+    for (const url of [`${ROUTE}/`, `${ROUTE}/x`, '/api/edge//source-protection', '/api/edge/source-protection%2f', '/api/edge/%73ource-protection',
+        '/api/edge/Source-Protection', '/api/edge/./source-protection', '/api/edge/x/../source-protection']) {
+        const refused = plan(url);
+        assert.equal(refused.ok === true && refused.operation === 'source-protection', false, url);
+    }
+    // The public and managed listeners never serve it.
+    for (const listener of ['public', 'managed']) {
+        const other = plan(ROUTE, { listener, host: listener === 'managed' ? 'host.containers.internal:8080' : undefined });
+        assert.equal(other.ok === true && other.kind === 'private-operation', false, listener);
+    }
+    // The neighbouring private operations are unchanged.
+    assert.equal(plan('/api/edge/runtime-origins', { method: 'GET' }).operation, 'runtime-origins');
+    assert.equal(plan('/api/edge/turn-credentials').operation, 'turn-credentials');
+});
+
+test('P5 route: reachable with the verified private identity of an execution-provider agent, refused for every other caller', async (t) => {
+    const world = routerWorld(t);
+    const store = await makeWorld(t);
+    await store.register();
+    const sources = boxScopeSources(t, store.workspaceRoot);
+    const serving = { workspaceRoot: store.workspaceRoot, insideBox: true, scopeSources: sources };
+    const call = (options) => throughPrivateListener(world, privateRequest(options), serving);
+
+    // The provider agent reaches the service, which sees only the verified identity.
+    const holders = sourceProtectionHolderCallers(resolveEdgeRoutePlan({
+        req: privateRequest(), parsedUrl: new URL(ROUTE, 'http://127.0.0.1:8081'), listener: 'private',
+    }).snapshot);
+    assert.deepEqual(holders.map((entry) => entry.agentId), [PROVIDER_AGENT]);
+    const reached = await call({});
+    assert.equal(reached.res.statusCode, 200, reached.res.body);
+    assert.equal(reached.res.headers['cache-control'], 'no-store');
+    assert.equal(reached.res.headers['content-type'], 'application/json');
+    const described = reached.res.json();
+    assert.equal(described.ok, true, reached.res.body);
+    // The store exists and the live Box scope is real, so the answer is the store state, not `unavailable`.
+    assert.notEqual(described.value.state, 'unavailable');
+    assert.equal(described.value.sourceStoreIdentity, store.storeId);
+    assert.equal(described.value.holderAcknowledged, false, 'this worker has not registered a generation in this store');
+
+    // A request-body op the service refuses is reported by the service, not by the transport.
+    const malformed = await call({ body: Buffer.from('not json') });
+    assert.equal(malformed.res.statusCode, 400);
+    assert.deepEqual(malformed.res.json(), { error: 'invalid_request' });
+
+    // Refused: a current agent without a provider declaration, a stale instance, an unsigned request, a wrong signed
+    // path or method, an assertion for another body, a forged identity header.
+    const plain = await call({ env: callerEnv('unrelated') });
+    assert.equal(plain.res.statusCode, 403);
+    assert.equal(plain.res.json().error, 'PRIVATE_CALLER_DENIED');
+    const stale = await call({ env: agentEnv(PROVIDER_AGENT, 'explorer-instance-0', 'explorer-enable') });
+    assert.equal(stale.res.statusCode, 401);
+    const staleEnable = await call({ env: agentEnv(PROVIDER_AGENT, 'explorer-instance', 'explorer-enable-0') });
+    assert.equal(staleEnable.res.statusCode, 401);
+    assert.equal((await call({ env: null })).res.statusCode, 401);
+    assert.equal((await call({ signedPath: '/api/edge/runtime-origins' })).res.statusCode, 401);
+    const other = privateRequest({ body: envelope('state', null) });
+    other.headers['ploinky-agent-assertion'] = privateRequest({ body: envelope('describe', null) }).headers['ploinky-agent-assertion'];
+    assert.equal((await throughPrivateListener(world, other, serving)).res.statusCode, 401);
+    const forged = await call({ env: callerEnv('unrelated'), headers: { 'x-ploinky-agent-id': PROVIDER_AGENT } });
+    assert.equal(forged.res.statusCode, 403);
+    // A refused caller never reaches the service: nothing was read from the store on its behalf.
+    assert.equal(plain.res.body.includes(store.storeId), false);
+    // Declarations are re-read from the active generation: without one nobody holds the reservation.
+    const bare = routerWorld(t, { declare: false });
+    const nobody = await throughPrivateListener(bare, privateRequest(), serving);
+    assert.equal(nobody.res.statusCode, 403);
+    assert.equal(nobody.res.json().error, 'PRIVATE_CALLER_DENIED');
+});
+
+test('P5 route: without a Box scope the service is unavailable, never permissive', async (t) => {
+    const world = routerWorld(t);
+    const store = await makeWorld(t);
+    await store.register();
+    const sources = boxScopeSources(t, store.workspaceRoot);
+    const ask = async (serving, op = 'describe', generation = null, request) => (await throughPrivateListener(world,
+        privateRequest({ body: envelope(op, generation, request) }), { workspaceRoot: store.workspaceRoot, ...serving })).res.json();
+
+    // Outside the Box (the Router is not in a Box), engine-like evidence is not trusted.
+    assert.deepEqual((await ask({ insideBox: false, scopeSources: sources })).value, {
+        state: 'unavailable', sourceStoreIdentity: null, holderAcknowledged: false, currentGeneration: null,
+    });
+    assert.equal((await ask({ insideBox: false, scopeSources: sources }, 'state')).error.code, 'source_unavailable');
+    // Inside a Box whose engine evidence is missing or names another Box.
+    assert.equal((await ask({ insideBox: true, scopeSources: { ...sources, mountInfoPath: path.join(store.workspaceRoot, 'absent') } }, 'state')).error.code, 'source_unavailable');
+    const foreign = boxScopeSources(t, store.workspaceRoot, { record: 'name="ploinky-box-other-000000000000"\n' });
+    assert.equal((await ask({ insideBox: true, scopeSources: foreign }, 'state')).error.code, 'source_unavailable');
+    // Inside the Box, the real scope reaches the store.
+    assert.equal((await ask({ insideBox: true, scopeSources: sources }, 'state')).ok, true);
+    // With no store on disk the route answers without creating one.
+    const empty = tempWorkspace(t);
+    const before = listTree(empty);
+    const absent = (await throughPrivateListener(world, privateRequest(), { workspaceRoot: empty, insideBox: true, scopeSources: boxScopeSources(t, empty) })).res.json();
+    assert.equal(absent.value.state, 'unavailable');
+    assert.deepEqual(listTree(empty), before);
+});
+
+test('P5 route: RoutingServer dispatches the operation after the commit, with exactly the reviewed Router import', () => {
+    const source = fs.readFileSync(new URL('../../cli/server/RoutingServer.js', import.meta.url), 'utf8');
+    const branch = source.match(/if \(routePlan\.kind === 'private-operation' && routePlan\.operation === 'source-protection'\) \{\n([\s\S]*?)\n    \}\n/);
+    assert.ok(branch, 'the source-protection branch exists');
+    const lines = branch[1].split('\n').map((line) => line.trim());
+    assert.equal(lines[0], 'if (!commitRoutePlan(routePlan)) {');
+    assert.ok(lines.includes("sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });"));
+    const send = lines.findIndex((line) => line === 'await sendSourceProtection(res, {');
+    assert.ok(send > lines.indexOf('if (!commitRoutePlan(routePlan)) {'), 'the plan is committed before the service runs');
+    assert.deepEqual(lines.slice(send + 1, lines.indexOf('});', send)), [
+        'plan: routePlan,', 'body,', 'callerIdentity: req.privateAgentIdentity,', 'workspaceRoot: PLOINKY_WORKSPACE_ROOT,', 'insideBox,',
+        'audit: (event, value) => appendLog(event, value),',
+    ]);
+    // It follows authorizePrivateRoutePlan in the same request handler and is the only user of the operation.
+    assert.ok(source.indexOf('authorizePrivateRoutePlan({ req, plan: routePlan, body })') < source.indexOf("routePlan.operation === 'source-protection'"));
+    assert.equal(source.match(/sendSourceProtection/g).length, 2);
+    assert.deepEqual(source.match(/^import .*sendSourceProtection.*$/gm), ["import { sendSourceProtection } from './privateRouter.js';"]);
+    // The `insideBox` it passes is the Router's own Box-marker fact.
+    assert.match(source, /^const insideBox = isInsideBox\(\);$/m);
 });
 
 // ---------------------------------------------------------------- call sites

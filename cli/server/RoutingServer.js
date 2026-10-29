@@ -911,6 +911,22 @@ async function processPrivateRequest(req, res) {
         }
         return;
     }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'source-protection') {
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
+            return;
+        }
+        // The caller was authenticated and held to the execution-provider holder ACL by authorizePrivateRoutePlan above.
+        await sendSourceProtection(res, {
+            plan: routePlan,
+            body,
+            callerIdentity: req.privateAgentIdentity,
+            workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+            insideBox,
+            audit: (event, value) => appendLog(event, value),
+        });
+        return;
+    }
     if (routePlan.kind === 'private-operation' && routePlan.operation === 'runtime-origins') {
         sendRuntimeRouterOrigins(res, {
             plan: routePlan,
@@ -1287,3 +1303,4 @@ server.listen(port, '0.0.0.0', () => {
 // lines of this file keep their positions.
 import { privateForwardTrustedHeadersFactory } from './executionProvider/coordinatorHop.mjs';
 import { handleTaskReferenceRequest } from './executionProvider/taskReferenceRoutes.mjs';
+import { sendSourceProtection } from './privateRouter.js';
