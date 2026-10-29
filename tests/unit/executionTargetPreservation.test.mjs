@@ -28,6 +28,8 @@ const NEW_MODULES = Object.freeze([
     'cli/utils/runtime/sourceProtectionStore.mjs',
     'cli/utils/runtime/sourceProtectionInterlock.mjs',
     'cli/sandbox/legacyAgentAdoptionGuard.mjs',
+    'cli/server/executionTarget/provisioning.mjs',
+    'cli/server/executionTarget/liveScope.mjs',
 ]);
 const NEW_TESTS = Object.freeze([
     'tests/unit/executionTargetDeclaration.test.mjs',
@@ -39,13 +41,22 @@ const NEW_TESTS = Object.freeze([
     'tests/unit/executionTargetHelperTicket.test.mjs',
     'tests/unit/executionTargetSourceProtectionWiring.test.mjs',
     'tests/unit/legacyAgentMaskCompleteness.test.mjs',
+    'tests/unit/executionTargetProvisioning.test.mjs',
+    'tests/unit/executionTargetLiveScope.test.mjs',
 ]);
 // The pure guard names the legacy markers only to detect them.
 const GUARD = 'cli/sandbox/legacyAgentAdoptionGuard.mjs';
 
 // `contract` and `declaration` are common words; `discovery` appears in unrelated production code (model and agent
 // discovery). The `executionTarget/` path test and the exported operation names still catch a real importer of them.
-const BASENAME_EXEMPT = new Set(['contract', 'declaration', 'discovery']);
+const BASENAME_EXEMPT = new Set(['contract', 'declaration', 'discovery', 'provisioning']);
+
+// P3: the one start-boundary call site of target provisioning. It imports exactly these three names and nothing else
+// of the new modules; `planExecutionTargetLaunch` is null for every manifest without the `executionTarget` key.
+const PROVISIONING_CALL_SITE = Object.freeze({
+    file: 'cli/sandbox/docker/agentServiceManager.js',
+    line: "import { planExecutionTargetLaunch, provisionExecutionTarget, JOURNAL_INIT_TIMEOUT_MS, TARGET_RUNTIME_ROOT } from '../../server/executionTarget/provisioning.mjs';",
+});
 
 // P5: the reviewed lifecycle call sites of the source-protection gate. Each imports exactly the synchronous
 // `assertSourceSetFixed` and nothing else of the new modules; the gate is inert for a workspace without a store.
@@ -135,7 +146,7 @@ test('A1.1 step 2 the outer Box unmask=ALL baseline is present, unchanged and th
     assert.ok(boxOccurrences.includes(`${lifecycle}:177:'--security-opt', '${UNMASK}=ALL',`));
 });
 
-test('T1-10 / T1-11 the new generic modules have no production importer except the reviewed gate call sites, and register no route', () => {
+test('T1-10 / T1-11 the new generic modules have no production importer except the reviewed gate and provisioning call sites, and register no route', () => {
     const newNames = NEW_MODULES.map((relative) => path.basename(relative, '.mjs'));
     const operationNames = [
         'reserveWritableResources', 'prepareSourceTransition', 'releaseWritableReservation', 'acknowledgeSourceStore',
@@ -162,6 +173,14 @@ test('T1-10 / T1-11 the new generic modules have no production importer except t
             assert.deepEqual(text.match(/^import .*legacyAgentAdoptionGuard.*$/gm),
                 ["import { readContainerId } from './legacyAgentAdoptionGuard.mjs';"]);
             text = text.replaceAll('legacyAgentAdoptionGuard', '');
+        }
+        if (relative === PROVISIONING_CALL_SITE.file) {
+            assert.deepEqual(text.match(/^import .*executionTarget\/.*$/gm), [PROVISIONING_CALL_SITE.line], relative);
+            // Two reviewed plan sites: the start boundary, and the refusal of identity-preserving targeted restarts.
+            assert.equal(text.match(/\bplanExecutionTargetLaunch\(/g).length, 2, relative);
+            assert.equal(text.match(/if \(targetedRestart && planExecutionTargetLaunch\(\{ manifest,/g)?.length, 1, relative);
+            assert.equal(text.match(/\bprovisionExecutionTarget\(/g).length, 1, relative);
+            text = text.replaceAll(PROVISIONING_CALL_SITE.line, '');
         }
         if (Object.hasOwn(GATE_CALL_SITES, relative)) {
             assert.deepEqual(text.match(/^import .*sourceProtectionGate.*$/gm), [GATE_CALL_SITES[relative]], relative);

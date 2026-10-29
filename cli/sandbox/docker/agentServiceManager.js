@@ -99,7 +99,9 @@ import {
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
 import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
-import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, PLOINKY_SKILL_SCOPE_ENV, SHARED_DIR } from '../../utils/config.js';
+import { AGENTS_DATA_DIR, CONTROLLER_STATE_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, PLOINKY_SKILL_SCOPE_ENV, SHARED_DIR } from '../../utils/config.js';
+import { BOX_TMPFS } from '../../../ploinky-box/constants.mjs';
+import { planExecutionTargetLaunch, provisionExecutionTarget, JOURNAL_INIT_TIMEOUT_MS, TARGET_RUNTIME_ROOT } from '../../server/executionTarget/provisioning.mjs';
 import { ensureHostLaunchSkeleton, withHostLaunchExclusion } from '../hostLaunchExclusion.js';
 import {
     planRuntimeResources,
@@ -1086,6 +1088,46 @@ function appendExactManagedBindMount(args, value) {
     return true;
 }
 
+// Destinations of every bind, volume, mount and tmpfs grant already rendered.
+function renderedMountDestinations(args) {
+    const destinations = [];
+    for (let index = 0; index < args.length; index += 1) {
+        const arg = String(args[index]);
+        const next = String(args[index + 1] ?? '');
+        if (arg === '-v' || arg === '--volume') destinations.push(managedBindMountFromValue(next).destination);
+        else if (arg.startsWith('--volume=')) destinations.push(managedBindMountFromValue(arg.slice(9)).destination);
+        else if (arg === '--tmpfs') destinations.push(normalizeRuntimeMountTarget(next.split(':')[0]));
+        else if (arg.startsWith('--tmpfs=')) destinations.push(normalizeRuntimeMountTarget(arg.slice(8).split(':')[0]));
+        else if (arg === '--mount' || arg.startsWith('--mount=')) {
+            const spec = arg === '--mount' ? next : arg.slice(8);
+            for (const field of spec.split(',')) {
+                const [key, value] = field.split('=');
+                if (['dst', 'target', 'destination'].includes(key)) destinations.push(normalizeRuntimeMountTarget(value));
+            }
+        }
+    }
+    return destinations;
+}
+
+// The target's mailbox, journal and control binds are management-private. No
+// other grant may equal, contain or sit inside their runtime root, or a later
+// mount could shadow them with a reachable directory. Destinations are compared
+// as strings, so the image's conventional `/var/run -> /run` alias is folded in
+// and any `ploinky-target` path segment is refused. Other image symlinks are part
+// of the digest-pinned, reviewed target image inventory.
+export function assertExecutionTargetMountsReserved(args, root = TARGET_RUNTIME_ROOT) {
+    const reserved = path.posix.normalize(root);
+    for (const destination of renderedMountDestinations(args)) {
+        const raw = path.posix.normalize(String(destination));
+        const target = raw === '/var/run' || raw.startsWith('/var/run/') ? `/run${raw.slice('/var/run'.length)}` : raw;
+        if (target === reserved || target.startsWith(`${reserved}/`)
+            || reserved.startsWith(`${target === '/' ? '' : target}/`)
+            || target.split('/').includes(path.posix.basename(reserved))) {
+            throw new Error(`execution target runtime root '${reserved}' overlaps another mount at '${raw}'`);
+        }
+    }
+}
+
 function appendControllerStateGuards(args, runtime, {
     workspaceRoot,
     canonicalRuntimeWorkspaceGuards = isPloinkyBoxRuntime(),
@@ -1615,6 +1657,14 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         alias: hardwareAlias,
     });
     const runtime = getRuntime();
+    // Execution-target start boundary (plan section 5.6): null for every agent without the `executionTarget` key.
+    // A declared target refuses here, before any side effect, unless it is a valid global Podman agent in a Box.
+    const executionTargetPlan = planExecutionTargetLaunch({
+        manifest,
+        runMode: launchRecord.runMode || 'isolated',
+        runtime,
+        insideBox: isPloinkyBoxRuntime(),
+    });
     const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
         runtime,
         manifest,
@@ -2137,9 +2187,38 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.push('-v', `${resourcePlan.persistentStorage.hostPath}:${resourcePlan.persistentStorage.containerPath}${runtime === 'podman' ? ':z' : ''}`);
     }
 
+    // A declared execution target is provisioned before the guards are planned, so the controller state directory
+    // it writes into is already present (and masked) for this and every later bind plan.
+    // Refuse an overlapping grant before provisioning writes any record or mints an incarnation.
+    if (executionTargetPlan) assertExecutionTargetMountsReserved(args);
+    const executionTargetProvisioning = executionTargetPlan
+        ? provisionExecutionTarget({
+            plan: executionTargetPlan,
+            principal: deriveAgentPrincipalId(repoName, agentName),
+            containerName,
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+            image,
+            controllerStateDir: CONTROLLER_STATE_DIR,
+            boxTmpRoot: BOX_TMPFS.destination,
+            adoptOnly: adoptManagedRuntimeOnly,
+            runJournalInit: (journalInitArgs) => spawnSync(runtime, journalInitArgs, {
+                encoding: 'utf8', timeout: JOURNAL_INIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'],
+            }),
+        })
+        : null;
+
     // Apply controller-state guards after every broad, manifest, staged, and
     // resource bind so no later agent-controlled mount can expose old state.
     appendControllerStateGuards(args, runtime);
+
+    // The provisioned target binds are rendered after the guards on purpose: their sources are the controller-private
+    // journal root and the Box-tmpfs mailbox/control directories created above, which no manifest, profile or broad
+    // bind can name. They mount at fixed paths under /run/ploinky-target that no other grant covers.
+    if (executionTargetProvisioning) assertExecutionTargetMountsReserved(args);
+    for (const bind of executionTargetProvisioning?.binds || []) {
+        appendExactManagedBindMount(args, `${bind.source}:${bind.target}${runtime === 'podman' ? ':z' : ''}`);
+    }
 
     const envStrings = [
         ...buildEnvFlags(manifest, profileConfig, { agentName, repoName, profileName: activeProfile, forRuntime: true }),
@@ -3875,6 +3954,15 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         return import('../hardwareLimits/mpsLifecycle.mjs').then(({ ensureMpsAgentService }) => ensureMpsAgentService(agentName, manifest, agentPath, options));
     }
     const targetedRestart = normalizeTargetedRestart(options.targetedRestart);
+    // A targeted restart keeps the instance identity, but an execution target's helper launch file is single-use per
+    // provisioned instance: the recreated container could never start its helper. Refuse before the container is
+    // drained (a caller that already withdrew the route restores it through its failed-restart cleanup).
+    if (targetedRestart && planExecutionTargetLaunch({ manifest, runMode: mpsRecord?.runMode || 'isolated',
+        runtime: preflightAgentRuntime, insideBox: isPloinkyBoxRuntime() })) {
+        const error = new Error(`[restart] ${agentName}: execution targets do not support identity-preserving targeted restarts; replace the instance instead`);
+        error.code = 'PLOINKY_EXECUTION_TARGET_RESTART_UNSUPPORTED';
+        throw error;
+    }
     if (!options.networkLifecycleCapability) {
         return withNetworkLifecycleLock(
             (networkLifecycleCapability) => ensureAgentService(agentName, manifest, agentPath, {
