@@ -896,6 +896,26 @@ export function resolveEdgeRoutePlan({
                 snapshot,
             };
         }
+        if (pathname === '/api/edge/target-helper-ticket') {
+            // Exact POST of the worker's helper-ticket request: no query, fragment or alternate spelling.
+            if (String(req?.method || '').toUpperCase() !== 'POST'
+                || url.search || String(req?.url || '') !== pathname) {
+                return deny(400, 'TARGET_HELPER_TICKET_REQUEST_INVALID', { lease, hostSelection });
+            }
+            return {
+                matched: true,
+                ok: true,
+                kind: 'private-operation',
+                operation: 'target-helper-ticket',
+                listener,
+                host,
+                hostSelection,
+                pathname,
+                parsedUrl: url,
+                lease,
+                snapshot,
+            };
+        }
         if (pathname === '/api/edge/turn-credentials') {
             return {
                 matched: true,

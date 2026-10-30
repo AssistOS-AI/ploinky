@@ -2,8 +2,10 @@
 //
 // Mints the one-use bootstrap/reattach ticket a worker presents to the fixed target helper: a compact HS256 JWS with
 // header `{alg:"HS256",typ:"ploinky-target-helper+jwt",kid}` and exactly the eighteen frozen claims (A11.1 adds `leaseId`), signed with the
-// per-helper-incarnation secret. It is a dedicated token domain (purpose `ploinky.target-helper.v1`, issuer
-// `ploinky-router`): never a coordinator, user, broker, terminal, router-service or agentExec token.
+// per-helper-incarnation secret. Beside the ticket it returns the A11.5 session key: HKDF-SHA256 of the same secret, salt
+// SHA256(canonical claim bytes), info `ploinky-target-session-v1`, 32 bytes, derived inside the secret callback. It is a
+// dedicated token domain (purpose `ploinky.target-helper.v1`, issuer `ploinky-router`): never a coordinator, user, broker,
+// terminal, router-service or agentExec token.
 //
 // The module is a pure library. It registers no route, opens no socket and reads no environment. The secret is reached
 // only through an injected handle provider inside a callback; it is never stored on the minter, returned, logged or
@@ -22,6 +24,9 @@ export const TICKET_AUDIENCE_PREFIX = 'ploinky:target-helper:';
 export const TICKET_PERMISSIONS = Object.freeze(['commit', 'connect', 'input', 'lookup', 'prepare', 'release', 'renew', 'stop']);
 export const TICKET_MAX_LIFETIME_SECONDS = 30;
 export const TICKET_ISSUED_CAPACITY = 4096;
+// A11.5: the per-ticket session key both holders of the incarnation secret derive (helper `session::session_key`).
+export const SESSION_KEY_INFO = 'ploinky-target-session-v1';
+export const SESSION_KEY_BYTES = 32;
 const REPLAY_MARGIN_MS = 2000;
 const MAX_TOKEN_LENGTH = 65536;
 const CONTAINER_ID = /^[0-9a-f]{64}$/;
@@ -148,12 +153,18 @@ function b64(bytes) {
  *   randomBytes   (n) => Buffer; defaults to node:crypto (injected only for deterministic tests)
  *   issuedCapacity  bound on the one-use helper-nonce set; live entries are never evicted
  *
- * mint(context, request) returns {ok:true,value:{ticket,kid,jti,iat,exp}} or {ok:false,error:{code}} and never throws on bad
- * input. `context` is the verified caller context, separate from the request, and must equal the current worker; the
- * binding's whole worker half must equal it too. The request is exactly: binding
+ * mint(context, request) returns {ok:true,value:{ticket,kid,jti,iat,exp,sessionKey}} or {ok:false,error:{code}} and never throws
+ * on bad input. `sessionKey` is the canonical base64url of the 32-byte A11.5 session key of this ticket. `context` is the
+ * verified caller context, separate from the request, and must equal the current worker; the binding's whole worker half
+ * must equal it too. The request is exactly: binding
  * (TargetBinding), leaseId (Id, the lease the ticket is bound to), reservationId (Id), operationId, requestDigest (Digest), helperNonce (helper challenge nonce),
  * channelEpoch / previousChannelEpoch (channelEpoch strictly greater than the last epoch minted for the lease; previous null or lower), permissions (sorted unique
  * subset), ttlSeconds (1..30).
+ *
+ * Lease ownership: the first ticket minted for a leaseId binds that lease to the minting worker principal (principal only,
+ * so a restarted or advanced instance of the same worker keeps its lease). A request for the lease from any other principal
+ * is `caller_mismatch`, checked before the epoch so a foreign caller learns nothing about the lease. The binding is
+ * in memory only and is forgotten with the lease's epoch record; the helper remains the epoch authority.
  */
 // Same bounds as the helper's per-incarnation epoch map: 4096 live leases, forgotten after one execution lifetime idle.
 const LEASE_EPOCH_CAPACITY = 4096;
@@ -172,8 +183,9 @@ export function createTargetHelperTicketMinter({
     const trustedLive = Object.freeze({ workspaceId: live.workspaceId, boxIdentity: live.boxIdentity, boxGeneration: live.boxGeneration });
     // helper-nonce digest -> retain-until ms. A helper nonce is a single challenge: one ticket per nonce.
     const issued = new Map();
-    // leaseId -> {epoch: BigInt, touchedMs}. Epochs never repeat or go backwards for a live lease (A11.2). A lease idle
-    // longer than one execution lifetime is forgotten, mirroring the helper; the helper remains the epoch authority.
+    // leaseId -> {epoch: BigInt, touchedMs, owner}. Epochs never repeat or go backwards for a live lease (A11.2); `owner` is
+    // the worker principal that minted the lease's first ticket. A lease idle longer than one execution lifetime is
+    // forgotten, mirroring the helper; the helper remains the epoch authority.
     const lastEpoch = new Map();
 
     function sweep(nowMs) {
@@ -193,6 +205,7 @@ export function createTargetHelperTicketMinter({
         need(same(caller, current), 'caller_mismatch');
         need(same(caller, { principal: scope.workerPrincipal, runtimeInstanceId: scope.workerRuntimeInstanceId,
             enableGeneration: scope.workerEnableGeneration, generation: scope.workerGeneration }), 'caller_mismatch');
+        return caller;
     }
 
     function checkTarget(scope, request) {
@@ -232,16 +245,17 @@ export function createTargetHelperTicketMinter({
         // a previous epoch, when given, must be lower than the requested one.
         const epoch = BigInt(request.channelEpoch);
         need(request.previousChannelEpoch === null || BigInt(request.previousChannelEpoch) < epoch, 'channel_epoch_conflict');
-        const lastMinted = lastEpoch.get(request.leaseId)?.epoch;
-        need(lastMinted === undefined || epoch > lastMinted, 'channel_epoch_conflict');
-        checkCaller(context, binding.scope);
+        const caller = checkCaller(context, binding.scope);
+        const leaseEntry = lastEpoch.get(request.leaseId);
+        need(leaseEntry === undefined || leaseEntry.owner === caller.principal, 'caller_mismatch');
+        need(leaseEntry === undefined || epoch > leaseEntry.epoch, 'channel_epoch_conflict');
         checkTarget(binding.scope, request);
-        return { request, binding, permissions, ttl };
+        return { request, binding, permissions, ttl, owner: caller.principal };
     }
 
     function mint(context, request) {
         try {
-            const { binding, permissions, ttl } = build(context, request);
+            const { binding, permissions, ttl, owner } = build(context, request);
             const nowMs = now();
             need(Number.isSafeInteger(nowMs) && nowMs >= 0, 'invalid_request');
             sweep(nowMs);
@@ -273,24 +287,35 @@ export function createTargetHelperTicketMinter({
                 permissions: [...permissions],
                 limitsDigest: binding.limitsDigest
             };
-            const payload = b64(Buffer.from(canonicalOrThrow(claims), 'utf8'));
+            const claimBytes = Buffer.from(canonicalOrThrow(claims), 'utf8');
+            const payload = b64(claimBytes);
+            const claimsDigest = crypto.createHash('sha256').update(claimBytes).digest();
             let signed;
             try {
                 signed = secrets.useSecret(Object.freeze(targetIdentity(binding.scope)), (kid, secret) => {
                     if (!isOpaqueIdentity(kid) || !Buffer.isBuffer(secret) || secret.length < 32) return null;
                     const header = b64(Buffer.from(canonicalOrThrow({ alg: 'HS256', typ: TICKET_TYPE, kid }), 'utf8'));
                     const mac = crypto.createHmac('sha256', secret).update(`${header}.${payload}`).digest();
-                    return { ticket: `${header}.${payload}.${b64(mac)}`, kid };
+                    // A11.5: derived here, while the secret is in scope; the raw key bytes are zeroed after encoding. The key is
+                    // encoded from its own buffer (a view of the HKDF output), never through a pooled copy that would survive.
+                    const key = Buffer.from(crypto.hkdfSync('sha256', secret, claimsDigest, SESSION_KEY_INFO, SESSION_KEY_BYTES));
+                    try {
+                        return { ticket: `${header}.${payload}.${b64(mac)}`, kid, sessionKey: key.toString('base64url') };
+                    } finally {
+                        key.fill(0);
+                    }
                 });
             } catch {
                 signed = null;
             }
-            need(isPlainObject(signed) && typeof signed.ticket === 'string', 'secret_unavailable');
+            need(isPlainObject(signed) && typeof signed.ticket === 'string' && typeof signed.sessionKey === 'string', 'secret_unavailable');
             need(signed.ticket.length <= MAX_TOKEN_LENGTH, 'ticket_format');
             // Consume the nonce only after the ticket exists; the entry outlives the ticket by the replay margin.
             issued.set(nonceKey, exp * 1000 + REPLAY_MARGIN_MS);
-            lastEpoch.set(request.leaseId, { epoch: BigInt(request.channelEpoch), touchedMs: nowMs });
-            return Object.freeze({ ok: true, value: Object.freeze({ ticket: signed.ticket, kid: signed.kid, jti: claims.jti, iat, exp }) });
+            lastEpoch.set(request.leaseId, { epoch: BigInt(request.channelEpoch), touchedMs: nowMs, owner });
+            return Object.freeze({ ok: true, value: Object.freeze({
+                ticket: signed.ticket, kid: signed.kid, jti: claims.jti, iat, exp, sessionKey: signed.sessionKey,
+            }) });
         } catch (error) {
             if (error instanceof MintRefusal) return Object.freeze({ ok: false, error: Object.freeze({ code: error.code }) });
             return Object.freeze({ ok: false, error: Object.freeze({ code: 'invalid_request' }) });

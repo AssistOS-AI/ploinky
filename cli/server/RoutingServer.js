@@ -927,6 +927,19 @@ async function processPrivateRequest(req, res) {
         });
         return;
     }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'target-helper-ticket') {
+        // Authenticated and held to the single execution-provider caller by authorizePrivateRoutePlan above. The handler
+        // reads its evidence first, then commits the route plan, then mints; it is not committed here (R2).
+        await sendTargetHelperTicket(res, {
+            plan: routePlan,
+            body,
+            callerIdentity: req.privateAgentIdentity,
+            workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+            insideBox,
+            audit: (event, value) => appendLog(event, value),
+        });
+        return;
+    }
     if (routePlan.kind === 'private-operation' && routePlan.operation === 'runtime-origins') {
         sendRuntimeRouterOrigins(res, {
             plan: routePlan,
@@ -1304,3 +1317,4 @@ server.listen(port, '0.0.0.0', () => {
 import { privateForwardTrustedHeadersFactory } from './executionProvider/coordinatorHop.mjs';
 import { handleTaskReferenceRequest } from './executionProvider/taskReferenceRoutes.mjs';
 import { sendSourceProtection } from './privateRouter.js';
+import { sendTargetHelperTicket } from './privateRouter.js';

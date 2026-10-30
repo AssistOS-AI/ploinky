@@ -464,3 +464,21 @@ test('P4 the previous Router copy is retired only after the new record is writte
     assert.deepEqual(value, { kid: `hti1.${first.helperIncarnation}` });
     assert.equal(seen.length, 1, 'and still serves its incarnation');
 });
+
+test('A11.5 end to end: the session key the Router returns is HKDF over the secret parsed from the helper-side file', (t) => {
+    const env = workspace(t);
+    const result = provision(env);
+    const mint = minterFor(provider(env));
+    const helper = parseHelperFile(fs.readFileSync(instancePaths(env.boxTmpRoot, result.instanceKey).secret, 'utf8'));
+    const minted = mint(target(result));
+    assert.equal(minted.ok, true, JSON.stringify(minted));
+    const claimBytes = Buffer.from(minted.value.ticket.split('.')[1], 'base64url');
+    const expected = Buffer.from(crypto.hkdfSync('sha256', helper.secret, crypto.createHash('sha256').update(claimBytes).digest(),
+        Buffer.from('ploinky-target-session-v1', 'ascii'), 32));
+    assert.equal(minted.value.sessionKey, expected.toString('base64url'));
+    // The session key is neither the secret nor derivable without it: another secret over the same claims differs.
+    assert.notEqual(minted.value.sessionKey, helper.secret.toString('base64url'));
+    const wrong = Buffer.from(crypto.hkdfSync('sha256', crypto.randomBytes(32), crypto.createHash('sha256').update(claimBytes).digest(),
+        Buffer.from('ploinky-target-session-v1', 'ascii'), 32));
+    assert.notEqual(minted.value.sessionKey, wrong.toString('base64url'));
+});

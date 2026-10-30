@@ -454,3 +454,99 @@ test('A11.2 the per-lease epoch record is bounded: a full map refuses a new leas
     clock = NOW + 86_400_000 + 2;
     assert.equal(minter.mint(request({ leaseId: leaseN(0), channelEpoch: '2', helperNonce: nonceN(5002) })).error.code, 'channel_epoch_conflict');
 });
+
+// ---- A11.5 session key and R1 lease ownership (mint route spec 2026-10-30) ----
+
+// Independent restatement of the helper's `session::session_key`: HKDF-SHA256, ikm the incarnation secret, salt
+// SHA256(canonical claim bytes) as raw bytes, info `ploinky-target-session-v1`, 32 bytes.
+function referenceSessionKey(secret, ticket) {
+    const claimBytes = Buffer.from(ticket.split('.')[1], 'base64url');
+    const salt = crypto.createHash('sha256').update(claimBytes).digest();
+    return Buffer.from(crypto.hkdfSync('sha256', secret, salt, Buffer.from('ploinky-target-session-v1', 'ascii'), 32));
+}
+
+test('A11.5 the minter returns the per-ticket session key: HKDF of the incarnation secret over the canonical claims digest', () => {
+    const { minter } = makeMinter();
+    const first = minter.mint(request({ helperNonce: nonce(110) }));
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.deepEqual(Object.keys(first.value).sort(), ['exp', 'iat', 'jti', 'kid', 'sessionKey', 'ticket']);
+    const key = first.value.sessionKey;
+    assert.match(key, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(Buffer.from(key, 'base64url').length, 32);
+    assert.equal(Buffer.from(key, 'base64url').toString('base64url'), key, 'canonical base64url');
+    assert.equal(key, referenceSessionKey(SECRET, first.value.ticket).toString('base64url'));
+    // Fresh per ticket (the claims differ in jti, nonce and epoch); neither the key nor the secret is in the ticket.
+    const second = minter.mint(request({ channelEpoch: '2', helperNonce: nonce(111) }));
+    assert.notEqual(second.value.sessionKey, key);
+    assert.equal(second.value.sessionKey, referenceSessionKey(SECRET, second.value.ticket).toString('base64url'));
+    assert.equal(first.value.ticket.includes(key), false);
+    // A different incarnation secret over the same claims gives a different key: the key is bound to the secret.
+    assert.notEqual(referenceSessionKey(OTHER_SECRET, first.value.ticket).toString('base64url'), key);
+});
+
+// session-fixture-v1.json (AssistOSExplorer robo-work/native/crates/target-helper/tests/vectors, slice P6b, A11), copied
+// here as literals: PUBLIC SYNTHETIC TEST MATERIAL, the fixture key is public and only valid in a proof-fixture build.
+const SESSION_FIXTURE = Object.freeze({
+    kid: 'proof-fixture-helper-ticket-v1',
+    secretHex: '5055424c49432053594e5448455449432070726f6f662d666978747572652076',
+    claimsCanonicalSha256: '63cbcaa88c38776fa59586babf55c91d87386c430edec83108cbef062c4ed869',
+    sessionKeyHex: 'c469c78a13ffd968689de405e341f0198a45f7d1eb7db70b28a833f109a59725',
+    compactJws: 'eyJhbGciOiJIUzI1NiIsImtpZCI6InByb29mLWZpeHR1cmUtaGVscGVyLXRpY2tldC12MSIsInR5cCI6InBsb2lua3ktdGFyZ2V0LWhlbHBlcitqd3QifQ.eyJhdWQiOiJwbG9pbmt5OnRhcmdldC1oZWxwZXI6Y2VmNjJhY2RmZmU5Y2VmMDc1MDk5OTg5MTliY2YxMGE5MTcwMDFhOTQ5MTA2N2MxMjdkYTA5YzAzODEzMWQzNSIsImJpbmRpbmciOnsiYXR0ZW1wdElkIjoiQmdZR0JnWUdCZ1lHQmdZR0JnWUdCZyIsImNoYW5uZWxNYW5pZmVzdERpZ2VzdCI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJjb25maWdSZXZpc2lvbiI6MiwiY29udHJhY3REaWdlc3QiOiIwNzA3MDcwNzA3MDcwNzA3MDcwNzA3MDcwNzA3MDcwNzA3MDcwNzA3MDcwNzA3MDcwNzA3MDcwNzA3MDcwNzA3IiwiY29udHJhY3RWZXJzaW9uIjoxLCJlZmZlY3RpdmVTZWN1cml0eURpZ2VzdCI6IjBjMGMwYzBjMGMwYzBjMGMwYzBjMGMwYzBjMGMwYzBjMGMwYzBjMGMwYzBjMGMwYzBjMGMwYzBjMGMwYzBjMGMiLCJleGVjdXRpb25JZCI6IkJRVUZCUVVGQlFVRkJRVUZCUVVGQlEiLCJncmFudFBvbGljeURpZ2VzdCI6IjBkMGQwZDBkMGQwZDBkMGQwZDBkMGQwZDBkMGQwZDBkMGQwZDBkMGQwZDBkMGQwZDBkMGQwZDBkMGQwZDBkMGQiLCJoZWxwZXJFeGVjdXRhYmxlRGlnZXN0IjoiMDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNiIsImhvbWVDb21wYXRpYmlsaXR5RGlnZXN0IjoiMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMiIsImlucHV0TWFuaWZlc3REaWdlc3QiOiIwZTBlMGUwZTBlMGUwZTBlMGUwZTBlMGUwZTBlMGUwZTBlMGUwZTBlMGUwZTBlMGUwZTBlMGUwZTBlMGUwZTBlIiwiaW52ZW50b3J5RGlnZXN0IjoiMDgwODA4MDgwODA4MDgwODA4MDgwODA4MDgwODA4MDgwODA4MDgwODA4MDgwODA4MDgwODA4MDgwODA4MDgwOCIsImpvdXJuYWxTdG9yZUlkZW50aXR5IjoiQXdNREF3TURBd01EQXdNREF3TURBdyIsImxpbWl0c0RpZ2VzdCI6IjBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEiLCJuYXRpdmVDb25maWdQcm9qZWN0aW9uRGlnZXN0IjoiMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMCIsInByb2ZpbGVEaWdlc3QiOiIwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5IiwicXVhbGlmaWNhdGlvblJlY29yZERpZ2VzdCI6IjBiMGIwYjBiMGIwYjBiMGIwYjBiMGIwYjBiMGIwYjBiMGIwYjBiMGIwYjBiMGIwYjBiMGIwYjBiMGIwYjBiMGIiLCJyb2JvdElkIjoiQkFRRUJBUUVCQVFFQkFRRUJBUUVCQSIsInNjb3BlIjp7ImFnZW50UHJpbmNpcGFsIjoiYWdlbnQ6U3ludGhldGljL3RhcmdldCIsImJveEdlbmVyYXRpb24iOiJib3gtZ2VuZXJhdGlvbi0xIiwiYm94SWRlbnRpdHkiOiJwdWJsaWMtc3ludGhldGljLWJveCIsImNvbnRhaW5lcklkIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImVuYWJsZUdlbmVyYXRpb24iOiJ0YXJnZXQtZW5hYmxlLTEiLCJoZWxwZXJJbmNhcm5hdGlvbiI6IkFnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWciLCJydW50aW1lSW5zdGFuY2VJZCI6InRhcmdldC1ydW50aW1lLTEiLCJ3b3JrZXJFbmFibGVHZW5lcmF0aW9uIjoid29ya2VyLWVuYWJsZS0xIiwid29ya2VyR2VuZXJhdGlvbiI6IkFRRUJBUUVCQVFFQkFRRUJBUUVCQVEiLCJ3b3JrZXJQcmluY2lwYWwiOiJhZ2VudDpTeW50aGV0aWMvd29ya2VyIiwid29ya2VyUnVudGltZUluc3RhbmNlSWQiOiJ3b3JrZXItcnVudGltZS0xIiwid29ya3NwYWNlSWQiOiJwdWJsaWMtc3ludGhldGljLXdvcmtzcGFjZSJ9LCJza2lsbFZpZXdNYW5pZmVzdERpZ2VzdCI6IjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYiLCJzb3VyY2UiOnsicmVwb3NpdG9yeVNvdXJjZU1vZGUiOiJwcm9kIiwic291cmNlQWNjZXB0YW5jZUlkZW50aXR5IjoicHVibGljLXN5bnRoZXRpYy1hY2NlcHRhbmNlIiwic291cmNlQ2xvc3VyZURpZ2VzdCI6IjA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQiLCJzb3VyY2VQcm90ZWN0aW9uRXBvY2giOjMsInNvdXJjZVJlcG9zaXRvcnlJZGVudGl0eSI6Imh0dHBzOi8vZXhhbXBsZS5pbnZhbGlkL3B1YmxpYy1zeW50aGV0aWMuZ2l0Iiwic291cmNlUmV2aXNpb24iOnsiYWxnb3JpdGhtIjoiZ2l0LXNoYTEiLCJ2YWx1ZSI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEifSwic291cmNlU2VsZWN0aW9uRGlnZXN0IjoiMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMyJ9LCJ0YXJnZXRJbWFnZURpZ2VzdCI6InNoYTI1NjowNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1IiwidmVyc2lvbiI6MX0sImNoYW5uZWxFcG9jaCI6IjEiLCJleHAiOjE4MDAwMDAwMzAsImhlbHBlck5vbmNlIjoiSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQSIsImlhdCI6MTgwMDAwMDAwMCwiaXNzIjoicGxvaW5reS1yb3V0ZXIiLCJqdGkiOiJJU0VoSVNFaElTRWhJU0VoSVNFaElTRWhJU0VoSVNFaElTRWhJU0VoSVNFIiwibGVhc2VJZCI6IkNRa0pDUWtKQ1FrSkNRa0pDUWtKQ1EiLCJsaW1pdHNEaWdlc3QiOiIwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhIiwib3BlcmF0aW9uSWQiOiJDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBIiwicGVybWlzc2lvbnMiOlsiY29tbWl0IiwiY29ubmVjdCIsImlucHV0IiwibG9va3VwIiwicHJlcGFyZSIsInJlbGVhc2UiLCJyZW5ldyIsInN0b3AiXSwicHJldmlvdXNDaGFubmVsRXBvY2giOm51bGwsInB1cnBvc2UiOiJwbG9pbmt5LnRhcmdldC1oZWxwZXIudjEiLCJyZXF1ZXN0RGlnZXN0IjoiMTMxMzEzMTMxMzEzMTMxMzEzMTMxMzEzMTMxMzEzMTMxMzEzMTMxMzEzMTMxMzEzMTMxMzEzMTMxMzEzMTMxMyIsInJlc2VydmF0aW9uSWQiOiJCd2NIQndjSEJ3Y0hCd2NIQndjSEJ3Iiwic3ViIjoiYWdlbnQ6U3ludGhldGljL3dvcmtlciIsInZlcnNpb24iOjF9.IVlhWd60Yuy0yCGzVAkLRlUkf215R222L2dCAioNLaw',
+});
+
+test('A11.5 the minter reproduces session-fixture-v1.json byte for byte: the compact JWS and the session key', () => {
+    const fixtureClaims = JSON.parse(Buffer.from(SESSION_FIXTURE.compactJws.split('.')[1], 'base64url').toString('utf8'));
+    const sc = fixtureClaims.binding.scope;
+    const secret = Buffer.from(SESSION_FIXTURE.secretHex, 'hex');
+    const worker = { principal: sc.workerPrincipal, runtimeInstanceId: sc.workerRuntimeInstanceId, enableGeneration: sc.workerEnableGeneration, generation: sc.workerGeneration };
+    const authority = createTargetHelperCallerAuthority();
+    const raw = createTargetHelperTicketMinter({
+        live: { workspaceId: sc.workspaceId, boxIdentity: sc.boxIdentity, boxGeneration: sc.boxGeneration },
+        readTarget: (scopeArg) => entryFor(scopeArg),
+        readWorker: () => worker,
+        callerAuthority: authority,
+        secrets: { useSecret: (_target, fn) => fn(SESSION_FIXTURE.kid, Buffer.from(secret)) },
+        now: () => fixtureClaims.iat * 1000,
+        randomBytes: (n) => Buffer.alloc(n, 0x21),
+    });
+    const minted = raw.mint(authority.issue(worker), {
+        binding: fixtureClaims.binding, leaseId: fixtureClaims.leaseId, reservationId: fixtureClaims.reservationId,
+        operationId: fixtureClaims.operationId, requestDigest: fixtureClaims.requestDigest, helperNonce: fixtureClaims.helperNonce,
+        channelEpoch: fixtureClaims.channelEpoch, previousChannelEpoch: fixtureClaims.previousChannelEpoch,
+        permissions: fixtureClaims.permissions, ttlSeconds: fixtureClaims.exp - fixtureClaims.iat,
+    });
+    assert.equal(minted.ok, true, JSON.stringify(minted));
+    assert.equal(minted.value.ticket, SESSION_FIXTURE.compactJws);
+    assert.equal(crypto.createHash('sha256').update(Buffer.from(minted.value.ticket.split('.')[1], 'base64url')).digest('hex'), SESSION_FIXTURE.claimsCanonicalSha256);
+    assert.equal(Buffer.from(minted.value.sessionKey, 'base64url').toString('hex'), SESSION_FIXTURE.sessionKeyHex);
+});
+
+test('R1 a lease is bound to the principal that minted its first ticket; another principal is caller_mismatch, the same worker after a restart keeps it', () => {
+    const authority = createTargetHelperCallerAuthority();
+    let current = WORKER;
+    const raw = createTargetHelperTicketMinter({
+        live: LIVE, readTarget: (sc) => entryFor(sc), readWorker: () => current, callerAuthority: authority,
+        secrets: { useSecret: (_target, fn) => fn(KID, Buffer.from(SECRET)) }, now: () => NOW,
+    });
+    const as = (worker, overrides) => {
+        current = worker;
+        const half = { workerPrincipal: worker.principal, workerRuntimeInstanceId: worker.runtimeInstanceId,
+            workerEnableGeneration: worker.enableGeneration, workerGeneration: worker.generation };
+        return raw.mint(authority.issue(worker), request({ binding: binding(half), leaseId: id(120), ...overrides }));
+    };
+    assert.equal(as(WORKER, { channelEpoch: '5', helperNonce: nonce(120) }).ok, true);
+    // Another principal, even with an epoch above or below the lease's last epoch: caller_mismatch, never an epoch answer.
+    const other = { principal: 'agent:robo/other', runtimeInstanceId: 'oinst-1', enableGeneration: 'ogen-1', generation: id(9) };
+    for (const epoch of ['1', '5', '6', '99']) {
+        assert.equal(as(other, { channelEpoch: epoch, helperNonce: nonce(121) }).error.code, 'caller_mismatch', epoch);
+    }
+    // The refusals consumed nothing: the owner continues with the next epoch and the same nonce the other caller tried.
+    assert.equal(as(WORKER, { channelEpoch: '6', helperNonce: nonce(121) }).ok, true);
+    // A restarted (new instance, enable generation) or advanced (new generation) instance of the same worker keeps the lease.
+    const restarted = { ...WORKER, runtimeInstanceId: 'winst-2', enableGeneration: 'wgen-2', generation: id(10) };
+    assert.equal(as(restarted, { channelEpoch: '7', helperNonce: nonce(122) }).ok, true);
+    assert.equal(as(restarted, { channelEpoch: '7', helperNonce: nonce(123) }).error.code, 'channel_epoch_conflict');
+    // The other principal can open its own lease.
+    assert.equal(as(other, { leaseId: id(121), channelEpoch: '1', helperNonce: nonce(124) }).ok, true);
+    assert.equal(as(WORKER, { leaseId: id(121), channelEpoch: '2', helperNonce: nonce(125) }).error.code, 'caller_mismatch');
+});
