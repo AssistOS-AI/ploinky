@@ -56,6 +56,16 @@ function canonicalDataRoot(workspaceRoot) {
     return projectedCanonicalPath(lexical);
 }
 
+function pathExists(target) {
+    try {
+        fs.lstatSync(target);
+        return true;
+    } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+    }
+}
+
 function isRealDirectory(target) {
     try {
         const stat = fs.lstatSync(target);
@@ -68,24 +78,36 @@ function isRealDirectory(target) {
 
 // Every first-level directory of `.data` plus the declared peer roots, minus
 // the ones the owner needs, deduplicated so no mask sits inside another.
-function peerMaskRoots(dataRoot, ownRoots, peerRoots) {
+function peerMaskRoots(dataRoot, ownRoots, peerRoots, skipped = []) {
     const candidates = new Set();
+    const declaredPeers = new Set();
     for (const entry of fs.readdirSync(dataRoot, { withFileTypes: true })) {
         if (entry.isDirectory()) candidates.add(path.join(dataRoot, entry.name));
     }
     for (const peerRoot of peerRoots || []) {
-        const resolved = projectedCanonicalPath(peerRoot);
+        // Canonicalize the parent only: a link planted at the peer path itself
+        // must stay visible as a link so it is reported, never followed.
+        const resolved = path.join(projectedCanonicalPath(path.dirname(path.resolve(peerRoot))),
+            path.basename(peerRoot));
         if (!isPathWithin(resolved, dataRoot) || resolved === dataRoot) {
             throw guardError(`peer agent data root '${peerRoot}' must be strictly inside '${dataRoot}'`, {
                 peerRoot, dataRoot,
             });
         }
         candidates.add(resolved);
+        declaredPeers.add(resolved);
     }
-    const eligible = Array.from(candidates).filter(candidate => (
-        isRealDirectory(candidate)
-        && !ownRoots.some(own => isPathWithin(candidate, own) || isPathWithin(own, candidate))
-    ));
+    const eligible = Array.from(candidates).filter(candidate => {
+        if (ownRoots.some(own => isPathWithin(candidate, own) || isPathWithin(own, candidate))) return false;
+        if (isRealDirectory(candidate)) return true;
+        // A declared peer path that exists as a link or a file cannot be masked
+        // by a directory mount; report it instead of failing the launch. An
+        // absent path is expected (the peer has not started) and not reported.
+        if (declaredPeers.has(candidate) && pathExists(candidate)) {
+            skipped.push({ peer: candidate, reason: 'not a real directory (link or file)' });
+        }
+        return false;
+    });
     return eligible
         .filter(candidate => !eligible.some(other => other !== candidate && isPathWithin(candidate, other)))
         .sort();
@@ -121,7 +143,7 @@ export function planAgentPrivateDataGuards(bindings, {
         ...grants.filter(grant => grant.source !== dataRoot && isPathWithin(grant.source, dataRoot))
             .map(grant => grant.source),
     ];
-    const peers = peerMaskRoots(dataRoot, ownRoots, peerRoots);
+    const peers = peerMaskRoots(dataRoot, ownRoots, peerRoots, plan.skipped);
     if (!peers.length) return plan;
 
     const masks = new Map();
@@ -159,6 +181,10 @@ export function planAgentPrivateDataGuards(bindings, {
 // over the single empty guard source.
 export function agentPrivateDataGuardMounts(bindings, options = {}) {
     const plan = planAgentPrivateDataGuards(bindings, options);
+    if (plan.skipped.length) {
+        console.warn(`[agent-data] ${plan.skipped.length} peer private data path(s) left unmasked: `
+            + plan.skipped.map(entry => `${entry.peer} (${entry.reason})`).join('; '));
+    }
     if (!plan.masks.length) return [];
     const source = ensureAgentDataGuardSource({
         workspaceRoot: options.workspaceRoot || PLOINKY_WORKSPACE_ROOT,

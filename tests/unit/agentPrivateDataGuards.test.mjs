@@ -189,8 +189,10 @@ test('docker and podman launches render the masks read-only and never mask the o
         assert.ok(rendered.some(value => value.endsWith(`:${path.join(workspace, '.ploinky-box')}${ro}`)));
         // Planning again over the rendered args adds nothing: the targets are taken.
         const rerendered = [...args];
+        const quiet = t.mock.method(console, 'warn', () => {});
         assert.deepEqual(appendAgentPrivateDataGuards(rerendered, runtime, { workspaceRoot: workspace, peerRoots: [] }), []);
         assert.deepEqual(rerendered, args);
+        quiet.mock.restore();
     }
 });
 
@@ -314,4 +316,32 @@ test('the launch reads the real registry and masks the home of a peer that has n
     appendAgentPrivateDataGuards(adoptArgs, 'podman', { workspaceRoot: workspace, adoptOnly: true });
     assert.equal(fs.existsSync(path.join(data, 'late')), false);
     assert.ok(adoptArgs.some(value => value.endsWith(`:${path.join(data, 'peer-alias')}:z,ro`)));
+});
+
+test('a peer path that is a file or a link is reported as unmaskable and never fails a launch', t => {
+    const { workspace, data } = fixture(t, ['robo', 'robo-home', 'shared', 'good-peer']);
+    fs.writeFileSync(path.join(data, 'file-peer'), 'not a directory');
+    fs.symlinkSync('good-peer', path.join(data, 'link-peer'));
+    const registry = {
+        'ctr-1': { type: 'agent', agentName: 'file-peer', repoName: 'r' },
+        'ctr-2': { type: 'agent', agentName: 'link-peer', repoName: 'r' },
+        'ctr-3': { type: 'agent', agentName: 'good-peer', repoName: 'r' },
+    };
+    const roots = collectRegisteredPeerAgentDataRoots({
+        workspaceRoot: workspace, create: true, readRegistry: () => registry, describe: () => null,
+    });
+    assert.deepEqual(roots.map(root => path.basename(root)), ['file-peer', 'good-peer', 'link-peer']);
+    assert.equal(fs.readFileSync(path.join(data, 'file-peer'), 'utf8'), 'not a directory', 'the file is untouched');
+    assert.equal(fs.lstatSync(path.join(data, 'link-peer')).isSymbolicLink(), true, 'the link is not followed');
+
+    const plan = planAgentPrivateDataGuards(ownerBindings(workspace), { workspaceRoot: workspace, peerRoots: roots });
+    assert.deepEqual(plan.masks.map(mask => path.basename(mask.target)), ['good-peer']);
+    assert.deepEqual(plan.skipped.map(entry => path.basename(entry.peer)).sort(), ['file-peer', 'link-peer']);
+
+    const warnings = [];
+    t.mock.method(console, 'warn', (message) => { warnings.push(String(message)); });
+    const mounts = agentPrivateDataGuardMounts(ownerBindings(workspace), { workspaceRoot: workspace, peerRoots: roots });
+    assert.equal(mounts.filter(mount => !mount.parent).length, 1);
+    assert.equal(warnings.length, 1, 'one warning per launch');
+    assert.match(warnings[0], /file-peer.*link-peer|link-peer.*file-peer/);
 });

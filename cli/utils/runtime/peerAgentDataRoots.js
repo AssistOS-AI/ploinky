@@ -6,7 +6,6 @@ import { readAgentRegistrySnapshot } from '../agentRegistrySnapshot.js';
 import { sanitizeAgentDataName } from '../workspaceStructure.js';
 import {
     AGENT_DATA_POLICY_CODE,
-    assertCanonicalAgentDataPath,
     ensureAgentDataDirectory,
     validateAgentDataKey,
 } from './agentDataPathPolicy.js';
@@ -40,15 +39,10 @@ export function collectRegisteredPeerAgentDataRoots({
     const root = path.resolve(workspaceRoot);
     const dataRoot = path.join(root, '.data');
     const declared = new Set();
-    const declare = (target) => {
-        try {
-            assertCanonicalAgentDataPath(target, { workspaceRoot: root });
-        } catch (error) {
-            if (error?.code === AGENT_DATA_POLICY_CODE) return;
-            throw error;
-        }
-        declared.add(target);
-    };
+    // Every declared path is a validated single segment directly beneath
+    // `.data`, so it is lexically safe. Whether it is a real directory is the
+    // planner's call (it reports a link or a file instead of following it).
+    const declare = (target) => { declared.add(target); };
     for (const [name, record] of Object.entries(readRegistry() || {})) {
         if (name.startsWith('_') || !record || typeof record !== 'object') continue;
         const agentName = typeof record.agentName === 'string' ? record.agentName : '';
@@ -67,6 +61,19 @@ export function collectRegisteredPeerAgentDataRoots({
         declare(path.join(dataRoot, key));
     }
     const roots = Array.from(declared).sort();
-    if (create) for (const target of roots) ensureDirectory(target);
+    // Creation is best effort for peers: a peer path that cannot become a
+    // directory (a file or link planted there, a policy refusal) must not stop
+    // an unrelated agent from launching. It stays declared, and the planner then
+    // reports it as not maskable. The agent's own storage keeps its hard failure
+    // where it is created (ensurePersistentStorageHostDir / the home bootstrap).
+    if (create) {
+        for (const target of roots) {
+            try {
+                ensureDirectory(target);
+            } catch (_) {
+                // reported by planAgentPrivateDataGuards when the path is not a real directory
+            }
+        }
+    }
     return roots;
 }
