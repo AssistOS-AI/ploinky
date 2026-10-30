@@ -120,6 +120,8 @@ import {
     prepareControllerGuardMountpointCleanup,
     protectedControllerStateRoots,
 } from '../../utils/runtime/controllerStateGuards.js';
+import { agentPrivateDataGuardMounts } from '../../utils/runtime/agentPrivateDataGuards.js';
+import { collectRegisteredPeerAgentDataRoots } from '../../utils/runtime/peerAgentDataRoots.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
 import {
@@ -1175,6 +1177,30 @@ function appendControllerStateGuards(args, runtime, {
         appendExactManagedBindMount(args, `${guard.source}:${guard.target}${suffix}`);
     }
     return targets;
+}
+
+// Masks every other agent's private `.data` directory inside this runtime's
+// workspace grant (see cli/utils/runtime/agentPrivateDataGuards.js). Peers come
+// from the agent registry at this launch, so an agent registered later is only
+// masked in containers created after it; a read-only adoption creates nothing.
+function appendAgentPrivateDataGuards(args, runtime, {
+    workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+    adoptOnly = false,
+    peerRoots = null,
+} = {}) {
+    const bindings = expectedBindMountsFromArgs(args).map(mount => ({
+        hostPath: mount.source,
+        runtimePath: mount.destination,
+        readOnly: !mount.rw,
+    }));
+    const roots = peerRoots || collectRegisteredPeerAgentDataRoots({ workspaceRoot, create: !adoptOnly });
+    const mounts = agentPrivateDataGuardMounts(bindings, { workspaceRoot, peerRoots: roots });
+    for (const mount of mounts) {
+        const suffix = runtime === 'podman'
+            ? (mount.readOnly ? ':z,ro' : ':z') : (mount.readOnly ? ':ro' : '');
+        appendExactManagedBindMount(args, `${mount.source}:${mount.target}${suffix}`);
+    }
+    return mounts;
 }
 
 function expectedBindMountsFromArgs(args, descriptorHostFile = '') {
@@ -2240,6 +2266,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // Apply controller-state guards after every broad, manifest, staged, and
     // resource bind so no later agent-controlled mount can expose old state.
     appendControllerStateGuards(args, runtime);
+    // Peer agents' private `.data` directories are masked after every other
+    // bind too, and after the controller guards they must not conflict with.
+    appendAgentPrivateDataGuards(args, runtime, { adoptOnly: adoptManagedRuntimeOnly });
 
     // The provisioned target binds are rendered after the guards on purpose: their sources are the controller-private
     // journal root and the Box-tmpfs mailbox/control directories created above, which no manifest, profile or broad
@@ -5592,6 +5621,7 @@ export function isGenerationCapabilityRuntimeEffective({
 export {
     assertPodmanCodeMountAllowed,
     appendControllerStateGuards,
+    appendAgentPrivateDataGuards,
     appendExactManagedBindMount,
     runningMailboxRootHolders,
     appendUniquePortMapping,

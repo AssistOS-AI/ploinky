@@ -177,7 +177,7 @@ export function getAgentDataDir(instanceName) {
     return path.join(AGENTS_DATA_DIR, sanitizeAgentDataName(instanceName));
 }
 
-function sanitizeAgentDataName(value) {
+export function sanitizeAgentDataName(value) {
     return String(value || 'agent').replace(/[^A-Za-z0-9_.-]/g, '_');
 }
 

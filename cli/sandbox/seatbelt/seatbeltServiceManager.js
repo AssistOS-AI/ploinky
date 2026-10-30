@@ -107,6 +107,7 @@ import { buildFullEnvMap } from '../bwrap/bwrapServiceManager.js';
 import { agentLibGrant, agentLibReuseProblem, agentLibRuntimeRecord } from '../agentLibGrant.js';
 import { detectHostRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
 // Seatbelt profile generator
+import { collectRegisteredPeerAgentDataRoots } from '../../utils/runtime/peerAgentDataRoots.js';
 import { buildSeatbeltProfile, writeSeatbeltProfile } from './seatbeltProfile.js';
 import { assertRouterEndpoint } from '../routerPort.js';
 import {
@@ -701,6 +702,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
             ...readManifestVolumeOptions(profileConfig),
         },
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+        peerAgentDataRoots: collectRegisteredPeerAgentDataRoots({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, create: true }),
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
             ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : [])
@@ -1188,6 +1190,7 @@ async function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir
             ...readManifestVolumeOptions(profileConfig),
         },
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+        peerAgentDataRoots: collectRegisteredPeerAgentDataRoots({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, create: true }),
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
             ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : [])

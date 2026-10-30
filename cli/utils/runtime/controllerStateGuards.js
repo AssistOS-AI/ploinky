@@ -87,18 +87,39 @@ export function ensureControllerGuardSources({
     fs.chmodSync(base, 0o700);
     const sources = new Map();
     for (const protectedRoot of protectedControllerStateRoots(workspaceRoot)) {
-        const source = path.join(base, protectedRoot.key);
-        fs.mkdirSync(source, { recursive: true, mode: 0o555 });
-        if (fs.lstatSync(source).isSymbolicLink()) {
-            throw guardError(`runtime guard source '${source}' must be a physical directory`, { source });
-        }
-        if (fs.readdirSync(source).length !== 0) {
-            throw guardError(`runtime guard source '${source}' is not empty`, { source });
-        }
-        fs.chmodSync(source, 0o555);
-        sources.set(protectedRoot.key, source);
+        sources.set(protectedRoot.key, ensureEmptyGuardSource(base, protectedRoot.key));
     }
     return sources;
+}
+
+function ensureEmptyGuardSource(base, key) {
+    const source = path.join(base, key);
+    fs.mkdirSync(source, { recursive: true, mode: 0o555 });
+    if (fs.lstatSync(source).isSymbolicLink()) {
+        throw guardError(`runtime guard source '${source}' must be a physical directory`, { source });
+    }
+    if (fs.readdirSync(source).length !== 0) {
+        throw guardError(`runtime guard source '${source}' is not empty`, { source });
+    }
+    fs.chmodSync(source, 0o555);
+    return source;
+}
+
+// The one empty read-only source every peer-agent private data mask mounts.
+// It lives beside the controller guard sources, outside the workspace, and is
+// shared by all masks: a bind source may back any number of targets.
+export const AGENT_DATA_GUARD_KEY = 'agent-data';
+
+export function ensureAgentDataGuardSource({
+    workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+} = {}) {
+    const base = guardBase(workspaceRoot);
+    fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+    if (fs.lstatSync(base).isSymbolicLink()) {
+        throw guardError(`runtime guard base '${base}' must be a physical directory`, { base });
+    }
+    fs.chmodSync(base, 0o700);
+    return ensureEmptyGuardSource(base, AGENT_DATA_GUARD_KEY);
 }
 
 // The host state skeleton is never removed by code: a masked Box keeps it as a
@@ -140,12 +161,12 @@ export function normalizeRuntimeMountTarget(value) {
     return path.posix.resolve(target);
 }
 
-function runtimeDescendant(target, relativeHostPath) {
+export function runtimeDescendant(target, relativeHostPath) {
     const segments = relativeHostPath.split(path.sep).filter(Boolean);
     return normalizeRuntimeMountTarget(path.posix.join(normalizeRuntimeMountTarget(target), ...segments));
 }
 
-function runtimePathWithin(candidate, parent) {
+export function runtimePathWithin(candidate, parent) {
     return candidate === parent || candidate.startsWith(parent === '/' ? '/' : `${parent}/`);
 }
 

@@ -53,6 +53,8 @@ import {
     controllerGuardTargets,
     normalizeRuntimeMountTarget,
 } from '../../utils/runtime/controllerStateGuards.js';
+import { agentPrivateDataGuardMounts } from '../../utils/runtime/agentPrivateDataGuards.js';
+import { collectRegisteredPeerAgentDataRoots } from '../../utils/runtime/peerAgentDataRoots.js';
 import {
     assertCanonicalAgentDataPath,
     ensureAgentDataDirectory,
@@ -532,7 +534,6 @@ function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_R
     }
     const targets = controllerGuardTargets(bindings, { workspaceRoot });
     const guards = controllerGuardMounts(targets, { workspaceRoot, bindings });
-    if (!guards.length) return targets;
     for (const guard of guards) {
         if (guard.replaceExisting) {
             for (const binding of bindings) {
@@ -542,6 +543,16 @@ function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_R
             bindings.push({ hostPath: guard.source, runtimePath: guard.target, readOnly: guard.readOnly });
         }
     }
+    // Every other agent's private `.data` directory is masked inside a
+    // workspace grant, after the controller guards and every other bind.
+    const privateDataGuards = agentPrivateDataGuardMounts(bindings, {
+        workspaceRoot,
+        peerRoots: collectRegisteredPeerAgentDataRoots({ workspaceRoot, create: true }),
+    });
+    for (const guard of privateDataGuards) {
+        bindings.push({ hostPath: guard.source, runtimePath: guard.target, readOnly: guard.readOnly });
+    }
+    if (!guards.length && !privateDataGuards.length) return targets;
     // Bubblewrap applies mounts sequentially. Parent pins must precede existing
     // descendant grants, otherwise they hide dependency/source alias overlays.
     // Keep equal-target precedence and every non-bind argument unchanged.

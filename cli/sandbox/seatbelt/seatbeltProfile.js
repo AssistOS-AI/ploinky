@@ -14,6 +14,7 @@ import {
     resolveManifestVolumeHostPath,
 } from '../../utils/runtime/manifestVolumePolicy.js';
 import { protectedControllerStateRoots } from '../../utils/runtime/controllerStateGuards.js';
+import { peerAgentDataDenyPaths } from '../../utils/runtime/agentPrivateDataGuards.js';
 import {
     AGENT_DATA_POLICY_CODE,
     isPathWithin,
@@ -45,6 +46,7 @@ function buildSeatbeltProfile(options) {
         workspaceRoot = PLOINKY_WORKSPACE_ROOT,
         extraReadPaths = [],
         extraWritePaths = [],
+        peerAgentDataRoots = [],
         agentLibGrant: grant = null,
     } = options;
 
@@ -274,6 +276,30 @@ function buildSeatbeltProfile(options) {
     }
     lines.push(')');
     lines.push('');
+    // Seatbelt creates no mount namespace, so a peer agent's private `.data`
+    // directory cannot be masked by an empty bind. Deny it, and renaming it or
+    // its parent away, for every spelling. The agent's own homes, volumes,
+    // persistent storage and the shared directory are never peers.
+    const peerDataRoots = peerAgentDataDenyPaths([
+        agentWorkDir,
+        sharedDir,
+        ...normalizedVolumes,
+        ...normalizedExtraWritePaths,
+    ].filter(Boolean), { workspaceRoot, peerRoots: peerAgentDataRoots });
+    if (peerDataRoots.length) {
+        const peerRules = dedupePathRules(peerDataRoots.flatMap(root => (
+            pathAliases(root).map(value => ({ kind: 'subpath', path: value }))
+        )));
+        const dataRootRules = pathAliases(path.join(path.resolve(workspaceRoot), '.data'));
+        lines.push('; Peer agents\' private data is opaque even through a broad workspace grant');
+        lines.push('(deny file-read* file-write*');
+        for (const rule of peerRules) lines.push(`    (${rule.kind} ${sbplQuote(rule.path)})`);
+        lines.push(')');
+        lines.push('(deny file-write*');
+        for (const value of dataRootRules) lines.push(`    (literal ${sbplQuote(value)})`);
+        lines.push(')');
+        lines.push('');
+    }
 
     return lines.join('\n') + '\n';
 }
