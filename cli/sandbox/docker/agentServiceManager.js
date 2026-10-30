@@ -102,6 +102,7 @@ import { buildAgentShellArgs } from './agentShell.js';
 import { AGENTS_DATA_DIR, CONTROLLER_STATE_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, PLOINKY_SKILL_SCOPE_ENV, SHARED_DIR } from '../../utils/config.js';
 import { BOX_TMPFS } from '../../../ploinky-box/constants.mjs';
 import { planExecutionTargetLaunch, provisionExecutionTarget, JOURNAL_INIT_TIMEOUT_MS, TARGET_RUNTIME_ROOT } from '../../server/executionTarget/provisioning.mjs';
+import { ensureMailboxRoot, planWorkerMailboxGrant, retireInstanceMailboxes, WORKER_TARGETS_PATH } from '../../server/executionTarget/workerMailbox.mjs';
 import { ensureHostLaunchSkeleton, withHostLaunchExclusion } from '../hostLaunchExclusion.js';
 import {
     planRuntimeResources,
@@ -170,6 +171,7 @@ import {
 } from '../../utils/runtime/profileService.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../../utils/runtime/startupReadiness.js';
 import { assertExecutionProviderPublication } from '../../server/executionProvider/publication.mjs';
+import { readExecutionProviderDeclaration } from '../../server/executionProvider/declaration.mjs';
 import {
     getAgentWorkDir,
     getAgentCodePath,
@@ -942,6 +944,7 @@ function removeContainerForRecreate(runtime, containerName, label, record = null
         // A failed retirement aborts this launch before any successor exists.
         if (predecessorReceipt) retireRuntimePredecessor(predecessorReceipt);
         clearLivenessState(containerName);
+        retireRemovedTargetMailboxes(containerName, exactRecord, { keepCurrent: true });
         return result;
     } catch (cause) {
         if (isLegacyAgentLifecycleRefusal(cause)) throw cause;
@@ -1665,6 +1668,32 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         runtime,
         insideBox: isPloinkyBoxRuntime(),
     });
+    // The single execution-provider worker's read-only view of every target mailbox (a separate decision from the
+    // target plan; null for every agent without an `executionProvider` declaration).
+    const workerMailboxGrant = planWorkerMailboxGrant({
+        manifest,
+        routeKey: options.alias || launchRecord.alias || agentName,
+        repoName,
+        agentName,
+        runtime,
+        insideBox: isPloinkyBoxRuntime(),
+        registry: agentSnapshot,
+        readManifestOf: routedAgentManifestReader(),
+        readProviderDeclaration: readExecutionProviderDeclaration,
+        boxTmpRoot: BOX_TMPFS.destination,
+        listMailboxRootHolders: (source) => runningMailboxRootHolders(runtime, source),
+        ownContainers: {
+            containerName,
+            predecessor: options.replacementPredecessor
+                ? { containerName: options.replacementPredecessor.containerName, containerId: options.replacementPredecessor.containerId }
+                : null,
+        },
+    });
+    if (workerMailboxGrant?.withheld === 'ambiguous') {
+        console.error(`[start] ${repoName}/${agentName}: target mailboxes withheld from this worker: more than one execution provider is enabled (${workerMailboxGrant.principals.join(', ')})`);
+    } else if (workerMailboxGrant?.withheld === 'held-elsewhere') {
+        console.error(`[start] ${repoName}/${agentName}: target mailboxes withheld from this worker: the mailbox root is already held by another container (${workerMailboxGrant.holders ? workerMailboxGrant.holders.join(', ') : 'holders could not be listed'})`);
+    }
     const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
         runtime,
         manifest,
@@ -2218,6 +2247,18 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (executionTargetProvisioning) assertExecutionTargetMountsReserved(args);
     for (const bind of executionTargetProvisioning?.binds || []) {
         appendExactManagedBindMount(args, `${bind.source}:${bind.target}${runtime === 'podman' ? ':z' : ''}`);
+    }
+    // The worker's mailbox-only root, read-only, after every guard and target bind. The root holds only per-incarnation
+    // mailboxes (no control directory or secret), so targets provisioned later appear without a worker restart. A
+    // worker started before any target creates it; adoption only accepts the exact existing directory.
+    if (workerMailboxGrant?.source) {
+        if (adoptManagedRuntimeOnly) {
+            requireManagedAdoptionDirectory(workerMailboxGrant.source, 'worker target mailbox root', { requireOwner: true });
+        } else {
+            ensureMailboxRoot({ boxTmpRoot: BOX_TMPFS.destination });
+        }
+        assertExecutionTargetMountsReserved(args, WORKER_TARGETS_PATH);
+        appendExactManagedBindMount(args, `${workerMailboxGrant.source}:${WORKER_TARGETS_PATH}:z,ro`);
     }
 
     const envStrings = [
@@ -4799,6 +4840,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
             adoptManagedRuntimeOnly,
+            // The exact predecessor a coordinated replacement retires after this launch (still running meanwhile).
+            replacementPredecessor: options.replacementPredecessor || null,
             ...(existingRuntimeAtEntry && recreateReason && !targetedRestart && !preservePreparedRegistryRecord
                 ? { predecessorRegistryRecord: structuredClone(existingRecord) }
                 : {}),
@@ -5027,6 +5070,7 @@ function removeExactGenerationCandidate({
     network,
     record,
     assertExistingAgent = null,
+    keepCurrentMailbox = false,
 } = {}) {
     const cleanup = createNetworkLifecycleAdapter({ runtime: getRuntime() }).removeExactContainer(
         containerName,
@@ -5045,6 +5089,7 @@ function removeExactGenerationCandidate({
         throw new Error(`exact failed candidate was preserved (${cleanup.reason || cleanup.state || 'ownership mismatch'})`);
     }
     clearLivenessState(containerName);
+    retireRemovedTargetMailboxes(containerName, record, { keepCurrent: keepCurrentMailbox });
     return cleanup;
 }
 
@@ -5072,7 +5117,65 @@ export function retireExactAgentRuntimePredecessor(predecessor, {
             runtime: legacy.runtime, runMode: legacy.runMode, containerName, containerId, record: inspected,
             registryRecord: record,
         }),
+        keepCurrentMailbox: true,
     });
+}
+
+// Another agent's manifest as the Router reads it: from the `hostPath` of its route in routing.json (read once per
+// start). Null when the route has none; throws when a routed manifest cannot be read (the grant then fails closed).
+function routedAgentManifestReader(loadRouting = readRoutingConfig) {
+    let routing = null;
+    return ({ routeKey }) => {
+        routing ||= loadRouting();
+        const hostPath = String(routing?.routes?.[routeKey]?.hostPath || '').trim();
+        if (!hostPath) return null;
+        return JSON.parse(fs.readFileSync(path.join(hostPath, 'manifest.json'), 'utf8'));
+    };
+}
+
+// The running containers (exact name and immutable id) that bind exactly `source`, as the container runtime reports
+// them. A container that disappears between the listing and its inspection is skipped; any other failure throws (the
+// grant then fails closed).
+function runningMailboxRootHolders(runtime, source, run = spawnSync) {
+    const query = (args) => run(runtime, args, { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+    const running = () => {
+        const listed = query(['ps', '-q', '--no-trunc']);
+        if (listed?.error || listed?.status !== 0) throw new Error('running containers could not be listed');
+        return String(listed.stdout || '').split('\n').map((id) => id.trim()).filter(Boolean);
+    };
+    const wanted = path.resolve(source);
+    const holders = [];
+    for (const id of running()) {
+        const inspected = query(['inspect', '--type', 'container', '--format', '{{json .}}', id]);
+        if (inspected?.error || inspected?.status !== 0) {
+            if (running().includes(id)) throw new Error(`running container ${id} could not be inspected`);
+            continue;
+        }
+        const record = JSON.parse(String(inspected.stdout || '').trim());
+        const mounts = Array.isArray(record?.Mounts) ? record.Mounts : [];
+        if (mounts.some((mount) => typeof mount?.Source === 'string' && path.resolve(mount.Source) === wanted)) {
+            holders.push({ id: String(record.Id || id), name: String(record.Name || '').replace(/^\//, '') });
+        }
+    }
+    return holders;
+}
+
+// Once the exact container of a target instance is proven removed or absent, its own incarnation mailboxes go (exact
+// owner match in the provisioning record; `keepCurrent` for predecessor retirement). Best effort and silent: only
+// inside a Box, never for another instance, and never a failure of the removal.
+function retireRemovedTargetMailboxes(containerName, record, { keepCurrent = false } = {}) {
+    try {
+        if (!isPloinkyBoxRuntime() || !record?.repoName || !record?.agentName) return;
+        retireInstanceMailboxes({
+            controllerStateDir: CONTROLLER_STATE_DIR,
+            boxTmpRoot: BOX_TMPFS.destination,
+            principal: deriveAgentPrincipalId(record.repoName, record.agentName),
+            containerName,
+            instanceId: String(record.instanceId || ''),
+            enableGeneration: String(record.enableGeneration || ''),
+            keepCurrent,
+        });
+    } catch (_) {}
 }
 
 /**
@@ -5490,6 +5593,7 @@ export {
     assertPodmanCodeMountAllowed,
     appendControllerStateGuards,
     appendExactManagedBindMount,
+    runningMailboxRootHolders,
     appendUniquePortMapping,
     buildPersistentAgentRunArgs,
     buildBoxPodmanHostArgs,

@@ -461,7 +461,9 @@ function planAgentEnable({
     aliasParam,
     authModeParam,
     authOptions = {},
-}, map, routing, resolvedInput = undefined) {
+}, map, routing, resolvedInput = undefined, {
+    containerPresent = containerExists,
+} = {}) {
     const {
         agentPath,
         manifest,
@@ -616,6 +618,15 @@ function planAgentEnable({
         if (!sameAgent) continue;
         if (alias || r.alias) continue;
         if (key === containerName) continue;
+        // A same-agent record under another key (for example a coordinated replacement's `__candidate_` name) is
+        // dropped only when its container is gone. A live one would keep running unregistered, with every bind and
+        // grant it holds, beside the new runtime: refuse instead and leave its retirement to the operator.
+        if (r.runtime !== 'bwrap' && r.runtime !== 'seatbelt' && containerPresent(key)) {
+            const error = new Error(`enable agent: '${repoName}/${shortAgentName}' is registered as '${key}', whose container still exists; retire that runtime first (for example 'ploinky disable agent ${repoName}/${shortAgentName}') instead of enabling a second one beside it`);
+            error.code = 'PLOINKY_AGENT_ENABLE_LIVE_RECORD';
+            error.containerName = key;
+            throw error;
+        }
         try { delete map[key]; } catch (_) {}
     }
     map[containerName] = record;
@@ -785,6 +796,7 @@ export function prepareAgentEnableBatch(requests, {
     hardwareContext,
     boxMarkerOptions,
     inspectLegacy = inspectInterimAgentLifecycle,
+    containerPresent = containerExists,
 } = {}) {
     if (!Array.isArray(requests)) {
         throw new Error('prepare agent enable batch: requests must be an array');
@@ -829,7 +841,7 @@ export function prepareAgentEnableBatch(requests, {
 
     try {
         for (const { request, input } of resolvedRequests) {
-            plans.push(planAgentEnable(request, map, routing, input));
+            plans.push(planAgentEnable(request, map, routing, input, { containerPresent }));
         }
         for (const plan of plans) inspectLegacy({ containerName: plan.containerName,
             registryRecord: previousAgents[plan.containerName], runtime: getRuntime });
@@ -1001,10 +1013,10 @@ export function prepareAgentEnableBatch(requests, {
  * No prepared generation, workspace structure, or registry write is produced. */
 export function previewAgentEnable(request, {
     readRegistry = readAgentRegistrySnapshot, readRouting = loadRoutingConfig,
-    resolveInput = resolveAgentEnableInput,
+    resolveInput = resolveAgentEnableInput, containerPresent = containerExists,
 } = {}) {
     const registry = readRegistry();
-    const plan = planAgentEnable(request, structuredClone(registry), structuredClone(readRouting()), resolveInput(request));
+    const plan = planAgentEnable(request, structuredClone(registry), structuredClone(readRouting()), resolveInput(request), { containerPresent });
     return { plan, predecessor: registry[plan.containerName] || null };
 }
 

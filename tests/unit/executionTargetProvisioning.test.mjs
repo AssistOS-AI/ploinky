@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { EXECUTION_TARGET_HELPER_CONTRACT_ID, TARGET_LIMITS_V1 } from '../../cli/server/executionTarget/declaration.mjs';
 import { discoverExecutionTargets } from '../../cli/server/executionTarget/discovery.mjs';
 import {
+    BOX_MAILBOXES_DIRECTORY,
     BOX_TARGETS_DIRECTORY,
     HELPER_LAUNCH_FILE,
     HELPER_SECRET_FILE,
@@ -189,9 +190,14 @@ test('P3 provisioning creates private dirs, records journal identity and dev/ino
     const [mailbox, journalRoot, control] = result.binds.map((bind) => bind.source);
     assert.equal(journalRoot, paths.journalRoot);
     assert.ok(journalRoot.startsWith(path.join(env.controllerStateDir, 'execution-targets') + path.sep));
-    assert.ok(mailbox.startsWith(path.join(env.boxTmpRoot, BOX_TARGETS_DIRECTORY) + path.sep));
-    assert.equal(path.dirname(mailbox), path.dirname(control));
-    for (const directory of [paths.root, journalRoot, mailbox, control, path.dirname(mailbox), path.join(env.boxTmpRoot, BOX_TARGETS_DIRECTORY)]) {
+    // The mailbox is the incarnation's own directory in the mailbox-only root, apart from the instance's control dir.
+    assert.equal(mailbox, path.join(env.boxTmpRoot, BOX_MAILBOXES_DIRECTORY, result.helperIncarnation));
+    assert.ok(control.startsWith(path.join(env.boxTmpRoot, BOX_TARGETS_DIRECTORY) + path.sep));
+    assert.equal(inside(path.join(env.boxTmpRoot, BOX_MAILBOXES_DIRECTORY), control), false);
+    assert.deepEqual(fs.readdirSync(path.join(env.boxTmpRoot, BOX_MAILBOXES_DIRECTORY)), [result.helperIncarnation]);
+    assert.deepEqual(fs.readdirSync(mailbox), []);
+    for (const directory of [paths.root, journalRoot, mailbox, control, path.dirname(control), path.join(env.boxTmpRoot, BOX_TARGETS_DIRECTORY),
+        path.join(env.boxTmpRoot, BOX_MAILBOXES_DIRECTORY)]) {
         assert.equal(mode(directory), 0o700, directory);
     }
     // The controller state directory itself is never re-moded.
@@ -209,6 +215,7 @@ test('P3 provisioning creates private dirs, records journal identity and dev/ino
     assert.equal(record.current.containerName, 'ploinky_rwrepo_rwtarget_abc');
     assert.deepEqual([record.current.instanceId, record.current.enableGeneration], ['inst-1', 'egen-1']);
     assert.deepEqual(record.incarnations, [result.helperIncarnation]);
+    assert.deepEqual(record.incarnationOwners, { [result.helperIncarnation]: { containerName: 'ploinky_rwrepo_rwtarget_abc', instanceId: 'inst-1', enableGeneration: 'egen-1' } });
     assert.equal(mode(paths.record), 0o600);
     assert.equal(fs.readdirSync(paths.root).filter((name) => name.endsWith('.tmp')).length, 0);
 });
@@ -222,11 +229,17 @@ test('P3 every helper start gets a fresh incarnation; the journal (keyed by prin
     assert.equal(second.journalStoreIdentity, first.journalStoreIdentity);
     assert.equal(second.binds[1].source, first.binds[1].source);
     assert.notEqual(second.binds[0].source, first.binds[0].source);
-    // The predecessor's instance directories are left in place (it may still be running).
+    // The predecessor's instance directories and mailbox are left in place (it may still be running).
     assert.ok(fs.existsSync(first.binds[0].source));
+    assert.ok(fs.existsSync(first.binds[2].source));
+    assert.deepEqual(fs.readdirSync(path.join(env.boxTmpRoot, BOX_MAILBOXES_DIRECTORY)).sort(), [first.helperIncarnation, second.helperIncarnation].sort());
     const record = readProvisioningRecord({ controllerStateDir: env.controllerStateDir, principal: PRINCIPAL });
     assert.deepEqual(record.incarnations, [first.helperIncarnation, second.helperIncarnation]);
     assert.equal(record.current.instanceId, 'inst-2');
+    assert.deepEqual(record.incarnationOwners, {
+        [first.helperIncarnation]: { containerName: 'ploinky_rwrepo_rwtarget_abc', instanceId: 'inst-1', enableGeneration: 'egen-1' },
+        [second.helperIncarnation]: { containerName: 'ploinky_rwrepo_rwtarget_candidate', instanceId: 'inst-2', enableGeneration: 'egen-2' },
+    });
 });
 
 test('P3 a recorded incarnation is never issued again', (t) => {
@@ -309,7 +322,8 @@ test('P3 a launch that may adopt the already provisioned exact instance re-deriv
     assert.equal(again.helperIncarnation, first.helperIncarnation);
     assert.equal(helper.calls.length, 1, 'no second journal-init');
     assert.equal(fs.readFileSync(targetStatePaths(env.controllerStateDir, PRINCIPAL).record, 'utf8'), before);
-    assert.deepEqual(fs.readdirSync(path.dirname(path.dirname(first.binds[0].source))), [path.basename(path.dirname(first.binds[0].source))]);
+    assert.deepEqual(fs.readdirSync(path.dirname(path.dirname(first.binds[2].source))), [path.basename(path.dirname(first.binds[2].source))]);
+    assert.deepEqual(fs.readdirSync(path.dirname(first.binds[0].source)), [first.helperIncarnation]);
     // The launch file stays single-use: once the first helper consumed it, nothing re-creates it.
     fs.rmSync(path.join(first.binds[2].source, HELPER_LAUNCH_FILE));
     provision(env, helper);
@@ -321,11 +335,15 @@ test('P3 a left-over instance directory the record does not name is set aside, n
     const helper = fakeHelper();
     const key = instanceKey({ principal: PRINCIPAL, containerName: 'ploinky_rwrepo_rwtarget_abc', instanceId: 'inst-1', enableGeneration: 'egen-1' });
     const left = instancePaths(env.boxTmpRoot, key);
-    fs.mkdirSync(left.mailbox, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(left.mailbox, 'stale.sock'), '');
+    // A left-over of the earlier layout (mailbox inside the instance directory) is set aside as it is.
+    const leftMailbox = path.join(left.root, 'mailbox');
+    fs.mkdirSync(leftMailbox, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(leftMailbox, 'stale.sock'), '');
     const result = provision(env, helper);
-    assert.equal(result.binds[0].source, left.mailbox);
-    assert.deepEqual(fs.readdirSync(left.mailbox), []);
+    assert.equal(result.binds[2].source, left.control);
+    assert.equal(result.binds[0].source, path.join(env.boxTmpRoot, BOX_MAILBOXES_DIRECTORY, result.helperIncarnation));
+    assert.deepEqual(fs.readdirSync(result.binds[0].source), []);
+    assert.deepEqual(fs.readdirSync(left.root).sort(), ['control', ROUTER_SECRET_FILE].sort());
     const parked = fs.readdirSync(left.parent).filter((name) => name.startsWith(`${key}.stale-`));
     assert.equal(parked.length, 1);
     assert.deepEqual(fs.readdirSync(path.join(left.parent, parked[0], 'mailbox')), ['stale.sock']);
@@ -489,9 +507,10 @@ test('P4 a set-aside left-over instance keeps no launch file and no secret copy'
     const env = workspace(t);
     const key = instanceKey({ principal: PRINCIPAL, containerName: 'ploinky_rwrepo_rwtarget_abc', instanceId: 'inst-1', enableGeneration: 'egen-1' });
     const left = instancePaths(env.boxTmpRoot, key);
-    fs.mkdirSync(left.mailbox, { recursive: true, mode: 0o700 });
+    const leftMailbox = path.join(left.root, 'mailbox');
+    fs.mkdirSync(leftMailbox, { recursive: true, mode: 0o700 });
     fs.mkdirSync(left.control, { mode: 0o700 });
-    fs.writeFileSync(path.join(left.mailbox, 'stale.sock'), '');
+    fs.writeFileSync(path.join(leftMailbox, 'stale.sock'), '');
     for (const file of [left.launch, left.secret, left.routerSecret]) fs.writeFileSync(file, 'old secret material\n', { mode: 0o600 });
     const spy = secretSpy();
     provision(env, fakeHelper(), { secretRandomBytes: spy.draw });
@@ -515,6 +534,7 @@ test('P4 a left-over whose secret path cannot be removed, or whose control path 
     assert.equal(code(() => provision(env, fakeHelper())), E.stateInvalid);
     assert.deepEqual(fs.readdirSync(left.parent), [key], 'nothing set aside');
     assert.equal(readProvisioningRecord({ controllerStateDir: env.controllerStateDir, principal: PRINCIPAL }), null);
+    assert.deepEqual(fs.readdirSync(path.join(env.boxTmpRoot, BOX_MAILBOXES_DIRECTORY)), [], 'a refused start leaves no mailbox');
 
     fs.rmSync(left.control, { recursive: true });
     const elsewhere = path.join(env.root, 'elsewhere');
@@ -556,7 +576,7 @@ test('P4 a new incarnation changes secret and kid and retires the previous Route
     const old = instancePaths(env.boxTmpRoot, first.instanceKey);
     const now = instancePaths(env.boxTmpRoot, second.instanceKey);
     assert.equal(fs.existsSync(old.routerSecret), false, 'the superseded Router copy is retired');
-    assert.ok(fs.existsSync(old.mailbox) && fs.existsSync(old.control), 'the predecessor may still be running');
+    assert.ok(fs.existsSync(first.binds[0].source) && fs.existsSync(old.control), 'the predecessor may still be running');
     const text = fs.readFileSync(now.routerSecret, 'utf8');
     assert.ok(text.includes(`kid=hti1.${second.helperIncarnation}\n`) && text.includes(spy.drawn[1].toString('base64url')));
     assert.notEqual(first.helperIncarnation, second.helperIncarnation);

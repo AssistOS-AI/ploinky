@@ -6,8 +6,11 @@
 //     which every agent bind masks, keyed by the agent principal so the journal survives container replacement;
 //   - has the target's own helper mint (or report) the journal store through an injected one-shot runner, and records
 //     the returned store identity together with the directory device/inode, cross-checked against its own lstat;
-//   - creates a per-instance private mailbox directory and a control directory under the Box tmpfs (a plain
-//     filesystem on which AF_UNIX sockets work, never the agent's fuse-overlayfs root and never the workspace bind);
+//   - creates a per-instance private control directory under the Box tmpfs (a plain filesystem on which AF_UNIX sockets
+//     work, never the agent's fuse-overlayfs root and never the workspace bind), and one private mailbox directory per
+//     helper incarnation in a separate mailbox-only root of the Box tmpfs (`ploinky-target-mailboxes/<incarnation>`),
+//     which holds nothing but mailboxes, so the single execution-provider worker can be given that whole root read-only
+//     (workerMailbox.mjs) without ever reaching a control directory, a launch file or a secret copy;
 //   - mints a fresh helper incarnation for this helper start, refuses one already recorded, and hands it to the
 //     target's launcher only through a single-use launch file in the control directory (never env or argv of the
 //     container, so a reused or restarted container can never present it again);
@@ -52,6 +55,10 @@ export const JOURNAL_ROOT_DIRECTORY = 'journal-root';
 // Directory names below the controller state directory and below the Box tmpfs.
 export const CONTROLLER_TARGETS_DIRECTORY = 'execution-targets';
 export const BOX_TARGETS_DIRECTORY = 'ploinky-execution-targets';
+// The mailbox-only root of the Box tmpfs: exactly one directory per helper incarnation, named by the incarnation.
+export const BOX_MAILBOXES_DIRECTORY = 'ploinky-target-mailboxes';
+// Fixed in-worker location of that root (never manifest-controlled).
+export const WORKER_TARGETS_PATH = '/run/ploinky-worker-targets';
 // Recorded incarnations; older entries roll off (an incarnation is 128 CSPRNG bits).
 export const INCARNATION_HISTORY_BOUND = 1024;
 export const JOURNAL_INIT_TIMEOUT_MS = 60_000;
@@ -119,12 +126,22 @@ export function instancePaths(boxTmpRoot, key) {
     return Object.freeze({
         parent: path.join(path.resolve(boxTmpRoot), BOX_TARGETS_DIRECTORY),
         root,
-        mailbox: path.join(root, 'mailbox'),
         control: path.join(root, 'control'),
         launch: path.join(root, 'control', HELPER_LAUNCH_FILE),
         secret: path.join(root, 'control', HELPER_SECRET_FILE),
         routerSecret: path.join(root, ROUTER_SECRET_FILE),
     });
+}
+
+/** The mailbox-only root of the Box tmpfs. */
+export function mailboxRootPath(boxTmpRoot) {
+    return path.join(path.resolve(boxTmpRoot), BOX_MAILBOXES_DIRECTORY);
+}
+
+/** The mailbox directory of one helper incarnation (an incarnation is a 22-character base64url id, never a path). */
+export function mailboxPath(boxTmpRoot, helperIncarnation) {
+    if (!isId(helperIncarnation)) refuse('a mailbox is named only by a valid helper incarnation', E.stateInvalid);
+    return path.join(mailboxRootPath(boxTmpRoot), helperIncarnation);
 }
 
 /**
@@ -205,6 +222,22 @@ function existingDirectory(fsApi, target) {
     return stat;
 }
 
+/**
+ * Creates (0700) or validates the mailbox-only root of the Box tmpfs: a real directory owned by this process inside an
+ * existing real Box tmpfs. A symlink, a non-directory or a foreign owner refuses. Returns the root path.
+ */
+export function ensureMailboxRoot({
+    boxTmpRoot,
+    fsApi = fs,
+    euid = typeof process.geteuid === 'function' ? process.geteuid() : null,
+} = {}) {
+    if (typeof boxTmpRoot !== 'string' || !path.isAbsolute(boxTmpRoot)) refuse('the Box tmpfs root must be absolute', E.stateInvalid);
+    existingDirectory(fsApi, path.resolve(boxTmpRoot));
+    const root = mailboxRootPath(boxTmpRoot);
+    privateDirectory(fsApi, root, euid);
+    return root;
+}
+
 function privateChain(fsApi, base, leaf, euid) {
     const relative = path.relative(base, leaf);
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) refuse('execution-target path escapes its root', E.stateInvalid);
@@ -230,12 +263,26 @@ function writeExclusive(fsApi, target, text) {
     }
 }
 
+function validOwner(owner) {
+    return isPlainObject(owner) && Object.keys(owner).sort().join(',') === 'containerName,enableGeneration,instanceId'
+        && typeof owner.containerName === 'string' && owner.containerName.length > 0
+        && isOpaqueIdentity(owner.instanceId) && isOpaqueIdentity(owner.enableGeneration);
+}
+
+// `incarnationOwners` maps a recorded incarnation to the exact instance it was minted for. It is optional (records
+// written before it existed name no owner, and an unowned mailbox is never deleted) but strict when present.
+function validOwners(owners, incarnations) {
+    if (!isPlainObject(owners)) return false;
+    return Object.entries(owners).every(([incarnation, owner]) => incarnations.includes(incarnation) && validOwner(owner));
+}
+
 function validRecord(value, principal) {
     if (!isPlainObject(value) || value.version !== PROVISIONING_RECORD_VERSION || value.principal !== principal) return false;
     const journal = value.journal;
     if (!isPlainObject(journal) || !isId(journal.storeIdentity) || !DECIMAL.test(journal.device) || !DECIMAL.test(journal.inode)) return false;
     if (!Array.isArray(value.incarnations) || value.incarnations.length > INCARNATION_HISTORY_BOUND
         || !value.incarnations.every(isId) || new Set(value.incarnations).size !== value.incarnations.length) return false;
+    if (Object.hasOwn(value, 'incarnationOwners') && !validOwners(value.incarnationOwners, value.incarnations)) return false;
     const current = value.current;
     if (current === null) return true;
     return isPlainObject(current) && isId(current.helperIncarnation) && value.incarnations.includes(current.helperIncarnation)
@@ -351,9 +398,9 @@ function retireRouterSecret(fsApi, boxTmpRoot, previousKey, currentKey) {
     }
 }
 
-function bindsFor(paths, instance) {
+function bindsFor(paths, instance, mailbox) {
     return Object.freeze([
-        Object.freeze({ source: instance.mailbox, target: TARGET_MAILBOX_PATH }),
+        Object.freeze({ source: mailbox, target: TARGET_MAILBOX_PATH }),
         Object.freeze({ source: paths.journalRoot, target: TARGET_JOURNAL_PATH }),
         Object.freeze({ source: instance.control, target: TARGET_CONTROL_PATH }),
     ]);
@@ -417,7 +464,8 @@ export function provisionExecutionTarget({
     if (adoptOnly) {
         // Validation only: the running instance must be exactly the one this record provisioned.
         if (!sameInstance) refuse('the running target is not the provisioned instance', E.adoptionMismatch);
-        for (const directory of [paths.root, paths.journalRoot, instance.root, instance.mailbox, instance.control]) {
+        for (const directory of [paths.root, paths.journalRoot, instance.root, instance.control,
+            mailboxRootPath(boxTmpRoot), mailboxPath(boxTmpRoot, current.helperIncarnation)]) {
             privateDirectory(fsApi, directory, euid, { create: false });
         }
         const journal = lstatOrNull(fsApi, paths.journal);
@@ -425,7 +473,7 @@ export function provisionExecutionTarget({
             || String(journal.dev) !== record.journal.device || String(journal.ino) !== record.journal.inode) {
             refuse('the provisioned journal changed', E.journalChanged);
         }
-        return deepFreeze({ binds: bindsFor(paths, instance), helperIncarnation: current.helperIncarnation,
+        return deepFreeze({ binds: bindsFor(paths, instance, mailboxPath(boxTmpRoot, current.helperIncarnation)), helperIncarnation: current.helperIncarnation,
             journalStoreIdentity: record.journal.storeIdentity, instanceKey: key });
     }
     if (typeof runJournalInit !== 'function') refuse('execution-target provisioning requires a journal-init runner', E.stateInvalid);
@@ -467,17 +515,32 @@ export function provisionExecutionTarget({
     const secret = secretRandomBytes(TICKET_SECRET_BYTES);
     if (!Buffer.isBuffer(secret) || secret.length !== TICKET_SECRET_BYTES) refuse('helper ticket secret minting failed', E.stateInvalid);
     let secretFile = null;
+    const mailbox = mailboxPath(boxTmpRoot, helperIncarnation);
+    let mailboxCreated = false;
+    let recorded = false;
     try {
-        // 4. Per-instance mailbox and control directories on the Box tmpfs. A directory left by an earlier attempt of
-        //    the same instance identity is scrubbed of its launch and secret files and set aside (never reused, never
-        //    deleted here).
+        // 4. The incarnation's own mailbox in the mailbox-only root, created exclusively before anything else of this
+        //    start is written: an entry of any kind already at that name (directory, symlink, file) refuses, so a
+        //    refused start leaves no launch file, secret copy or record behind.
         existingDirectory(fsApi, path.resolve(boxTmpRoot));
+        privateDirectory(fsApi, mailboxRootPath(boxTmpRoot), euid);
+        try {
+            fsApi.mkdirSync(mailbox, { mode: 0o700 });
+        } catch (error) {
+            if (error?.code === 'EEXIST') refuse('an entry already exists at the new incarnation mailbox', E.stateInvalid);
+            throw error;
+        }
+        mailboxCreated = true;
+        privateDirectory(fsApi, mailbox, euid);
+        // 4b. Per-instance control directory on the Box tmpfs. A directory left by an earlier attempt of the same
+        //     instance identity is scrubbed of its launch and secret files and set aside (never reused, never deleted
+        //     here).
         privateDirectory(fsApi, instance.parent, euid);
         if (lstatOrNull(fsApi, instance.root)) {
             scrubLeftoverInstance(fsApi, instance);
             fsApi.renameSync(instance.root, `${instance.root}.stale-${crypto.randomBytes(6).toString('hex')}`);
         }
-        for (const directory of [instance.root, instance.mailbox, instance.control]) {
+        for (const directory of [instance.root, instance.control]) {
             fsApi.mkdirSync(directory, { mode: 0o700 });
             privateDirectory(fsApi, directory, euid);
         }
@@ -488,35 +551,57 @@ export function provisionExecutionTarget({
         writeExclusive(fsApi, instance.routerSecret, secretFile);
         fsyncDirectory(fsApi, instance.control);
         fsyncDirectory(fsApi, instance.root);
+        fsyncDirectory(fsApi, mailboxRootPath(boxTmpRoot));
+
+        // 5. Record identities before the target can use them, including which exact instance owns the new
+        //    incarnation's mailbox (only that instance's proven removal may delete it; see workerMailbox.mjs).
+        history.push(helperIncarnation);
+        const incarnations = history.slice(-INCARNATION_HISTORY_BOUND);
+        const owners = {};
+        // A record written before owners existed still names its current instance; carry that one over.
+        const previousOwners = record?.incarnationOwners
+            ?? (current ? { [current.helperIncarnation]: {
+                containerName: current.containerName, instanceId: current.instanceId, enableGeneration: current.enableGeneration,
+            } } : {});
+        for (const incarnation of incarnations) {
+            if (Object.hasOwn(previousOwners, incarnation)) owners[incarnation] = { ...previousOwners[incarnation] };
+        }
+        owners[helperIncarnation] = { containerName, instanceId, enableGeneration };
+        const next = {
+            version: PROVISIONING_RECORD_VERSION,
+            principal,
+            journal: { storeIdentity: reported.journalStoreIdentity, device: local.device, inode: local.inode },
+            current: {
+                helperIncarnation,
+                containerName,
+                instanceId,
+                enableGeneration,
+                instanceKey: key,
+                issuedAtMs: clock(),
+            },
+            incarnations,
+            incarnationOwners: owners,
+        };
+        if (!validRecord(next, principal)) refuse('execution-target record would be invalid', E.stateInvalid);
+        writeRecord(fsApi, paths, next);
+        recorded = true;
     } finally {
         secret.fill(0);
         secretFile?.fill(0);
+        // A start refused before its record names the new incarnation leaves no mailbox of it behind (best effort: the
+        // directory is empty, private and named by a never-reissued incarnation).
+        if (mailboxCreated && !recorded) {
+            try { fsApi.rmdirSync(mailbox); } catch (_) {}
+        }
     }
 
-    // 5. Record identities before the target can use them.
-    const previousKey = current?.instanceKey ?? null;
-    history.push(helperIncarnation);
-    const next = {
-        version: PROVISIONING_RECORD_VERSION,
-        principal,
-        journal: { storeIdentity: reported.journalStoreIdentity, device: local.device, inode: local.inode },
-        current: {
-            helperIncarnation,
-            containerName,
-            instanceId,
-            enableGeneration,
-            instanceKey: key,
-            issuedAtMs: clock(),
-        },
-        incarnations: history.slice(-INCARNATION_HISTORY_BOUND),
-    };
-    if (!validRecord(next, principal)) refuse('execution-target record would be invalid', E.stateInvalid);
-    writeRecord(fsApi, paths, next);
     // The record now names the new incarnation, so the provider already refuses the previous one; also retire its copy
-    // (best effort, never before the record is written).
+    // (best effort, never before the record is written). The previous incarnation's mailbox stays: its instance may
+    // still be running until its own exact retirement.
+    const previousKey = current?.instanceKey ?? null;
     retireRouterSecret(fsApi, boxTmpRoot, previousKey, key);
 
-    const binds = bindsFor(paths, instance);
+    const binds = bindsFor(paths, instance, mailbox);
     // The binds name exactly the directories provisioned above.
     for (const bind of binds) privateDirectory(fsApi, bind.source, euid, { create: false });
     return deepFreeze({ binds, helperIncarnation, journalStoreIdentity: reported.journalStoreIdentity, instanceKey: key });

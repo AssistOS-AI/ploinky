@@ -31,6 +31,7 @@ const NEW_MODULES = Object.freeze([
     'cli/server/executionTarget/provisioning.mjs',
     'cli/server/executionTarget/liveScope.mjs',
     'cli/server/executionTarget/helperTicketSecrets.mjs',
+    'cli/server/executionTarget/workerMailbox.mjs',
 ]);
 const NEW_TESTS = Object.freeze([
     'tests/unit/executionTargetDeclaration.test.mjs',
@@ -45,6 +46,7 @@ const NEW_TESTS = Object.freeze([
     'tests/unit/executionTargetProvisioning.test.mjs',
     'tests/unit/executionTargetLiveScope.test.mjs',
     'tests/unit/executionTargetHelperTicketSecrets.test.mjs',
+    'tests/unit/executionTargetWorkerMailbox.test.mjs',
 ]);
 // The pure guard names the legacy markers only to detect them.
 const GUARD = 'cli/sandbox/legacyAgentAdoptionGuard.mjs';
@@ -58,6 +60,11 @@ const BASENAME_EXEMPT = new Set(['contract', 'declaration', 'discovery', 'provis
 const PROVISIONING_CALL_SITE = Object.freeze({
     file: 'cli/sandbox/docker/agentServiceManager.js',
     line: "import { planExecutionTargetLaunch, provisionExecutionTarget, JOURNAL_INIT_TIMEOUT_MS, TARGET_RUNTIME_ROOT } from '../../server/executionTarget/provisioning.mjs';",
+    // The worker-mailbox grant (one start-boundary decision, the mailbox-root bind) and the exact-instance mailbox
+    // retirement after a proven removal. The local grant variable carries the module's basename.
+    workerMailboxLine: "import { ensureMailboxRoot, planWorkerMailboxGrant, retireInstanceMailboxes, WORKER_TARGETS_PATH } from '../../server/executionTarget/workerMailbox.mjs';",
+    workerMailboxCalls: Object.freeze({ planWorkerMailboxGrant: 1, retireInstanceMailboxes: 1, ensureMailboxRoot: 1 }),
+    workerMailboxVariable: 'workerMailboxGrant',
 });
 
 // P5: the one Router call site of the private source-protection operation. privateRouter.js imports exactly these two
@@ -168,6 +175,7 @@ test('T1-10 / T1-11 the new generic modules have no production importer except t
         'advanceWorkerGeneration', 'openSourceProtectionStore', 'createSourceProtectionInterlock',
         'evaluateLegacyAgentAdoption', 'evaluateInterimLegacyMarkers', 'validateExecutionTargetDeclaration',
         'readExecutionTargetDeclaration', 'discoverExecutionTargets', 'createTargetHelperTicketMinter',
+        'planWorkerMailboxGrant', 'retireInstanceMailboxes', 'ensureMailboxRoot',
     ];
     const importers = [];
     for (const relative of productionFiles()) {
@@ -190,12 +198,18 @@ test('T1-10 / T1-11 the new generic modules have no production importer except t
             text = text.replaceAll('legacyAgentAdoptionGuard', '');
         }
         if (relative === PROVISIONING_CALL_SITE.file) {
-            assert.deepEqual(text.match(/^import .*executionTarget\/.*$/gm), [PROVISIONING_CALL_SITE.line], relative);
+            assert.deepEqual(text.match(/^import .*executionTarget\/.*$/gm),
+                [PROVISIONING_CALL_SITE.line, PROVISIONING_CALL_SITE.workerMailboxLine], relative);
             // Two reviewed plan sites: the start boundary, and the refusal of identity-preserving targeted restarts.
             assert.equal(text.match(/\bplanExecutionTargetLaunch\(/g).length, 2, relative);
             assert.equal(text.match(/if \(targetedRestart && planExecutionTargetLaunch\(\{ manifest,/g)?.length, 1, relative);
             assert.equal(text.match(/\bprovisionExecutionTarget\(/g).length, 1, relative);
-            text = text.replaceAll(PROVISIONING_CALL_SITE.line, '');
+            text = text.replaceAll(PROVISIONING_CALL_SITE.line, '').replaceAll(PROVISIONING_CALL_SITE.workerMailboxLine, '');
+            for (const [name, count] of Object.entries(PROVISIONING_CALL_SITE.workerMailboxCalls)) {
+                assert.equal(text.match(new RegExp(`\\b${name}\\(`, 'g'))?.length, count, `${relative} ${name}`);
+                text = text.replaceAll(name, '');
+            }
+            text = text.replaceAll(PROVISIONING_CALL_SITE.workerMailboxVariable, '');
         }
         if (relative === ROUTER_GLUE.file) {
             assert.deepEqual(text.match(/^import .*executionTarget\/.*$/gm), ROUTER_GLUE.imports, relative);
