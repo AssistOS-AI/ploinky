@@ -1,7 +1,7 @@
 // Router target-helper ticket minter (plan section 5.6; frozen T0 section 8 + A1.7; proof sequence slice P4).
 //
 // Mints the one-use bootstrap/reattach ticket a worker presents to the fixed target helper: a compact HS256 JWS with
-// header `{alg:"HS256",typ:"ploinky-target-helper+jwt",kid}` and exactly the seventeen frozen claims, signed with the
+// header `{alg:"HS256",typ:"ploinky-target-helper+jwt",kid}` and exactly the eighteen frozen claims (A11.1 adds `leaseId`), signed with the
 // per-helper-incarnation secret. It is a dedicated token domain (purpose `ploinky.target-helper.v1`, issuer
 // `ploinky-router`): never a coordinator, user, broker, terminal, router-service or agentExec token.
 //
@@ -35,7 +35,7 @@ export const MINT_ERROR_CODES = Object.freeze([
 ]);
 
 const REQUEST_KEYS = Object.freeze([
-    'binding', 'reservationId', 'operationId', 'requestDigest', 'helperNonce', 'channelEpoch',
+    'binding', 'leaseId', 'reservationId', 'operationId', 'requestDigest', 'helperNonce', 'channelEpoch',
     'previousChannelEpoch', 'permissions', 'ttlSeconds'
 ]);
 const SCOPE_KEYS = Object.freeze([
@@ -151,10 +151,14 @@ function b64(bytes) {
  * mint(context, request) returns {ok:true,value:{ticket,kid,jti,iat,exp}} or {ok:false,error:{code}} and never throws on bad
  * input. `context` is the verified caller context, separate from the request, and must equal the current worker; the
  * binding's whole worker half must equal it too. The request is exactly: binding
- * (TargetBinding), reservationId (Id), operationId, requestDigest (Digest), helperNonce (helper challenge nonce),
- * channelEpoch / previousChannelEpoch (first bootstrap '1'/null, reattach previous+1), permissions (sorted unique
+ * (TargetBinding), leaseId (Id, the lease the ticket is bound to), reservationId (Id), operationId, requestDigest (Digest), helperNonce (helper challenge nonce),
+ * channelEpoch / previousChannelEpoch (channelEpoch strictly greater than the last epoch minted for the lease; previous null or lower), permissions (sorted unique
  * subset), ttlSeconds (1..30).
  */
+// Same bounds as the helper's per-incarnation epoch map: 4096 live leases, forgotten after one execution lifetime idle.
+const LEASE_EPOCH_CAPACITY = 4096;
+const LEASE_EPOCH_IDLE_MS = 86_400_000;
+
 export function createTargetHelperTicketMinter({
     live, readTarget, readWorker, callerAuthority, secrets, now = () => Date.now(), randomBytes = crypto.randomBytes, issuedCapacity = TICKET_ISSUED_CAPACITY
 } = {}) {
@@ -168,9 +172,13 @@ export function createTargetHelperTicketMinter({
     const trustedLive = Object.freeze({ workspaceId: live.workspaceId, boxIdentity: live.boxIdentity, boxGeneration: live.boxGeneration });
     // helper-nonce digest -> retain-until ms. A helper nonce is a single challenge: one ticket per nonce.
     const issued = new Map();
+    // leaseId -> {epoch: BigInt, touchedMs}. Epochs never repeat or go backwards for a live lease (A11.2). A lease idle
+    // longer than one execution lifetime is forgotten, mirroring the helper; the helper remains the epoch authority.
+    const lastEpoch = new Map();
 
     function sweep(nowMs) {
         for (const [key, until] of issued) if (until <= nowMs) issued.delete(key);
+        for (const [lease, entry] of lastEpoch) if (nowMs - entry.touchedMs > LEASE_EPOCH_IDLE_MS) lastEpoch.delete(lease);
     }
 
     function checkCaller(context, scope) {
@@ -210,6 +218,7 @@ export function createTargetHelperTicketMinter({
         need(isDigest(binding.limitsDigest));
         const bindingBytes = Buffer.byteLength(canonicalOrThrow(binding), 'utf8');
         need(bindingBytes <= 32 * 1024, 'capacity_exceeded');
+        need(isId(request.leaseId));
         need(isId(request.reservationId) && isOperationId(request.operationId) && isDigest(request.requestDigest));
         need(isNonce(request.helperNonce));
         const ttl = request.ttlSeconds;
@@ -219,12 +228,12 @@ export function createTargetHelperTicketMinter({
             TICKET_PERMISSIONS.includes(item) && (index === 0 || permissions[index - 1] < item))), 'ticket_permissions');
         need(isU64Text(request.channelEpoch) && (request.previousChannelEpoch === null || isU64Text(request.previousChannelEpoch)),
             'channel_epoch_conflict');
-        if (request.previousChannelEpoch === null) {
-            need(request.channelEpoch === '1', 'channel_epoch_conflict');
-        } else {
-            need(BigInt(request.channelEpoch) === BigInt(request.previousChannelEpoch) + 1n && BigInt(request.channelEpoch) <= U64_MAX,
-                'channel_epoch_conflict');
-        }
+        // A11.2: the epoch must be strictly greater than the last epoch minted for this lease (first use: any epoch >= 1);
+        // a previous epoch, when given, must be lower than the requested one.
+        const epoch = BigInt(request.channelEpoch);
+        need(request.previousChannelEpoch === null || BigInt(request.previousChannelEpoch) < epoch, 'channel_epoch_conflict');
+        const lastMinted = lastEpoch.get(request.leaseId)?.epoch;
+        need(lastMinted === undefined || epoch > lastMinted, 'channel_epoch_conflict');
         checkCaller(context, binding.scope);
         checkTarget(binding.scope, request);
         return { request, binding, permissions, ttl };
@@ -239,6 +248,7 @@ export function createTargetHelperTicketMinter({
             const nonceKey = crypto.createHash('sha256').update(request.helperNonce).digest('hex');
             need(!issued.has(nonceKey), 'ticket_replayed');
             need(issued.size < issuedCapacity, 'capacity_exceeded');
+            need(lastEpoch.has(request.leaseId) || lastEpoch.size < LEASE_EPOCH_CAPACITY, 'capacity_exceeded');
             const jtiBytes = randomBytes(32);
             need(Buffer.isBuffer(jtiBytes) && jtiBytes.length === 32, 'invalid_request');
             const iat = Math.floor(nowMs / 1000);
@@ -250,6 +260,7 @@ export function createTargetHelperTicketMinter({
                 purpose: TICKET_PURPOSE,
                 aud: `${TICKET_AUDIENCE_PREFIX}${digestOrThrow(targetIdentity(binding.scope))}`,
                 binding: JSON.parse(JSON.stringify(binding)),
+                leaseId: request.leaseId,
                 reservationId: request.reservationId,
                 operationId: request.operationId,
                 requestDigest: request.requestDigest,
@@ -278,6 +289,7 @@ export function createTargetHelperTicketMinter({
             need(signed.ticket.length <= MAX_TOKEN_LENGTH, 'ticket_format');
             // Consume the nonce only after the ticket exists; the entry outlives the ticket by the replay margin.
             issued.set(nonceKey, exp * 1000 + REPLAY_MARGIN_MS);
+            lastEpoch.set(request.leaseId, { epoch: BigInt(request.channelEpoch), touchedMs: nowMs });
             return Object.freeze({ ok: true, value: Object.freeze({ ticket: signed.ticket, kid: signed.kid, jti: claims.jti, iat, exp }) });
         } catch (error) {
             if (error instanceof MintRefusal) return Object.freeze({ ok: false, error: Object.freeze({ code: error.code }) });

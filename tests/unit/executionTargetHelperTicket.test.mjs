@@ -69,7 +69,7 @@ function makeMinter({ now = () => NOW, readTarget = (sc) => entryFor(sc), secret
 
 function request(overrides = {}) {
     return {
-        binding: binding(), reservationId: id(6), operationId: id(7), requestDigest: digest('7'),
+        binding: binding(), leaseId: id(5), reservationId: id(6), operationId: id(7), requestDigest: digest('7'),
         helperNonce: nonce(8), channelEpoch: '1', previousChannelEpoch: null, permissions: ['commit', 'prepare'], ttlSeconds: 30,
         ...overrides,
     };
@@ -100,7 +100,7 @@ function reference(token, options) {
     try { claims = JSON.parse(pb.toString('utf8')); } catch { return fail('ticket_format'); }
     if (canon(claims) !== pb.toString('utf8')) return fail('noncanonical_encoding');
     if (claims.version !== 1) return fail('unsupported_version');
-    const keys = ['version', 'iss', 'sub', 'purpose', 'aud', 'binding', 'reservationId', 'operationId', 'requestDigest', 'helperNonce', 'jti',
+    const keys = ['version', 'iss', 'sub', 'purpose', 'aud', 'binding', 'leaseId', 'reservationId', 'operationId', 'requestDigest', 'helperNonce', 'jti',
         'iat', 'exp', 'channelEpoch', 'previousChannelEpoch', 'permissions', 'limitsDigest'];
     if (Object.keys(claims).length !== keys.length || !keys.every((key) => Object.hasOwn(claims, key))) return fail('ticket_format');
     if (claims.iss !== 'ploinky-router' || claims.purpose !== 'ploinky.target-helper.v1') return fail('ticket_purpose');
@@ -118,13 +118,12 @@ function reference(token, options) {
     if (canon(claims.binding) !== canon(options.binding)) return fail('ticket_binding');
     if (claims.sub !== sc.workerPrincipal || claims.limitsDigest !== options.binding.limitsDigest) return fail('ticket_binding');
     const e = options.expected;
-    if (claims.reservationId !== e.reservationId || claims.operationId !== e.operationId || claims.requestDigest !== e.requestDigest
+    if (claims.leaseId !== e.leaseId || claims.reservationId !== e.reservationId || claims.operationId !== e.operationId || claims.requestDigest !== e.requestDigest
         || claims.helperNonce !== e.helperNonce) return fail('ticket_binding');
     if (options.channel.leaseState !== 'active') return fail('lease_retired');
     if (options.channel.currentEpoch === null) {
-        if (claims.channelEpoch !== '1' || claims.previousChannelEpoch !== null) return fail('channel_epoch_conflict');
-    } else if (claims.previousChannelEpoch !== options.channel.currentEpoch
-        || claims.channelEpoch !== String(BigInt(options.channel.currentEpoch) + 1n)) return fail('channel_epoch_conflict');
+        if (BigInt(claims.channelEpoch) < 1n) return fail('channel_epoch_conflict');
+    } else if (BigInt(claims.channelEpoch) <= BigInt(options.channel.currentEpoch)) return fail('channel_epoch_conflict');
     for (const k of [`jti:${claims.jti}`, `challenge:${options.challenge.id}`]) {
         const until = options.replay.get(k);
         if (until !== undefined && until > options.nowMs) return fail('ticket_replayed');
@@ -138,7 +137,7 @@ function verifyOptions(req, overrides = {}) {
     challengeCounter += 1;
     return {
         secret: SECRET, kid: KID, binding: req.binding,
-        expected: { reservationId: req.reservationId, operationId: req.operationId, requestDigest: req.requestDigest, helperNonce: req.helperNonce },
+        expected: { leaseId: req.leaseId, reservationId: req.reservationId, operationId: req.operationId, requestDigest: req.requestDigest, helperNonce: req.helperNonce },
         channel: { currentEpoch: null, leaseState: 'active' }, challenge: { id: `c-${challengeCounter}` }, nowMs: NOW + 1000,
         replay: new Map(), ...overrides,
     };
@@ -185,23 +184,53 @@ test('P4 a minted ticket passes the contract verifier with the frozen header, cl
     assert.equal(seen[0].workspaceId, 'ws-1');
 });
 
-test('P4 reattach ticket binds previous+1 epoch; stale CAS is a channel_epoch_conflict', () => {
+test('A11.2 a reattach ticket carries a strictly greater epoch; an epoch not above the helper current epoch is a channel_epoch_conflict', () => {
     const { minter } = makeMinter();
     const req = request({ channelEpoch: '4', previousChannelEpoch: '3', helperNonce: nonce(9) });
     const minted = minter.mint(req);
     assert.equal(minted.ok, true);
     assert.equal(reference(minted.value.ticket, verifyOptions(req, { channel: { currentEpoch: '3', leaseState: 'active' } })).ok, true);
-    const stale = minter.mint(request({ channelEpoch: '4', previousChannelEpoch: '3', helperNonce: nonce(10) }));
-    assert.equal(reference(stale.value.ticket, verifyOptions(request({ channelEpoch: '4', previousChannelEpoch: '3', helperNonce: nonce(10) }),
-        { channel: { currentEpoch: '4', leaseState: 'active' } })).code, 'channel_epoch_conflict');
+    // Gaps are allowed (a lost accepted or worker crash costs an epoch number).
+    const gap = request({ channelEpoch: '9', previousChannelEpoch: null, helperNonce: nonce(13) });
+    const gapMinted = minter.mint(gap);
+    assert.equal(gapMinted.ok, true);
+    assert.equal(reference(gapMinted.value.ticket, verifyOptions(gap, { channel: { currentEpoch: '3', leaseState: 'active' } })).ok, true);
+    // A ticket whose epoch is not above the helper's current epoch is refused by the verifier.
+    assert.equal(reference(minted.value.ticket, verifyOptions(req, { channel: { currentEpoch: '4', leaseState: 'active' } })).code, 'channel_epoch_conflict');
     // A retired lease is never reopened by any ticket.
-    const retired = minter.mint(request({ helperNonce: nonce(11) }));
+    const retired = minter.mint(request({ channelEpoch: '10', helperNonce: nonce(11) }));
     assert.equal(reference(retired.value.ticket, verifyOptions(request({ helperNonce: nonce(11) }), { channel: { currentEpoch: null, leaseState: 'retired' } })).code, 'lease_retired');
 });
 
-test('P4 minter refuses epoch shapes that cannot pass: first epoch must be 1 with null previous, reattach exactly previous+1', () => {
+test('A11.2 the minter refuses an epoch that is not strictly greater than the last minted epoch for that lease; epochs are tracked per lease', () => {
     const { minter } = makeMinter();
-    for (const [epoch, prev] of [['2', null], ['1', '1'], ['5', '3'], ['0', null], ['03', '2'], [1, null], ['18446744073709551616', '18446744073709551615']]) {
+    assert.equal(minter.mint(request({ channelEpoch: '5', helperNonce: nonce(30) })).ok, true);
+    for (const epoch of ['5', '4', '1']) {
+        assert.equal(minter.mint(request({ channelEpoch: epoch, helperNonce: nonce(31) })).error.code, 'channel_epoch_conflict', epoch);
+    }
+    // A refused request does not consume the helper nonce or advance the record.
+    assert.equal(minter.mint(request({ channelEpoch: '6', helperNonce: nonce(31) })).ok, true);
+    // Another lease starts fresh: any epoch >= 1.
+    assert.equal(minter.mint(request({ leaseId: id(55), channelEpoch: '1', helperNonce: nonce(32) })).ok, true);
+    assert.equal(minter.mint(request({ leaseId: id(55), channelEpoch: '1', helperNonce: nonce(33) })).error.code, 'channel_epoch_conflict');
+});
+
+test('A11.1 the ticket carries the requested leaseId as a claim and a ticket for lease A does not verify for lease B', () => {
+    const { minter } = makeMinter();
+    const req = request({ leaseId: id(40), helperNonce: nonce(34) });
+    const minted = minter.mint(req);
+    const claims = JSON.parse(Buffer.from(minted.value.ticket.split('.')[1], 'base64url').toString('utf8'));
+    assert.equal(claims.leaseId, id(40));
+    assert.equal(reference(minted.value.ticket, verifyOptions(req)).ok, true);
+    assert.equal(reference(minted.value.ticket, verifyOptions({ ...req, leaseId: id(41) })).code, 'ticket_binding');
+    assert.equal(minter.mint(request({ leaseId: 'not-an-id', helperNonce: nonce(35) })).error.code, 'invalid_request');
+    const { leaseId, ...missing } = request({ helperNonce: nonce(36) });
+    assert.equal(minter.mint(missing).error.code, 'invalid_request');
+});
+
+test('P4 minter refuses malformed epoch shapes: zero, leading zero, non-text, overflow, previous not below the requested epoch', () => {
+    const { minter } = makeMinter();
+    for (const [epoch, prev] of [['1', '1'], ['0', null], ['03', '2'], [1, null], ['2', '3'], ['18446744073709551616', '18446744073709551615']]) {
         assert.equal(minter.mint(request({ channelEpoch: epoch, previousChannelEpoch: prev, helperNonce: nonce(20) })).error.code, 'channel_epoch_conflict', `${epoch}/${prev}`);
     }
 });
@@ -214,21 +243,21 @@ test('P4 replay: a second validation of the same ticket or challenge refuses; th
     assert.equal(reference(minted.value.ticket, shared).ok, true);
     assert.equal(reference(minted.value.ticket, shared).code, 'ticket_replayed');
     // Same challenge, fresh ticket jti: also replayed.
-    const again = minter.mint(request({ helperNonce: nonce(12) }));
+    const again = minter.mint(request({ channelEpoch: '2', helperNonce: nonce(12) }));
     assert.equal(reference(again.value.ticket, { ...shared, expected: { ...shared.expected, helperNonce: nonce(12) } }).code, 'ticket_replayed');
     // Minter side: the nonce is consumed.
-    assert.equal(minter.mint(req).error.code, 'ticket_replayed');
+    assert.equal(minter.mint(request({ leaseId: id(56), helperNonce: req.helperNonce })).error.code, 'ticket_replayed');
 });
 
 test('P4 helper-nonce memory expires with the ticket plus margin and is bounded without live eviction', () => {
     let nowMs = NOW;
     const { minter } = makeMinter({ now: () => nowMs, capacity: 2 });
-    assert.equal(minter.mint(request({ helperNonce: nonce(30) })).ok, true);
-    assert.equal(minter.mint(request({ helperNonce: nonce(31) })).ok, true);
-    assert.equal(minter.mint(request({ helperNonce: nonce(32) })).error.code, 'capacity_exceeded');
-    assert.equal(minter.mint(request({ helperNonce: nonce(30) })).error.code, 'ticket_replayed');
+    assert.equal(minter.mint(request({ channelEpoch: '1', helperNonce: nonce(30) })).ok, true);
+    assert.equal(minter.mint(request({ channelEpoch: '2', helperNonce: nonce(31) })).ok, true);
+    assert.equal(minter.mint(request({ channelEpoch: '3', helperNonce: nonce(32) })).error.code, 'capacity_exceeded');
+    assert.equal(minter.mint(request({ channelEpoch: '3', helperNonce: nonce(30) })).error.code, 'ticket_replayed');
     nowMs += (TICKET_MAX_LIFETIME_SECONDS + 3) * 1000;
-    assert.equal(minter.mint(request({ helperNonce: nonce(32) })).ok, true);
+    assert.equal(minter.mint(request({ channelEpoch: '3', helperNonce: nonce(32) })).ok, true);
 });
 
 test('P4 lifetime: <=30 s is honored, expiry has no extension, 31 s is refused at mint and by the verifier', () => {
@@ -277,7 +306,7 @@ test('P4 wrong helper: stale or different incarnation, container, instance or ge
         const other = { ...req.binding, scope: { ...req.binding.scope, [field]: value } };
         assert.equal(reference(minted.value.ticket, verifyOptions({ ...req, binding: other })).code, 'ticket_binding', field);
     }
-    for (const field of ['reservationId', 'operationId', 'requestDigest', 'helperNonce']) {
+    for (const field of ['leaseId', 'reservationId', 'operationId', 'requestDigest', 'helperNonce']) {
         const wrong = verifyOptions(req);
         wrong.expected = { ...wrong.expected, [field]: field === 'requestDigest' ? digest('0') : field === 'helperNonce' ? nonce(77) : id(77) };
         assert.equal(reference(minted.value.ticket, wrong).code, 'ticket_binding', field);
@@ -405,4 +434,23 @@ test('P4 the minter module registers no route and reads no ambient state', async
     const source = readFileSync(new URL('../../cli/server/security/tokens/targetHelperTicketMinter.mjs', import.meta.url), 'utf8');
     assert.doesNotMatch(source, /process\.env|console\.|writeFile|appendFile/);
     assert.doesNotMatch(source, /from ['"]node:(fs|child_process|net|http|https|dgram)['"]/);
+});
+
+test('A11.2 the per-lease epoch record is bounded: a full map refuses a new lease, and leases idle past one execution lifetime are forgotten', () => {
+    let clock = NOW;
+    const { minter } = makeMinter({ now: () => clock, capacity: 10000 });
+    const leaseN = (n) => { const b = Buffer.alloc(16); b.writeUInt32BE(n + 1, 12); return b.toString('base64url'); };
+    const nonceN = (n) => { const b = Buffer.alloc(32, 0xaa); b.writeUInt32BE(n + 1, 28); return b.toString('base64url'); };
+    for (let i = 0; i < 4096; i += 1) {
+        assert.equal(minter.mint(request({ leaseId: leaseN(i), helperNonce: nonceN(i) })).ok, true, `lease ${i}`);
+    }
+    assert.equal(minter.mint(request({ leaseId: leaseN(4096), helperNonce: nonceN(4096) })).error.code, 'capacity_exceeded');
+    // A known lease still advances while the map is full (touched later than the others).
+    clock = NOW + 60_000;
+    assert.equal(minter.mint(request({ leaseId: leaseN(0), channelEpoch: '2', previousChannelEpoch: '1', helperNonce: nonceN(5000) })).ok, true);
+    // One execution lifetime later the idle leases are forgotten; the recently touched lease 0 is not yet.
+    clock = NOW + 86_400_000 + 1;
+    assert.equal(minter.mint(request({ leaseId: leaseN(4096), helperNonce: nonceN(5001) })).ok, true);
+    clock = NOW + 86_400_000 + 2;
+    assert.equal(minter.mint(request({ leaseId: leaseN(0), channelEpoch: '2', helperNonce: nonceN(5002) })).error.code, 'channel_epoch_conflict');
 });

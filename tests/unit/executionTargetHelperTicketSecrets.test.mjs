@@ -169,7 +169,7 @@ function minterFor(secrets) {
         };
         return minter.mint(context, {
             binding: { version: 1, scope, limitsDigest: digest('9'), robotId: id(3), executionId: id(4), attemptId: id(5), configRevision: 1 },
-            reservationId: id(6), operationId: id(7), requestDigest: digest('7'), helperNonce: Buffer.alloc(32, nonceByte).toString('base64url'),
+            leaseId: Buffer.alloc(16, nonceByte).toString('base64url'), reservationId: id(6), operationId: id(7), requestDigest: digest('7'), helperNonce: Buffer.alloc(32, nonceByte).toString('base64url'),
             channelEpoch: '1', previousChannelEpoch: null, permissions: ['commit', 'prepare'], ttlSeconds: 30,
         });
     };
