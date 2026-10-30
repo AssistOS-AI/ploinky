@@ -8,6 +8,7 @@ import { computeRchTool } from '../../Agent/lib/requestHash.mjs';
 import { handleRuntimeRoute } from '../../cli/server/handlers/webchat/runtimeRoutes.js';
 import {
     WEBCHAT_RUNTIME_OPEN_EVENT,
+    WEBCHAT_STOP_EVENT,
     serializeWebchatEnvelopeForAgent,
 } from '../../cli/server/handlers/webchat/messageEnvelope.js';
 import {
@@ -380,4 +381,89 @@ test('enable planning refuses an invalid webchat.delegations declaration and acc
         assert.throws(() => preview({ container, webchat: { delegations } }),
             /manifest\(fixtures\/unrelated\): Invalid MCP tool delegations for '__webchat_message__'/, JSON.stringify(delegations));
     }
+});
+
+// The WebChat stop (Escape or the stop button) posts a single ESC to /control.
+const controlLines = (tty, before) => tty.input.slice(before).map((line) => JSON.parse(line));
+
+test('a stop on a delegating agent is a signed stop envelope with the same grant as a message envelope; undeclared agents keep the unsigned control', (t) => {
+    webchatWorld(t);
+    const srv = server(t, { protocol: false });
+    srv.request('/stream', { tabId: 'tab-a', page: 'page-a', sid: 'sid-a', user: USER_A });
+    const tty = srv.ttys[0];
+    const before = tty.input.length;
+    const stop = srv.request('/control', { tabId: 'tab-a', page: 'page-a', sid: 'sid-a', user: USER_A, body: '\x1b' });
+    assert.equal(stop.res.statusCode, 204);
+    const [envelope] = controlLines(tty, before);
+    assert.equal(Object.hasOwn(envelope, '__webchatControl'), false, 'not the unsigned control line');
+    assert.equal(envelope.__webchatMessage, 1);
+    assert.equal(envelope.event, WEBCHAT_STOP_EVENT);
+    assert.equal(envelope.text, '');
+    assert.deepEqual(envelope.presentation, { visible: false });
+    assert.equal(envelope.sourceTabId, 'tab-a');
+    assert.equal(envelope.sourcePageInstanceId, 'page-a');
+
+    const claims = decodeJwt(envelope.invocation.token);
+    assert.equal(claims.tool, '__webchat_message__');
+    assert.equal(claims.sub, `user:${USER_A.id}`);
+    assert.equal(claims.rch, webchatRch({ ...baseArgs('tab-a', 'page-a'), event: WEBCHAT_STOP_EVENT }), 'the stop event is part of the signed arguments');
+    assert.notEqual(claims.rch, webchatRch(baseArgs('tab-a', 'page-a')));
+    const grant = verifyAdmissionGrant(claims);
+    assert.equal(grant.user.id, USER_A.id);
+
+    // Same delegation scope, TTL and key as a message envelope for the same user.
+    const message = JSON.parse(serializeWebchatEnvelopeForAgent({
+        req: { headers: { host: 'localhost' }, socket: {}, user: USER_A, authMode: 'sso' },
+        effectiveConfig: { agentName: 'unrelated' }, tabId: 'tab-a', pageInstanceId: 'page-a',
+        envelope: { text: 'hi', attachments: [], presentation: { visible: true } },
+    }));
+    const messageGrant = verifyAdmissionGrant(decodeJwt(message.invocation.token));
+    assert.deepEqual(grant.delegation.scope, messageGrant.delegation.scope);
+    assert.equal(grant.claims.exp - grant.claims.iat, messageGrant.claims.exp - messageGrant.claims.iat);
+    assert.deepEqual(Object.keys(decodeJwt(envelope.invocation.token).delegations), ['providerAdmission']);
+
+    // A guest's stop is signed too, without a grant, exactly like the guest's messages.
+    const guest = server(t, { protocol: false });
+    guest.request('/stream', { tabId: 'tab-g', page: 'page-g', sid: 'sid-g', user: GUEST });
+    guest.request('/control', { tabId: 'tab-g', page: 'page-g', sid: 'sid-g', user: GUEST, body: '\x1b' });
+    const guestStop = controlLines(guest.ttys[0], 0).find((line) => line.event === WEBCHAT_STOP_EVENT);
+    assert.equal(decodeJwt(guestStop.invocation.token).delegations, undefined);
+
+    // An agent that forwards envelopes without declaring delegations keeps the unsigned control.
+    const undeclared = server(t, { agentName: 'mailer', protocol: false });
+    undeclared.request('/stream');
+    undeclared.request('/control', { body: '\x1b' });
+    assert.deepEqual(controlLines(undeclared.ttys[0], 0).filter((line) => line.__webchatControl || line.event), [
+        { __webchatControl: 1, type: 'stop', sourceTabId: 'tab-a', sourcePageInstanceId: 'page-a' },
+    ]);
+
+    // A delegating agent whose configuration does not forward envelopes: the raw control passes through.
+    const raw = server(t, { forwardEnvelope: false, protocol: false });
+    raw.request('/stream');
+    raw.request('/control', { body: '\x1b' });
+    assert.equal(raw.ttys[0].input.at(-1), '\x1b');
+
+    // Other control bodies are untouched on a delegating agent.
+    srv.request('/control', { body: 'x' });
+    assert.equal(tty.input.at(-1), 'x');
+});
+
+test('an unauthenticated stop is refused as before and never yields a signed envelope', (t) => {
+    webchatWorld(t);
+    // A per-user runtime refuses a request without a verified user.
+    const scoped = server(t, { protocol: false });
+    scoped.effectiveConfig.runtimeScope = 'principal';
+    scoped.request('/stream', { user: USER_A });
+    const tty = scoped.ttys[0];
+    const before = tty.input.length;
+    const refused = scoped.request('/control', { user: null, body: '\x1b' });
+    assert.equal(refused.res.statusCode, 403);
+    assert.equal(tty.input.length, before, 'nothing is written');
+
+    // Without a user no token can be minted: the stop stays the unsigned control line, as today.
+    const open = server(t, { protocol: false });
+    open.request('/stream', { user: USER_A });
+    open.request('/control', { user: null, body: '\x1b' });
+    const lines = controlLines(open.ttys[0], 0).filter((line) => line.__webchatControl || line.event === WEBCHAT_STOP_EVENT);
+    assert.deepEqual(lines, [{ __webchatControl: 1, type: 'stop', sourceTabId: 'tab-a', sourcePageInstanceId: 'page-a' }]);
 });

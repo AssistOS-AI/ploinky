@@ -5,7 +5,9 @@ import {
     createWebchatRuntimeOpenAnnouncer,
     parseInputEnvelope,
     serializeWebchatEnvelopeForAgent,
-    shouldForwardWebchatEnvelope
+    serializeWebchatStopEnvelope,
+    shouldForwardWebchatEnvelope,
+    shouldSignWebchatStop
 } from './messageEnvelope.js';
 import {
     buildRuntimeKey,
@@ -384,14 +386,23 @@ export function handleRuntimeRoute({
         let body = '';
         req.on('data', chunk => body += chunk.toString());
         req.on('end', () => {
-            const control = body === '\x1b' && shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)
-                ? `${JSON.stringify({
-                    __webchatControl: 1,
-                    type: 'stop',
-                    sourceTabId: String(parsedUrl.searchParams.get('tabId') || '').trim(),
-                    sourcePageInstanceId: pageInstanceIdFrom(parsedUrl),
-                })}\n`
-                : body;
+            const stopTabId = String(parsedUrl.searchParams.get('tabId') || '').trim();
+            const stopPageInstanceId = pageInstanceIdFrom(parsedUrl);
+            const signedStop = body === '\x1b' && shouldSignWebchatStop(parsedUrl, effectiveConfig)
+                ? serializeWebchatStopEnvelope({
+                    req, effectiveConfig, tabId: stopTabId, pageInstanceId: stopPageInstanceId,
+                })
+                : '';
+            const control = signedStop
+                ? `${signedStop}\n`
+                : body === '\x1b' && shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)
+                    ? `${JSON.stringify({
+                        __webchatControl: 1,
+                        type: 'stop',
+                        sourceTabId: stopTabId,
+                        sourcePageInstanceId: stopPageInstanceId,
+                    })}\n`
+                    : body;
             if (!writeRuntimeInput(tab, control)) {
                 disposeUnavailableRuntime(tab, runtimeKey, runtimes);
                 res.writeHead(409); res.end();

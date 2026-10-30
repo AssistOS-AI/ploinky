@@ -74,7 +74,8 @@ export function sanitizeWebchatReferencesForEnvelope(references = []) {
 // read from a browser envelope, and it is part of the signed arguments, so an
 // agent recomputing them refuses an unsigned or altered event.
 export const WEBCHAT_RUNTIME_OPEN_EVENT = 'runtime-open';
-const ROUTER_ENVELOPE_EVENTS = new Set([WEBCHAT_RUNTIME_OPEN_EVENT]);
+export const WEBCHAT_STOP_EVENT = 'stop';
+const ROUTER_ENVELOPE_EVENTS = new Set([WEBCHAT_RUNTIME_OPEN_EVENT, WEBCHAT_STOP_EVENT]);
 
 // The signed `__webchat_message__` arguments. A principal-scoped runtime adds
 // `runtimeScope: "principal"`, taken only from the manifest-derived config, so
@@ -177,6 +178,35 @@ export function serializeWebchatRuntimeOpenEnvelope({ req, effectiveConfig, tabI
         envelope: { text: '', attachments: [], references: [], presentation: { visible: false } },
         event: WEBCHAT_RUNTIME_OPEN_EVENT,
     });
+}
+
+// The signed `stop` envelope: the stop button (or Escape) of a WebChat agent
+// whose admitted manifest declares `webchat.delegations` and whose configuration
+// forwards envelopes. It is a hidden, textless envelope signed for the user of
+// the control request through the same path as a message envelope, so it carries
+// the same delegation grants (scope, TTL, signing) and lets the agent authorize
+// the stop with its provider. Any other agent keeps the unsigned control line.
+export function shouldSignWebchatStop(parsedUrl, effectiveConfig) {
+    const agentName = String(effectiveConfig?.agentName || '').trim();
+    return shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)
+        && Boolean(agentName)
+        && routeDeclaresWebchatDelegations({ routeKey: agentName });
+}
+
+// Returns the envelope line, or '' when there is no verified user or no
+// invocation token could be minted (no secure wire): the caller then keeps the
+// unsigned control line, exactly as before.
+export function serializeWebchatStopEnvelope({ req, effectiveConfig, tabId, pageInstanceId = '' }) {
+    if (!String(req?.user?.id || '').trim()) return '';
+    const line = serializeWebchatEnvelopeForAgent({
+        req,
+        effectiveConfig,
+        tabId,
+        pageInstanceId,
+        envelope: { text: '', attachments: [], references: [], presentation: { visible: false } },
+        event: WEBCHAT_STOP_EVENT,
+    });
+    return JSON.parse(line).invocation?.token ? line : '';
 }
 
 // Returns the runtime's startup-state observer. It writes the envelope at most
