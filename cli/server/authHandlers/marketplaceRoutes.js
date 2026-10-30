@@ -628,7 +628,7 @@ function buildMarketplaceRepositories({ registry, user = null, machine = false }
     const repositories = [...repoNames].sort((left, right) => left.localeCompare(right)).map((name) => {
         const predefinedEntry = predefined[name] || {};
         const sourceEntry = sources[name] || {};
-        const kind = skillRepos.get(name)?.kind || predefinedEntry.kind || sourceEntry.kind || reposSvc.classifyRepoKind(name);
+        const kind = skillRepos.get(name)?.kind || reposSvc.resolveRepoKind(name);
         const url = predefinedEntry.url || sourceEntry.url || skillRepos.get(name)?.url || '';
         const localPath = workspaceAgentRepositoryPath(name);
         // Expose a workspace-relative label for the checkout, never an assumed

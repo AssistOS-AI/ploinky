@@ -83,7 +83,7 @@ export function listRepos() {
     console.log('Available repositories:');
     for (const [name, info] of Object.entries(allRepos)) {
         const isInstalled = installed.has(name);
-        const kind = info.kind || reposSvc.classifyRepoKind(name);
+        const kind = reposSvc.resolveRepoKind(name);
         const badges = [kindBadge(kind)];
         if (isInstalled) badges.push('[installed]');
         const url = info.url === 'local' ? '(local)' : info.url;

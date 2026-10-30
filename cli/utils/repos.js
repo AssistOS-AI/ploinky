@@ -167,18 +167,26 @@ export function getSkillRepositoryRecommendations(options = {}) {
     return [...names].sort((a, b) => a.localeCompare(b)).flatMap(name => {
         const preset = PREDEFINED_REPOS[name] || {};
         const registered = sources[name] || {};
-        const declared = preset.kind || registered.kind;
-        // A workspace checkout without a declared kind is classified from its contents, so one that also holds
-        // agents is mixed and consumers read only its skills/ folder.
+        const repoKind = resolveRepoKind(name, options);
+        // A workspace checkout that also holds agents is mixed and consumers read only its skills/ folder.
         const kind = local.has(name)
-            ? (['agents', 'mixed'].includes(declared || classifyRepoPath(local.get(name).source)) ? 'mixed' : 'skills')
-            : declared || classifyRepoKind(name);
+            ? (['agents', 'mixed'].includes(repoKind) ? 'mixed' : 'skills')
+            : repoKind;
         if (!['skills', 'mixed'].includes(kind)) return [];
         const url = preset.url || registered.url || local.get(name)?.source || '';
         if (!url) return [];
         return [{ name, url, kind, description: preset.description || '',
             branch: registered.branch || '', warnings: local.get(name)?.warnings || [], skillSource: resolveSkillRepositorySource(name, url, options) }];
     });
+}
+
+// The recorded kind is a snapshot from install time, so an existing checkout's current contents take precedence.
+export function resolveRepoKind(repoName, options = {}) {
+    const preset = PREDEFINED_REPOS[repoName]?.kind;
+    if (preset) return preset;
+    const current = classifyRepoPath(resolveSkillRepositorySource(repoName, '', options).source);
+    if (current !== 'unknown') return current;
+    return getRepoSources()[repoName]?.kind || classifyRepoKind(repoName);
 }
 
 export function classifyRepoKind(repoName) {
