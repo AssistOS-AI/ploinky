@@ -195,6 +195,12 @@ test('publication ignores a manifest without a declaration and returns the norma
     assert.equal(assertExecutionProviderPublication({ manifest: provider(), routeKey: KEY }).port, 7300);
 });
 
+test('publication refuses a manifest that still declares the retired executionTarget, alone or with a provider', () => {
+    refusal({ manifest: { executionTarget: {} } }, /executionTarget is no longer supported/);
+    refusal({ manifest: { executionTarget: null } }, /executionTarget is no longer supported/);
+    refusal({ manifest: provider({ executionTarget: { kind: 'worker' } }) }, /executionTarget is no longer supported/);
+});
+
 test('publication refuses an invalid declaration and the reserved task-refs route key', () => {
     refusal({ manifest: { executionProvider: null } }, /plain object/);
     refusal({ manifest: { executionProvider: { version: 1, port: 7300 } } }, /at least one/);

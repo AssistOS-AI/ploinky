@@ -76,8 +76,6 @@ function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = f
         readRuntimePredecessor, retireRuntimePredecessor, structuredClone,
         getRuntime: () => 'podman',
         clearLivenessState: (name) => calls.push(['clear-liveness', name]),
-        // Target-mailbox retirement after a proven removal is pinned by executionTargetWorkerMailbox.test.mjs.
-        retireRemovedTargetMailboxes: () => {},
         removeExactRegisteredContainer(name, input, options) {
             return removeExactRegisteredContainer(name, input, {
                 ...options,

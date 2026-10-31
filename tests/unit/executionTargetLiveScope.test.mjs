@@ -7,11 +7,9 @@ import test from 'node:test';
 
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { isOpaqueIdentity } from '../../cli/server/executionTarget/contract.mjs';
-import { discoverExecutionTargets } from '../../cli/server/executionTarget/discovery.mjs';
 import { createLiveBoxScopeProvider, readLiveBoxScope, workspaceScopeId } from '../../cli/server/executionTarget/liveScope.mjs';
 import { createSourceProtectionService } from '../../cli/server/executionTarget/sourceProtectionService.mjs';
 import { createRouterLiveScope } from '../../cli/server/privateRouter.js';
-import { createTargetHelperTicketMinter } from '../../cli/server/security/tokens/targetHelperTicketMinter.mjs';
 
 const BOX_NAME = 'ploinky-box-ws-0123456789ab';
 const BOX_ID = 'c'.repeat(64);
@@ -94,18 +92,11 @@ test('P3 the provider re-reads every call: a recreated Box is a new generation, 
     assert.equal(await provider(), null);
 });
 
-test('P3 the scope feeds discovery, the helper-ticket minter and the source-protection service', async (t) => {
+test('P3 the scope feeds the source-protection service', async (t) => {
     const env = fixture(t);
     const provider = createLiveBoxScopeProvider(env.options);
     const live = await provider();
     assert.ok(live);
-
-    const discovered = discoverExecutionTargets({ live, readRegistry: () => ({ agents: {} }), readManifest: () => ({}), readInstance: () => null });
-    assert.equal(discovered.ok, true);
-
-    assert.doesNotThrow(() => createTargetHelperTicketMinter({
-        live, readTarget: () => null, readWorker: () => null, callerAuthority: { resolve: () => null }, secrets: { useSecret: () => null },
-    }));
 
     fs.mkdirSync(env.options.workspaceRoot, { recursive: true });
     const service = createSourceProtectionService({

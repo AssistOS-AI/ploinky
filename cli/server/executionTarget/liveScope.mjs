@@ -1,8 +1,7 @@
 // Live Box scope `{workspaceId, boxIdentity, boxGeneration}` (plan section 5.6; T0 section 4 `LiveScope`; proof slice P3).
 //
-// One derivation for every consumer that takes a trusted `live` scope: target discovery (`live`), the helper-ticket
-// minter (`live`) and the source-protection service (`liveScope()`), and anything that persists a scope for later
-// comparison. Values:
+// One derivation for every consumer that takes a trusted `live` scope: the source-protection service (`liveScope()`)
+// and anything that persists a scope for later comparison. Values:
 //   workspaceId    `workspace:<sha256 hex of the resolved workspace root>`; stable across Box recreation
 //   boxIdentity    the versionless semantic Box instance name (`ploinky-box-<slug>-<pathHash>`), injected by the caller
 //                  from the Box identity module (the engine does not expose the name inside an unprivileged container)

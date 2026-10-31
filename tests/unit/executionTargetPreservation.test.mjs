@@ -19,78 +19,41 @@ const AGENT_LAUNCH_ROOTS = ['Agent', 'agentlib', 'bin', 'cli', 'container', 'cor
 const SKIPPED_DIRECTORIES = new Set(['node_modules', '.ploinky', '.git']);
 
 const NEW_MODULES = Object.freeze([
-    'cli/server/executionTarget/declaration.mjs',
     'cli/server/executionTarget/contract.mjs',
-    'cli/server/executionTarget/discovery.mjs',
-    'cli/server/security/tokens/targetHelperTicketMinter.mjs',
     'cli/server/executionTarget/sourceProtectionService.mjs',
     'cli/utils/runtime/sourceProtectionGate.mjs',
     'cli/utils/runtime/sourceProtectionStore.mjs',
     'cli/utils/runtime/sourceProtectionInterlock.mjs',
     'cli/sandbox/legacyAgentAdoptionGuard.mjs',
-    'cli/server/executionTarget/provisioning.mjs',
     'cli/server/executionTarget/liveScope.mjs',
-    'cli/server/executionTarget/helperTicketSecrets.mjs',
-    'cli/server/executionTarget/workerMailbox.mjs',
-    'cli/server/executionTarget/helperTicketService.mjs',
 ]);
 const NEW_TESTS = Object.freeze([
-    'tests/unit/executionTargetDeclaration.test.mjs',
     'tests/unit/executionTargetSourceProtection.test.mjs',
     'tests/unit/legacyAgentAdoptionGuard.test.mjs',
     'tests/unit/executionTargetPreservation.test.mjs',
     'tests/unit/executionTargetCommonVectors.test.mjs',
-    'tests/unit/executionTargetDiscovery.test.mjs',
-    'tests/unit/executionTargetHelperTicket.test.mjs',
     'tests/unit/executionTargetSourceProtectionWiring.test.mjs',
     'tests/unit/legacyAgentMaskCompleteness.test.mjs',
-    'tests/unit/executionTargetProvisioning.test.mjs',
     'tests/unit/executionTargetLiveScope.test.mjs',
-    'tests/unit/executionTargetHelperTicketSecrets.test.mjs',
-    'tests/unit/executionTargetWorkerMailbox.test.mjs',
-    'tests/unit/executionTargetHelperTicketRoute.test.mjs',
 ]);
 // The pure guard names the legacy markers only to detect them.
 const GUARD = 'cli/sandbox/legacyAgentAdoptionGuard.mjs';
 
-// `contract` and `declaration` are common words; `discovery` appears in unrelated production code (model and agent
-// discovery). The `executionTarget/` path test and the exported operation names still catch a real importer of them.
-const BASENAME_EXEMPT = new Set(['contract', 'declaration', 'discovery', 'provisioning']);
-
-// P3: the one start-boundary call site of target provisioning. It imports exactly these three names and nothing else
-// of the new modules; `planExecutionTargetLaunch` is null for every manifest without the `executionTarget` key.
-const PROVISIONING_CALL_SITE = Object.freeze({
-    file: 'cli/sandbox/docker/agentServiceManager.js',
-    line: "import { planExecutionTargetLaunch, provisionExecutionTarget, JOURNAL_INIT_TIMEOUT_MS, TARGET_RUNTIME_ROOT } from '../../server/executionTarget/provisioning.mjs';",
-    // The worker-mailbox grant (one start-boundary decision, the mailbox-root bind) and the exact-instance mailbox
-    // retirement after a proven removal. The local grant variable carries the module's basename.
-    workerMailboxLine: "import { ensureMailboxRoot, planWorkerMailboxGrant, retireInstanceMailboxes, WORKER_TARGETS_PATH } from '../../server/executionTarget/workerMailbox.mjs';",
-    workerMailboxCalls: Object.freeze({ planWorkerMailboxGrant: 1, retireInstanceMailboxes: 1, ensureMailboxRoot: 1 }),
-    workerMailboxVariable: 'workerMailboxGrant',
-});
+// `contract` is a common word. The `executionTarget/` path test and the exported operation names still catch a real
+// importer of it.
+const BASENAME_EXEMPT = new Set(['contract']);
 
 // P5: the one Router call site of the private source-protection operation. privateRouter.js imports exactly these two
 // modules of the new tree (the service and the live-scope provider), calls each exactly once, and RoutingServer.js
 // reaches them only through its `sendSourceProtection` import (pinned by the wiring test).
-// P4 mint route (2026-10-30): the one Router call site of the private helper-ticket operation adds exactly three imports
-// (the helper-ticket service with its store-pointer reader, the ticket-secret provider and the provisioning helper-facts
-// reader), each name called exactly once in the readers of `sendTargetHelperTicket`; RoutingServer.js reaches it only
-// through its `sendTargetHelperTicket` import (pinned by the route test).
 const ROUTER_GLUE = Object.freeze({
     file: 'cli/server/privateRouter.js',
     imports: Object.freeze([
         "import { createLiveBoxScopeProvider } from './executionTarget/liveScope.mjs';",
         "import { createSourceProtectionService } from './executionTarget/sourceProtectionService.mjs';",
-        "import { createHelperTicketService, readWorkerGenerationPointer } from './executionTarget/helperTicketService.mjs';",
-        "import { createHelperTicketSecretProvider } from './executionTarget/helperTicketSecrets.mjs';",
-        "import { readExecutionTargetHelperFacts } from './executionTarget/provisioning.mjs';",
     ]),
     // The injected live-scope key of the service call; the provider is the Router's own wrapper around the module's.
     liveScopeKey: 'liveScope: createRouterLiveScope(',
-    // The helper-ticket readers: each new-tree name is called once.
-    helperTicketCalls: Object.freeze({
-        createHelperTicketService: 1, readWorkerGenerationPointer: 1, createHelperTicketSecretProvider: 1, readExecutionTargetHelperFacts: 1,
-    }),
 });
 
 // P5: the reviewed lifecycle call sites of the source-protection gate. Each imports exactly the synchronous
@@ -188,7 +151,8 @@ test('T1-10 / T1-11 the new generic modules have no production importer except t
         'advanceWorkerGeneration', 'openSourceProtectionStore', 'createSourceProtectionInterlock',
         'evaluateLegacyAgentAdoption', 'evaluateInterimLegacyMarkers', 'validateExecutionTargetDeclaration',
         'readExecutionTargetDeclaration', 'discoverExecutionTargets', 'createTargetHelperTicketMinter',
-        'planWorkerMailboxGrant', 'retireInstanceMailboxes', 'ensureMailboxRoot',
+        'planWorkerMailboxGrant', 'retireInstanceMailboxes', 'ensureMailboxRoot', 'planExecutionTargetLaunch',
+        'provisionExecutionTarget', 'sendTargetHelperTicket', 'createHelperTicketService',
     ];
     const importers = [];
     for (const relative of productionFiles()) {
@@ -210,33 +174,14 @@ test('T1-10 / T1-11 the new generic modules have no production importer except t
                 ["import { readContainerId } from './legacyAgentAdoptionGuard.mjs';"]);
             text = text.replaceAll('legacyAgentAdoptionGuard', '');
         }
-        if (relative === PROVISIONING_CALL_SITE.file) {
-            assert.deepEqual(text.match(/^import .*executionTarget\/.*$/gm),
-                [PROVISIONING_CALL_SITE.line, PROVISIONING_CALL_SITE.workerMailboxLine], relative);
-            // Two reviewed plan sites: the start boundary, and the refusal of identity-preserving targeted restarts.
-            assert.equal(text.match(/\bplanExecutionTargetLaunch\(/g).length, 2, relative);
-            assert.equal(text.match(/if \(targetedRestart && planExecutionTargetLaunch\(\{ manifest,/g)?.length, 1, relative);
-            assert.equal(text.match(/\bprovisionExecutionTarget\(/g).length, 1, relative);
-            text = text.replaceAll(PROVISIONING_CALL_SITE.line, '').replaceAll(PROVISIONING_CALL_SITE.workerMailboxLine, '');
-            for (const [name, count] of Object.entries(PROVISIONING_CALL_SITE.workerMailboxCalls)) {
-                assert.equal(text.match(new RegExp(`\\b${name}\\(`, 'g'))?.length, count, `${relative} ${name}`);
-                text = text.replaceAll(name, '');
-            }
-            text = text.replaceAll(PROVISIONING_CALL_SITE.workerMailboxVariable, '');
-        }
         if (relative === ROUTER_GLUE.file) {
             assert.deepEqual(text.match(/^import .*executionTarget\/.*$/gm), ROUTER_GLUE.imports, relative);
             assert.equal(text.match(/\bcreateSourceProtectionService\(/g).length, 1, relative);
             assert.equal(text.match(/\bcreateLiveBoxScopeProvider\(/g).length, 1, relative);
-            // Two uses: the source-protection service and the helper-ticket readers (deliberately updated from 1).
-            assert.equal(text.split(ROUTER_GLUE.liveScopeKey).length - 1, 2, relative);
+            assert.equal(text.split(ROUTER_GLUE.liveScopeKey).length - 1, 1, relative);
             for (const line of ROUTER_GLUE.imports) text = text.replaceAll(line, '');
             text = text.replaceAll('createSourceProtectionService(', '').replaceAll('createLiveBoxScopeProvider(', '')
                 .replaceAll(ROUTER_GLUE.liveScopeKey, 'createRouterLiveScope(');
-            for (const [name, count] of Object.entries(ROUTER_GLUE.helperTicketCalls)) {
-                assert.equal(text.match(new RegExp(`\\b${name}\\(`, 'g'))?.length, count, `${relative} ${name}`);
-                text = text.replaceAll(name, '');
-            }
         }
         if (Object.hasOwn(GATE_CALL_SITES, relative)) {
             assert.deepEqual(text.match(/^import .*sourceProtectionGate.*$/gm), [GATE_CALL_SITES[relative]], relative);
@@ -245,10 +190,6 @@ test('T1-10 / T1-11 the new generic modules have no production importer except t
         }
         // Nothing in production may switch the full predicate on per call.
         if (text.includes('legacyAgentLifecycleGuard')) assert.doesNotMatch(text, /\bactive:\s*true\b/, relative);
-        // A sibling inside executionTarget/ (or anywhere) importing the exempt-named modules by specifier is an importer.
-        if (/['"][^'"]*\btargetHelperTicketMinter\.mjs['"]/.test(text)) importers.push(relative);
-        // ploinky-box has its own unrelated engine/discovery.mjs, so the bare specifier is only checked beside the module.
-        if (relative.startsWith('cli/server/executionTarget/') && /['"]\.\/discovery\.mjs['"]/.test(text)) importers.push(relative);
         if (/executionTarget\//.test(text) || newNames.some((name) => !BASENAME_EXEMPT.has(name) && text.includes(name))) {
             importers.push(relative);
         }
@@ -258,14 +199,14 @@ test('T1-10 / T1-11 the new generic modules have no production importer except t
     // Among tests, only the new T1 tests reach them.
     const testImporters = [...files('tests')].filter((relative) => (
         !relative.startsWith('tests/unit/fixtures/')
-        && (/executionTarget\/|sourceProtection(Store|Interlock)|legacyAgentAdoptionGuard|targetHelperTicketMinter/.test(read(relative)))
+        && (/executionTarget\/|sourceProtection(Store|Interlock)|legacyAgentAdoptionGuard/.test(read(relative)))
     ));
     assert.deepEqual(testImporters.sort(), [...NEW_TESTS].sort());
     for (const relative of NEW_MODULES) assert.equal(fs.existsSync(path.join(REPO_ROOT, relative)), true, relative);
 });
 
 test('P5 the Router glue names have exactly one production caller: RoutingServer.js through its reviewed import', () => {
-    const names = /\b(sendSourceProtection|createRouterLiveScope|sendTargetHelperTicket|targetHelperTicketReaders)\b/;
+    const names = /\b(sendSourceProtection|createRouterLiveScope)\b/;
     assert.deepEqual(productionFiles().filter((relative) => names.test(read(relative))).sort(), [
         'cli/server/RoutingServer.js', 'cli/server/privateRouter.js',
     ]);
@@ -273,21 +214,12 @@ test('P5 the Router glue names have exactly one production caller: RoutingServer
     assert.deepEqual(router.match(/^import .*sendSourceProtection.*$/gm), ["import { sendSourceProtection } from './privateRouter.js';"]);
     assert.equal(router.match(/\bsendSourceProtection\(/g).length, 1);
     assert.doesNotMatch(router, /createRouterLiveScope/);
-    // The helper-ticket operation: one bottom import and one call, no reader composition in RoutingServer.js.
-    assert.deepEqual(router.match(/^import .*sendTargetHelperTicket.*$/gm), ["import { sendTargetHelperTicket } from './privateRouter.js';"]);
-    assert.equal(router.match(/\bsendTargetHelperTicket\(/g).length, 1);
-    assert.doesNotMatch(router, /targetHelperTicketReaders|helperTicketService|createHelperTicket/);
-    // privateRouter.js: the definitions, the two uses of the live-scope provider (source protection and the
-    // helper-ticket readers; deliberately updated from one) and the default-export entries.
+    // privateRouter.js: the two definitions, the one use of the live-scope provider and the default-export entry.
     const glue = read(ROUTER_GLUE.file);
     assert.equal(glue.match(/\bsendSourceProtection\b/g).length, 2);
-    assert.equal(glue.match(/\bcreateRouterLiveScope\b/g).length, 3);
-    assert.equal(glue.match(/\bsendTargetHelperTicket\b/g).length, 2);
-    assert.equal(glue.match(/\btargetHelperTicketReaders\b/g).length, 2);
+    assert.equal(glue.match(/\bcreateRouterLiveScope\b/g).length, 2);
     assert.match(glue, /^export async function sendSourceProtection\(/m);
     assert.match(glue, /^export function createRouterLiveScope\(/m);
-    assert.match(glue, /^export async function sendTargetHelperTicket\(/m);
-    assert.match(glue, /^function targetHelperTicketReaders\(/m);
 });
 
 test('P5 the agent-side source-protection transport is a library for worker hosts: no production file imports it', () => {
@@ -297,20 +229,6 @@ test('P5 the agent-side source-protection transport is a library for worker host
     assert.deepEqual(importers, []);
     const text = read(transport);
     assert.doesNotMatch(text, /executionTarget\/|sourceProtection(Store|Interlock|Gate|Service)/);
-});
-
-test('P4 the agent-side helper-ticket transport is a library for worker hosts: no production file imports it', () => {
-    const transport = 'Agent/lib/helperTicketTransport.mjs';
-    assert.equal(fs.existsSync(path.join(REPO_ROOT, transport)), true);
-    const importers = productionFiles().filter((relative) => relative !== transport && read(relative).includes('helperTicketTransport'));
-    assert.deepEqual(importers, []);
-    const text = read(transport);
-    assert.doesNotMatch(text, /executionTarget\/|targetHelperTicketMinter|helperTicketService|helperTicketSecrets/);
-    // One request of at most 64 KiB each way; no retry loop and no cache.
-    assert.match(text, /^const MAX_REQUEST_BYTES = 64 \* 1024;$/m);
-    assert.match(text, /^const MAX_RESPONSE_BYTES = 64 \* 1024;$/m);
-    assert.equal(text.match(/\brequestOnce\(/g).length, 2, 'one definition, one call');
-    assert.doesNotMatch(text, /\bnew Map\(|\bwhile \(|\bfor \(/);
 });
 
 test('the new modules take faults and trust through injection, never through environment variables or network', () => {

@@ -114,6 +114,13 @@ export function assertExecutionProviderPublication({
     if (String(routeKey || '') === TASK_REFERENCE_ROUTE_KEY) {
         throw publicationError(routeKey, `the route key '${TASK_REFERENCE_ROUTE_KEY}' is reserved for the task-reference surface`);
     }
+    // The executionTarget declaration was retired: a manifest that still carries it is refused at enable and at start rather
+    // than silently run as an ordinary agent.
+    if (manifest && typeof manifest === 'object' && Object.hasOwn(manifest, 'executionTarget')) {
+        const error = new Error(`manifest(${routeKey}).executionTarget is no longer supported`);
+        error.code = EXECUTION_PROVIDER_INVALID;
+        throw error;
+    }
     const read = readExecutionProviderDeclaration(manifest, { routeKey });
     if (!read.present) return null;
     if (!read.valid) throw publicationError(routeKey, read.reason);

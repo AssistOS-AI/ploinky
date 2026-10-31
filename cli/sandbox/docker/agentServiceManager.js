@@ -99,10 +99,7 @@ import {
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
 import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
-import { AGENTS_DATA_DIR, CONTROLLER_STATE_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, PLOINKY_SKILL_SCOPE_ENV, SHARED_DIR } from '../../utils/config.js';
-import { BOX_TMPFS } from '../../../ploinky-box/constants.mjs';
-import { planExecutionTargetLaunch, provisionExecutionTarget, JOURNAL_INIT_TIMEOUT_MS, TARGET_RUNTIME_ROOT } from '../../server/executionTarget/provisioning.mjs';
-import { ensureMailboxRoot, planWorkerMailboxGrant, retireInstanceMailboxes, WORKER_TARGETS_PATH } from '../../server/executionTarget/workerMailbox.mjs';
+import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, PLOINKY_SKILL_SCOPE_ENV, SHARED_DIR } from '../../utils/config.js';
 import { ensureHostLaunchSkeleton, withHostLaunchExclusion } from '../hostLaunchExclusion.js';
 import {
     planRuntimeResources,
@@ -173,7 +170,6 @@ import {
 } from '../../utils/runtime/profileService.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../../utils/runtime/startupReadiness.js';
 import { assertExecutionProviderPublication } from '../../server/executionProvider/publication.mjs';
-import { readExecutionProviderDeclaration } from '../../server/executionProvider/declaration.mjs';
 import {
     getAgentWorkDir,
     getAgentCodePath,
@@ -946,7 +942,6 @@ function removeContainerForRecreate(runtime, containerName, label, record = null
         // A failed retirement aborts this launch before any successor exists.
         if (predecessorReceipt) retireRuntimePredecessor(predecessorReceipt);
         clearLivenessState(containerName);
-        retireRemovedTargetMailboxes(containerName, exactRecord, { keepCurrent: true });
         return result;
     } catch (cause) {
         if (isLegacyAgentLifecycleRefusal(cause)) throw cause;
@@ -1091,46 +1086,6 @@ function appendExactManagedBindMount(args, value) {
     }
     args.push('-v', String(value));
     return true;
-}
-
-// Destinations of every bind, volume, mount and tmpfs grant already rendered.
-function renderedMountDestinations(args) {
-    const destinations = [];
-    for (let index = 0; index < args.length; index += 1) {
-        const arg = String(args[index]);
-        const next = String(args[index + 1] ?? '');
-        if (arg === '-v' || arg === '--volume') destinations.push(managedBindMountFromValue(next).destination);
-        else if (arg.startsWith('--volume=')) destinations.push(managedBindMountFromValue(arg.slice(9)).destination);
-        else if (arg === '--tmpfs') destinations.push(normalizeRuntimeMountTarget(next.split(':')[0]));
-        else if (arg.startsWith('--tmpfs=')) destinations.push(normalizeRuntimeMountTarget(arg.slice(8).split(':')[0]));
-        else if (arg === '--mount' || arg.startsWith('--mount=')) {
-            const spec = arg === '--mount' ? next : arg.slice(8);
-            for (const field of spec.split(',')) {
-                const [key, value] = field.split('=');
-                if (['dst', 'target', 'destination'].includes(key)) destinations.push(normalizeRuntimeMountTarget(value));
-            }
-        }
-    }
-    return destinations;
-}
-
-// The target's mailbox, journal and control binds are management-private. No
-// other grant may equal, contain or sit inside their runtime root, or a later
-// mount could shadow them with a reachable directory. Destinations are compared
-// as strings, so the image's conventional `/var/run -> /run` alias is folded in
-// and any `ploinky-target` path segment is refused. Other image symlinks are part
-// of the digest-pinned, reviewed target image inventory.
-export function assertExecutionTargetMountsReserved(args, root = TARGET_RUNTIME_ROOT) {
-    const reserved = path.posix.normalize(root);
-    for (const destination of renderedMountDestinations(args)) {
-        const raw = path.posix.normalize(String(destination));
-        const target = raw === '/var/run' || raw.startsWith('/var/run/') ? `/run${raw.slice('/var/run'.length)}` : raw;
-        if (target === reserved || target.startsWith(`${reserved}/`)
-            || reserved.startsWith(`${target === '/' ? '' : target}/`)
-            || target.split('/').includes(path.posix.basename(reserved))) {
-            throw new Error(`execution target runtime root '${reserved}' overlaps another mount at '${raw}'`);
-        }
-    }
 }
 
 function appendControllerStateGuards(args, runtime, {
@@ -1686,40 +1641,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         alias: hardwareAlias,
     });
     const runtime = getRuntime();
-    // Execution-target start boundary (plan section 5.6): null for every agent without the `executionTarget` key.
-    // A declared target refuses here, before any side effect, unless it is a valid global Podman agent in a Box.
-    const executionTargetPlan = planExecutionTargetLaunch({
-        manifest,
-        runMode: launchRecord.runMode || 'isolated',
-        runtime,
-        insideBox: isPloinkyBoxRuntime(),
-    });
-    // The single execution-provider worker's read-only view of every target mailbox (a separate decision from the
-    // target plan; null for every agent without an `executionProvider` declaration).
-    const workerMailboxGrant = planWorkerMailboxGrant({
-        manifest,
-        routeKey: options.alias || launchRecord.alias || agentName,
-        repoName,
-        agentName,
-        runtime,
-        insideBox: isPloinkyBoxRuntime(),
-        registry: agentSnapshot,
-        readManifestOf: routedAgentManifestReader(),
-        readProviderDeclaration: readExecutionProviderDeclaration,
-        boxTmpRoot: BOX_TMPFS.destination,
-        listMailboxRootHolders: (source) => runningMailboxRootHolders(runtime, source),
-        ownContainers: {
-            containerName,
-            predecessor: options.replacementPredecessor
-                ? { containerName: options.replacementPredecessor.containerName, containerId: options.replacementPredecessor.containerId }
-                : null,
-        },
-    });
-    if (workerMailboxGrant?.withheld === 'ambiguous') {
-        console.error(`[start] ${repoName}/${agentName}: target mailboxes withheld from this worker: more than one execution provider is enabled (${workerMailboxGrant.principals.join(', ')})`);
-    } else if (workerMailboxGrant?.withheld === 'held-elsewhere') {
-        console.error(`[start] ${repoName}/${agentName}: target mailboxes withheld from this worker: the mailbox root is already held by another container (${workerMailboxGrant.holders ? workerMailboxGrant.holders.join(', ') : 'holders could not be listed'})`);
-    }
     const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
         runtime,
         manifest,
@@ -2242,53 +2163,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.push('-v', `${resourcePlan.persistentStorage.hostPath}:${resourcePlan.persistentStorage.containerPath}${runtime === 'podman' ? ':z' : ''}`);
     }
 
-    // A declared execution target is provisioned before the guards are planned, so the controller state directory
-    // it writes into is already present (and masked) for this and every later bind plan.
-    // Refuse an overlapping grant before provisioning writes any record or mints an incarnation.
-    if (executionTargetPlan) assertExecutionTargetMountsReserved(args);
-    const executionTargetProvisioning = executionTargetPlan
-        ? provisionExecutionTarget({
-            plan: executionTargetPlan,
-            principal: deriveAgentPrincipalId(repoName, agentName),
-            containerName,
-            instanceId: runtimeIdentity.instanceId,
-            enableGeneration: runtimeIdentity.enableGeneration,
-            image,
-            controllerStateDir: CONTROLLER_STATE_DIR,
-            boxTmpRoot: BOX_TMPFS.destination,
-            adoptOnly: adoptManagedRuntimeOnly,
-            runJournalInit: (journalInitArgs) => spawnSync(runtime, journalInitArgs, {
-                encoding: 'utf8', timeout: JOURNAL_INIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'],
-            }),
-        })
-        : null;
-
     // Apply controller-state guards after every broad, manifest, staged, and
     // resource bind so no later agent-controlled mount can expose old state.
     appendControllerStateGuards(args, runtime);
     // Peer agents' private `.data` directories are masked after every other
     // bind too, and after the controller guards they must not conflict with.
     appendAgentPrivateDataGuards(args, runtime, { adoptOnly: adoptManagedRuntimeOnly });
-
-    // The provisioned target binds are rendered after the guards on purpose: their sources are the controller-private
-    // journal root and the Box-tmpfs mailbox/control directories created above, which no manifest, profile or broad
-    // bind can name. They mount at fixed paths under /run/ploinky-target that no other grant covers.
-    if (executionTargetProvisioning) assertExecutionTargetMountsReserved(args);
-    for (const bind of executionTargetProvisioning?.binds || []) {
-        appendExactManagedBindMount(args, `${bind.source}:${bind.target}${runtime === 'podman' ? ':z' : ''}`);
-    }
-    // The worker's mailbox-only root, read-only, after every guard and target bind. The root holds only per-incarnation
-    // mailboxes (no control directory or secret), so targets provisioned later appear without a worker restart. A
-    // worker started before any target creates it; adoption only accepts the exact existing directory.
-    if (workerMailboxGrant?.source) {
-        if (adoptManagedRuntimeOnly) {
-            requireManagedAdoptionDirectory(workerMailboxGrant.source, 'worker target mailbox root', { requireOwner: true });
-        } else {
-            ensureMailboxRoot({ boxTmpRoot: BOX_TMPFS.destination });
-        }
-        assertExecutionTargetMountsReserved(args, WORKER_TARGETS_PATH);
-        appendExactManagedBindMount(args, `${workerMailboxGrant.source}:${WORKER_TARGETS_PATH}:z,ro`);
-    }
 
     const envStrings = [
         ...buildEnvFlags(manifest, profileConfig, { agentName, repoName, profileName: activeProfile, forRuntime: true }),
@@ -4024,15 +3904,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         return import('../hardwareLimits/mpsLifecycle.mjs').then(({ ensureMpsAgentService }) => ensureMpsAgentService(agentName, manifest, agentPath, options));
     }
     const targetedRestart = normalizeTargetedRestart(options.targetedRestart);
-    // A targeted restart keeps the instance identity, but an execution target's helper launch file is single-use per
-    // provisioned instance: the recreated container could never start its helper. Refuse before the container is
-    // drained (a caller that already withdrew the route restores it through its failed-restart cleanup).
-    if (targetedRestart && planExecutionTargetLaunch({ manifest, runMode: mpsRecord?.runMode || 'isolated',
-        runtime: preflightAgentRuntime, insideBox: isPloinkyBoxRuntime() })) {
-        const error = new Error(`[restart] ${agentName}: execution targets do not support identity-preserving targeted restarts; replace the instance instead`);
-        error.code = 'PLOINKY_EXECUTION_TARGET_RESTART_UNSUPPORTED';
-        throw error;
-    }
     if (!options.networkLifecycleCapability) {
         return withNetworkLifecycleLock(
             (networkLifecycleCapability) => ensureAgentService(agentName, manifest, agentPath, {
@@ -4869,8 +4740,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
             adoptManagedRuntimeOnly,
-            // The exact predecessor a coordinated replacement retires after this launch (still running meanwhile).
-            replacementPredecessor: options.replacementPredecessor || null,
             ...(existingRuntimeAtEntry && recreateReason && !targetedRestart && !preservePreparedRegistryRecord
                 ? { predecessorRegistryRecord: structuredClone(existingRecord) }
                 : {}),
@@ -5099,7 +4968,6 @@ function removeExactGenerationCandidate({
     network,
     record,
     assertExistingAgent = null,
-    keepCurrentMailbox = false,
 } = {}) {
     const cleanup = createNetworkLifecycleAdapter({ runtime: getRuntime() }).removeExactContainer(
         containerName,
@@ -5118,7 +4986,6 @@ function removeExactGenerationCandidate({
         throw new Error(`exact failed candidate was preserved (${cleanup.reason || cleanup.state || 'ownership mismatch'})`);
     }
     clearLivenessState(containerName);
-    retireRemovedTargetMailboxes(containerName, record, { keepCurrent: keepCurrentMailbox });
     return cleanup;
 }
 
@@ -5146,65 +5013,7 @@ export function retireExactAgentRuntimePredecessor(predecessor, {
             runtime: legacy.runtime, runMode: legacy.runMode, containerName, containerId, record: inspected,
             registryRecord: record,
         }),
-        keepCurrentMailbox: true,
     });
-}
-
-// Another agent's manifest as the Router reads it: from the `hostPath` of its route in routing.json (read once per
-// start). Null when the route has none; throws when a routed manifest cannot be read (the grant then fails closed).
-function routedAgentManifestReader(loadRouting = readRoutingConfig) {
-    let routing = null;
-    return ({ routeKey }) => {
-        routing ||= loadRouting();
-        const hostPath = String(routing?.routes?.[routeKey]?.hostPath || '').trim();
-        if (!hostPath) return null;
-        return JSON.parse(fs.readFileSync(path.join(hostPath, 'manifest.json'), 'utf8'));
-    };
-}
-
-// The running containers (exact name and immutable id) that bind exactly `source`, as the container runtime reports
-// them. A container that disappears between the listing and its inspection is skipped; any other failure throws (the
-// grant then fails closed).
-function runningMailboxRootHolders(runtime, source, run = spawnSync) {
-    const query = (args) => run(runtime, args, { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
-    const running = () => {
-        const listed = query(['ps', '-q', '--no-trunc']);
-        if (listed?.error || listed?.status !== 0) throw new Error('running containers could not be listed');
-        return String(listed.stdout || '').split('\n').map((id) => id.trim()).filter(Boolean);
-    };
-    const wanted = path.resolve(source);
-    const holders = [];
-    for (const id of running()) {
-        const inspected = query(['inspect', '--type', 'container', '--format', '{{json .}}', id]);
-        if (inspected?.error || inspected?.status !== 0) {
-            if (running().includes(id)) throw new Error(`running container ${id} could not be inspected`);
-            continue;
-        }
-        const record = JSON.parse(String(inspected.stdout || '').trim());
-        const mounts = Array.isArray(record?.Mounts) ? record.Mounts : [];
-        if (mounts.some((mount) => typeof mount?.Source === 'string' && path.resolve(mount.Source) === wanted)) {
-            holders.push({ id: String(record.Id || id), name: String(record.Name || '').replace(/^\//, '') });
-        }
-    }
-    return holders;
-}
-
-// Once the exact container of a target instance is proven removed or absent, its own incarnation mailboxes go (exact
-// owner match in the provisioning record; `keepCurrent` for predecessor retirement). Best effort and silent: only
-// inside a Box, never for another instance, and never a failure of the removal.
-function retireRemovedTargetMailboxes(containerName, record, { keepCurrent = false } = {}) {
-    try {
-        if (!isPloinkyBoxRuntime() || !record?.repoName || !record?.agentName) return;
-        retireInstanceMailboxes({
-            controllerStateDir: CONTROLLER_STATE_DIR,
-            boxTmpRoot: BOX_TMPFS.destination,
-            principal: deriveAgentPrincipalId(record.repoName, record.agentName),
-            containerName,
-            instanceId: String(record.instanceId || ''),
-            enableGeneration: String(record.enableGeneration || ''),
-            keepCurrent,
-        });
-    } catch (_) {}
 }
 
 /**
@@ -5623,7 +5432,6 @@ export {
     appendControllerStateGuards,
     appendAgentPrivateDataGuards,
     appendExactManagedBindMount,
-    runningMailboxRootHolders,
     appendUniquePortMapping,
     buildPersistentAgentRunArgs,
     buildBoxPodmanHostArgs,

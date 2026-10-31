@@ -7,7 +7,7 @@ import { previewAgentEnable } from '../../cli/utils/agents.js';
 
 // An enable drops other same-agent registry keys (for example a coordinated replacement's `__candidate_` record). It
 // must never drop one whose container still exists: that runtime would keep running unregistered beside the new one,
-// with every bind it holds (the read-only target-mailbox root of a worker included).
+// with every bind it holds.
 
 const BASE = getAgentContainerName('a', 'demo');
 const CANDIDATE = `${BASE}__candidate_44b7fad0ab95`;

@@ -1,5 +1,4 @@
 import crypto from 'node:crypto';
-import path from 'node:path';
 
 import { verifyJws } from '../../Agent/lib/jwtVerify.mjs';
 import {
@@ -23,13 +22,6 @@ import { coordinatorRouteForPlan, isUpgradeRequest } from './executionProvider/c
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createLiveBoxScopeProvider } from './executionTarget/liveScope.mjs';
 import { createSourceProtectionService } from './executionTarget/sourceProtectionService.mjs';
-import { BOX_TMPFS } from '../../ploinky-box/constants.mjs';
-import { assertExactContainerOwnership } from '../sandbox/docker/containerOwnership.js';
-import { workspaceNetworkIdentity } from '../sandbox/networkIdentity.js';
-import { inspectExactTerminalContainer } from './webtty/terminalTargetResolver.mjs';
-import { createHelperTicketService, readWorkerGenerationPointer } from './executionTarget/helperTicketService.mjs';
-import { createHelperTicketSecretProvider } from './executionTarget/helperTicketSecrets.mjs';
-import { readExecutionTargetHelperFacts } from './executionTarget/provisioning.mjs';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
 const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;
@@ -141,13 +133,6 @@ export function sourceProtectionHolderCallers(snapshot) {
     return callers;
 }
 
-// The helper-ticket operation (mint route spec): the exact current instance of the single execution-provider agent. With
-// no provider, or with two or more, nobody may call it.
-export function targetHelperTicketCallers(snapshot) {
-    const holders = sourceProtectionHolderCallers(snapshot);
-    return holders.length === 1 ? holders : [];
-}
-
 function callerAclForPlan(plan) {
     const security = plan.snapshot?.compiled?.security || {};
     if (plan.kind === 'private-operation') {
@@ -186,14 +171,6 @@ function callerAclForPlan(plan) {
                 callers: sourceProtectionHolderCallers(plan.snapshot),
                 methods: ['POST'],
                 paths: ['/api/edge/source-protection'],
-            };
-        }
-        if (plan.operation === 'target-helper-ticket') {
-            return {
-                operation: plan.operation,
-                callers: targetHelperTicketCallers(plan.snapshot),
-                methods: ['POST'],
-                paths: ['/api/edge/target-helper-ticket'],
             };
         }
         if (plan.operation === 'turn-credentials') {
@@ -594,132 +571,6 @@ export async function sendSourceProtection(res, {
     return true;
 }
 
-// The Router process's one helper-ticket service: its minter keeps the helper-nonce set and the per-lease epoch and owner
-// record for the life of the process, so it must never be rebuilt per request.
-let routerTargetHelperTickets = null;
-
-function processTargetHelperTickets() {
-    if (!routerTargetHelperTickets) routerTargetHelperTickets = createHelperTicketService();
-    return routerTargetHelperTickets;
-}
-
-/**
- * The Router-asserted evidence readers of one helper-ticket request, all derived from the exact route plan snapshot and
- * the Router's own state: the live Box scope, the worker's source-protection generation pointer, the active registry
- * record and manifest of the target, one exact ownership-checked inspection of the named container, the provisioning
- * record's helper facts and the controller-private ticket secret. Test seams: `scopeSources`, `controllerStateDir`,
- * `boxTmpRoot`, `inspectContainer`, `workspaceIdentity`, `secretOwner`.
- */
-function targetHelperTicketReaders({
-    plan,
-    workspaceRoot,
-    insideBox,
-    scopeSources,
-    controllerStateDir = path.join(String(workspaceRoot || ''), '.ploinky', 'data'),
-    boxTmpRoot = BOX_TMPFS.destination,
-    inspectContainer = inspectExactTerminalContainer,
-    workspaceIdentity = workspaceNetworkIdentity,
-    secretOwner,
-} = {}) {
-    const snapshot = plan.snapshot;
-    return {
-        liveScope: createRouterLiveScope({ workspaceRoot, insideBox, scopeSources }),
-        readWorkerGeneration: (principal) => readWorkerGenerationPointer({ workspaceRoot, principal }),
-        readRegistry: () => ({ agents: snapshot?.agents || {} }),
-        readManifest: (record) => snapshot?.manifests?.[String(record?.alias || record?.agentName || '')],
-        inspectInstance: async (containerName, record) => {
-            const workspaceHash = String(workspaceIdentity(workspaceRoot)?.hash || '');
-            if (!workspaceHash) return null;
-            const inspected = await inspectContainer(record.runtime, record.containerId);
-            // The same exact-ownership proof the terminal target resolver applies: labels, instance tuple, init, name.
-            assertExactContainerOwnership(containerName, record, {
-                Id: inspected.id,
-                Name: inspected.name,
-                Config: { Labels: inspected.labels },
-                HostConfig: { Init: inspected.init },
-            }, record.containerId, workspaceHash);
-            return { running: inspected.running === true && inspected.id === record.containerId, containerId: inspected.id };
-        },
-        readHelper: (record) => readExecutionTargetHelperFacts(record, { controllerStateDir }),
-        secrets: createHelperTicketSecretProvider({
-            controllerStateDir, boxTmpRoot, ...(secretOwner === undefined ? {} : { euid: secretOwner }),
-        }),
-    };
-}
-
-/**
- * Reply to an authorized helper-ticket request. `authorizePrivateRoutePlan` has verified the caller's private agent
- * assertion and held it to the single execution-provider caller. Order (R2): every asynchronous evidence read first,
- * then the route plan commit (a changed edge generation answers 503 and nothing is minted or consumed), then the
- * synchronous mint and the reply, with no await in between. The audit records the caller, code, kid, jti and exp only;
- * the ticket and the session key appear in the response body and nowhere else.
- */
-export async function sendTargetHelperTicket(res, {
-    plan,
-    body = Buffer.alloc(0),
-    callerIdentity = null,
-    workspaceRoot,
-    insideBox,
-    audit = () => {},
-    service = processTargetHelperTickets(),
-    ...sources
-} = {}) {
-    if (!plan?.ok || plan.listener !== 'private' || plan.kind !== 'private-operation'
-        || plan.operation !== 'target-helper-ticket') {
-        sendPrivateError(res, forbidden('helper tickets require the private operation plan', 'PRIVATE_LISTENER_REQUIRED'));
-        return false;
-    }
-    const callerAgentId = String(callerIdentity?.agentId || '');
-    const refused = (code) => audit('target_helper_ticket_refused', { callerAgentId, code });
-    if (!targetHelperTicketCallers(plan.snapshot).some((entry) => exactCaller(entry, callerIdentity || {}))) {
-        refused('PRIVATE_CALLER_DENIED');
-        sendPrivateError(res, forbidden('helper tickets are limited to the single execution provider'));
-        return false;
-    }
-    let prepared;
-    try {
-        prepared = await service.prepare({
-            identity: callerIdentity,
-            body,
-            readers: targetHelperTicketReaders({ plan, workspaceRoot, insideBox, ...sources }),
-        });
-    } catch (_) {
-        refused('TARGET_HELPER_TICKET_FAILED');
-        sendPrivateError(res, Object.assign(new Error('helper ticket failed'), { status: 500, code: 'TARGET_HELPER_TICKET_FAILED' }));
-        return false;
-    }
-    if (prepared.answer) {
-        refused(prepared.answer.body.error);
-        const payload = Buffer.from(JSON.stringify(prepared.answer.body));
-        res.writeHead(prepared.answer.status, {
-            'Content-Type': 'application/json',
-            'Content-Length': payload.length,
-            'Cache-Control': 'no-store',
-        });
-        res.end(payload);
-        return false;
-    }
-    if (!commitRoutePlan(plan)) {
-        refused('edge_generation_changed');
-        sendPrivateError(res, runtimeOriginsError(503, 'edge_generation_changed', 'edge generation changed'));
-        return false;
-    }
-    const result = prepared.mint();
-    const payload = Buffer.from(JSON.stringify(result));
-    res.writeHead(200, {
-        'Content-Type': 'application/json',
-        'Content-Length': payload.length,
-        'Cache-Control': 'no-store',
-    });
-    res.end(payload);
-    if (result.ok) {
-        audit('target_helper_ticket_minted', { callerAgentId, kid: result.value.kid, jti: result.value.jti, exp: result.value.exp });
-    } else {
-        refused(result.error.code);
-    }
-    return result.ok;
-}
-
 export {
     PRIVATE_ASSERTION_HEADER,
     RUNTIME_ORIGINS_PATH,
@@ -735,5 +586,4 @@ export default {
     sendPrivateError,
     sendRuntimeRouterOrigins,
     sendSourceProtection,
-    sendTargetHelperTicket,
 };
