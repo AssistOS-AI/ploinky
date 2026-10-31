@@ -311,7 +311,9 @@ async function createManager(t, options = {}) {
         agentWorkerFactory: options.agentWorkerFactory || (() => new FakeWorker()),
         launchStore: options.launchStore,
         targetResolver: options.targetResolver,
-        homeProfiles: options.homeProfiles,
+        providerHub: options.providerHub,
+        providerTargets: options.providerTargets,
+        providerWorkerFactory: options.providerWorkerFactory,
         agentProviderAvailable: options.agentProviderAvailable,
         audit: options.audit,
         now: options.now,
@@ -2888,200 +2890,6 @@ test('decided startup demotion reclaims the new shell and detached siblings with
     assert.deepEqual(workers.map(worker => worker.closed), [1, 1]);
 });
 
-const PROFILE = Object.freeze({ provider: 'provider', id: 'p-1', label: 'Profile One' });
-const PROFILE_HOME = Object.freeze({
-    relativePath: '.data/provider/profiles/p-1/home',
-    absolutePath: `${WORKSPACE_ROOT}/.data/provider/profiles/p-1/home`,
-    identity: Object.freeze({ dev: '11', ino: '12' }),
-});
-
-function profileTargets() {
-    const [box, agent] = terminalTargets();
-    return Object.freeze([
-        Object.freeze({ ...box, home: Object.freeze({ ...PROFILE_HOME, translatedHome: PROFILE_HOME.absolutePath }) }),
-        Object.freeze({ ...agent, access: 'rw', home: Object.freeze({ ...PROFILE_HOME, translatedHome: '/data/profiles/p-1/home' }) }),
-        Object.freeze({ ...agent, containerName: 'ploinky-agent-isolated', unavailable: 'home-unreachable' }),
-    ]);
-}
-
-function homeProfiles(answers = []) {
-    const calls = [];
-    return {
-        calls,
-        async resolve(args) {
-            calls.push(args);
-            const answer = answers.length ? answers.shift() : null;
-            if (answer instanceof Error) throw answer;
-            return answer || { profile: PROFILE, home: PROFILE_HOME };
-        },
-    };
-}
-
-function profileResolver() {
-    const discoveries = [];
-    return {
-        discoveries,
-        async discover(args) {
-            discoveries.push(args);
-            return { agentTargetsAvailable: true, targets: 'home' in args ? profileTargets() : terminalTargets() };
-        },
-        async revalidate({ target }) { return target; },
-    };
-}
-
-test('a profile discovery resolves the provider after admission and binds only eligible launches', async (t) => {
-    const order = [];
-    const profiles = homeProfiles();
-    const resolve = profiles.resolve;
-    profiles.resolve = async (args) => { order.push('provider'); return resolve(args); };
-    const targetResolver = profileResolver();
-    const manager = await createManager(t, {
-        agentProviderAvailable: true,
-        targetResolver,
-        homeProfiles: profiles,
-        auth: authAdapter({ validate: async () => { order.push('admission'); return { ok: true }; } }),
-    });
-    const req = { user: { id: 'local:admin', roles: ['admin'] } };
-    const discovery = await manager.discoverTargets({
-        req, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
-    });
-    assert.deepEqual(order.slice(0, 2), ['admission', 'provider']);
-    assert.equal(profiles.calls.length, 1);
-    assert.equal(profiles.calls[0].req, req);
-    assert.deepEqual(profiles.calls[0].profile, { provider: 'provider', id: 'p-1' });
-    assert.deepEqual(targetResolver.discoveries[0].home, PROFILE_HOME);
-    assert.deepEqual(discovery.profile, PROFILE);
-    assert.deepEqual(discovery.targets.map((row) => [row.kind, Boolean(row.launch), row.unavailable]), [
-        ['box', true, undefined], ['agent', true, undefined], ['agent', false, 'home-unreachable'],
-    ]);
-    assert.doesNotMatch(JSON.stringify(discovery), /profiles\/p-1\/home/);
-
-    // Without a profile the provider is never consulted and nothing changes.
-    const plain = await manager.discoverTargets({ req, routePlan: routePlan(), directory: 'Projects' });
-    assert.equal(profiles.calls.length, 1);
-    assert.equal('home' in targetResolver.discoveries[1], false);
-    assert.deepEqual(Object.keys(plain), ['id', 'directory', 'expiresAt', 'agentTargetsAvailable', 'targets']);
-    assert.deepEqual(plain.targets.map((row) => Object.keys(row)), [
-        ['launch', 'kind', 'label', 'detail', 'access', 'cwdDisplay'],
-        ['launch', 'kind', 'label', 'detail', 'access', 'cwdDisplay'],
-    ]);
-});
-
-test('a refused profile creates no discovery record and no launch', async (t) => {
-    const refusal = Object.assign(new Error('refused'), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
-    const targetResolver = profileResolver();
-    const manager = await createManager(t, {
-        targetResolver, homeProfiles: homeProfiles([refusal]),
-    });
-    const before = manager.launchStore.counts();
-    await assert.rejects(
-        manager.discoverTargets({
-            req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
-        }),
-        { code: 'WEBTTY_PROFILE_UNAVAILABLE' },
-    );
-    assert.equal(targetResolver.discoveries.length, 0);
-    assert.deepEqual(manager.launchStore.counts(), before);
-    // A manager without a provider refuses every profile the same way.
-    const bare = await createManager(t, { targetResolver: profileResolver() });
-    await assert.rejects(
-        bare.discoverTargets({
-            req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
-        }),
-        { code: 'WEBTTY_PROFILE_UNAVAILABLE' },
-    );
-});
-
-test('a Box profile session re-resolves the provider and changes HOME only in the shell environment', async (t) => {
-    const worker = new FakeWorker();
-    const profiles = homeProfiles();
-    const manager = await createManager(t, {
-        workerFactory: (options) => { worker.factoryOptions = options; return worker; },
-        targetResolver: profileResolver(),
-        homeProfiles: profiles,
-    });
-    const discovery = await manager.discoverTargets({
-        req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
-    });
-    const created = await manager.create({
-        req: {}, routePlan: routePlan(), launch: discovery.targets[0].launch, cols: 90, rows: 30,
-    });
-    assert.equal(profiles.calls.length, 2);
-    assert.deepEqual(profiles.calls[1].profile, { provider: 'provider', id: 'p-1' });
-    assert.deepEqual(Object.keys(worker.startFields).sort(),
-        ['cols', 'cwdRelative', 'homeIdentity', 'homeRelative', 'rows', 'shellEnv']);
-    assert.equal(worker.startFields.homeRelative, PROFILE_HOME.relativePath);
-    assert.deepEqual(worker.startFields.homeIdentity, { dev: '11', ino: '12' });
-    assert.deepEqual(worker.startFields.shellEnv, buildShellEnvironment({}, {
-        workspaceRoot: WORKSPACE_ROOT, profile: { ...PROFILE, home: PROFILE_HOME.absolutePath },
-    }));
-    assert.equal(worker.startFields.shellEnv.HOME, PROFILE_HOME.absolutePath);
-    assert.equal(worker.startFields.shellEnv.INPUTRC, '/etc/inputrc');
-    assert.equal(worker.startFields.shellEnv.PLOINKY_WEBTTY_PROFILE_PROVIDER, 'provider');
-    assert.equal(worker.startFields.shellEnv.PLOINKY_WEBTTY_PROFILE_ID, 'p-1');
-    assert.equal(worker.startFields.shellEnv.PLOINKY_WEBTTY_PROFILE_LABEL, 'Profile One');
-    // The worker process itself is created exactly as before.
-    assert.deepEqual(Object.keys(worker.factoryOptions).sort(), ['marker', 'terminalId', 'workspaceRoot']);
-    assert.deepEqual(manager.sessions.get(created.id).profile, PROFILE);
-});
-
-test('an agent profile session sends the translated HOME and profile to the agent worker only', async (t) => {
-    const agentWorker = new FakeWorker();
-    agentWorker.start = async function start() { return { recoveryEvidence: { exact: true } }; };
-    const manager = await createManager(t, {
-        agentProviderAvailable: true,
-        agentWorkerFactory: (options) => { agentWorker.factoryOptions = options; return agentWorker; },
-        targetResolver: profileResolver(),
-        homeProfiles: homeProfiles(),
-    });
-    const discovery = await manager.discoverTargets({
-        req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
-    });
-    const created = await manager.create({
-        req: {}, routePlan: routePlan(), launch: discovery.targets[1].launch, cols: 92, rows: 31,
-    });
-    assert.deepEqual(agentWorker.startFields, {
-        runtime: 'podman',
-        containerId: 'a'.repeat(64),
-        targetUser: '1000:1000',
-        translatedCwd: '/code/Projects',
-        marker: manager.sessions.get(created.id).marker,
-        cols: 92,
-        rows: 31,
-        translatedHome: '/data/profiles/p-1/home',
-        profile: PROFILE,
-    });
-    assert.deepEqual(agentWorker.factoryOptions, { terminalId: created.id });
-});
-
-test('creation fails as target-stale when the provider answer or home identity changed', async (t) => {
-    const refusal = Object.assign(new Error('refused'), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
-    for (const [name, answer] of [
-        ['replaced home', { profile: PROFILE, home: { ...PROFILE_HOME, identity: { dev: '11', ino: '13' } } }],
-        ['moved home', { profile: PROFILE, home: { ...PROFILE_HOME, relativePath: '.data/provider/p-2', absolutePath: `${WORKSPACE_ROOT}/.data/provider/p-2` } }],
-        ['relabelled', { profile: { ...PROFILE, label: 'Other' }, home: PROFILE_HOME }],
-        ['refused', refusal],
-    ]) {
-        const worker = new FakeWorker();
-        let workers = 0;
-        const manager = await createManager(t, {
-            workerFactory: () => { workers += 1; return worker; },
-            targetResolver: profileResolver(),
-            homeProfiles: homeProfiles([null, answer]),
-        });
-        const discovery = await manager.discoverTargets({
-            req: {}, routePlan: routePlan(), directory: 'Projects', profile: { provider: 'provider', id: 'p-1' },
-        });
-        await assert.rejects(
-            manager.create({ req: {}, routePlan: routePlan(), launch: discovery.targets[0].launch, cols: 80, rows: 24 }),
-            { code: 'WEBTTY_TARGET_STALE' },
-            name,
-        );
-        assert.equal(workers, 0, name);
-        assert.equal(manager.activeCount(), 0, name);
-    }
-});
-
 // ---- Close outcome, retention and listing (plan r3 3.4, A7) ----
 
 const SHELL_ROW_KEYS = [
@@ -3089,7 +2897,7 @@ const SHELL_ROW_KEYS = [
     'isOwner', 'ownerLabel', 'viewerCount', 'startedAt', 'lastActivityAt', 'capabilities', 'attach',
 ];
 const SHELL_OPTIONAL_KEYS = [
-    'endedAt', 'exitReason', 'closePolicy', 'pendingStopUntil', 'ownerViewOpen', 'profileLabel',
+    'endedAt', 'exitReason', 'closePolicy', 'pendingStopUntil', 'ownerViewOpen',
     'closure', 'closureScope', 'recordCleanup',
 ];
 
@@ -3105,7 +2913,7 @@ function assertExplorerShellRow(row) {
     assert.ok(row.pendingStopUntil === null
         || (Number.isSafeInteger(row.pendingStopUntil) && row.pendingStopUntil > 0));
     assert.equal(typeof row.ownerViewOpen, 'boolean');
-    assert.ok(row.profileLabel === null || (typeof row.profileLabel === 'string' && row.profileLabel.length > 0));
+    assert.equal(Object.hasOwn(row, 'profileLabel'), false);
     if (Object.hasOwn(row, 'closure')) {
         assert.equal(row.status, 'exited');
         assert.ok(['pending', 'proven', 'unconfirmed'].includes(row.closure));
@@ -4567,4 +4375,215 @@ test('retained reads keep authentication refusals and survive failed writes with
         assert.equal(snapshot(), before, failing);
     }
     assertRetainedExit(await f.stream(), 'target_identity_changed', 'the record still answers');
+});
+
+// ---- Provider terminals (targets served by an agent that declares terminals) ----
+
+class FakeProviderWorker extends EventEmitter {
+    constructor({ proven = true } = {}) {
+        super();
+        this.proven = proven;
+        this.started = [];
+        this.inputs = [];
+        this.closed = 0;
+        this.ended = false;
+    }
+
+    async spawn() { throw new Error('a provider terminal has no worker process to spawn'); }
+
+    async start(fields) { this.started.push(fields); return { processIdentity: null }; }
+
+    async input(data) { this.inputs.push(data); }
+
+    async resize() {}
+
+    async close() {
+        this.closed += 1;
+        if (!this.ended) this.end('exit', true);
+    }
+
+    end(category, proven = this.proven) {
+        this.ended = true;
+        this.lastProven = proven;
+        queueMicrotask(() => this.emit('terminal-exit', { category, cleanupProven: proven }));
+    }
+
+    async waitForExit() { return this.ended ? this.lastProven : false; }
+}
+
+function providerRow(overrides = {}) {
+    const directory = terminalTargets()[0].directory;
+    return Object.freeze({
+        kind: 'provider', provider: 'fixture-provider', providerPrincipal: 'agent:fixture/provider',
+        targetId: 'robot_1', label: 'Robot One', detail: 'fixture-provider', access: 'rw', cwdDisplay: 'Home',
+        project: null, directory, ...overrides,
+    });
+}
+
+async function createProviderSession(t, { worker = new FakeProviderWorker(), store = recordStore(), extra = {} } = {}) {
+    const factoryCalls = [];
+    const providerHub = { name: 'hub' };
+    const manager = await createManager(t, {
+        recordStore: store,
+        providerHub,
+        providerWorkerFactory: (options) => { factoryCalls.push(options); return worker; },
+        targetResolver: {
+            async discover() { return { agentTargetsAvailable: true, targets: [] }; },
+            async revalidate({ target }) { return target; },
+        },
+        ...extra,
+    });
+    const plan = routePlan();
+    const discovery = manager.launchStore.createDiscovery({
+        owner: { userId: LEASE.userId, sessionFingerprint: LEASE.sessionFingerprint },
+        routeBinding: terminalTargetRouteBinding(plan),
+        targets: [terminalTargets()[0], providerRow(extra.row)],
+    });
+    const created = await manager.create({ req: {}, routePlan: plan, launch: discovery.targets[1].launch, cols: 100, rows: 40 });
+    return { manager, worker, store, factoryCalls, providerHub, created, plan };
+}
+
+test('a provider terminal starts through the provider worker with the creating administrator lease and keeps no recovery record', async (t) => {
+    const { manager, worker, store, factoryCalls, providerHub, created } = await createProviderSession(t);
+    assert.equal(store.calls.created, 0, 'no durable record exists for a provider terminal');
+    assert.equal(factoryCalls.length, 1);
+    assert.equal(factoryCalls[0].hub, providerHub);
+    assert.equal(factoryCalls[0].routeKey, 'fixture-provider');
+    assert.deepEqual(factoryCalls[0].target, { targetId: 'robot_1', project: null });
+    assert.equal(factoryCalls[0].adminLease, LEASE);
+    assert.deepEqual(worker.started, [{ cols: 100, rows: 40 }]);
+    assert.deepEqual(created.target, { kind: 'provider', label: 'Robot One', detail: 'fixture-provider', access: 'rw', cwdDisplay: 'Home' });
+    assert.equal(Object.hasOwn(created, 'profileLabel'), false);
+    const session = manager.sessions.get(created.id);
+    assert.equal(session.recordHandle, null);
+    await manager.input(session, 'ls\n');
+    assert.deepEqual(worker.inputs, ['ls\n']);
+    const row = (await manager.listLiveSessions({ req: {}, routePlan: routePlan() })).sessions[0];
+    assertExplorerShellRow(row);
+    assert.equal(row.cwdDisplay, 'Home');
+});
+
+test('a provider terminal needs the provider layer: without a hub the create fails and reserves nothing', async (t) => {
+    const manager = await createManager(t, {
+        targetResolver: {
+            async discover() { return { agentTargetsAvailable: true, targets: [] }; },
+            async revalidate({ target }) { return target; },
+        },
+    });
+    const plan = routePlan();
+    const discovery = manager.launchStore.createDiscovery({
+        owner: { userId: LEASE.userId, sessionFingerprint: LEASE.sessionFingerprint },
+        routeBinding: terminalTargetRouteBinding(plan), targets: [terminalTargets()[0], providerRow()],
+    });
+    await assert.rejects(manager.create({ req: {}, routePlan: plan, launch: discovery.targets[1].launch }),
+        { code: 'WEBTTY_UNAVAILABLE' });
+    assert.equal(manager.activeCount(), 0);
+    assert.equal(manager.userCounts.size, 0);
+});
+
+test('a worker-reported shell exit settles proven and never touches availability', async (t) => {
+    const { manager, worker, created } = await createProviderSession(t);
+    worker.end('exit', true);
+    await Promise.allSettled([...manager.inFlightCloses]);
+    await new Promise((resolve) => setImmediate(resolve));
+    await Promise.allSettled([...manager.inFlightCloses]);
+    assert.equal(manager.sessions.has(created.id), false);
+    const row = await tombstoneRow(manager, created.id);
+    assert.equal(row.exitReason, 'terminal_exit');
+    assert.equal(row.closure, 'proven');
+    assert.deepEqual(manager.availability(), { ok: true });
+});
+
+test('a client shutdown ends the session with cause shutdown; the stop is unconfirmed at provider scope and WebTTY stays available', async (t) => {
+    const { manager, worker, created } = await createProviderSession(t, { worker: new FakeProviderWorker({ proven: false }) });
+    worker.end('shutdown', false);
+    for (let i = 0; i < 4; i += 1) {
+        await Promise.allSettled([...manager.inFlightCloses]);
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(manager.sessions.has(created.id), false);
+    const row = await tombstoneRow(manager, created.id);
+    assert.equal(row.exitReason, 'terminal_shutdown');
+    assert.equal(row.closure, 'unconfirmed');
+    assert.equal(row.closureScope, 'provider');
+    assert.deepEqual(manager.availability(), { ok: true }, 'one provider terminal never disables WebTTY');
+    // The Box path still creates sessions afterwards.
+    const box = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    assert.equal(box.target.kind, 'box');
+});
+
+test('a PTY that a reattach found missing ends the session (available=false means ended)', async (t) => {
+    const { manager, worker, created } = await createProviderSession(t, { worker: new FakeProviderWorker({ proven: false }) });
+    worker.end('unavailable', false);
+    for (let i = 0; i < 4; i += 1) {
+        await Promise.allSettled([...manager.inFlightCloses]);
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(manager.sessions.has(created.id), false);
+    assert.equal((await tombstoneRow(manager, created.id)).exitReason, 'terminal_unavailable');
+});
+
+test('an explicit stop closes the PTY through the provider worker and settles proven', async (t) => {
+    const { manager, worker, created } = await createProviderSession(t);
+    assert.equal(await manager.closeAuthorized({}, routePlan(), created.id), true);
+    assert.equal(worker.closed, 1);
+    const row = await tombstoneRow(manager, created.id);
+    assert.equal(row.closure, 'proven');
+    assert.equal(row.exitReason, 'requested');
+});
+
+test('a stop the provider never confirms is unconfirmed at provider scope, not a global disable', async (t) => {
+    const worker = new FakeProviderWorker();
+    worker.close = async function close() { this.closed += 1; };
+    worker.waitForExit = async () => false;
+    const { manager, created } = await createProviderSession(t, { worker });
+    assert.equal(await manager.closeAuthorized({}, routePlan(), created.id), true);
+    const row = await tombstoneRow(manager, created.id);
+    assert.equal(row.closure, 'unconfirmed');
+    assert.equal(row.closureScope, 'provider');
+    assert.deepEqual(manager.availability(), { ok: true });
+});
+
+test('a provider launch that is refused leaves no session, no quota and no record', async (t) => {
+    const worker = new FakeProviderWorker();
+    worker.start = async () => { throw Object.assign(new Error('refused'), { code: 'WEBTTY_PROVIDER_LAUNCH_REFUSED' }); };
+    const store = recordStore();
+    const manager = await createManager(t, {
+        recordStore: store,
+        providerHub: {},
+        providerWorkerFactory: () => worker,
+        targetResolver: {
+            async discover() { return { agentTargetsAvailable: true, targets: [] }; },
+            async revalidate({ target }) { return target; },
+        },
+    });
+    const plan = routePlan();
+    const discovery = manager.launchStore.createDiscovery({
+        owner: { userId: LEASE.userId, sessionFingerprint: LEASE.sessionFingerprint },
+        routeBinding: terminalTargetRouteBinding(plan), targets: [terminalTargets()[0], providerRow()],
+    });
+    await assert.rejects(manager.create({ req: {}, routePlan: plan, launch: discovery.targets[1].launch }),
+        { code: 'WEBTTY_PROVIDER_LAUNCH_REFUSED' });
+    await Promise.allSettled([...manager.inFlightCloses]);
+    assert.equal(manager.activeCount(), 0);
+    assert.equal(manager.userCounts.size, 0);
+    assert.equal(store.calls.created, 0);
+    assert.deepEqual(manager.availability(), { ok: true });
+});
+
+test('discovery passes the revalidated administrator and keeps provider notices beside the rows', async (t) => {
+    const calls = [];
+    const notice = [{ name: 'fixture-provider', available: false, reason: 'provider_unavailable' }];
+    const manager = await createManager(t, {
+        targetResolver: {
+            async discover(args) { calls.push(args); return { directory: terminalTargets()[0].directory, agentTargetsAvailable: false,
+                targets: [terminalTargets()[0]], providers: notice }; },
+            async revalidate({ target }) { return target; },
+        },
+    });
+    const user = { id: 'local:admin', roles: ['admin'] };
+    const discovery = await manager.discoverTargets({ req: { user }, routePlan: routePlan(), directory: 'Projects' });
+    assert.equal(calls[0].user, user);
+    assert.deepEqual(discovery.providers, notice);
+    assert.equal(discovery.targets.length, 1);
 });

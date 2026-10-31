@@ -1,17 +1,21 @@
 import crypto from 'node:crypto';
 
 export const WEBTTY_LAUNCH_LIMITS = Object.freeze({
-    maxTargetsPerDiscovery: 64,
+    // The Box, up to 63 agent targets and the provider inventories (each is
+    // bounded at 256 by the provider protocol and is never truncated).
+    maxTargetsPerDiscovery: 320,
     maxBatchesPerAuthSession: 3,
-    maxLaunchRecords: 512,
+    maxLaunchRecords: 1024,
     ttlMs: 5 * 60_000,
     attachTtlMs: 60_000,
     maxAttachRecords: 512,
 });
 
-const SAFE_TARGET_KEYS = Object.freeze(['kind', 'label', 'detail', 'access', 'cwdDisplay']);
+const SAFE_TARGET_KEYS = Object.freeze(['kind', 'label', 'detail', 'access', 'cwdDisplay', 'provider', 'targetId']);
 const DISPLAY_LIMITS = Object.freeze({ label: 128, detail: 256, cwdDisplay: 4 * 1024 });
-const TARGET_UNAVAILABLE_REASONS = new Set(['home-unreachable', 'home-read-only']);
+const PROVIDER_TARGET_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const PROVIDER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const PROVIDER_REASON = /^[a-z][a-z0-9_]{0,63}$/;
 
 function launchError(code, message = code) {
     const error = new Error(message);
@@ -69,8 +73,14 @@ function displayText(value, field) {
 }
 
 function safeTarget(target) {
-    if (!target || !['box', 'agent'].includes(target.kind)
+    if (!target || !['box', 'agent', 'provider'].includes(target.kind)
         || !['rw', 'ro'].includes(target.access)) {
+        throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
+    }
+    // A row that carries a removed `unavailable` mark, or a provider name on a
+    // target that no provider serves, is never turned into a launchable record.
+    if (target.unavailable !== undefined
+        || (target.kind !== 'provider' && (target.provider !== undefined || target.targetId !== undefined))) {
         throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
     }
     const row = {
@@ -80,31 +90,39 @@ function safeTarget(target) {
         access: target.access,
         cwdDisplay: displayText(target.cwdDisplay, 'cwdDisplay'),
     };
-    if (Object.keys(row).some((key) => !SAFE_TARGET_KEYS.includes(key))) {
-        throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
-    }
-    if (target.unavailable !== undefined) {
-        // An ineligible profile row is listed with its reason and no launch.
-        if (target.kind !== 'agent' || !TARGET_UNAVAILABLE_REASONS.has(target.unavailable)) {
+    // A provider row names the route of the provider that serves it, so the
+    // dialog can show the target under that provider.
+    if (target.kind === 'provider') {
+        if (typeof target.provider !== 'string' || !PROVIDER_NAME.test(target.provider)) {
             throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
         }
-        row.unavailable = target.unavailable;
+        row.provider = target.provider;
+        // The provider's opaque target id (administrator-only): a client that
+        // knows which target it means binds to it by id, never by label.
+        if (typeof target.targetId !== 'string' || !PROVIDER_TARGET_ID.test(target.targetId)) {
+            throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
+        }
+        row.targetId = target.targetId;
+    }
+    if (Object.keys(row).some((key) => !SAFE_TARGET_KEYS.includes(key))) {
+        throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
     }
     return Object.freeze(row);
 }
 
-function safeProfile(profile) {
-    if (profile === null || profile === undefined) return null;
-    const keys = profile && typeof profile === 'object' && !Array.isArray(profile) ? Object.keys(profile).sort() : [];
-    if (keys.join(',') !== 'id,label,provider'
-        || typeof profile.provider !== 'string' || !profile.provider
-        || typeof profile.id !== 'string' || !profile.id
-        || typeof profile.label !== 'string' || !profile.label
-        || /[\u0000-\u001f\u007f]/.test(profile.label)
-        || Buffer.byteLength(profile.label, 'utf8') > DISPLAY_LIMITS.label) {
-        throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
-    }
-    return Object.freeze({ provider: profile.provider, id: profile.id, label: profile.label });
+// Provider notices: a provider that declares terminals but cannot list them.
+// They carry a name and a reason code, never an error text.
+function safeProviders(providers) {
+    if (providers === undefined || providers === null) return [];
+    if (!Array.isArray(providers) || providers.length > 64) throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
+    return providers.map((entry) => {
+        if (!entry || typeof entry !== 'object' || entry.available !== false
+            || typeof entry.name !== 'string' || !PROVIDER_NAME.test(entry.name)
+            || typeof entry.reason !== 'string' || !PROVIDER_REASON.test(entry.reason)) {
+            throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
+        }
+        return Object.freeze({ name: entry.name, available: false, reason: entry.reason });
+    });
 }
 
 function cloneInternal(value) {
@@ -212,7 +230,7 @@ export class WebttyLaunchRecordStore {
         routeBinding: routeBindingInput,
         targets,
         agentTargetsAvailable = true,
-        profile = null,
+        providers = [],
     } = {}) {
         const now = this.now();
         this.cleanupExpired(now);
@@ -225,16 +243,8 @@ export class WebttyLaunchRecordStore {
         }
         const directory = canonicalDirectory(targets);
         const rows = targets.map(safeTarget);
-        const responseProfile = safeProfile(profile);
-        // With a profile, every launchable record binds that profile and its
-        // per-target HOME; without one, records are exactly as before.
-        for (const target of targets) {
-            if (target.unavailable !== undefined) continue;
-            if (responseProfile ? !target.home : target.home !== undefined) {
-                throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
-            }
-        }
-        const launchable = targets.filter((target) => target.unavailable === undefined).length;
+        const notices = safeProviders(providers);
+        const launchable = targets.length;
         const prior = this.sessionBatches(owner);
         const evictionCount = Math.max(0, prior.length - this.limits.maxBatchesPerAuthSession + 1);
         const evictions = prior.slice(0, evictionCount);
@@ -258,10 +268,6 @@ export class WebttyLaunchRecordStore {
         const responseTargets = [];
         const stagedLaunches = [];
         for (let index = 0; index < targets.length; index += 1) {
-            if (targets[index].unavailable !== undefined) {
-                responseTargets.push(rows[index]);
-                continue;
-            }
             const launchId = this.mintUniqueId(this.batches, this.launches, reservedIds);
             reservedIds.add(launchId);
             const record = Object.freeze({
@@ -272,9 +278,7 @@ export class WebttyLaunchRecordStore {
                 directory,
                 createdAt: now,
                 expiresAt,
-                target: cloneInternal(responseProfile
-                    ? { ...targets[index], profile: responseProfile }
-                    : targets[index]),
+                target: cloneInternal(targets[index]),
             });
             stagedLaunches.push([launchId, record]);
             batch.launchIds.push(launchId);
@@ -290,7 +294,7 @@ export class WebttyLaunchRecordStore {
             directory,
             expiresAt,
             agentTargetsAvailable: agentTargetsAvailable === true,
-            ...(responseProfile ? { profile: responseProfile } : {}),
+            ...(notices.length ? { providers: Object.freeze(notices) } : {}),
             targets: Object.freeze(responseTargets),
         });
     }

@@ -328,3 +328,127 @@ test('constructor requires an explicit complete set of positive finite resource 
     }
     assert.throws(() => new ProviderTerminalClient({ ...options, limits: { ...limits, extra: 1 } }), /configuration/);
 });
+
+test('shutdown reports one local notice that lists the PTYs it dropped, and no ended frame', async () => {
+    const h = harness();
+    const transport = await connect(h);
+    await launch(h, transport);
+    const notices = [];
+    const ended = [];
+    h.client.on('shutdown', (notice) => notices.push(notice));
+    h.client.on('ended', (frame) => ended.push(frame));
+    assert.equal(h.client.closed, false);
+    await h.client.shutdown();
+    await h.client.shutdown();
+    assert.deepEqual(notices, [{ ptySessionIds: [PTY] }]);
+    assert.equal(ended.length, 0, 'a local notice is not a protocol cause');
+    assert.equal(h.client.closed, true);
+    assert.equal(h.client.ownershipHeld(), false);
+    cleaned(h);
+});
+
+test('lease expiry shuts the client down with the same notice', async () => {
+    const h = harness();
+    const transport = await connect(h);
+    await launch(h, transport);
+    assert.equal(h.client.ownershipHeld(), true);
+    const notices = [];
+    h.client.on('shutdown', (notice) => notices.push(notice));
+    transport.autoCallback = true;
+    await h.clock.advance(3000);
+    assert.deepEqual(notices, [{ ptySessionIds: [PTY] }]);
+    assert.equal(h.client.ownershipHeld(), false);
+    cleaned(h);
+});
+
+test('a first hello that never produced ownership can be repeated; once ownership exists a failed connect keeps it', async () => {
+    const h = harness();
+    const first = h.client.connect({ lease: h.lease });
+    const refused = assert.rejects(first, /connect_failed/);
+    await flush();
+    const transport = h.transports[0];
+    transport.peer('challenge', { nonce: transport.nonce });
+    await flush();
+    assert.equal(transport.controls('hello').length, 1);
+    transport.emit('close');
+    await refused;
+    assert.equal(h.client.ownershipHeld(), false);
+    const second = await connect(h);
+    assert.equal(second.controls('hello').length, 1, 'the second connect sends hello again');
+    assert.equal(h.client.ownershipHeld(), true);
+    await h.client.shutdown();
+    cleaned(h);
+});
+
+test('a PTY missing from a reattach inventory is dropped, reported once and its operation forgotten', async () => {
+    const h = harness();
+    const old = await connect(h);
+    await launch(h, old);
+    assert.equal(h.client.ownershipHeld(), true);
+    const lost = [];
+    h.client.on('unavailable', (notice) => lost.push(notice));
+    const rotation = await startRotation(h);
+    await finishRotation(rotation, []);
+    assert.deepEqual(lost, [{ ptySessionId: PTY }]);
+    await assert.rejects(h.client.attach(PTY, { lease: h.lease }), /unknown_pty/);
+    // The operation was forgotten with the PTY: the same operation id is a new launch.
+    const again = h.client.launch(fields(), { lease: h.lease });
+    await flush();
+    assert.equal(rotation.transport.controls('launch').length, 1);
+    rotation.transport.peer('launched', { operationId: OPERATION, ptySessionId: OTHER });
+    assert.equal(await again, OTHER);
+    await h.client.shutdown();
+    cleaned(h);
+});
+
+test('the operation table does not fill: ended PTYs, refused launches and forgotten attempts free their slots', async () => {
+    const h = harness({ limits: { operations: 2, ptys: 2 } });
+    const transport = await connect(h);
+    const ids = ['a', 'b', 'c', 'd', 'e'].map((suffix, index) => `33333333-3333-4333-8333-33333333333${index}`);
+    for (let index = 0; index < 4; index += 1) {
+        const pty = `11111111-1111-4111-8111-11111111111${index}`;
+        const result = await launch(h, transport, fields({ operationId: ids[index] }), pty);
+        assert.equal(result, pty);
+        transport.peer('ended', { ptySessionId: pty, cause: 'exit' });
+    }
+    // Refused launches free their slot too.
+    for (let index = 0; index < 3; index += 1) {
+        const operationId = `44444444-4444-4444-8444-44444444444${index}`;
+        const pending = h.client.launch(fields({ operationId }), { lease: h.lease });
+        const rejected = assert.rejects(pending, { code: 'PROVIDER_TERMINAL_LAUNCH_FAILED', refusal: 'forbidden' });
+        await flush();
+        transport.peer('launch-failed', { operationId, code: 'forbidden' });
+        await rejected;
+    }
+    // A launch whose attempt gave up (uncertain) is forgotten by its owner.
+    const stuck = '55555555-5555-4555-8555-555555555555';
+    const uncertain = assert.rejects(h.client.launch(fields({ operationId: stuck }), { lease: h.lease }), /launch_uncertain/);
+    await h.clock.advance(100);
+    await uncertain;
+    assert.equal(h.client.forget(stuck), true);
+    assert.equal(h.client.forget(stuck), false);
+    const last = await launch(h, transport, fields({ operationId: ids[4] }), '11111111-1111-4111-8111-111111111119');
+    assert.equal(last, '11111111-1111-4111-8111-111111111119');
+    await h.client.shutdown();
+    cleaned(h);
+});
+
+test('a delivered launch refusal is final and says why; a timeout stays uncertain and carries no refusal', async () => {
+    const h = harness();
+    const transport = await connect(h);
+    const refused = h.client.launch(fields(), { lease: h.lease });
+    const refusal = refused.then(() => null, (error) => error);
+    await flush();
+    transport.peer('launch-failed', { operationId: OPERATION, code: 'robot_not_ready' });
+    const error = await refusal;
+    assert.equal(error.code, 'PROVIDER_TERMINAL_LAUNCH_FAILED');
+    assert.equal(error.refusal, 'robot_not_ready');
+    const silent = h.client.launch(fields({ operationId: OTHER }), { lease: h.lease });
+    const timeout = silent.then(() => null, (failure) => failure);
+    await h.clock.advance(100);
+    const uncertain = await timeout;
+    assert.equal(uncertain.code, 'PROVIDER_TERMINAL_LAUNCH_UNCERTAIN');
+    assert.equal(uncertain.refusal, undefined);
+    await h.client.shutdown();
+    cleaned(h);
+});

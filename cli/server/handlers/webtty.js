@@ -6,7 +6,6 @@ import { WEBTTY_PROTOCOL_LIMITS } from '../../../core-services/webtty/worker-pro
 import { isAdminUser } from '../auth/localService.js';
 import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
 import { commitRouteGeneration } from '../edgeRoutePlan.js';
-import { validateHomeProfileRequest } from '../webtty/homeProfileProvider.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEBTTY_ROOT = path.resolve(__dirname, '../webtty');
@@ -190,8 +189,10 @@ function mapOperationError(res, error) {
         sendError(res, 404, 'not_found');
     } else if (STALE_TARGET_ERRORS.has(code)) {
         sendError(res, 409, 'terminal_target_stale');
-    } else if (code === 'WEBTTY_PROFILE_UNAVAILABLE') {
-        sendError(res, 409, 'terminal_profile_unavailable');
+    } else if (code === 'WEBTTY_PROVIDER_LAUNCH_REFUSED') {
+        // A final refusal by the provider, with its validated reason code.
+        const reason = /^[a-z][a-z0-9_-]{0,63}$/.test(String(error?.reason || '')) ? { reason: error.reason } : {};
+        sendJson(res, 409, { ok: false, error: 'terminal_launch_refused', ...reason });
     } else if (code === 'WEBTTY_VIEW_STALE') {
         sendError(res, 409, 'terminal_view_stale');
     } else if (code === 'WEBTTY_UNAVAILABLE' || code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') {
@@ -301,11 +302,14 @@ export async function handleWebtty(req, res, parsedUrl, {
             sendError(res, error.code === 'UNSUPPORTED_MEDIA_TYPE' ? 415 : error.code === 'BODY_TOO_LARGE' ? 413 : 400, error.code.toLowerCase());
             return true;
         }
-        // Exactly `{dir}` (standalone) or `{dir, profile: {provider, id}}`.
-        // The browser names a profile; it never supplies a HOME path.
-        const withProfile = exactBodyKeys(body, ['dir', 'profile']);
-        if ((!withProfile && !exactBodyKeys(body, ['dir'])) || typeof body.dir !== 'string'
-            || (withProfile && !validateHomeProfileRequest(body.profile))) {
+        // Exactly `{dir}`. A request that still names a home profile is a
+        // payload of the removed profile feature: it fails explicitly and
+        // creates nothing.
+        if (Object.hasOwn(body, 'profile')) {
+            sendError(res, 410, 'legacy_terminal_profile');
+            return true;
+        }
+        if (!exactBodyKeys(body, ['dir']) || typeof body.dir !== 'string') {
             sendError(res, 400, 'invalid_discovery_request');
             return true;
         }
@@ -314,7 +318,6 @@ export async function handleWebtty(req, res, parsedUrl, {
                 req,
                 routePlan,
                 directory: body.dir,
-                ...(withProfile ? { profile: validateHomeProfileRequest(body.profile) } : {}),
             });
             sendJson(res, 201, { ok: true, discovery });
         } catch (error) {

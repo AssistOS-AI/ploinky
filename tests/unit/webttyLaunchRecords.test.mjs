@@ -324,54 +324,58 @@ test('unsafe display data and mismatched target directories are rejected before 
     assert.deepEqual(records.counts(), { batches: 0, launches: 0 });
 });
 
-function profileHome(translatedHome) {
+function providerTarget(overrides = {}) {
     return Object.freeze({
-        relativePath: '.data/provider/profiles/p-1/home',
-        absolutePath: '/physical/workspace/.data/provider/profiles/p-1/home',
-        identity: Object.freeze({ dev: '7', ino: '9' }),
-        translatedHome,
+        kind: 'provider',
+        provider: 'fixture-provider',
+        providerPrincipal: 'agent:fixture/provider',
+        targetId: 'target_1',
+        directory: directory(),
+        label: 'Target One',
+        detail: 'fixture-provider',
+        access: 'rw',
+        cwdDisplay: 'Home',
+        project: null,
+        ...overrides,
     });
 }
 
-test('a profile discovery binds profile and per-target HOME and lists ineligible rows without launches', () => {
-    const records = new WebttyLaunchRecordStore({ randomBytes: randomSource() });
-    const profile = Object.freeze({ provider: 'provider', id: 'p-1', label: 'Profile One' });
-    const homeBox = Object.freeze({ ...box(), home: profileHome('/physical/workspace/.data/provider/profiles/p-1/home') });
-    const homeAgent = Object.freeze({ ...agent(), home: profileHome('/data/profiles/p-1/home') });
-    const unreachable = Object.freeze({ ...agent(), containerName: 'isolated', unavailable: 'home-unreachable' });
-    const readOnly = Object.freeze({ ...agent(), containerName: 'read-only', unavailable: 'home-read-only' });
+test('a provider row is listed with its provider name and launches only through its own record', () => {
+    const records = store();
     const discovery = records.createDiscovery({
-        owner: OWNER, routeBinding: ROUTE, targets: [homeBox, homeAgent, unreachable, readOnly], profile,
+        owner: OWNER, routeBinding: ROUTE, targets: [box(), providerTarget()],
+        providers: [{ name: 'other-provider', available: false, reason: 'provider_unavailable' }],
     });
-    assert.deepEqual(discovery.profile, profile);
-    assert.deepEqual(Object.keys(discovery), ['id', 'directory', 'expiresAt', 'agentTargetsAvailable', 'profile', 'targets']);
-    assert.deepEqual(discovery.targets.map((row) => Object.keys(row)), [
-        ['launch', 'kind', 'label', 'detail', 'access', 'cwdDisplay'],
-        ['launch', 'kind', 'label', 'detail', 'access', 'cwdDisplay'],
-        ['kind', 'label', 'detail', 'access', 'cwdDisplay', 'unavailable'],
-        ['kind', 'label', 'detail', 'access', 'cwdDisplay', 'unavailable'],
-    ]);
-    assert.deepEqual(discovery.targets.slice(2).map((row) => row.unavailable), ['home-unreachable', 'home-read-only']);
-    // Neither HOME paths nor identities reach the browser.
-    assert.doesNotMatch(JSON.stringify(discovery), /profiles\/p-1\/home|"ino"|translatedHome/);
-    assert.equal(records.counts().launches, 2);
+    assert.deepEqual(Object.keys(discovery), ['id', 'directory', 'expiresAt', 'agentTargetsAvailable', 'providers', 'targets']);
+    assert.deepEqual(discovery.providers, [{ name: 'other-provider', available: false, reason: 'provider_unavailable' }]);
+    assert.deepEqual(Object.keys(discovery.targets[1]), ['launch', 'kind', 'label', 'detail', 'access', 'cwdDisplay', 'provider', 'targetId']);
+    assert.equal(discovery.targets[1].provider, 'fixture-provider');
+    // The opaque target id travels to the administrator's browser; the rest of
+    // the provider's identity never does, and the record keeps it.
+    assert.equal(discovery.targets[1].targetId, 'target_1');
+    assert.doesNotMatch(JSON.stringify(discovery), /agent:fixture|providerPrincipal/);
     const consumed = records.consume({ launch: discovery.targets[1].launch, owner: OWNER, routeBinding: ROUTE });
-    assert.deepEqual(consumed.target.profile, profile);
-    assert.deepEqual(consumed.target.home, homeAgent.home);
-    assert.equal(Object.isFrozen(consumed.target.home.identity), true);
+    assert.equal(consumed.target.targetId, 'target_1');
+    assert.equal(consumed.target.providerPrincipal, 'agent:fixture/provider');
 });
 
-test('profile and non-profile discoveries cannot mix HOME bindings', () => {
-    const records = new WebttyLaunchRecordStore({ randomBytes: randomSource() });
-    const profile = { provider: 'provider', id: 'p-1', label: 'Profile One' };
-    const homeBox = { ...box(), home: profileHome('/x/home') };
+test('provider unavailability is a notice, never a row; malformed notices and rows are refused', () => {
+    const records = store();
+    const plain = records.createDiscovery({ owner: OWNER, routeBinding: ROUTE, targets: [box()] });
+    assert.deepEqual(Object.keys(plain), ['id', 'directory', 'expiresAt', 'agentTargetsAvailable', 'targets']);
     for (const request of [
-        { targets: [box()], profile },
-        { targets: [homeBox] },
-        { targets: [homeBox, { ...agent(), unavailable: 'other-reason' }], profile },
-        { targets: [{ ...box(), unavailable: 'home-unreachable' }], profile },
-        { targets: [homeBox], profile: { ...profile, label: 'bad\nlabel' } },
-        { targets: [homeBox], profile: { ...profile, home: '/x' } },
+        { targets: [box(), providerTarget({ provider: 'bad name' })] },
+        { targets: [box(), providerTarget({ provider: undefined })] },
+        { targets: [box(), providerTarget({ targetId: undefined })] },
+        { targets: [box(), providerTarget({ targetId: 'bad id' })] },
+        { targets: [box(), providerTarget({ targetId: 'x'.repeat(129) })] },
+        { targets: [box(), { ...agent(), targetId: 'target_1' }] },
+        { targets: [box(), { ...agent(), provider: 'fixture-provider' }] },
+        { targets: [box(), { ...agent(), unavailable: 'home-unreachable' }] },
+        { targets: [box()], providers: [{ name: 'p', available: true, reason: 'x' }] },
+        { targets: [box()], providers: [{ name: 'p', available: false, reason: 'Bad Reason' }] },
+        { targets: [box()], providers: [{ name: 'p', available: false, reason: 'ok', detail: 'secret' }].map((e) => ({ ...e, name: 'x y' })) },
+        { targets: [box()], providers: 'nope' },
     ]) {
         assert.throws(
             () => records.createDiscovery({ owner: OWNER, routeBinding: ROUTE, ...request }),
@@ -379,8 +383,5 @@ test('profile and non-profile discoveries cannot mix HOME bindings', () => {
             JSON.stringify(request),
         );
     }
-    const plain = records.createDiscovery({ owner: OWNER, routeBinding: ROUTE, targets: [box(), agent()] });
-    assert.deepEqual(Object.keys(plain), ['id', 'directory', 'expiresAt', 'agentTargetsAvailable', 'targets']);
-    const consumed = records.consume({ launch: plain.targets[0].launch, owner: OWNER, routeBinding: ROUTE });
-    assert.equal('profile' in consumed.target || 'home' in consumed.target, false);
+    assert.deepEqual(records.counts(), { batches: 1, launches: 1 });
 });

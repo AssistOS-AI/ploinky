@@ -3471,6 +3471,123 @@
             "anchor": null,
             "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
           }
+        },
+        "de8c720d45bc7f35a8d315b3ae6e5208032b298ee908c8ebf826c17b8525bde3": {
+          "root.get": {
+            "line": 826,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "root-index.get": {
+            "line": 826,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "health.get": {
+            "line": 696,
+            "anchor": null,
+            "statement": "if (pathname === '/health') {"
+          },
+          "agent-card.get": {
+            "line": 786,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-card-slash.get": {
+            "line": 786,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "mcp-browser-client.get": {
+            "line": 518,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 518,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 787,
+            "anchor": null,
+            "statement": "} else if (agentName && isActiveAgentRootPlan(routePlan)) {"
+          },
+          "agent-mcp.post": {
+            "line": 796,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.get": {
+            "line": 796,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.delete": {
+            "line": 796,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-task-status.get": {
+            "line": 656,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-status-alias.get": {
+            "line": 656,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-cancel.post": {
+            "line": 597,
+            "anchor": null,
+            "statement": "} else if (isDelegatedAgentTaskCancelRoute) {"
+          },
+          "agent-openai.post": {
+            "line": 803,
+            "anchor": null,
+            "statement": "return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath, {"
+          },
+          "agent-root-websocket.get": {
+            "line": 1121,
+            "anchor": null,
+            "statement": "const handled = await handleAgentRootUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 1083,
+            "anchor": null,
+            "statement": "if (routePlan.kind === 'agent-port') {"
+          },
+          "internal-agent-control.*": {
+            "line": 533,
+            "anchor": null,
+            "statement": "if (hasInternalAgentSegment(pathname)) {"
+          },
+          "reserved--metrics.*": {
+            "line": 838,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--health-internal.*": {
+            "line": 838,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin.*": {
+            "line": 838,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin-*.*": {
+            "line": 838,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "unix-health.get": {
+            "line": 1034,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          }
         }
       },
       "candidate": "27fb848deaa7824177c9fb16cc265da2b9bb9cc919021fcaacb18580026596a9"
@@ -4466,6 +4583,58 @@
           },
           "webtty-delete.delete": {
             "line": 503,
+            "anchor": null,
+            "statement": "if (!selected.operation && method === 'DELETE') {"
+          }
+        },
+        "78569d92913f5520d6dbc6539d7c1ef6a72e4af3c85c8989c4e29f957fd2722a": {
+          "webtty-ui.get": {
+            "line": 263,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-ui-slash.get": {
+            "line": 263,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-assets.get": {
+            "line": 278,
+            "anchor": "pathname.startsWith('/webtty/assets/')",
+            "statement": "if (pathname.startsWith('/webtty/assets/') && method === 'GET') {"
+          },
+          "webtty-discover.post": {
+            "line": 297,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/target-discoveries' && method === 'POST') {"
+          },
+          "webtty-discovery-delete.delete": {
+            "line": 330,
+            "anchor": null,
+            "statement": "if (selectedDiscovery && method === 'DELETE') {"
+          },
+          "webtty-create.post": {
+            "line": 347,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/sessions' && method === 'POST') {"
+          },
+          "webtty-stream.get": {
+            "line": 385,
+            "anchor": null,
+            "statement": "if (selected.operation === 'stream' && method === 'GET') {"
+          },
+          "webtty-input.post": {
+            "line": 429,
+            "anchor": null,
+            "statement": "if (selected.operation === 'input' && method === 'POST') {"
+          },
+          "webtty-resize.post": {
+            "line": 453,
+            "anchor": null,
+            "statement": "if (selected.operation === 'resize' && method === 'POST') {"
+          },
+          "webtty-delete.delete": {
+            "line": 506,
             "anchor": null,
             "statement": "if (!selected.operation && method === 'DELETE') {"
           }

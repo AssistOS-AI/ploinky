@@ -20,7 +20,6 @@
     const targetElement = document.getElementById('target');
     const accessElement = document.getElementById('access');
     const roleElement = document.getElementById('role');
-    const profileElement = document.getElementById('profile');
     const killButton = document.getElementById('kill');
     const statusElement = document.getElementById('status');
     const statusDot = document.getElementById('status-dot');
@@ -143,12 +142,6 @@
                 type: VIEW_MESSAGE, sessionId: terminalSessionId, viewId, role, policy: closePolicy,
             }, window.location.origin);
         } catch (_) {}
-    }
-
-    function showProfile(label) {
-        if (!profileElement) return;
-        profileElement.textContent = label ? `Profile: ${label}` : '';
-        profileElement.hidden = !label;
     }
 
     const terminal = new window.Terminal({
@@ -418,7 +411,7 @@
         }
         terminalSessionId = session.id;
         if (!['owner', 'watcher'].includes(session.role)
-            || !target || !['box', 'agent'].includes(target.kind)
+            || !target || !['box', 'agent', 'provider'].includes(target.kind)
             || typeof target.label !== 'string' || !target.label
             || !['rw', 'ro'].includes(target.access)
             || typeof target.cwdDisplay !== 'string' || !target.cwdDisplay
@@ -430,7 +423,6 @@
         viewId = result.view.id;
         closePolicy = session.closePolicy;
         setRole(session.role);
-        showProfile(typeof session.profileLabel === 'string' ? session.profileLabel : '');
         targetElement.textContent = `${target.label}${target.detail ? ` — ${target.detail}` : ''}`;
         accessElement.textContent = target.access === 'ro' ? 'Read only folder mapping' : 'Read and write folder mapping';
         accessElement.className = `access-badge access-${target.access}`;

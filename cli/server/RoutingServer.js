@@ -110,7 +110,10 @@ import { createCloudflaredRouterIntegration } from '../../ploinky-box/cloudflare
 import { requestAgentCard } from './agentCardFanout.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { WebttySessionManager } from './webtty/sessionManager.mjs';
-import { WebttyHomeProfileProvider } from './webtty/homeProfileProvider.mjs';
+import { validateBrowserSessionLease } from './webtty/authLease.mjs';
+import { ProviderTerminalHub } from './webtty/providerTerminalHub.mjs';
+import { ProviderTerminalTargets } from './webtty/providerTerminalTargets.mjs';
+import { RouterServiceTokenService } from './security/tokens/RouterServiceTokenService.js';
 import { captureEdgeRoutingLease } from '../sandbox/edgeGeneration.js';
 import { refusalHeaders, routeRefusalCause } from './proxy/refusalMarker.js';
 import { onAuthenticatedRequestDecision } from './auth/authenticatedRequestEvents.mjs';
@@ -179,15 +182,22 @@ const webttyProviderLocality = resolveWebttyProviderLocality({
         environment: buildAgentWorkerEnvironment(),
     }),
 });
+// Terminals served by any agent whose manifest declares
+// `executionProvider.terminals`: targets and the terminal control channel both
+// travel over the existing private relay; no listener, port or credential is added.
+const webttyProviderHub = new ProviderTerminalHub({
+    relayManager: runtimeRelayManager,
+    routerServiceTokenService: new RouterServiceTokenService({
+        resolveAgentSecret: (agentId) => deriveAgentRequestSecret(agentId, { encoding: 'buffer' }),
+    }),
+    validateAdmin: (lease) => validateBrowserSessionLease(lease),
+    audit: (event, value) => appendLog(event, value),
+});
 const webttySessionManager = new WebttySessionManager({
     workspaceRoot: PLOINKY_WORKSPACE_ROOT,
     agentProviderAvailable: webttyProviderLocality.agentAvailable,
-    // Optional agent-nominated HOME profiles resolve over the existing private
-    // agent-port relay; no listener, port or credential is added.
-    homeProfiles: new WebttyHomeProfileProvider({
-        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
-        relayManager: runtimeRelayManager,
-    }),
+    providerHub: webttyProviderHub,
+    providerTargets: new ProviderTerminalTargets({ relayManager: runtimeRelayManager }),
     capturePlan: () => {
         const lease = captureEdgeRoutingLease();
         return { snapshot: lease.snapshot, lease };
@@ -1163,6 +1173,7 @@ const lifecycle = setupProcessLifecycle(
             hardwareAvailabilityLatcher.stop();
             stopObservingAuthenticatedRequests();
             await webttySessionManager.closeAll();
+            await webttyProviderHub.shutdown();
             runtimeRelayManager.close();
             await cloudflaredRouterIntegration.stop();
             await interfaceClassifier.close();

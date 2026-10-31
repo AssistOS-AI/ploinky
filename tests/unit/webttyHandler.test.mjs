@@ -745,7 +745,7 @@ test('only real HTML responses allow same-origin framing; assets, JSON and SSE r
     }
 });
 
-test('discovery accepts exactly {dir} or {dir, profile:{provider,id}} and never a HOME path', async () => {
+test('discovery accepts exactly {dir}; the removed profile payload gets 410 legacy_terminal_profile and creates nothing', async () => {
     const call = async (body, discoverTargets) => {
         const routePlan = plan();
         const input = request({ routePlan, url: '/webtty/target-discoveries', body });
@@ -760,32 +760,54 @@ test('discovery accepts exactly {dir} or {dir, profile:{provider,id}} and never 
     const record = async (value) => { observed.push(value); return { id: 'd'.repeat(32), targets: [] }; };
     assert.equal((await call({ dir: 'Projects' }, record)).statusCode, 201);
     assert.deepEqual(Object.keys(observed[0]).sort(), ['directory', 'req', 'routePlan']);
-    assert.equal((await call({ dir: 'Projects', profile: { provider: 'provider', id: 'p-1' } }, record)).statusCode, 201);
-    assert.deepEqual(Object.keys(observed[1]).sort(), ['directory', 'profile', 'req', 'routePlan']);
-    assert.deepEqual(observed[1].profile, { provider: 'provider', id: 'p-1' });
 
     const never = async () => { throw new Error('must not be called'); };
     for (const body of [
-        { dir: 'Projects', home: '/root' },
-        { dir: 'Projects', profile: { provider: 'provider', id: 'p-1' }, home: '/root' },
-        { dir: 'Projects', profile: { provider: 'provider', id: 'p-1', home: '/root' } },
+        { dir: 'Projects', profile: { provider: 'legacy-provider', id: 'r-1' } },
         { dir: 'Projects', profile: { provider: 'provider' } },
-        { dir: 'Projects', profile: { provider: 'provider', id: '../p' } },
-        { dir: 'Projects', profile: { provider: '/provider', id: 'p-1' } },
         { dir: 'Projects', profile: null },
         { dir: 'Projects', profile: 'provider/p-1' },
         { profile: { provider: 'provider', id: 'p-1' } },
+        { dir: 'Projects', profile: { provider: 'provider', id: 'p-1' }, home: '/root' },
     ]) {
+        const res = await call(body, never);
+        assert.equal(res.statusCode, 410, JSON.stringify(body));
+        assert.deepEqual(JSON.parse(res.body), { ok: false, error: 'legacy_terminal_profile' });
+    }
+    for (const body of [{ dir: 'Projects', home: '/root' }, {}, { dir: 7 }, { dir: 'Projects', extra: 1 }]) {
         const res = await call(body, never);
         assert.equal(res.statusCode, 400, JSON.stringify(body));
         assert.equal(JSON.parse(res.body).error, 'invalid_discovery_request');
     }
+    assert.equal(observed.length, 1, 'no refused payload reached the manager');
+});
 
-    const refused = await call({ dir: 'Projects', profile: { provider: 'provider', id: 'p-1' } }, async () => {
-        throw Object.assign(new Error('private provider detail'), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
+test('a provider launch refusal is a final 409 terminal_launch_refused, not a retryable error', async () => {
+    const routePlan = plan();
+    const input = request({
+        routePlan,
+        url: '/webtty/sessions',
+        body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep' },
     });
-    assert.equal(refused.statusCode, 409);
-    assert.deepEqual(JSON.parse(refused.body), { ok: false, error: 'terminal_profile_unavailable' });
+    const res = new MockResponse();
+    await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
+        manager: manager({
+            async create() { throw Object.assign(new Error('private provider detail'), { code: 'WEBTTY_PROVIDER_LAUNCH_REFUSED', reason: 'robot_not_ready' }); },
+        }),
+        routePlan,
+    });
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.headers['Retry-After'], undefined);
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: 'terminal_launch_refused', reason: 'robot_not_ready' });
+    for (const reason of ['Robot Ready', '../x', undefined]) {
+        const input2 = request({ routePlan, url: '/webtty/sessions', body: { launch: 'a'.repeat(32), cols: 80, rows: 24, closePolicy: 'keep' } });
+        const res2 = new MockResponse();
+        await handleWebtty(input2.req, res2, new URL(input2.req.url, 'https://app.example.test'), {
+            manager: manager({ async create() { throw Object.assign(new Error('x'), { code: 'WEBTTY_PROVIDER_LAUNCH_REFUSED', reason }); } }),
+            routePlan,
+        });
+        assert.deepEqual(JSON.parse(res2.body), { ok: false, error: 'terminal_launch_refused' }, String(reason));
+    }
 });
 
 test('the create body stays exactly {launch, cols, rows, closePolicy}: HOME and profile selectors are refused', async () => {

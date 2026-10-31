@@ -21,6 +21,7 @@ import {
     TerminalTargetResolver,
     terminalTargetRouteBinding,
 } from './terminalTargetResolver.mjs';
+import { ProviderTerminalSessionWorker } from './providerTerminalSession.mjs';
 import { WebttyWorkerClient } from './workerClient.mjs';
 
 const DEFAULT_AUTH_ADAPTER = Object.freeze({
@@ -148,7 +149,9 @@ export class WebttySessionManager {
         }),
         launchStore = new WebttyLaunchRecordStore(),
         targetResolver = null,
-        homeProfiles = null,
+        providerHub = null,
+        providerTargets = null,
+        providerWorkerFactory = (options) => new ProviderTerminalSessionWorker(options),
         capturePlan = null,
         agentProviderAvailable = false,
         workspaceRoot,
@@ -168,7 +171,8 @@ export class WebttySessionManager {
         this.now = now;
         this.audit = audit;
         this.capturePlan = capturePlan;
-        this.homeProfiles = homeProfiles;
+        this.providerHub = providerHub;
+        this.providerWorkerFactory = providerWorkerFactory;
         this.validationStartIndex = 0;
         this.routerEpoch = randomId(18);
         this.sessions = new Map();
@@ -188,6 +192,7 @@ export class WebttySessionManager {
         this.targetResolver = targetResolver || new TerminalTargetResolver({
             workspaceRoot,
             isTargetQuarantined: (candidate) => this.isAgentTargetQuarantined(candidate),
+            providerTargets,
         });
         this.ready = false;
         this.disabledCategory = 'initializing';
@@ -423,6 +428,19 @@ export class WebttySessionManager {
         try { unsubscribe?.(); } catch (_) { }
     }
 
+    // The session worker of a provider terminal. The creating request's
+    // administrator lease travels with it: it is revalidated when the launch
+    // evidence is minted, so a demoted administrator launches nothing.
+    createProviderWorker({ target, lease }) {
+        if (!this.providerHub) throw errorWithCode('WEBTTY_UNAVAILABLE');
+        return this.providerWorkerFactory({
+            hub: this.providerHub,
+            routeKey: target.provider,
+            target: { targetId: target.targetId, project: target.project ?? null },
+            adminLease: lease,
+        });
+    }
+
     async withAgentStartLock(target, operation) {
         // Engine exec records are scoped by immutable container identity, not
         // by Ploinky enable generation. A generation replacement that retains
@@ -443,25 +461,17 @@ export class WebttySessionManager {
         }
     }
 
-    // The provider is asked only after this request's own administrator
-    // admission was revalidated, and it signs with that identity.
-    async resolveHomeProfile({ req, routePlan, profile }) {
-        if (typeof this.homeProfiles?.resolve !== 'function') throw errorWithCode('WEBTTY_PROFILE_UNAVAILABLE');
-        const resolved = await this.homeProfiles.resolve({ req, routePlan, profile });
-        if (!resolved?.profile || !resolved?.home) throw errorWithCode('WEBTTY_PROFILE_UNAVAILABLE');
-        return resolved;
-    }
-
-    async discoverTargets({ req, routePlan, directory, profile = null }) {
+    async discoverTargets({ req, routePlan, directory }) {
         if (!this.availability().ok) throw errorWithCode('WEBTTY_UNAVAILABLE');
         const lease = await this.validatedLease(req);
         const binding = terminalTargetRouteBinding(routePlan);
-        const resolvedProfile = profile ? await this.resolveHomeProfile({ req, routePlan, profile }) : null;
         const discovered = await this.targetResolver.discover({
             routePlan,
             requestedDirectory: directory,
             agentProviderAvailable: this.agentProviderReady,
-            ...(resolvedProfile ? { home: resolvedProfile.home } : {}),
+            // The administrator this very request was just admitted as; a
+            // provider is asked on its behalf, never as another identity.
+            user: req?.user,
         });
         if (this.agentProviderReady && discovered.agentTargetsAvailable === false) {
             this.disableAgentProvider('discovery_provider_unavailable');
@@ -477,7 +487,7 @@ export class WebttySessionManager {
                 routeBinding: binding,
                 targets: discovered.targets,
                 agentTargetsAvailable: discovered.agentTargetsAvailable,
-                ...(resolvedProfile ? { profile: resolvedProfile.profile } : {}),
+                ...(discovered.providers ? { providers: discovered.providers } : {}),
             });
         } catch (error) {
             this.cleanupLaunchSubscription(lease.sessionFingerprint);
@@ -490,31 +500,6 @@ export class WebttySessionManager {
             agentTargetsAvailable: created.agentTargetsAvailable,
         });
         return created;
-    }
-
-    // Creation asks the provider again and requires the same answer and the
-    // same directory identity; any difference or refusal is a stale target.
-    async revalidateHomeProfile({ req, routePlan, target }) {
-        let current;
-        try {
-            current = await this.resolveHomeProfile({
-                req,
-                routePlan,
-                profile: { provider: target.profile.provider, id: target.profile.id },
-            });
-        } catch (_) {
-            throw errorWithCode('WEBTTY_TARGET_STALE');
-        }
-        const home = target.home;
-        if (!home || current.profile.provider !== target.profile.provider
-            || current.profile.id !== target.profile.id
-            || current.profile.label !== target.profile.label
-            || current.home.relativePath !== home.relativePath
-            || current.home.absolutePath !== home.absolutePath
-            || current.home.identity.dev !== home.identity.dev
-            || current.home.identity.ino !== home.identity.ino) {
-            throw errorWithCode('WEBTTY_TARGET_STALE');
-        }
     }
 
     async revalidateTarget(options) {
@@ -539,10 +524,6 @@ export class WebttySessionManager {
         return cancelled;
     }
 
-    profileLabel(session) {
-        return session.profile?.label ? displayText(session.profile.label, 128) || null : null;
-    }
-
     closePolicyOf(session) {
         return session.closePolicy === 'stop' ? 'stop' : 'keep';
     }
@@ -559,7 +540,6 @@ export class WebttySessionManager {
                 .map(key => [key, session.target[key]])),
             closePolicy: this.closePolicyOf(session),
             pendingStopUntil: session.pendingStop?.deadline ?? null,
-            profileLabel: this.profileLabel(session),
         };
     }
 
@@ -580,7 +560,6 @@ export class WebttySessionManager {
             closePolicy: this.closePolicyOf(session),
             pendingStopUntil: live ? session.pendingStop?.deadline ?? null : null,
             ownerViewOpen: live && this.ownerViewOpen(session),
-            profileLabel: this.profileLabel(session),
             capabilities: { watch: true, input: isOwner, stop: true, message: false },
             attach: { mode: 'webtty' },
         };
@@ -980,9 +959,6 @@ export class WebttySessionManager {
                 owner: this.launchOwner(lease),
                 routeBinding: terminalTargetRouteBinding(routePlan),
                 revalidate: async (storedTarget) => {
-                    if (storedTarget.profile) {
-                        await this.revalidateHomeProfile({ req, routePlan, target: storedTarget });
-                    }
                     return this.revalidateTarget({
                         routePlan,
                         target: storedTarget,
@@ -1014,7 +990,9 @@ export class WebttySessionManager {
             this.assertCreationActive(attempt);
             worker = target.kind === 'agent'
                 ? this.agentWorkerFactory({ terminalId: id })
-                : this.workerFactory({ terminalId: id, marker, workspaceRoot: this.workspaceRoot });
+                : target.kind === 'provider'
+                    ? this.createProviderWorker({ target, lease })
+                    : this.workerFactory({ terminalId: id, marker, workspaceRoot: this.workspaceRoot });
         } catch (error) {
             releaseQuota();
             throw error;
@@ -1032,9 +1010,6 @@ export class WebttySessionManager {
             routeLease: routePlan.lease,
             cwdRelative: target.directory.relativePath,
             target,
-            // This session field is in memory only. Agent startup evidence
-            // does persist translatedHome and the profile for exact recovery.
-            profile: target.profile || null,
             // Close policy, views and a pending stop are in memory only.
             closePolicy,
             views: new Map(),
@@ -1158,26 +1133,32 @@ export class WebttySessionManager {
             void this.closeSession(session, `worker_${message.category || 'error'}`);
         });
         try {
-            const workerIdentity = await worker.spawn();
+            // A provider terminal has no Router-side worker process and keeps
+            // no recovery record: the provider's lease bounds its PTY, so it
+            // can never make Router recovery unproven.
+            const providerTarget = target.kind === 'provider';
+            const workerIdentity = providerTarget ? null : await worker.spawn();
             this.assertStartupActive(session);
-            session.recordHandle = await this.recordStore.create({
-                routerEpoch: this.routerEpoch,
-                marker,
-                targetKind: target.kind,
-                target: target.kind === 'agent' ? {
-                    runtime: target.runtime,
-                    containerId: target.containerId,
-                    containerName: target.containerName,
-                    instanceId: target.instanceId,
-                    enableGeneration: target.enableGeneration,
-                } : null,
-                worker: {
-                    pid: workerIdentity.pid,
-                    startToken: workerIdentity.startToken,
-                    uid: workerIdentity.uid,
-                },
-            });
-            this.assertStartupActive(session);
+            if (!providerTarget) {
+                session.recordHandle = await this.recordStore.create({
+                    routerEpoch: this.routerEpoch,
+                    marker,
+                    targetKind: target.kind,
+                    target: target.kind === 'agent' ? {
+                        runtime: target.runtime,
+                        containerId: target.containerId,
+                        containerName: target.containerName,
+                        instanceId: target.instanceId,
+                        enableGeneration: target.enableGeneration,
+                    } : null,
+                    worker: {
+                        pid: workerIdentity.pid,
+                        startToken: workerIdentity.startToken,
+                        uid: workerIdentity.uid,
+                    },
+                });
+                this.assertStartupActive(session);
+            }
             if (target.kind === 'agent') {
                 await this.withAgentStartLock(target, async () => {
                     try {
@@ -1197,10 +1178,6 @@ export class WebttySessionManager {
                             marker,
                             cols,
                             rows,
-                            ...(target.profile ? {
-                                translatedHome: target.home.translatedHome,
-                                profile: target.profile,
-                            } : {}),
                         });
                         this.assertStartupActive(session);
                         const markedStarting = await this.queueRecordWrite(session, () => {
@@ -1246,6 +1223,9 @@ export class WebttySessionManager {
                         throw error;
                     }
                 });
+            } else if (providerTarget) {
+                await worker.start({ cols, rows });
+                this.assertStartupActive(session);
             } else {
                 const markedStarting = await this.queueRecordWrite(session, () => {
                     this.assertStartupActive(session);
@@ -1260,14 +1240,7 @@ export class WebttySessionManager {
                     rows,
                     shellEnv: buildShellEnvironment(process.env, {
                         workspaceRoot: this.workspaceRoot,
-                        ...(target.profile ? {
-                            profile: { ...target.profile, home: target.home.translatedHome },
-                        } : {}),
                     }),
-                    ...(target.profile ? {
-                        homeRelative: target.home.relativePath,
-                        homeIdentity: { dev: target.home.identity.dev, ino: target.home.identity.ino },
-                    } : {}),
                 });
                 this.assertStartupActive(session);
                 const identity = ready.processIdentity;
@@ -1304,7 +1277,8 @@ export class WebttySessionManager {
             this.audit('webtty_session_created', {
                 id: this.auditId(id),
                 targetKind: target.kind,
-                target: target.kind === 'agent' ? this.auditId(this.agentTargetKey(target)) : 'box',
+                target: target.kind === 'agent' ? this.auditId(this.agentTargetKey(target))
+                    : target.kind === 'provider' ? this.auditId(`${target.provider}:${target.targetId}`) : 'box',
                 directory: target.directory.relativePath || '.',
                 access: target.access,
             });
@@ -1325,7 +1299,6 @@ export class WebttySessionManager {
                 },
                 closePolicy: this.closePolicyOf(session),
                 pendingStopUntil: null,
-                profileLabel: this.profileLabel(session),
                 // The handler lifts `view` to the top level of its response.
                 view: { id: view.id },
             };
@@ -1925,7 +1898,13 @@ export class WebttySessionManager {
         let recordCleanupFailed = false;
         if (!exited) {
             session.preserveRecord = true;
-            if (session.target.kind === 'agent') {
+            if (session.target.kind === 'provider') {
+                // The provider's own lease still ends the PTY; nothing local
+                // is left unproven, so only this close is reported unconfirmed
+                // (scope 'provider'). It never disables other terminals.
+                this.noteCleanupFailure(session, 'provider');
+                this.safeAudit('webtty_provider_terminal_unconfirmed', { id: this.auditId(session.id) });
+            } else if (session.target.kind === 'agent') {
                 this.noteCleanupFailure(session, 'provider');
                 this.disableAgentProvider('worker_exit_unconfirmed');
             } else {

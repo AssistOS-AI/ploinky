@@ -40,7 +40,13 @@ export class ProviderTerminalState {
         if (!operation.attempt?.dispatched || operation.attempt.channel !== channel) return;
         if (frame.type === 'launch-failed') {
             operation.failure = true;
+            // The worker's validated refusal code (for example target_not_ready),
+            // delivered to the caller as a refusal and not as an uncertainty.
+            operation.refusal = frame.code;
             operation.attempt.finish(true);
+            // The refusal is delivered; the operation is not retained, so
+            // refused launches never fill the operation table.
+            this.operations.delete(frame.operationId);
             return;
         }
         if (this.ptys.has(frame.ptySessionId)) throw terminalError();
@@ -70,6 +76,14 @@ export class ProviderTerminalState {
         }
     }
 
+    // Removes an operation that never produced a PTY and has no attempt in
+    // flight; returns whether anything was removed.
+    forget(operationId) {
+        const operation = this.operations.get(operationId);
+        if (!operation || operation.result || operation.attempt) return false;
+        return this.operations.delete(operationId);
+    }
+
     reconcile(inventory) {
         // Validate the entire inventory before mutating any known cursor.
         for (const entry of inventory) {
@@ -90,6 +104,16 @@ export class ProviderTerminalState {
             const pty = this.ptys.get(entry.ptySessionId);
             if (pty) this.acknowledge(pty, terminalSequence(entry.inputNext, { exhausted: true }) - 1n);
         }
+        // A PTY the worker no longer lists has ended: forget it (and its
+        // operation) and report it, so no entry stays unavailable for ever.
+        const lost = [];
+        for (const pty of [...this.ptys.values()]) {
+            if (!pty.available) {
+                lost.push(pty.id);
+                this.ended(pty.id);
+            }
+        }
+        return lost;
     }
 
     disconnect(channel) {
@@ -104,6 +128,9 @@ export class ProviderTerminalState {
         if (!pty) return false;
         for (const frame of pty.inputs.values()) this.inputBytes -= frame.length;
         this.ptys.delete(id);
+        for (const [operationId, operation] of this.operations) {
+            if (operation.result === id) this.operations.delete(operationId);
+        }
         return true;
     }
 

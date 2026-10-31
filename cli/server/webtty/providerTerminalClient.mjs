@@ -164,7 +164,8 @@ export class ProviderTerminalClient extends EventEmitter {
             const [reply] = await Promise.all([response, channel.send(wire, false, () => {}, true)]);
             this.#lease(lease);
             if (this.#closed || channel.closed) throw terminalError('closed');
-            if (ownership) this.#state.reconcile(reply.ptys);
+            let lost = [];
+            if (ownership) lost = this.#state.reconcile(reply.ptys);
             else this.#ownership = {
                 ownershipSessionId: reply.ownershipSessionId, workerGeneration: reply.workerGeneration,
                 secret: reply.secret, leaseExpiresAt: reply.leaseExpiresAt,
@@ -174,6 +175,9 @@ export class ProviderTerminalClient extends EventEmitter {
             this.#provisional = null;
             this.#renew(reply.leaseExpiresAt);
             previous?.close('superseded');
+            // After a reattach the worker's inventory is authoritative: a PTY
+            // that is not in it has ended, and the Router learns that here.
+            for (const ptySessionId of lost) this.emit('unavailable', { ptySessionId });
             channel.activate();
             if (this.#usable(lease) !== channel) throw terminalError('disconnected');
             this.#scheduleHeartbeat();
@@ -182,6 +186,11 @@ export class ProviderTerminalClient extends EventEmitter {
             controller.abort();
             channel?.close('connect_failed');
             if (this.#provisional === channel) this.#provisional = null;
+            // A first hello that never produced an ownership session (refused,
+            // or its reply lost) leaves no PTY and no secret to protect: a
+            // later hello only supersedes whatever the worker created. Reset
+            // the latch so that the next connect() can try again.
+            if (!this.#ownership) this.#helloSent = false;
             throw terminalError('connect_failed');
         }
     }
@@ -255,7 +264,9 @@ export class ProviderTerminalClient extends EventEmitter {
             channel = this.#usable(lease);
             operation = this.#state.operation(fields);
             if (operation.result) return Promise.resolve(operation.result);
-            if (operation.failure) return Promise.reject(terminalError('launch_failed'));
+            if (operation.failure) {
+                return Promise.reject(Object.assign(terminalError('launch_failed'), { refusal: operation.refusal }));
+            }
             if (operation.attempt) return operation.attempt.promise;
         } catch (error) { return Promise.reject(error); }
         const attempt = { channel, finish: null };
@@ -276,7 +287,14 @@ export class ProviderTerminalClient extends EventEmitter {
                     });
                 } catch (_) { finish(true); }
             })();
-        }, this.#limits.operationMs, 'launch_uncertain').finally(() => {
+        }, this.#limits.operationMs, 'launch_uncertain').catch((error) => {
+            // A delivered refusal is final and says why; only a timeout, a
+            // disconnect or a stale lease leaves the launch uncertain.
+            if (operation.failure) {
+                throw Object.assign(terminalError('launch_failed'), { refusal: operation.refusal });
+            }
+            throw error;
+        }).finally(() => {
             if (operation.attempt === attempt) operation.attempt = null;
         });
         return attempt.promise;
@@ -376,9 +394,27 @@ export class ProviderTerminalClient extends EventEmitter {
             channel?.close('shutdown');
             this.#active = null;
             this.#ownership = null;
+            const known = [...this.#state.ptys.keys()];
             this.#state.clear();
+            // A local notice, not a protocol cause and not an `ended` frame:
+            // the client is permanently closed and every PTY it knew is gone
+            // from its point of view. Its owner replaces it and ends those
+            // sessions with the cause 'shutdown'.
+            this.emit('shutdown', { ptySessionIds: known });
             return { localClosed: true, remoteTerminationProven: false };
         })();
         return this.#shutdown;
     }
+
+    // Non-secret view for the owner of this client: whether the worker-side
+    // ownership session is still held locally (its deadline has not passed).
+    ownershipHeld() {
+        return !this.#closed && Boolean(this.#ownership) && this.#ownership.deadline > this.#deps.now();
+    }
+
+    get closed() { return this.#closed; }
+
+    // Drops an unresolved launch operation that no attempt is waiting on, so a
+    // long-lived client does not accumulate operations it will never retry.
+    forget(operationId) { return this.#state.forget(operationId); }
 }

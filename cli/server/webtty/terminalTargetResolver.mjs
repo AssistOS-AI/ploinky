@@ -273,34 +273,6 @@ function sameDirectory(left, right) {
         && left.identity.ino === right.identity.ino;
 }
 
-// A profile HOME may be the workspace-root bound plus a relative-path bound.
-export const TERMINAL_HOME_MAX_BYTES = WEBTTY_AGENT_PROTOCOL_LIMITS.maxTranslatedHomeBytes;
-
-function profileHome(home, translatedHome) {
-    return Object.freeze({
-        relativePath: home.relativePath,
-        absolutePath: home.absolutePath,
-        identity: Object.freeze({ dev: home.identity.dev, ino: home.identity.ino }),
-        translatedHome,
-    });
-}
-
-// A target reaches the profile HOME only through the same live mounts that
-// carry its cwd, with the same alias and shadow rules, and only writable.
-async function translateProfileHome(home, mounts, fsApi) {
-    const mapping = await translateWorkspaceDirectoryToMount(home.absolutePath, mounts, { fsApi });
-    if (!mapping || Buffer.byteLength(mapping.translatedCwd, 'utf8') > TERMINAL_HOME_MAX_BYTES) {
-        return { unavailable: 'home-unreachable' };
-    }
-    if (mapping.access !== 'rw') return { unavailable: 'home-read-only' };
-    return { home: profileHome(home, mapping.translatedCwd) };
-}
-
-function boxProfileTarget(directory, home) {
-    const box = boxTarget(directory);
-    return home ? Object.freeze({ ...box, home: profileHome(home, home.absolutePath) }) : box;
-}
-
 function routeSnapshot(routePlan) {
     const snapshot = routePlan?.snapshot;
     const lease = routePlan?.lease;
@@ -418,9 +390,6 @@ async function resolveOneAgent(candidate, directory, context) {
         );
         if (!mapping) return null;
         const display = safeAgentDisplay(candidate, mapping);
-        const profile = context.home
-            ? await translateProfileHome(context.home, inspected.mounts, context.fsApi)
-            : null;
         return Object.freeze({
             kind: 'agent',
             directory,
@@ -435,7 +404,6 @@ async function resolveOneAgent(candidate, directory, context) {
             translatedCwd: mapping.translatedCwd,
             access: mapping.access,
             ...display,
-            ...(profile || {}),
         });
     } catch (error) {
         if (error?.code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') throw error;
@@ -551,7 +519,9 @@ export class TerminalTargetResolver {
         isTargetQuarantined = () => false,
         fsApi = fs,
         limits = TERMINAL_TARGET_DISCOVERY_LIMITS,
+        providerTargets = null,
     } = {}) {
+        this.providerTargets = providerTargets;
         this.directoryResolver = directoryResolver;
         this.inspectContainer = inspectContainer;
         this.workspaceIdentity = workspaceIdentity;
@@ -577,10 +547,27 @@ export class TerminalTargetResolver {
         );
     }
 
-    async discover({ routePlan, requestedDirectory, agentProviderAvailable = true, home = null } = {}) {
+    // Box and Ploinky agent targets, then the targets that declaring providers
+    // list for this directory. A provider that cannot answer is a notice in
+    // `providers`, never a target; it does not affect the other targets.
+    async discover(options = {}) {
+        const local = await this.discoverLocal(options);
+        if (!this.providerTargets) return local;
+        const external = await this.providerTargets.discover({
+            routePlan: options.routePlan, directory: local.directory, user: options.user,
+        });
+        routeSnapshot(options.routePlan);
+        return Object.freeze({
+            ...local,
+            targets: Object.freeze([...local.targets, ...external.targets]),
+            ...(external.providers.length ? { providers: external.providers } : {}),
+        });
+    }
+
+    async discoverLocal({ routePlan, requestedDirectory, agentProviderAvailable = true } = {}) {
         const snapshot = routeSnapshot(routePlan);
         const directory = resolveDirectory(requestedDirectory, this);
-        const box = boxProfileTarget(directory, home);
+        const box = boxTarget(directory);
         if (!agentProviderAvailable) {
             routeSnapshot(routePlan);
             return Object.freeze({
@@ -624,7 +611,6 @@ export class TerminalTargetResolver {
                     workspaceHash,
                     isTargetQuarantined: this.isTargetQuarantined,
                     fsApi: this.fsApi,
-                    home,
                 }), { signal: controller.signal, output: partialResults }),
                 budget,
             ]);
@@ -653,7 +639,7 @@ export class TerminalTargetResolver {
 
     async revalidate({ routePlan, target, agentProviderAvailable = true } = {}) {
         const snapshot = routeSnapshot(routePlan);
-        if (!target || !['box', 'agent'].includes(target.kind) || !target.directory) {
+        if (!target || !['box', 'agent', 'provider'].includes(target.kind) || !target.directory) {
             throw targetError('WEBTTY_TARGET_STALE');
         }
         let directory;
@@ -664,24 +650,15 @@ export class TerminalTargetResolver {
             throw targetError('WEBTTY_TARGET_STALE');
         }
         if (!sameDirectory(directory, target.directory)) throw targetError('WEBTTY_TARGET_STALE');
-        if (target.unavailable) throw targetError('WEBTTY_TARGET_STALE');
-        let home = null;
-        if (target.home) {
-            // The profile HOME is revalidated like the cwd: same path, same
-            // directory identity, and the same per-target translation.
-            try {
-                home = resolveDirectory(target.home.relativePath, this);
-            } catch (error) {
-                if (error?.code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') throw error;
-                throw targetError('WEBTTY_TARGET_STALE');
-            }
-            if (!sameDirectory(home, target.home)) throw targetError('WEBTTY_TARGET_STALE');
-        }
         if (target.kind === 'box') {
-            if (home && target.home.translatedHome !== home.absolutePath) throw targetError('WEBTTY_TARGET_STALE');
             routeSnapshot(routePlan);
-            const box = boxProfileTarget(directory, home);
-            return target.profile ? Object.freeze({ ...box, profile: target.profile }) : box;
+            return boxTarget(directory);
+        }
+        if (target.kind === 'provider') {
+            if (!this.providerTargets) throw targetError('WEBTTY_TARGET_STALE');
+            const revalidated = this.providerTargets.revalidate({ routePlan, target });
+            routeSnapshot(routePlan);
+            return Object.freeze({ ...revalidated, directory });
         }
         if (!agentProviderAvailable) throw targetError('WEBTTY_TARGET_PROVIDER_UNAVAILABLE');
         const candidate = exactCandidate(target.containerName, snapshot.agents?.[target.containerName], this.supportedRuntimes);
@@ -703,12 +680,6 @@ export class TerminalTargetResolver {
             if (!mapping || inspected.user !== target.targetUser
                 || mapping.translatedCwd !== target.translatedCwd || mapping.access !== target.access) {
                 throw targetError('WEBTTY_TARGET_STALE');
-            }
-            if (home) {
-                const translated = await translateProfileHome(home, inspected.mounts, this.fsApi);
-                if (translated.home?.translatedHome !== target.home.translatedHome) {
-                    throw targetError('WEBTTY_TARGET_STALE');
-                }
             }
             routeSnapshot(routePlan);
             return Object.freeze({ ...target, directory });

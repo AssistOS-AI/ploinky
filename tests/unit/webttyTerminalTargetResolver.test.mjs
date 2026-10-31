@@ -805,141 +805,66 @@ test('Box targets resolve through the explicit workspace root and display the wo
     );
 });
 
-// A home profile as the provider resolves it: workspace-relative realpath,
-// absolute realpath and directory identity.
-function spacedProfileFixture(t) {
-    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky webtty home '));
-    const root = path.join(parent, 'my work space');
-    const data = path.join(root, '.data', 'roboTeamAgent');
-    fs.mkdirSync(path.join(root, 'projects', 'demo'), { recursive: true });
-    fs.mkdirSync(path.join(data, 'robots', 'r-1', 'home'), { recursive: true });
-    fs.mkdirSync(path.join(root, '.data', 'isolated', 'work'), { recursive: true });
-    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
-    return { parent, root, data };
+// Provider targets (any agent that declares executionProvider.terminals) are
+// appended after the Box and agent targets; their failure is a notice only.
+function providerStub({ rows = [], providers = [], revalidate = (value) => value.target } = {}) {
+    const calls = { discover: [], revalidate: [] };
+    return {
+        calls,
+        async discover(args) { calls.discover.push(args); return { targets: rows, providers }; },
+        revalidate(args) { calls.revalidate.push(args); return revalidate(args); },
+    };
 }
 
-function resolvedHome(root, relative = '.data/roboTeamAgent/robots/r-1/home') {
-    const resolved = resolveWorkspaceDirectory(relative, { workspaceRoot: root });
-    const stat = fs.statSync(resolved.absolutePath, { bigint: true });
-    return Object.freeze({
-        relativePath: resolved.relativePath,
-        absolutePath: resolved.absolutePath,
-        identity: Object.freeze({ dev: String(stat.dev), ino: String(stat.ino) }),
-    });
-}
-
-test('profile HOME is the same-path Box home and a writable live-mount translation per agent', async (t) => {
-    const { root, data } = spacedProfileFixture(t);
-    assert.equal(root.startsWith('/workspace'), false);
-    assert.match(root, / /);
-    const home = resolvedHome(root);
-    const records = {
-        global_like: agentRecord({ containerId: 'a'.repeat(64), agentName: 'global' }),
-        isolated_like: agentRecord({ containerId: 'b'.repeat(64), agentName: 'isolated' }),
-    };
-    const mountsById = {
-        // The workspace at its own path, plus the provider data directory at
-        // /data and /root as equivalent aliases.
-        ['a'.repeat(64)]: [bind(root, root, true), bind(data, '/data', true), bind(data, '/root', true)],
-        // Only its own data directory at /root.
-        ['b'.repeat(64)]: [bind(path.join(root, '.data', 'isolated'), '/root', true)],
-    };
-    const inspectContainer = async (_runtime, id) => {
-        const name = Object.keys(records).find((key) => records[key].containerId === id);
-        return { ...inspectedAgent(root, name, records[name]), Mounts: mountsById[id] };
-    };
-    const targetResolver = resolver(root, inspectContainer);
-    const plan = routePlan(records);
-
-    const project = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo', home });
-    const [box, globalAgent] = project.targets;
-    assert.equal(box.kind, 'box');
-    assert.equal(box.home.translatedHome, fs.realpathSync(path.join(data, 'robots', 'r-1', 'home')));
-    assert.equal(box.home.translatedHome, home.absolutePath);
-    assert.equal(globalAgent.agentName, 'global');
-    assert.equal(globalAgent.translatedCwd, path.join(root, 'projects', 'demo'));
-    assert.equal(globalAgent.home.translatedHome, '/data/robots/r-1/home');
-    assert.deepEqual(globalAgent.home.identity, home.identity);
-    assert.equal(globalAgent.unavailable, undefined);
-    assert.equal(project.targets.length, 2, 'the isolated agent cannot reach the project cwd');
-
-    const own = await targetResolver.discover({ routePlan: plan, requestedDirectory: '.data/isolated/work', home });
-    const isolated = own.targets.find((target) => target.agentName === 'isolated');
-    assert.equal(isolated.translatedCwd, '/root/work');
-    assert.equal(isolated.unavailable, 'home-unreachable');
-    assert.equal(isolated.home, undefined);
-
-    // Without a profile the same discovery is exactly today's.
-    const plain = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
-    assert.equal(plain.targets.some((target) => 'home' in target || 'unavailable' in target), false);
-});
-
-test('read-only, conflicting-alias and shadowed profile homes are refused, never bypassed', async (t) => {
-    const { root, data } = spacedProfileFixture(t);
-    const home = resolvedHome(root);
-    const homeSource = path.join(data, 'robots', 'r-1', 'home');
-    const cases = [
-        ['home-read-only', [bind(root, root, true), bind(data, '/data', false), bind(data, '/root', false)]],
-        // A writable alias never wins over a read-only alias of the same source.
-        ['home-unreachable', [bind(root, root, true), bind(data, '/data', true), bind(data, '/root', false)]],
-        ['home-unreachable', [
-            bind(root, root, true),
-            { Type: 'volume', Source: 'named', Destination: path.join(root, '.data'), RW: true, Name: 'named' },
-        ]],
-        ['home-unreachable', [bind(root, root, true), bind(path.join(root, 'projects'), homeSource, true)]],
-    ];
-    for (const [reason, mounts] of cases) {
-        const record = agentRecord();
-        const targetResolver = resolver(root, async () => ({
-            ...inspectedAgent(root, CONTAINER_NAME, record), Mounts: mounts,
-        }));
-        const discovery = await targetResolver.discover({
-            routePlan: routePlan({ [CONTAINER_NAME]: record }), requestedDirectory: 'projects/demo', home,
-        });
-        const agent = discovery.targets[1];
-        assert.equal(agent?.unavailable, reason, JSON.stringify(mounts));
-        assert.equal(agent.home, undefined);
-        await assert.rejects(
-            targetResolver.revalidate({ routePlan: routePlan({ [CONTAINER_NAME]: record }), target: agent }),
-            (error) => error.code === 'WEBTTY_TARGET_STALE',
-        );
-    }
-});
-
-test('create-time revalidation repeats the profile HOME identity and translation', async (t) => {
-    const { root, data } = spacedProfileFixture(t);
-    const home = resolvedHome(root);
+test('provider rows follow the Box and agents; a provider notice does not touch other targets', async (t) => {
+    const { root } = fixture(t);
     const record = agentRecord();
-    let mounts = [bind(root, root, true), bind(data, '/data', true)];
-    const targetResolver = resolver(root, async () => ({
-        ...inspectedAgent(root, CONTAINER_NAME, record), Mounts: mounts,
-    }));
     const plan = routePlan({ [CONTAINER_NAME]: record });
-    const discovery = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo', home });
-    const [box, agent] = discovery.targets;
-    const profile = Object.freeze({ provider: 'roboTeamAgent', id: 'r-1', label: 'Robot One' });
-    const acceptedBox = await targetResolver.revalidate({ routePlan: plan, target: { ...box, profile } });
-    assert.deepEqual(acceptedBox.home, box.home);
-    assert.deepEqual(acceptedBox.profile, profile);
-    const acceptedAgent = await targetResolver.revalidate({ routePlan: plan, target: { ...agent, profile } });
-    assert.equal(acceptedAgent.home.translatedHome, '/data/robots/r-1/home');
+    const row = Object.freeze({ kind: 'provider', provider: 'fixture-provider', targetId: 't1', label: 'T1',
+        detail: 'fixture-provider', access: 'rw', cwdDisplay: 'Home' });
+    const providerTargets = providerStub({ rows: [row] });
+    const targetResolver = resolver(root, async () => inspectedAgent(root, CONTAINER_NAME, record), { providerTargets });
+    const user = { id: 'local:admin', roles: ['admin'] };
+    const found = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo', user });
+    assert.deepEqual(found.targets.map((target) => target.kind), ['box', 'agent', 'provider']);
+    assert.equal(found.providers, undefined);
+    assert.equal(providerTargets.calls.discover[0].user, user);
+    assert.equal(providerTargets.calls.discover[0].directory.relativePath, 'projects/demo');
 
-    // The mount now reaches the home only read-only.
-    mounts = [bind(root, root, true), bind(data, '/data', false)];
+    const notice = [{ name: 'fixture-provider', available: false, reason: 'provider_unavailable' }];
+    const down = resolver(root, async () => inspectedAgent(root, CONTAINER_NAME, record),
+        { providerTargets: providerStub({ providers: notice }) });
+    const withNotice = await down.discover({ routePlan: plan, requestedDirectory: 'projects/demo', user });
+    assert.deepEqual(withNotice.targets.map((target) => target.kind), ['box', 'agent']);
+    assert.deepEqual(withNotice.providers, notice);
+
+    // Provider-less discovery is exactly the previous shape.
+    const plain = await resolver(root, async () => inspectedAgent(root, CONTAINER_NAME, record))
+        .discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    assert.deepEqual(plain.targets.map((target) => target.kind), ['box', 'agent']);
+    assert.equal('providers' in plain, false);
+});
+
+test('a provider target is revalidated by its provider; a moved directory or a missing provider layer is stale', async (t) => {
+    const { root } = fixture(t);
+    const plan = routePlan({});
+    const providerTargets = providerStub({ rows: [Object.freeze({ kind: 'provider', provider: 'p', targetId: 't1', label: 'T1',
+        detail: 'p', access: 'rw', cwdDisplay: 'Home' })] });
+    const targetResolver = resolver(root, async () => null, { providerTargets });
+    const found = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    const target = { ...found.targets.find((entry) => entry.kind === 'provider'), directory: found.directory };
+    const accepted = await targetResolver.revalidate({ routePlan: plan, target });
+    assert.equal(accepted.kind, 'provider');
+    assert.equal(accepted.directory.relativePath, 'projects/demo');
+    assert.equal(providerTargets.calls.revalidate.length, 1);
+
+    const refusing = resolver(root, async () => null, { providerTargets: providerStub({
+        revalidate: () => { throw Object.assign(new Error('stale'), { code: 'WEBTTY_TARGET_STALE' }); } }) });
+    await assert.rejects(refusing.revalidate({ routePlan: plan, target }), { code: 'WEBTTY_TARGET_STALE' });
+    await assert.rejects(resolver(root, async () => null).revalidate({ routePlan: plan, target }),
+        { code: 'WEBTTY_TARGET_STALE' });
     await assert.rejects(
-        targetResolver.revalidate({ routePlan: plan, target: agent }),
-        (error) => error.code === 'WEBTTY_TARGET_STALE',
+        targetResolver.revalidate({ routePlan: plan, target: { ...target, directory: { ...target.directory, relativePath: 'projects' } } }),
+        { code: 'WEBTTY_TARGET_STALE' },
     );
-    mounts = [bind(root, root, true), bind(data, '/data', true)];
-    // The home directory is replaced at the same path (new dev/ino).
-    const homePath = path.join(data, 'robots', 'r-1', 'home');
-    // Keep the original alive so the replacement cannot reuse its inode.
-    fs.renameSync(homePath, `${homePath}-previous`);
-    fs.mkdirSync(homePath);
-    for (const target of [box, agent]) {
-        await assert.rejects(
-            targetResolver.revalidate({ routePlan: plan, target }),
-            (error) => error.code === 'WEBTTY_TARGET_STALE',
-        );
-    }
 });

@@ -64,7 +64,7 @@ function createHarness({
         elements.set(id, value);
         return value;
     }
-    for (const id of ['directory', 'target', 'access', 'status', 'status-dot', 'dimensions', 'message', 'terminal', 'role', 'profile', 'kill']) element(id);
+    for (const id of ['directory', 'target', 'access', 'status', 'status-dot', 'dimensions', 'message', 'terminal', 'role', 'kill']) element(id);
 
     class FakeTerminal {
         constructor(options) {
@@ -159,7 +159,6 @@ function createHarness({
                             },
                             closePolicy: JSON.parse(options.body || '{}').closePolicy || 'keep',
                             pendingStopUntil: null,
-                            profileLabel: null,
                             ...sessionOverride,
                         },
                         view: viewOverride === undefined ? { id: `view-${'v'.repeat(26)}${requests.length}` } : viewOverride,
@@ -221,7 +220,6 @@ function createHarness({
                             },
                             closePolicy: 'keep',
                             pendingStopUntil: null,
-                            profileLabel: null,
                             ...sessionOverride,
                         },
                         view: { id: 'v'.repeat(32) },
@@ -584,6 +582,29 @@ test('invalid created session rolls back exactly once; malformed attach never de
     }
 });
 
+test('the page accepts a provider target and shows its access and directory; an unknown kind is rolled back', async () => {
+    const provider = createHarness({
+        hash: `#launch=${'a'.repeat(32)}`,
+        sessionOverride: {
+            target: { kind: 'provider', label: 'Robot <1>', detail: 'fixture-provider', access: 'rw', cwdDisplay: 'Home' },
+        },
+    });
+    await flushTasks();
+    assert.equal(deletions(provider).length, 0, 'a valid provider target is not rolled back');
+    assert.equal(provider.sources.length, 1);
+    assert.equal(provider.elements.get('target').textContent, 'Robot <1> — fixture-provider');
+    assert.equal(provider.elements.get('directory').textContent, 'Home');
+    assert.equal(provider.elements.get('access').textContent, 'Read and write folder mapping');
+
+    const unknown = createHarness({
+        hash: `#launch=${'a'.repeat(32)}`,
+        sessionOverride: { target: { kind: 'other', label: 'x', detail: '', access: 'rw', cwdDisplay: 'Home' } },
+    });
+    await flushTasks();
+    assert.equal(deletions(unknown).length, 1);
+    assert.equal(unknown.sources.length, 0);
+});
+
 test('attach startup network failure and malformed id never issue DELETE', async () => {
     for (const requestHandler of [
         () => { throw new Error('network unavailable'); },
@@ -831,7 +852,7 @@ test('A9: a keep page signals keep; embedded pages and watchers never signal', a
 });
 
 test('A9: an embedded page announces its view only to its parent origin after attach', async () => {
-    const harness = createHarness({ embedded: true, sessionOverride: { id: SESSION_ID, profileLabel: 'Robot <A>' } });
+    const harness = createHarness({ embedded: true, sessionOverride: { id: SESSION_ID } });
     await flushTasks();
     const view = harness.sources[0].url.split('?view=')[1];
     // The page runs in its own realm; compare plain JSON shapes.
@@ -840,8 +861,6 @@ test('A9: an embedded page announces its view only to its parent origin after at
         targetOrigin: 'https://app.example.test',
     }]);
     assert.equal(harness.stored.size, 0, 'embedded pages remember nothing');
-    assert.equal(harness.elements.get('profile').textContent, 'Profile: Robot <A>');
-    assert.equal(harness.elements.get('profile').hidden, false);
     // The page has no policy control, so nothing re-announces or changes the policy.
     harness.windowListeners.get('pagehide')();
     await flushTasks();
