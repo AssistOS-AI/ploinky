@@ -2,7 +2,9 @@ import fs from 'fs';
 import { readMpsStatus } from '../sandbox/hardwareLimits/mpsStatus.mjs';
 import { releaseMpsRuntimeOwner } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { readAppliedObservation } from '../sandbox/hardwareLimits/runtimeState.mjs';
-import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
+import { pinnedAgentRepositoryPath, resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
+import { AGENT_SOURCE_CHANGED, assertAgentSourcePin, displaySourcePath, reEnableCommand } from '../utils/agentSourcePin.mjs';
+import { REPOSITORY_AMBIGUOUS, isRepositoryAmbiguity } from '../utils/repositorySource.mjs';
 import crypto from 'node:crypto';
 import path from 'path';
 import { Worker } from 'worker_threads';
@@ -102,7 +104,12 @@ const TERMINAL_POLICY_CODES = new Set([
     // no retry or readiness probe until their relevant inputs change.
     HARDWARE_UNENFORCEABLE,
     HARDWARE_DEPENDENCY_BLOCKED,
+    // A source that no longer matches its enable pin, or a repository two
+    // workspace folders claim, keeps the agent stopped until an operator acts.
+    AGENT_SOURCE_CHANGED,
+    REPOSITORY_AMBIGUOUS,
 ]);
+const SOURCE_TERMINAL_CODES = new Set([AGENT_SOURCE_CHANGED, REPOSITORY_AMBIGUOUS]);
 const TERMINAL_LEDGER_SCHEMA_VERSION = 1;
 // Terminal blockers survive monitor restarts while their registry entry is
 // present. Once the entry disappears, retain the tombstone only long enough
@@ -1265,8 +1272,24 @@ export function syncManagedContainers(monitor) {
         const alias = record.alias || null;
         if (!agentName || !repoName) continue;
 
-        const manifestPath = path.join(resolveAgentRepositoryPath(repoName), agentName, 'manifest.json');
-        if (!fs.existsSync(manifestPath)) {
+        let manifestPath = '';
+        let sourceError = null;
+        try {
+            const repositoryPath = resolveAgentRepositoryPath(repoName);
+            manifestPath = path.join(repositoryPath, agentName, 'manifest.json');
+            // A pinned folder that is gone is a source refusal, not a missing manifest.
+            if (repositoryPath === pinnedAgentRepositoryPath(repoName) && !fs.existsSync(repositoryPath)) {
+                sourceError = Object.assign(new Error(`Agent '${repoName}/${agentName}' was enabled from `
+                    + `${displaySourcePath(repositoryPath)}, which no longer exists. Ploinky will not start or restart it from `
+                    + `another folder: restore that folder, or run '${reEnableCommand({ repoName, agentName, alias: alias || '' })}'.`),
+                { code: AGENT_SOURCE_CHANGED });
+            }
+        } catch (error) {
+            // Only this agent's repository is unresolved; the others still sync.
+            if (!isRepositoryAmbiguity(error)) throw error;
+            sourceError = error;
+        }
+        if (!sourceError && !fs.existsSync(manifestPath)) {
             logEvent(monitorRef, 'warn', 'container_manifest_missing', {
                 container: containerName,
                 agent: agentName,
@@ -1278,6 +1301,11 @@ export function syncManagedContainers(monitor) {
 
         let restartInput;
         try {
+            if (sourceError) throw sourceError;
+            // Folder and repository name only on every sync (no Git command
+            // per tick); every launch, including a watchdog restart, runs the
+            // full check with the origin in its service preflight.
+            assertAgentSourcePin(record, { repoName, agentName, agentPath: path.dirname(manifestPath), originOf: () => '' });
             restartInput = resolveWatchdogRestartInput(record, {
                 containerName,
                 agentName,
@@ -1293,6 +1321,7 @@ export function syncManagedContainers(monitor) {
             if (!restartInput) continue;
         } catch (error) {
             const terminal = classifyTerminalFailure(error);
+            let stateChanged = false;
             const fallbackDigest = digestValue({
                 containerName,
                 repoName,
@@ -1322,11 +1351,27 @@ export function syncManagedContainers(monitor) {
                 const existing = monitorRef.terminalLedger?.get(containerName);
                 if (existing?.restartInputDigest !== fallbackDigest || (existing?.mpsFingerprint || null) !== info.mpsFingerprint) {
                     recordTerminalFailure(monitorRef, info, error, fallbackDigest);
+                    stateChanged = true;
                 }
                 const target = monitorRef.targets.get(containerName);
                 if (target?.pendingRestartTimer) clearTimeout(target.pendingRestartTimer);
                 if (target) stopProbeWorker(target);
                 inventoryChanged = monitorRef.targets.delete(containerName) || inventoryChanged;
+            }
+            if (SOURCE_TERMINAL_CODES.has(String(error?.code || ''))) {
+                // The agent is left as it is (a running runtime keeps the
+                // pinned bind it was created with) and is never restarted.
+                // The plain reason is logged once per state change, not per sync.
+                if (stateChanged) {
+                    logEvent(monitorRef, 'warn', 'container_source_changed', {
+                        container: containerName,
+                        agent: agentName,
+                        repo: repoName,
+                        code: error.code,
+                        message: error.message,
+                    });
+                }
+                continue;
             }
             logEvent(monitorRef, terminal ? 'warn' : 'error', terminal
                 ? 'container_runtime_policy_terminal'

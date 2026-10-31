@@ -2,7 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { REPOS_DIR, isDebugMode } from './config.js';
 import * as reposSvc from './repos.js';
-import { listAgentRepositoryNames, resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
+import { freshAgentRepositoryPath, listAgentRepositoryNames, pinnedAgentRepositoryPath, planningAgentRepositoryNames, planningAgentRepositoryPath, resolveAgentRepositoryPath, unresolvedAgentRepositories } from './agentRepositorySource.mjs';
+import { AGENT_SOURCE_CHANGED, displaySourcePath, reEnableCommand } from './agentSourcePin.mjs';
 
 // Simple ANSI color helpers
 const ANSI = {
@@ -24,25 +25,39 @@ function debugLog(...args) {
 
 /**
  * Finds the manifest.json for a given agent name.
+ *
+ * Launch lookups (the default) use the folder a repository's enabled agents
+ * are pinned to. Planning lookups (`{ planning: true }`: a new enable, a
+ * re-enable) use the fresh resolution and refuse when it is contested. In both,
+ * a bare name refuses whenever an unresolved repository has a folder holding
+ * that agent, even if another repository also has it: a bare name never falls
+ * through to some other folder.
  * @param {string} agentName - The short name or prefixed name (repo:agent) of the agent.
+ * @param {{planning?: boolean}} [options]
  * @returns {{manifestPath: string, repo: string, shortAgentName: string}} Details of the found agent.
  * @throws {Error} If the agent is not found or the name is ambiguous.
  */
-function findAgent(agentName) {
+function findAgent(agentName, { planning = false } = {}) {
     debugLog(`Searching for agent '${agentName}'...`);
+    const repositoryPath = planning ? planningAgentRepositoryPath : resolveAgentRepositoryPath;
     if (agentName.includes(':') || agentName.includes('/')) {
         const [repoName, shortAgentName] = agentName.split(/[:/]/);
-        const manifestPath = path.join(resolveAgentRepositoryPath(repoName), shortAgentName, 'manifest.json');
+        const manifestPath = path.join(repositoryPath(repoName), shortAgentName, 'manifest.json');
         if (fs.existsSync(manifestPath)) {
             debugLog(`Found agent directly with prefixed name: ${manifestPath}`);
             return { manifestPath, repo: repoName, shortAgentName };
-        } else {
-            throw new Error(`Agent '${agentName}' not found.`);
         }
+        const pinned = planning ? null : pinnedAgentRepositoryPath(repoName);
+        if (pinned && !fs.existsSync(pinned)) throw pinnedFolderGoneError(repoName, shortAgentName, pinned);
+        throw new Error(`Agent '${agentName}' not found.`);
     }
 
+    const contested = unresolvedAgentRepositories({ planning })
+        .filter(({ error }) => error.candidates.some(candidate => fs.existsSync(path.join(candidate, agentName, 'manifest.json'))));
+    if (contested.length) throw contested[0].error;
+
     const foundAgents = [];
-    const installedRepos = listAgentRepositoryNames();
+    const installedRepos = planning ? planningAgentRepositoryNames() : listAgentRepositoryNames();
     if (!installedRepos.length) {
         throw new Error("Ploinky environment not initialized. No repos found.");
     }
@@ -53,12 +68,24 @@ function findAgent(agentName) {
     const searchRepos = (repos, label) => {
         debugLog(`Searching ${label} repos: ${repos.join(', ')}`);
         for (const repo of repos) {
-            const repoPath = resolveAgentRepositoryPath(repo);
+            // Planning searches the fresh resolution (a moved checkout is
+            // found where it is now); launches search the pinned folders.
+            let repoPath;
+            try { repoPath = planning ? freshAgentRepositoryPath(repo) : resolveAgentRepositoryPath(repo); }
+            catch (error) {
+                // A contested repository holding this agent was refused above;
+                // one that does not hold it is simply not a match.
+                if (planning && error?.code === 'PLOINKY_REPOSITORY_AMBIGUOUS') continue;
+                throw error;
+            }
             let isDirectory = false;
             try {
                 isDirectory = fs.statSync(repoPath).isDirectory();
             } catch (error) {
                 if (!['ENOENT', 'ENOTDIR'].includes(error?.code)) throw error;
+                // A pinned folder that is gone refuses; it is never skipped, so
+                // a bare name cannot fall through to another folder.
+                if (!planning && repoPath === pinnedAgentRepositoryPath(repo)) throw pinnedFolderGoneError(repo, agentName, repoPath);
                 debugLog(`Skipping inaccessible repo entry '${repo}': ${error?.message || error}`);
                 continue;
             }
@@ -89,7 +116,20 @@ function findAgent(agentName) {
     }
 
     debugLog(`Resolved agent '${agentName}' to: ${foundAgents[0].manifestPath}`);
+    if (planning) {
+        // The planned repository must also be uncontested by a pin.
+        const found = foundAgents[0];
+        return { ...found, manifestPath: path.join(planningAgentRepositoryPath(found.repo), agentName, 'manifest.json') };
+    }
     return foundAgents[0];
+}
+
+function pinnedFolderGoneError(repoName, agentName, pinned) {
+    const error = new Error(`Agent '${repoName}/${agentName}' was enabled from '${displaySourcePath(pinned)}', which no longer exists. `
+        + 'Ploinky does not start it from another folder: restore that folder, or run '
+        + `'${reEnableCommand({ repoName, agentName })}' to enable it from where its repository resolves now.`);
+    error.code = AGENT_SOURCE_CHANGED;
+    return error;
 }
 
 /**

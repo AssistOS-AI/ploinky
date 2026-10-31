@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { listAgentRepositoryNames, resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
+import { listAgentRepositoryNames, planningAgentRepositoryPath, resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import path from 'path';
 import net from 'net';
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
@@ -12,6 +12,8 @@ import { gatherSsoStatus, listAuthProviders } from './security/sso.js';
 import { inspectWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
 import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { agentLibSourceIdHash } from '../../agentlib/contract.mjs';
+import { collectAgentSourceProblems } from './agentSourcePin.mjs';
+import { loadAgents } from './workspace.js';
 
 const PREDEFINED_REPOS = reposSvc.getPredefinedRepos();
 
@@ -429,4 +431,44 @@ export async function statusWorkspace({ verbose = false } = {}) {
 
     listReposForStatus();
     listCurrentAgents({ verbose });
+    printAgentSourceStatus();
+}
+
+// Agents Ploinky will not start because their source changed after enable, or because
+// two workspace folders claim their repository: the plain reason and the fix.
+// Also repositories whose enabled agents still start from their pinned folder
+// while another folder claims the repository: new enables of those refuse.
+export function printAgentSourceStatus({ agents = undefined, log = console.log } = {}) {
+    let problems;
+    let registry;
+    try {
+        registry = agents === undefined ? loadAgents() : agents;
+        problems = collectAgentSourceProblems(registry, {
+            resolveRepositoryPath: resolveAgentRepositoryPath,
+        });
+    } catch (error) {
+        log(`- ${styles.label('Agent sources')}: ${styles.warn(`unavailable (${error?.message || error})`)}`);
+        return [];
+    }
+    const contested = [];
+    const pinnedRepositories = new Set(Object.values(registry || {})
+        .filter((record) => record?.type === 'agent' && record.sourceIdentity && record.repoName)
+        .map((record) => record.repoName));
+    for (const repoName of [...pinnedRepositories].sort()) {
+        try { planningAgentRepositoryPath(repoName); }
+        catch (error) {
+            if (error?.code === 'PLOINKY_REPOSITORY_AMBIGUOUS') contested.push({ repoName, message: error.message });
+        }
+    }
+    if (!problems.length && !contested.length) return problems;
+    log(`- ${styles.label('Agent sources')}:`);
+    for (const problem of problems) {
+        log(`  ${bulletSymbol} ${styles.name(`${problem.repoName}/${problem.agentName}`)} ${styles.danger('will not start')}: ${problem.message}`);
+    }
+    for (const entry of contested) {
+        log(`  ${bulletSymbol} ${styles.name(entry.repoName)} ${styles.warn('contested')}: its enabled agents keep starting from their `
+            + `pinned folder; new enables refuse. ${entry.message}`);
+    }
+    problems.contested = contested;
+    return problems;
 }

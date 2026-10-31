@@ -44,6 +44,26 @@ export function workspaceRepositoryPath(name, { workspaceRoot, url = '', accept 
     const identity = repositoryIdentity(url);
     if (!identity) return null;
     const matches = workspaceRepositories(workspaceRoot, accept).filter(entry => repositoryOrigin(entry.directory) === identity);
-    if (matches.length > 1) throw new Error(`Multiple workspace checkouts match repository '${name}'`);
+    if (matches.length > 1) throw repositoryAmbiguityError(name, matches.map(entry => entry.directory));
     return matches[0]?.directory || null;
+}
+
+export const REPOSITORY_AMBIGUOUS = 'PLOINKY_REPOSITORY_AMBIGUOUS';
+
+// Two workspace folders with the same origin leave only this repository
+// unresolved. Callers that iterate every repository skip it by this code;
+// callers that resolve it by name refuse with this message. Neither falls back
+// to another copy of the repository.
+export function repositoryAmbiguityError(name, directories, { message = '' } = {}) {
+    const names = directories.map(directory => path.basename(directory)).sort();
+    const error = new Error(message || `Repository '${name}' is unresolved: the workspace folders ${names.map(entry => `'${entry}'`).join(' and ')} `
+        + 'both have its Git origin. Remove or rename the folder that should not supply it.');
+    error.code = REPOSITORY_AMBIGUOUS;
+    error.repositoryName = name;
+    error.candidates = [...directories];
+    return error;
+}
+
+export function isRepositoryAmbiguity(error) {
+    return error?.code === REPOSITORY_AMBIGUOUS;
 }

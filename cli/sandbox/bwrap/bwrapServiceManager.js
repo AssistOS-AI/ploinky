@@ -1,4 +1,5 @@
 import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
+import { launchSourceIdentity } from '../../utils/agentSourcePin.mjs';
 import { execSync, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -1206,6 +1207,10 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     agents[containerName] = {
         agentName,
         repoName,
+        sourceIdentity: launchSourceIdentity([
+            options.preservePreparedRegistryRecord === true ? options.preparedRegistryRecord : null,
+            currentRecord,
+        ], { repoName, agentName, agentPath }),
         runtime: 'bwrap',
         pid: child.pid,
         containerImage: 'host (bwrap)',

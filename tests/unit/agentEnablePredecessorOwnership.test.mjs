@@ -536,9 +536,10 @@ for (const [label, manifest, native] of [
 // ------------------------------------------------------------------
 // Eligibility follows the resolved successor's launch path.
 
+// sourceIdentity: the enable-time source pin (agentSourcePin.mjs).
 const BASE_STAGED_KEYS = [
     'agentName', 'auth', 'config', 'containerImage', 'createdAt', 'enableGeneration',
-    'instanceId', 'profile', 'projectPath', 'repoName', 'runMode', 'type',
+    'instanceId', 'profile', 'projectPath', 'repoName', 'runMode', 'sourceIdentity', 'type',
 ];
 
 function seeded(t, manifests, records) {

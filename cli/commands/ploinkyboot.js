@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
+import { isRepositoryAmbiguity } from '../utils/repositorySource.mjs';
 import path from 'path';
 import { PLOINKY_DIR } from '../utils/config.js';
 import * as repos from '../utils/repos.js';
@@ -38,7 +39,16 @@ export function prepareDefaultBootRepositories({
 } = {}) {
     const prepared = [];
     for (const { name, url } of bootRepos) {
-        const repoPath = resolveAgentRepositoryPath(name);
+        let repoPath;
+        try { repoPath = resolveAgentRepositoryPath(name); }
+        catch (err) {
+            // An unresolved repository is reported and skipped; the other
+            // boot repositories are still prepared.
+            if (!isRepositoryAmbiguity(err)) throw err;
+            error(`Default '${name}' repository is unresolved: ${err.message}`);
+            prepared.push({ name, action: 'unresolved', branch: null });
+            continue;
+        }
         const repoBranchPolicy = policyForBootRepo(name, branchPolicy);
         if (!fs.existsSync(repoPath)) {
             log(`Default '${name}' repository not found. Cloning...`);

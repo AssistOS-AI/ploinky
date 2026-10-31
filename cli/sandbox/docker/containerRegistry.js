@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
+import { isRepositoryAmbiguity } from '../../utils/repositorySource.mjs';
 import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'node:util';
 import path from 'path';
@@ -23,7 +24,9 @@ function parseAgentInfoFromMounts(mounts = []) {
             const source = path.resolve(mount.Source);
             const agentRoot = path.basename(source) === 'code' ? path.dirname(source) : source;
             if (fs.existsSync(path.join(agentRoot, 'manifest.json'))) {
-                repoName = resolveAgentRepositoryName(agentRoot);
+                // A container of an unresolved repository is still listed.
+                try { repoName = resolveAgentRepositoryName(agentRoot); }
+                catch (error) { if (!isRepositoryAmbiguity(error)) throw error; }
                 agentName = path.basename(agentRoot);
                 break;
             }

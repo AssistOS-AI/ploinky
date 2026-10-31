@@ -936,6 +936,18 @@ async function processPrivateRequest(req, res) {
         });
         return;
     }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'runtime-sources') {
+        // Authorized above against the execution-provider holder ACL; the
+        // lease is revalidated before the reply is written.
+        sendRuntimeSources(res, {
+            plan: routePlan,
+            body,
+            callerIdentity: req.privateAgentIdentity,
+            workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+            audit: (event, value) => appendLog(event, value),
+        });
+        return;
+    }
     if (routePlan.kind === 'private-operation' && routePlan.operation === 'workspace-metrics') {
         if (!commitRoutePlan(routePlan)) {
             sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
@@ -1304,3 +1316,4 @@ server.listen(port, '0.0.0.0', () => {
 import { privateForwardTrustedHeadersFactory } from './executionProvider/coordinatorHop.mjs';
 import { handleTaskReferenceRequest } from './executionProvider/taskReferenceRoutes.mjs';
 import { sendSourceProtection } from './privateRouter.js';
+import { sendRuntimeSources } from './runtimeSources.mjs';

@@ -97,6 +97,7 @@ import {
   RUNNING_DIR,
 } from '../utils/config.js';
 import { preflightLinkedRepositories } from '../utils/linkInstall.mjs';
+import { validLinkPin } from '../utils/agentSourcePin.mjs';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from '../utils/workspaceDependencyGraph.js';
 import {
   mergeRoutingConfig,
@@ -2897,7 +2898,27 @@ export function preflightStartLinkedRepositories(admittedStart, {
 } = {}) {
   if (!branchPolicy?.branch) return [];
   const nodes = [...admittedStart.graph.nodes.values(), ...(admittedStart.additionalNodes || [])];
-  return preflight(nodes.map((node) => node.manifest), { ...options, workspaceRoot, branchPolicy });
+  return preflight(nodes.map((node) => node.manifest), {
+    ...options, workspaceRoot, branchPolicy, pinned: recordedLinkPins(admittedStart.registry),
+  });
+}
+
+// The link-install checkouts enabled agents recorded at their first launch,
+// one per repository name; a name recorded at different folders is left to
+// each agent's own launch check.
+function recordedLinkPins(registry) {
+  const byName = new Map();
+  const conflicting = new Set();
+  for (const record of Object.values(registry || {})) {
+    if (record?.type !== 'agent' || !Array.isArray(record.linkedRepositories)) continue;
+    for (const pin of record.linkedRepositories) {
+      if (!validLinkPin(pin)) continue;
+      const known = byName.get(pin.name);
+      if (known && (known.realpath !== pin.realpath || known.origin !== pin.origin)) conflicting.add(pin.name);
+      else byName.set(pin.name, pin);
+    }
+  }
+  return [...byName.values()].filter((pin) => !conflicting.has(pin.name));
 }
 
 export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { hardwareContext, boxMarkerOptions } = {}) {

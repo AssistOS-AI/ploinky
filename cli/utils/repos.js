@@ -1,10 +1,10 @@
 import fs from 'fs';
-import { workspaceRepositories } from './repositorySource.mjs';
+import { isRepositoryAmbiguity, workspaceRepositories } from './repositorySource.mjs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { listWorkspaceSkillRepositories, resolveSkillRepositorySource } from './skillRepositorySource.js';
 import { PLOINKY_WORKSPACE_ROOT, PLOINKY_DIR } from './config.js';
-import { listAgentRepositoryNames, resolveAgentRepositoryPath, workspaceAgentRepositoryPath } from './agentRepositorySource.mjs';
+import { freshAgentRepositoryPath, listAgentRepositoryNames, resolveAgentRepositoryPath, workspaceAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { isAgentRepositoryUnregistered, setAgentRepositoryRegistered } from './agentRepositoryRegistration.mjs';
 import { parseBranchPolicy } from '../../agentlib/branchPolicy.mjs';
 import { runGitCommand, sanitizeGitDiagnostic } from './gitCommand.js';
@@ -12,6 +12,7 @@ import { createOperationRecord } from '../commands/updateOutcome.js';
 import { throwUnlessVerified, updateCheckoutFastForward } from './git/verifiedUpdate.js';
 import { assessGeneratedCheckoutState } from './git/generatedState.js';
 import { assertSourceSetFixed } from './runtime/sourceProtectionGate.mjs';
+import { displaySourcePath, pinnedRepositoryPath, readRegisteredAgents } from './agentSourcePin.mjs';
 
 export const REPO_SOURCES_FILE = path.join(PLOINKY_DIR, 'repo_sources.json');
 export const ENABLED_REPOS_FILE = path.join(PLOINKY_DIR, 'enabled_repos.json');
@@ -186,7 +187,13 @@ export function classifyRepoKind(repoName) {
     if (declared) return declared;
 
     const preferred = resolveSkillRepositorySource(repoName, '');
-    return classifyRepoPath(preferred.origin === 'workspace' ? preferred.source : resolveAgentRepositoryPath(repoName));
+    if (preferred.origin === 'workspace') return classifyRepoPath(preferred.source);
+    try { return classifyRepoPath(resolveAgentRepositoryPath(repoName)); }
+    catch (error) {
+        // An unresolved repository has no single folder to classify.
+        if (isRepositoryAmbiguity(error)) return 'unknown';
+        throw error;
+    }
 }
 
 // skills: a skills/ folder with at least one SKILL.md folder; agents: a top-level folder with a manifest.json.
@@ -585,8 +592,27 @@ export function updateRegisteredRepository(name, {
     if (!name) throw new Error('Missing repository name.');
     assertSourceSetFixed({ workspaceRoot: PLOINKY_WORKSPACE_ROOT, kind: 'repository-update' });
     if (isAgentRepositoryUnregistered(name)) throw new Error(`Repository '${name}' is not installed.`);
-    const localPath = workspaceAgentRepositoryPath(name);
-    const repoPath = resolveAgentRepositoryPath(name);
+    // Enabled agents run from the folder their enable pinned. Update that
+    // folder, even when the repository name now resolves to another one.
+    const pinned = pinnedRepositoryPath(name, readRegisteredAgents());
+    let localPath;
+    let repoPath;
+    if (pinned.path) {
+        repoPath = pinned.path;
+        let reposRoot = path.resolve(PLOINKY_DIR, 'repos');
+        try { reposRoot = fs.realpathSync(reposRoot); } catch (_) {}
+        const managed = path.relative(reposRoot, repoPath);
+        localPath = managed && !managed.startsWith('..') && !path.isAbsolute(managed) ? null : repoPath;
+        let resolved = '';
+        try { resolved = fs.realpathSync(freshAgentRepositoryPath(name)); } catch (_) { resolved = ''; }
+        if (resolved !== repoPath) {
+            console.log(`[update] ${name}: updating ${displaySourcePath(repoPath)}, the folder its enabled agents were `
+                + `enabled from, not ${resolved ? displaySourcePath(resolved) : 'the folder the name resolves to now'}.`);
+        }
+    } else {
+        localPath = workspaceAgentRepositoryPath(name);
+        repoPath = resolveAgentRepositoryPath(name);
+    }
     if (!fs.existsSync(repoPath)) {
         throw new Error(`Repository '${name}' is not installed.`);
     }
@@ -988,7 +1014,16 @@ export function listRepositorySources() {
     const skills = new Map(getSkillRepositoryRecommendations().map(repo => [repo.name, repo]));
     return [...names].sort().map(name => {
         const url = registered[name]?.url || '';
-        const agentSource = workspaceAgentRepositoryPath(name);
+        let agentSource;
+        try { agentSource = workspaceAgentRepositoryPath(name); }
+        catch (error) {
+            // Two workspace folders claim this repository: it is listed as
+            // unresolved, and every other repository is still listed.
+            if (!isRepositoryAmbiguity(error)) throw error;
+            return { name, repoName: name, url, source: '', origin: 'unresolved', unresolved: error.message,
+                candidates: error.candidates.map(directory => path.relative(PLOINKY_WORKSPACE_ROOT, directory)).sort(),
+                kind: skills.get(name)?.kind || 'agents', warnings: [error.message] };
+        }
         const resolved = agentSource ? { source: fs.realpathSync(agentSource), origin: 'workspace' }
             : resolveSkillRepositorySource(name, url);
         return { name, repoName: name, url, ...resolved, kind: skills.get(name)?.kind || classifyRepoKind(name),

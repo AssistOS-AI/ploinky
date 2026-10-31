@@ -13,6 +13,7 @@ import {
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
 import { resolveEnabledAgentRecordFromMap } from './agentRegistryResolver.js';
 import { resolveAgentAuthPolicy } from './manifestAuth.js';
+import { assertAgentSourcePin } from './agentSourcePin.mjs';
 
 function manifestForAgentRef(agentRef) {
     try {
@@ -167,7 +168,15 @@ function resolveWorkspaceDependencyGraph({
         stack = [],
         selectionPath = [],
     } = {}) {
-        const resolved = findAgent(agentRef);
+        // A bare name of an enabled agent launches from that agent's record
+        // (and so from its pinned source), never from a fresh bare-name search.
+        let enabled = null;
+        if (!/[:/]/.test(String(agentRef || ''))) {
+            try { enabled = resolveEnabledAgentRegistryRecord(agentRef, registry); } catch (_) { enabled = null; }
+        }
+        const resolved = findAgent(enabled?.record?.repoName && enabled.record.agentName === agentRef
+            ? `${enabled.record.repoName}/${enabled.record.agentName}`
+            : agentRef);
         const nodeId = createGraphNodeId(resolved.repo, resolved.shortAgentName, alias);
         const instanceKey = effectiveInstanceKey(resolved.repo, resolved.shortAgentName, alias);
         const requestedProfile = normalizeProfileOverride(profile);
@@ -188,6 +197,13 @@ function resolveWorkspaceDependencyGraph({
                 repoName: resolved.repo,
                 shortAgentName: resolved.shortAgentName,
                 alias
+            });
+            // An enabled agent whose repository now resolves to a different
+            // folder is refused before the graph can stage or launch it.
+            assertAgentSourcePin(registryRecord, {
+                repoName: resolved.repo,
+                agentName: resolved.shortAgentName,
+                agentPath: path.dirname(resolved.manifestPath),
             });
             const selectedProfile = requestedProfile || normalizeProfileOverride(registryRecord?.profile);
             const profileName = resolveEffectiveProfile(manifest, selectedProfile, `${resolved.repo}/${resolved.shortAgentName}`, {

@@ -1,6 +1,7 @@
 import { ensureRepositoryLink } from '../../utils/repositoryInstall.mjs';
-import { prepareLinkedRepositories } from '../../utils/linkInstall.mjs';
+import { linkedRepositoryPins, prepareLinkedRepositories } from '../../utils/linkInstall.mjs';
 import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
+import { assertAgentSourcePin, launchSourceIdentity } from '../../utils/agentSourcePin.mjs';
 import { execSync, spawnSync } from 'child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'fs';
@@ -1913,11 +1914,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const manifestInstallCmd = String(profileConfig?.install || manifest?.install || '').trim();
     const combinedInstallCmd = manifestInstallCmd;
 
+    // A record launched before keeps its recorded link-install checkouts; an
+    // enable (whose prepared record has none) resolves and records them anew.
     const linkedRepositories = prepareLinkedRepositories(manifest, {
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         create: !adoptManagedRuntimeOnly,
         writable: !isolatedHome,
+        pinned: Array.isArray(launchRecord.linkedRepositories) ? launchRecord.linkedRepositories : null,
     });
+    const linkedRepositoryRecord = linkedRepositoryPins(manifest, linkedRepositories);
     // /code is always a direct bind of the agent source, with dependencies and
     // /code/... volumes mounted over mount points created in the source. Only
     // /Agent is staged: a copy whose node_modules and linked repositories are
@@ -2728,6 +2733,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         createdRegistryRecord = {
             ...launchRecord,
             type: 'agent', agentName, repoName, runtime, containerId,
+            linkedRepositories: structuredClone(linkedRepositoryRecord),
             ...(options.alias ? { alias: options.alias } : {}),
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
@@ -3037,6 +3043,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     agents[containerName] = {
         agentName,
         repoName,
+        sourceIdentity: launchSourceIdentity([launchRecord, persistedRecord], { repoName, agentName, agentPath }),
+        // The link-install checkouts this launch mounted ({ name, origin,
+        // realpath }): later launches mount exactly these, and the Router
+        // reports them without resolving anything again.
+        linkedRepositories: structuredClone(linkedRepositoryRecord),
         containerImage: image,
         ...(manifestImage && manifestImage !== image ? { manifestImage } : {}),
         ...(llmStartup.enabled ? {
@@ -3781,6 +3792,9 @@ export function admitAgentServicePreflight(agentName, manifest, agentPath, optio
         && options.preparedRegistryRecord
         ? options.preparedRegistryRecord
         : mutablePreflightRecord;
+    // The record being launched (an explicit enable's prepared record carries
+    // its new pin) must name the folder this launch resolved.
+    assertAgentSourcePin(preflightRecord, { repoName: preflightRepoName, agentName, agentPath });
     // Every refusal this admission raises names the exact admitted instance:
     // the registry key (a staged replacement candidate belongs to it) and
     // the instance alias, as graph admission records them.
@@ -4817,6 +4831,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     agents[containerName] = {
         agentName,
         repoName,
+        sourceIdentity: launchSourceIdentity([startedRecord, launchRecord], { repoName, agentName, agentPath }),
+        ...(Array.isArray(startedRecord.linkedRepositories)
+            ? { linkedRepositories: structuredClone(startedRecord.linkedRepositories) }
+            : {}),
         containerImage: startedRecord.containerImage || image,
         ...(startedRecord.manifestImage ? { manifestImage: startedRecord.manifestImage } : {}),
         ...(startedRecord.llmRuntime ? { llmRuntime: startedRecord.llmRuntime } : {}),

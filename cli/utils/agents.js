@@ -30,6 +30,7 @@ import {
 } from '../sandbox/bwrap/bwrapFleet.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
+import { agentSourceIdentity, sourcePinReport } from './agentSourcePin.mjs';
 import { resolveManifestRuntimeProfile } from './runtime/profileService.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from './runtime/startupReadiness.js';
@@ -388,7 +389,9 @@ function resolveAgentEnableInput({
     boxMarkerOptions,
 } = {}) {
     const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
-    const { manifestPath, repo: repoName, shortAgentName } = findAgent(normalized.agentName);
+    // A new enable or re-enable plans from the fresh, uncontested resolution:
+    // a folder planted beside an enabled agent's pinned source refuses here.
+    const { manifestPath, repo: repoName, shortAgentName } = findAgent(normalized.agentName, { planning: true });
     const manifestBytes = fs.readFileSync(manifestPath);
     const manifest = JSON.parse(manifestBytes.toString('utf8'));
     resolveManifestStartup(manifest);
@@ -581,6 +584,9 @@ function planAgentEnable({
         ...(runtimeKind === 'seatbelt' || runtimeKind === 'bwrap' ? { runtime: runtimeKind } : {}),
         instanceId,
         enableGeneration,
+        // The folder this enable resolved; later launches must resolve the
+        // same one (agentSourcePin.mjs). Only an explicit enable rewrites it.
+        sourceIdentity: agentSourceIdentity({ repoName, agentPath }),
         config: {
             binds: [
                 { source: projectPath, target: projectMountTarget },
@@ -842,6 +848,17 @@ export function prepareAgentEnableBatch(requests, {
     try {
         for (const { request, input } of resolvedRequests) {
             plans.push(planAgentEnable(request, map, routing, input, { containerPresent }));
+        }
+        for (const plan of plans) {
+            const report = sourcePinReport({
+                repoName: plan.repoName,
+                agentName: plan.shortAgentName,
+                pin: plan.record.sourceIdentity,
+                previousPin: previousAgents?.[plan.containerName]?.type === 'agent'
+                    ? previousAgents[plan.containerName].sourceIdentity
+                    : undefined,
+            });
+            if (report) console.log(report);
         }
         for (const plan of plans) inspectLegacy({ containerName: plan.containerName,
             registryRecord: previousAgents[plan.containerName], runtime: getRuntime });

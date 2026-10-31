@@ -911,6 +911,27 @@ export function resolveEdgeRoutePlan({
                 snapshot,
             };
         }
+        if (pathname === '/api/edge/runtime-sources') {
+            // Exact metadata read, like runtime-origins: the raw target must be
+            // the bare path, with no query, fragment, or normalized alias.
+            if (String(req?.method || '').toUpperCase() !== 'GET'
+                || url.search || String(req?.url || '') !== pathname) {
+                return deny(400, 'RUNTIME_SOURCES_REQUEST_INVALID', { lease, hostSelection });
+            }
+            return {
+                matched: true,
+                ok: true,
+                kind: 'private-operation',
+                operation: 'runtime-sources',
+                listener,
+                host,
+                hostSelection,
+                pathname,
+                parsedUrl: url,
+                lease,
+                snapshot,
+            };
+        }
         return deny(404, 'PRIVATE_ROUTE_SURFACE_DENIED', { lease, hostSelection });
     }
     // Before any public surface or agent selection.

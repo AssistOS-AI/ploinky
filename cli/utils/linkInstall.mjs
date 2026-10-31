@@ -3,6 +3,7 @@ import { workspaceRepositories } from './repositorySource.mjs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { assertSourceSetFixed } from './runtime/sourceProtectionGate.mjs';
+import { AGENT_SOURCE_CHANGED, displaySourcePath, validLinkPin } from './agentSourcePin.mjs';
 
 function repository(value) {
     if (typeof value !== 'string' || !value.trim()) throw new Error('link-install entries must be Git URLs');
@@ -39,10 +40,21 @@ export function linkInstallDeclarations(manifest) {
 // `branchPolicy.branch` (the start's `--branch`) selects the branch of a new
 // clone and is checked, never applied, against an existing workspace checkout.
 // Without it no remote is queried and no branch is inspected.
+// `pinned` is the agent record's `linkedRepositories` ({ name, origin,
+// realpath }) recorded at its first launch: a pinned declaration mounts exactly
+// that folder, without searching the workspace, and refuses (never substitutes
+// or clones) when the folder is gone, replaced, or carries another origin.
 export function prepareLinkedRepositories(manifest, { workspaceRoot, create = true, writable = false,
-    execFile = execFileSync, branchPolicy = null, log = console.log } = {}) {
+    execFile = execFileSync, branchPolicy = null, log = console.log, pinned = null } = {}) {
     const declarations = linkInstallDeclarations(manifest);
     if (!declarations.length) return [];
+    const pins = new Map();
+    if (pinned !== null && pinned !== undefined) {
+        if (!Array.isArray(pinned) || !pinned.every(validLinkPin)) {
+            throw linkPinError('the recorded link-install checkouts of this agent are malformed', null, workspaceRoot);
+        }
+        for (const pin of pinned) pins.set(pin.name, pin);
+    }
     const requestedBranch = branchPolicy?.branch || null;
     const strict = branchPolicy?.fallback === 'fail';
     const root = fs.realpathSync(workspaceRoot);
@@ -56,7 +68,12 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
         try { return repository(String(git(['-C', directory, 'config', '--get', 'remote.origin.url'])).trim()).identity; }
         catch { return null; }
     };
-    const known = workspaceRepositories(root).map(entry => ({ directory: entry.directory, identity: origin(entry.directory) }));
+    // Read only when an unpinned declaration needs the origin scan.
+    let knownEntries = null;
+    const known = () => {
+        knownEntries ||= workspaceRepositories(root).map(entry => ({ directory: entry.directory, identity: origin(entry.directory) }));
+        return knownEntries;
+    };
     const checkedOutBranch = directory => {
         try { return String(git(['-C', directory, 'symbolic-ref', '--short', '-q', 'HEAD'])).trim() || null; }
         catch { return null; }
@@ -85,8 +102,30 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
         return null;
     };
     return declarations.map(repo => {
-        const matches = known.filter(entry => entry.identity === repo.identity);
-        if (matches.length > 1) throw new Error(`Multiple workspace repositories match link-install ${repo.name}`);
+        const pin = pins.get(repo.name);
+        if (pin) {
+            const refuse = problem => { throw linkPinError(problem, pin, root, repo.name); };
+            if (pin.origin !== repo.identity) refuse('its manifest now declares a different repository');
+            const stat = fs.lstatSync(pin.realpath, { throwIfNoEntry: false });
+            if (!stat) refuse('that folder no longer exists');
+            if (!stat.isDirectory() || fs.realpathSync(pin.realpath) !== pin.realpath) refuse('that folder was replaced');
+            if (origin(pin.realpath) !== repo.identity) refuse('its Git origin is no longer the declared repository');
+            if (requestedBranch) {
+                const branch = branchFor(repo, 'keeping the recorded checkout');
+                const current = branch && checkedOutBranch(pin.realpath);
+                if (branch && current !== branch) {
+                    throw new Error(`link-install repository ${repo.name} is on '${current || 'detached HEAD'}', not requested branch '${branch}'; switch it yourself (Ploinky never modifies workspace checkouts)`);
+                }
+            }
+            return { name: repo.name, source: pin.realpath, target: pin.realpath,
+                link: `linked/${repo.name}`, readOnly: !writable };
+        }
+        const matches = known().filter(entry => entry.identity === repo.identity);
+        if (matches.length > 1) {
+            throw new Error(`Multiple workspace repositories match link-install ${repo.name}: `
+                + `${matches.map(entry => `'${path.basename(entry.directory)}'`).sort().join(' and ')} both have its Git origin. `
+                + 'Remove or rename the folder that should not supply it.');
+        }
         let source = matches[0]?.directory;
         if (!source) {
             source = path.join(root, repo.name);
@@ -106,7 +145,7 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
             } catch {
                 throw new Error(`Could not clone link-install repository ${repo.name}; check Git access and the workspace destination`);
             } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
-            known.push({ directory: source, identity: repo.identity });
+            known().push({ directory: source, identity: repo.identity });
         }
         if (!fs.lstatSync(source).isDirectory() || fs.realpathSync(source) !== source || origin(source) !== repo.identity) {
             throw new Error(`link-install repository identity changed: ${repo.name}`);
@@ -124,6 +163,21 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
         return { name: repo.name, source, target: source,
             link: `linked/${repo.name}`, readOnly: !writable };
     });
+}
+
+function linkPinError(problem, pin, root, name = pin?.name || '') {
+    const where = pin ? ` was recorded at ${displaySourcePath(pin.realpath, root)} (Git origin ${pin.origin}) when this agent was first launched, but` : '';
+    const error = new Error(`link-install repository ${name}${where} ${problem}. Ploinky does not substitute another `
+        + 'checkout: restore that folder, or enable the agent again to record a new one.');
+    error.code = AGENT_SOURCE_CHANGED;
+    error.status = 409;
+    return error;
+}
+
+/** The link-install pins a launch records: { name, origin, realpath } per mounted checkout. */
+export function linkedRepositoryPins(manifest, mounts) {
+    const identities = new Map(linkInstallDeclarations(manifest).map(repo => [repo.name, repo.identity]));
+    return mounts.map(({ name, source }) => ({ name, origin: identities.get(name) || '', realpath: source }));
 }
 
 // `start --branch` resolves every link-install repository of the whole admitted

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { PLOINKY_WORKSPACE_ROOT } from '../../config.js';
 import { readAgentRegistrySnapshot } from '../../agentRegistrySnapshot.js';
 import { resolveAgentRepositoryPath } from '../../agentRepositorySource.mjs';
+import { pinnedRepositoryPath } from '../../agentSourcePin.mjs';
 import { readGlobalDepsPackage, mergePackageJson } from '../dependencyInstaller.js';
 import { assertNoReservedAgentLibDependency } from '../agentLibLink.js';
 import { activeBoxMcpSdkBundle, withoutBoxMcpSdk } from '../../../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
@@ -77,7 +78,7 @@ export async function refreshUpdateGitPins({
 } = {}, {
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     readRegistry = () => readAgentRegistrySnapshot({ workspaceRoot }),
-    repositoryPath = resolveAgentRepositoryPath,
+    repositoryPath = null,
     readGlobalPackage = readGlobalDepsPackage,
     readSdkBundle = activeBoxMcpSdkBundle,
     store: suppliedStore = null,
@@ -94,6 +95,11 @@ export async function refreshUpdateGitPins({
             return { records: [recordFor('registry', 'uncertain', 'git-pin-registry-unreadable', error.message)], queriesRun: 0, changed: false };
         }
         const names = repositoryNames === null ? null : new Set(repositoryNames.map(String));
+        // By default the pinned folder of a repository's enabled agents, the
+        // one `update repo` advanced (agentSourcePin.mjs).
+        const resolveRepository = typeof repositoryPath === 'function'
+            ? repositoryPath
+            : (name) => pinnedRepositoryPath(name, registry).path || resolveAgentRepositoryPath(name);
         const selected = [];
         for (const [registration, record] of Object.entries(registry || {})) {
             if (registration === '_config' || record?.type !== 'agent') continue;
@@ -102,7 +108,7 @@ export async function refreshUpdateGitPins({
                 continue;
             }
             let repoPath;
-            try { repoPath = canonical(repositoryPath(record.repoName)); }
+            try { repoPath = canonical(resolveRepository(record.repoName)); }
             catch (error) {
                 if (!names || names.has(record.repoName)) records.push(recordFor(registration, 'failed', 'git-pin-source-unavailable', error.message));
                 continue;

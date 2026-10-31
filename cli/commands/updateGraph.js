@@ -9,6 +9,7 @@ import { resolveSkillRepositorySource } from '../utils/skillRepositorySource.js'
 import { findSkillsManifestPath, readSkillsManifest } from './skills.js';
 import { readAgentRegistrySnapshot } from '../utils/agentRegistrySnapshot.js';
 import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
+import { pinnedRepositoryPath } from '../utils/agentSourcePin.mjs';
 import { linkInstallDeclarations } from '../utils/linkInstall.mjs';
 import { parseEnableDirective } from '../utils/runtime/bootstrapManifest.js';
 import { findAgent } from '../utils/utils.js';
@@ -143,7 +144,7 @@ function enableEntries(manifest) {
 export function readUpdateGraph({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     readRegistry = () => readAgentRegistrySnapshot({ workspaceRoot }),
-    repositoryPath = resolveAgentRepositoryPath,
+    repositoryPath = null,
     // Same resolver the start path uses for a bare enabled agent name.
     resolveAgent = findAgent,
     skillScopeContext = commandSkillScopes.getStore(),
@@ -169,6 +170,11 @@ export function readUpdateGraph({
         return graph;
     }
     addSkillScopes(graph, workspaceRoot, registry, skillScopeContext, resolveSkillSource);
+    // By default a repository whose enabled agents are pinned is the pinned
+    // folder, the one `update repo` acts on (agentSourcePin.mjs).
+    if (typeof repositoryPath !== 'function') {
+        repositoryPath = name => pinnedRepositoryPath(name, registry).path || resolveAgentRepositoryPath(name);
+    }
     const addRepository = name => {
         const repoName = String(name || '').trim();
         if (!repoName || graph.repositories.has(repoName)) return;
@@ -190,6 +196,10 @@ export function readUpdateGraph({
         addRepository(record.repoName);
         if (record.develRepo) addRepository(record.develRepo);
         pending.push([String(record.repoName), String(record.agentName)]);
+        // The link-install checkouts this agent recorded at its first launch.
+        for (const pin of Array.isArray(record.linkedRepositories) ? record.linkedRepositories : []) {
+            if (pin && typeof pin.realpath === 'string' && path.isAbsolute(pin.realpath)) graph.linkInstallPaths.add(canonical(pin.realpath));
+        }
     }
     while (pending.length) {
         const [repoName, agentName] = pending.shift();

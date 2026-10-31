@@ -1,4 +1,5 @@
 import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
+import { launchSourceIdentity } from '../../utils/agentSourcePin.mjs';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -819,6 +820,10 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     agents[containerName] = {
         agentName,
         repoName,
+        sourceIdentity: launchSourceIdentity([
+            options.preservePreparedRegistryRecord === true ? options.preparedRegistryRecord : null,
+            existingRecord,
+        ], { repoName, agentName, agentPath }),
         runtime: 'seatbelt',
         pid: child.pid,
         containerImage: 'host (seatbelt)',
