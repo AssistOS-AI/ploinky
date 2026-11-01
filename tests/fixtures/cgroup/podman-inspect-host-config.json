@@ -1,0 +1,9 @@
+{
+  "PidMode": "private",
+  "CgroupMode": "private",
+  "CgroupnsMode": null,
+  "CgroupParent": "/ploinky/agents",
+  "CgroupManager": "cgroupfs",
+  "Cgroups": "default",
+  "UsernsMode": ""
+}

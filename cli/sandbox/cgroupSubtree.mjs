@@ -110,6 +110,13 @@ export function normalizeAgentCgroupReservation(value, containerId) {
         nativeRoot: root ? Object.freeze({ path: root.path, dev: root.dev, ino: root.ino }) : null });
 }
 
+export function cgroupNamespaceModeFromInspection(record) {
+    const modes = [record?.HostConfig?.CgroupMode, record?.HostConfig?.CgroupnsMode]
+        .filter((value) => value !== undefined && value !== null);
+    if (!modes.length || modes.some((value) => typeof value !== 'string' || value !== modes[0])) return null;
+    return modes[0];
+}
+
 export function verifyCgroupContainerConfiguration({ descriptor, containerId, record } = {}) {
     if (!descriptor?.cgroupDelegation) return;
     if (record?.Id !== containerId) throw cgroupUnavailable('agent immutable ID contract mismatch');
@@ -122,7 +129,7 @@ export function verifyCgroupContainerConfiguration({ descriptor, containerId, re
         throw cgroupUnavailable('agent Box namespace arguments contract mismatch');
     }
     if (record?.HostConfig?.PidMode !== 'private') throw cgroupUnavailable('agent private PID namespace contract mismatch');
-    if (record?.HostConfig?.CgroupnsMode !== 'private') throw cgroupUnavailable('agent private cgroup namespace contract mismatch');
+    if (cgroupNamespaceModeFromInspection(record) !== 'private') throw cgroupUnavailable('agent private cgroup namespace contract mismatch');
     const env = (record.Config.Env || []).filter((entry) => entry.startsWith('PLOINKY_CGROUP_SUBTREE='));
     const binds = (record.Mounts || []).filter((mount) => mount.Destination === CGROUP_HELPER_DIRECTORY);
     if (env.length !== 1 || env[0] !== `PLOINKY_CGROUP_SUBTREE=${CGROUP_SUBTREE_PATH}`) throw cgroupUnavailable('agent provider env contract mismatch');
