@@ -42,6 +42,10 @@ import {
 } from './agentWorkerProtocol.mjs';
 
 const PODMAN = '/usr/bin/podman';
+const CLEANUP_DIAGNOSTIC_STEPS = new Set(["begin","pre-ready-reset","missing-client","missing-inner","capture-session","correlate-exec","signal-snapshot-term","wait-snapshot-term","signal-snapshot-kill","wait-snapshot-kill","list-residual","signal-residual-term","wait-residual-term","signal-residual-kill","wait-residual-kill","list-residual-final","signal-client-term","wait-client-term","signal-client-kill","wait-client-kill","drain-exec"]);
+const CLEANUP_DIAGNOSTIC_CODES = new Set(["WEBTTY_AGENT_PROCESS_IDENTITY_STALE","WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN","WEBTTY_PROCESS_IDENTITY_STALE","WEBTTY_PROCESS_IDENTITY_UNPROVEN","WEBTTY_AGENT_PODMAN_FAILURE","ESRCH","EPERM","EACCES","ENOENT"]);
+const CLEANUP_DIAGNOSTIC_CATEGORIES = new Set(["session-anchor-missing","session-anchor","session-member-changed","container-init-replaced","process-not-readable","process-missing","exec-not-drained","exec-id-ambiguity","deadline","inspect","proc-scan-timeout","proc-scan-limit","inner-process-ambiguity"]);
+
 const STARTUP_TIMEOUT_MS = 10_000;
 const TERM_GRACE_MS = 750;
 const KILL_GRACE_MS = 500;
@@ -994,9 +998,25 @@ export class AgentTerminalWorker {
         void this.cleanup(this.closing ? 'requested' : (event.signal ? 'signal' : 'clean'));
     }
 
+    reportCleanupDiagnostic(phase, error = null) {
+        try {
+            const step = CLEANUP_DIAGNOSTIC_STEPS.has(this.cleanupDiagnosticStep) ? this.cleanupDiagnosticStep : 'begin';
+            const code = CLEANUP_DIAGNOSTIC_CODES.has(error?.code) ? error.code : 'unmapped';
+            const category = CLEANUP_DIAGNOSTIC_CATEGORIES.has(error?.category) ? error.category : 'unmapped';
+            const elapsedMs = Math.max(0, Math.min(60000, Date.now() - this.cleanupDiagnosticStartedAt));
+            const line = 'PLOINKY_WEBTTY_CLEANUP_STEP ' + JSON.stringify({ terminalId: this.terminalId, step, phase, code, category, elapsedMs }) + '\n';
+            this.cleanupDiagnosticBytes ||= 0;
+            if (this.cleanupDiagnosticBytes + Buffer.byteLength(line) > 16 * 1024) return;
+            this.cleanupDiagnosticBytes += Buffer.byteLength(line);
+            this.processApi.stderr?.write(line);
+        } catch (_) { }
+    }
+
     cleanup(category) {
         if (this.cleanupPromise) return this.cleanupPromise;
         this.closing = true;
+        this.cleanupDiagnosticStartedAt = Date.now();
+        this.cleanupDiagnosticStep = 'begin';
         this.readinessReject?.(new Error('agent shell startup was cancelled'));
         const controller = new AbortController();
         const cleanupContext = Object.freeze({
@@ -1006,6 +1026,7 @@ export class AgentTerminalWorker {
         let cleanupTimer;
         const deadline = new Promise((resolve) => {
             cleanupTimer = setTimeout(() => {
+                this.reportCleanupDiagnostic('deadline');
                 controller.abort();
                 resolve(this.finalizeCleanup(category, {
                     proven: false,
@@ -1032,20 +1053,23 @@ export class AgentTerminalWorker {
         let preserveStartingEvidence = false;
         let snapshot = [];
         if (this.pty && !this.innerProcess) {
+            this.cleanupDiagnosticStep = 'pre-ready-reset';
             const preReadyProven = await this.proveAndResetPreReadyAttempt(cleanupContext);
             if (!active()) return;
-            if (!preReadyProven) proven = false;
+            if (!preReadyProven) { proven = false; this.reportCleanupDiagnostic('unproven'); }
         }
-        if (this.pty && !this.clientProcess) proven = false;
-        if (this.pty && !this.innerProcess) proven = false;
+        if (this.pty && !this.clientProcess) { this.cleanupDiagnosticStep = 'missing-client'; proven = false; this.reportCleanupDiagnostic('unproven'); }
+        if (this.pty && !this.innerProcess) { this.cleanupDiagnosticStep = 'missing-inner'; proven = false; this.reportCleanupDiagnostic('unproven'); }
         if (this.innerProcess) {
             try {
+                this.cleanupDiagnosticStep = 'capture-session';
                 snapshot = await this.captureSession(this.innerProcess);
                 if (!active()) return;
             } catch (error) {
+                this.reportCleanupDiagnostic('caught', error);
                 if (!active()) return;
                 if (error?.code !== 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE') {
-                    proven = false;
+                    { proven = false; this.reportCleanupDiagnostic('unproven'); }
                     providerEvidenceFailed ||= error?.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN'
                         && !targetLocalProcessIdentityFailure(error);
                 }
@@ -1053,6 +1077,7 @@ export class AgentTerminalWorker {
         }
         if (this.innerProcess && !this.execId) {
             try {
+                this.cleanupDiagnosticStep = 'correlate-exec';
                 const correlatedExecId = await this.correlatePreReadyExec(
                     snapshot,
                     cleanupContext,
@@ -1060,12 +1085,13 @@ export class AgentTerminalWorker {
                 if (!active()) return;
                 if (correlatedExecId) this.execId = correlatedExecId;
                 else {
-                    proven = false;
+                    { proven = false; this.reportCleanupDiagnostic('unproven'); }
                     preserveStartingEvidence = true;
                 }
             } catch (error) {
+                this.reportCleanupDiagnostic('caught', error);
                 if (!active()) return;
-                proven = false;
+                { proven = false; this.reportCleanupDiagnostic('unproven'); }
                 preserveStartingEvidence = true;
                 providerEvidenceFailed ||= error?.code === 'WEBTTY_AGENT_PODMAN_FAILURE'
                     && !['target-stale', 'exec-id-ambiguity', 'deadline'].includes(error?.category);
@@ -1076,48 +1102,60 @@ export class AgentTerminalWorker {
         try {
             if (!preserveStartingEvidence && snapshot.length > 0) {
                 if (!active()) return;
+                this.cleanupDiagnosticStep = 'signal-snapshot-term';
                 await this.signalSession(snapshot, 'SIGTERM', cleanupContext);
                 if (!active()) return;
+                this.cleanupDiagnosticStep = 'wait-snapshot-term';
                 if (!await waitForIdentitiesGone(snapshot, this.readInnerIdentity, TERM_GRACE_MS)) {
                     if (!active()) return;
+                    this.cleanupDiagnosticStep = 'signal-snapshot-kill';
                     await this.signalSession(snapshot, 'SIGKILL', cleanupContext);
                     if (!active()) return;
+                    this.cleanupDiagnosticStep = 'wait-snapshot-kill';
                     if (!await waitForIdentitiesGone(snapshot, this.readInnerIdentity, KILL_GRACE_MS)) {
-                        proven = false;
+                        { proven = false; this.reportCleanupDiagnostic('unproven'); }
                     }
                     if (!active()) return;
                 }
             }
         } catch (error) {
+                this.reportCleanupDiagnostic('caught', error);
             if (!active()) return;
-            proven = false;
+            { proven = false; this.reportCleanupDiagnostic('unproven'); }
             providerEvidenceFailed ||= error?.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN'
                 && !targetLocalProcessIdentityFailure(error);
         }
         if (this.innerProcess && !preserveStartingEvidence) {
             try {
+                this.cleanupDiagnosticStep = 'list-residual';
                 let residual = await this.listSession(this.innerProcess);
                 if (!active()) return;
                 if (residual.length > 0) {
+                    this.cleanupDiagnosticStep = 'signal-residual-term';
                     await this.signalSession(residual, 'SIGTERM', cleanupContext);
                     if (!active()) return;
+                    this.cleanupDiagnosticStep = 'wait-residual-term';
                     if (!await waitForIdentitiesGone(residual, this.readInnerIdentity, TERM_GRACE_MS)) {
                         if (!active()) return;
+                        this.cleanupDiagnosticStep = 'signal-residual-kill';
                         await this.signalSession(residual, 'SIGKILL', cleanupContext);
                         if (!active()) return;
+                        this.cleanupDiagnosticStep = 'wait-residual-kill';
                         if (!await waitForIdentitiesGone(residual, this.readInnerIdentity, KILL_GRACE_MS)) {
-                            proven = false;
+                            { proven = false; this.reportCleanupDiagnostic('unproven'); }
                         }
                         if (!active()) return;
                     }
+                    this.cleanupDiagnosticStep = 'list-residual-final';
                     residual = await this.listSession(this.innerProcess);
                     if (!active()) return;
-                    if (residual.length > 0) proven = false;
+                    if (residual.length > 0) { proven = false; this.reportCleanupDiagnostic('unproven'); }
                 }
             } catch (error) {
+                this.reportCleanupDiagnostic('caught', error);
                 if (!active()) return;
                 if (error?.code !== 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE') {
-                    proven = false;
+                    { proven = false; this.reportCleanupDiagnostic('unproven'); }
                     providerEvidenceFailed ||= error?.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN'
                         && error?.category !== 'session-anchor-missing';
                 }
@@ -1126,25 +1164,31 @@ export class AgentTerminalWorker {
         try {
             if (!preserveStartingEvidence && this.clientProcess && !this.ptyExited) {
                 if (!active()) return;
+                this.cleanupDiagnosticStep = 'signal-client-term';
                 this.signalClient(this.clientProcess, 'SIGTERM');
+                this.cleanupDiagnosticStep = 'wait-client-term';
                 if (!await this.waitClientExit(this.clientProcess, { timeoutMs: TERM_GRACE_MS })) {
                     if (!active()) return;
+                    this.cleanupDiagnosticStep = 'signal-client-kill';
                     this.signalClient(this.clientProcess, 'SIGKILL');
+                    this.cleanupDiagnosticStep = 'wait-client-kill';
                     if (!await this.waitClientExit(this.clientProcess, { timeoutMs: KILL_GRACE_MS })) {
-                        proven = false;
+                        { proven = false; this.reportCleanupDiagnostic('unproven'); }
                     }
                 }
                 if (!active()) return;
             }
         } catch (error) {
+                this.reportCleanupDiagnostic('caught', error);
             if (!active()) return;
             if (error?.code !== 'WEBTTY_PROCESS_IDENTITY_STALE') {
-                proven = false;
+                { proven = false; this.reportCleanupDiagnostic('unproven'); }
                 providerEvidenceFailed ||= error?.code === 'WEBTTY_PROCESS_IDENTITY_UNPROVEN';
             }
         }
         try {
             if (this.execId && active()) {
+                this.cleanupDiagnosticStep = 'drain-exec';
                 await this.drainExecCleanup(
                     this.spec.containerId,
                     this.execId,
@@ -1153,8 +1197,9 @@ export class AgentTerminalWorker {
                 if (!active()) return;
             }
         } catch (error) {
+                this.reportCleanupDiagnostic('caught', error);
             if (!active()) return;
-            proven = false;
+            { proven = false; this.reportCleanupDiagnostic('unproven'); }
             providerEvidenceFailed ||= error?.code === 'WEBTTY_AGENT_PODMAN_FAILURE'
                 && error?.category !== 'exec-not-drained'
                 && error?.category !== 'exec-id-ambiguity'

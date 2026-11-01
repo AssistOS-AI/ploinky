@@ -127,6 +127,39 @@ function harness(overrides = {}) {
     return { child, client, forkCalls, signals };
 }
 
+test('cleanup stderr forwarding validates split records, redacts extra fields and bounds intake', async (context) => {
+    const h = harness();
+    const forwarded = [];
+    context.mock.method(console, 'error', (line) => forwarded.push(line));
+    await h.client.spawn();
+    const entry = {
+        terminalId: TERMINAL_ID, step: 'list-residual', phase: 'caught',
+        code: 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN',
+        category: 'session-anchor-missing', elapsedMs: 4,
+        secret: 'REDACT_TEST_CANARY',
+    };
+    const record = (value) => `PLOINKY_WEBTTY_CLEANUP_STEP ${JSON.stringify(value)}\n`;
+    const line = record(entry);
+    h.child.stdout.write(line);
+    assert.equal(forwarded.length, 0);
+    h.child.stderr.write(line.slice(0, 20));
+    assert.equal(forwarded.length, 0);
+    h.child.stderr.write(line.slice(20));
+    assert.equal(forwarded.length, 1);
+    const { secret, ...expected } = entry;
+    assert.deepEqual(JSON.parse(forwarded[0].slice('PLOINKY_WEBTTY_CLEANUP_STEP '.length)), expected);
+    for (const overrides of [
+        { terminalId: 'foreign' }, { step: secret }, { code: secret },
+        { category: secret }, { phase: secret }, { elapsedMs: -1 },
+        { elapsedMs: 60001 }, { elapsedMs: 1.5 },
+    ]) h.child.stderr.write(record({ ...entry, ...overrides }));
+    h.child.stderr.write('PLOINKY_WEBTTY_CLEANUP_STEP invalid-json\n');
+    assert.equal(forwarded.length, 1);
+    h.child.stderr.write(`${'x'.repeat(17_000)}\n`);
+    h.child.stderr.write(line);
+    assert.equal(forwarded.length, 1);
+});
+
 test('agent client forks a separate fixed worker with a scrubbed environment', async () => {
     const h = harness();
     assert.deepEqual(await h.client.spawn(), {
