@@ -76,7 +76,7 @@ test('router source drift: importing drifted source retains aggregated failures 
     const harness = 'tests/security/authorization';
     const files = new Set(routerInventoryBaseline.map(fileOf));
     for (const file of ['router-inventory.mjs', 'router-source-references.mjs',
-      'router-live-sessions-inventory.mjs', 'router-reference-obligations.json']) files.add(`${harness}/${file}`);
+      'router-live-sessions-inventory.mjs', 'router-agent-images-inventory.mjs', 'router-reference-obligations.json']) files.add(`${harness}/${file}`);
     for (const file of files) {
       const target = path.join(root, file);
       fs.mkdirSync(path.dirname(target), { recursive: true });

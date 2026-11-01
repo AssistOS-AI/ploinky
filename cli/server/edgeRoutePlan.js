@@ -911,18 +911,20 @@ export function resolveEdgeRoutePlan({
                 snapshot,
             };
         }
-        if (pathname === '/api/edge/runtime-sources') {
+        if (pathname === '/api/edge/runtime-sources' || pathname === '/api/edge/agent-images') {
             // Exact metadata read, like runtime-origins: the raw target must be
             // the bare path, with no query, fragment, or normalized alias.
             if (String(req?.method || '').toUpperCase() !== 'GET'
                 || url.search || String(req?.url || '') !== pathname) {
-                return deny(400, 'RUNTIME_SOURCES_REQUEST_INVALID', { lease, hostSelection });
+                const code = pathname === '/api/edge/agent-images'
+                    ? 'AGENT_IMAGES_REQUEST_INVALID' : 'RUNTIME_SOURCES_REQUEST_INVALID';
+                return deny(400, code, { lease, hostSelection });
             }
             return {
                 matched: true,
                 ok: true,
                 kind: 'private-operation',
-                operation: 'runtime-sources',
+                operation: pathname === '/api/edge/agent-images' ? 'agent-images' : 'runtime-sources',
                 listener,
                 host,
                 hostSelection,

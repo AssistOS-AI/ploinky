@@ -958,6 +958,10 @@ async function processPrivateRequest(req, res) {
         });
         return;
     }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'agent-images') {
+        await sendAgentImages(res, { plan: routePlan, body, audit: (event, value) => appendLog(event, value) });
+        return;
+    }
     if (routePlan.kind === 'private-operation' && routePlan.operation === 'workspace-metrics') {
         if (!commitRoutePlan(routePlan)) {
             sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store', ...refusalHeaders('route', 'edge-generation-changed') });
@@ -1328,3 +1332,4 @@ import { privateForwardTrustedHeadersFactory } from './executionProvider/coordin
 import { handleTaskReferenceRequest } from './executionProvider/taskReferenceRoutes.mjs';
 import { sendSourceProtection } from './privateRouter.js';
 import { sendRuntimeSources } from './runtimeSources.mjs';
+import { sendAgentImages } from './agentImages.mjs';

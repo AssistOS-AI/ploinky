@@ -27,6 +27,7 @@ const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
 const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;
 const RUNTIME_ORIGINS_PATH = '/api/edge/runtime-origins';
 const RUNTIME_SOURCES_PATH = '/api/edge/runtime-sources';
+const AGENT_IMAGES_PATH = '/api/edge/agent-images';
 const RUNTIME_ORIGINS_SCHEMA_VERSION = 1;
 const ACTIVATION_ID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 // One replay quota per enabled agent, so an agent that exhausts its own quota
@@ -157,14 +158,14 @@ function callerAclForPlan(plan) {
                 paths: [RUNTIME_ORIGINS_PATH],
             };
         }
-        if (plan.operation === 'runtime-sources') {
+        if (plan.operation === 'runtime-sources' || plan.operation === 'agent-images') {
             // The folders active agents execute from: only the exact current
             // instances that declare an execution provider may read them.
             return {
                 operation: plan.operation,
                 callers: sourceProtectionHolderCallers(plan.snapshot),
                 methods: ['GET'],
-                paths: [RUNTIME_SOURCES_PATH],
+                paths: [plan.operation === 'agent-images' ? AGENT_IMAGES_PATH : RUNTIME_SOURCES_PATH],
             };
         }
         if (plan.operation === 'workspace-logs') {

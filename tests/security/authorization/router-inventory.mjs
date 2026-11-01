@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import { collectRouterSourceDrift, hasRouterSourceReference, normalizeRouterInventory, resolveRouterSourceReference } from './router-source-references.mjs';
 import { buildLiveSessionsRouterInventory } from './router-live-sessions-inventory.mjs';
+import { buildAgentImagesRouterInventory } from './router-agent-images-inventory.mjs';
 
 const access = {
   public: { anonymous: 'allow', selfRegistered: 'allow', user: 'allow', admin: 'allow' },
@@ -155,7 +156,8 @@ export const routerInventoryHistorical = Object.freeze(routerInventoryBaseline.m
 // overlay tests also reject this historical-only fallback.
 export const routerInventory = (() => {
   try {
-    return buildLiveSessionsRouterInventory(routerInventoryHistorical, readRouterSource('cli/server/handlers/webtty.js'));
+    const current = buildLiveSessionsRouterInventory(routerInventoryHistorical, readRouterSource('cli/server/handlers/webtty.js'));
+    return buildAgentImagesRouterInventory(current, readRouterSource('cli/server/edgeRoutePlan.js'));
   } catch {
     return routerInventoryHistorical;
   }
@@ -172,7 +174,8 @@ export function routerSourceDrift({ readSource = readRouterSource } = {}) {
   if (!drift.length) {
     try {
       const historical = routerInventoryBaseline.map(row => resolveRouterSourceReference(row, readSource(row.source.split(':')[0])));
-      buildLiveSessionsRouterInventory(historical, readSource('cli/server/handlers/webtty.js'));
+      const current = buildLiveSessionsRouterInventory(historical, readSource('cli/server/handlers/webtty.js'));
+      buildAgentImagesRouterInventory(current, readSource('cli/server/edgeRoutePlan.js'));
     } catch (error) {
       drift.push(`LIVE_SESSIONS_SOURCE_DRIFT: ${String(error?.message ?? error).split('\n')[0]}`);
     }
