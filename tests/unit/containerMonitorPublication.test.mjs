@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 // The monitor reads workspace locks and the edge selector even when runtime
 // launch/publication are mocked. Bind those real reads to an isolated workspace
@@ -11,6 +12,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-publica
 const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 const { performContainerRestart } = await import('../../cli/server/containerMonitor.js');
+const { prepareTargetedAgentRestart, commitTargetedAgentRestart } = await import('../../cli/commands/targetedAgentRestart.js');
+const { writeRuntimeCandidate, readRuntimeCandidate } = await import('../../cli/sandbox/runtimeCandidateStore.js');
 const {
     inactivateEdgeRoutingGeneration,
     readEdgeRoutingSelection,
@@ -764,6 +767,93 @@ test('monitor rejects a malformed ensure result instead of reporting healthy reu
         assert.equal(target.isRestarting, false);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('watchdog publication permits a same-tuple targeted restart and preserves foreign or unpublished receipts', async t => {
+    for (const scenario of ['published', 'wrong-container', 'wrong-operation', 'publication-failed']) {
+        await t.test(scenario, async () => {
+            const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-receipt-'));
+            t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+            const manifestPath = path.join(root, 'manifest.json');
+            fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'none' } }));
+            const record = { type: 'agent', repoName: 'repo', agentName: 'demo', runtime: 'podman',
+                instanceId: randomUUID(), enableGeneration: randomUUID(), containerId: 'b'.repeat(64) };
+            const result = preparedRestartResult({ hostPort: null, containerId: record.containerId,
+                registryRecord: record, stagedRegistryRecord: { ...record } });
+            const receipt = writeRuntimeCandidate({ containerName: result.containerName, containerId: record.containerId,
+                registryRecord: record, operationId: randomUUID(), runtime: 'podman', runtimeNetwork: { mode: 'default' } });
+            result.durableCandidate = { ...receipt,
+                ...(scenario === 'wrong-container' ? { containerId: 'c'.repeat(64) } : {}),
+                ...(scenario === 'wrong-operation' ? { operationId: randomUUID() } : {}) };
+            let agents = { [result.containerName]: structuredClone(record) };
+            let routing = { routes: {} };
+            let sequence = 0;
+            let cleanupCalls = 0;
+            const events = [];
+            const loadAgents = () => structuredClone(agents);
+            const saveAgents = value => { agents = structuredClone(value); };
+            const mergeRouting = async mutator => {
+                routing = await mutator(structuredClone(routing));
+                sequence += 1;
+            };
+            const monitor = {
+                readEdgeRoutingSelection: inactiveEdgeSelection, config: {}, targets: new Map(),
+                isShuttingDown: () => false,
+                createWorkspaceMutationLease: () => ({ token: 'workspace' }), releaseWorkspaceMutationLease() {},
+                resolveRouterEndpoint: () => ({ mode: 'default', host: 'host.containers.internal', port: 8080,
+                    url: 'http://host.containers.internal:8080' }),
+                ensureAgentService: () => result, loadAgents, saveAgents, mergeRoutingConfig: mergeRouting,
+                applyEdgeRoutingGeneration() {
+                    if (scenario === 'publication-failed') throw new Error('publication failed');
+                },
+                abortEdgeRoutingPreparation() {},
+                cleanupExactAgentRuntimeCandidate() { cleanupCalls += 1; },
+                log(_level, event) {
+                    events.push(event);
+                    if (event === 'container_restart_candidate_retirement_failed') throw new Error('logger failed');
+                },
+            };
+            const target = restartTarget(manifestPath);
+            monitor.targets.set(target.containerName, target);
+            const pending = performContainerRestart(monitor, target, 'not_running');
+            if (scenario === 'publication-failed') {
+                await assert.rejects(pending, /publication failed/);
+                assert.equal(readRuntimeCandidate(result.containerName, record).operationId, receipt.operationId);
+                assert.equal(events.includes('container_restart_candidate_retirement_failed'), false);
+                assert.equal(events.includes('container_restart_success'), false);
+                assert.equal(cleanupCalls, 1);
+                return;
+            }
+            await pending;
+            assert.equal(events.includes('container_restart_success'), true);
+            assert.equal(cleanupCalls, 0, 'receipt reporting must not clean the serving runtime');
+            assert.equal(agents[result.containerName].containerId, record.containerId);
+            if (scenario !== 'published') {
+                assert.equal(readRuntimeCandidate(result.containerName, record).operationId, receipt.operationId);
+                assert.equal(events.includes('container_restart_candidate_retirement_failed'), true);
+                assert.throws(() => writeRuntimeCandidate({ ...receipt, operationId: randomUUID() }), /different launch/);
+                return;
+            }
+            assert.equal(readRuntimeCandidate(result.containerName, record), null);
+            const loadActive = () => ({ selector: { state: 'active', generation: `generation-${sequence}`,
+                activationId: `activation-${sequence}`, selectorDigest: `digest-${sequence}` },
+            generation: { routing: structuredClone(routing), agents: loadAgents(), compiled: { hosts: {} } } });
+            const dependencies = { mergeRouting, loadActive, loadAgents, saveAgents,
+                withdrawRoute() { throw new Error('fixture uses coordinated inactive withdrawal'); },
+                reopenRoute() { throw new Error('fixture uses coordinated inactive publication'); },
+                retireEntriesAfterApply() {} };
+            const transition = await prepareTargetedAgentRestart({ containerName: result.containerName,
+                routeKey: 'demo', repoName: 'repo', shortAgentName: 'demo', record }, dependencies);
+            const successor = { ...record, containerId: 'd'.repeat(64) };
+            const nextReceipt = writeRuntimeCandidate({ ...receipt, containerId: successor.containerId,
+                predecessorContainerId: record.containerId, operationId: randomUUID(), registryRecord: successor });
+            await commitTargetedAgentRestart({ transition, result: { containerName: result.containerName,
+                containerId: successor.containerId, registryRecord: successor, durableCandidate: nextReceipt }, agentPath: root }, dependencies);
+            assert.equal(agents[result.containerName].containerId, successor.containerId);
+            assert.equal(routing.routes.demo.draining, undefined);
+            assert.equal(readRuntimeCandidate(result.containerName, successor), null);
+        });
     }
 });
 
