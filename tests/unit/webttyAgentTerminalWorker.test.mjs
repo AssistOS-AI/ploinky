@@ -1342,6 +1342,63 @@ test('ExecID selection tolerates unrelated removals but rejects concurrent addit
 
 const PROFILE = Object.freeze({ provider: 'provider', id: 'p-1', label: 'Profile One' });
 
+test('profile launcher is written only after inner capture, target revalidation and exec correlation', async () => {
+    let inspections = 0;
+    const h = harness({
+        captureInner: async () => {
+            assert.equal(h.ptyState.writes.length, 1, 'only the readiness probe precedes capture');
+            return INNER;
+        },
+        inspectTarget: () => {
+            inspections += 1;
+            assert.equal(h.ptyState.writes.length, inspections === 1 ? 0 : 1);
+            return { absent: false, running: true, id: CONTAINER_ID, initPid: 4299,
+                execIds: inspections === 1 ? [] : [EXEC_ID] };
+        },
+    });
+    await h.worker.initialize(init({ translatedHome: '/data/profiles/p-1/home', profile: PROFILE }));
+    await h.worker.launch();
+    assert.equal(h.ptyState.writes.length, 2);
+    assert.equal(h.ptyState.writes[1],
+        'if [ -x /etc/ploinky/webtty-profile-shell ]; then exec /etc/ploinky/webtty-profile-shell; fi\r');
+    const ready = h.processApi.sent.find(message => message.type === 'ready');
+    assert.equal(ready.recoveryEvidence.execId, EXEC_ID);
+    assert.deepEqual(ready.recoveryEvidence.innerProcess, INNER);
+});
+
+test('profile launcher condition preserves the shell when the fixed hook is not executable', async () => {
+    const h = harness();
+    await h.worker.initialize(init({ translatedHome: '/data/profiles/p-1/home', profile: PROFILE }));
+    await h.worker.launch();
+    assert.equal(h.ptyState.writes.length, 2);
+    const command = h.ptyState.writes[1].replace(/\r$/, '\n');
+    // Interpose the shell predicate without changing the host's /etc tree.
+    const absent = spawnSync('/bin/bash', ['-c',
+        `function [ { printf '%s\\n' "$*" >&2; return 1; }; ${command}printf 'plain-shell'`], { encoding: 'utf8' });
+    assert.equal(absent.status, 0, absent.stderr);
+    assert.equal(absent.stderr, '-x /etc/ploinky/webtty-profile-shell ]\n');
+    assert.equal(absent.stdout, 'plain-shell');
+
+    const plain = harness();
+    await plain.worker.initialize(init());
+    await plain.worker.launch();
+    assert.equal(plain.ptyState.writes.length, 1, 'unprofiled terminals receive only the readiness probe');
+});
+
+test('profile launcher is never written after stale target or ambiguous exec correlation', async () => {
+    for (const after of [{ initPid: 9999, execIds: [EXEC_ID] }, { initPid: 4299, execIds: [] }]) {
+        let inspections = 0;
+        const h = harness({
+            inspectTarget: () => ({ absent: false, running: true, id: CONTAINER_ID,
+                ...(++inspections === 1 ? { initPid: 4299, execIds: [] } : after) }),
+        });
+        await h.worker.initialize(init({ translatedHome: '/data/profiles/p-1/home', profile: PROFILE }));
+        await assert.rejects(h.worker.spawnAttempt('/bin/bash'));
+        assert.equal(h.ptyState.writes.length, 1, 'only the readiness probe was written');
+        assert.equal(h.processApi.sent.some(message => message.type === 'ready'), false);
+    }
+});
+
 test('a profile adds exactly HOME, INPUTRC and three profile variables to the exec, and nothing without one', () => {
     const plain = fixedAgentPodmanArgv(init());
     const profiled = fixedAgentPodmanArgv(init({ translatedHome: '/data/profiles/p-1/home', profile: PROFILE }));

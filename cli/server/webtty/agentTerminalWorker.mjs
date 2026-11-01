@@ -776,6 +776,9 @@ export class AgentTerminalWorker {
             throw podmanRuntimeError('target-stale');
         }
         this.execId = selectExactNewExecId(this.baselineExecIds, after.execIds);
+        if (this.spec.profile) {
+            this.pty.write('if [ -x /etc/ploinky/webtty-profile-shell ]; then exec /etc/ploinky/webtty-profile-shell; fi\r');
+        }
         return match;
     }
 
