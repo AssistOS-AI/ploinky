@@ -17,8 +17,8 @@ export function readManifestVolumeOptions(manifest) {
         : {};
 }
 
-export function resolveManifestVolumeHostPath(hostPath, workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
-    const resolved = assertManifestVolumeStoragePolicy(hostPath, { workspaceRoot });
+export function resolveManifestVolumeHostPath(hostPath, workspaceRoot = PLOINKY_WORKSPACE_ROOT, { agentName } = {}) {
+    const resolved = assertManifestVolumeStoragePolicy(hostPath, { workspaceRoot, agentName });
     if (isInsideBox() && !isManagedManifestVolumeSource(String(hostPath), { workspaceRoot })) {
         const error = new Error(`manifest volume source '${hostPath}' is outside the managed Ploinky workspace`);
         error.code = 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED';
@@ -34,12 +34,13 @@ export function resolveManifestVolumeHostPath(hostPath, workspaceRoot = PLOINKY_
 
 export function ensureManifestVolumeHostPath(resolvedHostPath, _containerPath, options = {}, {
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+    agentName,
 } = {}) {
     if (!resolvedHostPath) return;
     const dataRoot = path.join(path.resolve(workspaceRoot), '.data');
     const dataBacked = isPathWithin(resolvedHostPath, dataRoot);
     const revalidate = () => {
-        assertManifestVolumeStoragePolicy(resolvedHostPath, { workspaceRoot });
+        assertManifestVolumeStoragePolicy(resolvedHostPath, { workspaceRoot, agentName });
         if (dataBacked) assertCanonicalAgentDataPath(resolvedHostPath, { workspaceRoot });
     };
     const ensureDirectory = (directory) => {
@@ -120,7 +121,7 @@ export function normalizeManifestVolumeHostPaths(volumes, options = {}) {
     const workspaceRoot = options.workspaceRoot || PLOINKY_WORKSPACE_ROOT;
     const paths = [];
     for (const hostPath of Object.keys(volumes)) {
-        const resolvedHostPath = resolveManifestVolumeHostPath(hostPath, workspaceRoot);
+        const resolvedHostPath = resolveManifestVolumeHostPath(hostPath, workspaceRoot, options);
         paths.push(resolvedHostPath);
     }
     return Array.from(new Set(paths));
@@ -128,6 +129,7 @@ export function normalizeManifestVolumeHostPaths(volumes, options = {}) {
 
 export function assertManifestStorageAdmission(manifest, profileConfig = null, {
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+    agentName,
 } = {}) {
     const rootVolumes = manifest?.volumes && typeof manifest.volumes === 'object'
         ? manifest.volumes
@@ -136,7 +138,7 @@ export function assertManifestStorageAdmission(manifest, profileConfig = null, {
         ? profileConfig.volumes
         : {};
     for (const source of [...Object.keys(rootVolumes), ...Object.keys(profileVolumes)]) {
-        resolveManifestVolumeHostPath(source, workspaceRoot);
+        resolveManifestVolumeHostPath(source, workspaceRoot, { agentName });
     }
     return true;
 }

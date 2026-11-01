@@ -343,7 +343,7 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         profileName: info.profile || undefined,
         path: `manifest(${info.repoName}/${info.agentName})`,
     });
-    assertManifestStorageAdmission(manifest, profileResolution.profileConfig);
+    assertManifestStorageAdmission(manifest, profileResolution.profileConfig, { agentName: info.agentName });
     const runtimeKind = info.runtime === 'bwrap' || info.runtime === 'seatbelt'
         ? info.runtime
         : 'container';

@@ -291,6 +291,7 @@ function canonicalProtectedPath(root) {
 
 export function assertManifestVolumeStoragePolicy(source, {
     workspaceRoot,
+    agentName,
 } = {}) {
     const root = resolvePolicyWorkspaceRoot(workspaceRoot);
     const resolvedSource = path.isAbsolute(String(source))
@@ -312,6 +313,15 @@ export function assertManifestVolumeStoragePolicy(source, {
         path.join(root, '.ploinky'),
     ];
     const canonicalSource = projectedCanonicalPath(resolvedSource);
+    const privateRoot = path.join(root, '.data', '.private');
+    if (isPathWithin(resolvedSource, privateRoot)
+        || isPathWithin(canonicalSource, projectedCanonicalPath(privateRoot))) {
+        const ownRoot = agentName ? path.join(privateRoot, validateAgentDataKey(agentName)) : null;
+        if (!ownRoot || resolvedSource !== ownRoot || canonicalSource !== projectedCanonicalPath(ownRoot)) {
+            throw policyError(`manifest volume source '${source}' is not the agent's exact private data directory`);
+        }
+        assertCanonicalAgentDataPath(ownRoot, { workspaceRoot: root });
+    }
     for (const protectedRoot of protectedRoots) {
         const canonicalProtected = canonicalProtectedPath(protectedRoot);
         if (isPathWithin(resolvedSource, protectedRoot)

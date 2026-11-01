@@ -9,6 +9,9 @@ import {
     AGENT_DATA_POLICY_CODE,
     isPathWithin,
     projectedCanonicalPath,
+    assertCanonicalAgentDataPath,
+    ensureAgentDataDirectory,
+    validateAgentDataKey,
 } from './agentDataPathPolicy.js';
 
 function guardError(message, context = {}) {
@@ -32,12 +35,31 @@ function guardError(message, context = {}) {
 // mask is always there, so an absent or symlinked directory is a guard error,
 // never a reason to pin the workspace read-only or to skip the mask.
 export const HOST_STATE_GUARD_KEY = 'host';
+export const PRIVATE_DATA_GUARD_KEY = 'private';
+
+export function ensurePrivateDataRoot(workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
+    return ensureAgentDataDirectory(path.join(workspaceRoot, '.data', '.private'), { workspaceRoot, mode: 0o700 });
+}
+
+function canonicalPrivateDataRoot(hostPath, workspaceRoot) {
+    assertCanonicalAgentDataPath(hostPath, { workspaceRoot });
+    let stat;
+    try { stat = fs.lstatSync(hostPath); } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+        throw guardError(`the private data directory '${hostPath}' is missing`);
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw guardError(`the private data directory '${hostPath}' must be a real directory`);
+    }
+    return projectedCanonicalPath(hostPath);
+}
 
 export function protectedControllerStateRoots(workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
     const root = path.resolve(workspaceRoot);
     return Object.freeze([
         Object.freeze({ key: 'data', hostPath: path.join(root, '.ploinky', 'data') }),
         Object.freeze({ key: HOST_STATE_GUARD_KEY, hostPath: path.join(root, HOST_STATE_DIRECTORY_NAME) }),
+        Object.freeze({ key: PRIVATE_DATA_GUARD_KEY, hostPath: path.join(root, '.data', '.private') }),
     ]);
 }
 
@@ -101,13 +123,13 @@ export function ensureControllerGuardSources({
     return sources;
 }
 
-// The host state skeleton is never removed by code: a masked Box keeps it as a
-// mountpoint. Only the controller data root can be a runtime-created mountpoint.
+// The host and private state skeletons persist. Only the controller data root
+// can be a runtime-created mountpoint.
 export function prepareControllerGuardMountpointCleanup({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
     const missingRoots = protectedControllerStateRoots(workspaceRoot)
-        .filter(({ key, hostPath }) => key !== HOST_STATE_GUARD_KEY && !fs.existsSync(hostPath));
+        .filter(({ key, hostPath }) => key !== HOST_STATE_GUARD_KEY && key !== PRIVATE_DATA_GUARD_KEY && !fs.existsSync(hostPath));
     return () => {
         for (const { hostPath } of missingRoots) {
             let stat;
@@ -172,6 +194,7 @@ function protectedRootSymlinks(target) {
 
 export function controllerGuardTargets(bindings, {
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+    agentName,
 } = {}) {
     const targets = new Map();
     const frameworkRoot = projectedCanonicalPath(path.join(workspaceRoot, '.ploinky'));
@@ -184,13 +207,18 @@ export function controllerGuardTargets(bindings, {
         const canonicalSource = projectedCanonicalPath(source);
         for (const protectedRoot of protectedControllerStateRoots(workspaceRoot)) {
             const hostState = protectedRoot.key === HOST_STATE_GUARD_KEY;
-            const canonicalProtectedRoot = hostState
-                ? path.join(projectedCanonicalPath(path.dirname(protectedRoot.hostPath)), path.basename(protectedRoot.hostPath))
-                : projectedCanonicalPath(protectedRoot.hostPath);
+            const privateData = protectedRoot.key === PRIVATE_DATA_GUARD_KEY;
+            let canonicalProtectedRoot;
+            if (privateData) canonicalProtectedRoot = canonicalPrivateDataRoot(protectedRoot.hostPath, workspaceRoot);
+            else if (hostState) {
+                canonicalProtectedRoot = path.join(
+                    projectedCanonicalPath(path.dirname(protectedRoot.hostPath)), path.basename(protectedRoot.hostPath),
+                );
+            } else canonicalProtectedRoot = projectedCanonicalPath(protectedRoot.hostPath);
             // Workspace and controller aliases are allowed. Inspect indirection
             // introduced below the canonical controller root instead. The host
             // state directory takes no indirection at all (checked below).
-            for (const symlink of hostState ? [] : protectedRootSymlinks(path.join(frameworkRoot, protectedRoot.key))) {
+            for (const symlink of hostState || privateData ? [] : protectedRootSymlinks(path.join(frameworkRoot, protectedRoot.key))) {
                 const parent = projectedCanonicalPath(path.dirname(symlink));
                 if (binding.readOnly !== true && !isPathWithin(parent, frameworkRoot)
                     && isPathWithin(parent, canonicalSource)) {
@@ -203,6 +231,11 @@ export function controllerGuardTargets(bindings, {
                 canonicalHostStateRoot(protectedRoot.hostPath);
             }
             if (isPathWithin(canonicalSource, canonicalProtectedRoot)) {
+                if (privateData && agentName
+                    && source === path.join(protectedRoot.hostPath, validateAgentDataKey(agentName))) {
+                    assertCanonicalAgentDataPath(source, { workspaceRoot });
+                    continue;
+                }
                 throw guardError(
                     `runtime bind source '${source}' is inside protected controller state`,
                     { source, canonicalSource, protectedRoot: protectedRoot.hostPath, destination },
@@ -329,6 +362,8 @@ export function controllerGuardMounts(targets, options = {}) {
         // absent (which would pin the whole workspace read-only).
         const exists = guard.key === HOST_STATE_GUARD_KEY
             ? Boolean(canonicalHostStateRoot(guard.protectedHostPath))
+            : guard.key === PRIVATE_DATA_GUARD_KEY
+                ? Boolean(canonicalPrivateDataRoot(guard.protectedHostPath, options.workspaceRoot || PLOINKY_WORKSPACE_ROOT))
             : fs.existsSync(guard.protectedHostPath);
         if (guard.parentTarget) {
             for (const binding of bindings) {

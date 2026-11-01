@@ -495,7 +495,7 @@ function assertIsolatedProjectIsOwnHome({ cwd, cwdMountTarget, agentHomeDir, wor
  * The writable binds bwrap compiles, in the order it emits them, so any alias of
  * the selected achillesAgentLib source can be shadowed read-only afterwards.
  */
-function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, agentHomeDir, sharedDir, volumes, volumeOptions }) {
+function writableBwrapBinds({ agentName, agentCodePath, codeReadOnly, cwd, cwdMountTarget, agentHomeDir, sharedDir, volumes, volumeOptions }) {
     const binds = [];
     if (!codeReadOnly && agentCodePath) binds.push({ hostPath: agentCodePath, runtimePath: '/code' });
     if (sharedDir) binds.push({ hostPath: sharedDir, runtimePath: '/shared' });
@@ -508,13 +508,13 @@ function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, 
         for (const [hostPath, containerPath] of Object.entries(volumes)) {
             const mountOptions = (volumeOptions || {})[containerPath] || {};
             if (mountOptions.readOnly === true) continue;
-            binds.push({ hostPath: resolveManifestVolumeHostPath(hostPath), runtimePath: containerPath });
+            binds.push({ hostPath: resolveManifestVolumeHostPath(hostPath, PLOINKY_WORKSPACE_ROOT, { agentName }), runtimePath: containerPath });
         }
     }
     return binds;
 }
 
-function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
+function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT, agentName } = {}) {
     // The guards always mask `.ploinky-box`, so its skeleton exists before
     // they are planned; a launch that cannot create it fails here.
     ensureHostLaunchSkeleton(workspaceRoot);
@@ -530,8 +530,8 @@ function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_R
         });
         index += 2;
     }
-    const targets = controllerGuardTargets(bindings, { workspaceRoot });
-    const guards = controllerGuardMounts(targets, { workspaceRoot, bindings });
+    const targets = controllerGuardTargets(bindings, { workspaceRoot, agentName });
+    const guards = controllerGuardMounts(targets, { workspaceRoot, bindings, agentName });
     if (!guards.length) return targets;
     for (const guard of guards) {
         if (guard.replaceExisting) {
@@ -574,6 +574,7 @@ function mergeBwrapManifestVolumes(manifest, profileConfig) {
 
 function buildBwrapArgs(options) {
     const {
+        agentName,
         agentCodePath,
         agentLibPath,
         nodeModulesDir,
@@ -715,11 +716,11 @@ function buildBwrapArgs(options) {
     if (volumes && typeof volumes === 'object') {
         const volumeOptions = options.volumeOptions || {};
         for (const [hostPath, containerPath] of Object.entries(volumes)) {
-            const resolvedHostPath = resolveManifestVolumeHostPath(hostPath);
+            const resolvedHostPath = resolveManifestVolumeHostPath(hostPath, PLOINKY_WORKSPACE_ROOT, { agentName });
             const mountOptions = volumeOptions[containerPath]
                 || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
                 || {};
-            ensureManifestVolumeHostPath(resolvedHostPath, containerPath, mountOptions);
+            ensureManifestVolumeHostPath(resolvedHostPath, containerPath, mountOptions, { agentName });
             const codeRelPath = bwrapCodeVolumeRelativePath(containerPath);
             // The mount point must match the source: a file volume needs a file.
             if (codeRelPath && codeReadOnly) {
@@ -749,6 +750,7 @@ function buildBwrapArgs(options) {
     // Applied after every writable bind: a workspace or project mount that also
     // exposes the selected source would otherwise leave the same inode writable.
     for (const shadow of agentLibAliasShadows(grant, writableBwrapBinds({
+        agentName,
         agentCodePath,
         codeReadOnly,
         cwd,
@@ -762,7 +764,7 @@ function buildBwrapArgs(options) {
     }
 
     // Apply the old-root opacity boundary after every ordinary bind.
-    appendControllerStateGuards(args, { workspaceRoot: options.workspaceRoot });
+    appendControllerStateGuards(args, { workspaceRoot: options.workspaceRoot, agentName });
 
     // Process isolation — do NOT unshare network (agents need host network)
     // NOTE: --die-with-parent is intentionally omitted. Agent processes must survive
@@ -1071,6 +1073,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     // Build bwrap arguments
     const manifestStorage = mergeBwrapManifestVolumes(manifest, profileConfig);
     const bwrapArgs = buildBwrapArgs({
+        agentName,
         agentCodePath,
         agentLibPath,
         nodeModulesDir,
@@ -1518,6 +1521,7 @@ async function attachBwrapInteractive(agentName, manifest, agentPath, workdir, e
     // Build bwrap args (same mounts as the running agent)
     const manifestStorage = mergeBwrapManifestVolumes(manifest, profileConfig);
     const bwrapArgs = buildBwrapArgs({
+        agentName,
         agentCodePath,
         agentLibPath,
         nodeModulesDir,

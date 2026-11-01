@@ -8,6 +8,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { createMutationLockManager } from '../../ploinky-box/locks.mjs';
 import { heldHostLaunchExclusion, setHeldHostLaunchExclusion } from './hostLaunchExclusionState.js';
+import { ensurePrivateDataRoot } from '../utils/runtime/controllerStateGuards.js';
 
 // Host-runtime launches (bwrap, seatbelt, host Podman) and Box transactions
 // exclude each other through the workspace lock (D4). A Box transaction holds
@@ -37,14 +38,16 @@ function absoluteRoot(workspaceRoot) {
 /**
  * Creates the host state skeleton of the workspace before a host-runtime
  * launch, without any lock. A launch that cannot create it must fail. Inside a
- * Box it does nothing: the inherited read-only mask already covers it.
+ * Box the host state already has its inherited mask; private agent data still
+ * needs its real directory before runtime guard planning.
  */
 export function ensureHostLaunchSkeleton(workspaceRoot, {
     insideBox = isInsideBox,
     ensureSkeleton = ensureHostStateSkeleton,
 } = {}) {
-    if (insideBox()) return null;
     const root = absoluteRoot(workspaceRoot);
+    ensurePrivateDataRoot(root);
+    if (insideBox()) return null;
     try {
         return ensureSkeleton(root);
     } catch (error) {

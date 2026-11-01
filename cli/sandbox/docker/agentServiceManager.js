@@ -522,13 +522,13 @@ function getVolumeOptionsForContainerPath(volumeOptions, containerPath) {
         || {};
 }
 
-function collectManifestVolumeEntries(manifest, profileConfig = null) {
+function collectManifestVolumeEntries(manifest, profileConfig = null, agentName) {
     const volumes = mergeManifestVolumes(manifest, profileConfig);
     const volumeOptions = mergeManifestVolumeOptions(manifest, profileConfig);
     return Object.entries(volumes).map(([hostPath, containerPath]) => ({
         hostPath,
         containerPath,
-        resolvedHostPath: resolveManifestVolumeHostPath(hostPath),
+        resolvedHostPath: resolveManifestVolumeHostPath(hostPath, PLOINKY_WORKSPACE_ROOT, { agentName }),
         options: getVolumeOptionsForContainerPath(volumeOptions, containerPath),
     }));
 }
@@ -1079,6 +1079,7 @@ function appendExactManagedBindMount(args, value) {
 
 function appendControllerStateGuards(args, runtime, {
     workspaceRoot,
+    agentName,
     canonicalRuntimeWorkspaceGuards = isPloinkyBoxRuntime(),
 } = {}) {
     // The guards always mask `.ploinky-box`, so its skeleton exists before
@@ -1089,7 +1090,7 @@ function appendControllerStateGuards(args, runtime, {
         runtimePath: mount.destination,
         readOnly: !mount.rw,
     }));
-    const guardOptions = { workspaceRoot, bindings };
+    const guardOptions = { workspaceRoot, bindings, agentName };
     const targets = controllerGuardTargets(bindings, guardOptions);
     // Narrow repository grants can still cause the container engine to create
     // the canonical workspace parents. Guard those synthetic parents too so
@@ -1884,11 +1885,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const stageAgentLib = runtime === 'podman' || linkedRepositories.length > 0;
     const codeMountPoints = [];
     const manifestVolumeMounts = [];
-    for (const { resolvedHostPath, containerPath, options } of collectManifestVolumeEntries(manifest, profileConfig)) {
+    for (const { resolvedHostPath, containerPath, options } of collectManifestVolumeEntries(manifest, profileConfig, agentName)) {
         if (adoptManagedRuntimeOnly) {
             assertManagedAdoptionManifestVolume(resolvedHostPath, containerPath, options);
         } else {
-            ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options);
+            ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options, { agentName });
         }
         const codeRelPath = codeRelativeMountPath(containerPath);
         if (linkedRepositories.length && (containerPath === '/Agent' || containerPath === '/Agent/linked' || containerPath.startsWith('/Agent/linked/')
@@ -2077,7 +2078,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     args.splice(1, 0, ...networkLifecycle.agentIdentityLabelArgs(manifestNetwork, runtimeIdentity));
 
     for (const { resolvedHostPath, containerPath, options } of manifestVolumeMounts) {
-        ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options);
+        ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options, { agentName });
         const mountSuffix = manifestVolumeMountSuffix(runtime, resolvedHostPath, options);
         appendExactManagedBindMount(args, `${resolvedHostPath}:${containerPath}${mountSuffix}`);
     }
@@ -2125,7 +2126,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     // Apply controller-state guards after every broad, manifest, staged, and
     // resource bind so no later agent-controlled mount can expose old state.
-    appendControllerStateGuards(args, runtime);
+    appendControllerStateGuards(args, runtime, { agentName });
 
     const envStrings = [
         ...buildEnvFlags(manifest, profileConfig, { agentName, repoName, profileName: activeProfile, forRuntime: true }),
@@ -3736,7 +3737,7 @@ export function admitAgentServicePreflight(agentName, manifest, agentPath, optio
         persistedProfileName: preflightRecord.profile,
         path: `manifest(${preflightRepoName}/${agentName})`,
     });
-    assertManifestStorageAdmission(manifest, preflightProfile.profileConfig);
+    assertManifestStorageAdmission(manifest, preflightProfile.profileConfig, { agentName });
     // Reject manifest-declared capabilities before even selecting a backend.
     // A second admission below adds the read-only catalog selection.
     admitManifestRuntimeCapabilities(manifest, {
