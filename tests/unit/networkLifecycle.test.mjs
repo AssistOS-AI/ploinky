@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { readRuntimeCandidate, retireRuntimeCandidate, writeRuntimeCandidate } from '../../cli/sandbox/runtimeCandidateStore.js';
+import { readRuntimeCandidate, retireRuntimeCandidate, writeRuntimeCandidate, commitRuntimeCandidateCgroup } from '../../cli/sandbox/runtimeCandidateStore.js';
+import { reserveAgentCgroup } from '../../cli/sandbox/cgroupSubtree.mjs';
 
 import {
     NETWORK_LABELS,
@@ -1566,4 +1567,84 @@ test('network lifecycle capability is exact-path reentrant and invalid after out
         () => withNetworkLifecycleLock(() => {}, { lockPath, capability: captured }),
         { code: 'PLOINKY_NETWORK_LIFECYCLE_CAPABILITY_REQUIRED' },
     );
+});
+
+test('C2: actual managed replacement keeps cgroup receipts on leftover/unknown root after successful engine rm', (t) => {
+    for (const mode of ['busy', 'denied', 'uncommitted']) {
+        const harness = networkHarness(t);
+        const workspaceRoot = harness.identity.canonical;
+        const network = canonicalizeNetwork({ mode: 'default' });
+        const id = 'c'.repeat(64);
+        const nativePath = `/ploinky/agents/libpod-${id}`;
+        const root = path.join(harness.dir, 'fake-cgroup');
+        const native = `${root}${nativePath}`;
+        fs.mkdirSync(native, { recursive: true });
+        fs.writeFileSync(path.join(native, 'cgroup.procs'), '987\n');
+        const descriptor = { boxContext: { markerIdentity: 'exact-box-generation' }, cgroupDelegation: {
+            schemaVersion: 1, ready: true, parent: '/ploinky/agents', cgroupNamespace: 'cgroup:[100]',
+            pidNamespace: 'pid:[100]', controllers: ['cpu', 'memory', 'pids'], reason: null,
+        } };
+        const record = { type: 'agent', agentName: 'demo', repoName: 'repo', runtime: 'podman', containerId: id,
+            ...TEST_RUNTIME_IDENTITY, cgroupSubtree: reserveAgentCgroup(descriptor, id) };
+        let receipt = writeRuntimeCandidate({ operationId: randomUUID(), containerName: 'demo-container',
+            containerId: id, runtime: 'podman', runtimeNetwork: network, registryRecord: record }, { workspaceRoot });
+        if (mode !== 'uncommitted') {
+            const stat = fs.lstatSync(native);
+            receipt = commitRuntimeCandidateCgroup(receipt, { ...record.cgroupSubtree,
+                nativeRoot: { path: nativePath, dev: String(stat.dev), ino: String(stat.ino) } }, { workspaceRoot });
+        }
+        const fsApi = new Proxy(fs, { get(target, key) {
+            if (key === 'readlinkSync') return (name) => name.endsWith('/pid') ? 'pid:[100]' : 'cgroup:[100]';
+            if (key === 'statfsSync') return () => ({ type: 0x63677270 });
+            if (key === 'lstatSync') return (name) => {
+                if (mode === 'denied' && name === native) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+                return fs.lstatSync(name);
+            };
+            return target[key];
+        } });
+        const adapter = createNetworkLifecycleAdapter({ runtime: 'podman', run: harness.run, workspaceRoot,
+            lockPath: path.join(harness.dir, 'cgroup-removal.lock'), cgroupCleanupOptions: { fsApi, cgroupRoot: root } });
+        harness.containers.set(id, managedAgentRecord({ id, name: 'demo-container',
+            labels: managedAgentLabels(harness.identity, network), running: false }));
+        let creates = 0;
+        assert.throws(() => adapter.runManagedContainerTransaction({ network, canonicalAgentId: 'demo',
+            containerName: 'demo-container', runtimeIdentity: TEST_RUNTIME_IDENTITY,
+            createContainer: () => { creates += 1; } }), mode === 'denied' ? /denied/ : mode === 'busy' ? /busy/ : /unresolved/);
+        assert.equal(harness.containers.has(id), false, `${mode}: engine removal succeeded`);
+        assert.equal(creates, 0, `${mode}: no successor before root absence`);
+        assert.ok(readRuntimeCandidate('demo-container', record, { workspaceRoot }), `${mode}: durable receipt retained`);
+        assert.ok(fs.existsSync(native), `${mode}: no guessed/busy hierarchy deletion`);
+    }
+});
+
+test('C2: managed launch failure before start retains its durable uncommitted root reservation after engine removal', (t) => {
+    const harness = networkHarness(t), network = canonicalizeNetwork({ mode: 'default' });
+    const id = 'd'.repeat(64), workspaceRoot = harness.identity.canonical;
+    const record = { type: 'agent', agentName: 'demo', repoName: 'repo', runtime: 'podman', containerId: id,
+        ...TEST_RUNTIME_IDENTITY, cgroupSubtree: reserveAgentCgroup({ boxContext: { markerIdentity: 'exact-box' },
+            cgroupDelegation: { schemaVersion: 1, ready: true, parent: '/ploinky/agents',
+                cgroupNamespace: 'cgroup:[100]', pidNamespace: 'pid:[100]', controllers: ['cpu', 'memory', 'pids'] } }, id) };
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({ network, canonicalAgentId: 'demo',
+        containerName: 'demo-container', runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer(plan) {
+            const primary = plan.attachments[0];
+            const candidate = managedAgentRecord({ id, name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, id.slice(0, 12)] } } });
+            harness.containers.set(id, candidate);
+            harness.networks.get(primary.name).Containers[id] = { Name: candidate.Name };
+            return id;
+        },
+        onContainerCreated({ containerId }) {
+            writeRuntimeCandidate({ operationId: randomUUID(), containerName: 'demo-container', containerId,
+                runtime: 'podman', runtimeNetwork: network, registryRecord: record }, { workspaceRoot });
+        },
+        preStartLaunch() {
+            assert.equal(readRuntimeCandidate('demo-container', record, { workspaceRoot }).registryRecord.cgroupSubtree.nativeRoot, null);
+            throw new Error('launcher failed before native-root observation');
+        },
+    }), /unresolved/);
+    assert.equal(harness.calls.some((args) => args[0] === 'start'), false);
+    assert.equal(harness.containers.has(id), false);
+    assert.ok(readRuntimeCandidate('demo-container', record, { workspaceRoot }));
 });

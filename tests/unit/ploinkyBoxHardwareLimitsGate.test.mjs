@@ -87,7 +87,7 @@ function owned(identity, { running = true, id = 'a'.repeat(64), labels = {} } = 
 
 // A start supervisor whose every mutation is recorded. Reconciliation is the
 // first Box mutation, so "no mutation" means no reconcile/start event.
-function startSupervisor(state, { env = {}, events = [] } = {}) {
+function startSupervisor(state, { env = {}, events = [], preparation } = {}) {
     const ownership = owned(state.identity);
     const agentLib = agentLibFixture(state.identity.workspaceRoot);
     const supervisor = createBoxSupervisor({
@@ -111,10 +111,31 @@ function startSupervisor(state, { env = {}, events = [] } = {}) {
         revalidateAgentLibSource: () => {},
         commitAgentLibSelection: () => {},
         hardwareGateStore: state.gateStore,
+        ...(preparation ? { prepareHardwareGeneration: preparation } : {}),
         stderr: { write: (text) => events.push(`stderr:${text.trim()}`) },
     });
     return { supervisor, events };
 }
+
+test('C10/C11: gate-off cgroup declaration prepares the exact Box before graph work without policy storage', async (t) => {
+    const state = fixture(t);
+    const manifest = path.join(state.workspace, 'repo', 'nested', 'manifest.json');
+    fs.mkdirSync(path.dirname(manifest), { recursive: true });
+    fs.writeFileSync(manifest, JSON.stringify({ containerSecurity: { nestedPodman: true, cgroupSubtree: true } }));
+    const events = [];
+    const { supervisor } = startSupervisor(state, { events, env: { PLOINKY_BOX_HARDWARE_LIMITS: 'off' },
+        preparation: async ({ containerId, hardware }) => {
+            assert.equal(containerId, 'a'.repeat(64));
+            assert.equal(hardware == null, true);
+            events.push('prepare-delegation');
+            return { structurallyPrepared: true };
+        } });
+    await supervisor.runStartTransaction(['start', 'nested']);
+    assert.ok(events.indexOf('prepare-delegation') >= 0);
+    assert.ok(events.indexOf('prepare-delegation') < events.indexOf('start-core'));
+    assert.equal(state.gateStore.read(state.identity).enabled, false);
+    assert.equal(fs.existsSync(storePaths(state).storeRoot), false);
+});
 
 function storePaths(state) {
     return hardwareStorePaths({ identity: state.identity });

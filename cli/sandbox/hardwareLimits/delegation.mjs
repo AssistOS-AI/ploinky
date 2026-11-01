@@ -405,6 +405,17 @@ export function verifyLaunchedHardwareLimits({
         throw notObserved(`PID ${pid} is not visible (${error?.code || 'unreadable'})`);
     }
     if (!leaf) throw notObserved(`PID ${pid} has no unified cgroup entry`);
+    let nativeLeaf = leaf;
+    let initStart = null;
+    if (descriptor.cgroupDelegation) {
+        nativeLeaf = leaf.replace(/\/core$/, '');
+        if (!leaf.endsWith('/core') || !new RegExp(`^${placement.cgroupParent}/libpod-${containerId}(?:\\.scope)?$`).test(nativeLeaf)) {
+            throw refuse('the opted-in agent init is not in its exact native root/core');
+        }
+        const stat = read(fsApi, `${procRoot}/${pid}/stat`);
+        initStart = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+        if (!/^[1-9][0-9]*$/.test(initStart || '')) throw notObserved('invalid init process start identity');
+    }
     if (!leaf.startsWith(`${placement.cgroupParent}/`)) {
         throw refuse(`the applied limits disagree with the admitted ones (the agent runs in ${leaf}, not under ${placement.cgroupParent})`);
     }
@@ -424,7 +435,7 @@ export function verifyLaunchedHardwareLimits({
     if (agentNamespace === coreNamespace) {
         throw refuse('the applied limits disagree with the admitted ones (the agent shares the Box core cgroup namespace instead of a private namespace)');
     }
-    const readback = verifyLeafLimits({ fsApi, cgroupRoot, leaf, expected: placement.expected || {} });
+    const readback = verifyLeafLimits({ fsApi, cgroupRoot, leaf: nativeLeaf, expected: placement.expected || {} });
     if (!readback.ok && (!readback.leafPresent || readback.readFailures.length)) {
         // A failed leaf read can mean the process exited mid-readback: that is
         // the ordinary not-running failure, never a hardware refusal.
@@ -449,5 +460,10 @@ export function verifyLaunchedHardwareLimits({
         if (disappeared) throw notObserved(disappeared);
         throw refuse('the agent cgroup namespace changed during limits readback');
     }
-    return Object.freeze({ leaf, cgroupNamespace: agentNamespace, observed: readback.observed, verified: true });
+    if (initStart) {
+        const stat = read(fsApi, `${procRoot}/${pid}/stat`);
+        if (stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19] !== initStart) throw notObserved('init process identity changed');
+    }
+    return Object.freeze({ leaf: nativeLeaf, ...(initStart ? { processLeaf: leaf, initStart } : {}),
+        cgroupNamespace: agentNamespace, observed: readback.observed, verified: true });
 }

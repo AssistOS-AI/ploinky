@@ -5,6 +5,7 @@ import path from 'node:path';
 import { PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import { openVerifiedRegularFile, readVerifiedJsonObject } from '../utils/verifiedReadOnlyFile.js';
 import { canonicalizeNetwork } from './networkContract.js';
+import { normalizeAgentCgroupReservation, cleanupOwnedContainerCgroup } from './cgroupSubtree.mjs';
 
 const MAX_BYTES = 32 * 1024;
 const DESCRIPTOR_TARGET = '/run/ploinky/router-descriptor.json';
@@ -66,6 +67,7 @@ function normalize(candidate) {
             runtime: candidate.runtime,
             instanceId: record.instanceId,
             enableGeneration: record.enableGeneration,
+            ...(record.cgroupSubtree ? { cgroupSubtree: normalizeAgentCgroupReservation(record.cgroupSubtree, candidate.containerId) } : {}),
             config: { binds: descriptorBinds.map(bind => ({ source: bind.source, target: bind.target, ro: true, generatedRouterDescriptor: true })) },
         },
         preparationLease: lease ? Object.fromEntries(leaseFields.map(field => [field, lease[field]])) : null,
@@ -126,12 +128,16 @@ export function readRuntimeCandidate(containerName, record, { workspaceRoot = PL
 }
 
 // Call only after exact absence/removal, or publication of the complete record.
-export function retireRuntimeCandidate(candidate, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
+export function retireRuntimeCandidate(candidate, { workspaceRoot = PLOINKY_WORKSPACE_ROOT, cgroupCleanupOptions = {} } = {}) {
     const { root, name } = location(candidate.containerName, candidate.registryRecord, workspaceRoot);
     const stored = readRuntimeCandidate(candidate.containerName, candidate.registryRecord, { workspaceRoot });
     if (!stored) return false;
     if (stored.containerId !== candidate.containerId || stored.operationId !== candidate.operationId) {
         throw candidateError('changed before retirement');
+    }
+    if (stored.registryRecord.cgroupSubtree) {
+        cleanupOwnedContainerCgroup({ containerId: stored.containerId, record: stored.registryRecord,
+            ...cgroupCleanupOptions, workspaceRoot, removeEmpty: false });
     }
     const opened = openVerifiedRegularFile({ trustedRoot: root, relativeSegments: [name] });
     if (!opened) return false;
@@ -146,4 +152,52 @@ export function retireRuntimeCandidate(candidate, { workspaceRoot = PLOINKY_WORK
         fs.closeSync(opened.descriptor);
     }
     return true;
+}
+
+export function retireAbsentCgroupCandidates(containerId, { workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+    cgroupCleanupOptions = {} } = {}) {
+    const root = path.join(workspaceRoot, '.ploinky/run/runtime-candidates');
+    let names;
+    try { names = fs.readdirSync(root).sort(); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    if (names.length > 512) throw candidateError('cleanup lookup exceeds its bound');
+    for (const name of names) {
+        if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+        const value = readVerifiedJsonObject({ trustedRoot: root, relativeSegments: [name], byteLimit: MAX_BYTES });
+        if (value?.containerId === containerId && value.registryRecord?.cgroupSubtree) {
+            retireRuntimeCandidate(value, { workspaceRoot, cgroupCleanupOptions });
+        }
+    }
+}
+
+// One permitted transition: commit the exact observed native identity to the
+// reservation persisted before start. Callers hold the existing launch lock.
+export function commitRuntimeCandidateCgroup(candidate, reservation, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
+    const stored = readRuntimeCandidate(candidate.containerName, candidate.registryRecord, { workspaceRoot });
+    if (!stored || stored.containerId !== candidate.containerId || stored.operationId !== candidate.operationId
+        || !stored.registryRecord.cgroupSubtree) throw candidateError('cgroup reservation no longer belongs to this launch');
+    const previous = stored.registryRecord.cgroupSubtree;
+    const observed = normalizeAgentCgroupReservation(reservation, stored.containerId);
+    if (!observed.nativeRoot || JSON.stringify({ ...previous, nativeRoot: null }) !== JSON.stringify({ ...observed, nativeRoot: null })
+        || previous.nativeRoot && JSON.stringify(previous.nativeRoot) !== JSON.stringify(observed.nativeRoot)) {
+        throw candidateError('cgroup reservation changed its authority or committed root');
+    }
+    const updated = normalize({ ...stored, registryRecord: { ...stored.registryRecord, cgroupSubtree: observed } });
+    const { root, name, file } = location(candidate.containerName, candidate.registryRecord, workspaceRoot);
+    const opened = openVerifiedRegularFile({ trustedRoot: root, relativeSegments: [name] });
+    if (!opened) throw candidateError('disappeared before committing its cgroup identity');
+    const temporary = `${file}.${crypto.randomUUID()}.tmp`;
+    try {
+        if (fs.readFileSync(opened.descriptor, 'utf8') !== JSON.stringify(stored)) throw candidateError('changed during cgroup commit');
+        const fd = fs.openSync(temporary, 'wx', 0o600);
+        try { fs.writeFileSync(fd, JSON.stringify(updated)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        const stat = fs.lstatSync(file);
+        if (stat.dev !== opened.dev || stat.ino !== opened.ino) throw candidateError('identity changed during cgroup commit');
+        fs.renameSync(temporary, file);
+        const directory = fs.openSync(root, 'r');
+        try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    } finally {
+        fs.closeSync(opened.descriptor);
+        try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    return Object.freeze(updated);
 }

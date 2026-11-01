@@ -28,6 +28,7 @@ import {
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
 import { inspectExactContainer, removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
+import { hasCgroupDelegationFootprint } from '../sandbox/cgroupSubtree.mjs';
 import { inspectInterimAgentLifecycle, assertInterimLifecycleMutation,
   isLegacyAgentLifecycleRefusal, interimReceiptRegistryRecord } from '../sandbox/legacyAgentLifecycleGuard.mjs';
 import { observeSandboxRuntime, registeredRuntimeTuple } from '../sandbox/bwrap/bwrapFleet.js';
@@ -1404,6 +1405,13 @@ export function graphNodeRuntimeReplacementReason(plan, {
   // limits hash (empty without hardware placement) must match the runtime.
   const admitted = admitRuntimeImpl(node, profileResolution, { runtime, recordAlias: record.alias || '', key: existing.key });
   const admittedDescriptor = admitted?.descriptor || null;
+  // This permission is independent of envhash and of gate-off limitsHash.
+  // Plan its identity rotation before graph staging can skip service startup.
+  const cgroupRequested = node.manifest?.containerSecurity?.cgroupSubtree === true;
+  const cgroupPresent = hasCgroupDelegationFootprint(record, { Config: { Labels: {
+    'ploinky.cgroup-subtree': getContainerLabelImpl(existing.key, 'ploinky.cgroup-subtree'),
+  } } });
+  if (cgroupRequested !== cgroupPresent) return 'cgroupDelegationChanged';
   const limitsReason = admittedDescriptor
     ? limitsHashReuseReason(admittedDescriptor, getContainerLabelImpl(existing.key, LIMITS_HASH_LABEL))
     : null;

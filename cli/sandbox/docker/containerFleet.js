@@ -24,6 +24,8 @@ import {
 } from '../networkLifecycle.js';
 import { assertExactContainerOwnership, IMMUTABLE_CONTAINER_ID } from './containerOwnership.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
+import { cleanupOwnedContainerCgroup, assertCgroupCleanupEvidence } from '../cgroupSubtree.mjs';
+import { retireAbsentCgroupCandidates } from '../runtimeCandidateStore.js';
 import {
     buildGeneratedRouterDescriptorEnv,
     readVerifiedGeneratedRouterDescriptorFile,
@@ -234,6 +236,8 @@ function removeExactContainerAndDescriptorOnce(name, record, runtime, {
     recoverIncompleteIdentity = false,
     onRecoveredIdentity = null,
     assertBeforeMutation = null,
+    cgroupCleanup = cleanupOwnedContainerCgroup,
+    cgroupCleanupOptions = {},
 } = {}, progress) {
     let expectedId = String(record?.containerId || '').trim();
     const incompleteId = !IMMUTABLE_CONTAINER_ID.test(expectedId);
@@ -270,6 +274,10 @@ function removeExactContainerAndDescriptorOnce(name, record, runtime, {
         // and cannot replace a recorded immutable ID.
         let inspected = inspect(runtime, incompleteId ? name : expectedId);
         if (!inspected) {
+            if (remove && !incompleteId) {
+                cgroupCleanup({ containerId: expectedId, record, ...cgroupCleanupOptions });
+                retireAbsentCgroupCandidates(expectedId, { workspaceRoot: cgroupCleanupOptions.workspaceRoot, cgroupCleanupOptions });
+            }
             if (recoverIncompleteIdentity) {
                 if (!incompleteId && inspect(runtime, name)) {
                     throw new Error(`reinstall recovery for '${name}' found a different named container while its recorded immutable ID is absent`);
@@ -316,12 +324,17 @@ function removeExactContainerAndDescriptorOnce(name, record, runtime, {
             if (recoveredIdentity) assertRecoveryAgentIdentity(name, exactRecord, current);
             assertExactDescriptorMount(name, current, artifact);
             assertDescriptorUnchanged(name, artifact);
+            assertCgroupCleanupEvidence({ containerId: expectedId, record: exactRecord, inspected: current, ...cgroupCleanupOptions });
             return current;
         };
         // Pin/reinspect after discovery and before any signal. A replacement
         // observed between name lookup and ID lookup is never adopted.
         inspected = revalidate();
         if (!inspected) {
+            if (remove) {
+                cgroupCleanup({ containerId: expectedId, record: exactRecord, ...cgroupCleanupOptions });
+                retireAbsentCgroupCandidates(expectedId, { workspaceRoot: cgroupCleanupOptions.workspaceRoot, cgroupCleanupOptions });
+            }
             if (recoverIncompleteIdentity && !inspect(runtime, name)) {
                 return Object.freeze({ found: false, stopped: false, removed: false, state: 'absent' });
             }
@@ -377,6 +390,8 @@ function removeExactContainerAndDescriptorOnce(name, record, runtime, {
                     throw new Error(`descriptor cleanup for '${name}' could not prove exact container removal`);
                 }
             }
+            cgroupCleanup({ containerId: expectedId, record: exactRecord, ...cgroupCleanupOptions });
+            retireAbsentCgroupCandidates(expectedId, { workspaceRoot: cgroupCleanupOptions.workspaceRoot, cgroupCleanupOptions });
             if (artifact) {
                 assertDescriptorUnchanged(name, artifact);
                 fs.unlinkSync(artifact.source);

@@ -780,6 +780,27 @@ port with the host firewall or a trusted network. Bind does not change firewall
 rules, DNS, tunnels, or authentication settings, and it does not rewrite callback
 URLs registered with an SSO provider.
 
+## A cgroup subtree for a nested agent
+
+An agent that manages its own child workloads can request a private writable cgroup v2 hierarchy:
+
+```json
+{
+  "containerSecurity": {
+    "nestedPodman": true,
+    "cgroupSubtree": true
+  }
+}
+```
+
+Declare both booleans at the manifest root. Profiles and alternate capability fields cannot grant this permission. It requires in-Box Podman with verified crun/cgroupfs, delegated CPU, memory and PID controllers, and an image whose existing user is namespace root. Ploinky does not change the image user or add privileges for this request. The image must provide Node.js 22 or newer at `/usr/local/bin/node` or `/usr/bin/node`, `/bin/sh` and `/bin/mount`.
+
+Ploinky prepares the exact Box during supported host lifecycle operations when it sees a qualifying installed or linked manifest. This works with hardware limits off and does not enable their gate or initialize their policy store. A newly fetched repository or a hot-installed manifest may not have been visible during that host pass. Its first enable then fails closed with `PLOINKY_CGROUP_DELEGATION_UNAVAILABLE`: `cgroup delegation not prepared yet; run ploinky restart`. Run `ploinky restart` on the host, then retry the enable. A Box that is already prepared can start the agent normally.
+
+Before brokers, install hooks or agent code run, a fixed read-only helper verifies private PID and cgroup namespaces and prepares `/run/ploinky/cgroup`. `/sys/fs/cgroup` stays read-only. Startup processes run in `core`; the native root and `workloads` parent stay empty. Only the opted-in agent receives the runtime-owned `PLOINKY_CGROUP_SUBTREE=/run/ploinky/cgroup/workloads`. Configuration cannot replace that value. Child workload managers must enforce and verify their own child limits before releasing work.
+
+Ploinky records ownership before starting the container and retains it until the exact native hierarchy is proven absent. A failed removal can leave an unresolved cleanup receipt even after the engine container has disappeared. Ploinky refuses to guess a root path, move unrelated processes or delete a busy hierarchy to make that cleanup succeed.
+
 ## Hardware limits for agents
 
 Explorer administrators edit CPU cores, RAM percentage and eligible NVIDIA GPU

@@ -1,6 +1,7 @@
 import { buildHostSkillScope } from './skillScope.mjs';
 import { readGraphSkillScope, validateGraphSkillScope, writeGraphSkillScope } from './graphSkillScope.mjs';
 import os from 'node:os';
+import { declaredCgroupSubtreeAgents } from './cgroupSubtree.mjs';
 import path from 'node:path';
 import http from 'node:http';
 
@@ -395,6 +396,7 @@ export function createBoxSupervisor({
     // MPS tool discovery for gate-on GPU wiring; the GPU module's default.
     discoverGpuMpsTools = undefined,
     scanGpuAgents = declaredGpuAgents,
+    scanCgroupSubtreeAgents = declaredCgroupSubtreeAgents,
     countNoWaitWorkers = null,
     waitDelay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     now = () => Date.now(),
@@ -611,16 +613,20 @@ export function createBoxSupervisor({
     // not fatal to the core: limited agents are refused and unrelated agents
     // still start (plan §7.2).
     async function prepareGateOnGeneration(identity, engine, containerId, hardware) {
-        if (!hardware) return null;
+        const cgroupRequested = scanCgroupSubtreeAgents(identity.workspaceRoot).length > 0;
+        if (!hardware && !cgroupRequested) return null;
         try {
             const result = await prepareHardwareGeneration({ identity, engine, containerId, runner, hardware, stderr });
             if (result?.structurallyPrepared !== true) {
-                stderr?.write?.(`[ploinky] Hardware limits: this Box is not prepared (${result?.reason || 'unknown reason'}); `
-                    + 'agents requesting limits will be refused. Run `ploinky limits status`.\n');
+                stderr?.write?.(hardware
+                    ? `[ploinky] Hardware limits: this Box is not prepared (${result?.reason || 'unknown reason'}); agents requesting limits will be refused. Run \`ploinky limits status\`.\n`
+                    : `[ploinky] Cgroup delegation is not prepared (${result?.reason || 'unknown reason'}); fix the prerequisite, then run ploinky restart.\n`);
             }
             return result;
         } catch (error) {
-            stderr?.write?.(`[ploinky] Hardware limits: Box preparation failed (${error.message}); agents requesting limits will be refused.\n`);
+            stderr?.write?.(hardware
+                ? `[ploinky] Hardware limits: Box preparation failed (${error.message}); agents requesting limits will be refused.\n`
+                : `[ploinky] Cgroup delegation preparation failed (${error.message}); fix the prerequisite, then run ploinky restart.\n`);
             return Object.freeze({ structurallyPrepared: false, reason: error.message });
         }
     }

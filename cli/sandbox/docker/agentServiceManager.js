@@ -248,7 +248,10 @@ import {
     RUNTIME_CLEANUP_RECEIPT_VERSION,
 } from '../runtimeCleanupReceipt.js';
 
-import { readRuntimeCandidate, writeRuntimeCandidate, retireRuntimeCandidate } from '../runtimeCandidateStore.js';
+import { readRuntimeCandidate, writeRuntimeCandidate, retireRuntimeCandidate, commitRuntimeCandidateCgroup } from '../runtimeCandidateStore.js';
+import { CGROUP_ENTRYPOINT, CGROUP_HELPER_DIRECTORY, CGROUP_HELPER_SOURCE, CGROUP_SUBTREE_PATH,
+    reserveAgentCgroup, cgroupUnavailable } from '../cgroupSubtree.mjs';
+import { verifyCgroupContainerConfiguration, isNamespaceRootImageUser, cgroupDelegationReuseReason } from '../cgroupSubtree.mjs';
 import { readRuntimePredecessor, retireRuntimePredecessor } from '../runtimePredecessorStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1673,6 +1676,23 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         });
     }
     const hardwareLaunch = createHardwareLaunchGuard(runtimeAdmission, {
+        withCgroupExclusion: (callback) => withNetworkLifecycleLock(callback, { waitMs: 15 * 60 * 1000 }),
+        recordCgroup: (reservation) => {
+            if (!durableCandidate) {
+                durableCandidate = readRuntimeCandidate(containerName, launchRecord);
+                if (durableCandidate) createdRegistryRecord = { ...launchRecord, ...durableCandidate.registryRecord };
+            }
+            if (!durableCandidate) {
+                recordCreatedIdentity({ containerId: reservation.containerId, launch: generatedLaunch });
+            }
+            durableCandidate = commitRuntimeCandidateCgroup(durableCandidate, reservation);
+            createdRegistryRecord.cgroupSubtree = reservation;
+            if (options.preserveRegistryRecord !== true) {
+                const agents = loadAgentsMap();
+                agents[containerName] = { ...agents[containerName], cgroupSubtree: reservation };
+                saveAgentsMap(agents);
+            }
+        },
         key: hardwareInstanceKey,
         observationKey: containerName,
         mpsLaunch: options.mpsLaunch,
@@ -2050,6 +2070,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         agentHomeDir,
         agentLibGrant: containerAgentLibGrant,
     });
+    if (runtimeAdmission.descriptor.cgroupDelegation) {
+        args.push('-v', `${CGROUP_HELPER_SOURCE}:${CGROUP_HELPER_DIRECTORY}:ro`);
+    }
     const topologyMount = edgeTopologyMount();
     if (adoptManagedRuntimeOnly) {
         requireManagedAdoptionDirectory(topologyMount.source, 'edge topology directory');
@@ -2246,6 +2269,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // config can redirect the runtime, inject a master key, or override the
     // agent's derived secret.
     stripReservedAndRestoreRuntimeRouterEnvFlags(envStrings, {});
+    if (runtimeAdmission.descriptor.cgroupDelegation) envStrings.push(formatEnvFlag('PLOINKY_CGROUP_SUBTREE', CGROUP_SUBTREE_PATH));
     for (const [key, value] of Object.entries(PLOINKY_SKILL_SCOPE_ENV)) envStrings.push(formatEnvFlag(key, value));
     // Only non-secret principal fields exist before topology attestation.
     for (const [key, value] of Object.entries(buildAgentPrincipalEnv(
@@ -2282,8 +2306,17 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         const mainEntrypoint = manifestEntrypoint
             ? Object.freeze([manifestEntrypoint])
             : inspectImageEntrypoint(runtime, image);
-        args.push('--entrypoint', AGENT_CONTROL_ENTRYPOINT);
+        const cgroup = runtimeAdmission.descriptor.cgroupDelegation;
+        if (cgroup) {
+            const user = spawnSync(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', image],
+                { encoding: 'utf8', timeout: 5000, maxBuffer: 8192 });
+            if (user.error || user.status !== 0 || !isNamespaceRootImageUser(String(user.stdout || '').trim())) {
+                throw cgroupUnavailable('the existing image user must be namespace root');
+            }
+        }
+        args.push('--entrypoint', cgroup ? CGROUP_ENTRYPOINT : AGENT_CONTROL_ENTRYPOINT);
         args.push(image);
+        if (cgroup) args.push(cgroup.cgroupNamespace, cgroup.pidNamespace);
         const mainCommandIndex = args.length;
         if (useStartEntry) {
             const startArgs = splitCommandArgs(startCmd);
@@ -2465,6 +2498,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     };
 
     const inspectGeneratedRouterAdoption = ({ plan, record }) => {
+        const cgroupReason = cgroupDelegationReuseReason(runtimeAdmission.descriptor, launchRecord, record);
+        if (cgroupReason) return { adopted: false, reason: cgroupReason };
         const { generationLease, intent, attested } = prepareGeneratedRouterAttestation(plan);
         try {
             const descriptorMounts = (record?.Mounts || []).filter((mount) => (
@@ -2514,7 +2549,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 || String(record?.Image || '') !== String(attested.evidence.target.image || '')
                 || String(record?.Config?.User || '') !== String(attested.evidence.target.user || '')
                 || JSON.stringify(record?.Config?.Entrypoint || [])
-                    !== JSON.stringify([AGENT_CONTROL_ENTRYPOINT])
+                    !== JSON.stringify([runtimeAdmission.descriptor.cgroupDelegation ? CGROUP_ENTRYPOINT : AGENT_CONTROL_ENTRYPOINT])
                 || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
                     !== managedUserNamespaceFromAttestation(attested)
                 || String(record?.Config?.WorkingDir || '') !== containerWorkdir
@@ -2574,8 +2609,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         cleanup();
     };
 
-    const preStartGeneratedRouterLaunch = ({ launch }) => {
+    const preStartGeneratedRouterLaunch = ({ launch, record, containerId }) => {
         if (!launch) throw new Error('managed generated-local launch is missing before runtime start');
+        verifyCgroupContainerConfiguration({ descriptor: runtimeAdmission.descriptor, containerId, record });
         launch.generationLease.checkpoint('pre-runtime');
         prepareGuardMountpointCleanupBeforeStart();
     };
@@ -2596,7 +2632,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             || String(record?.Image || '') !== String(launch.attested.evidence.target.image || '')
             || String(record?.Config?.User || '') !== String(launch.attested.evidence.target.user || '')
             || JSON.stringify(record?.Config?.Entrypoint || [])
-                !== JSON.stringify([AGENT_CONTROL_ENTRYPOINT])
+                !== JSON.stringify([runtimeAdmission.descriptor.cgroupDelegation ? CGROUP_ENTRYPOINT : AGENT_CONTROL_ENTRYPOINT])
             || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
                 !== managedUserNamespaceFromAttestation(launch.attested)
             || String(record?.Config?.WorkingDir || '') !== containerWorkdir
@@ -2733,6 +2769,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         createdRegistryRecord = {
             ...launchRecord,
             type: 'agent', agentName, repoName, runtime, containerId,
+            ...(runtimeAdmission.descriptor.cgroupDelegation ? { cgroupSubtree: reserveAgentCgroup(runtimeAdmission.descriptor, containerId) } : {}),
             linkedRepositories: structuredClone(linkedRepositoryRecord),
             ...(options.alias ? { alias: options.alias } : {}),
             instanceId: runtimeIdentity.instanceId,
@@ -2748,6 +2785,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 }] : [],
             },
         };
+        // A replacement that no longer opts in must not inherit its
+        // predecessor's container-ID-bound cleanup authority.
+        if (!runtimeAdmission.descriptor.cgroupDelegation) delete createdRegistryRecord.cgroupSubtree;
         // Persist before start/install can fail. Prepared launches retain their
         // signed registry source and use this separate immutable recovery record.
         durableCandidate = {
@@ -2867,7 +2907,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         runtimeIdentity,
                         expectedContainerId: createdId,
                         onCreated: recordCreatedIdentity,
-                        beforeStart: prepareGuardMountpointCleanupBeforeStart,
+                        beforeStart: ({ containerId, record }) => {
+                            verifyCgroupContainerConfiguration({ descriptor: runtimeAdmission.descriptor, containerId, record });
+                            prepareGuardMountpointCleanupBeforeStart();
+                        },
                         afterStart: cleanupGuardMountpointsAfterStart,
                         commandPrefix: hardwareLaunch.commandPrefix(),
                     }) || '');
@@ -3049,6 +3092,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         // reports them without resolving anything again.
         linkedRepositories: structuredClone(linkedRepositoryRecord),
         containerImage: image,
+        ...(createdRegistryRecord?.cgroupSubtree ? { cgroupSubtree: createdRegistryRecord.cgroupSubtree } : {}),
         ...(manifestImage && manifestImage !== image ? { manifestImage } : {}),
         ...(llmStartup.enabled ? {
             llmRuntime: {
@@ -4501,6 +4545,24 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             canReuseExisting = false;
             recreateReason ||= 'runtimeStoppedAfterInspection';
         }
+        let inspectedRecords;
+        if (canReuseExisting) {
+            const inspection = spawnSync(runtime, ['inspect', reuseInspection.id], {
+                encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5_000,
+            });
+            try { inspectedRecords = JSON.parse(inspection.stdout || ''); } catch (_) {}
+            if (inspection.error || inspection.status !== 0 || !Array.isArray(inspectedRecords)
+                || inspectedRecords.length !== 1
+                || String(inspectedRecords[0]?.Id || inspectedRecords[0]?.ID || '') !== reuseInspection.id) {
+                throw new Error(`cannot verify exact runtime authority for '${containerName}'; preserving existing runtime`);
+            }
+            assertExistingAgent({ record: inspectedRecords[0], containerId: reuseInspection.id, containerName });
+            const cgroupReason = cgroupDelegationReuseReason(serviceAdmission.descriptor, existingRecord, inspectedRecords[0]);
+            if (cgroupReason) {
+                canReuseExisting = false;
+                recreateReason ||= cgroupReason;
+            }
+        }
         if (canReuseExisting && runtimeNetworkPlan.requiresManagedNetwork) {
             // Healthy managed reuse is a validation-only adoption against the
             // exact active generation. It must neither create a preparation
@@ -4520,16 +4582,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 cwdMountTarget: (launchRecord.runMode || 'isolated') === 'isolated' ? '/root' : desiredProject,
                 agentHomeDir: getAgentWorkDir(aliasOverride || agentName),
             });
-            const inspection = spawnSync(runtime, ['inspect', reuseInspection.id], {
-                encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5_000,
-            });
-            let inspectedRecords;
-            try { inspectedRecords = JSON.parse(inspection.stdout || ''); } catch (_) {}
-            if (inspection.error || inspection.status !== 0 || !Array.isArray(inspectedRecords)
-                || inspectedRecords.length !== 1
-                || String(inspectedRecords[0]?.Id || inspectedRecords[0]?.ID || '') !== reuseInspection.id) {
-                throw new Error(`cannot verify exact HOME layout for '${containerName}'; preserving existing runtime`);
-            }
             if (!hasExactAgentHomeLayout(inspectedRecords[0], desiredHomeLayout)) {
                 canReuseExisting = false;
                 recreateReason ||= 'agentHomeLayoutChanged';
@@ -4539,7 +4591,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 canReuseExisting = false;
                 recreateReason ||= 'dependencyMountDrifted';
             }
-            assertExistingAgent({ record: inspectedRecords[0], containerId: reuseInspection.id, containerName });
             if (!canReuseExisting) debugLog(`[ensureAgentService] ${agentName}: host/none reuse rejected (${recreateReason})`);
         }
         if (canReuseExisting) {
@@ -4837,6 +4888,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             : {}),
         containerImage: startedRecord.containerImage || image,
         ...(startedRecord.manifestImage ? { manifestImage: startedRecord.manifestImage } : {}),
+        ...(startedRecord.cgroupSubtree ? { cgroupSubtree: structuredClone(startedRecord.cgroupSubtree) } : {}),
         ...(startedRecord.llmRuntime ? { llmRuntime: startedRecord.llmRuntime } : {}),
         createdAt: launchRecord.createdAt || new Date().toISOString(),
         projectPath: projPath,
@@ -4872,7 +4924,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     if (!preserveRuntimeRegistryRecord) saveAgentsMap(agents);
 
     syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
-    if (!preserveRuntimeRegistryRecord && started?.durableCandidate) {
+    if (!preserveRuntimeRegistryRecord && started?.durableCandidate && !started.registryRecord?.cgroupSubtree) {
         retireRuntimeCandidate(started.durableCandidate);
     }
     const returnPort = runtimeNetworkPlan.mode === 'host'
@@ -5433,6 +5485,7 @@ export function isGenerationCapabilityRuntimeEffective({
         || !isRunning(owner.containerName)) {
         return false;
     }
+    if ((manifest.containerSecurity?.cgroupSubtree === true) !== Boolean(record.cgroupSubtree)) return false;
     const inspect = inspectContainerContract || createNetworkLifecycleAdapter({ runtime: getRuntime() })
         .inspectContainerContract;
     const inspection = inspect(owner.containerName, profileResolution.network, record.agentName, {

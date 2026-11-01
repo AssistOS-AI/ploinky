@@ -20,6 +20,7 @@ const imp = (relative) => import(new URL(relative, import.meta.url).href);
 const { ensureGraphNodesEnabled, graphNodeRuntimeReplacementReason } = await imp('../../cli/commands/workspaceUtil.js');
 const replacementLog = await imp('../../cli/sandbox/runtimeReplacementLog.js');
 const capabilities = await imp('../../cli/sandbox/runtimeCapabilities.js');
+const cgroups = await imp('../../cli/sandbox/cgroupSubtree.mjs');
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -53,6 +54,7 @@ function runGraph({ node = graphNode(), record = graphRecord(), replacement = {}
     const lines = [];
     const events = [];
     ensureGraphNodesEnabled({ nodes: new Map([[node.id, node]]) }, registry, {
+        inspectLegacy: () => ({ runtime: 'podman', runMode: record.runMode, containerId: record.containerId || '' }),
         logLine(line) { lines.push(line); events.push('line'); },
         ...(reason !== undefined ? { runtimeReplacementReason() { return reason; } } : {}),
         runtimeReplacementOptions: {
@@ -192,6 +194,9 @@ function service({ options = {}, labels = {}, hashes = { desired: FULL_B }, desc
     const admission = { descriptor, runtimeKind: 'container' };
     const noOp = () => {};
     const dependencies = {
+        inspectInterimAgentLifecycle: () => ({ runMode: 'isolated', containerId: id }),
+        assertLegacyAgentConfinement: noOp,
+        cgroupDelegationReuseReason: cgroups.cgroupDelegationReuseReason,
         admitAgentServicePreflight: () => ({ preflightRepoName: 'demo', preflightManifestPath: '/fixture/manifest.json', preflightManifestBytes: Buffer.from('{}'), preflightAgentRuntime: 'podman', preflightRuntimeKind: 'container', preflightAdmission: admission, hardwareInstanceKey: key }),
         normalizeTargetedRestart: () => null,
         readAppliedObservation: () => null,
@@ -307,3 +312,19 @@ test('RR.service-agentlib-change-prints-shortened-fingerprints', () => {
     f.run();
     assert.deepEqual(f.lines, [`[start] demo/worker: replacing its runtime (agentLibSelectionChanged: agentLib fingerprint changed (${'a'.repeat(12)} != ${'b'.repeat(12)}))`]);
 });
+
+for (const [oldPermission, nextPermission] of [[true, false], [true, undefined], [false, true], [false, undefined]]) {
+  test(`C1.graph-cgroup-${oldPermission}-to-${nextPermission}`, () => {
+    const node = graphNode({ manifest: { container: 'image', network: { mode: 'none' },
+      containerSecurity: { nestedPodman: true, ...(nextPermission === undefined ? {} : { cgroupSubtree: nextPermission }) } } });
+    const record = graphRecord({ ...(oldPermission ? { cgroupSubtree: { containerId: FULL_A } } : {}) });
+    const reason = graphNodeRuntimeReplacementReason({ node, existing: { key: 'worker_container', rec: record } }, {
+      containerExistsImpl: () => true, isContainerRunningImpl: () => true, getRuntimeForAgentImpl: () => 'podman',
+      getRuntimeImpl: () => 'podman', computeEnvHashImpl: () => FULL_B,
+      getContainerLabelImpl: (_key, label) => label === 'ploinky.cgroup-subtree' ? (oldPermission ? '1' : '') : FULL_B,
+      admitRuntimeImpl: () => null, isLlmRuntimeManifestImpl: () => false,
+      createNetworkLifecycleAdapterImpl: () => ({ inspectContainerContract: () => ({ state: 'exact' }) }),
+    });
+    assert.equal(reason, oldPermission !== (nextPermission === true) ? 'cgroupDelegationChanged' : '');
+  });
+}

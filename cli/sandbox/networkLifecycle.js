@@ -20,6 +20,8 @@ import {
 } from './networkIdentity.js';
 import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
 import { isLegacyAgentLifecycleRefusal } from './legacyAgentLifecycleGuard.mjs';
+import { cleanupOwnedContainerCgroup, assertCgroupCleanupEvidence } from './cgroupSubtree.mjs';
+import { retireAbsentCgroupCandidates } from './runtimeCandidateStore.js';
 
 export { NETWORK_LABELS, physicalNetworkName, workspaceNetworkIdentity } from './networkIdentity.js';
 
@@ -604,8 +606,14 @@ export function createNetworkLifecycleAdapter({
     inspectRunningHosts,
     runtimeProofRetryDelaysMs = PODMAN_RUNTIME_PROOF_RETRY_DELAYS_MS,
     waitForRuntimeProofRetry = waitSynchronously,
+    cgroupCleanup = cleanupOwnedContainerCgroup,
+    cgroupCleanupOptions = {},
 } = {}) {
     if (!runtime) throw new Error('network lifecycle requires a container runtime');
+    const completeCgroupRemoval = (containerId) => {
+        cgroupCleanup({ containerId, workspaceRoot, ...cgroupCleanupOptions });
+        retireAbsentCgroupCandidates(containerId, { workspaceRoot, cgroupCleanupOptions });
+    };
     if (!Array.isArray(runtimeProofRetryDelaysMs)
         || runtimeProofRetryDelaysMs.some((delayMs) => !Number.isFinite(Number(delayMs)) || Number(delayMs) < 0)) {
         throw new Error('network lifecycle runtime proof retry delays must be non-negative finite numbers');
@@ -1050,7 +1058,9 @@ export function createNetworkLifecycleAdapter({
                 if (current
                     && String(current?.Id || current?.ID || '') === ownedContainerId
                     && hasRequiredLabels(labelsOf(current), exactLabels)) {
+                    assertCgroupCleanupEvidence({ containerId: ownedContainerId, inspected: current, workspaceRoot, ...cgroupCleanupOptions });
                     execute(['rm', '-f', ownedContainerId]);
+                    if (!inspectContainer(ownedContainerId)) completeCgroupRemoval(ownedContainerId);
                 }
             }
             throw error;
@@ -1182,11 +1192,14 @@ export function createNetworkLifecycleAdapter({
                     }
                     assertRequiredLabels(containerName, labelsOf(beforeRemoval), ownershipLabels);
                     assertExistingAgent?.({ record: beforeRemoval, containerId: previousId, containerName });
+                    assertCgroupCleanupEvidence({ containerId: previousId, inspected: beforeRemoval, workspaceRoot, ...cgroupCleanupOptions });
                     beforeDestructiveWork?.({ kind: 'remove', containerName, containerId: previousId });
                     const removed = execute(['rm', '-f', previousId]);
                     if (!removed.ok && !missing(removed)) {
                         throw new Error(`cannot remove predecessor '${containerName}' for managed replacement: ${failure(removed)}`);
                     }
+                    if (inspectContainer(previousId)) throw new Error('managed predecessor absence was not proven');
+                    completeCgroupRemoval(previousId);
                     if (previousDescriptor) {
                         if (!removed.ok || inspectContainer(previousId)) {
                             throw new Error(`cannot prove exact predecessor '${containerName}' removal for descriptor cleanup`);
@@ -1251,6 +1264,7 @@ export function createNetworkLifecycleAdapter({
                     error.message += `; failure cleanup could not inspect candidate '${containerName}': ${inspectError.message}`;
                 }
                 if (candidateCreationAttempted && candidateInspectionComplete && !candidate) {
+                    if (candidateId) completeCgroupRemoval(candidateId);
                     launchArtifactCleanupSafe = true;
                 } else if (candidateCreationAttempted
                     && candidate
@@ -1262,13 +1276,17 @@ export function createNetworkLifecycleAdapter({
                         error.message += `; failure cleanup preserved candidate '${containerName}' because its immutable ID was unavailable`;
                     } else {
                         candidateId = inspectedId;
+                        assertCgroupCleanupEvidence({ containerId: candidateId, inspected: candidate, workspaceRoot, ...cgroupCleanupOptions });
                         const removed = execute(['rm', '-f', candidateId]);
                         if (!removed.ok && !missing(removed)) {
                             error.message += `; failure cleanup could not remove candidate '${containerName}': ${failure(removed)}`;
                         } else {
                             try {
                                 const remaining = inspectContainer(candidateId);
-                                if (!remaining) launchArtifactCleanupSafe = true;
+                                if (!remaining) {
+                                    completeCgroupRemoval(candidateId);
+                                    launchArtifactCleanupSafe = true;
+                                }
                                 else error.message += `; failure cleanup preserved candidate '${containerName}' because immutable-ID absence was not proven`;
                             } catch (inspectError) {
                                 error.message += `; failure cleanup could not prove immutable-ID absence for '${containerName}': ${inspectError.message}`;
@@ -1576,6 +1594,7 @@ export function createNetworkLifecycleAdapter({
             requireRuntimeIdentity: true,
         });
         if (inspection.state === 'absent') {
+            completeCgroupRemoval(exactContainerId);
             return { removed: false, state: 'absent', id: exactContainerId };
         }
         if (inspection.state !== 'exact' || inspection.id !== exactContainerId) {
@@ -1592,11 +1611,14 @@ export function createNetworkLifecycleAdapter({
         }
         assertRequiredLabels(containerName, labelsOf(exactRecord), expectedAgentLabels(identity.hash, contractHash, { instanceId, enableGeneration }));
         assertExistingAgent?.({ record: exactRecord, containerId: exactContainerId, containerName });
+        assertCgroupCleanupEvidence({ containerId: exactContainerId, inspected: exactRecord, workspaceRoot, ...cgroupCleanupOptions });
         const descriptorArtifact = captureGeneratedRouterDescriptorArtifact(exactRecord);
         const removed = execute(['rm', '-f', exactContainerId]);
         if (!removed.ok && !missing(removed)) {
             throw new Error(`cannot remove exact failed candidate '${containerName}' (${exactContainerId}): ${failure(removed)}`);
         }
+        if (inspectContainer(exactContainerId)) throw new Error('exact candidate absence was not proven');
+        completeCgroupRemoval(exactContainerId);
         if (descriptorArtifact) {
             if (!removed.ok || inspectContainer(exactContainerId)) {
                 throw new Error(`cannot prove exact failed candidate '${containerName}' removal for descriptor cleanup`);

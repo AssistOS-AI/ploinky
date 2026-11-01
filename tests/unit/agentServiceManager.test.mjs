@@ -302,6 +302,11 @@ test('effective generation capability requires the exact managed runtime to be r
         isRunning: () => true,
         inspectContainerContract: () => ({ state: 'owned-drift', reason: 'runtime-identity' }),
     }), false);
+    generation.agents[owner.containerName].cgroupSubtree = { containerId: 'a'.repeat(64) };
+    assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
+        exists: () => true, isRunning: () => true,
+        inspectContainerContract: () => assert.fail('an opted-out generation must not accept the delegated predecessor'),
+    }), false);
 });
 
 test('targeted capability restart cannot activate before exact semantic readiness succeeds', () => {
@@ -607,7 +612,10 @@ test('existing-container ownership inspection is unconditional across network mo
     const earlyReuse = source.indexOf('returning early (container exists)', homeVerification);
     assert.ok(homeVerification > 0 && earlyReuse > homeVerification);
     const homeVerificationSource = source.slice(homeVerification, earlyReuse);
-    assert.match(homeVerificationSource, /spawnSync\(runtime, \['inspect', reuseInspection\.id\]/);
+    const authorityVerification = source.indexOf("spawnSync(runtime, ['inspect', reuseInspection.id]", source.indexOf('let canReuseExisting = true'));
+    assert.ok(authorityVerification > 0 && authorityVerification < homeVerification,
+        'the exact authority inspection precedes both managed adoption and unmanaged HOME checks');
+    assert.match(source.slice(authorityVerification, homeVerification), /cgroupDelegationReuseReason\(serviceAdmission\.descriptor, existingRecord, inspectedRecords\[0\]\)/);
     assert.match(homeVerificationSource, /!hasExactAgentHomeLayout\(inspectedRecords\[0\], desiredHomeLayout\)/);
     assert.match(homeVerificationSource, /canReuseExisting = false;\s*recreateReason \|\|= 'agentHomeLayoutChanged'/);
 });

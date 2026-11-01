@@ -47,11 +47,13 @@ import { engineCommandArgs } from './hardwareLimits/runtimeCommand.mjs';
 import { writeAppliedObservation } from './hardwareLimits/runtimeState.mjs';
 import { verifyMpsLaunch } from './hardwareLimits/mpsLaunch.mjs';
 import { verifyMpsRuntimeObservation } from './hardwareLimits/mpsRuntimeObservation.mjs';
+import { admittedCgroupSubtree, observeCgroupSubtreeContext, prepareCgroupSubtreeParent,
+    waitForAgentCgroupSubtree, CGROUP_HELPER_DIRECTORY, CGROUP_SUBTREE_MOUNT, CGROUP_PARENT, cgroupUnavailable } from './cgroupSubtree.mjs';
 
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 const ADMITTED_DESCRIPTORS = new WeakSet();
 
-const CONTAINER_SECURITY_KEYS = new Set(['gpu', 'nestedPodman', 'privileged', 'shmSize']);
+const CONTAINER_SECURITY_KEYS = new Set(['gpu', 'nestedPodman', 'cgroupSubtree', 'privileged', 'shmSize']);
 // An agent's own /dev/shm size (every agent has its own IPC namespace): whole
 // MiB or GiB, from 1m to 16g.
 const SHM_SIZE_RE = /^[1-9][0-9]{0,5}[mg]$/;
@@ -61,6 +63,7 @@ function shmSizeMiB(value) {
     return Number(value.slice(0, -1)) * (value.endsWith('g') ? 1024 : 1);
 }
 const DIRECT_CAPABILITY_FIELDS = new Set([
+    'cgroupSubtree', 'cgroupDelegation', 'cgroupParent', 'cgroupns', 'cgroups',
     'nestedPodman',
     'privileged',
     'devices',
@@ -267,6 +270,12 @@ function validateContainerSecurityBlock(value, context) {
     if (value.gpu !== undefined && typeof value.gpu !== 'boolean') {
         throw securityError('manifest.containerSecurity.gpu must be boolean', context);
     }
+    if (value.cgroupSubtree !== undefined && typeof value.cgroupSubtree !== 'boolean') {
+        throw securityError('manifest.containerSecurity.cgroupSubtree must be boolean', context);
+    }
+    if (value.cgroupSubtree === true && value.nestedPodman !== true) {
+        throw securityError('manifest.containerSecurity.cgroupSubtree requires nestedPodman', context);
+    }
     if (value.shmSize !== undefined && (typeof value.shmSize !== 'string' || !SHM_SIZE_RE.test(value.shmSize)
         || shmSizeMiB(value.shmSize) > MAX_SHM_MIB)) {
         throw securityError('manifest.containerSecurity.shmSize must be a size such as 512m or 2g, from 1m to 16g', context);
@@ -280,6 +289,7 @@ function validateContainerSecurityBlock(value, context) {
     return Object.freeze({
         privileged: value.privileged === true,
         nestedPodman: value.nestedPodman === true,
+        ...(value.cgroupSubtree === true ? { cgroupSubtree: true } : {}),
         // Only when declared, so every other agent's descriptor is unchanged.
         ...(value.gpu === true ? { gpu: true } : {}),
         ...(value.shmSize !== undefined ? { shmSize: value.shmSize } : {}),
@@ -333,6 +343,17 @@ function validateVolumesBlock(value, label, context) {
     }
 }
 
+function rejectAlternateCgroupDeclarations(value, label, context) {
+    for (const [suffix, block] of [['runtime', value?.runtime], ['runtime.resources', value?.runtime?.resources],
+        ['security', value?.security], ['capabilities', value?.capabilities]]) {
+        if (!isPlainObject(block)) continue;
+        if (Object.hasOwn(block, 'cgroupSubtree') || Object.hasOwn(block, 'cgroupDelegation')
+            || isPlainObject(block.containerSecurity) && Object.hasOwn(block.containerSecurity, 'cgroupSubtree')) {
+            throw securityError(`${label}.${suffix} cannot declare cgroupSubtree; use root containerSecurity`, context);
+        }
+    }
+}
+
 export function validateManifestRuntimeCapabilities(manifest, {
     agentId = '',
     path = 'manifest',
@@ -342,6 +363,7 @@ export function validateManifestRuntimeCapabilities(manifest, {
     }
     const context = { agentId: String(agentId || ''), path: String(path || 'manifest') };
     rejectDirectCapabilityFields(manifest, path, context);
+    rejectAlternateCgroupDeclarations(manifest, path, context);
     const containerSecurity = validateContainerSecurityBlock(manifest.containerSecurity, context);
     validateLlmRuntimeBlock(manifest.llmRuntime, `${path}.llmRuntime`, context);
     validateHardwareLimitsShape(manifest.hardwareLimits, `${path}.hardwareLimits`);
@@ -363,6 +385,7 @@ export function validateManifestRuntimeCapabilities(manifest, {
             ...context,
             profileName,
         }, { allowProfileMountModes: true });
+        rejectAlternateCgroupDeclarations(profile, `${path}.profiles.${profileName}`, context);
         validateLlmRuntimeBlock(
             profile.llmRuntime,
             `${path}.profiles.${profileName}.llmRuntime`,
@@ -498,6 +521,18 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
         ...(manifest?.volumes || {}),
         ...(profileConfig?.volumes || {}),
     }, { workspaceRoot });
+    if (validated.containerSecurity.cgroupSubtree) {
+        const targets = volumes.map((volume) => volume.target);
+        const persistentTarget = manifest?.runtime?.resources?.persistentStorage?.containerPath;
+        if (typeof persistentTarget === 'string') targets.push(persistentTarget);
+        for (const declaredTarget of targets) {
+            const target = path.posix.resolve('/', declaredTarget);
+            if ([CGROUP_HELPER_DIRECTORY, CGROUP_SUBTREE_MOUNT].some((reserved) => target === reserved
+                || target.startsWith(`${reserved}/`) || reserved.startsWith(`${target}/`) || target === '/')) {
+                throw securityError('manifest volume overlaps reserved cgroup delegation paths');
+            }
+        }
+    }
     const capabilities = {
         privileged: validated.containerSecurity.privileged,
         nestedPodman: validated.containerSecurity.nestedPodman,
@@ -661,6 +696,7 @@ export function admitManifestRuntimeCapabilities(manifest, {
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     hardwareAdmission = 'strict',
     hardwareContext,
+    cgroupContext,
     instanceKey = '',
     alias = '',
     helper = false,
@@ -734,6 +770,13 @@ export function admitManifestRuntimeCapabilities(manifest, {
         runtimeKind,
         insideBox: boxContext.insideBox,
     });
+    if (descriptor.containerSecurity.cgroupSubtree) {
+        if (!boxContext.insideBox || runtimeKind !== 'container' || runtime === 'docker') {
+            throw new RuntimeCapabilityError('cgroup subtree requires in-Box Podman');
+        }
+        const delegation = admittedCgroupSubtree(cgroupContext || observeCgroupSubtreeContext());
+        descriptor = deepFreeze({ ...descriptor, cgroupDelegation: delegation });
+    }
     const hardwareEligibility = admitHardwareEligibility(descriptor, {
         context: hardwareFacts,
         instanceKey,
@@ -799,6 +842,7 @@ function hardwarePlacementFor(descriptor, context, runtimeKind) {
 // The engine-level prefix for create/start/exec of a hardware-placed agent;
 // empty for every other invocation so its command form is unchanged.
 export function hardwareCommandPrefix(descriptor) {
+    if (descriptor?.cgroupDelegation) return ['--cgroup-manager=cgroupfs'];
     const prefix = descriptor?.hardwarePlacement?.enginePrefix;
     return Array.isArray(prefix) ? [...prefix] : [];
 }
@@ -842,6 +886,10 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
     runtime = 'podman',
     query,
     hardwareContext,
+    cgroupContext,
+    cgroupPreparationOptions,
+    recordCgroup = () => {},
+    withCgroupExclusion = (callback) => callback(),
     fsApi,
     cgroupRoot,
     procRoot,
@@ -857,6 +905,10 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
     return Object.freeze({
         createArgs(args) {
             recheck();
+            if (descriptor.cgroupDelegation) {
+                assertCgroupAdmissionCurrent(runtimeAdmission, { cgroupContext });
+                prepareCgroupSubtreeParent(descriptor.cgroupDelegation, cgroupPreparationOptions);
+            }
             return engineCommandArgs(hardwareCommandPrefix(descriptor), args);
         },
         commandPrefix() {
@@ -867,6 +919,14 @@ export function createHardwareLaunchGuard(runtimeAdmission, {
         // admitted limits (plan §8.1: an inspect field alone is not proof).
         afterLaunch({ containerId }) {
             let readback = null;
+            if (descriptor.cgroupDelegation) {
+                withCgroupExclusion(() => {
+                    const observed = waitForAgentCgroupSubtree({ descriptor, containerId, query,
+                        ...(fsApi ? { fsApi } : {}), ...(cgroupRoot ? { cgroupRoot } : {}), ...(procRoot ? { procRoot } : {}) });
+                    recordCgroup(observed.reservation);
+                    assertCgroupAdmissionCurrent(runtimeAdmission, { cgroupContext });
+                });
+            }
             if (descriptor.hardwarePlacement) {
                 readback = verifyLaunchedHardwareLimits({
                     descriptor,
@@ -920,6 +980,7 @@ export function assertRuntimeAdmissionCurrent(admission, {
     boxMarkerOptions,
     gpuGrantOptions,
     hardwareContext,
+    cgroupContext,
 } = {}) {
     if (!admission || admission.schemaVersion !== 1 || !admission.descriptor) {
         throw new RuntimeCapabilityError('runtime admission is missing or invalid', {
@@ -984,6 +1045,15 @@ export function assertRuntimeAdmissionCurrent(admission, {
         }
     }
     assertHardwareAdmissionCurrent(admission, { hardwareContext });
+    assertCgroupAdmissionCurrent(admission, { cgroupContext });
+    return admission;
+}
+
+export function assertCgroupAdmissionCurrent(admission, { cgroupContext } = {}) {
+    const admitted = admission?.descriptor?.cgroupDelegation;
+    if (admitted && stableDigest(admittedCgroupSubtree(cgroupContext || observeCgroupSubtreeContext())) !== stableDigest(admitted)) {
+        throw cgroupUnavailable('delegation authority changed after admission');
+    }
     return admission;
 }
 
@@ -1059,12 +1129,16 @@ export function renderRuntimePolicyArgs(descriptor, { runtime } = {}) {
         // limit so swap cannot extend the cap (leaf memory.swap.max = 0).
         const memoryIndex = args.indexOf('--memory');
         if (memoryIndex >= 0) args.splice(memoryIndex + 2, 0, '--memory-swap', args[memoryIndex + 1]);
-        args.push(
-            `--cgroups=${placement.cgroups}`,
-            `--cgroupns=${placement.cgroupns}`,
-            `--cgroup-parent=${placement.cgroupParent}`,
-            '--label', `${LIMITS_HASH_LABEL}=${placement.limitsHash}`,
-        );
+    }
+    const effectivePlacement = descriptor.cgroupDelegation
+        ? { cgroups: 'enabled', cgroupns: 'private', cgroupParent: CGROUP_PARENT } : placement;
+    if (effectivePlacement) {
+        args.push(`--cgroups=${effectivePlacement.cgroups}`, `--cgroupns=${effectivePlacement.cgroupns}`,
+            `--cgroup-parent=${effectivePlacement.cgroupParent}`);
+    }
+    if (placement) args.push('--label', `${LIMITS_HASH_LABEL}=${placement.limitsHash}`);
+    if (descriptor.cgroupDelegation) {
+        args.push('--pid=private', '--label', 'ploinky.cgroup-subtree=1');
     }
     // A manifest-declared GPU agent learns whether it got the device and, if
     // not, what to run on the host (D14).

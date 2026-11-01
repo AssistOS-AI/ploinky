@@ -273,6 +273,36 @@ test('D.readback-private-namespace', (t) => {
     assert.throws(() => launchGuard(box, LIMITED, { fake }).afterLaunch({ containerId: 'f'.repeat(64) }), /namespace changed/);
 });
 
+test('C10: nested delegated init in core verifies aggregate limits at exact native root, never core defaults', (t) => {
+    const box = inBox(t);
+    const admission = admit(box, { ...LIMITED, containerSecurity: { nestedPodman: true, cgroupSubtree: true } }, {
+        cgroupContext: { schemaVersion: 1, ready: true, parent: '/ploinky/agents', controllers: ALL,
+            cgroupNamespace: 'cgroup:[1000]', pidNamespace: 'pid:[1000]', reason: null },
+    });
+    const id = 'f'.repeat(64), native = `/ploinky/agents/libpod-${id}`;
+    const fake = launchedFixture(EXACT_LEAF);
+    fake.addGroup(native, { uid: 1000 }); fake.addGroup(`${native}/core`, { uid: 1000 });
+    for (const [key, value] of Object.entries(EXACT_LEAF)) fake.groups.get(native).values.set(key, value);
+    for (const key of ['memory.max', 'cpu.max', 'pids.max']) fake.groups.get(`${native}/core`).values.set(key, 'max');
+    fake.placePid(321, `${native}/core`);
+    const originalRead = fake.readFileSync.bind(fake);
+    fake.readFileSync = (target) => target === '/proc/321/stat'
+        ? '321 (init) S ' + Array(18).fill('0').join(' ') + ' 1234' : originalRead(target);
+    const verify = () => verifyLaunchedHardwareLimits({ descriptor: admission.descriptor, containerId: id, fsApi: fake,
+        query: () => ({ ok: true, stdout: '321\n' }), refuse: (message) => new Error(message) });
+    const result = verify();
+    assert.equal(result.leaf, native);
+    assert.equal(result.processLeaf, `${native}/core`);
+    assert.equal(result.observed['memory.max'], EXACT_LEAF['memory.max']);
+    fake.groups.get(native).values.set('memory.max', '1');
+    for (const [key, value] of Object.entries(EXACT_LEAF)) fake.groups.get(`${native}/core`).values.set(key, value);
+    assert.throws(verify, /memory.max/);
+    const argv = renderRuntimePolicyArgs(admission.descriptor, { runtime: 'podman' });
+    assert.equal(argv.filter((value) => value === '--cgroup-parent=/ploinky/agents').length, 1);
+    assert.equal(argv.filter((value) => value === '--cgroupns=private').length, 1);
+    assert.equal(argv.filter((value) => value === '--cgroups=enabled').length, 1);
+});
+
 test('D.readback-namespace-process-exit', (t) => {
     const box = inBox(t);
     const fake = launchedFixture(EXACT_LEAF);
