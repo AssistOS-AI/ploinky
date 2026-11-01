@@ -69,6 +69,26 @@ test('cleanup diagnostics redact error details and stop at the worker byte cap',
     assert.equal(lines.length, count);
 });
 
+test('per-member diagnostics allow only exact bounded PID, birth, signal and outcome fields', () => {
+    const lines = [];
+    const receiver = { terminalId: TERMINAL_ID,
+        processApi: { stderr: { write: (line) => lines.push(line) } } };
+    const report = (member) => AgentTerminalWorker.prototype.reportCleanupMemberDiagnostic.call(receiver, member);
+    const member = { pid: 5002, startToken: 'linux-proc:50020', signal: 'SIGTERM', outcome: 'denied',
+        argv: ['CANARY'], environment: 'CANARY', message: 'CANARY' };
+    report(member);
+    assert.deepEqual(JSON.parse(lines[0].slice('PLOINKY_WEBTTY_CLEANUP_MEMBER '.length)), {
+        terminalId: TERMINAL_ID, pid: 5002, startToken: 'linux-proc:50020', signal: 'SIGTERM', outcome: 'denied',
+    });
+    assert.equal(lines.join('').includes('CANARY'), false);
+    for (const changed of [{ pid: 1 }, { startToken: 'CANARY' }, { signal: 'CANARY' }, { outcome: 'CANARY' }]) {
+        report({ ...member, ...changed });
+    }
+    assert.equal(lines.length, 1);
+    for (let index = 0; index < 200; index += 1) report(member);
+    assert.equal(Buffer.byteLength(lines.join('')) <= 16 * 1024, true);
+});
+
 test('cleanup diagnostics name a failed session capture without changing its outcome', async () => {
     const h = harness({
         captureSession: async () => {
@@ -396,7 +416,12 @@ function harness(overrides = {}) {
             )),
         captureClient: overrides.captureClient || (() => CLIENT),
         captureInner: overrides.captureInner || (async () => INNER),
-        captureSession: overrides.captureSession || (async () => []),
+        captureSession: overrides.captureSession || (async () => [markerWrapperIdentity()]),
+        captureCleanupScope: overrides.captureCleanupScope || (async () => ({ captured: true })),
+        cleanupScopeAbsent: overrides.cleanupScopeAbsent || (async () => true),
+        readCleanupIdentity: overrides.readCleanupIdentity || (async () => null),
+        listCleanupMarkers: overrides.listCleanupMarkers || (async () => []),
+        listBoxSession: overrides.listBoxSession || (async () => []),
         listSession: overrides.listSession || (async () => []),
         signalSession: overrides.signalSession || (async () => {}),
         readInnerIdentity: overrides.readInnerIdentity || (async (pid) => {
@@ -444,6 +469,212 @@ test('worker sends its first byte only after async exact client capture complete
     assert.equal(h.ptyState.writes.length, 1);
     assert.equal(challengeCalls, 1);
     assert.equal(h.processApi.sent.some((message) => message.type === 'ready'), true);
+});
+
+test('ready cleanup resolves transient EACCES only after two fresh positive snapshots', async () => {
+    const calls = [];
+    const positives = [];
+    const completeScans = [];
+    const h = harness({
+        captureSession: async () => [markerWrapperIdentity()],
+        signalSession: async () => {
+            calls.push('signal');
+            throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        },
+        listSession: async () => {
+            calls.push('list');
+            if (calls.filter((value) => value === 'list').length === 1) {
+                throw Object.assign(new Error('transient'), { code: 'EACCES' });
+            }
+            return [];
+        },
+        drainExec: () => calls.push('drain'),
+        listCleanupMarkers: async () => { completeScans.push(Date.now()); return []; },
+        inspectTargetCleanup: async () => {
+            positives.push(Date.now());
+            return { absent: false, id: CONTAINER_ID, running: true, initPid: 4299, execIds: [] };
+        },
+    });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    const first = h.worker.cleanup('requested');
+    assert.equal(h.worker.cleanup('requested'), first);
+    await first;
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, true);
+    assert.equal(positives.length >= 4, true);
+    assert.equal(completeScans.length >= 2, true);
+    assert.equal(completeScans.at(-1) - completeScans[0] >= 25, true);
+    assert.equal(calls.filter((value) => value === 'signal').length, 1);
+    assert.equal(calls.filter((value) => value === 'drain').length, 1);
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+});
+
+test('otherwise proven ready cleanup is vetoed by a private setsid survivor', async () => {
+    const h = harness({ cleanupScopeAbsent: async () => false });
+    h.worker.cleanupDeadlineMs = 80;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+});
+
+function cleanupProofHarness(overrides = {}) {
+    const calls = { signals: 0, drains: 0, reads: 0 };
+    const h = harness({
+        captureSession: async () => [markerWrapperIdentity()],
+        signalSession: async () => {
+            calls.signals += 1;
+            throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        },
+        drainExec: () => { calls.drains += 1; },
+        readCleanupIdentity: async () => { calls.reads += 1; return null; },
+        inspectTargetCleanup: async () => ({ absent: false, id: CONTAINER_ID,
+            running: true, initPid: INNER.containerInitBoxPid, execIds: [] }),
+        ...overrides,
+    });
+    h.worker.cleanupDeadlineMs = 100;
+    return { ...h, calls };
+}
+
+test('ready positive proof fails closed for every live or unknown evidence surface', async (t) => {
+    const extraMember = { ...markerWrapperIdentity(), pid: 4310, startToken: 'linux-proc:43100' };
+    const failures = {
+        'live original client': { readCleanupIdentity: async (pid) => pid === CLIENT.pid ? CLIENT : null },
+        'live original wrapper': { readCleanupIdentity: async (pid) => pid === INNER.boxPid ? markerWrapperIdentity() : null },
+        'live original captured child': {
+            captureSession: async () => [markerWrapperIdentity(), extraMember],
+            readCleanupIdentity: async (pid) => pid === extraMember.pid ? extraMember : null,
+        },
+        'live exact marker': { listCleanupMarkers: async () => [markerWrapperIdentity()] },
+        'live Box SID': { listBoxSession: async () => [{ pid: 4311 }] },
+        'live private TERM-ignoring child': { cleanupScopeAbsent: async () => false },
+        'original ExecID still present': { inspectTargetCleanup: async () => ({ absent: false,
+            id: CONTAINER_ID, running: true, initPid: 4299, execIds: [EXEC_ID] }) },
+        'persistent EACCES': { readCleanupIdentity: async () => {
+            throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        } },
+        'wrapped STALE is unknown': { readCleanupIdentity: async () => {
+            throw Object.assign(new Error('unknown'), { code: 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE' });
+        } },
+        'undefined identity is unknown': { readCleanupIdentity: async () => undefined },
+        'malformed marker scan': { listCleanupMarkers: async () => null },
+        'malformed session scan': { listBoxSession: async () => undefined },
+    };
+    for (const [name, overrides] of Object.entries(failures)) {
+        await t.test(name, async () => {
+            const h = cleanupProofHarness(overrides);
+            await h.worker.initialize(init());
+            await h.worker.launch();
+            await h.worker.cleanup('requested');
+            assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+            assert.equal(h.calls.signals, 1);
+            assert.equal(h.calls.drains, 1);
+            assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+        });
+    }
+});
+
+test('missing, unanchored or malformed original evidence cannot enter the positive proof', async () => {
+    for (const overrides of [
+        { captureSession: async () => [] },
+        { captureSession: async () => [{ ...markerWrapperIdentity(), startToken: 'linux-proc:99999' }] },
+        { captureSession: async () => [markerWrapperIdentity(), { pid: undefined }] },
+        { captureCleanupScope: async () => { throw Object.assign(new Error('incomplete'), { code: 'EACCES' }); } },
+    ]) {
+        const h = cleanupProofHarness(overrides);
+        await h.worker.initialize(init());
+        await h.worker.launch();
+        await h.worker.cleanup('requested');
+        assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+        assert.equal(h.calls.reads, 0);
+    }
+});
+
+test('a ready terminal missing its original ExecID cannot adopt or drain a later foreign exec', async () => {
+    const h = cleanupProofHarness();
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    h.worker.execId = '';
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.worker.execId, '');
+    assert.equal(h.calls.signals, 0);
+    assert.equal(h.calls.drains, 0);
+    assert.equal(h.calls.reads, 0);
+});
+
+test('hard PID/init/namespace contradictions cannot become successful after a later absence', async () => {
+    for (const contradiction of ['pid', 'init', 'namespace', 'scope']) {
+        const h = cleanupProofHarness();
+        await h.worker.initialize(init());
+        await h.worker.launch();
+        let reads = 0;
+        if (contradiction === 'pid' || contradiction === 'namespace') {
+            h.worker.readCleanupIdentity = async () => ++reads === 1 ? {
+                ...CLIENT, startToken: 'linux-proc:99999', pidNamespace: 'pid:[9999]',
+            } : null;
+        } else if (contradiction === 'init') {
+            h.worker.readInnerIdentity = async (pid) => ({ pid, state: 'S',
+                startToken: 'linux-proc:99999', pidNamespace: INNER.pidNamespace });
+        } else {
+            h.worker.cleanupScopeAbsent = async () => {
+                if (++reads === 1) throw Object.assign(new Error('replaced'), { category: 'cleanup-process-replaced' });
+                return true;
+            };
+        }
+        await h.worker.cleanup('requested');
+        assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+        assert.equal(h.calls.drains, 1);
+    }
+});
+
+test('late positive scan cannot replace finalized failure or perform another cleanup action', async () => {
+    let release;
+    const h = cleanupProofHarness({ listCleanupMarkers: () => new Promise((resolve) => { release = resolve; }) });
+    h.worker.cleanupDeadlineMs = 40;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    const calls = { ...h.calls };
+    release([]);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.deepEqual(h.calls, calls);
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+    assert.equal(h.ptyState.disposed, 0);
+});
+
+test('an intervening negative snapshot resets the two-positive stability requirement', async () => {
+    const h = cleanupProofHarness();
+    const snapshots = [];
+    const values = [true, false, true, true];
+    h.worker.cleanupPositiveSnapshot = async () => {
+        snapshots.push(Date.now());
+        return values.shift();
+    };
+    const context = { deadlineAt: Date.now() + 500, signal: new AbortController().signal };
+    assert.equal(await h.worker.confirmReadyCleanup([], {}, context), true);
+    assert.equal(snapshots.length, 4);
+    assert.equal(snapshots[3] - snapshots[2] >= 25, true);
+});
+
+test('one positive snapshot cannot succeed when the second completes after the original deadline', async () => {
+    let scans = 0;
+    const h = cleanupProofHarness({ listBoxSession: async () => {
+        if (++scans === 2) await new Promise((resolve) => setTimeout(resolve, 120));
+        return [];
+    } });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    const started = Date.now();
+    await h.worker.cleanup('requested');
+    assert.equal(Date.now() - started < 300, true);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(scans, 2);
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+    assert.equal(h.calls.signals, 1);
+    assert.equal(h.calls.drains, 1);
 });
 
 test('invalid readiness challenge fails without input or an unhandled pending readiness rejection', async () => {
@@ -597,6 +828,7 @@ test('the Bash wrapper cannot forward target-controlled fallback statuses', () =
 });
 
 test('worker cleanup has a hard deadline below the Router-side worker grace', async () => {
+    assert.equal(AGENT_WORKER_CLEANUP_DEADLINE_MS, 5_500);
     assert.equal(AGENT_WORKER_CLEANUP_DEADLINE_MS < 8_500, true);
     const h = harness({
         captureSession: () => new Promise(() => {}),
@@ -631,6 +863,7 @@ test('a hanging cleanup inspect finalizes before Router grace and cannot drain l
     await h.worker.initialize(init());
     await h.worker.launch();
     h.worker.execId = '';
+    h.worker.readySent = false;
 
     const startedAt = Date.now();
     await h.worker.cleanup('requested');
@@ -959,12 +1192,7 @@ test('true Bash absence falls back through the same persistent identity-captured
 test('cleanup signals the captured inner session, then client, and drains only its ExecID', async () => {
     const calls = [];
     const h = harness({
-        captureSession: async () => [{
-            pid: 4300,
-            startToken: 'linux-proc:43000',
-            pidNamespace: 'pid:[9001]',
-            nssid: [4300, 42],
-        }],
+        captureSession: async () => [markerWrapperIdentity()],
         signalSession: async (_snapshot, signal) => calls.push(`inner:${signal}`),
         signalClient: (_identity, signal) => calls.push(`client:${signal}`),
         drainExec: (containerId, execId) => calls.push(`drain:${containerId}:${execId}`),
