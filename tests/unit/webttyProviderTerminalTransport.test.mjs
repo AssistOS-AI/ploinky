@@ -30,6 +30,7 @@ test('text and binary frames arrive with their kind; split writes and back-to-ba
     const ws = new BoundedClientWebSocket(socket);
     const seen = [];
     ws.on('message', (data, binary) => seen.push([Buffer.isBuffer(data) ? data.toString('hex') : data, binary]));
+    ws.start();
     const text = serverFrame(0x1, '{"v":1}');
     const bin = serverFrame(0x2, Buffer.from([1, 2, 3]));
     feed(socket, Buffer.concat([text.subarray(0, 3)]));
@@ -43,6 +44,7 @@ test('a ping is answered with a masked pong; a close frame ends the connection',
     const ws = new BoundedClientWebSocket(socket);
     let closed = 0;
     ws.on('close', () => { closed += 1; });
+    ws.start();
     feed(socket, serverFrame(0x9, 'hi'));
     const pong = readClientFrame(written[0]);
     assert.equal(pong.opcode, 0xa);
@@ -82,6 +84,7 @@ test('every frame violation ends the connection before any payload is delivered'
         let closed = 0;
         ws.on('message', (data) => seen.push(data));
         ws.on('close', () => { closed += 1; });
+        ws.start();
         feed(socket, bytes);
         assert.deepEqual(seen, [], name);
         assert.equal(closed, 1, name);
@@ -94,6 +97,7 @@ test('the largest allowed data and control frames are accepted', () => {
     const ws = new BoundedClientWebSocket(socket);
     const sizes = [];
     ws.on('message', (data) => sizes.push(data.length));
+    ws.start();
     feed(socket, serverFrame(0x2, Buffer.alloc(PROVIDER_TERMINAL_LIMITS.header + PROVIDER_TERMINAL_LIMITS.payload)));
     feed(socket, serverFrame(0x1, 'a'.repeat(PROVIDER_TERMINAL_LIMITS.json)));
     assert.deepEqual(sizes, [26 + 64 * 1024, PROVIDER_TERMINAL_LIMITS.json]);
@@ -116,6 +120,106 @@ test('send writes masked frames of the right kind and reports the write result; 
     const after = [];
     ws.send('x', { binary: false }, (error) => after.push(error?.code));
     assert.deepEqual(after, ['PROVIDER_TERMINAL_DISCONNECTED']);
+});
+
+test('startup retains HEAD before later data and delivers split frames once after explicit readiness', async () => {
+    const { socket } = socketPair();
+    const first = serverFrame(0x1, 'challenge');
+    const second = serverFrame(0x2, Buffer.from([1, 2, 3]));
+    const ws = new BoundedClientWebSocket(socket, first.subarray(0, 1));
+    const seen = [];
+    ws.on('message', (data, binary) => seen.push([String(data), binary]));
+    feed(socket, first.subarray(1, 4));
+    feed(socket, Buffer.concat([first.subarray(4), second.subarray(0, 3)]));
+    await flush();
+    assert.deepEqual(seen, []);
+    assert.equal(socket.isPaused(), true);
+    ws.start();
+    ws.start();
+    assert.deepEqual(seen, [['challenge', false]]);
+    feed(socket, second.subarray(3));
+    assert.deepEqual(seen, [['challenge', false], ['\u0001\u0002\u0003', true]]);
+    ws.close();
+    ws.close();
+    assert.equal(ws.buffer.length, 0);
+});
+
+test('HEAD and pre-start data share one bounded startup buffer at the largest legal wire frame', () => {
+    const maximum = PROVIDER_TERMINAL_LIMITS.header + PROVIDER_TERMINAL_LIMITS.payload + 10;
+    const frame = serverFrame(0x2, Buffer.alloc(maximum - 10));
+    for (const length of [maximum - 1, maximum, maximum + 1]) {
+        const { socket } = socketPair();
+        const ws = new BoundedClientWebSocket(socket, frame.subarray(0, 10));
+        const sizes = [];
+        let closed = 0;
+        ws.on('message', (data) => sizes.push(data.length));
+        ws.on('close', () => { closed += 1; });
+        feed(socket, Buffer.concat([frame.subarray(10), Buffer.alloc(Math.max(0, length - maximum))])
+            .subarray(0, length - 10));
+        if (length > maximum) {
+            assert.equal(ws.buffer.length, 0);
+            assert.throws(() => ws.start(), { code: 'PROVIDER_TERMINAL_DISCONNECTED' });
+            assert.equal(closed, 1);
+            assert.deepEqual(sizes, []);
+        } else {
+            ws.start();
+            if (length < maximum) feed(socket, frame.subarray(length));
+            assert.deepEqual(sizes, [maximum - 10]);
+        }
+        ws.close();
+        assert.equal(closed, 1);
+        assert.equal(ws.buffer.length, 0);
+    }
+    const { socket } = socketPair();
+    const ws = new BoundedClientWebSocket(socket, Buffer.alloc(maximum + 1));
+    let closed = 0;
+    ws.on('close', () => { closed += 1; });
+    assert.equal(closed, 0, 'construction never invokes a consumer callback');
+    assert.equal(ws.buffer.length, 0);
+    assert.throws(() => ws.start(), { message: 'Provider terminal: disconnected' });
+    ws.close();
+    assert.equal(closed, 1);
+});
+
+test('early EOF, error, local close and invalid startup frames remain closed without retained bytes', () => {
+    for (const cause of ['end', 'error', 'close', 'local', 'head-close', 'oversize', 'fragment']) {
+        const { socket } = socketPair();
+        let head = serverFrame(0x1, 'challenge');
+        if (cause === 'head-close') head = serverFrame(0x8);
+        if (cause === 'fragment') head = serverFrame(0x1, 'challenge', { fin: false });
+        if (cause === 'oversize') head = serverFrame(0x1, 'a'.repeat(PROVIDER_TERMINAL_LIMITS.json + 1));
+        const ws = new BoundedClientWebSocket(socket, head);
+        const seen = [];
+        let closed = 0;
+        ws.on('message', (data) => seen.push(data));
+        ws.on('close', () => { closed += 1; });
+        if (['end', 'error', 'close'].includes(cause)) socket.emit(cause, new Error('fixture failure'));
+        else if (cause === 'local') ws.close();
+        assert.throws(() => ws.start(), { message: 'Provider terminal: disconnected' }, cause);
+        ws.close();
+        assert.deepEqual(seen, [], cause);
+        assert.equal(closed, 1, cause);
+        assert.equal(ws.buffer.length, 0, cause);
+        assert.equal(socket.destroyed, true, cause);
+    }
+});
+
+test('closure or error during startup cannot deliver later HEAD frames or resume the socket', () => {
+    for (const cause of ['close', 'error']) {
+        const { socket } = socketPair();
+        const ws = new BoundedClientWebSocket(socket,
+            Buffer.concat([serverFrame(0x1, 'challenge'), serverFrame(0x1, 'later')]));
+        const seen = [];
+        ws.on('message', (data) => {
+            seen.push(data);
+            if (cause === 'close') ws.close();
+            else socket.emit('error', new Error('fixture failure'));
+        });
+        assert.throws(() => ws.start(), { code: 'PROVIDER_TERMINAL_DISCONNECTED' });
+        assert.deepEqual(seen, ['challenge']);
+        assert.equal(socket.isPaused(), true);
+        assert.equal(ws.buffer.length, 0);
+    }
 });
 
 // ---- the relay handshake -----------------------------------------------
@@ -142,6 +246,7 @@ test('the upgrade goes through the checked-out relay with the Router-only auth h
     // A frame the worker pushes right after the 101 reaches the channel.
     const received = [];
     transport.on('message', (data, binary) => received.push([String(data), binary]));
+    transport.start();
     relay.streams[0].push(serverFrame(0x1, '{"v":1,"type":"challenge"}'));
     await flush();
     assert.deepEqual(received, [['{"v":1,"type":"challenge"}', false]]);

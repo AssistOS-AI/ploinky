@@ -48,7 +48,8 @@ export class TerminalTasks {
 }
 
 // Injected transport: EventEmitter on/off; message(data, isBinary), error,
-// close; send(data, { binary }, callback), close(). No network is opened here.
+// close; send(data, { binary }, callback), close(), optional start() after the
+// challenge waiter is armed. No network is opened here.
 export class ProviderTerminalChannel {
     constructor(transport, { timers, limits, checkLease, onFrame, onClose }) {
         this.transport = transport;
@@ -95,8 +96,13 @@ export class ProviderTerminalChannel {
 
     wait(type) {
         if (this.waiter) throw terminalError('busy');
-        const result = this.tasks.run((finish) => { this.waiter = { type, finish }; },
-            this.limits.handshakeMs, 'handshake');
+        const result = this.tasks.run((finish) => {
+            this.waiter = { type, finish };
+            if (type === 'challenge') {
+                if (this.transport.closed) throw terminalError('disconnected');
+                this.transport.start?.();
+            }
+        }, this.limits.handshakeMs, 'handshake');
         return result.finally(() => { this.waiter = null; });
     }
 

@@ -15,6 +15,7 @@ const CONTROL_MAX = 125;
 const TEXT_MAX = PROVIDER_TERMINAL_LIMITS.json;
 const BINARY_MAX = PROVIDER_TERMINAL_LIMITS.header + PROVIDER_TERMINAL_LIMITS.payload;
 const FRAME_HEADER_MAX = 2 + 8;
+const STARTUP_MAX = BINARY_MAX + FRAME_HEADER_MAX;
 
 function maskedFrame(opcode, payload) {
     const length = payload.length;
@@ -44,20 +45,40 @@ export class BoundedClientWebSocket extends EventEmitter {
     constructor(socket, head = Buffer.alloc(0)) {
         super();
         this.socket = socket;
-        this.buffer = Buffer.alloc(0);
+        this.startupFailed = (head?.length || 0) > STARTUP_MAX;
+        this.buffer = this.startupFailed ? Buffer.alloc(0) : Buffer.from(head || Buffer.alloc(0));
+        this.started = false;
         this.closed = false;
         this.decoder = new TextDecoder('utf-8', { fatal: true });
+        socket.pause();
         socket.on('data', (chunk) => this.#data(chunk));
         socket.on('error', () => this.#end());
         socket.on('close', () => this.#end());
         socket.on('end', () => this.#end());
-        if (head?.length) queueMicrotask(() => this.#data(head));
+    }
+
+    // The channel arms its challenge waiter before starting reception; async
+    // transport opening must not decide when the consumer can receive HEAD.
+    start() {
+        if (this.closed) throw terminalError('disconnected');
+        if (this.started) return;
+        this.started = true;
+        if (this.startupFailed) {
+            this.#end();
+            throw terminalError('disconnected');
+        }
+        const head = this.buffer;
+        this.buffer = Buffer.alloc(0);
+        this.#data(head);
+        if (this.closed) throw terminalError('disconnected');
+        this.socket.resume();
     }
 
     #end() {
         if (this.closed) return;
         this.closed = true;
         this.buffer = Buffer.alloc(0);
+        this.startupFailed = false;
         try { this.socket.destroy(); } catch (_) { }
         this.emit('close');
     }
@@ -68,6 +89,16 @@ export class BoundedClientWebSocket extends EventEmitter {
 
     #data(chunk) {
         if (this.closed) return;
+        if (!this.started) {
+            if (this.startupFailed) return;
+            if (this.buffer.length + chunk.length > STARTUP_MAX) {
+                this.buffer = Buffer.alloc(0);
+                this.startupFailed = true;
+                return;
+            }
+            this.buffer = Buffer.concat([this.buffer, chunk]);
+            return;
+        }
         this.buffer = Buffer.concat([this.buffer, chunk]);
         for (;;) {
             if (this.closed || this.buffer.length < 2) return;
@@ -203,6 +234,7 @@ export async function openProviderTerminalTransport({ plan, lease, relayManager,
                 signal?.removeEventListener('abort', onAbort);
                 const websocket = new BoundedClientWebSocket(upgraded, upstreamHead);
                 websocket.once('close', release);
+                if (websocket.closed) release();
                 resolve(websocket);
             });
             upstream.once('response', (response) => { response.resume(); fail(terminalError('handshake')); });
