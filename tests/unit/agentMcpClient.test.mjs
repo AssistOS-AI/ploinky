@@ -181,16 +181,18 @@ test('auth responses and unrelated 503 errors never acquire the inactive-target 
     }
 });
 
-test('HTTP error status is retained without embedding an unparsed response body', async (t) => {
+test('HTTP error status retains the original bounded response-text diagnostic', async (t) => {
+    const responseText = `${'x'.repeat(200)}outside-limit`;
     await withCaptureServer(t, (_req, _body, res) => {
         res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end('synthetic-private-detail');
+        res.end(responseText);
     });
     const client = await createAgentClient('dpuAgent');
     await assert.rejects(client.callTool('probe', {}), error => {
         assert.equal(error.statusCode, 502);
         assert.equal(error.code, undefined);
-        assert.equal(error.message.includes('synthetic-private-detail'), false);
+        assert.equal(error.message, `agent-to-agent call failed (status 502): ${responseText.slice(0, 200)}`);
+        assert.equal(error.message.includes('outside-limit'), false);
         return true;
     });
 });

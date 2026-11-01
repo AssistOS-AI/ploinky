@@ -684,7 +684,7 @@ export async function createAgentClient(agentName, options = {}) {
         const delegationToken = Object.prototype.hasOwnProperty.call(callOptions || {}, 'userDelegationToken')
             ? callOptions.userDelegationToken
             : defaultDelegationToken;
-        const { status, json } = await postToolCall(
+        const { status, json, text } = await postToolCall(
             agentName,
             body,
             assertion,
@@ -702,7 +702,7 @@ export async function createAgentClient(agentName, options = {}) {
             throw err;
         }
         if (status >= 400 || !json) {
-            const err = new Error(`agent-to-agent call failed (status ${status})`);
+            const err = new Error(`agent-to-agent call failed (status ${status}): ${(text || '').slice(0, 200)}`.trim());
             err.statusCode = status;
             throw err;
         }
