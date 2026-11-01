@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { reserveAgentCgroup, verifyAgentCgroupSubtree, cleanupOwnedContainerCgroup,
+import { reserveAgentCgroup, verifyAgentCgroupSubtree, verifyCgroupContainerConfiguration, cleanupOwnedContainerCgroup,
     waitForAgentCgroupSubtree, CGROUP_ENTRYPOINT, CGROUP_HELPER_DIRECTORY, CGROUP_HELPER_SOURCE, CGROUP_SUBTREE_PATH } from '../../cli/sandbox/cgroupSubtree.mjs';
 import { readRuntimeCandidate, writeRuntimeCandidate, commitRuntimeCandidateCgroup } from '../../cli/sandbox/runtimeCandidateStore.js';
 import { removeExactContainerAndDescriptor } from '../../cli/sandbox/docker/containerFleet.js';
@@ -18,6 +18,34 @@ const ROOT = `/ploinky/agents/libpod-${ID}`;
 const CONTEXT = { schemaVersion: 1, ready: true, parent: '/ploinky/agents', cgroupNamespace: 'cgroup:[100]',
     pidNamespace: 'pid:[100]', controllers: ['cpu', 'memory', 'pids'], reason: null };
 const DESCRIPTOR = { cgroupDelegation: CONTEXT, boxContext: { markerIdentity: 'exact-box-generation' } };
+
+test('static startup refusal identifies the failed contract without printing supplied values', () => {
+    const valid = { Id: ID, Config: { User: '', Entrypoint: [CGROUP_ENTRYPOINT],
+        Cmd: [CONTEXT.cgroupNamespace, CONTEXT.pidNamespace], Env: [`PLOINKY_CGROUP_SUBTREE=${CGROUP_SUBTREE_PATH}`] },
+        HostConfig: { PidMode: 'private', CgroupnsMode: 'private' },
+        Mounts: [{ Destination: CGROUP_HELPER_DIRECTORY, Source: CGROUP_HELPER_SOURCE, RW: false }] };
+    verifyCgroupContainerConfiguration({ descriptor: DESCRIPTOR, containerId: ID, record: valid });
+    const probes = [
+        ['immutable ID', (r) => { r.Id = 'sensitive-value'; }],
+        ['image user', (r) => { r.Config.User = 'sensitive-value'; }],
+        ['entrypoint', (r) => { r.Config.Entrypoint = ['sensitive-value']; }],
+        ['Box namespace arguments', (r) => { r.Config.Cmd[0] = 'sensitive-value'; }],
+        ['private PID namespace', (r) => { r.HostConfig.PidMode = 'sensitive-value'; }],
+        ['private cgroup namespace', (r) => { r.HostConfig.CgroupnsMode = 'sensitive-value'; }],
+        ['provider env', (r) => { r.Config.Env[0] = 'PLOINKY_CGROUP_SUBTREE=sensitive-value'; }],
+        ['read-only helper mount', (r) => { r.Mounts[0].Source = 'sensitive-value'; }],
+    ];
+    for (const [field, mutate] of probes) {
+        const record = structuredClone(valid);
+        mutate(record);
+        assert.throws(() => verifyCgroupContainerConfiguration({ descriptor: DESCRIPTOR, containerId: ID, record }), (error) => {
+            assert.equal(error.code, 'PLOINKY_CGROUP_DELEGATION_UNAVAILABLE');
+            assert.ok(error.message.includes(`${field} contract mismatch`));
+            assert.equal(error.message.includes('sensitive-value'), false);
+            return true;
+        });
+    }
+});
 
 function fixture(t) {
     const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nested-cgroup-lifecycle-'));
@@ -175,7 +203,7 @@ test('post-start/adoption proof binds namespace, native inode, mount, entrypoint
     record.Config.Env.push(`PLOINKY_CGROUP_SUBTREE=${CGROUP_SUBTREE_PATH}`);
     assert.throws(verify, /env contract mismatch/);
     record.Config.Env.pop(); record.Config.User = '1000';
-    assert.throws(verify, /image\/entrypoint/);
+    assert.throws(verify, /image user contract mismatch/);
     assert.throws(() => cleanupOwnedContainerCgroup({ containerId: ID, record: { cgroupSubtree: {
         ...native.reservation, nativeRoot: { ...native.reservation.nativeRoot, path: '/ploinky/agents/sibling' } } }, fsApi: native.fsApi }), /invalid native-root/);
 });

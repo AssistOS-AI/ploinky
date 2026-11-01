@@ -663,6 +663,67 @@ test('finalize runs the post-start checkpoint even when runtime start fails', (t
     assert.deepEqual(checkpoints, ['before', 'start', 'after']);
 });
 
+test('failed start preserves its original cause through post-start and unresolved native-root cleanup', (t) => {
+    for (const failureMode of ['status', 'throw', 'returned-error']) {
+        const harness = networkHarness(t);
+        const network = canonicalizeNetwork({ mode: 'host' });
+        const id = 'e'.repeat(64);
+        harness.containers.set(id, managedAgentRecord({ id, name: 'failed-start-container',
+            labels: managedAgentLabels(harness.identity, network),
+            networks: { host: { NetworkID: 'host' } }, networkMode: 'host' }));
+        const original = Object.assign(new Error('engine start transport failed'), { code: 'ENGINE_START_FAILED' });
+        const adapter = createNetworkLifecycleAdapter({ runtime: 'podman',
+            workspaceRoot: harness.identity.canonical, lockPath: path.join(harness.dir, 'start-cause.lock'),
+            run(runtime, args) {
+                if (args[0] === 'start') {
+                    if (failureMode === 'throw') throw original;
+                    if (failureMode === 'returned-error') return { ok: false, status: 1, error: original };
+                    return { ok: false, status: 126, stdout: '', stderr: 'crun: startup refused' };
+                }
+                return harness.run(runtime, args);
+            },
+            cgroupCleanup() { throw new Error('native-root reservation remains unresolved'); },
+        });
+        assert.throws(() => adapter.finalizeContainer('failed-start-container', adapter.preflight(network, 'demo'), {
+            network, runtimeIdentity: TEST_RUNTIME_IDENTITY,
+            afterStart() { throw new Error('post-start mountpoint cleanup refused'); },
+        }), (error) => {
+            assert.match(error.message, failureMode === 'status' ? /crun: startup refused/ : /engine start transport failed/);
+            if (failureMode === 'throw') assert.equal(error, original);
+            if (failureMode !== 'status') assert.equal(error.code, 'ENGINE_START_FAILED');
+            if (failureMode === 'returned-error') assert.equal(error.cause, original);
+            assert.match(error.message, /post-start mountpoint cleanup refused/);
+            assert.match(error.message, /native-root reservation remains unresolved/);
+            return true;
+        });
+        assert.equal(harness.containers.has(id), false);
+    }
+});
+
+test('default engine runner retains startup stderr in the failure after inherited output', (t) => {
+    const harness = networkHarness(t), network = canonicalizeNetwork({ mode: 'host' });
+    const id = 'f'.repeat(64), runtime = path.join(harness.dir, 'fake-engine');
+    const marker = path.join(harness.dir, 'removed');
+    const record = managedAgentRecord({ id, name: 'failed-start-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: { host: { NetworkID: 'host' } }, networkMode: 'host' });
+    fs.writeFileSync(runtime, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === 'start') { process.stderr.write('crun: exact startup refused\\n'); process.exit(126); }
+if (args[0] === 'rm') { fs.writeFileSync(${JSON.stringify(marker)}, 'removed'); process.exit(0); }
+if (args[0] === 'container' && args[1] === 'inspect' && !fs.existsSync(${JSON.stringify(marker)})) {
+    process.stdout.write(${JSON.stringify(JSON.stringify([record]))}); process.exit(0);
+}
+process.stderr.write('no such container'); process.exit(125);
+`, { mode: 0o700 });
+    const adapter = createNetworkLifecycleAdapter({ runtime, workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'default-start.lock') });
+    assert.throws(() => adapter.finalizeContainer('failed-start-container', adapter.preflight(network, 'demo'),
+        { network, runtimeIdentity: TEST_RUNTIME_IDENTITY }), /cannot start .*crun: exact startup refused/);
+    assert.equal(fs.existsSync(marker), true);
+});
+
 test('runtime identity labels bind inspection and label construction to the exact registry tuple', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'host' });
@@ -1624,8 +1685,11 @@ test('C2: managed launch failure before start retains its durable uncommitted ro
         ...TEST_RUNTIME_IDENTITY, cgroupSubtree: reserveAgentCgroup({ boxContext: { markerIdentity: 'exact-box' },
             cgroupDelegation: { schemaVersion: 1, ready: true, parent: '/ploinky/agents',
                 cgroupNamespace: 'cgroup:[100]', pidNamespace: 'pid:[100]', controllers: ['cpu', 'memory', 'pids'] } }, id) };
+    const original = Object.assign(new Error('launcher failed before native-root observation'), { code: 'STARTUP_REFUSED' });
+    let artifactCleanup = 0;
     assert.throws(() => harness.adapter.runManagedContainerTransaction({ network, canonicalAgentId: 'demo',
         containerName: 'demo-container', runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        prepareLaunch: () => ({ cleanup() { artifactCleanup += 1; } }),
         createContainer(plan) {
             const primary = plan.attachments[0];
             const candidate = managedAgentRecord({ id, name: 'demo-container',
@@ -1641,10 +1705,18 @@ test('C2: managed launch failure before start retains its durable uncommitted ro
         },
         preStartLaunch() {
             assert.equal(readRuntimeCandidate('demo-container', record, { workspaceRoot }).registryRecord.cgroupSubtree.nativeRoot, null);
-            throw new Error('launcher failed before native-root observation');
+            throw original;
         },
-    }), /unresolved/);
+    }), (error) => {
+        assert.equal(error, original);
+        assert.equal(error.code, 'STARTUP_REFUSED');
+        assert.match(error.message, /^launcher failed before native-root observation/);
+        assert.match(error.message, /unresolved/);
+        assert.equal(error.ploinkyContainerTransaction.exactCleanupPerformed, false);
+        return true;
+    });
     assert.equal(harness.calls.some((args) => args[0] === 'start'), false);
     assert.equal(harness.containers.has(id), false);
     assert.ok(readRuntimeCandidate('demo-container', record, { workspaceRoot }));
+    assert.equal(artifactCleanup, 0);
 });

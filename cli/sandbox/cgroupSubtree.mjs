@@ -112,20 +112,21 @@ export function normalizeAgentCgroupReservation(value, containerId) {
 
 export function verifyCgroupContainerConfiguration({ descriptor, containerId, record } = {}) {
     if (!descriptor?.cgroupDelegation) return;
-    if (record?.Id !== containerId
-        || !isNamespaceRootImageUser(record?.Config?.User || '')
-        || JSON.stringify(record?.Config?.Entrypoint) !== JSON.stringify([CGROUP_ENTRYPOINT])
-        || JSON.stringify(record?.Config?.Cmd?.slice(0, 2)) !== JSON.stringify([
-            descriptor.cgroupDelegation.cgroupNamespace, descriptor.cgroupDelegation.pidNamespace])
-        || record?.HostConfig?.PidMode !== 'private' || record?.HostConfig?.CgroupnsMode !== 'private') {
-        throw cgroupUnavailable('agent image/entrypoint/private namespace contract mismatch');
+    if (record?.Id !== containerId) throw cgroupUnavailable('agent immutable ID contract mismatch');
+    if (!isNamespaceRootImageUser(record?.Config?.User || '')) throw cgroupUnavailable('agent image user contract mismatch');
+    if (JSON.stringify(record?.Config?.Entrypoint) !== JSON.stringify([CGROUP_ENTRYPOINT])) {
+        throw cgroupUnavailable('agent entrypoint contract mismatch');
     }
+    if (JSON.stringify(record?.Config?.Cmd?.slice(0, 2)) !== JSON.stringify([
+        descriptor.cgroupDelegation.cgroupNamespace, descriptor.cgroupDelegation.pidNamespace])) {
+        throw cgroupUnavailable('agent Box namespace arguments contract mismatch');
+    }
+    if (record?.HostConfig?.PidMode !== 'private') throw cgroupUnavailable('agent private PID namespace contract mismatch');
+    if (record?.HostConfig?.CgroupnsMode !== 'private') throw cgroupUnavailable('agent private cgroup namespace contract mismatch');
     const env = (record.Config.Env || []).filter((entry) => entry.startsWith('PLOINKY_CGROUP_SUBTREE='));
     const binds = (record.Mounts || []).filter((mount) => mount.Destination === CGROUP_HELPER_DIRECTORY);
-    if (env.length !== 1 || env[0] !== `PLOINKY_CGROUP_SUBTREE=${CGROUP_SUBTREE_PATH}`
-        || binds.length !== 1 || binds[0].RW !== false || binds[0].Source !== CGROUP_HELPER_SOURCE) {
-        throw cgroupUnavailable('agent helper/env contract mismatch');
-    }
+    if (env.length !== 1 || env[0] !== `PLOINKY_CGROUP_SUBTREE=${CGROUP_SUBTREE_PATH}`) throw cgroupUnavailable('agent provider env contract mismatch');
+    if (binds.length !== 1 || binds[0].RW !== false || binds[0].Source !== CGROUP_HELPER_SOURCE) throw cgroupUnavailable('agent read-only helper mount contract mismatch');
 }
 
 export function hasCgroupDelegationFootprint(record, inspected) {

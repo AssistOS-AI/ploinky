@@ -457,8 +457,10 @@ export async function withNetworkLifecycleLockAsync(callback, options = {}) {
 function defaultRun(runtime, args, options = {}) {
     const result = spawnSync(runtime, args, {
         encoding: 'utf8',
-        stdio: options.inherit ? 'inherit' : ['ignore', 'pipe', 'pipe'],
+        stdio: options.inherit ? ['inherit', 'inherit', 'pipe'] : ['ignore', 'pipe', 'pipe'],
+        ...(options.inherit ? { maxBuffer: 256 * 1024 } : {}),
     });
+    if (options.inherit && result.stderr) process.stderr.write(result.stderr);
     return {
         ok: result.status === 0 && !result.error,
         status: Number.isInteger(result.status) ? result.status : 1,
@@ -1033,12 +1035,26 @@ export function createNetworkLifecycleAdapter({
             }
             if (beforeStart) beforeStart({ plan, containerId: ownedContainerId, record: configured });
             let started;
+            let startError;
             try {
                 started = run(runtime, engineCommandArgs(commandPrefix, ['start', ownedContainerId]), { inherit: true });
+                if (!started.ok) {
+                    const error = new Error(`cannot start '${containerName}': ${failure(started)}`, { cause: started.error || undefined });
+                    if (started.error?.code) error.code = started.error.code;
+                    throw error;
+                }
+            } catch (error) {
+                startError = error;
+                throw error;
             } finally {
-                if (afterStart) afterStart({ plan, containerId: ownedContainerId, record: configured });
+                if (afterStart) {
+                    try { afterStart({ plan, containerId: ownedContainerId, record: configured }); }
+                    catch (error) {
+                        if (!startError) throw error;
+                        startError.message += `; post-start checkpoint failed: ${error.message}`;
+                    }
+                }
             }
-            if (!started.ok) throw new Error(`cannot start '${containerName}': ${failure(started)}`);
             const running = inspectContainer(ownedContainerId);
             if (!running || !(running.State?.Running === true || running.State?.Status === 'running')) {
                 throw new Error(`container '${containerName}' did not reach running state`);
@@ -1052,16 +1068,20 @@ export function createNetworkLifecycleAdapter({
             }
             return ownedContainerId;
         } catch (error) {
-            if (ownedContainerId) {
-                let current = null;
-                try { current = inspectContainer(ownedContainerId); } catch (_) {}
-                if (current
-                    && String(current?.Id || current?.ID || '') === ownedContainerId
-                    && hasRequiredLabels(labelsOf(current), exactLabels)) {
-                    assertCgroupCleanupEvidence({ containerId: ownedContainerId, inspected: current, workspaceRoot, ...cgroupCleanupOptions });
-                    execute(['rm', '-f', ownedContainerId]);
-                    if (!inspectContainer(ownedContainerId)) completeCgroupRemoval(ownedContainerId);
+            try {
+                if (ownedContainerId) {
+                    let current = null;
+                    try { current = inspectContainer(ownedContainerId); } catch (_) {}
+                    if (current
+                        && String(current?.Id || current?.ID || '') === ownedContainerId
+                        && hasRequiredLabels(labelsOf(current), exactLabels)) {
+                        assertCgroupCleanupEvidence({ containerId: ownedContainerId, inspected: current, workspaceRoot, ...cgroupCleanupOptions });
+                        execute(['rm', '-f', ownedContainerId]);
+                        if (!inspectContainer(ownedContainerId)) completeCgroupRemoval(ownedContainerId);
+                    }
                 }
+            } catch (cleanupError) {
+                error.message += `; failure cleanup could not complete exact candidate removal: ${cleanupError.message}`;
             }
             throw error;
         }
@@ -1264,8 +1284,12 @@ export function createNetworkLifecycleAdapter({
                     error.message += `; failure cleanup could not inspect candidate '${containerName}': ${inspectError.message}`;
                 }
                 if (candidateCreationAttempted && candidateInspectionComplete && !candidate) {
-                    if (candidateId) completeCgroupRemoval(candidateId);
-                    launchArtifactCleanupSafe = true;
+                    try {
+                        if (candidateId) completeCgroupRemoval(candidateId);
+                        launchArtifactCleanupSafe = true;
+                    } catch (cleanupError) {
+                        error.message += `; failure cleanup could not prove native-root absence: ${cleanupError.message}`;
+                    }
                 } else if (candidateCreationAttempted
                     && candidate
                     && hasRequiredLabels(labelsOf(candidate), agentLabels)) {
@@ -1276,21 +1300,25 @@ export function createNetworkLifecycleAdapter({
                         error.message += `; failure cleanup preserved candidate '${containerName}' because its immutable ID was unavailable`;
                     } else {
                         candidateId = inspectedId;
-                        assertCgroupCleanupEvidence({ containerId: candidateId, inspected: candidate, workspaceRoot, ...cgroupCleanupOptions });
-                        const removed = execute(['rm', '-f', candidateId]);
-                        if (!removed.ok && !missing(removed)) {
-                            error.message += `; failure cleanup could not remove candidate '${containerName}': ${failure(removed)}`;
-                        } else {
-                            try {
-                                const remaining = inspectContainer(candidateId);
-                                if (!remaining) {
-                                    completeCgroupRemoval(candidateId);
-                                    launchArtifactCleanupSafe = true;
+                        try {
+                            assertCgroupCleanupEvidence({ containerId: candidateId, inspected: candidate, workspaceRoot, ...cgroupCleanupOptions });
+                            const removed = execute(['rm', '-f', candidateId]);
+                            if (!removed.ok && !missing(removed)) {
+                                error.message += `; failure cleanup could not remove candidate '${containerName}': ${failure(removed)}`;
+                            } else {
+                                try {
+                                    const remaining = inspectContainer(candidateId);
+                                    if (!remaining) {
+                                        completeCgroupRemoval(candidateId);
+                                        launchArtifactCleanupSafe = true;
+                                    }
+                                    else error.message += `; failure cleanup preserved candidate '${containerName}' because immutable-ID absence was not proven`;
+                                } catch (inspectError) {
+                                    error.message += `; failure cleanup could not prove immutable-ID absence for '${containerName}': ${inspectError.message}`;
                                 }
-                                else error.message += `; failure cleanup preserved candidate '${containerName}' because immutable-ID absence was not proven`;
-                            } catch (inspectError) {
-                                error.message += `; failure cleanup could not prove immutable-ID absence for '${containerName}': ${inspectError.message}`;
                             }
+                        } catch (cleanupError) {
+                            error.message += `; failure cleanup could not complete exact candidate removal: ${cleanupError.message}`;
                         }
                     }
                 } else if (candidateCreationAttempted && candidate) {
