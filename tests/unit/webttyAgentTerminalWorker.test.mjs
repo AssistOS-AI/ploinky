@@ -21,6 +21,7 @@ import {
     waitForExactAgentPodmanClient,
 } from '../../cli/server/webtty/agentTerminalWorker.mjs';
 import { agentWorkerMessage } from '../../cli/server/webtty/agentWorkerProtocol.mjs';
+import { readAgentCleanupProcessIdentity } from '../../cli/server/webtty/agentProcessIdentity.mjs';
 
 const TERMINAL_ID = 'abcdefghijklmnopqrstuvwx';
 const CONTAINER_ID = 'a'.repeat(64);
@@ -685,6 +686,62 @@ test('hard PID/init/namespace contradictions cannot become successful after a la
         await h.worker.cleanup('requested');
         assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
         assert.equal(h.calls.drains, 1);
+    }
+});
+
+test('actual absence-reader contradictions stay latched while reparenting and read errors can be retried', async (t) => {
+    for (const phase of ['initial-scope', 'positive-proof']) {
+        for (const change of ['birth', 'namespace', 'parent', 'EACCES']) {
+            await t.test(`${phase}: ${change} then absence`, async () => {
+                const pid = phase === 'initial-scope' ? INNER.boxPid : CLIENT.pid;
+                let stats = 0;
+                let namespaces = 0;
+                const errors = [];
+                const fsApi = {
+                    readFile: async (file) => {
+                        if (file.endsWith('/status')) return Buffer.from(`NSpid:\t${pid}\t42\n`);
+                        stats += 1;
+                        if (stats > 2) throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+                        if (change === 'EACCES') {
+                            stats = 2;
+                            throw Object.assign(new Error('unknown'), { code: 'EACCES' });
+                        }
+                        const fields = ['S', stats === 2 && change === 'parent' ? 2 : 1,
+                            pid, pid, 34816, pid];
+                        while (fields.length < 19) fields.push(0);
+                        fields.push(stats === 2 && change === 'birth' ? 99999 : pid * 10);
+                        return Buffer.from(`${pid} (worker) ${fields.join(' ')} 0\n`);
+                    },
+                    readlink: async () => ++namespaces === 2 && change === 'namespace'
+                        ? 'pid:[9999]' : INNER.pidNamespace,
+                };
+                const read = async (selectedPid) => {
+                    if (selectedPid !== pid) return null;
+                    try {
+                        return await readAgentCleanupProcessIdentity(pid, { fsApi });
+                    } catch (error) {
+                        errors.push(error.category || error.code);
+                        throw error;
+                    }
+                };
+                const overrides = phase === 'initial-scope'
+                    ? { cleanupScopeAbsent: async () => await read(pid) === null }
+                    : { readCleanupIdentity: read };
+                const h = cleanupProofHarness(overrides);
+                h.worker.cleanupDeadlineMs = 300;
+                await h.worker.initialize(init());
+                await h.worker.launch();
+                await h.worker.cleanup('requested');
+                const hard = change === 'birth' || change === 'namespace';
+                assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, !hard);
+                assert.deepEqual(errors, [hard ? 'cleanup-process-replaced'
+                    : change === 'parent' ? 'cleanup-process-changed' : 'EACCES']);
+                assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+                assert.equal(h.processApi.sent.some((message) => message.type === 'error'), hard);
+                assert.equal(h.calls.signals, 1);
+                assert.equal(h.calls.drains, 1);
+            });
+        }
     }
 });
 

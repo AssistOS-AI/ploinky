@@ -592,8 +592,10 @@ export async function readAgentCleanupProcessIdentity(pid, {
     const after = parseAgentLinuxProcStat(await boundedProcFile(fsApi, statPath, {
         encoding: 'utf8', category: 'proc-stat',
     }), pid);
-    if (before.startToken !== after.startToken || before.parentPid !== after.parentPid
-        || namespaceBefore !== namespaceAfter) {
+    if (before.startToken !== after.startToken || namespaceBefore !== namespaceAfter) {
+        throw agentProcessIdentityError('cleanup-process-replaced');
+    }
+    if (before.parentPid !== after.parentPid) {
         throw agentProcessIdentityError('cleanup-process-changed');
     }
     const nspid = parseStatusVector(status, 'NSpid');
