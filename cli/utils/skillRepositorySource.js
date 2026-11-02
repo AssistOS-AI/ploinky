@@ -3,6 +3,7 @@ import path from 'node:path';
 import { workspaceRepositoryPath } from './repositorySource.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { workspaceCheckoutsAllowed } from './reposSource.mjs';
+import { skillsetMDParser } from './skillsetMDParser.mjs';
 
 // Recommendations use the workspace checkout before a managed repository.
 // This is discovery only: never clone, pull, or modify either source here.
@@ -63,6 +64,41 @@ function hasAgentLibDescriptors(directory) {
             && hasAgentLibDescriptors(path.join(directory, entry.name))) return true;
     }
     return false;
+}
+
+const SKILLSETS_MAX_BYTES = 1024 * 1024;
+
+// A skill is a real skills/<folder> holding a SKILL.md file, named by its folder. SKILL.md is never read.
+function listSkillNames(source) {
+    const skillsRoot = path.join(source, 'skills');
+    if (!fs.lstatSync(skillsRoot, { throwIfNoEntry: false })?.isDirectory()) return [];
+    return fs.readdirSync(skillsRoot, { withFileTypes: true })
+        .filter(entry => entry.isDirectory() && !entry.name.startsWith('.')
+            && fs.lstatSync(path.join(skillsRoot, entry.name, 'SKILL.md'), { throwIfNoEntry: false })?.isFile())
+        .map(entry => entry.name)
+        .sort((left, right) => left.localeCompare(right));
+}
+
+function readSkillsetDefinitions(source, skills) {
+    const file = path.join(source, 'skillsets.md');
+    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!stat) return [];
+    if (!stat.isFile() || stat.size > SKILLSETS_MAX_BYTES) throw new Error('Invalid skillsets.md: expected a regular file of at most 1 MiB');
+    return skillsetMDParser(fs.readFileSync(file, 'utf8'), skills);
+}
+
+// The skills and root skillsets.md declarations of one local checkout. A broken declaration is
+// reported as a warning, so it cannot hide the repository's skills or fail the whole listing.
+export function readRepositorySkillCatalog(source) {
+    const catalog = { skills: [], skillsets: [], warnings: [] };
+    try {
+        catalog.skills = listSkillNames(source);
+        catalog.skillsets = readSkillsetDefinitions(source, catalog.skills);
+    } catch (error) {
+        catalog.warnings.push(['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'ELOOP'].includes(error.code)
+            ? `Repository skills could not be read (${error.code})` : error.message);
+    }
+    return catalog;
 }
 
 export function listWorkspaceSkillRepositories({ workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {

@@ -3,7 +3,7 @@ import { workspaceRepositories } from './repositorySource.mjs';
 import { workspaceCheckoutsAllowed } from './reposSource.mjs';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { listWorkspaceSkillRepositories, resolveSkillRepositorySource } from './skillRepositorySource.js';
+import { listWorkspaceSkillRepositories, readRepositorySkillCatalog, resolveSkillRepositorySource } from './skillRepositorySource.js';
 import { PLOINKY_WORKSPACE_ROOT, PLOINKY_DIR } from './config.js';
 import { listAgentRepositoryNames, resolveAgentRepositoryPath, workspaceAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { isAgentRepositoryUnregistered, setAgentRepositoryRegistered } from './agentRepositoryRegistration.mjs';
@@ -992,7 +992,11 @@ export function listRepositorySources() {
         const agentSource = workspaceAgentRepositoryPath(name);
         const resolved = agentSource ? { source: fs.realpathSync(agentSource), origin: 'workspace' }
             : resolveSkillRepositorySource(name, url);
-        return { name, repoName: name, url, ...resolved, kind: skills.get(name)?.kind || classifyRepoKind(name),
-            warnings: skills.get(name)?.warnings || [] };
+        const kind = skills.get(name)?.kind || classifyRepoKind(name);
+        const warnings = skills.get(name)?.warnings || [];
+        if (!['skills', 'mixed'].includes(kind)) return { name, repoName: name, url, ...resolved, kind, warnings };
+        const catalog = resolved.origin === 'remote' ? { skills: [], skillsets: [], warnings: [] } : readRepositorySkillCatalog(resolved.source);
+        return { name, repoName: name, url, ...resolved, kind, skills: catalog.skills, skillsets: catalog.skillsets,
+            warnings: [...warnings, ...catalog.warnings] };
     });
 }
