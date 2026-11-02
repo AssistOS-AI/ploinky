@@ -21,7 +21,8 @@ import {
     waitForExactAgentPodmanClient,
 } from '../../cli/server/webtty/agentTerminalWorker.mjs';
 import { agentWorkerMessage } from '../../cli/server/webtty/agentWorkerProtocol.mjs';
-import { readAgentCleanupProcessIdentity } from '../../cli/server/webtty/agentProcessIdentity.mjs';
+import { agentCleanupScopeAbsent, captureAgentCleanupScope,
+    readAgentCleanupProcessIdentity } from '../../cli/server/webtty/agentProcessIdentity.mjs';
 
 const TERMINAL_ID = 'abcdefghijklmnopqrstuvwx';
 const CONTAINER_ID = 'a'.repeat(64);
@@ -596,6 +597,37 @@ function cleanupProofHarness(overrides = {}) {
     h.worker.cleanupDeadlineMs = 100;
     return { ...h, calls };
 }
+
+test('a captured permanent private zombie keeps ready cleanup unproven through its deadline', async () => {
+    const zombie = { pid: 4310, state: 'Z', startToken: 'linux-proc:43100', parentPid: INNER.boxPid,
+        pidNamespace: 'pid:[9010]', nspid: [4310, 55, 1] };
+    const targetInit = { pid: INNER.containerInitBoxPid, state: 'S', startToken: INNER.containerInitStartToken,
+        parentPid: 1, pidNamespace: INNER.pidNamespace, nspid: [INNER.containerInitBoxPid, 1] };
+    const records = new Map([targetInit, markerWrapperIdentity(), zombie].map(value => [value.pid, value]));
+    const options = {
+        fsApi: { readdir: async () => [...records.keys()].map(pid => ({ name: String(pid), isDirectory: () => true })) },
+        readIdentity: async pid => records.get(pid) || null,
+        readAnchorIdentity: async pid => records.get(pid),
+    };
+    let scope;
+    const h = cleanupProofHarness({
+        captureCleanupScope: async record => { scope = await captureAgentCleanupScope(record, options); return scope; },
+        cleanupScopeAbsent: captured => agentCleanupScopeAbsent(captured, options),
+        drainExec: () => { h.calls.drains++; records.delete(INNER.boxPid); },
+    });
+    h.worker.cleanupDeadlineMs = 120;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    const started = Date.now();
+    await h.worker.cleanup('requested');
+    assert.equal(scope?.namespaceInits[0].state, 'Z');
+    assert.equal(Date.now() - started >= h.worker.cleanupDeadlineMs, true);
+    assert.equal(h.calls.reads >= 2, true);
+    assert.equal(h.calls.signals, 1); assert.equal(h.calls.drains, 1);
+    assert.equal(h.processApi.sent.find(message => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.processApi.sent.filter(message => message.type === 'exit').length, 1);
+    assert.equal(h.ptyState.disposed, 0);
+});
 
 test('ready positive proof fails closed for every live or unknown evidence surface', async (t) => {
     const extraMember = { ...markerWrapperIdentity(), pid: 4310, startToken: 'linux-proc:43100' };

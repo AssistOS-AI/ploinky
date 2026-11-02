@@ -137,6 +137,70 @@ test('cleanup captures native descendants and private namespace PID 1 without gr
     assert.equal(await agentCleanupScopeAbsent(scope, f.options), true);
 });
 
+test('cleanup capture retains stable private zombies until they positively disappear', async (t) => {
+    for (const role of ['private-init', 'private-child']) {
+        await t.test(role, async () => {
+            const f = cleanupFixture();
+            const zombie = role === 'private-init' ? f.privateInit : f.child;
+            f.records.set(zombie.pid, { ...zombie, state: 'Z' });
+            if (role === 'private-init') f.records.delete(f.child.pid);
+            const scope = await captureAgentCleanupScope(f.record, f.options);
+            assert.equal(scope.descendants.find(value => value.pid === zombie.pid)?.state, 'Z');
+            if (role === 'private-init') assert.equal(scope.namespaceInits[0].state, 'Z');
+            for (const member of scope.descendants) if (member.pid !== zombie.pid) f.records.delete(member.pid);
+            assert.equal(await agentCleanupScopeAbsent(scope, f.options), false, 'a surviving zombie is still present');
+            f.records.delete(zombie.pid);
+            assert.equal(await agentCleanupScopeAbsent(scope, f.options), true);
+        });
+    }
+});
+
+test('stable zombie capture never admits the wrapper, container init or same-namespace members', async (t) => {
+    const mutations = {
+        wrapper: f => f.records.set(f.wrapper.pid, { ...f.wrapper, state: 'Z' }),
+        'container-init': f => f.records.set(f.init.pid, { ...f.init, state: 'Z' }),
+        'same-namespace-child': f => f.records.set(5005, { ...identity({ pid: 5005,
+            parentPid: f.wrapper.pid, nspid: [5005, 45] }), state: 'Z' }),
+        'private-depth-not-deeper': f => f.records.set(f.privateInit.pid,
+            { ...f.privateInit, state: 'Z', nspid: [f.privateInit.pid, 1] }),
+        'private-namespace-without-init': f => f.records.set(f.privateInit.pid,
+            { ...f.privateInit, state: 'Z', nspid: [f.privateInit.pid, 43, 2] }),
+    };
+    for (const [name, mutate] of Object.entries(mutations)) {
+        await t.test(name, async () => {
+            const f = cleanupFixture(); mutate(f);
+            await assert.rejects(captureAgentCleanupScope(f.record, f.options), error =>
+                /^WEBTTY_AGENT_PROCESS_IDENTITY_(?:STALE|UNPROVEN)$/.test(error.code));
+        });
+    }
+});
+
+test('private zombie capture rejects state transitions and any changed identity component', async (t) => {
+    const mutations = {
+        'live-to-zombie': value => ({ ...value, state: 'Z' }),
+        'zombie-to-live': value => ({ ...value, state: 'S' }),
+        pid: value => ({ ...value, pid: 5999 }),
+        birth: value => ({ ...value, startToken: 'linux-proc:99999' }),
+        parent: value => ({ ...value, parentPid: 1 }),
+        namespace: value => ({ ...value, pidNamespace: 'pid:[9999]' }),
+        nspid: value => ({ ...value, nspid: [value.pid, 99, 1] }),
+        'malformed-nspid': value => ({ ...value, nspid: [value.pid, 0] }),
+    };
+    for (const [name, mutate] of Object.entries(mutations)) {
+        await t.test(name, async () => {
+            const f = cleanupFixture(); f.records.delete(f.child.pid);
+            f.records.set(f.privateInit.pid, { ...f.privateInit, state: name === 'live-to-zombie' ? 'S' : 'Z' });
+            const originalRead = f.options.readIdentity;
+            let reads = 0;
+            f.options.readIdentity = async pid => {
+                const value = await originalRead(pid);
+                return pid === f.privateInit.pid && ++reads === 2 ? mutate(value) : value;
+            };
+            await assert.rejects(captureAgentCleanupScope(f.record, f.options), { category: 'cleanup-scope-changed' });
+        });
+    }
+});
+
 test('complete namespace scan vetoes an uncaptured setsid/reparented private child', async () => {
     const f = cleanupFixture();
     const scope = await captureAgentCleanupScope(f.record, f.options);

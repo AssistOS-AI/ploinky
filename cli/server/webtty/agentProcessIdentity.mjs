@@ -631,8 +631,10 @@ async function scanCleanupProcesses({ procRoot = '/proc', fsApi = fs,
     return identities;
 }
 
-function sameCleanupIdentity(current, expected, { parent = false } = {}) {
-    return current && current.state !== 'Z' && current.pid === expected.pid
+function sameCleanupIdentity(current, expected, { parent = false, allowStableZombie = false } = {}) {
+    const expectedZombie = allowStableZombie && expected.state === 'Z';
+    return current && (expectedZombie ? current.state === 'Z' : current.state !== 'Z')
+        && current.pid === expected.pid
         && current.startToken === expected.startToken
         && current.pidNamespace === expected.pidNamespace
         && exactArgv(current.nspid, expected.nspid)
@@ -696,10 +698,16 @@ export async function captureAgentCleanupScope(record, options = {}) {
         }
         return inits[0];
     });
+    const capturedPrivateNamespaces = new Set(namespaceInits.map(entry => entry.pidNamespace));
     const deadline = { deadlineAt: Date.now() + PROC_SCAN_TIMEOUT_MS };
     for (const expected of descendants) {
         const current = await boundedProcScanCall(readIdentity(expected.pid, options), deadline);
-        if (!sameCleanupIdentity(current, expected, { parent: true })) {
+        const privateMember = expected.pidNamespace !== record.pidNamespace
+            && expected.nspid.length > record.nspid.length
+            && capturedPrivateNamespaces.has(expected.pidNamespace);
+        // Retain stable private zombies as presence evidence until they are reaped.
+        if ((expected.state === 'Z' && !privateMember)
+            || !sameCleanupIdentity(current, expected, { parent: true, allowStableZombie: privateMember })) {
             throw agentProcessIdentityError('cleanup-scope-changed');
         }
     }
