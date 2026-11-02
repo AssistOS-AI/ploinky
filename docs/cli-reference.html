@@ -287,9 +287,12 @@ restart MyAPI --accept-failed-drain &lt;container-id&gt;
                         
                         <h3>var</h3>
                         <p>Set a workspace variable (stored in .ploinky/.secrets).</p>
-                        <pre><code>var &lt;VAR&gt; &lt;value&gt;</code></pre>
+                        <pre><code>var &lt;VAR&gt; &lt;value&gt;
+var &lt;VAR&gt; --stdin</code></pre>
+                        <p><code>--stdin</code> takes the value from piped input and removes one trailing newline, so a secret never appears in a process list. A terminal is refused.</p>
                         <pre><code># Examples
-var API_KEY sk-123456789</code></pre>
+var API_KEY sk-123456789
+printf %s "$API_KEY" | ploinky var API_KEY --stdin</code></pre>
 
                         <h3>vars</h3>
                         <p>List all workspace variables.</p>
@@ -464,6 +467,12 @@ MCP ping succeeded.</code></pre>
                         <p>In the Ploinky REPL, <code>destroy</code> removes workspace runtimes and regenerated dependencies while leaving the outer Box and <code>.data/</code> homes in place. From a host terminal, <code>ploinky destroy</code> removes the exact managed outer Box and discards its nested runtime layer and inner volumes, then removes this workspace's host GPU-grant and hardware-limits records from <code>&lt;workspace&gt;/.ploinky-box</code>, so the next start begins from manifest defaults. Workspace files, persistent agent homes (<code>.data/</code>), <code>.ploinky/data/</code>, <code>.env</code> and the saved Router binding remain; regenerated dependency and image caches are removed only when the corresponding cache-deletion option selects them.</p>
                         <p>Upgrading has no backward compatibility: a Box created by an older Ploinky fails the compatibility check, so run <code>ploinky destroy</code> and then <code>ploinky start</code>. State in the old <code>~/.ploinky-box</code> is ignored; re-apply <code>ploinky bind</code>, <code>ploinky gpu grant</code> or <code>ploinky gpu revoke</code> and hardware limits afterwards. If an older Ploinky already destroyed the old Box before this version ever ran, remove <code>&lt;workspace&gt;/.ploinky-box</code> (host state only) before the first start. This never means deleting <code>.data/</code>, <code>.ploinky/data/</code> or <code>.env</code>: they hold user data and keys, and <code>destroy</code> and <code>destroy --delete-cache</code> keep them.</p>
                         <pre><code>destroy</code></pre>
+                        <p>From a host terminal, <code>ploinky destroy --delete-data --confirm-workspace PATH</code> also deletes everything in the workspace without prompting: documents, <code>.data/</code>, <code>.env</code> and the encryption identity. An empty <code>.ploinky</code> and the <code>.ploinky-box</code> skeleton remain. <code>PATH</code> must be exactly this workspace. It is refused, with nothing written, for a directory that is not a Ploinky workspace, the home directory or an ancestor of it, a workspace whose data directories or <code>.env</code> are links, a workspace that overlaps the running Ploinky checkout, a mount inside it, or another Box or running container using it. A failed removal exits 1 and running it again finishes. Output gives counts and never file names.</p>
+
+                        <h3>edge set</h3>
+                        <p>From a host terminal, <code>ploinky edge set FILE|-</code> saves the host-owned <code>.ploinky/edge-desired.json</code> from a file or piped input, atomically and privately, under the workspace lock. It needs no Box and activates nothing: the next <code>ploinky start</code> stages the file, compiles it and activates the routing generation.</p>
+                        <pre><code>ploinky edge set edge-desired.json
+ploinky edge set - &lt; edge-desired.json</code></pre>
 
                         <h3>unlock</h3>
                         <p>From a host terminal, <code>ploinky unlock [--force-holder PID@MACHINE]</code> removes a workspace lock, its reclaim guard or the hardware store lock that a command no longer running left behind in <code>&lt;workspace&gt;/.ploinky-box</code>. It removes a lock only when its holder is gone; a holder that cannot be checked needs the exact <code>--force-holder PID@MACHINE</code> value printed by the busy error, which must name only a holder that is really gone (naming one that is still running can let two commands hold the lock at once), and a holder classified as running is never removed. Locks with leftover contents, no or a malformed owner record, or that are not private directories are listed with manual steps and never removed, and the command exits 1. It does not wait for the lock it is recovering and does not accept <code>--allow-host-process</code>. Unlock commands for one workspace run one at a time under <code>.ploinky-box/locks/unlock.lock</code>: a second one waits up to 2 seconds, then refuses and names the running one. The lock of an unlock that is no longer running is taken over automatically; a stuck <code>.ploinky-box/locks/unlock.lock.reclaim</code> is never removed by unlock, which lists it with the <code>rm -r</code> step to run by hand.</p>

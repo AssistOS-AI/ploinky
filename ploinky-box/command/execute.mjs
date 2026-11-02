@@ -20,11 +20,12 @@ export function buildContainerExecArgs(containerId, commandArgv, {
     outputIsTty = false,
     shell = false,
     logStream = false,
+    forwardStdin = false,
     colorOutput = false,
 } = {}) {
     const workdir = boxWorkspaceExecOptions(workspaceRoot);
     const args = ['container', 'exec'];
-    if (logStream) {
+    if (logStream || forwardStdin) {
         args.push('--interactive');
     } else if (interactive && inputIsTty && outputIsTty) {
         args.push('--interactive', '--tty');
@@ -50,12 +51,12 @@ export function buildContainerExecArgs(containerId, commandArgv, {
 
 export function executeProcess(command, args, {
     env = buildEngineProcessEnvironment(),
+    input,
     spawnSyncImpl = spawnSync,
 } = {}) {
-    const result = spawnSyncImpl(command, args, {
-        stdio: 'inherit',
-        env,
-    });
+    const result = spawnSyncImpl(command, args, input === undefined
+        ? { stdio: 'inherit', env }
+        : { stdio: ['pipe', 'inherit', 'inherit'], input, env });
     if (Number.isInteger(result.status)) return result.status;
     if (result.signal) return signalExitCode(result.signal);
     return 1;

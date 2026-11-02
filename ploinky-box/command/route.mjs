@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import { PloinkyBoxError } from '../errors.mjs';
 import { stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
 import { parseUpdateRequest, UpdateRequestError } from '../../cli/commands/updateRequest.js';
@@ -18,6 +20,25 @@ function requireNoArgs(parsed, command) {
     }
 }
 
+const DESTROY_DELETE_DATA_USAGE = 'Usage: ploinky destroy --delete-data --confirm-workspace ABSOLUTE_WORKSPACE_PATH';
+
+// Irreversible, so the form is exact. The path is the confirmation; the
+// supervisor compares it with the selected workspace.
+function routeDestroyDeleteData(parsed) {
+    if (parsed.allowHostProcesses?.length) {
+        throw routeError('destroy: --allow-host-process is not supported with --delete-data');
+    }
+    if (parsed.commandArgs.includes('--delete-cache')) {
+        throw routeError('destroy: --delete-data already deletes the cache; do not combine it with --delete-cache');
+    }
+    const args = [...parsed.commandArgs];
+    args.splice(args.indexOf('--delete-data'), 1);
+    if (args.length !== 2 || args[0] !== '--confirm-workspace' || !path.isAbsolute(args[1])) {
+        throw routeError(DESTROY_DELETE_DATA_USAGE);
+    }
+    return Object.freeze({ kind: 'destroy', deleteCache: false, deleteData: true, confirmWorkspace: args[1] });
+}
+
 function routeDestroy(parsed) {
     if (parsed.dryRun) {
         throw routeError('destroy: --dry-run is not supported');
@@ -31,6 +52,9 @@ function routeDestroy(parsed) {
     if (parsed.commandArgs.length === 0) {
         return Object.freeze({ kind: 'destroy', deleteCache: false });
     }
+    if (parsed.commandArgs.includes('--delete-data')) {
+        return routeDestroyDeleteData(parsed);
+    }
     if (parsed.commandArgs[0] !== '--delete-cache') {
         throw routeError(`destroy: unexpected trailing argument '${parsed.commandArgs[0]}'`);
     }
@@ -41,6 +65,28 @@ function routeDestroy(parsed) {
         throw routeError(message);
     }
     return Object.freeze({ kind: 'destroy', deleteCache: true });
+}
+
+// Saving the host-owned edge input is host work: no Box is needed and no
+// routing generation is activated until the next start.
+function routeEdge(parsed) {
+    if (parsed.dryRun) {
+        throw routeError('edge: --dry-run is not supported');
+    }
+    if (parsed.explicitPort !== null) {
+        throw routeError('edge: --port is not supported');
+    }
+    if (parsed.explicitMediaPort !== null) {
+        throw routeError('edge: --udp-port is not supported');
+    }
+    const [action, source, extra] = parsed.commandArgs;
+    if (action !== 'set' || !source) {
+        throw routeError('Usage: ploinky edge set FILE|-');
+    }
+    if (extra !== undefined) {
+        throw routeError(`edge set: unexpected trailing argument '${extra}'`);
+    }
+    return Object.freeze({ kind: 'edge-set', source });
 }
 
 const DEBUG_TOKENS = new Set(['--debug', '-d']);
@@ -163,6 +209,9 @@ export function routeOuterCommand(parsed, options = {}) {
     if (parsed.command === 'destroy') {
         return routeDestroy(parsed);
     }
+    if (parsed.command === 'edge') {
+        return routeEdge(parsed);
+    }
     if (parsed.command === 'update') {
         return routeUpdate(parsed, options);
     }
@@ -243,8 +292,14 @@ export function routeOuterCommand(parsed, options = {}) {
             coreArgv: parsed.forwardingArgv,
         });
     }
+    // The secret travels on stdin so it never reaches a process argument list.
+    const stdinValue = parsed.command === 'var'
+        && parsed.commandArgs.length === 2
+        && parsed.commandArgs[1] === '--stdin'
+        && !parsed.dryRun;
     return Object.freeze({
         kind: parsed.dryRun ? 'dry-run' : 'generic',
         coreArgv: parsed.forwardingArgv,
+        ...(stdinValue ? { stdinValue: true } : {}),
     });
 }

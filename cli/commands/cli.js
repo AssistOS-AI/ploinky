@@ -67,6 +67,8 @@ import { importAgentLib } from '../../agentlib/runtime.mjs';
 import {
     handleVarsCommand,
     handleVarCommand,
+    handleVarStdinCommand,
+    isVarStdinRequest,
     handleEchoCommand,
     handleExposeCommand,
 } from './envVarCommands.js';
@@ -266,7 +268,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             handleVarsCommand();
             break;
         case 'var':
-            handleVarCommand(options);
+            if (isVarStdinRequest(options)) await handleVarStdinCommand(options[0]);
+            else handleVarCommand(options);
             break;
         case 'echo':
             handleEchoCommand(options);

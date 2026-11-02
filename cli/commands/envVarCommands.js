@@ -2,6 +2,7 @@ import path from 'path';
 import { showHelp } from './help.js';
 import * as envSvc from '../utils/security/secretVars.js';
 import { findAgent } from '../utils/utils.js';
+import { VAR_STDIN_MAX_BYTES, decodeVarStdinValue } from './varStdinValue.js';
 import {
     assertActiveEdgeRoutingSourcesCurrent,
     inactivateEdgeRoutingGeneration,
@@ -10,6 +11,7 @@ import {
 } from '../sandbox/edgeGeneration.js';
 
 const INLINE_ASSIGNMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const VAR_STDIN_FLAG = '--stdin';
 
 function parseInlineAssignmentToken(token) {
     if (typeof token !== 'string') return null;
@@ -72,6 +74,31 @@ function handleVarCommand(options = []) {
     setVarValue(name, value);
 }
 
+function isVarStdinRequest(options = []) {
+    return options.length === 2 && options[1] === VAR_STDIN_FLAG;
+}
+
+// The value comes from stdin so a secret never reaches a process argument list.
+async function handleVarStdinCommand(name, input = process.stdin) {
+    if (parseInlineAssignmentToken(name)) {
+        throw new Error('var --stdin takes a variable name, not an assignment.');
+    }
+    if (input.isTTY === true) {
+        throw new Error('var --stdin reads piped input, not a terminal.');
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of input) {
+        const bytes = Buffer.from(chunk);
+        size += bytes.length;
+        if (size > VAR_STDIN_MAX_BYTES) {
+            throw new Error(`var --stdin accepts at most ${VAR_STDIN_MAX_BYTES} bytes.`);
+        }
+        chunks.push(bytes);
+    }
+    setVarValue(name, decodeVarStdinValue(Buffer.concat(chunks)));
+}
+
 function handleEchoCommand(options = []) {
     if (!options[0]) { showHelp(); throw new Error('Usage: echo <VAR|$VAR>'); }
     const output = envSvc.echoVar(options[0]);
@@ -132,6 +159,8 @@ function handleExposeCommand(options = []) {
 export {
     handleVarsCommand,
     handleVarCommand,
+    handleVarStdinCommand,
+    isVarStdinRequest,
     handleEchoCommand,
     handleExposeCommand,
 };

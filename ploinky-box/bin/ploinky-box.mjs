@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -10,6 +11,7 @@ import { updateHostPloinkySource } from '../command/hostUpdate.mjs';
 import { resolvePloinkyUpdateScope } from '../../cli/commands/ploinkyUpdateScope.js';
 import { resolveUpdateFolderScope, withDefaultUpdateFolder } from '../../cli/commands/updateRequest.js';
 import { buildUpdateResult, createOperationRecord } from '../../cli/commands/updateOutcome.js';
+import { VAR_STDIN_MAX_BYTES, decodeVarStdinValue } from '../../cli/commands/varStdinValue.js';
 import { agentLibIdentity } from '../../agentlib/contract.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createUpdateHostState } from '../update/hostState.mjs';
@@ -20,6 +22,7 @@ import {
     discardRelaunchHandoff,
 } from '../update/relaunchHandoff.mjs';
 import { BOX_IMAGE_OVERRIDE_ENV, BOX_IMAGE_REFERENCE, BOX_LABELS } from '../constants.mjs';
+import { BOX_EDGE_DESIRED_MAX_BYTES } from '../edgeDesired.mjs';
 import { buildEngineProcessEnvironment } from '../process.mjs';
 import { isLoopbackRouterBinding } from '../routerBinding.mjs';
 import {
@@ -101,6 +104,16 @@ Commands:
   ploinky destroy --delete-cache  Remove the outer Box and those records, and delete
                                   .ploinky/box/dependencies and .ploinky/box/images without prompting;
                                   with no Box present, also .ploinky/agentlib
+  ploinky destroy --delete-data --confirm-workspace PATH
+                                  Remove the outer Box, then irreversibly delete everything in this
+                                  workspace without prompting: documents, .data, .env, and the
+                                  encryption identity. PATH must be exactly this workspace. Refused
+                                  unless it is a Ploinky workspace with nothing else using it, and
+                                  when the running Ploinky checkout lies inside it
+  ploinky edge set FILE|-         Save the host-owned .ploinky/edge-desired.json from FILE or piped
+                                  input; no Box needed, and it takes effect on the next start
+  ploinky var NAME --stdin        Set a variable from piped input, so a secret never appears in a
+                                  process list; removes one trailing newline
   ploinky cli                     Open Bash in the Box
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
   ploinky logs tail [TARGET]      Follow Router or agent logs; inspect-only
@@ -199,10 +212,45 @@ If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/
 
 function outerDebug(parsed, route, stdout) {
     if (!parsed.debug.enabled) return;
-    if (['help', 'status', 'stop', 'destroy', 'bash', 'dry-run', 'bind', 'bind-dry-run',
+    if (['help', 'status', 'stop', 'destroy', 'edge-set', 'bash', 'dry-run', 'bind', 'bind-dry-run',
         'gpu-status', 'gpu-grant', 'gpu-revoke', 'limits-status', 'limits-clear', 'unlock'].includes(route.kind)) {
         stdout.write('[INFO] Debug mode enabled.\n');
     }
+}
+
+// Operator input is read completely before the Box is prepared or a lock is
+// taken: no prepared child can consume it, and bad input changes nothing.
+async function readOperatorInput(input, label, maxBytes) {
+    if (input?.isTTY === true) {
+        throw new PloinkyBoxError(`${label} reads piped input, not a terminal`, { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of input) {
+        const bytes = Buffer.from(chunk);
+        size += bytes.length;
+        if (size > maxBytes) {
+            throw new PloinkyBoxError(`${label} accepts at most ${maxBytes} bytes`, { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
+        }
+        chunks.push(bytes);
+    }
+    return Buffer.concat(chunks);
+}
+
+function readEdgeSetFile(source, launchDirectory) {
+    const file = path.resolve(launchDirectory, source);
+    const stat = fs.statSync(file);
+    if (!stat.isFile()) {
+        throw new PloinkyBoxError('ploinky edge set takes a regular file or - for piped input', {
+            code: 'PLOINKY_BOX_ARGUMENT_INVALID',
+        });
+    }
+    if (stat.size > BOX_EDGE_DESIRED_MAX_BYTES) {
+        throw new PloinkyBoxError(`ploinky edge set accepts at most ${BOX_EDGE_DESIRED_MAX_BYTES} bytes`, {
+            code: 'PLOINKY_BOX_ARGUMENT_INVALID',
+        });
+    }
+    return fs.readFileSync(file);
 }
 
 function executePrepared(prepared, coreArgv, {
@@ -215,6 +263,7 @@ function executePrepared(prepared, coreArgv, {
     colorOutput = false,
     engineEnv,
     launchCwd,
+    stdinValue,
 }) {
     return execute(prepared.engine.name, buildContainerExecArgs(
         prepared.containerId,
@@ -227,11 +276,12 @@ function executePrepared(prepared, coreArgv, {
             shell,
             interactive,
             logStream,
+            forwardStdin: stdinValue !== undefined,
             colorOutput,
             inputIsTty: input.isTTY === true,
             outputIsTty: output.isTTY === true,
         },
-    ), { env: engineEnv });
+    ), stdinValue === undefined ? { env: engineEnv } : { env: engineEnv, input: stdinValue });
 }
 
 const DEPLOYMENT_DIAGNOSTIC_HINT = 'Run ploinky diagnose from this workspace for prerequisite, storage, and security-profile diagnostics.';
@@ -264,8 +314,13 @@ export async function runOuterCli(argv, options = {}) {
         try { command = parseOuterArguments(argv).command; } catch (_) {}
         // Host-only commands: lock recovery included, since the Box masks the
         // host state that holds the locks.
-        if (command === 'diagnose' || command === 'repair' || command === 'unlock') {
+        if (command === 'diagnose' || command === 'repair' || command === 'unlock' || command === 'edge') {
             errorOutput.write(`ploinky ${command} must run on the physical host, outside the Box. Exit this shell and run ploinky ${command} from the host workspace.\n`);
+            return 1;
+        }
+        // The core destroy ignores options it does not know.
+        if (command === 'destroy' && argv.includes('--delete-data')) {
+            errorOutput.write('ploinky destroy --delete-data must run on the physical host, outside the Box. Exit this shell and run it from the host workspace.\n');
             return 1;
         }
         return execute('/opt/ploinky/bin/ploinky-local', [...argv], { env });
@@ -310,12 +365,18 @@ export async function runOuterCli(argv, options = {}) {
         }
         return report.exitCode;
     }
+    // Refused input is an argument problem, not a deployment one to diagnose.
+    const stdinValue = route.stdinValue
+        ? await readOperatorInput(options.input ?? process.stdin, 'ploinky var --stdin', VAR_STDIN_MAX_BYTES)
+        : undefined;
+    if (stdinValue !== undefined) decodeVarStdinValue(stdinValue);
     const dispatch = { relaunched: false, reported: false };
     try {
         const exitCode = await runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch, {
             ...options,
             env,
             updateHandoff,
+            stdinValue,
         });
         // A structured update result already names its failed phases.
         if (exitCode !== 0 && DEPLOYMENT_ROUTES.has(route.kind) && !dispatch.relaunched && !dispatch.reported) {
@@ -348,6 +409,7 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     handoffParentPid = process.ppid,
     handoffNow,
     onUpdateResult,
+    stdinValue,
 } = {}) {
     const selectedSupervisor = supervisor || createBoxSupervisor({
         env, launchCwd: launchDirectory, allowHostProcesses: parsed.allowHostProcesses,
@@ -408,12 +470,13 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
         const container = status.ownership?.handles?.container;
         // An absent Box still needs locked cleanup of retained current markers.
         // Keep unsupported/ambiguous observations read-only.
-        if (!container && !route.deleteCache && status.state !== 'absent') {
+        if (!container && !route.deleteCache && !route.deleteData && status.state !== 'absent') {
             output.write(formatBoxStatus(status));
             return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
         }
         const destroyed = await selectedSupervisor.runDestroyTransaction(container?.id || null, {
             deleteCache: route.deleteCache,
+            ...(route.deleteData ? { deleteData: true, confirmWorkspace: route.confirmWorkspace } : {}),
         });
         const removedRecords = destroyed?.removedRecords || [];
         output.write(
@@ -427,6 +490,21 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
                 + `${deletedPaths.length > 0 ? deletedPaths.join(', ') : 'nothing remained to delete'}.\n`,
             );
         }
+        if (route.deleteData) {
+            const removedEntries = destroyed?.deletedWorkspace?.removedEntries ?? 0;
+            output.write(
+                `The workspace data of ${status.identity.instance} was deleted: ${removedEntries} entries removed. `
+                + 'An empty .ploinky and the .ploinky-box skeleton remain.\n',
+            );
+        }
+        return 0;
+    }
+    if (route.kind === 'edge-set') {
+        const bytes = route.source === '-'
+            ? await readOperatorInput(input, 'ploinky edge set', BOX_EDGE_DESIRED_MAX_BYTES)
+            : readEdgeSetFile(route.source, launchDirectory);
+        const saved = await selectedSupervisor.runEdgeSetTransaction(bytes);
+        output.write(`Saved ${saved.path} (sha256 ${saved.digest}). It takes effect on the next ploinky start.\n`);
         return 0;
     }
     if (route.kind === 'bind-dry-run') {
@@ -579,6 +657,7 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
         interactive: ['repl', 'agent-cli'].includes(route.kind),
         launchCwd: launchDirectory,
         engineEnv,
+        stdinValue,
     });
 }
 

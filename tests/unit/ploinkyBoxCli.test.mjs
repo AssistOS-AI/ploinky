@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import test from 'node:test';
 
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
@@ -87,6 +88,10 @@ function fakeSupervisor(events, { statusState = 'absent', removedRecords = null 
                     : [],
                 removedRecords: removedRecords ? [...removedRecords] : [],
             };
+        },
+        runEdgeSetTransaction: async (bytes) => {
+            events.push(['edge-set', Buffer.from(bytes).toString()]);
+            return { path: `${WORKSPACE_ROOT}/.ploinky/edge-desired.json`, digest: 'd'.repeat(64), size: bytes.length };
         },
         inspectBoxStatus: () => { events.push('status'); return status; },
         planDryRun: (options) => { events.push(['dry-run', options]); return { mutationPerformed: false }; },
@@ -1347,6 +1352,96 @@ test('destroy --delete-cache runs without prompting and works without a containe
         assert.match(output.value(), /\.ploinky\/box\/images/);
         assert.doesNotMatch(output.value(), /named volumes/);
     }
+});
+
+test('destroy --delete-data passes the confirmation and reports counts, even with no container', async () => {
+    for (const statusState of ['running-initialized', 'absent']) {
+        const events = [];
+        const output = bufferStream();
+        const supervisor = fakeSupervisor(events, { statusState });
+        const original = supervisor.runDestroyTransaction;
+        supervisor.runDestroyTransaction = async (id, options) => ({
+            ...(await original(id, options)),
+            deletedWorkspace: { removedEntries: 7 },
+        });
+        const code = await runOuterCli(['destroy', '--delete-data', '--confirm-workspace', WORKSPACE_ROOT], {
+            env: {}, input: {}, output, errorOutput: bufferStream(), supervisor, detectInsideBox: () => false,
+        });
+        assert.equal(code, 0);
+        assert.deepEqual(events.find((event) => Array.isArray(event) && event[0] === 'destroy'), [
+            'destroy',
+            statusState === 'running-initialized' ? 'a'.repeat(64) : null,
+            { deleteCache: false, deleteData: true, confirmWorkspace: WORKSPACE_ROOT },
+        ]);
+        assert.match(output.value(), /7 entries removed/);
+    }
+});
+
+test('destroy --delete-data is not routed to the core inside a Box, unlike plain destroy', async () => {
+    const errorOutput = bufferStream();
+    const code = await runOuterCli(['destroy', '--delete-data', '--confirm-workspace', '/work/space'], {
+        env: {}, input: {}, output: bufferStream(), errorOutput, detectInsideBox: () => true,
+        execute: () => assert.fail('destroy --delete-data must not reach the core'),
+    });
+    assert.equal(code, 1);
+    assert.match(errorOutput.value(), /must run on the physical host/);
+    let forwarded = null;
+    assert.equal(await runOuterCli(['destroy'], {
+        env: {}, input: {}, output: bufferStream(), errorOutput: bufferStream(), detectInsideBox: () => true,
+        execute: (command, args) => { forwarded = [command, args]; return 0; },
+    }), 0);
+    assert.deepEqual(forwarded, ['/opt/ploinky/bin/ploinky-local', ['destroy']]);
+});
+
+test('edge set saves stdin or a file without preparing a Box and reports the next start', async (t) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-set-'));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const document = JSON.stringify({ hosts: {} });
+    fs.writeFileSync(path.join(directory, 'desired.json'), document);
+    for (const [source, input] of [
+        ['-', Readable.from([Buffer.from(document)])],
+        ['desired.json', {}],
+    ]) {
+        const events = [];
+        const output = bufferStream();
+        const code = await runOuterCli(['edge', 'set', source], {
+            env: {}, input, output, errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events), cwd: () => directory, detectInsideBox: () => false,
+        });
+        assert.equal(code, 0);
+        assert.deepEqual(events, [['edge-set', document]]);
+        assert.match(output.value(), /takes effect on the next ploinky start/);
+        assert.match(output.value(), new RegExp(`sha256 ${'d'.repeat(64)}`));
+    }
+});
+
+test('edge set refuses a terminal, oversized input and running inside a Box, changing nothing', async (t) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-set-'));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(directory, 'large.json'), Buffer.alloc((1024 * 1024) + 1, ' '));
+    const events = [];
+    const options = {
+        env: {}, output: bufferStream(), errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events), cwd: () => directory, detectInsideBox: () => false,
+    };
+    const terminal = Readable.from([]);
+    terminal.isTTY = true;
+    await assert.rejects(runOuterCli(['edge', 'set', '-'], { ...options, input: terminal }), /not a terminal/);
+    await assert.rejects(
+        runOuterCli(['edge', 'set', '-'], { ...options, input: Readable.from([Buffer.alloc((1024 * 1024) + 1)]) }),
+        /accepts at most/,
+    );
+    await assert.rejects(runOuterCli(['edge', 'set', 'large.json'], { ...options, input: {} }), /accepts at most/);
+    await assert.rejects(runOuterCli(['edge', 'set', directory], { ...options, input: {} }), /takes a regular file/);
+    assert.deepEqual(events, []);
+
+    const errorOutput = bufferStream();
+    const code = await runOuterCli(['edge', 'set', '-'], {
+        ...options, input: {}, errorOutput, detectInsideBox: () => true,
+        execute: () => assert.fail('edge set must not reach the core'),
+    });
+    assert.equal(code, 1);
+    assert.match(errorOutput.value(), /must run on the physical host/);
 });
 
 test('destroy runs input-free marker recovery when the outer Box is already absent', async () => {

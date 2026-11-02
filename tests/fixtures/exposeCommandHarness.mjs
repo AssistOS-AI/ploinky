@@ -42,6 +42,7 @@ try {
         } }),
         workspace: stub({ getConfig: () => ({ static: { agent: input.staticAgent } }) }),
         secretInjector: stub({ loadSecretsFile() {}, loadEnvFile() {} }),
+        varStdinValue: stub({ VAR_STDIN_MAX_BYTES: 0, decodeVarStdinValue() {} }),
         encryptedSecretsFile: stub({ deleteSecretValue() {}, readSecretsFile() {}, setSecretValue() {} }),
         masterKey: stub({ deriveAgentSecret() {}, deriveWorkspaceSecret() {} }),
         edgeGeneration: stub({

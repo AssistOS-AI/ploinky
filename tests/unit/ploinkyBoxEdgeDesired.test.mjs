@@ -10,6 +10,7 @@ import {
     readWorkspaceEdgeDesired,
     stageWorkspaceEdgeDesired,
     replaceWorkspaceEdgeDesired,
+    writeWorkspaceEdgeDesired,
 } from '../../ploinky-box/edgeDesired.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 
@@ -63,6 +64,78 @@ test('host authority replacement is digest-fenced and requires coordination', t 
     assert.equal(after.digest, crypto.createHash('sha256').update(bytes).digest('hex'));
     assert.throws(() => replaceWorkspaceEdgeDesired(fixture.identity, { expectedDigest: before.digest,
         bytes: JSON.stringify(desiredDocument()), assertHeld() {} }), /changed before replacement/);
+});
+
+test('the operator save is atomic, private and needs the mutation lock', (t) => {
+    const fixture = workspaceFixture(t);
+    const bytes = Buffer.from(`${JSON.stringify(desiredDocument(), null, 2)}\n`);
+    assert.throws(() => writeWorkspaceEdgeDesired(fixture.identity, { bytes }), /requires mutation coordination/);
+    assert.equal(fs.existsSync(fixture.candidatePath), false);
+
+    let held = 0;
+    const saved = writeWorkspaceEdgeDesired(fixture.identity, { bytes, assertHeld() { held += 1; } });
+    assert.equal(held >= 2, true);
+    assert.deepEqual(saved, {
+        path: fixture.candidatePath,
+        digest: crypto.createHash('sha256').update(bytes).digest('hex'),
+        size: bytes.length,
+    });
+    assert.equal(fs.statSync(fixture.candidatePath).mode & 0o777, 0o600);
+
+    const next = Buffer.from(JSON.stringify({ hosts: { 'external.test': { agent: 'demo/app' } } }));
+    fs.chmodSync(fixture.candidatePath, 0o664);
+    const replaced = writeWorkspaceEdgeDesired(fixture.identity, { bytes: next, assertHeld() {} });
+    assert.equal(replaced.digest, crypto.createHash('sha256').update(next).digest('hex'));
+    assert.equal(fs.statSync(fixture.candidatePath).mode & 0o777, 0o600);
+    assert.deepEqual(fs.readdirSync(path.dirname(fixture.candidatePath)), ['edge-desired.json']);
+});
+
+test('the operator save keeps the old file when the input or the target is unsafe', (t) => {
+    const fixture = workspaceFixture(t);
+    const original = JSON.stringify(desiredDocument());
+    fs.writeFileSync(fixture.candidatePath, original, { mode: 0o600 });
+    const assertHeld = () => {};
+    for (const bytes of ['not json', '[]', '{}', '{"hosts":[]}', Buffer.alloc(BOX_EDGE_DESIRED_MAX_BYTES + 1, 'a')]) {
+        assert.throws(
+            () => writeWorkspaceEdgeDesired(fixture.identity, { bytes, assertHeld }),
+            (error) => error.code === 'PLOINKY_BOX_EDGE_DESIRED_INVALID',
+        );
+        assert.equal(fs.readFileSync(fixture.candidatePath, 'utf8'), original);
+    }
+
+    const elsewhere = path.join(fixture.root, 'elsewhere.json');
+    fs.writeFileSync(elsewhere, original, { mode: 0o600 });
+    fs.rmSync(fixture.candidatePath);
+    fs.symlinkSync(elsewhere, fixture.candidatePath);
+    assert.throws(
+        () => writeWorkspaceEdgeDesired(fixture.identity, { bytes: original, assertHeld }),
+        /one non-linked regular file/,
+    );
+    fs.rmSync(fixture.candidatePath);
+    fs.linkSync(elsewhere, fixture.candidatePath);
+    assert.throws(
+        () => writeWorkspaceEdgeDesired(fixture.identity, { bytes: original, assertHeld }),
+        /one non-linked regular file/,
+    );
+    fs.rmSync(fixture.candidatePath);
+    fs.mkdirSync(fixture.candidatePath);
+    assert.throws(
+        () => writeWorkspaceEdgeDesired(fixture.identity, { bytes: original, assertHeld }),
+        /one non-linked regular file/,
+    );
+});
+
+test('the operator save refuses a symlinked workspace anchor', (t) => {
+    const fixture = workspaceFixture(t);
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-edge-elsewhere-'));
+    t.after(() => fs.rmSync(elsewhere, { recursive: true, force: true }));
+    fs.rmdirSync(path.join(fixture.root, '.ploinky'));
+    fs.symlinkSync(elsewhere, path.join(fixture.root, '.ploinky'));
+    assert.throws(
+        () => writeWorkspaceEdgeDesired(fixture.identity, { bytes: JSON.stringify(desiredDocument()), assertHeld() {} }),
+        /must be a real directory/,
+    );
+    assert.deepEqual(fs.readdirSync(elsewhere), []);
 });
 
 test('host-owned edge desired state rejects unsafe or malformed authority files', (t) => {

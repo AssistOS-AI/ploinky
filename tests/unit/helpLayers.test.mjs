@@ -38,6 +38,8 @@ test('host and core lifecycle help have different scopes', () => {
     assert.match(host, /status \[--verbose\]/i);
     assert.match(host, /stop core services, then stop the outer runtime/i);
     assert.match(host, /destroy \[--delete-cache\]/i);
+    assert.match(host, /destroy --delete-data --confirm-workspace PATH/);
+    assert.match(host, /edge set FILE\|-/);
     assert.match(host, /remove the outer runtime without prompting/i);
     assert.match(host, /optionally delete \.ploinky\/box cache data/i);
     assert.match(host, /GPU grants and hardware-limits records/);

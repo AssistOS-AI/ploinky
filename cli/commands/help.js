@@ -19,6 +19,8 @@ function lifecycleHelpLines(surface) {
             '  status [--verbose]             Show combined, read-only outer runtime and workspace status',
             '  stop                           Stop core services, then stop the outer runtime',
             '  destroy [--delete-cache]       Remove the outer runtime without prompting, then this workspace\'s GPU grants and hardware-limits records (in .ploinky-box); optionally delete .ploinky/box cache data (and .ploinky/agentlib when no Box exists)',
+            '  destroy --delete-data --confirm-workspace PATH  Remove the outer runtime, then irreversibly delete everything in this workspace, including documents and the encryption identity',
+            '  edge set FILE|-                Save the host-owned .ploinky/edge-desired.json; it takes effect on the next start',
             '  unlock [--force-holder PID@MACHINE]  Remove a workspace or hardware store lock left by a command that is no longer running',
         ];
     }
@@ -134,11 +136,12 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
         },
         'var': {
             description: 'Set a workspace variable (stored encrypted in .ploinky/data/.secrets)',
-            syntax: 'var <VAR> <value>',
+            syntax: 'var <VAR> <value> | var <VAR> --stdin',
             examples: [
-                'var API_KEY sk-123456'
+                'var API_KEY sk-123456',
+                'printf %s "$API_KEY" | ploinky var API_KEY --stdin'
             ],
-            notes: "Use 'vars' to list variables. Router control surfaces use authenticated workspace sessions."
+            notes: "Use 'vars' to list variables. --stdin takes the value from piped input and removes one trailing newline, so a secret never appears in a process list. Router control surfaces use authenticated workspace sessions."
         },
         'vars': {
             description: 'List workspace variables (from encrypted .ploinky/data/.secrets)',
@@ -709,9 +712,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             },
             destroy: {
                 description: 'Stop nested agents, remove the outer runtime and then this workspace\'s GPU grants and hardware-limits records, retaining the host workspace and its .ploinky/box dependency and image cache directories by default.',
-                syntax: 'destroy [--delete-cache]',
-                examples: ['destroy', 'destroy --delete-cache'],
-                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Both forms run without prompting. Without the flag, this host-level command retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so the MCP SDK copied from the Box image and reusable nested image content survive destroy and recreate. Once the outer runtime is gone, both forms also remove this workspace\'s GPU grants and hardware-limits records from <workspace>/.ploinky-box (the saved GPU grant and revoke, the saved hardware-limits gate, stored limits and transition journals), so the next start begins from manifest defaults; router bindings are kept, and so are update records. Box host state lives only in <workspace>/.ploinky-box, which every Box and agent runtime sees as an empty read-only directory; nothing goes in ~/.ploinky-box. With --delete-cache, it also deletes those two cache directories and, when no Box existed for the workspace as destroy started, the Ploinky-managed AgentLib state in .ploinky/agentlib (a local achillesAgentLib checkout is never touched); the workspace, .data, .env, .ploinky/data/master-key, repositories, agents, router bindings, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds. Upgrading has no backward compatibility: a Box made by an older Ploinky fails the compatibility check, so run ploinky destroy and then ploinky start; state in the old ~/.ploinky-box is ignored, so re-apply ploinky bind, ploinky gpu grant or revoke and hardware limits afterwards. If an older Ploinky already destroyed the old Box before this version ever ran, remove <workspace>/.ploinky-box (host state only) before the first start. This never means deleting .data/, .ploinky/data/ or .env: they hold user data and keys, and destroy and destroy --delete-cache keep them.',
+                syntax: 'destroy [--delete-cache] | destroy --delete-data --confirm-workspace PATH',
+                examples: ['destroy', 'destroy --delete-cache', 'destroy --delete-data --confirm-workspace /home/admin/workspace'],
+                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Both forms run without prompting. Without the flag, this host-level command retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so the MCP SDK copied from the Box image and reusable nested image content survive destroy and recreate. Once the outer runtime is gone, both forms also remove this workspace\'s GPU grants and hardware-limits records from <workspace>/.ploinky-box (the saved GPU grant and revoke, the saved hardware-limits gate, stored limits and transition journals), so the next start begins from manifest defaults; router bindings are kept, and so are update records. Box host state lives only in <workspace>/.ploinky-box, which every Box and agent runtime sees as an empty read-only directory; nothing goes in ~/.ploinky-box. With --delete-cache, it also deletes those two cache directories and, when no Box existed for the workspace as destroy started, the Ploinky-managed AgentLib state in .ploinky/agentlib (a local achillesAgentLib checkout is never touched); the workspace, .data, .env, .ploinky/data/master-key, repositories, agents, router bindings, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds. Upgrading has no backward compatibility: a Box made by an older Ploinky fails the compatibility check, so run ploinky destroy and then ploinky start; state in the old ~/.ploinky-box is ignored, so re-apply ploinky bind, ploinky gpu grant or revoke and hardware limits afterwards. If an older Ploinky already destroyed the old Box before this version ever ran, remove <workspace>/.ploinky-box (host state only) before the first start. This never means deleting .data/, .ploinky/data/ or .env: they hold user data and keys, and destroy and destroy --delete-cache keep them. --delete-data also deletes every file in the workspace, including documents, .data, .env and the encryption identity, leaving an empty .ploinky and the .ploinky-box skeleton. PATH must be exactly this workspace. It is refused for a directory that is not a Ploinky workspace, when anything else uses the workspace, or when the running Ploinky checkout lies inside it. Output never names the deleted files.',
             },
             unlock: {
                 description: 'Remove a workspace lock, its reclaim guard or the hardware store lock that a command no longer running left behind.',

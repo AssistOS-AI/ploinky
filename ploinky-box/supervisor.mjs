@@ -62,7 +62,14 @@ import { discoverBoxOwnership, listWorkspaceContainers } from './engine/discover
 import {
     readWorkspaceEdgeDesired,
     stageWorkspaceEdgeDesired,
+    writeWorkspaceEdgeDesired,
 } from './edgeDesired.mjs';
+import {
+    assertNoLiveWorkspaceUsers,
+    assertWorkspaceDeletionPaths,
+    removeWorkspaceContents,
+    workspaceDataKeptError,
+} from './workspaceDeletion.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import {
     buildGpuWiring,
@@ -364,6 +371,7 @@ export function createBoxSupervisor({
     resolveHostReachableIpv4 = detectHostReachableIpv4,
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
+    writeEdgeDesired = writeWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
     selectAgentLib = selectWorkspaceAgentLibSource,
     loadAgentLibImage = loadBoxAgentLibImage,
@@ -376,6 +384,8 @@ export function createBoxSupervisor({
     retireDestroyedMarkers = retireDestroyedBoxNoWaitMarkers,
     destroyBoxCache = removeWorkspaceDataPaths,
     destroyManagedAgentLib = removeManagedAgentLibState,
+    homeDirectory = os.homedir(),
+    readMountTable,
     inspectBoxData = inspectWorkspaceDataPaths,
     captureCoreStartArgv = captureConfiguredCoreStartArgv,
     routerBindingStore = createRouterBindingStore(),
@@ -3825,7 +3835,37 @@ export function createBoxSupervisor({
         return { removedRecords, deletedPaths, deletedAgentLibPaths };
     }
 
-    async function runDestroyTransaction(expectedContainerId, { deleteCache = false } = {}) {
+    // Saves the host-owned edge input under the workspace lock. Only a later
+    // start stages it and activates a routing generation.
+    async function runEdgeSetTransaction(bytes) {
+        return lockedMutation(async (identity, lock) => writeEdgeDesired(identity, {
+            bytes,
+            assertHeld: () => lock.assertHeld(identity.instance),
+        }));
+    }
+
+    async function runDestroyTransaction(expectedContainerId, {
+        deleteCache = false,
+        deleteData = false,
+        confirmWorkspace,
+    } = {}) {
+        const assertDeletablePaths = (identity) => assertWorkspaceDeletionPaths(identity, {
+            confirmWorkspace, repositoryRoot, homeDirectory, platform, readMountTable,
+        });
+        const assertNotInUse = (identity, engine, excludeContainerIds = []) => assertNoLiveWorkspaceUsers(
+            identity,
+            guard.quiescence({ identity, engine, excludeContainerIds }),
+            { engine, excludeContainerIds, platform, runner },
+        );
+        // The lock creates host state in the selected directory, so every
+        // refusal comes before it too. All of this only reads.
+        if (deleteData) {
+            const selected = resolveIdentity();
+            assertDeletablePaths(selected);
+            const observed = assertMutableOwnership(inspect(selected));
+            const selectedBox = observed.handles?.container;
+            assertNotInUse(selected, observed.engine, selectedBox ? [selectedBox.id] : []);
+        }
         return lockedMutation(async (identity, lock, ownership) => {
             const container = ownership.handles?.container;
             if (!container && expectedContainerId) {
@@ -3834,12 +3874,17 @@ export function createBoxSupervisor({
             // Without a container, the locked discovery itself is the proof:
             // only an absent or owned observation passes lockedMutation.
             const absentProven = !container && ['absent', 'owned'].includes(ownership.state);
-            if (!container && !deleteCache) {
+            if (!container && !deleteCache && !deleteData) {
                 const { removedRecords } = finishDestroy(identity, lock, { boxProvenGone: absentProven, deleteCache, container });
                 return Object.freeze({ identity, action: 'absent', removedRecords });
             }
             if (container && (!expectedContainerId || container.id !== expectedContainerId)) {
                 throw supervisorError('Box changed before destroy; nothing was removed');
+            }
+            if (deleteData) {
+                // A refusal here leaves the Box running.
+                assertDeletablePaths(identity);
+                assertNotInUse(identity, ownership.engine, container ? [container.id] : []);
             }
             if (container) {
                 // Quiesce nested agents before the outer Box disappears. If the
@@ -3886,6 +3931,18 @@ export function createBoxSupervisor({
             const { removedRecords, deletedPaths, deletedAgentLibPaths } = finishDestroy(identity, lock, {
                 boxProvenGone: container ? true : absentProven, deleteCache, container,
             });
+            let deletedWorkspace = null;
+            if (deleteData) {
+                try {
+                    assertDeletablePaths(identity);
+                    assertNotInUse(identity, ownership.engine);
+                } catch (error) {
+                    throw workspaceDataKeptError(error);
+                }
+                deletedWorkspace = removeWorkspaceContents(identity, {
+                    lock, engine: ownership.engine, platform, runner,
+                });
+            }
             return Object.freeze({
                 identity,
                 action: container ? 'destroyed' : 'deleted-cache',
@@ -3895,6 +3952,7 @@ export function createBoxSupervisor({
                 deletedAgentLibPaths,
                 removedRecords,
                 hostStateQuarantine,
+                ...(deletedWorkspace ? { deletedWorkspace } : {}),
             });
         }, { policy: HOST_STATE_POLICY.restrict });
     }
@@ -4147,6 +4205,7 @@ export function createBoxSupervisor({
         runUnlock,
         runStopTransaction,
         runDestroyTransaction,
+        runEdgeSetTransaction,
         inspectBoxStatus,
         planDryRun,
         planBindDryRun,

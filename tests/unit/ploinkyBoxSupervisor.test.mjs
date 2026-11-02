@@ -295,6 +295,45 @@ test('a failed nested stop halts the Box but removes nothing', async (t) => {
     assert.equal(fs.existsSync(identity.dataPaths.dependencies), true);
 });
 
+test('edge set saves under the workspace lock with no Box and no engine mutation', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const lockManager = fakeLockManager(state.root, events);
+    const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        ...state.stores,
+        resolveIdentity: () => identity,
+        launchCwd: identity.workspaceRoot,
+        lockManager,
+        discover: () => ({ state: 'absent', engine: { name: 'podman' }, handles: null }),
+        runner: { run(command, args) { events.push(args.join(' ')); } },
+    });
+    const bytes = JSON.stringify({ hosts: {} });
+    const saved = await supervisor.runEdgeSetTransaction(bytes);
+    assert.equal(lockManager.acquisitions, 1);
+    assert.deepEqual(events, ['lock', 'release']);
+    assert.equal(saved.path, path.join(identity.anchorPath, 'edge-desired.json'));
+    assert.equal(fs.readFileSync(saved.path, 'utf8'), bytes);
+});
+
+test('edge set refuses a foreign Box state before it writes', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        ...state.stores,
+        resolveIdentity: () => identity,
+        launchCwd: identity.workspaceRoot,
+        lockManager: fakeLockManager(state.root, []),
+        discover: () => ({ state: 'foreign', message: 'fixture foreign Box', handles: null }),
+    });
+    await assert.rejects(supervisor.runEdgeSetTransaction(JSON.stringify({ hosts: {} })), /fixture foreign Box/);
+    assert.equal(fs.existsSync(path.join(identity.anchorPath, 'edge-desired.json')), false);
+});
+
 test('a failed outer removal retains the workspace cache data', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));

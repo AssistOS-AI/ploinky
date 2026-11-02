@@ -101,32 +101,80 @@ function exactDigest(result) {
     return String(result.stdout || '').trim().split(/\s+/)[0];
 }
 
-// The caller journals both versions before entering its mutation coordination.
-// The same writer is usable through the confined Box channel for subuid-owned anchors.
-export function replaceWorkspaceEdgeDesired(identity, { expectedDigest, bytes, assertHeld, fsApi = fs } = {}) {
+function validatedAuthorityBytes(bytes, assertHeld) {
     if (typeof assertHeld !== 'function') throw desiredError('Edge authority replacement requires mutation coordination');
     assertHeld();
     const text = Buffer.from(bytes || '');
     if (text.length > BOX_EDGE_DESIRED_MAX_BYTES) throw desiredError('Edge authority replacement is too large');
     validateCandidateDocument(text, BOX_EDGE_DESIRED_FILE);
-    if (!/^[a-f0-9]{64}$/.test(String(expectedDigest || ''))) throw desiredError('Expected edge authority digest is required');
-    const current = readWorkspaceEdgeDesired(identity, { fsApi });
-    if (!current || current.digest !== expectedDigest) throw desiredError('Edge authority changed before replacement');
-    const temporary = `${current.path}.${crypto.randomUUID()}.tmp`;
+    return text;
+}
+
+function installAuthorityBytes(identity, target, text, { assertHeld, assertCurrent, fsApi }) {
+    const temporary = `${target}.${crypto.randomUUID()}.tmp`;
     try {
         const fd = fsApi.openSync(temporary, 'wx', 0o600);
         try { fsApi.writeFileSync(fd, text); fsApi.fsyncSync(fd); } finally { fsApi.closeSync(fd); }
         assertHeld();
-        if (readWorkspaceEdgeDesired(identity, { fsApi })?.digest !== expectedDigest) {
-            throw desiredError('Edge authority changed during replacement');
-        }
-        fsApi.renameSync(temporary, current.path);
+        assertCurrent();
+        fsApi.renameSync(temporary, target);
         const directory = fsApi.openSync(identity.anchorPath, 'r');
         try { fsApi.fsyncSync(directory); } finally { fsApi.closeSync(directory); }
     } finally {
         try { fsApi.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     return readWorkspaceEdgeDesired(identity, { fsApi });
+}
+
+// The caller journals both versions before entering its mutation coordination.
+// The same writer is usable through the confined Box channel for subuid-owned anchors.
+export function replaceWorkspaceEdgeDesired(identity, { expectedDigest, bytes, assertHeld, fsApi = fs } = {}) {
+    const text = validatedAuthorityBytes(bytes, assertHeld);
+    if (!/^[a-f0-9]{64}$/.test(String(expectedDigest || ''))) throw desiredError('Expected edge authority digest is required');
+    const current = readWorkspaceEdgeDesired(identity, { fsApi });
+    if (!current || current.digest !== expectedDigest) throw desiredError('Edge authority changed before replacement');
+    return installAuthorityBytes(identity, current.path, text, {
+        assertHeld,
+        fsApi,
+        assertCurrent() {
+            if (readWorkspaceEdgeDesired(identity, { fsApi })?.digest !== expectedDigest) {
+                throw desiredError('Edge authority changed during replacement');
+            }
+        },
+    });
+}
+
+function assertWritableAuthorityPath(identity, target, fsApi) {
+    const anchor = fsApi.lstatSync(identity.anchorPath);
+    if (!anchor.isDirectory() || anchor.isSymbolicLink()) {
+        throw desiredError(`Workspace identity anchor must be a real directory: ${identity.anchorPath}`);
+    }
+    let stat;
+    try {
+        stat = fsApi.lstatSync(target);
+    } catch (error) {
+        if (error.code === 'ENOENT') return;
+        throw desiredError(`Unable to inspect Box edge desired state: ${target}`, error);
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+        throw desiredError(`Box edge desired state must be one non-linked regular file: ${target}`);
+    }
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+        throw desiredError(`Box edge desired state must be owned by the current user: ${target}`);
+    }
+}
+
+// The operator's save of the host-owned input that the next start stages. It
+// never touches the Box or activates a routing generation.
+export function writeWorkspaceEdgeDesired(identity, { bytes, assertHeld, fsApi = fs } = {}) {
+    const text = validatedAuthorityBytes(bytes, assertHeld);
+    const target = path.join(identity.anchorPath, BOX_EDGE_DESIRED_FILE);
+    assertWritableAuthorityPath(identity, target, fsApi);
+    return installAuthorityBytes(identity, target, text, {
+        assertHeld,
+        fsApi,
+        assertCurrent: () => assertWritableAuthorityPath(identity, target, fsApi),
+    });
 }
 
 export function stageWorkspaceEdgeDesired({

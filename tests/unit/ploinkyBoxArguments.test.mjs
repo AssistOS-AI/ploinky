@@ -305,6 +305,54 @@ test('destroy accepts only one explicit trailing cache-deletion flag', () => {
     );
 });
 
+test('destroy --delete-data requires the exact form and an absolute confirmation path', () => {
+    const route = (argv) => routeOuterCommand(parseOuterArguments(argv));
+    const expected = { kind: 'destroy', deleteCache: false, deleteData: true, confirmWorkspace: '/work/space' };
+    assert.deepEqual(route(['destroy', '--delete-data', '--confirm-workspace', '/work/space']), expected);
+    assert.deepEqual(route(['destroy', '--confirm-workspace', '/work/space', '--delete-data']), expected);
+    for (const argv of [
+        ['destroy', '--delete-data'],
+        ['destroy', '--delete-data', '--confirm-workspace'],
+        ['destroy', '--delete-data', '--confirm-workspace', 'relative/path'],
+        ['destroy', '--delete-data', '--delete-data', '--confirm-workspace', '/work/space'],
+        ['destroy', '--delete-data', '--confirm-workspace', '/work/space', 'extra'],
+        ['destroy', '--delete-data', '--confirm-workspace', '/a', '--confirm-workspace', '/b'],
+    ]) {
+        assert.throws(() => route(argv), /Usage: ploinky destroy --delete-data/, argv.join(' '));
+    }
+    assert.throws(
+        () => route(['destroy', '--delete-data', '--delete-cache', '--confirm-workspace', '/work/space']),
+        /do not combine it with --delete-cache/,
+    );
+    assert.throws(
+        () => route(['--allow-host-process', '123', 'destroy', '--delete-data', '--confirm-workspace', '/work/space']),
+        /--allow-host-process is not supported with --delete-data/,
+    );
+    assert.throws(
+        () => route(['--dry-run', 'destroy', '--delete-data', '--confirm-workspace', '/work/space']),
+        /--dry-run is not supported/,
+    );
+    assert.throws(() => route(['destroy', '--confirm-workspace', '/work/space']), /unexpected trailing argument '--confirm-workspace'/);
+    assert.deepEqual(route(['destroy', '--delete-cache']), { kind: 'destroy', deleteCache: true });
+});
+
+test('edge accepts only set with one source and refuses every other form', () => {
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['edge', 'set', '-'])), { kind: 'edge-set', source: '-' });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['edge', 'set', 'desired.json'])), {
+        kind: 'edge-set',
+        source: 'desired.json',
+    });
+    for (const argv of [['edge'], ['edge', 'set'], ['edge', 'apply', '-'], ['edge', 'show']]) {
+        assert.throws(() => routeOuterCommand(parseOuterArguments(argv)), /Usage: ploinky edge set FILE\|-/);
+    }
+    assert.throws(
+        () => routeOuterCommand(parseOuterArguments(['edge', 'set', '-', 'extra'])),
+        /unexpected trailing argument 'extra'/,
+    );
+    assert.throws(() => routeOuterCommand(parseOuterArguments(['--dry-run', 'edge', 'set', '-'])), /--dry-run is not supported/);
+    assert.throws(() => parseOuterArguments(['--port', '8097', 'edge', 'set', '-']), /--port is valid only before/);
+});
+
 test('unsupported public override surfaces reject before routing', () => {
     for (const argv of [
         ['--image', 'candidate', 'start', 'Agent'],
