@@ -63,6 +63,7 @@ import {
     readWorkspaceEdgeDesired,
     stageWorkspaceEdgeDesired,
     writeWorkspaceEdgeDesired,
+    writeWorkspaceEdgeDesiredThroughBox,
 } from './edgeDesired.mjs';
 import {
     assertNoLiveWorkspaceUsers,
@@ -372,6 +373,7 @@ export function createBoxSupervisor({
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
     writeEdgeDesired = writeWorkspaceEdgeDesired,
+    writeEdgeDesiredThroughBox = writeWorkspaceEdgeDesiredThroughBox,
     healthCheck = checkBoxHealth,
     selectAgentLib = selectWorkspaceAgentLibSource,
     loadAgentLibImage = loadBoxAgentLibImage,
@@ -3838,10 +3840,22 @@ export function createBoxSupervisor({
     // Saves the host-owned edge input under the workspace lock. Only a later
     // start stages it and activates a routing generation.
     async function runEdgeSetTransaction(bytes) {
-        return lockedMutation(async (identity, lock) => writeEdgeDesired(identity, {
-            bytes,
-            assertHeld: () => lock.assertHeld(identity.instance),
-        }));
+        return lockedMutation(async (identity, lock, ownership) => {
+            const assertHeld = () => lock.assertHeld(identity.instance);
+            const container = ownership.handles?.container;
+            if (container?.runtime?.running) {
+                return writeEdgeDesiredThroughBox(identity, {
+                    bytes, assertHeld, engine: ownership.engine, containerId: container.id, runner,
+                });
+            }
+            // A paused or stopping Box still has processes, and no exec can reach it.
+            if (container && !STOPPED_BOX_STATUSES.has(String(container.runtime?.status || '').toLowerCase())) {
+                throw supervisorError('The Box is neither running nor stopped; wait for it to settle, then save the edge desired state again');
+            }
+            // The host may write only once nothing of this workspace can change the path under it.
+            guard.quiescence({ identity, engine: ownership.engine });
+            return writeEdgeDesired(identity, { bytes, assertHeld });
+        });
     }
 
     async function runDestroyTransaction(expectedContainerId, {

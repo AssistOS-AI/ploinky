@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import {
     BOX_EDGE_DESIRED_MAX_BYTES,
@@ -123,6 +125,27 @@ test('the operator save keeps the old file when the input or the target is unsaf
         () => writeWorkspaceEdgeDesired(fixture.identity, { bytes: original, assertHeld }),
         /one non-linked regular file/,
     );
+});
+
+test('the Box writer saves stdin into the workspace and reports its digest', async (t) => {
+    const fixture = workspaceFixture(t);
+    const entry = fileURLToPath(new URL('../../ploinky-box/entrypoint/write-edge-desired.mjs', import.meta.url));
+    const document = JSON.stringify(desiredDocument());
+    const run = (input) => spawnSync(process.execPath, [entry], {
+        encoding: 'utf8', input, env: { ...process.env, PLOINKY_WORKSPACE_ROOT: fixture.root },
+    });
+    const saved = run(document);
+    assert.equal(saved.status, 0, saved.stderr);
+    assert.deepEqual(JSON.parse(saved.stdout), {
+        digest: crypto.createHash('sha256').update(document).digest('hex'),
+        size: Buffer.byteLength(document),
+    });
+    assert.equal(fs.readFileSync(fixture.candidatePath, 'utf8'), document);
+    assert.equal(fs.statSync(fixture.candidatePath).mode & 0o777, 0o600);
+    const refused = run('not json');
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /EDGE DESIRED WRITE FAILED/);
+    assert.equal(fs.readFileSync(fixture.candidatePath, 'utf8'), document);
 });
 
 test('the operator save refuses a symlinked workspace anchor', (t) => {

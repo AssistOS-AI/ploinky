@@ -318,6 +318,120 @@ test('edge set saves under the workspace lock with no Box and no engine mutation
     assert.equal(fs.readFileSync(saved.path, 'utf8'), bytes);
 });
 
+test('edge set goes through a running Box and never writes from the host', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity, { running: true });
+    const bytes = JSON.stringify({ hosts: {} });
+    const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+    const queries = [];
+    const supervisor = createBoxSupervisor({
+        hostStateGuard: {
+            ...PERMISSIVE_HOST_STATE_GUARD,
+            quiescence() { assert.fail('a running Box takes the Box write'); },
+        },
+        ...state.stores,
+        resolveIdentity: () => identity,
+        launchCwd: identity.workspaceRoot,
+        lockManager: fakeLockManager(state.root, []),
+        discover: () => ownership,
+        runner: {
+            run() { assert.fail('the host runs nothing else'); },
+            query(command, args, options) {
+                queries.push({ command, args, options });
+                return { ok: true, status: 0, stdout: `${JSON.stringify({ digest, size: bytes.length })}\n`, stderr: '' };
+            },
+        },
+    });
+    const saved = await supervisor.runEdgeSetTransaction(bytes);
+    assert.equal(fs.existsSync(path.join(identity.anchorPath, 'edge-desired.json')), false);
+    assert.equal(saved.digest, digest);
+    assert.equal(saved.path, path.join(identity.anchorPath, 'edge-desired.json'));
+    assert.equal(queries.length, 1);
+    assert.equal(queries[0].command, 'podman');
+    assert.deepEqual(queries[0].args.slice(0, 4), ['container', 'exec', '-i', '--user']);
+    assert.ok(queries[0].args.includes(ownership.handles.container.id));
+    assert.deepEqual(queries[0].args.slice(-2), ['node', '/opt/ploinky/ploinky-box/entrypoint/write-edge-desired.mjs']);
+    assert.equal(queries[0].args.some((value) => String(value).includes('hosts')), false);
+    assert.equal(Buffer.from(queries[0].options.input).toString(), bytes);
+});
+
+test('edge set refuses a wrong or failed Box write', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity, { running: true });
+    for (const [answer, pattern] of [
+        [{ ok: false, status: 1, stdout: '', stderr: 'refused in the Box' }, /refused in the Box/],
+        [{ ok: true, status: 0, stdout: `${JSON.stringify({ digest: 'a'.repeat(64), size: 1 })}\n`, stderr: '' }, /does not match/],
+        [{ ok: true, status: 0, stdout: 'not json\n', stderr: '' }, /did not report/],
+    ]) {
+        const supervisor = createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+            ...state.stores,
+            resolveIdentity: () => identity,
+            launchCwd: identity.workspaceRoot,
+            lockManager: fakeLockManager(fs.mkdtempSync(path.join(state.root, 'locks-')), []),
+            discover: () => ownership,
+            runner: { run() {}, query: () => answer },
+        });
+        await assert.rejects(supervisor.runEdgeSetTransaction(JSON.stringify({ hosts: {} })), pattern);
+    }
+});
+
+test('edge set with no running Box writes from the host only after the quiescence gate', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const target = path.join(identity.anchorPath, 'edge-desired.json');
+    const stopped = owned(identity, { running: false });
+    stopped.handles.container.runtime.status = 'exited';
+    for (const ownership of [
+        { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: null },
+        stopped,
+    ]) {
+        const make = (quiescence) => createBoxSupervisor({
+            hostStateGuard: { ...PERMISSIVE_HOST_STATE_GUARD, quiescence },
+            ...state.stores,
+            resolveIdentity: () => identity,
+            launchCwd: identity.workspaceRoot,
+            lockManager: fakeLockManager(fs.mkdtempSync(path.join(state.root, 'locks-')), []),
+            discover: () => ownership,
+            runner: { run() {}, query() { assert.fail('no Box to write through'); } },
+        });
+        await assert.rejects(
+            make(() => { throw new Error('another runtime runs'); }).runEdgeSetTransaction(JSON.stringify({ hosts: {} })),
+            /another runtime runs/,
+        );
+        assert.equal(fs.existsSync(target), false);
+        await make(() => []).runEdgeSetTransaction(JSON.stringify({ hosts: {} }));
+        assert.equal(fs.existsSync(target), true);
+        fs.rmSync(target);
+    }
+});
+
+test('edge set refuses a Box that is neither running nor stopped', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    for (const status of ['paused', 'stopping', 'removing', '', undefined]) {
+        const ownership = owned(identity, { running: false });
+        ownership.handles.container.runtime.status = status;
+        const supervisor = createBoxSupervisor({
+            hostStateGuard: { ...PERMISSIVE_HOST_STATE_GUARD, quiescence() { assert.fail('refused before the gate'); } },
+            ...state.stores,
+            resolveIdentity: () => identity,
+            launchCwd: identity.workspaceRoot,
+            lockManager: fakeLockManager(fs.mkdtempSync(path.join(state.root, 'locks-')), []),
+            discover: () => ownership,
+            runner: { run() {}, query() { assert.fail('no exec'); } },
+        });
+        await assert.rejects(supervisor.runEdgeSetTransaction(JSON.stringify({ hosts: {} })), /neither running nor stopped/);
+        assert.equal(fs.existsSync(path.join(identity.anchorPath, 'edge-desired.json')), false);
+    }
+});
+
 test('edge set refuses a foreign Box state before it writes', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));

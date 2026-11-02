@@ -177,6 +177,45 @@ export function writeWorkspaceEdgeDesired(identity, { bytes, assertHeld, fsApi =
     });
 }
 
+// A running Box can change the workspace, so the host never writes there while
+// one runs: a swapped path could redirect a write made with the host user's
+// access. The document goes to the Box on stdin and the Box writes it.
+export function writeWorkspaceEdgeDesiredThroughBox(identity, {
+    bytes,
+    assertHeld,
+    engine,
+    containerId,
+    runner,
+} = {}) {
+    const text = validatedAuthorityBytes(bytes, assertHeld);
+    if (!/^[a-f0-9]{12,64}$/.test(String(containerId || ''))) {
+        throw desiredError('Writing through the Box requires an immutable outer container ID');
+    }
+    const workspaceRoot = identity.workspaceRoot;
+    const result = runner.query(String(engine?.name || engine || ''), [
+        'container', 'exec', '-i', '--user', 'podman', ...boxWorkspaceExecOptions(workspaceRoot),
+        ...Object.entries(boxWorkspaceEnvironment(workspaceRoot))
+            .flatMap(([key, value]) => ['--env', `${key}=${value}`]),
+        containerId,
+        'node', '/opt/ploinky/ploinky-box/entrypoint/write-edge-desired.mjs',
+    ], { input: text, timeoutMs: 60_000 });
+    if (!result?.ok) {
+        throw desiredError(`The Box could not save the edge desired state: ${String(result?.stderr || '').trim() || String(result?.error?.message || 'no detail')}`);
+    }
+    const digest = crypto.createHash('sha256').update(text).digest('hex');
+    let reported;
+    try {
+        reported = JSON.parse(String(result.stdout || '').trim().split('\n').at(-1));
+    } catch (error) {
+        throw desiredError('The Box did not report the saved edge desired state', error);
+    }
+    assertHeld();
+    if (reported?.digest !== digest || reported?.size !== text.length) {
+        throw desiredError('The edge desired state saved in the Box does not match this document');
+    }
+    return Object.freeze({ path: path.join(identity.anchorPath, BOX_EDGE_DESIRED_FILE), digest, size: text.length });
+}
+
 export function stageWorkspaceEdgeDesired({
     candidate,
     engine,
