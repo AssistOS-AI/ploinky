@@ -91,17 +91,14 @@ test('a denied first member cannot leave a later independently verified member u
     for (const code of ['EACCES', 'EPERM']) {
         const members = [identity({ pid: 5002 }), identity({ pid: 5003 })];
         const attempted = [];
-        const outcomes = [];
         await assert.rejects(signalExactAgentSessionSnapshot(members, 'SIGTERM', {
             readIdentity: async (pid) => members.find((entry) => entry.pid === pid),
             signalImpl: (pid) => {
                 attempted.push(pid);
                 if (pid === 5002) throw Object.assign(new Error('denied'), { code });
             },
-            onSignalResult: (result) => outcomes.push(result),
         }), { code });
         assert.deepEqual(attempted, [5002, 5003]);
-        assert.deepEqual(outcomes.map((entry) => entry.outcome), ['denied', 'sent']);
     }
 });
 

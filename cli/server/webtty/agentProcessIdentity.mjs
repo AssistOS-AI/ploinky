@@ -756,7 +756,6 @@ export async function signalExactAgentSessionSnapshot(snapshot, signal, {
     fsApi = fs,
     readIdentity = readAgentBoxProcessIdentity,
     signalImpl = process.kill.bind(process),
-    onSignalResult = () => {},
 } = {}) {
     if (!AGENT_PROCESS_SIGNALS.includes(signal)) throw agentProcessIdentityError('signal');
     if (!Array.isArray(snapshot) || snapshot.length === 0) {
@@ -785,18 +784,13 @@ export async function signalExactAgentSessionSnapshot(snapshot, signal, {
         }
         // No asynchronous or logging operation belongs between this final
         // identity check and the exact positive-PID signal.
-        let outcome = 'sent';
         try {
             signalImpl(current.pid, signal);
             signaled += 1;
         } catch (error) {
             if (error?.code !== 'EACCES' && error?.code !== 'EPERM') throw error;
             denied ||= error;
-            outcome = 'denied';
         }
-        try { onSignalResult(Object.freeze({
-            pid: current.pid, startToken: current.startToken, signal, outcome,
-        })); } catch (_) { }
     }
     if (denied) throw denied;
     return Object.freeze({ signal, signaled });

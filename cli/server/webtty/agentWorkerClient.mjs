@@ -22,11 +22,6 @@ export const WEBTTY_AGENT_WORKER_INVOCATION = '--ploinky-webtty-agent-worker=v1'
 // wins instead of racing an indistinguishable client timeout.
 export const AGENT_WORKER_RESPONSE_TIMEOUT_MS = 11_000;
 
-
-const CLEANUP_DIAGNOSTIC_STEPS = new Set(["begin","pre-ready-reset","missing-client","missing-inner","capture-session","correlate-exec","signal-snapshot-term","wait-snapshot-term","signal-snapshot-kill","wait-snapshot-kill","list-residual","signal-residual-term","wait-residual-term","signal-residual-kill","wait-residual-kill","list-residual-final","signal-client-term","wait-client-term","signal-client-kill","wait-client-kill","drain-exec"]);
-const CLEANUP_DIAGNOSTIC_CODES = new Set(["WEBTTY_AGENT_PROCESS_IDENTITY_STALE","WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN","WEBTTY_PROCESS_IDENTITY_STALE","WEBTTY_PROCESS_IDENTITY_UNPROVEN","WEBTTY_AGENT_PODMAN_FAILURE","ESRCH","EPERM","EACCES","ENOENT"]);
-const CLEANUP_DIAGNOSTIC_CATEGORIES = new Set(["session-anchor-missing","session-anchor","session-member-changed","container-init-replaced","process-not-readable","process-missing","exec-not-drained","exec-id-ambiguity","deadline","inspect","proc-scan-timeout","proc-scan-limit","inner-process-ambiguity"]);
-
 const MAX_QUEUED_IPC_BYTES = 256 * 1024;
 const MAX_DIAGNOSTIC_BYTES = 16 * 1024;
 export const AGENT_WORKER_CLOSE_GRACE_MS = 8_500;
@@ -99,48 +94,8 @@ export class AgentWebttyWorkerClient extends EventEmitter {
             stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         });
         this.child = child;
-        let cleanupDiagnosticBuffer = '';
-        let cleanupDiagnosticInputBytes = 0;
         for (const stream of [child.stdout, child.stderr]) {
             stream?.on('data', (chunk) => {
-                if (stream === child.stderr && cleanupDiagnosticInputBytes < MAX_DIAGNOSTIC_BYTES) {
-                    const allowed = Buffer.from(chunk).subarray(0, MAX_DIAGNOSTIC_BYTES - cleanupDiagnosticInputBytes);
-                    cleanupDiagnosticInputBytes += allowed.length;
-                    cleanupDiagnosticBuffer += allowed.toString('utf8');
-                    const lines = cleanupDiagnosticBuffer.split('\n');
-                    cleanupDiagnosticBuffer = lines.pop();
-                    for (const line of lines) {
-                        if (line.startsWith('PLOINKY_WEBTTY_CLEANUP_MEMBER ')) {
-                            try {
-                                const entry = JSON.parse(line.slice('PLOINKY_WEBTTY_CLEANUP_MEMBER '.length));
-                                if (entry.terminalId !== this.terminalId
-                                    || !Number.isSafeInteger(entry.pid) || entry.pid <= 1
-                                    || typeof entry.startToken !== 'string'
-                                    || !/^linux-proc:[1-9][0-9]*$/.test(entry.startToken)
-                                    || !['SIGTERM', 'SIGKILL'].includes(entry.signal)
-                                    || !['sent', 'denied'].includes(entry.outcome)) continue;
-                                console.error('PLOINKY_WEBTTY_CLEANUP_MEMBER ' + JSON.stringify({
-                                    terminalId: this.terminalId, pid: entry.pid, startToken: entry.startToken,
-                                    signal: entry.signal, outcome: entry.outcome,
-                                }));
-                            } catch (_) { }
-                            continue;
-                        }
-                        if (!line.startsWith('PLOINKY_WEBTTY_CLEANUP_STEP ')) continue;
-                        try {
-                            const entry = JSON.parse(line.slice('PLOINKY_WEBTTY_CLEANUP_STEP '.length));
-                            if (entry.terminalId !== this.terminalId || !CLEANUP_DIAGNOSTIC_STEPS.has(entry.step)
-                                || !['caught', 'unproven', 'deadline'].includes(entry.phase)
-                                || !CLEANUP_DIAGNOSTIC_CODES.has(entry.code) && entry.code !== 'unmapped'
-                                || !CLEANUP_DIAGNOSTIC_CATEGORIES.has(entry.category) && entry.category !== 'unmapped'
-                                || !Number.isSafeInteger(entry.elapsedMs) || entry.elapsedMs < 0 || entry.elapsedMs > 60000) continue;
-                            console.error('PLOINKY_WEBTTY_CLEANUP_STEP ' + JSON.stringify({
-                                terminalId: this.terminalId, step: entry.step, phase: entry.phase,
-                                code: entry.code, category: entry.category, elapsedMs: entry.elapsedMs,
-                            }));
-                        } catch (_) { }
-                    }
-                }
                 this.diagnosticBytes = Math.min(
                     MAX_DIAGNOSTIC_BYTES,
                     this.diagnosticBytes + Buffer.byteLength(chunk),

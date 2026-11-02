@@ -44,73 +44,18 @@ const CLIENT = Object.freeze({
     ttyNumber: 34816,
 });
 
-test('cleanup diagnostics redact error details and stop at the worker byte cap', () => {
-    const marker = 'REDACT_TEST_CANARY';
-    const lines = [];
-    const receiver = {
-        terminalId: TERMINAL_ID,
-        cleanupDiagnosticStep: 'list-residual',
-        cleanupDiagnosticStartedAt: Date.now(),
-        processApi: { stderr: { write: (line) => lines.push(line) } },
-    };
-    const error = {
-        code: marker, category: marker, message: marker, stack: marker,
-        argv: [marker], env: { secret: marker },
-    };
-    const report = () => AgentTerminalWorker.prototype.reportCleanupDiagnostic.call(receiver, 'caught', error);
-    report();
-    const entry = JSON.parse(lines[0].slice('PLOINKY_WEBTTY_CLEANUP_STEP '.length));
-    assert.equal(entry.step, 'list-residual');
-    assert.equal(entry.code, 'unmapped');
-    assert.equal(entry.category, 'unmapped');
-    assert.equal(lines[0].includes(marker), false);
-    for (let index = 0; index < 200; index += 1) report();
-    assert.equal(Buffer.byteLength(lines.join('')) <= 16 * 1024, true);
-    const count = lines.length;
-    report();
-    assert.equal(lines.length, count);
-});
-
-test('per-member diagnostics allow only exact bounded PID, birth, signal and outcome fields', () => {
-    const lines = [];
-    const receiver = { terminalId: TERMINAL_ID,
-        processApi: { stderr: { write: (line) => lines.push(line) } } };
-    const report = (member) => AgentTerminalWorker.prototype.reportCleanupMemberDiagnostic.call(receiver, member);
-    const member = { pid: 5002, startToken: 'linux-proc:50020', signal: 'SIGTERM', outcome: 'denied',
-        argv: ['CANARY'], environment: 'CANARY', message: 'CANARY' };
-    report(member);
-    assert.deepEqual(JSON.parse(lines[0].slice('PLOINKY_WEBTTY_CLEANUP_MEMBER '.length)), {
-        terminalId: TERMINAL_ID, pid: 5002, startToken: 'linux-proc:50020', signal: 'SIGTERM', outcome: 'denied',
-    });
-    assert.equal(lines.join('').includes('CANARY'), false);
-    for (const changed of [{ pid: 1 }, { startToken: 'CANARY' }, { signal: 'CANARY' }, { outcome: 'CANARY' }]) {
-        report({ ...member, ...changed });
-    }
-    assert.equal(lines.length, 1);
-    for (let index = 0; index < 200; index += 1) report(member);
-    assert.equal(Buffer.byteLength(lines.join('')) <= 16 * 1024, true);
-});
-
-test('cleanup diagnostics name a failed session capture without changing its outcome', async () => {
+test('a failed session capture leaves the cleanup unproven', async () => {
     const h = harness({
         captureSession: async () => {
-            throw Object.assign(new Error('REDACT_TEST_CANARY'), {
+            throw Object.assign(new Error('capture failed'), {
                 code: 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN',
                 category: 'session-anchor-missing',
             });
         },
     });
-    const lines = [];
-    h.processApi.stderr = { write: (line) => lines.push(line) };
     await h.worker.initialize(init());
     await h.worker.launch();
     await h.worker.cleanup('requested');
-    const caught = lines.map((line) => JSON.parse(line.slice('PLOINKY_WEBTTY_CLEANUP_STEP '.length)))
-        .find((entry) => entry.phase === 'caught');
-    assert.equal(caught.step, 'capture-session');
-    assert.equal(caught.code, 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN');
-    assert.equal(caught.category, 'session-anchor-missing');
-    assert.equal(lines.join('').includes('REDACT_TEST_CANARY'), false);
     assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
 });
 
