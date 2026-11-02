@@ -518,6 +518,66 @@ test('otherwise proven ready cleanup is vetoed by a private setsid survivor', as
     assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
 });
 
+test('normal ready PTY exit succeeds when its wrapper, client and ExecID are already gone', async () => {
+    const stale = () => {
+        throw Object.assign(new Error('original wrapper already exited'), {
+            code: 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE', category: 'process-not-readable',
+        });
+    };
+    const h = harness({
+        captureSession: stale,
+        captureCleanupScope: () => assert.fail('an exited shell must not require new scope tracking'),
+        cleanupScopeAbsent: () => assert.fail('successful natural cleanup must retain its baseline path'),
+        readCleanupIdentity: () => assert.fail('successful natural cleanup must not enter the new proof'),
+        inspectTargetCleanup: async () => ({ absent: false, id: CONTAINER_ID,
+            running: true, initPid: INNER.containerInitBoxPid, execIds: [] }),
+        signalClient: () => assert.fail('the exited client must not be signalled'),
+        signalSession: () => assert.fail('an absent original session must not be signalled'),
+    });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    h.worker.handlePtyExit({ exitCode: 0, signal: null });
+    await h.worker.cleanupPromise;
+    const exit = h.processApi.sent.find((message) => message.type === 'exit');
+    assert.equal(exit?.category, 'clean');
+    assert.equal(exit?.cleanupProven, true);
+    assert.equal(h.processApi.sent.some((message) => message.type === 'error'), false);
+});
+
+test('an already-exited shell with incomplete cleanup remains unproven without a captured scope', async () => {
+    const h = harness({
+        captureSession: async () => {
+            throw Object.assign(new Error('gone'), { code: 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE' });
+        },
+        captureCleanupScope: () => assert.fail('an exited shell cannot provide a live capture'),
+        listSession: async () => { throw Object.assign(new Error('unknown'), { code: 'EACCES' }); },
+        readCleanupIdentity: () => assert.fail('missing scope must not enter the new proof'),
+    });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    h.worker.handlePtyExit({ exitCode: 0, signal: null });
+    await h.worker.cleanupPromise;
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.processApi.sent.some((message) => message.type === 'error'), true);
+});
+
+test('a late PTY exit cannot exempt a forced close from its captured private-scope survivor veto', async () => {
+    const h = harness({
+        captureCleanupScope: async () => {
+            h.worker.handlePtyExit({ exitCode: 0, signal: null });
+            return { captured: true };
+        },
+        cleanupScopeAbsent: async () => false,
+    });
+    h.worker.cleanupDeadlineMs = 80;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.worker.ptyExited, true);
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+});
+
 function cleanupProofHarness(overrides = {}) {
     const calls = { signals: 0, drains: 0, reads: 0 };
     const h = harness({

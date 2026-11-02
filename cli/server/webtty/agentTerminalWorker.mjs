@@ -1167,6 +1167,7 @@ export class AgentTerminalWorker {
         let snapshot = [];
         let cleanupScope = null;
         let cleanupScopeContradiction = false;
+        const shellAlreadyExited = this.ptyExited;
         const readyExecId = this.readySent ? this.execId : '';
         if (this.readySent && !/^[a-f0-9]{64}$/.test(readyExecId)) {
             proven = false;
@@ -1219,7 +1220,7 @@ export class AgentTerminalWorker {
                     && !targetLocalProcessIdentityFailure(error);
             }
         }
-        if (this.readySent && this.innerProcess) {
+        if (this.readySent && this.innerProcess && !shellAlreadyExited) {
             try {
                 if (!active()) return;
                 cleanupScope = await this.captureCleanupScope(this.innerProcess);
@@ -1336,7 +1337,9 @@ export class AgentTerminalWorker {
                 && error?.category !== 'deadline';
         }
         if (!active()) return;
-        if (this.readySent) {
+        // An already-exited shell keeps the established successful cleanup
+        // path. A later PTY exit cannot exempt a forced close from its vetoes.
+        if (this.readySent && (!shellAlreadyExited || !proven)) {
             try {
                 if (!cleanupScope) proven = false;
                 else {

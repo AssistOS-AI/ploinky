@@ -110,6 +110,22 @@ export class AgentWebttyWorkerClient extends EventEmitter {
                     const lines = cleanupDiagnosticBuffer.split('\n');
                     cleanupDiagnosticBuffer = lines.pop();
                     for (const line of lines) {
+                        if (line.startsWith('PLOINKY_WEBTTY_CLEANUP_MEMBER ')) {
+                            try {
+                                const entry = JSON.parse(line.slice('PLOINKY_WEBTTY_CLEANUP_MEMBER '.length));
+                                if (entry.terminalId !== this.terminalId
+                                    || !Number.isSafeInteger(entry.pid) || entry.pid <= 1
+                                    || typeof entry.startToken !== 'string'
+                                    || !/^linux-proc:[1-9][0-9]*$/.test(entry.startToken)
+                                    || !['SIGTERM', 'SIGKILL'].includes(entry.signal)
+                                    || !['sent', 'denied'].includes(entry.outcome)) continue;
+                                console.error('PLOINKY_WEBTTY_CLEANUP_MEMBER ' + JSON.stringify({
+                                    terminalId: this.terminalId, pid: entry.pid, startToken: entry.startToken,
+                                    signal: entry.signal, outcome: entry.outcome,
+                                }));
+                            } catch (_) { }
+                            continue;
+                        }
                         if (!line.startsWith('PLOINKY_WEBTTY_CLEANUP_STEP ')) continue;
                         try {
                             const entry = JSON.parse(line.slice('PLOINKY_WEBTTY_CLEANUP_STEP '.length));
