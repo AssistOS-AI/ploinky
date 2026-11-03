@@ -139,9 +139,10 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             syntax: 'var <VAR> <value> | var <VAR> --stdin',
             examples: [
                 'var API_KEY sk-123456',
+                'var PLOINKY_IMAGE_REFRESH off',
                 'printf %s "$API_KEY" | ploinky var API_KEY --stdin'
             ],
-            notes: "Use 'vars' to list variables. --stdin takes the value from piped input and removes one trailing newline, so a secret never appears in a process list. Router control surfaces use authenticated workspace sessions."
+            notes: "Use 'vars' to list variables. `ploinky var PLOINKY_IMAGE_REFRESH off|check|always` controls whether `ploinky update` re-pulls changed registry image tags (default check). --stdin takes the value from piped input and removes one trailing newline, so a secret never appears in a process list. Router control surfaces use authenticated workspace sessions."
         },
         'vars': {
             description: 'List workspace variables (from encrypted .ploinky/data/.secrets)',
