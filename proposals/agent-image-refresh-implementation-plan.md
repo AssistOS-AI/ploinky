@@ -352,3 +352,190 @@ All new modules are `.mjs`, have no import-time side effects, and stay under 300
 - Superseded-image cleanup, which would remove dangling images from `.ploinky/box/images`. A future change could run `<rt> image rm <oldId>` without `--force`, only after the replacement passed readiness. It is not in this change, so that rollback remains possible.
 - An AssistOSExplorer change: `roboWorkAgent/server/environment.mjs:63` has its own missing-only `podman pull` for `roboteam-desktop:runtime` and `roboteam-browser:runtime`.
 - The Box image policy (`ploinky-box/lifecycle/transactions.mjs`) is out of scope.
+
+## 8. Addendum: Box image refresh on full `ploinky update`
+
+Status: proposed (not implemented). This is new scope on top of the implemented agent-image behavior (HEAD `a17ddc7`). Line numbers refer to that commit.
+
+### 8.1 Outcome
+
+During a **host-side full update** (`ploinky update`, `ploinky update all [<folder>]`; `kind: 'all'` → `runFullUpdate`, `ploinky-box/supervisor.mjs:2255-2257, 2277`), the supervisor checks the reference of the Box image, `plan.imageRef` (`supervisor.mjs:1714`, which is `resolveBoxImageReference(env)` honoring `PLOINKY_BOX_IMAGE`). The check runs when all of the following hold:
+- the reference is a mutable registry tag;
+- the workspace variable `PLOINKY_IMAGE_REFRESH` is not `off`;
+- a Box container exists and is running.
+
+The check compares the registry digest with the RepoDigests of the image the existing Box runs. If they differ, the supervisor pulls the tag. If the pulled tag's image ID differs from the running Box's image ID, it forces a Box replacement through the existing transaction, so the existing pull, contract validation, AgentLib supply check, replacement, rollback and graph restart do the work. The outcome is one non-required `image` record.
+
+There is **no check** in these cases:
+- `update repos` and `update repo <name>` (`runTargetedUpdate` :2554 never replaces a Box), or `--dry-run`;
+- `start` or `restart`;
+- the reference is digest-pinned (`@<algo>:<hex>`), unqualified, or `localhost/…`;
+- the Box is absent: the transaction creates it and pulls the tag, as it does today.
+
+### 8.2 Verified current behavior
+
+- **Reuse never looks at the image.** `requiresReplacement` (`ploinky-box/lifecycle/transactions.mjs:565-588`) compares only the reference string (`old.imageRef !== imageRef`, :583) and the AgentLib selection (:587). A reused Box therefore never picks up a re-pushed `ploinky-box:latest`.
+- **Replacement and creation pull the tag.** `imagePolicy: 'pull'` (default, :390) calls `pullBoxImage` (:173, module-local, 30 min stream timeout), then `validateImage` (:723-724). `'preserve'` (:706) keeps the old image.
+- **The running image is known.** The old Box's `imageId` is `container.runtime.imageId` and `imageRef` is its label (`oldDesired`, :110-118). Restore recreates the old Box **from that immutable ID** (`restoreOldContainer`, :309-345), so a moved tag never prevents rollback.
+- **AgentLib image mode.** When the workspace has no local AgentLib checkout, the AgentLib is supplied by the Box image.
+  - The selection (`updateAgentLib`, `supervisor.mjs:2307-2312`) loads the bundle from the **local** tag. For an existing Box, `imageBundleLoader` (:439-443) passes `refresh: false`, so nothing is pulled.
+  - The transaction then refuses `desiredAgentLib.supplyingImageId !== image.immutableId` (:727-729). A Box pull must therefore happen **before** `updateAgentLib`, so that the selection already names the new image. With the new image selected, `agentLibSelectionChanged` alone forces the replacement.
+- **The host cannot read workspace variables.** The supervisor reads none. `PLOINKY_IMAGE_REFRESH` lives in the encrypted `.ploinky/data/.secrets`, keyed by the managed Box master key `.ploinky/data/master-key`. The host never loads that key, and `cli/utils/config.js` derives its workspace root from cwd and env at import. The supervisor already runs read-only in-Box programs, for example `readInboxStatus` (:844) running `/opt/ploinky/ploinky-box/inbox/readStatus.mjs`.
+- **Layering allows the registry modules.** `ploinky-box/` already imports import-free `cli/` modules (`updateOutcome.js`, `updateRecords.js`, `reposSource.mjs`, `updateRequest.js`, among others). `imageReference.mjs` and `registryDigest.mjs` have no imports, so they are safe to use host-side. `imageRefresh.mjs` is **not**, because it imports `secretVars.js` and `common.js` (and through them `config.js`).
+
+### 8.3 Decisions
+
+1. **Reading the variable.** The Box answers, so the master key never leaves the Box (invariant 8) and no `config.js` root guessing happens on the host.
+   - Add an import-free `cli/sandbox/docker/imageRefreshPolicy.mjs` exporting `IMAGE_REFRESH_VAR` and `imageRefreshPolicyOf(raw)`. Its rule: `'off'` gives `off`; anything else gives `refresh`, with `ignoredValue` as today. `resolveImageRefreshPolicy` in `imageRefresh.mjs` delegates to it, with no behavior change.
+   - Add `ploinky-box/inbox/readImageRefreshPolicy.mjs`. It imports `readSecretsFile` (`cli/utils/security/encryptedSecretsFile.js`; a light chain: `config.js`, `masterKey.js` and small `ploinky-box` helpers, no CLI core) and `imageRefreshPolicyOf`, and prints `{"policy":"off"|"refresh"}`, or `{"policy":"unknown"}` when the secrets cannot be read.
+   - The supervisor runs it like `readInboxStatus`: `container exec --user podman <boxWorkspaceExecOptions> <boxId> /usr/local/bin/node /opt/ploinky/ploinky-box/inbox/readImageRefreshPolicy.mjs`, via `runner.query` with a 15 s timeout.
+   - An `unknown` result, a non-zero exit or unparsable output means **no Box check**, recorded as `box-image-policy-unavailable`. The Box check fails toward not replacing, unlike the in-Box agent phase.
+   - Alias values (`$OTHER`) are not followed by the probe. Documented: set the literal `off`.
+2. **A stopped Box defers the check.** The probe needs a running Box, and `ploinky stop` stops the Box container (`supervisor.mjs:3645-3648`). Record `box-image-check-deferred`; the full update starts the Box, so the next update checks it. Rejected alternative: start the Box, check, then reconcile a second time to replace it. That would mean a double reconcile, with muddled `priorRunning` and graph-restore semantics.
+3. **Pull first, then decide.** In `runFullUpdate`, between `updateWorkspacePloinky` (:2284-2306) and `updateAgentLib` (:2307), add:
+
+   ```js
+   const boxImage = await refreshBoxImage({ engine: ownership.engine, container: ownership.handles?.container || null,
+       imageRef: plan.imageRef, workspaceRoot: identity.workspaceRoot, runner, env, stdout, stderr });
+   ```
+
+   `refreshBoxImageForUpdate` is the default supervisor seam `refreshBoxImage`, in the new `ploinky-box/update/boxImageRefresh.mjs`. It never throws and returns `{ replaceImage, beforeId, afterId, outcome, reason }`:
+   1. Skip, with no record, when: there is no container; the ref is pinned, unqualified or `localhost`; or the policy is `off` (log one line, as the agent phase does).
+   2. Stopped Box or unknown policy: no fetch, and a record as described in decisions 1 and 2.
+   3. `beforeId = normalizeImageId(container.runtime.imageId)` (`ploinky-box/contract/image-id.mjs`). Read `local = repoDigestSet(<RepoDigests of beforeId>, parsed)` from `runner.query(engine, ['image', 'inspect', '--format', '{{json .RepoDigests}}', beforeId])`. Inspecting by **ID** is correct even after the tag has moved.
+   4. `nativeFetchIgnoresProxy(env)` uses the supervisor's `env`. If true, go straight to the pull. Otherwise call `fetchRemoteManifestDigest(parsed)`:
+      - `ok` and `local.has(digest)` → `current`, no pull;
+      - `unavailable` (offline, DNS, timeout, 429, 5xx) → keep the Box, `registry-unreachable`;
+      - `ok` with a different digest, or `undetermined` → pull.
+   5. Pull the **tag** with `pullBoxImage` (export it from `transactions.mjs`; 30 min timeout). The host workspace lock is already held, and transactions pull the tag the same way today. On failure the outcome is `box-image-pull-failed`, and the Box is kept.
+   6. `image = inspectAndValidateImage(engine, imageRef, runner)` (`contract/image.mjs:341`), and `afterId = normalizeImageId(image.immutableId)`.
+      - If the contract fails: re-tag the old image (`restoreBoxImageTag`), outcome `box-image-invalid`, Box kept.
+      - If `afterId === beforeId` (a delegated pull found nothing new): `current`.
+      - Otherwise `replaceImage: true`.
+
+   **Unprovable digest (recommended):** pull, then compare image IDs. This never replaces the Box needlessly. The cost is one counted Docker Hub pull per update when the digest is unprovable, for example behind a proxy.
+4. **Forcing the replacement.** Add a transaction option `replaceImage = false` (next to `imagePolicy`, `transactions.mjs:390`):
+   - add `|| replaceImage === true` to `requiresReplacement`;
+   - throw `transactionError` if `replaceImage && imagePolicy === 'preserve'`.
+
+   `reconcileConfiguredGraph` (`supervisor.mjs:2313-2330`) receives `replaceImage: boxImage.replaceImage`. This is an explicit option rather than a new comparison inside `requiresReplacement`, so the transaction stays declarative and no other command can trigger it.
+   - In AgentLib **image** mode, `updateAgentLib` now loads the new local tag, so `agentLibSelectionChanged` also requires the replacement and the supply check at :727 passes.
+   - In **local** mode, only `replaceImage` forces it.
+   - `imagePolicy` stays `'pull'`. The transaction's own pull is then a no-op. If the registry moved again in between, the transaction refuses (image mode) or uses the newer tag (local mode), and the record takes `afterId` from `prepared.ownership.handles.container.runtime.imageId`.
+5. **Rollback keeps the tag coherent.** Every path that restores the previous Box after `replaceImage: true` calls `restoreBoxImageTag(engine, beforeId, imageRef)`: `<engine> tag <beforeId> <imageRef>`, which never throws and logs on failure. Those paths are:
+   - a throw from `reconcileConfiguredGraph`, handled by wrapping the call at :2313 in `try/catch` and re-throwing;
+   - the blocked-activation `rollbackPreparedGraph` (:2414);
+   - the failure `rollbackPreparedGraph` (:2490).
+
+   Without the re-tag, in image mode the next `ploinky start` would select the new tag and replace the Box again. The record becomes `box-image-rolled-back`.
+6. **Activation is unchanged.** A replacement stops the old Box and its graph. The existing `restart = activity.active && decision.activationAllowed` (:2404) then runs `executeBoundedRestart` in the new Box, and an inactive graph stays down, as with any update-time replacement today. The in-Box update and its agent image phase run in the new Box, after the Box step.
+7. **Records and exit codes.**
+   - One record with phase `image`, id `box:<canonical ref>`, `required: false`, `details: { box: true }`, and `before`/`after` `{ imageId }`. It is added to `inputRecords` (:2353), or to `error.updateRecords` on throwing paths.
+
+   | Outcome | Record outcome | Code |
+   | --- | --- | --- |
+   | replaced | `changed` | `box-image-refreshed` |
+   | current | `unchanged` | `box-image-current` |
+   | registry unreachable | `skipped` | `registry-unreachable` |
+   | pull failed | `skipped` | `box-image-pull-failed` |
+   | invalid image | `skipped` | `box-image-invalid` |
+   | stopped Box | `skipped` | `box-image-check-deferred` |
+   | unknown policy | `skipped` | `box-image-policy-unavailable` |
+   | rolled back | `skipped` | `box-image-rolled-back` |
+
+   - Skips leave the update at exit 0.
+   - A replacement that **started and failed** keeps today's semantics: the transaction or restart failure, the existing recovery, and a non-zero exit. The graph was disrupted, so reporting success would be wrong. Recommended; see 8.6.
+8. **Time.** The Box step runs host-side, before the in-Box core update. It therefore does not consume the in-Box 30 min `UPDATE_RUNNER_DEFAULTS.timeoutMs`, and the agent image phase's budget is unchanged (it is measured from the in-Box start). Host bounds:
+   - policy probe: 15 s;
+   - registry: 10 s per request, at most 3 requests;
+   - RepoDigests and contract inspection: the default query timeout;
+   - Box pull: 30 min (`pullBoxImage`);
+   - replacement: the existing transaction bounds.
+
+   All of this runs under the host workspace lock, as Box creation pulls do today. There is no extra host budget.
+9. **Version skew.** None. The host and the probe run the same `/opt/ploinky` source.
+
+### 8.4 Phases
+
+1. **Pure pieces.** Write `imageRefreshPolicy.mjs` and switch `imageRefresh.mjs` to it, then write `ploinky-box/inbox/readImageRefreshPolicy.mjs`. Add tests: the rule table, and the probe printing `unknown` on unreadable secrets (run with a fixture workspace and master key).
+2. **Box step.** Write `ploinky-box/update/boxImageRefresh.mjs`:
+   - `refreshBoxImageForUpdate(input, deps)`. Its `deps` seams are `runner`, `fetchDigest = fetchRemoteManifestDigest`, `pull = pullBoxImage`, `validateImage = inspectAndValidateImage`, `readPolicy`.
+   - `restoreBoxImageTag`.
+   - `boxImageRecord(result, { prepared, rolledBack })`, using `createOperationRecord`.
+
+   Export `pullBoxImage` from `transactions.mjs`.
+3. **Transaction.** Add `replaceImage` as described in 8.3 decision 4, with tests in `tests/unit/ploinkyBoxTransactions.test.mjs`:
+   - a reusable Box plus `replaceImage: true` gives `action: 'replaced'` with `pullBoxImage` called;
+   - the default gives `reused`;
+   - `replaceImage` together with `preserve` throws before any mutation;
+   - image mode with the new supplying ID passes the :727 check.
+4. **Supervisor wiring.** Add the `refreshBoxImage` option to `createBoxSupervisor` (default `refreshBoxImageForUpdate`). Then, in `runFullUpdate`: the call before `updateAgentLib`, `replaceImage` into `reconcileConfiguredGraph`, the re-tag in the three restore paths, and the record into `inputRecords` / `error.updateRecords`. `runTargetedUpdate` is untouched.
+5. **Docs.**
+   - DS006: the Box image is checked on full update, with the same opt-out, and pinning is recommended for production.
+   - DS004: one sentence on `update`.
+   - `cli/commands/help.js` and `publicUsageText` (`ploinky-box/bin/ploinky-box.mjs`): "update also refreshes the Box image when its tag moved".
+
+### 8.5 Tests
+
+**New: `tests/unit/ploinkyBoxImageRefresh.test.mjs`.** This name matches the boundary allowlist `tests/unit/ploinkyBox*.test.mjs`. It uses a fake runner (`query`/`run`/`stream`) and a fake `fetchDigest`. Cases:
+- No record and no fetch: pinned, unqualified, `localhost`, or no container.
+- Stopped Box: `box-image-check-deferred`, with no probe and no fetch.
+- Policy:
+  - `off`: no record, no fetch;
+  - probe `unknown`, a non-zero exit, or garbage output: `box-image-policy-unavailable`, no fetch.
+- Digest in the RepoDigests of `beforeId`: `current`, and no `pull` call. Assert that the inspect argument is the image **ID**, not the ref.
+- Digest differs: one `pull` of the tag, `validateImage`; a new ID gives `replaceImage: true` and `box-image-refreshed` once `prepared.action === 'replaced'`.
+- `undetermined`, proxy env, or a TLS-class error: pull. The same ID afterwards gives `current` with `replaceImage: false`.
+- `unavailable` or 429: no pull, `registry-unreachable`.
+- Pull throws: `box-image-pull-failed`.
+- Contract invalid: `<engine> tag <beforeId> <ref>`, then `box-image-invalid`.
+- `restoreBoxImageTag` never throws.
+- A spy proves that no token text appears in logs or records.
+
+**Supervisor (with fakes):**
+- A full update with `refreshBoxImage` returning `replaceImage: true` passes it to the reconcile.
+- Its record lands in the result.
+- A reconcile failure re-tags and keeps the existing error and exit.
+- A targeted update never calls `refreshBoxImage`.
+
+**Existing tests that must inject a no-op seam.** They run `runUpdateTransaction` with `env: {}`, so the default ref is `docker.io/assistos/ploinky-box:latest`, which would reach the probe and the network. Each must pass `refreshBoxImage: async () => ({ replaceImage: false, outcome: 'skipped' })`:
+- `ploinkyBoxSupervisor`
+- `ploinkyBoxUpdateTransaction`
+- `ploinkyBoxUpdateProtocol`
+- `ploinkyBoxUpdateProofSignals`
+- `ploinkyBoxUpdateSourceMismatch`
+- `ploinkyBoxUpdateMutationGaps`
+- `ploinkyBoxUpdateHostExclusions`
+- `ploinkyBoxHostExclusionsInterrupt`
+- `ploinkyBoxHostUpdateAgentLib`
+- `ploinkyBoxImageAgentLibSupervisor`
+- `ploinkyBoxHardwareLimitsGate`
+- `ploinkyBoxGpuGrant`
+- `ploinkyBoxBindLifecycle`
+- `ploinkyBoxCli`
+- `ploinkyGraphSkillScope`
+
+All are `tests/unit/*.test.mjs` that call `runUpdateTransaction`. Tests that assert exact record lists then stay unchanged. `ploinkyBoxTransactions.test.mjs` gains only the new cases. `ploinkyBoxImageContract.test.mjs` is unaffected.
+
+**Manual verification recipe** (real Podman host; the probe image must pass the Box contract, so check first with `ploinky diagnose`):
+1. Create image A: `podman pull docker.io/assistos/ploinky-box:latest`, `podman tag` it as `docker.io/<you>/ploinky-box-probe:latest`, and `podman push` it.
+2. In a scratch workspace: `PLOINKY_BOX_IMAGE=docker.io/<you>/ploinky-box-probe:latest ploinky start <agent>`. Record the Box container ID and its `.Image`.
+3. Push image B under the same tag (`FROM` A plus one harmless file layer). Run `ploinky update` with the same `PLOINKY_BOX_IMAGE`. Expect:
+   - the pull and a Box replacement (new container ID, `.Image` equals B's ID);
+   - the graph restarted if it was active;
+   - the record `image box:… changed box-image-refreshed`;
+   - exit 0.
+4. Run `ploinky update` again. Expect `box-image-current`, no pull and no replacement.
+5. Run `ploinky update repo <name>`. Expect no Box check line.
+6. Run `ploinky var PLOINKY_IMAGE_REFRESH off`, push C, and run `ploinky update`. Expect the Box kept and no registry traffic. Then `ploinky var PLOINKY_IMAGE_REFRESH on`.
+7. Block the registry host. `ploinky update` keeps the Box, records `registry-unreachable`, and exits 0.
+8. Push D that breaks the contract (for example `USER root`). Expect `box-image-invalid`, the tag back on B's ID, the Box kept, and exit 0.
+9. Run `ploinky stop`, then `ploinky update`. Expect `box-image-check-deferred`.
+10. Set `PLOINKY_BOX_IMAGE=…@sha256:<B>` and run `ploinky update`. Expect no check.
+
+### 8.6 Open questions (with recommendations)
+
+1. **A replacement that started and failed:** non-zero exit (existing semantics) or a skipped record with exit 0? *Recommend non-zero.* The graph was stopped and restored, so the operator should see a failure, not "complete-with-skips".
+2. **Stopped Box:** defer (recommended), or start, check and replace in the same update? *Recommend defer.* The full update starts the Box, so the next update checks it.
+3. **Folder-scoped full update (`update <folder>`):** include (recommended)? It already runs the replacing full transaction, and the Box is workspace-wide.
+4. **Unprovable digest:** pull and compare IDs (recommended), or skip as unavailable? *Recommend pull*, because pinning or `off` are the escapes for proxied, quota-sensitive hosts.
