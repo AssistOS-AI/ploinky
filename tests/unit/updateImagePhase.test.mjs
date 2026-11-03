@@ -185,7 +185,8 @@ test('refreshUpdateImages: nothing without a static agent; skipped while no-wait
     const calls = [];
     const deps = (overrides) => ({
         getConfig: () => ({ static: { agent: 'explorer' } }),
-        inspectInFlightNoWaitWorkers: () => [],
+        inspectLiveNoWaitWorkers: () => [],
+        isProcessAlive: () => true,
         refreshWorkspaceGraphImages: async (received, options) => { calls.push([received, options]); return ['done']; },
         reposDir: '/ws/.ploinky/repos',
         ...overrides,
@@ -194,7 +195,7 @@ test('refreshUpdateImages: nothing without a static agent; skipped while no-wait
     assert.deepEqual(await refreshUpdateImages({ request, session, log: (l) => logs.push(l) }, deps({ getConfig: () => ({}) })), []);
     assert.equal(calls.length, 0);
     assert.deepEqual(await refreshUpdateImages({ request, session, log: (l) => logs.push(l) },
-        deps({ inspectInFlightNoWaitWorkers: () => [{ containerName: 'c' }] })).then((r) => r.map((x) => [x.action, x.code])),
+        deps({ inspectLiveNoWaitWorkers: () => [{ containerName: 'c', pid: 4242, canProgress: true }] })).then((r) => r.map((x) => [x.action, x.code])),
         [['phase-skipped', 'image-refresh-workers-active']]);
     assert.equal(calls.length, 0);
     assert.match(logs.join('\n'), /no-wait workers of an earlier start are still running/);
@@ -365,7 +366,8 @@ test('phase: the cancellation checkpoint carries the image records so far; a pul
 
 test('silent skips leave one optional skipped record each, so the update is not reported as fully verified', async () => {
     const workers = await refreshUpdateImages({ request: { kind: 'all', folderPath: '' }, session: { enabled: true }, log: () => {} }, {
-        getConfig: () => ({ static: { agent: 'x' } }), inspectInFlightNoWaitWorkers: () => [{ containerName: 'c' }],
+        getConfig: () => ({ static: { agent: 'x' } }), inspectLiveNoWaitWorkers: () => [{ containerName: 'c', pid: 4242, canProgress: true }],
+        isProcessAlive: () => true,
     });
     const graph = await refreshWorkspaceGraphImages({ enabled: true });
     assert.deepEqual(graph.map((entry) => entry.code), ['image-refresh-graph-unavailable']);
@@ -420,4 +422,24 @@ test('phase: the retag callback re-reads the policy, so turning refresh off duri
     assert.equal(tags.length, 0);
     assert.equal(result.records.at(-1).code, 'image-refresh-turned-off');
     assert.equal(result.exitCode, 0);
+});
+
+test('refreshUpdateImages: only a worker that can progress and whose published pid is alive skips the phase', async () => {
+    const run = async (worker, alive) => {
+        const calls = [];
+        const result = await refreshUpdateImages({ request: { kind: 'all', folderPath: '' }, session: { enabled: true }, log: () => {} }, {
+            getConfig: () => ({ static: { agent: 'x' } }),
+            inspectLiveNoWaitWorkers: () => [worker],
+            isProcessAlive: () => alive,
+            refreshWorkspaceGraphImages: async () => { calls.push('refresh'); return []; },
+        });
+        return { result, calls };
+    };
+    const base = { containerName: 'c', runId: 'r', canProgress: true };
+    assert.deepEqual((await run({ ...base, pid: null }, true)).calls, ['refresh'], 'no published pid');
+    assert.deepEqual((await run({ ...base, pid: 4242 }, false)).calls, ['refresh'], 'the pid is not running');
+    assert.deepEqual((await run({ ...base, pid: 4242, canProgress: false }, true)).calls, ['refresh'], 'cannot progress');
+    const blocked = await run({ ...base, pid: 4242 }, true);
+    assert.deepEqual(blocked.calls, []);
+    assert.deepEqual(blocked.result.map((entry) => entry.code), ['image-refresh-workers-active']);
 });

@@ -154,9 +154,14 @@ export async function refreshWorkspaceGraphImages(session, { includeNoWait = tru
 export async function refreshUpdateImages({ request, session, log }, deps = {}) {
     const getConfig = deps.getConfig || (await import('../utils/workspace.js')).getConfig;
     if (!getConfig()?.static?.agent) return [];
-    const inspectInFlight = deps.inspectInFlightNoWaitWorkers
-        || (await import('./noWaitRunSettlement.js')).inspectInFlightNoWaitWorkers;
-    if (inspectInFlight().length) {
+    const inspectLive = deps.inspectLiveNoWaitWorkers
+        || (await import('./noWaitRunSettlement.js')).inspectLiveNoWaitWorkers;
+    const isAlive = deps.isProcessAlive || (await import('../sandbox/processIdentity.js')).isProcessAlive;
+    // A status file alone never blocks the refresh: only a worker whose published
+    // pid is a running process can still pull or create from an image tag.
+    const active = inspectLive().filter((worker) => worker.canProgress
+        && Number.isSafeInteger(worker.pid) && worker.pid > 0 && isAlive(worker.pid));
+    if (active.length) {
         log('[update] Image refresh skipped: no-wait workers of an earlier start are still running. '
             + 'Run `ploinky update` again once they finish.');
         return phaseSkipped('image-refresh-workers-active', 'no-wait workers of an earlier start are still running');
