@@ -75,6 +75,21 @@ require_helper_privilege() {
     fail "$helper requires ${capability}=ep file capability or setuid-root"
 }
 
+# Inner Podman writes advisory warnings to stderr, on some hosts for every
+# command (a cgroup v1 host prints a cgroups-v1 deprecation notice), so an
+# observed value is only the command's stdout. Stderr follows stdout only when
+# the command fails, which keeps Podman's own diagnostic for the caller's
+# failure message. Descriptor 3 carries stdout past the inner substitution,
+# which captures stderr alone.
+inner_podman_stdout() {
+    local diagnostic
+    local status=0
+
+    { diagnostic="$(podman "$@" 2>&1 1>&3 3>&-)" || status=$?; } 3>&1
+    test "$status" -eq 0 || printf '%s\n' "$diagnostic"
+    return "$status"
+}
+
 configured_subid_count() {
     local file="$1"
     awk -F: '$1 == "podman" { total += $3 } END { print total + 0 }' "$file"
@@ -96,7 +111,7 @@ require_full_mapping() {
         || fail "cannot read $subid_file"
     test "$configured" -eq "$EXPECTED_SUBORDINATE_IDS" \
         || fail "podman subordinate ${kind^^} range must contain exactly $EXPECTED_SUBORDINATE_IDS IDs (observed $configured)"
-    mapping="$(podman unshare cat "$proc_file" 2>&1)" \
+    mapping="$(inner_podman_stdout unshare cat "$proc_file")" \
         || fail "cannot inspect Podman ${kind^^} mapping: $mapping"
     mapped="$(printf '%s\n' "$mapping" | mapped_id_count)"
     test "$mapped" -eq "$EXPECTED_MAPPED_IDS" \
@@ -106,7 +121,7 @@ require_full_mapping() {
 reject_retained_managed_containers() {
     local managed_ids
 
-    if ! managed_ids="$(podman ps --all --quiet --filter "label=$MANAGED_LABEL" 2>&1)"; then
+    if ! managed_ids="$(inner_podman_stdout ps --all --quiet --filter "label=$MANAGED_LABEL")"; then
         fail "cannot enumerate Ploinky-managed nested containers: ${managed_ids:-no diagnostic}"
     fi
     test -z "$managed_ids" || fail \
@@ -127,7 +142,7 @@ require_managed_network_stack() {
     test "$oldest_version" = "$MINIMUM_PODMAN_VERSION" \
         || fail "inner Podman must be $MINIMUM_PODMAN_VERSION or newer (observed $podman_version)"
 
-    network_backend="$(podman info --format '{{.Host.NetworkBackend}}' 2>&1)" \
+    network_backend="$(inner_podman_stdout info --format '{{.Host.NetworkBackend}}')" \
         || fail "cannot inspect inner Podman network backend: ${network_backend:-no diagnostic}"
     test "$network_backend" = netavark \
         || fail "inner Podman network backend must be netavark (observed ${network_backend:-unknown})"
@@ -136,6 +151,15 @@ require_managed_network_stack() {
     pasta_version="$(pasta --version 2>&1)" \
         || fail "pasta backend is not operational: ${pasta_version:-no diagnostic}"
     test -n "$pasta_version" || fail "pasta backend returned no version evidence"
+}
+
+require_rootless_inner_podman() {
+    local rootless
+
+    rootless="$(inner_podman_stdout info --format '{{.Host.Security.Rootless}}')" \
+        || fail "cannot inspect inner Podman rootless state: ${rootless:-no diagnostic}"
+    test "$rootless" = true \
+        || fail "inner Podman must be rootless (observed ${rootless:-unknown})"
 }
 
 require_cloudflared_contract() {
@@ -190,13 +214,10 @@ require_helper_privilege newuidmap cap_setuid
 require_helper_privilege newgidmap cap_setgid
 log "Validating nested rootless Podman networking"
 podman version >/dev/null 2>&1 || fail "inner podman version check failed"
-if ! podman_info="$(podman info 2>&1)"; then
+if ! podman_info="$(inner_podman_stdout info)"; then
     fail "inner podman not functional: ${podman_info:-no diagnostic}"
 fi
-inner_rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>&1)" \
-    || fail "cannot inspect inner Podman rootless state: ${inner_rootless:-no diagnostic}"
-test "$inner_rootless" = true \
-    || fail "inner Podman must be rootless (observed ${inner_rootless:-unknown})"
+require_rootless_inner_podman
 require_managed_network_stack
 require_full_mapping uid
 require_full_mapping gid
