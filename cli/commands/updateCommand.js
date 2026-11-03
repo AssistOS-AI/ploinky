@@ -128,14 +128,8 @@ async function runUpdate(normalizedOptions, {
     let releaseFailed = false;
     try {
         const request = parseUpdateRequest(args);
-        // An invalid PLOINKY_IMAGE_REFRESH never fails the update: the image phase records it and is skipped.
-        let imageRefreshPolicy = null;
-        let imageRefreshPolicyError = null;
-        try {
-            imageRefreshPolicy = resolveImageRefreshPolicy({ env });
-        } catch (error) {
-            imageRefreshPolicyError = error;
-        }
+        // The workspace variable PLOINKY_IMAGE_REFRESH=off opts the image refresh out; it never fails the update.
+        const { policy: imageRefreshPolicy, ignoredValue: imageRefreshIgnoredValue } = resolveImageRefreshPolicy();
         let lease = null;
         let ownsLease = false;
         if (workspaceMutationLease) {
@@ -169,7 +163,7 @@ async function runUpdate(normalizedOptions, {
         }
         if (!isCancelledResult(result)) {
             result = await appendImageRefreshPhase(result, {
-                request, policy: imageRefreshPolicy, policyError: imageRefreshPolicyError, cancellation,
+                request, policy: imageRefreshPolicy, ignoredValue: imageRefreshIgnoredValue, cancellation,
                 hostActivates: Boolean(reportRequest), log, refreshImages,
                 deadlineMs: startedAtMs + IMAGE_PHASE_BUDGET_MS, heldLease: ownsLease ? null : lease,
             });

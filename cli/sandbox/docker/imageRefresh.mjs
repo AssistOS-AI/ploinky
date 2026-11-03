@@ -10,28 +10,21 @@ import { parseImageReference, repoDigestSet } from './imageReference.mjs';
 import { fetchRemoteManifestDigest, nativeFetchIgnoresProxy } from './registryDigest.mjs';
 
 export const IMAGE_REFRESH_VAR = 'PLOINKY_IMAGE_REFRESH';
-const IMAGE_REFRESH_POLICIES = new Set(['check', 'always', 'off']);
 // A pull that cannot get at least this long is deferred instead of started.
 const MIN_PULL_BUDGET_MS = 60_000;
 
-// Workspace variable first (`ploinky var PLOINKY_IMAGE_REFRESH off`, visible
-// inside the Box), then the process environment, then 'check'.
-export function resolveImageRefreshPolicy({ env = process.env, readVar = resolveVarValue } = {}) {
+// The workspace variable (`ploinky var PLOINKY_IMAGE_REFRESH off`, visible inside the Box) is the only
+// source. `off` is the only recognised value and turns the refresh off; anything else is ignored.
+// Returns { policy: 'off' | 'refresh', ignoredValue }.
+export function resolveImageRefreshPolicy({ readVar = resolveVarValue } = {}) {
     let raw = '';
     try {
         raw = String(readVar(IMAGE_REFRESH_VAR) || '').trim();
     } catch (error) {
-        debugLog(`[pull] ${IMAGE_REFRESH_VAR}: workspace variables unreadable (${error?.message || error}); `
-            + 'using the environment');
+        debugLog(`[pull] ${IMAGE_REFRESH_VAR}: workspace variables unreadable (${error?.message || error}); refreshing`);
     }
-    if (!raw) raw = String(env?.[IMAGE_REFRESH_VAR] || '').trim();
-    if (!raw) return 'check';
-    if (!IMAGE_REFRESH_POLICIES.has(raw)) {
-        const error = new Error(`${IMAGE_REFRESH_VAR} must be 'check', 'always' or 'off', not '${raw}'`);
-        error.code = 'PLOINKY_IMAGE_REFRESH_INVALID';
-        throw error;
-    }
-    return raw;
+    if (raw === 'off') return { policy: 'off', ignoredValue: '' };
+    return { policy: 'refresh', ignoredValue: raw };
 }
 
 // null when the image is missing locally; otherwise its RepoDigests (maybe empty).
@@ -156,7 +149,7 @@ export function createImageRefreshSession({
         if (local === null) return skipped(ref);
         if (deadlineMs - now() < MIN_PULL_BUDGET_MS) return { ...base, action: 'deferred' };
         let knownDigest = '';
-        if (policy !== 'always' && !nativeFetchIgnoresProxy(env, execArgv)) {
+        if (!nativeFetchIgnoresProxy(env, execArgv)) {
             const remote = await fetchRemoteManifestDigest(parsed, { fetchImpl, unreachableHosts });
             const localSet = repoDigestSet(local, parsed);
             if (remote.status === 'ok' && localSet.has(remote.digest)) {

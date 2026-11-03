@@ -42,7 +42,7 @@ function response(status, digest) {
 function makeSession(overrides = {}) {
     const state = { heads: 0, pulls: [], tags: [], logs: [] };
     const session = createImageRefreshSession({
-        policy: 'check',
+        policy: 'refresh',
         runtime: 'podman',
         log: (line) => state.logs.push(line),
         env: {},
@@ -227,7 +227,7 @@ function gitResult(overrides = {}) {
 
 const phaseOptions = (overrides = {}) => ({
     request: { kind: 'all', folderPath: '' },
-    policy: 'check',
+    policy: 'refresh',
     cancellation: { checkpoint: async () => {} },
     hostActivates: false,
     log: () => {},
@@ -236,16 +236,29 @@ const phaseOptions = (overrides = {}) => ({
     ...overrides,
 });
 
-test('phase: an invalid policy adds one non-required skipped record and leaves the exit status alone', async () => {
-    const error = Object.assign(new Error("PLOINKY_IMAGE_REFRESH must be 'check', 'always' or 'off', not 'Off'"), { code: 'PLOINKY_IMAGE_REFRESH_INVALID' });
+test('phase: an ignored policy value warns once, adds no record and refreshes as usual', async () => {
+    const logs = [];
     let called = false;
-    const result = await appendImageRefreshPhase(gitResult(), phaseOptions({ policy: null, policyError: error, refreshImages: async () => { called = true; return []; } }));
-    assert.equal(called, false);
-    const record = result.records.at(-1);
-    assert.deepEqual([record.phase, record.outcome, record.code, record.required], ['image', 'skipped', 'image-refresh-invalid-policy', false]);
-    assert.match(record.reason, /check\|always\|off/);
+    const result = await appendImageRefreshPhase(gitResult(), phaseOptions({
+        ignoredValue: 'always', log: (line) => logs.push(line), refreshImages: async () => { called = true; return []; },
+    }));
+    assert.equal(called, true);
+    assert.equal(logs.filter((line) => /PLOINKY_IMAGE_REFRESH='always' is ignored/.test(line)).length, 1);
+    assert.equal(result.records.some((record) => record.phase === 'image'), false);
     assert.equal(result.exitCode, 0);
-    assert.equal(result.activationAllowed, true);
+});
+
+test('phase: off logs one line and pulls nothing', async () => {
+    const logs = [];
+    let called = false;
+    const input = gitResult();
+    const result = await appendImageRefreshPhase(input, phaseOptions({
+        policy: 'off', log: (line) => logs.push(line), refreshImages: async () => { called = true; return []; },
+    }));
+    assert.equal(called, false);
+    assert.equal(result, input);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /Image refresh is turned off for this workspace/);
 });
 
 test('phase: a failed or recovery-needing git phase skips the image phase with one record', async () => {
@@ -257,8 +270,8 @@ test('phase: a failed or recovery-needing git phase skips the image phase with o
     assert.equal(result.exitCode, failed.exitCode, 'the skip changes nothing about the exit status');
 });
 
-test('phase: off and update repos add nothing and never refresh', async () => {
-    for (const options of [{ policy: 'off' }, { request: { kind: 'repos' } }]) {
+test('phase: update repos adds nothing and never refreshes', async () => {
+    for (const options of [{ request: { kind: 'repos' } }]) {
         let called = false;
         const input = gitResult();
         const result = await appendImageRefreshPhase(input, phaseOptions({ ...options, refreshImages: async () => { called = true; return []; } }));

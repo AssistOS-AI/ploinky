@@ -29,11 +29,11 @@ New code is dependency-free Node.js (`engines.node >= 22`). It uses global `fetc
    - Registry reachable but the digest cannot be proven: run `<runtime> pull`.
    - Pull failure: warn and keep the cached image.
    - Nothing in the refresh fails `update`. A failure becomes a `skipped` record and the exit code stays 0.
-6. **Policy.** `PLOINKY_IMAGE_REFRESH` = `check` (default) | `always` | `off`. It is read from the workspace variable (`ploinky var PLOINKY_IMAGE_REFRESH off`) first, then from the process environment.
-   - `off` disables registry checks and refresh pulls.
-   - `imageChanged` recreation (contract item 2) stays active under every policy, because it reacts only to local state.
-   - `start`, `restart` and the no-wait worker do not read the variable.
-   - An invalid value never fails `update`: the image phase is skipped with one non-required `skipped` record (`image-refresh-invalid-policy`).
+6. **Opt-out.** Refreshing is simply what `ploinky update` does by default. The workspace variable `PLOINKY_IMAGE_REFRESH` has one recognised value, `off` (`ploinky var PLOINKY_IMAGE_REFRESH off`): a developer escape hatch for workspaces that build agent images locally under the published tag (`install-roboteam-local-in-box.sh` sets it automatically).
+   - It is read **only** from the workspace variable, never from the process environment, and is not forwarded from the host.
+   - When it is `off`, `update` logs one line saying so and checks and pulls nothing.
+   - Any other non-empty value (including the former `check` and `always`) is ignored: `update` logs one warning and refreshes as usual. It never fails the update and adds no record.
+   - `imageChanged` recreation (contract item 2) is unaffected, because it reacts only to local state.
 7. **`start` and every `restart` form** (including `restart router`) never check or pull. They still recreate an agent whose tag already moved locally, the same way they handle every other drift reason.
 
 ## 2. Verified current behavior
@@ -104,35 +104,18 @@ Ploinky reads no credentials, so there is no `registryAuth.mjs`. The token stays
 
 (Recent 22.x and Node 24 support `--use-env-proxy`.) When it returns true, the session skips the `HEAD` and delegates to the engine. `NO_PROXY` is not interpreted. In-Box processes have no proxy variables today.
 
-**Rate limits.** Docker documents that a manifest `HEAD` does not count as a pull; the live probe returned `ratelimit-limit: 100;w=3600`. Delegated pulls and policy `always` do count, because the engine fetches the manifest with `GET`.
+**Rate limits.** Docker documents that a manifest `HEAD` does not count as a pull; the live probe returned `ratelimit-limit: 100;w=3600`. Fallback pulls (digest unknown) do count, because the engine fetches the manifest with `GET`.
 
-### D3. Policy (`cli/sandbox/docker/imageRefresh.mjs`)
+### D3. Opt-out (`cli/sandbox/docker/imageRefresh.mjs`)
 
 ```js
 export const IMAGE_REFRESH_VAR = 'PLOINKY_IMAGE_REFRESH';
-const IMAGE_REFRESH_POLICIES = new Set(['check', 'always', 'off']);
 
-// Workspace variable first (`ploinky var PLOINKY_IMAGE_REFRESH off`, visible
-// inside the Box), then the process environment, then 'check'.
-export function resolveImageRefreshPolicy({ env = process.env, readVar = resolveVarValue } = {}) {
-    let raw = '';
-    try {
-        raw = String(readVar(IMAGE_REFRESH_VAR) || '').trim();
-    } catch (error) {
-        debugLog(`[pull] ${IMAGE_REFRESH_VAR}: workspace variables unreadable (${error?.message || error}); using the environment`);
-    }
-    if (!raw) raw = String(env?.[IMAGE_REFRESH_VAR] || '').trim();
-    if (!raw) return 'check';
-    if (!IMAGE_REFRESH_POLICIES.has(raw)) {
-        const error = new Error(`${IMAGE_REFRESH_VAR} must be 'check', 'always' or 'off', not '${raw}'`);
-        error.code = 'PLOINKY_IMAGE_REFRESH_INVALID';
-        throw error;
-    }
-    return raw;
-}
+// The workspace variable is the only source. `off` is the only recognised value.
+export function resolveImageRefreshPolicy({ readVar = resolveVarValue } = {})  // { policy: 'off' | 'refresh', ignoredValue }
 ```
 
-The variable is read inside the in-Box process, so no host-to-Box environment forwarding is needed and nothing changes in `ploinky-box/`. A manifest-level policy is not provided (decision Q2).
+The variable is read inside the in-Box process through the workspace variable store, so nothing changes in `ploinky-box/`. An unreadable store means refresh. A manifest-level policy is not provided.
 
 ### D4. The refresh session (`imageRefresh.mjs`)
 
@@ -157,7 +140,7 @@ Seams for tests: `fetchImpl`, `spawn`, `env`, `execArgv`, `pull` (defaults to `p
    - no runtime was found.
 2. `local = readRepoDigests(ref)`. This runs `<rt> image inspect --format '{{json .RepoDigests}}' <ref>` with a 30 s timeout. A non-zero exit means the image is missing: skip and do not pull. An empty or `null` array gives an empty set, which proves nothing and so leads to a pull.
 3. If `deadlineMs - now() < 60 s`, the result is `deferred`: no registry call, no pull (code `image-refresh-deferred`).
-4. If the policy is `always`, or `nativeFetchIgnoresProxy()` is true, the digest is unknown and the engine will pull the tag (step 6). Otherwise `remote = await fetchRemoteManifestDigest(parsed, { unreachableHosts })` (one `Set` per session):
+4. If `nativeFetchIgnoresProxy()` is true, the digest is unknown and the engine will pull the tag (step 6). Otherwise `remote = await fetchRemoteManifestDigest(parsed, { unreachableHosts })` (one `Set` per session):
    - `ok` and `local.has(remote.digest)`: `current`.
    - `ok` and not present: log, remember the digest, continue.
    - `unavailable`: warn, keep cached.
@@ -244,12 +227,10 @@ There is **no automatic pruning** in this change. The previous image stays on di
 Code lives in `cli/commands/updateImagePhase.js` (the commands layer: target collection, record mapping, filters, the phase itself, the tag-move lease). `cli/sandbox/docker/imageRefresh.mjs` returns plain result objects and does not import the update records.
 
 - **Phase.** `'image'` is in `UPDATE_PHASES` (`updateOutcome.js`, before `'activation'`).
-- **Policy parse.** In `runUpdate`, right after `parseUpdateRequest`, `resolveImageRefreshPolicy({ env })` is called. An invalid value **never fails the update**: the error is kept and the image phase appends one non-required `skipped` record, id `PLOINKY_IMAGE_REFRESH`, code `image-refresh-invalid-policy`, with a message naming the accepted values `check|always|off`. The repositories are updated as usual and the exit status is unaffected. (In the Box flow the host has already mutated before the in-Box core runs, so failing there would only block activation.)
+- **Policy.** In `runUpdate`, right after `parseUpdateRequest`, `resolveImageRefreshPolicy()` is called. It never fails the update. `off`: the phase logs `[update] Image refresh is turned off for this workspace ...` and does nothing. An ignored value: one `[update] Warning: PLOINKY_IMAGE_REFRESH='...' is ignored ...` line, then the refresh runs. The records model has no informational outcome, so neither case adds a record.
 - **Budget.** `runUpdateCommand` records its start time. The image phase deadline is `start + IMAGE_PHASE_BUDGET_MS`, where `IMAGE_PHASE_BUDGET_MS = UPDATE_RUNNER_DEFAULTS.timeoutMs - 10 min` (the host bounds the whole in-Box update, `ploinky-box/update/coreRunner.mjs`, 30 min). Each pull is capped at the remaining budget; once less than 60 s remain, the remaining refs are recorded `skipped` / `image-refresh-deferred` and the update continues with exit 0.
-- **Host environment.** `runBoundedUpdateCommand` (`ploinky-box/supervisor.mjs`) passes `PLOINKY_IMAGE_REFRESH` from the host environment into the in-Box update (`imageRefreshPolicy` option, default `process.env.PLOINKY_IMAGE_REFRESH`) and nothing else, so the environment fallback works for host-driven updates. The workspace variable still wins.
 - **`appendImageRefreshPhase`** (after the `releaseFailed` block, before the outer `catch`, only when the result is not a cancellation):
-  - Unchanged result when the policy is `off` or `request.kind === 'repos'`.
-  - Invalid policy: the record above.
+  - Unchanged result, with no log, when `request.kind === 'repos'`.
   - When the git phase failed or needs recovery (`exitCode !== 0` or `!activationAllowed`): one `skipped` record, id `image-refresh`, code `image-refresh-skipped-git-failed`; no image moves while activation is blocked.
   - Otherwise it creates the session with the budget, `beforePull` and `afterPullFailure` set to `cancellation.checkpoint('image', [...git records, ...image records so far])`, and `withRetagLease` from `createRetagLease` (brief workspace mutation lease; the caller's lease is reused when the caller holds one). A `UpdateCancelledError` keeps all records and reaches the existing `catch` as a `cancelled` record.
   - A throw from `refreshImages` other than `UpdateCancelledError` is logged as `[pull] Warning: image refresh skipped (...)` and leaves the result unchanged.
@@ -283,7 +264,6 @@ All new modules are `.mjs`, have no import-time side effects, and stay under 300
   - `agentServiceManager.js`: D5 hook 1;
   - `noWaitWorker.js`: D5 hook 2;
   - `updateCommand.js` and `updateOutcome.js`: D8;
-  - `ploinky-box/supervisor.mjs`: the `PLOINKY_IMAGE_REFRESH` pass-through for the update;
   - `workspaceUtil.js` is **not** modified;
   - help text only (the DS specification files are not edited: AGENTS.md forbids it for behavior work).
 
@@ -304,13 +284,13 @@ All new modules are `.mjs`, have no import-time side effects, and stay under 300
 **Phase 3: the update image phase (D8).** Add `'image'` to `UPDATE_PHASES`, the policy parse, and `updateImagePhase.js` (`appendImageRefreshPhase`, `refreshUpdateImages`, `refreshWorkspaceGraphImages`).
 
 **Phase 4: docs and the cross-repository step.**
-7. Docs: `cli/commands/help.js` only (`ploinky var PLOINKY_IMAGE_REFRESH off|check|always`, and that the host environment value reaches the update). DS004/DS006/DS009 are not edited. Run `fileSizesCheck.sh`.
+7. Docs: `cli/commands/help.js` only (`update` refreshes by default; `ploinky var PLOINKY_IMAGE_REFRESH off` opts out). DS004/DS006/DS009 are not edited. Run `fileSizesCheck.sh`.
 8. In `/home/user/container-image-builds/scripts/install-roboteam-local-in-box.sh`, as a separate commit in that repository, insert inside the `agent|all` build branch, right after the local agent image build succeeded (not before the prerequisites):
 
     ```bash
     # Local builds reuse the published tags; stop Ploinky from refreshing them from the registry.
     if /opt/ploinky/bin/ploinky-local var PLOINKY_IMAGE_REFRESH off; then
-        echo "[local-images] image refresh is off for this workspace; 'ploinky var PLOINKY_IMAGE_REFRESH check' follows the registry again"
+        echo "[local-images] image refresh is off for this workspace"
     else
         echo "[local-images] could not set PLOINKY_IMAGE_REFRESH; run 'ploinky var PLOINKY_IMAGE_REFRESH off' before the next update" >&2
     fi
@@ -321,15 +301,14 @@ All new modules are `.mjs`, have no import-time side effects, and stay under 300
 
 ## 6. Testing
 
-**New unit tests** (`tests/unit/*.test.mjs`, `node:test` plus `node:assert/strict`, style of `manifestImageResolution.test.mjs`). The seams are `fetchImpl`, `spawn`, `env`, `pull` and `readImageId`; there is no network and no engine.
+**New unit tests** (`tests/unit/*.test.mjs`, `node:test` plus `node:assert/strict`, style of `manifestImageResolution.test.mjs`). The seams are `fetchImpl`, `spawn`, `env`, `pull`, `readVar` and `readImageId`; there is no network and no engine.
 
 - `imageReference.test.mjs`: reference parsing (`docker.io/...`, `node:18-alpine`, `docker.io/node`, `localhost:5000/a/b:t`, `ghcr.io/o/r:t`, digest pinning, malformed refs) and `repoDigestSet`.
 - `registryDigest.test.mjs`: anonymous `200`; `401` Bearer to token to `200` (Accept header, `service`/`scope` query, exactly one retry, `access_token`, odd quoting); the `undetermined` and `unavailable` classes; the unreachable-host memo; `nativeFetchIgnoresProxy`; the token never appears in logs or results.
-- `imageRefresh.test.mjs`: policy precedence and validation; the session (digest pull plus retag with one `HEAD` for two agents, busy lease, failing `tag`, same-ID digest pull, skip classes, equal digest, empty RepoDigests, `undetermined` fallback to a tag pull, `unavailable`, `pull-failed`, `error`, `always`, `off`, proxy fallback, hook errors propagating, budget deferral and per-pull timeout capping, unknown runtime).
+- `imageRefresh.test.mjs`: the opt-out (`off` only, workspace variable only, other values ignored and reported); the session (digest pull plus retag with one `HEAD` for two agents, busy lease, failing `tag`, same-ID digest pull, skip classes, equal digest, empty RepoDigests, `undetermined` fallback to a tag pull, `unavailable`, `pull-failed`, `error`, `off`, proxy fallback, hook errors propagating, budget deferral and per-pull timeout capping, unknown runtime).
 - `agentImageChange.test.mjs`: `containerImageChange`, `desiredImageRef` and `imageChangeDetail` through injected readers, including Podman's bare-hex `.Image`.
-- `updateImagePhase.test.mjs`: target collection, `refreshAdmittedGraphImages`, the record table, the agent filters (including registered repos from a subdirectory), `refreshUpdateImages` (no static agent, in-flight worker skip, filter forwarding), the retag lease, and `appendImageRefreshPhase` (invalid policy record, git-failed skip, `off`/`repos`, budget deferral, digest pull plus retag and `image-retag-deferred`, cancellation carrying the image records and a signal-killed pull).
+- `updateImagePhase.test.mjs`: target collection, `refreshAdmittedGraphImages`, the record table, the agent filters (including registered repos from a subdirectory), `refreshUpdateImages` (no static agent, in-flight worker skip, filter forwarding), the retag lease, and `appendImageRefreshPhase` (ignored-value warning, `off` log line, git-failed skip, `repos`, budget deferral, digest pull plus retag and `image-retag-deferred`, cancellation carrying the image records and a signal-killed pull).
 - `updateImageRefreshPhase.test.mjs`: the command level through `runUpdateCommand`: an invalid policy is a skipped record with exit 0 and the repositories still update; image records follow the git records; a failed pull stays exit 0; a workspace without a static agent has nothing to refresh; a throwing refresh is a warning; cancellation keeps the git records.
-- `ploinkyBoxUpdateRunner.test.mjs`: only `PLOINKY_IMAGE_REFRESH` is forwarded into the in-Box update.
 - `updateReportProtocol.test.mjs`: an `image` record round-trips through the published report.
 - Behavioral regression in `tests/unit/dependencyStoreRuntimeWiring.test.mjs`, with `wiringWorkspace(t, { packageJson: null })` (a start command and no `package.json`): a first start; then the engine resolves the tag to another image ID (`FAKE_ENGINE_IMAGE_HEX`, standing in for the pull `ploinky update` performed) and the next start recreates the container (`createdByThisLaunch === true`); a third start with the same ID reuses it.
 
@@ -345,7 +324,7 @@ All new modules are `.mjs`, have no import-time side effects, and stay under 300
 3. Push image B under the same tag, then run `ploinky start`. Expect no `[pull]` lines and no replacement: start never contacts the registry.
 4. Run `ploinky update`. Expect `registry digest differs`, the rollback hint and an `image` record `image-refreshed`. With an active Box graph, the host restart activates it; otherwise run `ploinky restart` and expect `replacing its runtime (imageChanged: ...)`.
 5. Run `ploinky update` again. Expect `1 current` and no pull.
-6. Run `ploinky var PLOINKY_IMAGE_REFRESH off`, push again, and run `ploinky update`: no registry traffic. Run `ploinky var PLOINKY_IMAGE_REFRESH bogus`, then `ploinky update`: the repositories update and the image phase records `image-refresh-invalid-policy` (exit 0).
+6. Run `ploinky var PLOINKY_IMAGE_REFRESH off`, push again, and run `ploinky update`: one "turned off" line, no registry traffic. Run `ploinky var PLOINKY_IMAGE_REFRESH bogus`, then `ploinky update`: one warning, and the refresh runs as usual.
 7. Offline (block the registry host): `ploinky update` succeeds with one warning and a `registry-unreachable` record. Roll back with the printed `podman tag ...` and `ploinky restart`.
 8. In-Box local build: run `install-roboteam-local-in-box.sh agent`, then `ploinky update`. The local build is kept, and the variable reads `off`.
 
@@ -363,7 +342,7 @@ All new modules are `.mjs`, have no import-time side effects, and stay under 300
 **Operational risks:**
 - A broken re-push reaches every workspace at its next update. Mitigations: the rollback hint, pinning agent images by digest in production, and `PLOINKY_IMAGE_REFRESH off`. The Box's automatic graph rollback restores sources, not the moved tag.
 - A lagging registry mirror can report "changed" on every update until it catches up.
-- A fallback pull, or the `always` policy, counts against the Docker Hub pull quota.
+- A fallback pull counts against the Docker Hub pull quota.
 - The image phase has a time budget below the host's 30-minute in-Box bound; refs it cannot finish are deferred to the next update.
 
 **Known follow-ups:**

@@ -53,18 +53,31 @@ function makeSession(overrides = {}) {
     return { session, state };
 }
 
-test('policy: the workspace variable wins over the environment, then the default', () => {
-    assert.equal(resolveImageRefreshPolicy({ env: { PLOINKY_IMAGE_REFRESH: 'always' }, readVar: () => 'off' }), 'off');
-    assert.equal(resolveImageRefreshPolicy({ env: { PLOINKY_IMAGE_REFRESH: 'always' }, readVar: () => '' }), 'always');
-    assert.equal(resolveImageRefreshPolicy({ env: {}, readVar: () => '' }), 'check');
+test('policy: off is the only recognised value and comes only from the workspace variable', () => {
+    assert.deepEqual(resolveImageRefreshPolicy({ readVar: () => 'off' }), { policy: 'off', ignoredValue: '' });
+    assert.deepEqual(resolveImageRefreshPolicy({ readVar: () => '  off ' }), { policy: 'off', ignoredValue: '' });
+    assert.deepEqual(resolveImageRefreshPolicy({ readVar: () => '' }), { policy: 'refresh', ignoredValue: '' });
 });
 
-test('policy: an unreadable variable store falls back to the environment; invalid values throw', () => {
-    const readVar = () => { throw new Error('boom'); };
-    assert.equal(resolveImageRefreshPolicy({ env: { PLOINKY_IMAGE_REFRESH: 'off' }, readVar }), 'off');
-    assert.throws(() => resolveImageRefreshPolicy({ env: { PLOINKY_IMAGE_REFRESH: 'bogus' }, readVar: () => '' }),
-        { code: 'PLOINKY_IMAGE_REFRESH_INVALID' });
-    assert.throws(() => resolveImageRefreshPolicy({ env: {}, readVar: () => 'Check' }), { code: 'PLOINKY_IMAGE_REFRESH_INVALID' });
+test('policy: the process environment is not consulted', () => {
+    const previous = process.env.PLOINKY_IMAGE_REFRESH;
+    process.env.PLOINKY_IMAGE_REFRESH = 'off';
+    try {
+        assert.equal(resolveImageRefreshPolicy({ readVar: () => '' }).policy, 'refresh');
+    } finally {
+        if (previous === undefined) delete process.env.PLOINKY_IMAGE_REFRESH;
+        else process.env.PLOINKY_IMAGE_REFRESH = previous;
+    }
+});
+
+test('policy: any other value, including the removed check and always modes, is ignored and reported', () => {
+    for (const value of ['check', 'always', 'Off', 'bogus']) {
+        assert.deepEqual(resolveImageRefreshPolicy({ readVar: () => value }), { policy: 'refresh', ignoredValue: value });
+    }
+});
+
+test('policy: an unreadable variable store refreshes', () => {
+    assert.deepEqual(resolveImageRefreshPolicy({ readVar: () => { throw new Error('boom'); } }), { policy: 'refresh', ignoredValue: '' });
 });
 
 const DIGEST_REF = `docker.io/assistos/roboteam-agent@${REMOTE_DIGEST}`;
@@ -185,12 +198,7 @@ test('session: an unexpected internal error is an error result under the normali
     assert.match(session.summaryLine(), /1 failed/);
 });
 
-test('session: policy always pulls the tag without a registry check; off makes no calls', async () => {
-    const always = makeSession({ policy: 'always' });
-    assert.equal((await always.session.refresh(REF)).action, 'refreshed');
-    assert.equal(always.state.heads, 0);
-    assert.deepEqual(always.state.pulls, [REF]);
-    assert.equal(always.session.enabled, true);
+test('session: policy off makes no calls', async () => {
     const off = makeSession({ policy: 'off' });
     assert.equal(off.session.enabled, false);
     assert.equal((await off.session.refresh(REF)).action, 'skipped');

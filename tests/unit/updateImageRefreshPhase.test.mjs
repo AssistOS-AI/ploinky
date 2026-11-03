@@ -43,17 +43,10 @@ function harness({ refreshImages, env = {} } = {}) {
     return { run, calls, logs };
 }
 
-test('an invalid PLOINKY_IMAGE_REFRESH is a skipped image record: the repositories still update and the exit status is 0', async () => {
-    const { run, calls } = harness({ env: { PLOINKY_IMAGE_REFRESH: 'Off' }, refreshImages: async () => [] });
-    const result = await run();
-    assert.equal(calls.handlers, 1, 'the repository phases run');
-    assert.equal(calls.refresh, 0);
-    assert.equal(result.exitCode, 0);
-    assert.deepEqual(result.records.map((record) => [record.phase, record.outcome, record.code]), [
-        ['workspace-repository', 'changed', ''],
-        ['image', 'skipped', 'image-refresh-invalid-policy'],
-    ]);
-    assert.equal(result.records[1].required, false);
+test('PLOINKY_IMAGE_REFRESH is read from the workspace variable only; the process environment cannot turn the refresh off', async () => {
+    const { run, calls } = harness({ env: { PLOINKY_IMAGE_REFRESH: 'off' }, refreshImages: async () => [] });
+    await run();
+    assert.equal(calls.refresh, 1);
 });
 
 test('image records are appended after the git records; a failed pull stays exit 0 and activation stays allowed', async () => {
@@ -75,10 +68,7 @@ test('image records are appended after the git records; a failed pull stays exit
     assert.ok(logs.some((line) => /Refreshed images take effect after `ploinky restart`/.test(line)));
 });
 
-test('policy off and update repos skip the image phase entirely', async () => {
-    const off = harness({ env: { PLOINKY_IMAGE_REFRESH: 'off' }, refreshImages: async () => [] });
-    await off.run();
-    assert.equal(off.calls.refresh, 0);
+test('update repos skips the image phase entirely', async () => {
     const repos = harness({ refreshImages: async () => [] });
     await repos.run(['repos']);
     assert.equal(repos.calls.refresh, 0);

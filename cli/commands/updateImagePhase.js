@@ -185,13 +185,18 @@ const phaseRecord = (id, code, reason) => createOperationRecord({
 });
 
 export async function appendImageRefreshPhase(result, {
-    request, policy, policyError = null, cancellation, hostActivates, log, refreshImages = refreshUpdateImages,
+    request, policy, ignoredValue = '', cancellation, hostActivates, log, refreshImages = refreshUpdateImages,
     deadlineMs, heldLease = null, sessionOptions = {},
 }) {
-    if (policy === 'off' || request.kind === 'repos') return result;
-    if (policyError) {
-        return appendUpdateRecords(result, [phaseRecord('PLOINKY_IMAGE_REFRESH', 'image-refresh-invalid-policy',
-            `${policyError.message}; the image refresh was skipped (accepted values: check|always|off)`)]);
+    if (request.kind === 'repos') return result;
+    if (policy === 'off') {
+        log('[update] Image refresh is turned off for this workspace (PLOINKY_IMAGE_REFRESH=off); '
+            + 'no image was checked or pulled.');
+        return result;
+    }
+    if (ignoredValue) {
+        log(`[update] Warning: PLOINKY_IMAGE_REFRESH='${ignoredValue.slice(0, 40)}' is ignored; `
+            + "the only recognised value is 'off'. Refreshing images as usual.");
     }
     if (result.exitCode !== 0 || result.activationAllowed === false) {
         return appendUpdateRecords(result, [phaseRecord('image-refresh', 'image-refresh-skipped-git-failed',
