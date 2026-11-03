@@ -35,6 +35,7 @@ import {
 import { checkoutShadowMount } from '../contract/checkoutAlias.mjs';
 import { discoverBoxOwnership, discoverEngineView } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { assertImageRefreshOptions, imageRefreshResult, refreshBoxImageTag } from './imageTagRefresh.mjs';
 import {
     assertCreateArgsConfined,
     assertRecordedDataSourcesConfined,
@@ -170,7 +171,7 @@ function writeProgress(stderr, message) {
     stderr?.write?.(`[ploinky] ${message}\n`);
 }
 
-async function pullBoxImage(engine, imageRef, runner, {
+export async function pullBoxImage(engine, imageRef, runner, {
     stdout = process.stdout,
     stderr = process.stderr,
     timeoutMs = 1_800_000,
@@ -388,6 +389,10 @@ export async function reconcileBoxContainer({
     assertGateOffRestore = null,
     imageRef = BOX_IMAGE_REFERENCE,
     imagePolicy = 'pull',
+    // A host full update: replace the Box for a registry-proven new image (digest pulled first), or pull
+    // the tag here and replace only if it names another image. Mutually exclusive.
+    replaceImage = false,
+    refreshImageTag = false,
     allowReplacement = true,
     requireExistingContainerId = null,
     // The quiescence gate (plan D3): undefined runs the real gate; a function
@@ -414,12 +419,16 @@ export async function reconcileBoxContainer({
     if (!IMAGE_POLICIES.has(imagePolicy)) {
         throw transactionError(`Unsupported Box image policy ${String(imagePolicy)}`);
     }
+    assertImageRefreshOptions({
+        replaceImage, refreshImageTag, imagePolicy, allowReplacement, requireExistingContainerId,
+    }, transactionError);
     const dependencies = {
         discover: seams.discover || ((selectedIdentity) => discoverBoxOwnership(selectedIdentity, {
             platform, env, runner,
         })),
         preflight: seams.preflight || preflightPublications,
         recheckReleased: seams.recheckReleased || recheckReleasedPublications,
+        pullImage: seams.pullImage || pullBoxImage,
         validateImage: seams.validateImage || inspectAndValidateImage,
         validateExistingImage: seams.validateExistingImage || inspectAndValidateExistingImage,
         probeAgentLib: seams.probeAgentLib || probeImageAgentLib,
@@ -562,6 +571,12 @@ export async function reconcileBoxContainer({
             { code: 'PLOINKY_BOX_DATA_PATH_MISSING' },
         );
     }
+    // Pulled and validated under this lock before the reuse decision; a pull writes only the image store.
+    const imageRefresh = refreshImageTag === true && old
+        ? await refreshBoxImageTag({
+            dependencies, engine, imageRef, old, desiredAgentLib, runner, stdout, stderr,
+        })
+        : null;
     const requiresReplacement = Boolean(old) && (
         old.networkMode !== selectedBoxNetworkMode(engine)
         || old.hostPort !== portPlan.hostPort
@@ -585,6 +600,8 @@ export async function reconcileBoxContainer({
         // A changed source directory, mode, identity, or fingerprint must never
         // leave the old inode mounted in a reused Box.
         || agentLibSelectionChanged(old.agentLib, desiredAgentLib)
+        || replaceImage === true
+        || imageRefresh?.outcome === 'replace'
     );
     // Targeted commands may reuse, start, or create a Box, but must never
     // replace one: a replacement stops its graph and they would not restart it.
@@ -671,6 +688,7 @@ export async function reconcileBoxContainer({
             routerBinding: reusedBinding,
             gpu: old.gpu,
             hardware: old.hardware ?? null,
+            imageRefresh: imageRefreshResult(imageRefresh),
             previousAgentLib: old.agentLib,
             previousRouterBinding: reusedBinding,
             previousGpu: old.gpu,
@@ -719,8 +737,11 @@ export async function reconcileBoxContainer({
                 );
             }
         }
+    } else if (imageRefresh?.outcome === 'replace') {
+        // Pulled and validated above under this lock: no second counted pull.
+        image = imageRefresh.image;
     } else {
-        await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
+        await dependencies.pullImage(engine, imageRef, runner, { stdout, stderr });
         image = dependencies.validateImage(engine.name, imageRef, runner);
     }
     if (desiredAgentLib.mode === 'image') {
@@ -888,6 +909,7 @@ export async function reconcileBoxContainer({
             hardware: desiredHardware,
             previousHardware: old ? (old.hardware ?? null) : null,
             imageId: image.immutableId,
+            imageRefresh: imageRefreshResult(imageRefresh),
             previousAgentLib: old?.agentLib || null,
             previousRouterBinding: old ? routerBindingResult(old.routerBinding, old.hostPort) : null,
             previousGpu: old ? old.gpu : null,
