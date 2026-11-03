@@ -1,18 +1,18 @@
 // Registry refresh of mutable container image tags, used only by `ploinky
 // update`. Start, restart and the no-wait worker never call into this module.
+// Results are plain objects; the commands layer turns them into update records.
 import { spawnSync } from 'node:child_process';
-import { containerToolchainIdentity } from '../../utils/dependencies/store/installContract.mjs';
-import { resolveManifestImage, resolveVarValue } from '../../utils/security/secretVars.js';
-import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
-import { classifyDependencyGraphWaitMode } from '../../utils/workspaceDependencyGraph.js';
-import { createOperationRecord, sanitizeReason } from '../../commands/updateOutcome.js';
+import { resolveVarValue } from '../../utils/security/secretVars.js';
 import { debugLog } from '../../utils/utils.js';
-import { probeContainerRuntime, pullImage } from './common.js';
+import { imagePullTimeoutMs, probeContainerRuntime, pullImage } from './common.js';
+import { readLocalImageId } from './imageChange.mjs';
 import { parseImageReference, repoDigestSet } from './imageReference.mjs';
 import { fetchRemoteManifestDigest, nativeFetchIgnoresProxy } from './registryDigest.mjs';
 
 export const IMAGE_REFRESH_VAR = 'PLOINKY_IMAGE_REFRESH';
 const IMAGE_REFRESH_POLICIES = new Set(['check', 'always', 'off']);
+// A pull that cannot get at least this long is deferred instead of started.
+const MIN_PULL_BUDGET_MS = 60_000;
 
 // Workspace variable first (`ploinky var PLOINKY_IMAGE_REFRESH off`, visible
 // inside the Box), then the process environment, then 'check'.
@@ -21,7 +21,8 @@ export function resolveImageRefreshPolicy({ env = process.env, readVar = resolve
     try {
         raw = String(readVar(IMAGE_REFRESH_VAR) || '').trim();
     } catch (error) {
-        debugLog(`[pull] ${IMAGE_REFRESH_VAR}: workspace variables unreadable (${error?.message || error}); using the environment`);
+        debugLog(`[pull] ${IMAGE_REFRESH_VAR}: workspace variables unreadable (${error?.message || error}); `
+            + 'using the environment');
     }
     if (!raw) raw = String(env?.[IMAGE_REFRESH_VAR] || '').trim();
     if (!raw) return 'check';
@@ -31,14 +32,6 @@ export function resolveImageRefreshPolicy({ env = process.env, readVar = resolve
         throw error;
     }
     return raw;
-}
-
-function defaultReadImageId(runtime, ref) {
-    try {
-        return containerToolchainIdentity({ runtime, image: ref }).identity.imageId;
-    } catch (_) {
-        return null;
-    }
 }
 
 // null when the image is missing locally; otherwise its RepoDigests (maybe empty).
@@ -55,32 +48,103 @@ function defaultReadRepoDigests(runtime, ref, spawn = spawnSync) {
     }
 }
 
+// Bounded, credential-free text for logs and records.
+const clean = (value) => String(value ?? '')
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s@]*@/gi, '$1')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
+    .slice(0, 500);
 const short = (id) => String(id || '').replace(/^sha256:/, '').slice(0, 12);
 const bareId = (id) => String(id || '').replace(/^sha256:/, '');
+const runLeased = async (fn) => ({ ok: true, value: await fn() });
 
 /**
  * One refresh session per command. `refresh` never throws, except for an error
- * thrown by the caller's `beforePull` (update cancellation).
+ * thrown by the caller's `beforePull` or `afterPullFailure` hooks (update
+ * cancellation). With a registry digest known, the digest is pulled (the tag
+ * does not move) and the tag is then moved inside `withRetagLease`; without
+ * one, the engine pulls the tag itself.
  */
 export function createImageRefreshSession({
     policy,
     runtime = undefined,
     log = console.log,
     beforePull = null,
+    afterPullFailure = null,
+    withRetagLease = runLeased,
+    deadlineMs = Infinity,
+    now = Date.now,
     fetchImpl = globalThis.fetch,
     spawn = spawnSync,
     env = process.env,
     execArgv = process.execArgv,
     pull = pullImage,
-    readImageId = defaultReadImageId,
+    pullTimeoutMs = imagePullTimeoutMs,
+    readImageId = readLocalImageId,
     readRepoDigests = (rt, ref) => defaultReadRepoDigests(rt, ref, spawn),
 } = {}) {
     const memo = new Map();
     const unreachableHosts = new Set();
     let resolvedRuntime = runtime;
-    let cancelError = null;
+    let hookError = null;
 
     const skipped = (ref) => ({ ref, canonical: ref, action: 'skipped', agents: [] });
+    const hook = async (fn) => {
+        try {
+            await fn?.();
+        } catch (error) {
+            hookError = error;
+            throw error;
+        }
+    };
+
+    function retag(rt, imageId, ref) {
+        const result = spawn(rt, ['tag', imageId, ref], {
+            encoding: 'utf8', stdio: ['ignore', 'ignore', 'pipe'], timeout: 30_000,
+        });
+        if (result.error || result.status !== 0) {
+            const detail = result.error?.message || result.stderr || `exit ${result.status}`;
+            throw new Error(`${rt} tag failed: ${clean(detail)}`);
+        }
+    }
+
+    async function pullAndMove(rt, ref, base, knownDigest, parsed) {
+        const beforeId = readImageId(rt, ref);
+        await hook(beforePull);
+        const remaining = deadlineMs - now();
+        const timeoutMs = Math.floor(Math.min(pullTimeoutMs(), remaining));
+        if (timeoutMs < MIN_PULL_BUDGET_MS) return { ...base, action: 'deferred' };
+        const pulledRef = knownDigest ? `${parsed.registry}/${parsed.repository}@${knownDigest}` : ref;
+        const failed = async (error) => {
+            await hook(afterPullFailure);
+            const message = clean(error?.message || error);
+            log(`[pull] Warning: pull of ${pulledRef} failed (${message}); using the cached image.`);
+            return { ...base, action: 'pull-failed', reason: message };
+        };
+        try {
+            pull(pulledRef, { runtime: rt, log, timeoutMs });
+        } catch (error) {
+            return failed(error);
+        }
+        const afterId = readImageId(rt, pulledRef);
+        if (knownDigest) {
+            if (!afterId) return failed(new Error('the pulled image could not be inspected'));
+            if (afterId !== beforeId) {
+                try {
+                    const moved = await withRetagLease(() => retag(rt, afterId, ref));
+                    if (!moved.ok) return { ...base, action: 'retag-deferred', beforeId, afterId };
+                } catch (error) {
+                    return failed(error);
+                }
+            }
+        }
+        if (beforeId && afterId && beforeId !== afterId) {
+            const agents = base.agents.join(', ') || 'its agents';
+            log(`[pull] ${ref} refreshed for ${agents}; previous image ${bareId(beforeId)}. `
+                + `To roll back: ${rt} tag ${bareId(beforeId)} ${ref}, then ploinky restart.`);
+            return { ...base, action: 'refreshed', beforeId, afterId };
+        }
+        return { ...base, action: 'current', beforeId, afterId };
+    }
 
     async function check(ref, agents) {
         const rt = resolvedRuntime;
@@ -90,6 +154,8 @@ export function createImageRefreshSession({
         const base = { ref, canonical: parsed.canonical, agents };
         const local = readRepoDigests(rt, ref);
         if (local === null) return skipped(ref);
+        if (deadlineMs - now() < MIN_PULL_BUDGET_MS) return { ...base, action: 'deferred' };
+        let knownDigest = '';
         if (policy !== 'always' && !nativeFetchIgnoresProxy(env, execArgv)) {
             const remote = await fetchRemoteManifestDigest(parsed, { fetchImpl, unreachableHosts });
             const localSet = repoDigestSet(local, parsed);
@@ -99,36 +165,20 @@ export function createImageRefreshSession({
             }
             if (remote.status === 'ok') {
                 const localDigest = [...localSet][0];
-                log(`[pull] ${ref}: registry digest differs (local ${localDigest ? `sha256:${short(localDigest)}` : 'unknown'}, registry sha256:${short(remote.digest)}); pulling...`);
+                const localText = localDigest ? `sha256:${short(localDigest)}` : 'unknown';
+                log(`[pull] ${ref}: registry digest differs (local ${localText}, `
+                    + `registry sha256:${short(remote.digest)}); pulling...`);
+                knownDigest = remote.digest;
             } else if (remote.status === 'unavailable') {
-                const message = sanitizeReason(remote.reason);
-                log(`[pull] Warning: registry ${parsed.apiHost} unreachable for ${ref} (${message}); using the cached image.`);
+                const message = clean(remote.reason);
+                log(`[pull] Warning: registry ${parsed.apiHost} unreachable for ${ref} (${message}); `
+                    + 'using the cached image.');
                 return { ...base, action: 'unavailable', reason: message };
             } else {
-                log(`[pull] ${ref}: registry digest not readable (${sanitizeReason(remote.reason)}); asking ${rt} to pull`);
+                log(`[pull] ${ref}: registry digest not readable (${clean(remote.reason)}); asking ${rt} to pull`);
             }
         }
-        const beforeId = readImageId(rt, ref);
-        try {
-            await beforePull?.();
-        } catch (error) {
-            cancelError = error;
-            throw error;
-        }
-        try {
-            pull(ref, { runtime: rt, log });
-        } catch (error) {
-            const message = sanitizeReason(error?.message || error);
-            log(`[pull] Warning: pull of ${ref} failed (${message}); using the cached image.`);
-            return { ...base, action: 'pull-failed', reason: message };
-        }
-        const afterId = readImageId(rt, ref);
-        if (beforeId && afterId && beforeId !== afterId) {
-            log(`[pull] ${ref} refreshed for ${agents.join(', ') || 'its agents'}; previous image ${bareId(beforeId)}. `
-                + `To roll back: ${rt} tag ${bareId(beforeId)} ${ref}, then ploinky restart.`);
-            return { ...base, action: 'refreshed', beforeId, afterId };
-        }
-        return { ...base, action: 'current', beforeId, afterId };
+        return pullAndMove(rt, ref, base, knownDigest, parsed);
     }
 
     async function refresh(ref, { agents = [] } = {}) {
@@ -138,7 +188,8 @@ export function createImageRefreshSession({
             try { resolvedRuntime = probeContainerRuntime(); } catch (_) { resolvedRuntime = null; }
         }
         if (!resolvedRuntime) return skipped(text);
-        const key = `${resolvedRuntime}|${parseImageReference(text)?.canonical || text}`;
+        const canonical = parseImageReference(text)?.canonical || text;
+        const key = `${resolvedRuntime}|${canonical}`;
         const known = memo.get(key);
         if (known) {
             for (const agent of agents) if (!known.agents.includes(agent)) known.agents.push(agent);
@@ -149,10 +200,10 @@ export function createImageRefreshSession({
         try {
             result = await check(text, list);
         } catch (error) {
-            if (error === cancelError) throw error;
-            const message = sanitizeReason(error?.message || error);
+            if (hookError && error === hookError) throw error;
+            const message = clean(error?.message || error);
             log(`[pull] Warning: image refresh of ${text} failed (${message}); using the cached image.`);
-            result = { ref: text, canonical: text, action: 'unavailable', agents: list, reason: message };
+            result = { ref: text, canonical, action: 'error', agents: list, reason: message };
         }
         memo.set(key, result);
         return result;
@@ -163,93 +214,10 @@ export function createImageRefreshSession({
         refresh,
         results: () => [...memo.values()].filter((entry) => entry.action !== 'skipped'),
         summaryLine() {
-            const counts = { refreshed: 0, current: 0, unavailable: 0, 'pull-failed': 0 };
-            for (const entry of memo.values()) if (entry.action in counts) counts[entry.action] += 1;
-            return `[pull] Image refresh: ${counts.refreshed} refreshed, ${counts.current} current, `
-                + `${counts.unavailable} unavailable, ${counts['pull-failed']} failed.`;
+            const count = (...actions) => [...memo.values()].filter((entry) => actions.includes(entry.action)).length;
+            return `[pull] Image refresh: ${count('refreshed')} refreshed, ${count('current')} current, `
+                + `${count('unavailable')} unavailable, ${count('pull-failed', 'error')} failed, `
+                + `${count('deferred', 'retag-deferred')} deferred.`;
         },
     });
-}
-
-/**
- * The mutable image refs of an admitted graph: one target per container
- * agent. Catalog-digest-pinned and hardware-refused records are skipped, and
- * no-wait nodes only when `includeNoWait`. `additionalNodes` are not graph
- * nodes, so they always count as blocking. Never throws.
- */
-export function collectAdmittedImageTargets(admittedStart, { includeNoWait = false, filter = null } = {}) {
-    const noWait = classifyDependencyGraphWaitMode(admittedStart?.graph).noWait;
-    const targets = [];
-    for (const record of admittedStart?.admissions || []) {
-        try {
-            if (record.runtimeKind !== 'container' || record.hardwareRefusal) continue;
-            if (!includeNoWait && noWait.has(record.nodeId)) continue;
-            const catalog = record.admission?.descriptor?.catalogIdentity;
-            if (catalog?.imageDigest) continue;
-            const agentId = String(record.admission?.agentId || '');
-            const slash = agentId.lastIndexOf('/');
-            const repoName = slash === -1 ? '' : agentId.slice(0, slash);
-            const agentName = slash === -1 ? agentId : agentId.slice(slash + 1);
-            let ref = String(catalog?.imageRef || '').trim();
-            if (!ref) {
-                const manifest = JSON.parse(Buffer.from(record.manifestBytesBase64, 'base64').toString('utf8'));
-                const { profileConfig } = resolveManifestRuntimeProfile(manifest, {
-                    agentName: agentId,
-                    profileName: record.profileName || undefined,
-                    path: `manifest(${agentId})`,
-                });
-                ref = resolveManifestImage(manifest, profileConfig, { agentName, repoName });
-            }
-            if (!ref || ref.includes('${')) continue;
-            const target = { ref, repoName, agentName, manifestPath: record.manifestPath };
-            if (filter && !filter(target)) continue;
-            targets.push(target);
-        } catch (error) {
-            debugLog(`[pull] image target skipped for ${record?.nodeId}: ${error?.message || error}`);
-        }
-    }
-    return targets;
-}
-
-/** Refresh each distinct ref of the admitted graph once; prints the summary when anything was checked. */
-export async function refreshAdmittedGraphImages(admittedStart, session, options = {}) {
-    if (!session?.enabled) return [];
-    const groups = new Map();
-    for (const target of collectAdmittedImageTargets(admittedStart, options)) {
-        if (!groups.has(target.ref)) groups.set(target.ref, []);
-        groups.get(target.ref).push(`${target.repoName}/${target.agentName}`);
-    }
-    for (const [ref, agents] of groups) await session.refresh(ref, { agents });
-    const results = session.results();
-    if (results.length) console.log(session.summaryLine());
-    return results;
-}
-
-const RECORD_MAP = Object.freeze({
-    refreshed: ['changed', 'image-refreshed'],
-    current: ['unchanged', 'image-current'],
-    unavailable: ['skipped', 'registry-unreachable'],
-    'pull-failed': ['skipped', 'image-pull-failed'],
-});
-
-/** One optional `image` phase record per checked mutable ref. */
-export function imageRefreshUpdateRecords(results = []) {
-    const records = [];
-    for (const result of results) {
-        const mapped = RECORD_MAP[result.action];
-        if (!mapped) continue;
-        records.push(createOperationRecord({
-            phase: 'image',
-            id: result.canonical || result.ref,
-            outcome: mapped[0],
-            attempted: result.action === 'refreshed' || result.action === 'pull-failed',
-            required: false,
-            code: mapped[1],
-            reason: result.reason || '',
-            before: result.beforeId ? { imageId: result.beforeId } : null,
-            after: result.afterId ? { imageId: result.afterId } : null,
-            details: { agents: result.agents || [] },
-        }));
-    }
-    return records;
 }

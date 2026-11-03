@@ -11,13 +11,9 @@ process.chdir(workspace);
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 
 const {
-    collectAdmittedImageTargets,
     createImageRefreshSession,
-    imageRefreshUpdateRecords,
-    refreshAdmittedGraphImages,
     resolveImageRefreshPolicy,
 } = await import('../../cli/sandbox/docker/imageRefresh.mjs');
-const { decideUpdateStatus } = await import('../../cli/commands/updateOutcome.js');
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -38,7 +34,9 @@ function response(status, digest) {
 
 // A session with every seam injected: no network, no engine.
 function makeSession(overrides = {}) {
-    const state = { heads: 0, pulls: [], logs: [], ids: [OLD, NEW], local: [`docker.io/assistos/roboteam-agent@${LOCAL_DIGEST}`] };
+    const state = {
+        heads: 0, pulls: [], tags: [], logs: [], ids: [OLD, NEW], local: [`docker.io/assistos/roboteam-agent@${LOCAL_DIGEST}`],
+    };
     const session = createImageRefreshSession({
         policy: 'check',
         runtime: 'podman',
@@ -48,7 +46,8 @@ function makeSession(overrides = {}) {
         fetchImpl: async () => { state.heads += 1; return response(200, REMOTE_DIGEST); },
         readRepoDigests: () => state.local,
         readImageId: () => (state.pulls.length ? state.ids[1] : state.ids[0]),
-        pull: (ref) => { state.pulls.push(ref); },
+        pull: (ref, options) => { state.pulls.push(ref); state.timeouts = [...(state.timeouts || []), options.timeoutMs]; },
+        spawn: (_runtime, args) => { state.tags.push(args); return { status: 0 }; },
         ...overrides,
     });
     return { session, state };
@@ -68,20 +67,53 @@ test('policy: an unreadable variable store falls back to the environment; invali
     assert.throws(() => resolveImageRefreshPolicy({ env: {}, readVar: () => 'Check' }), { code: 'PLOINKY_IMAGE_REFRESH_INVALID' });
 });
 
-test('session: two agents on one ref make one HEAD, one pull, and the rollback hint names the old ID', async () => {
+const DIGEST_REF = `docker.io/assistos/roboteam-agent@${REMOTE_DIGEST}`;
+
+test('session: a known registry digest is pulled by digest, then the tag is moved; one HEAD for two agents', async () => {
     const { session, state } = makeSession();
     const first = await session.refresh(REF, { agents: ['repo/a'] });
     const second = await session.refresh(REF, { agents: ['repo/b'] });
     assert.equal(first.action, 'refreshed');
     assert.equal(second, first);
     assert.equal(state.heads, 1);
-    assert.deepEqual(state.pulls, [REF]);
+    assert.deepEqual(state.pulls, [DIGEST_REF], 'the tag itself is never pulled');
+    assert.deepEqual(state.tags, [['tag', NEW, REF]]);
     assert.deepEqual(first.agents, ['repo/a', 'repo/b']);
     const log = state.logs.join('\n');
     assert.match(log, /registry digest differs/);
     assert.match(log, new RegExp(`previous image ${'1'.repeat(64)}`));
     assert.match(log, new RegExp(`podman tag ${'1'.repeat(64)} ${REF}`));
-    assert.match(session.summaryLine(), /1 refreshed, 0 current, 0 unavailable, 0 failed/);
+    assert.match(session.summaryLine(), /1 refreshed, 0 current, 0 unavailable, 0 failed, 0 deferred/);
+});
+
+test('session: a busy lease defers the tag move without a rollback and records retag-deferred', async () => {
+    const { session, state } = makeSession({ withRetagLease: async () => ({ ok: false }) });
+    const result = await session.refresh(REF);
+    assert.equal(result.action, 'retag-deferred');
+    assert.equal(state.tags.length, 0);
+    assert.match(session.summaryLine(), /1 deferred/);
+});
+
+test('session: the tag move runs inside the lease callback only', async () => {
+    const events = [];
+    const { session, state } = makeSession({
+        withRetagLease: async (fn) => { events.push(`lease:${state.tags.length}`); const value = await fn(); events.push(`done:${state.tags.length}`); return { ok: true, value }; },
+    });
+    assert.equal((await session.refresh(REF)).action, 'refreshed');
+    assert.deepEqual(events, ['lease:0', 'done:1']);
+});
+
+test('session: a failing tag command is a pull-failed result', async () => {
+    const { session } = makeSession({ spawn: () => ({ status: 1, stderr: 'no space' }) });
+    const result = await session.refresh(REF);
+    assert.equal(result.action, 'pull-failed');
+    assert.match(result.reason, /tag failed/);
+});
+
+test('session: a digest pull that finds the same image ID is current and moves nothing', async () => {
+    const { session, state } = makeSession({ readImageId: () => OLD });
+    assert.equal((await session.refresh(REF)).action, 'current');
+    assert.equal(state.tags.length, 0);
 });
 
 test('session: pinned, unqualified, localhost and missing images make no fetch and no pull', async () => {
@@ -108,16 +140,22 @@ test('session: an equal digest means no pull', async () => {
     assert.equal(state.pulls.length, 0);
 });
 
-test('session: an empty RepoDigests set and an undetermined registry answer both delegate to a pull', async () => {
-    const empty = makeSession({ readRepoDigests: () => [] });
-    assert.equal((await empty.session.refresh(REF)).action, 'refreshed');
-    const undetermined = makeSession({ fetchImpl: async () => response(404) });
-    assert.equal((await undetermined.session.refresh(REF)).action, 'refreshed');
-    assert.match(undetermined.state.logs.join('\n'), /asking podman to pull/);
+test('session: an empty RepoDigests set with a known digest pulls by digest', async () => {
+    const { session, state } = makeSession({ readRepoDigests: () => [] });
+    assert.equal((await session.refresh(REF)).action, 'refreshed');
+    assert.deepEqual(state.pulls, [DIGEST_REF]);
 });
 
-test('session: a pull that finds nothing new is current, not refreshed', async () => {
-    const { session } = makeSession({ readImageId: () => OLD });
+test('session: an undetermined registry answer falls back to the engine pulling the tag, with no retag', async () => {
+    const { session, state } = makeSession({ fetchImpl: async () => response(404) });
+    assert.equal((await session.refresh(REF)).action, 'refreshed');
+    assert.deepEqual(state.pulls, [REF]);
+    assert.equal(state.tags.length, 0);
+    assert.match(state.logs.join('\n'), /asking podman to pull/);
+});
+
+test('session: a plain pull that finds nothing new is current, not refreshed', async () => {
+    const { session } = makeSession({ fetchImpl: async () => response(404), readImageId: () => OLD });
     assert.equal((await session.refresh(REF)).action, 'current');
 });
 
@@ -135,12 +173,23 @@ test('session: a throwing pull is pull-failed and never throws; credentials in t
     assert.equal(result.action, 'pull-failed');
     assert.equal(result.reason.includes('pw'), false);
     assert.match(state.logs.join('\n'), /Warning: pull of .* failed/);
+    assert.equal(state.tags.length, 0);
 });
 
-test('session: policy always skips the registry check; off makes no calls', async () => {
+test('session: an unexpected internal error is an error result under the normalized ref', async () => {
+    const { session } = makeSession({ readImageId: () => { throw new Error('engine crashed'); } });
+    const result = await session.refresh(REF);
+    assert.equal(result.action, 'error');
+    assert.equal(result.canonical, REF);
+    assert.match(result.reason, /engine crashed/);
+    assert.match(session.summaryLine(), /1 failed/);
+});
+
+test('session: policy always pulls the tag without a registry check; off makes no calls', async () => {
     const always = makeSession({ policy: 'always' });
     assert.equal((await always.session.refresh(REF)).action, 'refreshed');
     assert.equal(always.state.heads, 0);
+    assert.deepEqual(always.state.pulls, [REF]);
     assert.equal(always.session.enabled, true);
     const off = makeSession({ policy: 'off' });
     assert.equal(off.session.enabled, false);
@@ -152,12 +201,44 @@ test('session: a proxy that native fetch would ignore delegates to the engine wi
     const { session, state } = makeSession({ env: { HTTPS_PROXY: 'http://proxy:3128' } });
     assert.equal((await session.refresh(REF)).action, 'refreshed');
     assert.equal(state.heads, 0);
+    assert.deepEqual(state.pulls, [REF]);
 });
 
-test('session: an error from beforePull propagates unchanged and nothing is pulled', async () => {
+test('session: an error from beforePull or afterPullFailure propagates unchanged', async () => {
     const cancelled = new Error('cancelled');
-    const { session, state } = makeSession({ beforePull: async () => { throw cancelled; } });
-    await assert.rejects(session.refresh(REF), (error) => error === cancelled);
+    const before = makeSession({ beforePull: async () => { throw cancelled; } });
+    await assert.rejects(before.session.refresh(REF), (error) => error === cancelled);
+    assert.equal(before.state.pulls.length, 0);
+    const after = makeSession({ pull: () => { throw new Error('killed by signal'); }, afterPullFailure: async () => { throw cancelled; } });
+    await assert.rejects(after.session.refresh(REF), (error) => error === cancelled, 'a pull that failed because of a signal is a cancellation');
+});
+
+test('session: with the budget used up the remaining refs are deferred without any registry or pull call', async () => {
+    let clock = 0;
+    const { session, state } = makeSession({ deadlineMs: 100_000, now: () => clock });
+    clock = 50_000;
+    assert.equal((await session.refresh(REF)).action, 'deferred', 'under a minute left');
+    assert.equal(state.heads + state.pulls.length, 0);
+    assert.equal((await session.refresh('node:18-alpine')).action, 'skipped', 'refs that need no refresh stay skipped');
+    assert.match(session.summaryLine(), /1 deferred/);
+});
+
+test('session: each pull is capped at the remaining budget', async () => {
+    const { session, state } = makeSession({ deadlineMs: 600_000, now: () => 0, pullTimeoutMs: () => 30 * 60 * 1000 });
+    await session.refresh(REF);
+    assert.deepEqual(state.timeouts, [600_000]);
+    const roomy = makeSession({ deadlineMs: Infinity, pullTimeoutMs: () => 123_000 });
+    await roomy.session.refresh(REF);
+    assert.deepEqual(roomy.state.timeouts, [123_000]);
+});
+
+test('session: a budget that runs out during the registry check defers before pulling', async () => {
+    let clock = 0;
+    const { session, state } = makeSession({
+        deadlineMs: 100_000, now: () => clock,
+        fetchImpl: async () => { clock = 90_000; return response(200, REMOTE_DIGEST); },
+    });
+    assert.equal((await session.refresh(REF)).action, 'deferred');
     assert.equal(state.pulls.length, 0);
 });
 
@@ -165,103 +246,4 @@ test('session: an unknown runtime is skipped', async () => {
     const { session, state } = makeSession({ runtime: null });
     assert.equal((await session.refresh(REF)).action, 'skipped');
     assert.equal(state.heads, 0);
-});
-
-function admission(nodeId, agentId, { manifest, runtimeKind = 'container', hardwareRefusal = null, catalogIdentity = null } = {}) {
-    const bytes = Buffer.from(JSON.stringify(manifest || { container: REF }));
-    return {
-        nodeId,
-        manifestPath: `/ws/${agentId}/manifest.json`,
-        manifestBytesBase64: bytes.toString('base64'),
-        profileName: 'default',
-        runtimeKind,
-        hardwareRefusal,
-        admission: { agentId, descriptor: { catalogIdentity } },
-    };
-}
-
-function admitted(admissions) {
-    const nodes = new Map([
-        ['s', { dependencies: new Set(['w']), dependencyEdges: new Map([['w', { noWait: true }]]) }],
-        ['w', { dependencies: new Set(), dependencyEdges: new Map() }],
-        ['b', { dependencies: new Set(), dependencyEdges: new Map() }],
-    ]);
-    nodes.get('s').dependencies.add('b');
-    return { graph: { nodes, staticNodeId: 's' }, admissions };
-}
-
-test('targets: no-wait nodes only with includeNoWait; extra nodes count as blocking', () => {
-    const start = admitted([
-        admission('s', 'repo/static'),
-        admission('w', 'repo/waiter', { manifest: { container: 'ghcr.io/o/waiter:1' } }),
-        admission('extra:c', 'repo/extra', { manifest: { container: 'ghcr.io/o/extra:1' } }),
-    ]);
-    const blocking = collectAdmittedImageTargets(start, {});
-    assert.deepEqual(blocking.map((target) => target.agentName).sort(), ['extra', 'static']);
-    const all = collectAdmittedImageTargets(start, { includeNoWait: true });
-    assert.deepEqual(all.map((target) => target.ref).sort(), ['docker.io/assistos/roboteam-agent:runtime', 'ghcr.io/o/extra:1', 'ghcr.io/o/waiter:1']);
-    assert.equal(all[0].repoName, 'repo');
-    assert.equal(collectAdmittedImageTargets(start, { includeNoWait: true, filter: (target) => target.agentName === 'waiter' }).length, 1);
-});
-
-test('targets: sandbox, hardware-refused and catalog-digest records are skipped; a catalog ref beats the manifest image', () => {
-    const start = admitted([
-        admission('s', 'repo/sandbox', { runtimeKind: 'bwrap' }),
-        admission('b', 'repo/refused', { hardwareRefusal: { code: 'x' } }),
-        admission('extra:p', 'repo/pinned', { catalogIdentity: { imageRef: 'ghcr.io/o/m:1', imageDigest: `sha256:${'d'.repeat(64)}` } }),
-        admission('extra:q', 'repo/llm', { catalogIdentity: { imageRef: 'ghcr.io/o/llm:2', imageDigest: '' } }),
-    ]);
-    const targets = collectAdmittedImageTargets(start, { includeNoWait: true });
-    assert.deepEqual(targets.map((target) => [target.agentName, target.ref]), [['llm', 'ghcr.io/o/llm:2']]);
-});
-
-test('targets: an unresolved placeholder or a broken manifest is skipped without a throw', () => {
-    const start = admitted([
-        admission('s', 'repo/placeholder', { manifest: { container: 'ghcr.io/o/r:${NOT_SET_ANYWHERE}' } }),
-        { ...admission('b', 'repo/broken'), manifestBytesBase64: Buffer.from('{not json').toString('base64') },
-        admission('extra:ok', 'repo/ok', { manifest: { container: 'ghcr.io/o/ok:1' } }),
-    ]);
-    assert.deepEqual(collectAdmittedImageTargets(start, { includeNoWait: true }).map((target) => target.agentName), ['ok']);
-});
-
-test('refreshAdmittedGraphImages refreshes each distinct ref once with every agent and prints the summary', async () => {
-    const start = admitted([admission('s', 'repo/one'), admission('b', 'repo/two')]);
-    const { session, state } = makeSession();
-    const printed = [];
-    const original = console.log;
-    console.log = (line) => printed.push(String(line));
-    try {
-        const results = await refreshAdmittedGraphImages(start, session, { includeNoWait: true });
-        assert.equal(results.length, 1);
-        assert.deepEqual(results[0].agents, ['repo/one', 'repo/two']);
-    } finally {
-        console.log = original;
-    }
-    assert.equal(state.heads, 1);
-    assert.ok(printed.some((line) => /Image refresh: 1 refreshed/.test(line)));
-});
-
-test('update records follow the outcome table and a failed pull still exits 0 with activation allowed', () => {
-    const results = [
-        { action: 'refreshed', canonical: 'docker.io/o/a:1', agents: ['r/a'], beforeId: OLD, afterId: NEW },
-        { action: 'current', canonical: 'docker.io/o/b:1', agents: ['r/b'] },
-        { action: 'unavailable', canonical: 'docker.io/o/c:1', agents: [], reason: 'ENOTFOUND' },
-        { action: 'pull-failed', canonical: 'docker.io/o/d:1', agents: [], reason: 'exit 1' },
-        { action: 'skipped', canonical: 'docker.io/o/e:1', agents: [] },
-    ];
-    const records = imageRefreshUpdateRecords(results);
-    assert.deepEqual(records.map((record) => [record.phase, record.outcome, record.code, record.required]), [
-        ['image', 'changed', 'image-refreshed', false],
-        ['image', 'unchanged', 'image-current', false],
-        ['image', 'skipped', 'registry-unreachable', false],
-        ['image', 'skipped', 'image-pull-failed', false],
-    ]);
-    assert.deepEqual(records[0].before, { imageId: OLD });
-    assert.deepEqual(records[0].after, { imageId: NEW });
-    assert.deepEqual(records[0].details, { agents: ['r/a'] });
-    assert.equal(records[3].attempted, true);
-    const decision = decideUpdateStatus(records);
-    assert.equal(decision.status, 'complete-with-skips');
-    assert.equal(decision.exitCode, 0);
-    assert.equal(decision.activationAllowed, true);
 });

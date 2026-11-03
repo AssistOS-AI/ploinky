@@ -213,6 +213,42 @@ test('the bounded update command carries the nonce and context and never throws 
     }
 });
 
+test('the bounded update command forwards only PLOINKY_IMAGE_REFRESH from the host into the in-Box update', async () => {
+    const { runBoundedUpdateCommand } = await import('../../ploinky-box/supervisor.mjs');
+    const { agentLibFixture } = await import('../helpers/agentlibFixture.mjs');
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-runner-env-')));
+    try {
+        const envOf = async (imageRefreshPolicy) => {
+            const spawned = [];
+            await runBoundedUpdateCommand({ name: 'podman' }, 'c'.repeat(64), ['update'], 8080, 7882, {
+                query: (_engine, args) => ({ ok: true, stdout: args[1] === 'inspect' ? 'true' : '[]' }),
+            }, {
+                workspaceRoot: root, agentLib: agentLibFixture(root), reportNonce: NONCE, reportContext: { schema: 'x' },
+                stdout: sink(), stderr: sink(), env: { PATH: '/bin' }, imageRefreshPolicy,
+                runnerOptions: {
+                    spawnImpl(command, args) {
+                        spawned.push(args);
+                        const child = new EventEmitter();
+                        child.pid = 1;
+                        child.stdout = new EventEmitter();
+                        child.stderr = new EventEmitter();
+                        setImmediate(() => child.emit('close', 0, null));
+                        return child;
+                    },
+                },
+            });
+            return spawned[0].flatMap((value, index) => (spawned[0][index - 1] === '--env' ? [value] : []));
+        };
+        assert.ok((await envOf('off')).includes('PLOINKY_IMAGE_REFRESH=off'));
+        assert.equal((await envOf('')).some((value) => value.startsWith('PLOINKY_IMAGE_REFRESH')), false);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 test('the engine probe treats a stopped or removed Box as quiescent and anything unanswerable as unproven', async () => {
     const { probeInBoxUpdateProcesses } = await import('../../ploinky-box/supervisor.mjs');
     const engine = { name: 'podman' };

@@ -4546,6 +4546,8 @@ export async function runBoundedUpdateCommand(
         skillScopeEnv = {},
         reportNonce,
         reportContext,
+        // Only the image refresh policy of the host reaches the in-Box update; the core validates it.
+        imageRefreshPolicy = process.env.PLOINKY_IMAGE_REFRESH,
         env = buildEngineProcessEnvironment(),
         runnerOptions = {},
     } = {},
@@ -4563,6 +4565,9 @@ export async function runBoundedUpdateCommand(
             skillScopeEnv,
         ),
         '--env', `${UPDATE_REPORT_NONCE_ENV}=${reportNonce}`,
+        ...(String(imageRefreshPolicy || '').trim()
+            ? ['--env', `PLOINKY_IMAGE_REFRESH=${String(imageRefreshPolicy).trim()}`]
+            : []),
         '--env', `${UPDATE_REPORT_CONTEXT_ENV}=${JSON.stringify(reportContext)}`,
         '--user', 'podman',
         ...boxWorkspaceExecOptions(workspaceRoot),

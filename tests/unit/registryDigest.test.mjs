@@ -81,6 +81,15 @@ test('undetermined: non-Bearer challenge, refused or empty token, 4xx after the 
     }
 });
 
+test('a token realm that is not https is never requested; the engine is asked instead', async () => {
+    for (const realm of ['http://auth.example/token', 'ftp://auth.example/token', 'not a url']) {
+        const { fetchImpl, calls } = scripted(response(401, { 'www-authenticate': `Bearer realm="${realm}",service="s"` }));
+        const result = await fetchRemoteManifestDigest(parsed, { fetchImpl });
+        assert.equal(result.status, 'undetermined', realm);
+        assert.equal(calls.length, 1, 'no token request');
+    }
+});
+
 test('undetermined: TLS-class errors, including EPROTO and an expired certificate', async () => {
     for (const code of ['EPROTO', 'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'ERR_TLS_CERT_ALTNAME_INVALID']) {
         const error = new TypeError('fetch failed');
@@ -111,7 +120,9 @@ test('nativeFetchIgnoresProxy: a proxy without Node proxy support, and each way 
     assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p:3128' }, []), true);
     assert.equal(nativeFetchIgnoresProxy({ all_proxy: 'socks5://p:1080' }, []), true);
     assert.equal(nativeFetchIgnoresProxy({}, []), false);
-    assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_USE_ENV_PROXY: '1' }, []), false);
+    assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_USE_ENV_PROXY: '1' }, [], 24), false);
+    assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_USE_ENV_PROXY: '1' }, [], 22), true,
+        'on Node 22 the variable is not relied on');
     assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p' }, ['--use-env-proxy']), false);
     assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_OPTIONS: '--no-warnings --use-env-proxy' }, []), false);
 });

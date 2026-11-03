@@ -9,7 +9,8 @@ const MANIFEST_ACCEPT = [
     'application/vnd.docker.distribution.manifest.v2+json',
 ].join(', ');
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
-const TLS_CODE_PATTERN = /^(?:CERT_|ERR_TLS_|ERR_SSL_)|^(?:UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED_CERT_IN_CHAIN|DEPTH_ZERO_SELF_SIGNED_CERT|EPROTO)$/;
+const TLS_CODE_PATTERN = new RegExp('^(?:CERT_|ERR_TLS_|ERR_SSL_)|^(?:UNABLE_TO_VERIFY_LEAF_SIGNATURE|'
+    + 'SELF_SIGNED_CERT_IN_CHAIN|DEPTH_ZERO_SELF_SIGNED_CERT|EPROTO)$');
 
 export function isTlsClassError(error) {
     const code = String(error?.cause?.code ?? error?.code ?? '');
@@ -21,11 +22,16 @@ function errorLabel(error) {
 }
 
 /** Whether global fetch would bypass a configured proxy, so the engine must be asked instead. */
-export function nativeFetchIgnoresProxy(env = process.env, execArgv = process.execArgv) {
+export function nativeFetchIgnoresProxy(
+    env = process.env,
+    execArgv = process.execArgv,
+    nodeMajor = Number(process.versions.node.split('.')[0]),
+) {
     const proxied = ['HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
         .some((name) => String(env?.[name] || '').trim() !== '');
     if (!proxied) return false;
-    if (env?.NODE_USE_ENV_PROXY === '1') return false;
+    // NODE_USE_ENV_PROXY is only relied on from Node 24; older 22.x may ignore it.
+    if (env?.NODE_USE_ENV_PROXY === '1' && nodeMajor >= 24) return false;
     if ((execArgv || []).includes('--use-env-proxy')) return false;
     if (String(env?.NODE_OPTIONS || '').split(/\s+/).includes('--use-env-proxy')) return false;
     return true;
@@ -48,7 +54,7 @@ const undetermined = (reason) => ({ status: 'undetermined', reason });
 const unavailable = (reason) => ({ status: 'unavailable', reason });
 
 /**
- * @returns {Promise<{status:'ok',digest:string}|{status:'unavailable',reason:string}|{status:'undetermined',reason:string}>}
+ * @returns {Promise<{status:'ok',digest:string}|{status:'unavailable'|'undetermined',reason:string}>}
  * Never throws.
  */
 export async function fetchRemoteManifestDigest(parsed, {
@@ -82,7 +88,9 @@ export async function fetchRemoteManifestDigest(parsed, {
         if (response.status !== 401) return classifyResponse(response);
         const challenge = parseBearerChallenge(response.headers?.get?.('www-authenticate'));
         if (!challenge) return undetermined('registry requires an unsupported authentication scheme');
-        const tokenUrl = new URL(challenge.realm);
+        let tokenUrl;
+        try { tokenUrl = new URL(challenge.realm); } catch (_) { return undetermined('token realm is not a URL'); }
+        if (tokenUrl.protocol !== 'https:') return undetermined('token realm is not an https URL');
         if (challenge.service) tokenUrl.searchParams.set('service', challenge.service);
         tokenUrl.searchParams.set('scope', challenge.scope || `repository:${parsed.repository}:pull`);
         const tokenResponse = await fetchImpl(tokenUrl.href, { signal: AbortSignal.timeout(timeoutMs) });

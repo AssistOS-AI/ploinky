@@ -43,15 +43,17 @@ function harness({ refreshImages, env = {} } = {}) {
     return { run, calls, logs };
 }
 
-test('an invalid PLOINKY_IMAGE_REFRESH fails the update before any repository mutation or lease', async () => {
-    const { run, calls } = harness({ env: { PLOINKY_IMAGE_REFRESH: 'bogus' }, refreshImages: async () => [] });
+test('an invalid PLOINKY_IMAGE_REFRESH is a skipped image record: the repositories still update and the exit status is 0', async () => {
+    const { run, calls } = harness({ env: { PLOINKY_IMAGE_REFRESH: 'Off' }, refreshImages: async () => [] });
     const result = await run();
-    assert.equal(calls.handlers, 0);
+    assert.equal(calls.handlers, 1, 'the repository phases run');
     assert.equal(calls.refresh, 0);
-    assert.equal(result.exitCode, 1);
-    assert.deepEqual(result.records.map((record) => [record.phase, record.outcome]), [['command', 'failed']]);
-    assert.match(result.records[0].reason, /PLOINKY_IMAGE_REFRESH/);
-    assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'run', 'workspace-start.lock')), false);
+    assert.equal(result.exitCode, 0);
+    assert.deepEqual(result.records.map((record) => [record.phase, record.outcome, record.code]), [
+        ['workspace-repository', 'changed', ''],
+        ['image', 'skipped', 'image-refresh-invalid-policy'],
+    ]);
+    assert.equal(result.records[1].required, false);
 });
 
 test('image records are appended after the git records; a failed pull stays exit 0 and activation stays allowed', async () => {

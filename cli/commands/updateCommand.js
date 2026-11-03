@@ -1,4 +1,3 @@
-import path from 'node:path';
 import { PLOINKY_DIR } from '../utils/config.js';
 import {
     acquireWorkspaceMutationLease,
@@ -14,11 +13,8 @@ import { printUpdateSummary } from './updateSummary.js';
 import { withUpdateSkillScopes } from './updateGraph.js';
 import { updateAllRepos, updatePloinkyRepos, updateRepoResult } from './repoAgentCommands.js';
 import { UpdateCancelledError, createUpdateCancellation } from './updateCancellation.js';
-import {
-    createImageRefreshSession,
-    imageRefreshUpdateRecords,
-    resolveImageRefreshPolicy,
-} from '../sandbox/docker/imageRefresh.mjs';
+import { resolveImageRefreshPolicy } from '../sandbox/docker/imageRefresh.mjs';
+import { IMAGE_PHASE_BUDGET_MS, appendImageRefreshPhase } from './updateImagePhase.js';
 
 // The core `ploinky update` command boundary.
 //
@@ -33,9 +29,9 @@ import {
 // below the host's in-Box command timeout.
 //
 // Image refresh: `update` is the only command that checks a registry or pulls
-// a changed mutable image tag. It runs after the lease is released, so no pull
-// happens under the workspace lease; start and restart only recreate a
-// container whose image ID already changed locally.
+// a changed mutable image tag (updateImagePhase.js). It runs after the lease is
+// released, so no pull happens under the workspace lease; start and restart only
+// recreate a container whose image ID already changed locally.
 //
 // Cancellation: from the moment it holds the lease until its report is
 // published the update owns SIGINT/SIGTERM. A signal stops it at the next
@@ -98,57 +94,12 @@ function thrownRecord(error) {
     return commandErrorRecord(error, { outcome: 'uncertain', attempted: true, code: String(error?.code || 'update-threw') });
 }
 
-// Lazy imports keep workspaceUtil.js out of the update command's load path.
-async function refreshUpdateImages({ request, session, log }) {
-    const { getConfig } = await import('../utils/workspace.js');
-    if (!getConfig()?.static?.agent) return [];
-    const { inspectInFlightNoWaitWorkers } = await import('./noWaitRunSettlement.js');
-    if (inspectInFlightNoWaitWorkers().length) {
-        log('[update] Image refresh skipped: no-wait workers of an earlier start are still running. Run `ploinky update` again once they finish.');
-        return [];
-    }
-    let filter = null;
-    if (request.kind === 'repo') {
-        filter = (target) => target.repoName === request.repoName;
-    } else if (request.folderPath) {
-        const folder = path.resolve(request.folderPath);
-        filter = (target) => {
-            const relative = path.relative(folder, path.resolve(target.manifestPath || ''));
-            return Boolean(target.manifestPath) && !relative.startsWith('..') && !path.isAbsolute(relative);
-        };
-    }
-    const { refreshWorkspaceGraphImages } = await import('./workspaceUtil.js');
-    return refreshWorkspaceGraphImages(session, { includeNoWait: true, filter });
-}
-
-async function appendImageRefreshPhase(result, { request, policy, cancellation, hostActivates, log, refreshImages }) {
-    if (policy === 'off' || request.kind === 'repos') return result;
-    const session = createImageRefreshSession({
-        policy,
-        log,
-        beforePull: () => cancellation.checkpoint('image', result.records),
-    });
-    let results;
-    try {
-        results = await refreshImages({ request, session, log });
-    } catch (error) {
-        if (error instanceof UpdateCancelledError) throw error;
-        log(`[pull] Warning: image refresh skipped (${error?.message || error}).`);
-        return result;
-    }
-    const records = imageRefreshUpdateRecords(results);
-    if (!records.length) return result;
-    if (!hostActivates && results.some((entry) => entry.action === 'refreshed')) {
-        log('[update] Refreshed images take effect after `ploinky restart` (or `ploinky restart <agent>`).');
-    }
-    return appendUpdateRecords(result, records);
-}
-
 export async function runUpdateCommand(normalizedOptions = [], options = {}) {
+    const startedAtMs = Date.now();
     const cancellation = createUpdateCancellation();
     let result = null;
     try {
-        result = await runUpdate(normalizedOptions, { ...options, cancellation });
+        result = await runUpdate(normalizedOptions, { startedAtMs, ...options, cancellation });
         return result;
     } finally {
         await cancellation.dispose({ reported: isCancelledResult(result) });
@@ -167,7 +118,8 @@ async function runUpdate(normalizedOptions, {
     log = console.log,
     error: logError = console.error,
     cancellation,
-    refreshImages = refreshUpdateImages,
+    refreshImages,
+    startedAtMs = Date.now(),
 }) {
     const args = normalizedOptions.map(value => String(value ?? ''));
     const command = ['update', ...args];
@@ -176,13 +128,13 @@ async function runUpdate(normalizedOptions, {
     let releaseFailed = false;
     try {
         const request = parseUpdateRequest(args);
-        // An invalid PLOINKY_IMAGE_REFRESH refuses the update before any mutation.
-        let imageRefreshPolicy;
+        // An invalid PLOINKY_IMAGE_REFRESH never fails the update: the image phase records it and is skipped.
+        let imageRefreshPolicy = null;
+        let imageRefreshPolicyError = null;
         try {
             imageRefreshPolicy = resolveImageRefreshPolicy({ env });
         } catch (error) {
-            error.code = 'PLOINKY_UPDATE_IMAGE_REFRESH_INVALID';
-            throw error;
+            imageRefreshPolicyError = error;
         }
         let lease = null;
         let ownsLease = false;
@@ -217,7 +169,9 @@ async function runUpdate(normalizedOptions, {
         }
         if (!isCancelledResult(result)) {
             result = await appendImageRefreshPhase(result, {
-                request, policy: imageRefreshPolicy, cancellation, hostActivates: Boolean(reportRequest), log, refreshImages,
+                request, policy: imageRefreshPolicy, policyError: imageRefreshPolicyError, cancellation,
+                hostActivates: Boolean(reportRequest), log, refreshImages,
+                deadlineMs: startedAtMs + IMAGE_PHASE_BUDGET_MS, heldLease: ownsLease ? null : lease,
             });
         }
     } catch (error) {
