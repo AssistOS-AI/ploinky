@@ -38,8 +38,6 @@ Ploinky must prepare each agent's dependencies for the runtime that will execute
 
 The runtime key must distinguish host and container execution and include the effective platform, architecture, Node major version, and supported variant. The global cache key must include the resolved global dependency manifest. The agent cache key must include the merged global and agent dependency manifest. Installer metadata must bind the runtime used to perform installation and the selected image so a cache built by an incompatible environment cannot be mounted.
 
-A container dependency generation is bound to the immutable image ID, so a re-pulled image tag (see the image refresh policy in DS006) produces a new image ID and therefore a new dependency generation; an agent without dependencies is still replaced through the `imageChanged` reason.
-
 Cache preparation must use a bounded ownership lock and a temporary replacement path. A missing stamp, malformed stamp, changed package hash, changed runtime key, changed installer metadata, missing core marker, partial installation, or advanced tracked git commit makes the cache invalid. Box cache seeding must copy bytes safely across shared host mounts and must not rely on hard links.
 
 ### Coordinated startup flow
