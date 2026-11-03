@@ -38,7 +38,7 @@ export async function refreshBoxImageTag({
         return { outcome: 'invalid', beforeId, reason: reasonOf(error) };
     }
     const afterId = normalizeImageId(pulled.immutableId);
-    if (afterId === beforeId) return { outcome: 'current', beforeId, afterId };
+    if (afterId === beforeId) return { outcome: 'current', beforeId, afterId, image: pulled };
     // The AgentLib was selected from the pre-pull local tag: keep the Box, the next start applies the new tag.
     if (desiredAgentLib.mode === 'image' && desiredAgentLib.supplyingImageId !== afterId) {
         return { outcome: 'pending-agentlib', beforeId, afterId };

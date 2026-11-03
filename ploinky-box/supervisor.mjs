@@ -134,7 +134,7 @@ import {
     stopPloinkyLocalByContainerId,
 } from './lifecycle/container.mjs';
 import { observeBoxConfiguration, reconcileBoxContainer } from './lifecycle/transactions.mjs';
-import { boxImageUpdateRecord } from './update/boxImageRefresh.mjs';
+import { boxImageRolledBackRecord, boxImageUpdateRecord } from './update/boxImageRefresh.mjs';
 import { prepareBoxGeneration, verifyBoxRuntime } from './hardwareLimits/status.mjs';
 import {
     abortHardwareDowngradesForDestroy,
@@ -1202,6 +1202,8 @@ export function createBoxSupervisor({
             );
             failure.activation = activation;
             if (error?.admission) failure.admission = error.admission;
+            // The verified input outcomes (and the Box image record) stay in the host's failure result.
+            if (error?.updateRecords) failure.updateRecords = error.updateRecords;
             throw failure;
         }
         if (error && typeof error === 'object') error.activation = activation;
@@ -1344,6 +1346,15 @@ export function createBoxSupervisor({
                 priorGraphActive: priorGraphActive || (priorRunning && Boolean(priorCoreStartArgv)),
             });
         }
+    }
+
+    // A full update selects the AgentLib from the digest ref when the Box step proved a new image, from the tag
+    // when it asked the transaction to refresh the tag, and from the running image otherwise (policy off, an
+    // unreachable registry, a skip or a deferral): another workspace moving the shared tag never replaces this Box.
+    function fullUpdateImageSource(ownership, imageRef, boxImage) {
+        if (boxImage?.replaceImage) return boxImage.digestRef;
+        if (boxImage?.refreshImageTag) return imageRef;
+        return boxImage ? existingBoxImageSource(ownership, imageRef) : imageRef;
     }
 
     // A guarded start of an exact existing Box keeps that Box's image; other starts read the tag.
@@ -2335,7 +2346,7 @@ export function createBoxSupervisor({
             insideBox: false,
             // The digest ref names the image the replacement will run, so an image-supplied
             // AgentLib is selected from it and the transaction's selection check passes.
-            loadImageBundle: imageBundleLoader(ownership, boxImage?.replaceImage ? boxImage.digestRef : plan.imageRef),
+            loadImageBundle: imageBundleLoader(ownership, fullUpdateImageSource(ownership, plan.imageRef, boxImage)),
         });
         const prepared = await reconcileConfiguredGraph({
             identity,
@@ -2390,6 +2401,13 @@ export function createBoxSupervisor({
             ...(boxImageRecord ? [boxImageRecord] : []),
             agentLibRecord({ selection, changed, previous }),
         ];
+        // A replacement that is rolled back did not refresh the Box: its record says so.
+        const markBoxImageRolledBack = () => {
+            const at = boxImageRecord ? inputRecords.indexOf(boxImageRecord) : -1;
+            if (at >= 0 && prepared.action === 'replaced') {
+                inputRecords[at] = boxImageRolledBackRecord(boxImage, prepared);
+            }
+        };
         const warnings = [];
         let graphMutated = false;
         let restart = false;
@@ -2460,7 +2478,10 @@ export function createBoxSupervisor({
                         restoreStopped: ownership.handles?.container?.runtime?.running !== true,
                         priorGraphActive: activity.active,
                     });
+                    markBoxImageRolledBack();
                 } catch (rollbackError) {
+                    // Only a failed outer Box rollback leaves the new image running.
+                    if (!/outer Box rollback/.test(String(rollbackError?.message))) markBoxImageRolledBack();
                     outcome = rollbackError?.activation?.outcome || 'recovery-required';
                     if (rollbackError?.code === 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED') {
                         warnings.push(rollbackError.message);
@@ -2517,6 +2538,7 @@ export function createBoxSupervisor({
             }
         } catch (error) {
             if (error?.skipRollback) throw error;
+            markBoxImageRolledBack();
             // Keep the verified input outcomes in the final host result; the
             // host prepends its own records itself.
             if (error && typeof error === 'object' && !error.updateRecords) {

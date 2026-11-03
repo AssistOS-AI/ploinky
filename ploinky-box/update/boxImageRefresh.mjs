@@ -52,11 +52,13 @@ export async function refreshBoxImageForUpdate({
     validateExisting = inspectAndValidateExistingImage,
     probeAgentLib = probeImageAgentLib,
 } = {}) {
+    let known = {};
     try {
         const parsed = parseImageReference(imageRef);
         if (!container || !parsed || parsed.pinned || !parsed.explicitRegistry || isLocalhost(parsed.registry)
             || container.labels?.[BOX_LABELS.imageRef] !== imageRef) return result('skip');
         const base = { canonical: parsed.canonical };
+        known = base;
         if (container.runtime?.running !== true || activity?.undetermined) return result('deferred', base);
         const policy = readBoxPolicy({ runner, engine, container, workspaceRoot });
         if (policy === 'off') {
@@ -67,6 +69,7 @@ export async function refreshBoxImageForUpdate({
         if (policy !== 'refresh') return result('policy-unavailable', base);
 
         const beforeId = normalizeImageId(container.runtime.imageId);
+        known = { ...base, beforeId };
         const local = runner.query(engine.name, [
             'image', 'inspect', '--format', '{{json .RepoDigests}}', container.runtime.imageId,
         ], { timeoutMs: 10_000 });
@@ -90,8 +93,9 @@ export async function refreshBoxImageForUpdate({
         if (localDigests.has(remote.digest)) return result('current', { ...base, beforeId });
 
         const digestRef = `${parsed.registry}/${parsed.repository}@${remote.digest}`;
-        stderr?.write?.(`[ploinky] Box image ${imageRef}: registry digest differs (local ${short(beforeId)}, `
-            + `registry ${short(remote.digest)}); pulling by digest...\n`);
+        known = { ...base, beforeId, digestRef };
+        stderr?.write?.(`[ploinky] Box image ${imageRef}: registry digest ${short(remote.digest)} is not among the `
+            + `digests of the running image ${short(beforeId)}; pulling by digest...\n`);
         try {
             await pullImage(engine, digestRef, runner, { stdout, stderr });
         } catch (error) {
@@ -102,11 +106,14 @@ export async function refreshBoxImageForUpdate({
         const inspected = runner.query(engine.name, ['image', 'inspect', '--format', '{{.Id}}', digestRef],
             { timeoutMs: 10_000 });
         if (!inspected?.ok) throw new Error('the pulled image could not be inspected');
-        const afterId = normalizeImageId(String(inspected.stdout || '').trim());
+        // Engine and contract calls take the ID exactly as the engine reports it (Podman: bare hex);
+        // IDs are only compared after normalizing.
+        const rawAfterId = String(inspected.stdout || '').trim();
+        const afterId = normalizeImageId(rawAfterId);
         if (afterId === beforeId) return result('current', { ...base, beforeId, afterId });
         try {
-            validateExisting(engine.name, afterId, imageRef, runner);
-            probeAgentLib(engine.name, afterId, runner);
+            validateExisting(engine.name, rawAfterId, imageRef, runner);
+            probeAgentLib(engine.name, rawAfterId, runner);
         } catch (error) {
             return result('invalid', {
                 ...base, beforeId, afterId, digestRef, reason: sanitizeReason(error?.message || error),
@@ -114,7 +121,7 @@ export async function refreshBoxImageForUpdate({
         }
         return result('replace', { ...base, replaceImage: true, digestRef, beforeId, afterId });
     } catch (error) {
-        return result('error', { reason: sanitizeReason(error?.message || error) });
+        return result('error', { ...known, reason: sanitizeReason(error?.message || error) });
     }
 }
 
@@ -162,6 +169,27 @@ export function boxImageUpdateRecord(boxImage, prepared) {
         reason: reason || '',
         before: boxImage.beforeId ? { imageId: boxImage.beforeId } : null,
         after: afterId ? { imageId: afterId } : null,
+        details: { box: true },
+    });
+}
+
+/**
+ * The record of a Box replacement that was rolled back (blocked activation or a failed core update): the
+ * Box runs its previous image again, so the refresh did not take effect.
+ */
+export function boxImageRolledBackRecord(boxImage, prepared) {
+    const restoredId = boxImage?.beforeId || prepared?.imageRefresh?.beforeId || '';
+    return createOperationRecord({
+        phase: 'image',
+        id: `box:${boxImage?.canonical || 'image'}`,
+        outcome: 'skipped',
+        attempted: true,
+        required: false,
+        code: 'box-image-rolled-back',
+        reason: 'The Box image was replaced and then rolled back because the update could not be activated; '
+            + 'the previous image runs again. Run `ploinky update` again once the update inputs verify.',
+        before: restoredId ? { imageId: restoredId } : null,
+        after: restoredId ? { imageId: restoredId } : null,
         details: { box: true },
     });
 }

@@ -737,9 +737,14 @@ export async function reconcileBoxContainer({
                 );
             }
         }
-    } else if (imageRefresh?.outcome === 'replace') {
+    } else if (imageRefresh?.image) {
         // Pulled and validated above under this lock: no second counted pull.
         image = imageRefresh.image;
+    } else if (imageRefresh) {
+        // The tag refresh did not produce a usable image; a replacement needed for another reason
+        // must not pull the same tag again under this lock.
+        throw transactionError(`The Box image refresh did not complete (${imageRefresh.outcome}`
+            + `${imageRefresh.reason ? `: ${imageRefresh.reason}` : ''}); nothing was replaced`);
     } else {
         await dependencies.pullImage(engine, imageRef, runner, { stdout, stderr });
         image = dependencies.validateImage(engine.name, imageRef, runner);

@@ -1,7 +1,6 @@
 // The agent image phase counts only live no-wait workers: stale status files and markers whose
 // process is gone never block it. The edge generation, marker and status files are real.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -78,11 +77,6 @@ function writeMarker(identity) {
     writeJson(path.join(noWaitDir, `${CONTAINER}.current.json`), { createdAt: new Date().toISOString(), ...identity });
 }
 
-function deadPid() {
-    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
-    return Number(child.stdout);
-}
-
 async function phaseWith(extra = {}) {
     const calls = [];
     const logs = [];
@@ -94,30 +88,19 @@ async function phaseWith(extra = {}) {
     return { result, calls, logs };
 }
 
-test('a queued run-scoped status without a pid does not skip the agent image phase', async () => {
+test('a started run that has not published a pid yet is live but does not skip the agent image phase', async () => {
     fixture();
     const identity = runIdentity();
     writeMarker(identity);
     writeJson(path.join(noWaitDir, identity.statusFile), {
-        runId: identity.runId, runStartedAtMs: identity.runStartedAtMs, waveIndex: 1, state: 'queued',
-        sequencePhase: 'queued', sequencePhaseStartedAtMs: Date.now(), pid: null, workerPid: null,
+        ...identity, state: 'starting', sequencePhase: 'waiting-barrier', sequencePhaseStartedAtMs: Date.now(), pid: null,
     });
     const live = settlement.inspectLiveNoWaitWorkers();
-    assert.ok(live.every((worker) => !worker.pid), JSON.stringify(live));
+    assert.equal(live.length, 1, JSON.stringify(live));
+    assert.equal(live[0].canProgress, true, 'the run is counted by the liveness list');
+    assert.equal(live[0].pid, null);
     const { result, calls } = await phaseWith();
     assert.deepEqual(result, []);
-    assert.deepEqual(calls, ['refresh']);
-});
-
-test('a run whose published pid is a dead process does not skip the agent image phase', async () => {
-    fixture();
-    const identity = runIdentity();
-    writeMarker(identity);
-    writeJson(path.join(noWaitDir, identity.statusFile), {
-        runId: identity.runId, runStartedAtMs: identity.runStartedAtMs, waveIndex: 1, state: 'starting',
-        sequencePhase: 'active', sequencePhaseStartedAtMs: Date.now(), pid: deadPid(),
-    });
-    const { calls } = await phaseWith();
     assert.deepEqual(calls, ['refresh']);
 });
 

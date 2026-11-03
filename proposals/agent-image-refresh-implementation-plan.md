@@ -460,8 +460,8 @@ Steps:
      - `undetermined` (auth, non-Bearer challenge, TLS-class, other 4xx, no digest): `refreshImageTag: true`, outcome `tag-refresh`;
      - `ok` with a different digest: continue.
 6. **Pull by digest.** `digestRef = \`${parsed.registry}/${parsed.repository}@${remote.digest}\``, then `await pullImage(engine, digestRef, runner, { stdout, stderr })`. A throw gives outcome `pull-failed`. No tag moves.
-7. **Compare IDs.** Read `afterId = normalizeImageId(runner.query(engine.name, ['image', 'inspect', '--format', '{{.Id}}', digestRef]).stdout.trim())`. If it is equal to `beforeId`, the outcome is `current` (the registry index lists the same image).
-8. **Validate by ID.** Run `validateExisting(engine.name, afterId, imageRef, runner)`, then `probeAgentLib(engine.name, afterId, runner)`. Any throw gives outcome `invalid`. The Box is kept and nothing was moved.
+7. **Compare IDs.** Read `rawAfterId = runner.query(engine.name, ['image', 'inspect', '--format', '{{.Id}}', digestRef]).stdout.trim()` and `afterId = normalizeImageId(rawAfterId)`. If `afterId` equals `beforeId`, the outcome is `current` (the registry index lists the same image). IDs are compared only after normalizing; engine and contract calls take the ID exactly as the engine reports it (Podman prints bare hex, and `inspectImmutableImage` compares the raw `Id`).
+8. **Validate by ID.** Run `validateExisting(engine.name, rawAfterId, imageRef, runner)`, then `probeAgentLib(engine.name, rawAfterId, runner)` (the raw ID, never the `sha256:`-prefixed form). Any throw gives outcome `invalid`. The Box is kept and nothing was moved.
 9. **Done.** Return `{ outcome: 'replace', replaceImage: true, digestRef, beforeId, afterId }`.
 
 Log lines use the `[ploinky]` prefix, show digests and IDs shortened to 12 characters, and never include tokens.
@@ -534,7 +534,7 @@ Log lines use the `[ploinky]` prefix, show digests and IDs shortened to 12 chara
    - **`pending-agentlib`.** In image mode, the AgentLib was selected from the pre-pull local tag. The Box is reused, and the new tag is applied by the next `start`, `restart` or full `update` (their selection reads the moved tag). There is no second reconcile.
    - **`invalid`.** The tag now names a contract-invalid image (the "pull and compare" trade-off). After the reconcile, `runFullUpdate` logs the manual rollback for this outcome: `[ploinky] To roll back: <engine.name> tag <beforeId without sha256:> <imageRef>`.
 4. **`requiresReplacement`** (:565-588). Append `|| replaceImage === true || imageRefresh?.outcome === 'replace'`.
-5. **Image selection** (:706-725). Between the `preserve` branch and the pull branch, add `else if (imageRefresh?.outcome === 'replace') { image = imageRefresh.image; }`. That image was pulled and validated above under this lock, so the second counted pull is avoided. With `replaceImage` (the digest path), the existing `pullBoxImage(engine, imageRef, …)` runs and moves the tag inside the transaction. The :727 check then compares the digest-image selection with the tag's image.
+5. **Image selection** (:706-725). Between the `preserve` branch and the pull branch, add `else if (imageRefresh?.image) { image = imageRefresh.image; }` (outcomes `replace` and `current` keep the validated image). That image was pulled and validated above under this lock, so the second counted pull is avoided, including for a replacement needed for another reason. For the other refresh outcomes (`pull-failed`, `invalid`, `pending-agentlib`) a replacement needed for another reason fails fast with `The Box image refresh did not complete (<outcome>: <reason>); nothing was replaced` instead of pulling the same tag again under the lock. With `replaceImage` (the digest path), the existing `pullBoxImage(engine, imageRef, …)` runs and moves the tag inside the transaction. The :727 check then compares the digest-image selection with the tag's image.
    - If the registry moved again in between, image mode refuses before any mutation ("run the command again"), giving a non-zero exit. Local mode uses the newer tag; the record's `after` comes from `prepared.imageId`.
 6. **Results.** Add `imageRefresh: imageRefresh ? Object.freeze({ outcome, beforeId, afterId: afterId || null, reason: reason || '' }) : null` to the reuse result (:666-697) and to the `replaced`/`created` result (:881-896). Strip `image` from it.
 
@@ -554,7 +554,8 @@ Log lines use the `[ploinky]` prefix, show digests and IDs shortened to 12 chara
 | `tag-refresh` | `pending-agentlib` | `skipped` | `box-image-refresh-pending` |
 | `deferred` | – | `skipped` | `box-image-check-deferred` |
 | `policy-unavailable` | – | `skipped` | `box-image-policy-unavailable` |
-| `error` | – | `skipped` | `box-image-check-error` |
+| `error` | – | `skipped` | `box-image-check-error` (the id keeps `box:<canonical ref>`) |
+| any replacement | the Box was rolled back (activation blocked, or the core update failed) | `skipped` | `box-image-rolled-back` (`before` and `after` are the restored image ID) |
 
 Skips keep the update at exit 0. A replacement that started and failed keeps today's semantics: the existing restore from `old.imageId`, the existing error, and a **non-zero exit**.
 
@@ -578,7 +579,7 @@ Use it at three call sites:
 - `runTargetedUpdate` :2568: `imageBundleLoader(ownership, existingBoxImageSource(ownership, plan.imageRef))`;
 - `runStartTransaction` :1369: when `existing` (that is, `requiredId !== null`), `imageBundleLoader(ownership, existingBoxImageSource(ownership, ref))` with `ref = options.imageRef || existing.imageRef || resolveBoxImageReference(env)`. Otherwise keep the tag.
 
-Plain `start`, `restart` and the full update keep reading the tag, so they still replace the Box and restart its graph. Bind (:2860-2871) already uses the container's own selection.
+Plain `start` and `restart` keep reading the tag, so they still replace the Box and restart its graph. **Revision 3 (deviation from the original D7):** a full update reads the tag only when the Box step asks for it, that is the digest ref for `replace` and the tag for `tag-refresh` (which `pending-agentlib` needs to converge). For every other outcome (`off`, `unreachable`, `current`, `deferred`, `policy-unavailable`, a skip, an error) it uses `existingBoxImageSource`, so `PLOINKY_IMAGE_REFRESH=off`, an unreachable registry or a contract-invalid shared tag never replaces or refuses this workspace's Box because another workspace moved the tag. Without the Box step (`refreshBoxImage = null`) the tag is read as before. When a replacement is rolled back, the Box record is rebuilt as `box-image-rolled-back`; a rollback failure error carries the update records. Bind (:2860-2871) already uses the container's own selection.
 
 **D8. Time.** The step runs on the host before the in-Box core update, so it does not use the in-Box 30 min `UPDATE_RUNNER_DEFAULTS.timeoutMs`. Host bounds, all under the host workspace lock as Box pulls are today:
 - policy probe 15 s;
