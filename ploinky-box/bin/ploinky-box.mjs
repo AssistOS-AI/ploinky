@@ -38,6 +38,7 @@ import { isInsideBox } from '../lib/boxMarker.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
 import { TARGETED_UPDATE_OPERATION, formatLimitsStatus } from '../hardwareLimitsGate.mjs';
 import { formatUnlockReport } from '../unlock.mjs';
+import { refreshBoxImageForUpdate } from '../update/boxImageRefresh.mjs';
 
 function formatLimitsClearResult(result) {
     if (result.absent) return 'No hardware limits are stored for this workspace; nothing was changed.\n';
@@ -97,6 +98,9 @@ Commands:
                                   contents are listed, never removed
   ploinky update [PATH]           Verified fast-forward update of repos and skills
   ploinky update all [PATH]       (Ploinky only when its checkout is within PATH)
+                                  A full update also refreshes the Box image when its registry tag
+                                  moved; 'ploinky var PLOINKY_IMAGE_REFRESH off' turns agent and Box
+                                  image refresh off
   ploinky update repos|repo NAME  Update registered repositories; activation is pending
   ploinky destroy                 Remove the outer Box without prompting, then this workspace's
                                   GPU grants and hardware-limits records (in .ploinky-box);
@@ -413,6 +417,7 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
 } = {}) {
     const selectedSupervisor = supervisor || createBoxSupervisor({
         env, launchCwd: launchDirectory, allowHostProcesses: parsed.allowHostProcesses,
+        refreshBoxImage: refreshBoxImageForUpdate,
     });
     const engineEnv = buildEngineProcessEnvironment(env);
     outerDebug(parsed, route, output);

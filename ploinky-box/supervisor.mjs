@@ -134,6 +134,7 @@ import {
     stopPloinkyLocalByContainerId,
 } from './lifecycle/container.mjs';
 import { observeBoxConfiguration, reconcileBoxContainer } from './lifecycle/transactions.mjs';
+import { boxImageUpdateRecord } from './update/boxImageRefresh.mjs';
 import { prepareBoxGeneration, verifyBoxRuntime } from './hardwareLimits/status.mjs';
 import {
     abortHardwareDowngradesForDestroy,
@@ -410,6 +411,8 @@ export function createBoxSupervisor({
     discoverGpuMpsTools = undefined,
     scanGpuAgents = declaredGpuAgents,
     countNoWaitWorkers = null,
+    // The Box image check of a full update (production passes refreshBoxImageForUpdate); null means none.
+    refreshBoxImage = null,
     waitDelay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     now = () => Date.now(),
     readNetworkInterfaces = () => os.networkInterfaces(),
@@ -440,6 +443,16 @@ export function createBoxSupervisor({
         return () => loadAgentLibImage({
             engine: ownership.engine, imageRef, runner, stdout, stderr, refresh: ownership.state === 'absent',
         });
+    }
+
+    // The engine's image store is shared by every workspace on this host. An existing Box selects its
+    // image-supplied AgentLib from the image it runs, so a tag moved by another workspace never makes a
+    // non-replacing command replace or refuse it. A requested reference change still selects the new reference.
+    function existingBoxImageSource(ownership, imageRef) {
+        const container = ownership.handles?.container;
+        return container?.runtime?.imageId && container.labels?.[BOX_LABELS.imageRef] === imageRef
+            ? container.runtime.imageId
+            : imageRef;
     }
 
     // Bind never pulls: the supplying image may come only from a local image.
@@ -975,7 +988,7 @@ export function createBoxSupervisor({
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy,
-                loadImageBundle: imageBundleLoader(ownership, imageRef),
+                loadImageBundle: imageBundleLoader(ownership, existingBoxImageSource(ownership, imageRef)),
             });
             const prepared = await reconcileSafely({
                 identity,
@@ -1333,6 +1346,12 @@ export function createBoxSupervisor({
         }
     }
 
+    // A guarded start of an exact existing Box keeps that Box's image; other starts read the tag.
+    function startImageSource(ownership, existing, options) {
+        const ref = options.imageRef || existing?.imageRef || resolveBoxImageReference(env);
+        return existing ? existingBoxImageSource(ownership, ref) : ref;
+    }
+
     async function runStartTransaction(coreArgs = [], options = {}) {
         const requiredId = options.requireExistingContainerId ?? null;
         const authorize = (ownership) => {
@@ -1366,7 +1385,7 @@ export function createBoxSupervisor({
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
-                loadImageBundle: imageBundleLoader(ownership, options.imageRef || existing?.imageRef || resolveBoxImageReference(env)),
+                loadImageBundle: imageBundleLoader(ownership, startImageSource(ownership, existing, options)),
             });
             const reconcileStart = existing ? reconcileSafely : reconcileConfiguredGraph;
             const prepared = await reconcileStart({
@@ -2304,11 +2323,19 @@ export function createBoxSupervisor({
                 record: error.record,
             });
         }
+        const boxImage = refreshBoxImage
+            ? await refreshBoxImage({
+                engine: ownership.engine, container: ownership.handles?.container || null,
+                imageRef: plan.imageRef, workspaceRoot: identity.workspaceRoot, activity, env, stdout, stderr,
+            }, { runner })
+            : null;
         const { selection, changed, previous } = await updateAgentLib({
             workspaceRoot: identity.workspaceRoot,
             branchPolicy: plan.branchPolicy,
             insideBox: false,
-            loadImageBundle: imageBundleLoader(ownership, plan.imageRef),
+            // The digest ref names the image the replacement will run, so an image-supplied
+            // AgentLib is selected from it and the transaction's selection check passes.
+            loadImageBundle: imageBundleLoader(ownership, boxImage?.replaceImage ? boxImage.digestRef : plan.imageRef),
         });
         const prepared = await reconcileConfiguredGraph({
             identity,
@@ -2323,11 +2350,18 @@ export function createBoxSupervisor({
             hardware,
             reposSource,
             imageRef: plan.imageRef,
+            replaceImage: boxImage?.replaceImage === true,
+            refreshImageTag: boxImage?.refreshImageTag === true,
             platform,
             env,
             stdout,
             stderr,
         }, { priorCoreStartArgv, priorSkillScopeEnv, priorGraphActive: activity.active });
+        const boxImageRecord = boxImage ? boxImageUpdateRecord(boxImage, prepared) : null;
+        if (prepared.imageRefresh?.outcome === 'invalid') {
+            stderr?.write?.(`[ploinky] To roll back: ${ownership.engine.name} tag `
+                + `${prepared.imageRefresh.beforeId.replace(/^sha256:/, '')} ${plan.imageRef}\n`);
+        }
         const containerId = prepared.ownership.handles.container.id;
         const sourceSnapshot = {
             skillScopes: {
@@ -2353,6 +2387,7 @@ export function createBoxSupervisor({
         const inputRecords = [
             ...plan.hostRecords,
             ...[workspacePloinkyRecord(workspacePloinky)].filter(Boolean),
+            ...(boxImageRecord ? [boxImageRecord] : []),
             agentLibRecord({ selection, changed, previous }),
         ];
         const warnings = [];
@@ -2565,7 +2600,7 @@ export function createBoxSupervisor({
         const { selection } = await selectAgentLib({
             workspaceRoot: identity.workspaceRoot,
             branchPolicy: null,
-            loadImageBundle: imageBundleLoader(ownership, plan.imageRef),
+            loadImageBundle: imageBundleLoader(ownership, existingBoxImageSource(ownership, plan.imageRef)),
         });
         // A failed reuse or start returns the Box to its prior running state
         // through the same recovery as graph commands. The refusal to replace

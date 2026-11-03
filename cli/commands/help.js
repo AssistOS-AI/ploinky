@@ -143,7 +143,8 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 'printf %s "$API_KEY" | ploinky var API_KEY --stdin'
             ],
             notes: "Use 'vars' to list variables. "
-                + '`ploinky update` re-pulls changed registry image tags by default; '
+                + '`ploinky update` re-pulls changed registry image tags of agents and, in a full update, '
+                + 'of the Box by default; '
                 + '`ploinky var PLOINKY_IMAGE_REFRESH off` turns that off for this workspace '
                 + '(for agent images built locally under the published tag) '
                 + 'and `ploinky var PLOINKY_IMAGE_REFRESH on` turns it back on. '
