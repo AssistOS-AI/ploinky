@@ -110,6 +110,7 @@ if (cmd === 'inspect' || (cmd === 'container' && sub === 'inspect')) {
   if (fi > 0) {
     const f = argv[fi + 1];
     if (f.includes('.Id')) out(found[0].Id + '\n');
+    else if (f.trim() === '{{.Image}}') out(found[0].Image + '\n');
     else if (f.includes('Running')) out(String(found[0].State.Running) + '\n');
     else if (f.includes('Labels')) out(JSON.stringify(found[0].Labels) + '\n');
     else out(JSON.stringify(containerJson(found[0])) + '\n');

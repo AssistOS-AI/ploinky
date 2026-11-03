@@ -56,6 +56,27 @@ test('dependency store wiring: a new image ID under the same tag builds a new ob
     assert.deepEqual(payloadSnapshot(first.dependencies), before, 'predecessor payload bytes unchanged');
 });
 
+test('image refresh wiring: an update that re-pulls a tag makes the next start replace a container without package.json', (t) => {
+    // A start command and no package.json: only the imageChanged reason can notice the new image.
+    const w = wiringWorkspace(t, { packageJson: null });
+    const first = stepValue(driveWiring(w, [{ action: 'init-edge' }, ...firstStart(w)]), 'first');
+    assert.equal(first.createdByThisLaunch, true);
+
+    // `ploinky update` pulled the tag: the engine now resolves it to another image ID.
+    const pulled = { env: { FAKE_ENGINE_IMAGE_HEX: 'b'.repeat(64) } };
+    const second = driveWiring(w, [
+        { action: 'prepare-lease' },
+        { label: 'after-update', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
+    ], pulled);
+    assert.equal(stepValue(second, 'after-update').createdByThisLaunch, true, 'the container is recreated from the new image');
+
+    const third = driveWiring(w, [
+        { action: 'prepare-lease' },
+        { label: 'same-image', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
+    ], pulled);
+    assert.equal(stepValue(third, 'same-image').createdByThisLaunch, false, 'an unchanged image reuses the container');
+});
+
 const SEATBELT_MANIFEST = { 'lite-sandbox': true, start: 'node index.js', network: { mode: 'host' }, readiness: { protocol: 'none' } };
 const SEATBELT_SKIP = process.platform !== 'darwin' && 'seatbelt runs on macOS only';
 const ALIAS_B = 'ploinky_repo_demo_b';

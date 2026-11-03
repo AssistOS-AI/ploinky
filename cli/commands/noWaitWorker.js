@@ -22,7 +22,7 @@ import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 // already-running blocking stack.
 import fs from 'fs';
 import { withDependencyRefresh } from '../utils/dependencies/dependencyRefresh.mjs';
-import { admittedRuntimeDependencyProblem } from '../sandbox/docker/agentServiceManager.js';
+import { admittedRuntimeDependencyProblem, containerImageChange } from '../sandbox/docker/agentServiceManager.js';
 import path from 'path';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -1975,8 +1975,25 @@ async function main() {
                 } catch (error) {
                     dependencyProblem = `dependency generation check failed: ${error?.message || error}`;
                 }
+                // A ready runtime is adopted only while it still runs the image its
+                // reference resolves to; a re-pulled tag goes through ensure.
+                let imageChange = null;
+                if (lifecycle.targetState === 'ready') {
+                    let desiredImageRef = String(runtimeAdmission.descriptor?.catalogIdentity?.imageRef || '');
+                    if (!desiredImageRef) {
+                        try {
+                            desiredImageRef = resolveManifestImage(manifest, profileResolution.profileConfig, {
+                                agentName: shortAgent, repoName,
+                            });
+                        } catch (_) {
+                            desiredImageRef = '';
+                        }
+                    }
+                    imageChange = containerImageChange({ runtime: admittedRuntime, containerName, imageRef: desiredImageRef });
+                }
                 const adopted = lifecycle.targetState === 'ready'
                     && !dependencyProblem
+                    && !imageChange
                     && !manifest['link-install']?.length
                     && !['default', 'bridge'].includes(profileResolution.network.mode);
                 return {

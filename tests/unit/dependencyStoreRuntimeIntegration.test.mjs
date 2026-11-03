@@ -374,6 +374,12 @@ test('dependency store runtime wiring: every container reuse path consults the g
     assert.ok(check < service.indexOf("debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`)"), 'before host/none early return');
     assert.ok(check < service.indexOf('const runtimeIdentity = resolveReplacementRuntimeIdentity({', check), 'before prepared-lease replacement identity');
     assert.match(service, /recreateReason \|\|= 'dependencyGenerationChanged'/);
+    // A re-pulled tag replaces the runtime before any reuse path, whether or not it has dependencies.
+    const imageCheck = service.indexOf('containerImageChange(');
+    assert.ok(imageCheck > 0);
+    assert.ok(imageCheck < service.indexOf('adoptManagedRuntimeOnly = !managedReconciliationPreparationLease'), 'image check before validation-only adoption');
+    assert.ok(imageCheck < service.indexOf("debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`)"), 'image check before host/none early return');
+    assert.match(service, /recreateReason = 'imageChanged'/);
     // The decision is not gated by preservePreparedRegistryRecord or a
     // preparation lease: the real start path (which passes both) consults it.
     assert.match(service, /if \(existingRuntimeAtEntry && !recreateReason\) \{\s*const dependencyProblem = containerDependencyReuseProblem\(/);
@@ -412,6 +418,7 @@ test('dependency store runtime wiring: sandboxes, attachments and no-wait adopti
     const capture = slice(worker, 'capture(lifecycle) {', 'async ensure(lifecycle, context, networkLifecycleCapability) {');
     assert.match(capture, /admittedRuntimeDependencyProblem\(\{/);
     assert.match(capture, /&& !dependencyProblem/);
+    assert.match(capture, /&& !imageChange/);
     assert.doesNotMatch(capture, /hasAgentPackageJson/);
 });
 
