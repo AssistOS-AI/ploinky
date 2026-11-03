@@ -27,13 +27,20 @@ import {
     projectExactAgentProcessTarget,
 } from './agentRuntime.mjs';
 import {
+    agentCleanupScopeAbsent,
+    captureAgentCleanupScope,
     captureAgentInnerProcessIdentity,
     captureAgentSessionSnapshot,
     isAgentTargetLocalEvidenceFailure,
     listAgentSessionMembers,
+    listAgentRecordedNamespaceMarkerProcesses,
+    readAgentCleanupProcessIdentity,
     readAgentBoxProcessIdentity,
     signalExactAgentSessionSnapshot,
 } from './agentProcessIdentity.mjs';
+import {
+    listLinuxSessionMembers,
+} from './runtimeRecords.mjs';
 import {
     WEBTTY_AGENT_BACKEND,
     WEBTTY_AGENT_PROTOCOL_LIMITS,
@@ -42,6 +49,7 @@ import {
 } from './agentWorkerProtocol.mjs';
 
 const PODMAN = '/usr/bin/podman';
+
 const STARTUP_TIMEOUT_MS = 10_000;
 const TERM_GRACE_MS = 750;
 const KILL_GRACE_MS = 500;
@@ -485,6 +493,11 @@ export class AgentTerminalWorker {
         captureClient = waitForExactAgentPodmanClient,
         captureInner = captureAgentInnerProcessIdentity,
         captureSession = captureAgentSessionSnapshot,
+        captureCleanupScope = captureAgentCleanupScope,
+        cleanupScopeAbsent = agentCleanupScopeAbsent,
+        readCleanupIdentity = readAgentCleanupProcessIdentity,
+        listCleanupMarkers = listAgentRecordedNamespaceMarkerProcesses,
+        listBoxSession = listLinuxSessionMembers,
         listSession = listAgentSessionMembers,
         signalSession,
         readInnerIdentity = readAgentBoxProcessIdentity,
@@ -503,6 +516,11 @@ export class AgentTerminalWorker {
         this.captureClient = captureClient;
         this.captureInner = captureInner;
         this.captureSession = captureSession;
+        this.captureCleanupScope = captureCleanupScope;
+        this.cleanupScopeAbsent = cleanupScopeAbsent;
+        this.readCleanupIdentity = readCleanupIdentity;
+        this.listCleanupMarkers = listCleanupMarkers;
+        this.listBoxSession = listBoxSession;
         this.listSession = listSession;
         this.signalSession = signalSession || ((snapshot, signalName, cleanupContext = {}) => (
             signalExactAgentSessionSnapshot(snapshot, signalName, {
@@ -776,6 +794,9 @@ export class AgentTerminalWorker {
             throw podmanRuntimeError('target-stale');
         }
         this.execId = selectExactNewExecId(this.baselineExecIds, after.execIds);
+        if (this.spec.profile) {
+            this.pty.write('if [ -x /etc/ploinky/webtty-profile-shell ]; then exec /etc/ploinky/webtty-profile-shell; fi\r');
+        }
         return match;
     }
 
@@ -1013,7 +1034,9 @@ export class AgentTerminalWorker {
             }, this.cleanupDeadlineMs);
         });
         this.cleanupPromise = Promise.race([
-            this.performCleanup(category, cleanupContext),
+            this.performCleanup(category, cleanupContext).then((result) => (
+                this.cleanupFinalized ? result : deadline
+            )),
             deadline,
         ]).finally(() => {
             clearTimeout(cleanupTimer);
@@ -1022,12 +1045,96 @@ export class AgentTerminalWorker {
         return this.cleanupPromise;
     }
 
+    async cleanupPositiveSnapshot(snapshot, scope, cleanupContext) {
+        const active = () => {
+            if (!this.cleanupActive(cleanupContext)) throw cleanupDeadlineError();
+        };
+        const checkInit = async () => {
+            active();
+            const inspected = await this.inspectTargetCleanup(
+                this.spec.containerId, this.cleanupPodmanOptions(cleanupContext),
+            );
+            active();
+            if (inspected.absent || !inspected.running || inspected.id !== this.spec.containerId
+                || inspected.initPid !== this.innerProcess.containerInitBoxPid
+                || !Array.isArray(inspected.execIds)) throw podmanRuntimeError('target-stale');
+            const init = await this.readInnerIdentity(this.innerProcess.containerInitBoxPid);
+            active();
+            if (init?.state === 'Z' || init?.startToken !== this.innerProcess.containerInitStartToken
+                || init?.pidNamespace !== this.innerProcess.pidNamespace) {
+                throw podmanRuntimeError('target-stale');
+            }
+            return !inspected.execIds.includes(this.execId);
+        };
+        if (!await checkInit()) return false;
+        active();
+        for (const expected of [this.clientProcess,
+            ...snapshot]) {
+            active();
+            const current = await this.readCleanupIdentity(expected.pid);
+            active();
+            if (current !== null) {
+                if (!current || current.pid !== expected.pid || current.startToken !== expected.startToken
+                    || (expected.pidNamespace && current.pidNamespace !== expected.pidNamespace)) {
+                    throw Object.assign(new Error('cleanup process identity changed'), {
+                        code: 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN', category: 'cleanup-process-replaced',
+                    });
+                }
+                return false;
+            }
+        }
+        active();
+        const markers = await this.listCleanupMarkers(this.innerProcess, this.spec.marker);
+        active();
+        if (!Array.isArray(markers) || markers.length) return false;
+        const members = await this.listSession(this.innerProcess);
+        active();
+        if (!Array.isArray(members) || members.length) return false;
+        const boxMembers = await this.listBoxSession(this.innerProcess.boxSessionId);
+        active();
+        if (!Array.isArray(boxMembers) || boxMembers.length) return false;
+        const scopeAbsent = await this.cleanupScopeAbsent(scope);
+        active();
+        if (!scopeAbsent) return false;
+        return checkInit();
+    }
+
+    async confirmReadyCleanup(snapshot, scope, cleanupContext) {
+        let positiveAt = null;
+        while (this.cleanupActive(cleanupContext)) {
+            try {
+                const positive = await this.cleanupPositiveSnapshot(snapshot, scope, cleanupContext);
+                if (!this.cleanupActive(cleanupContext)) return false;
+                if (positive) {
+                    if (positiveAt !== null && Date.now() - positiveAt >= 25) return true;
+                    positiveAt = Date.now();
+                } else positiveAt = null;
+            } catch (error) {
+                if (!this.cleanupActive(cleanupContext)) return false;
+                if (error?.category === 'target-stale' || error?.category === 'cleanup-process-replaced') return false;
+                positiveAt = null;
+            }
+            if (!this.cleanupActive(cleanupContext)) return false;
+            await delay(Math.min(25, Math.max(1, cleanupContext.deadlineAt - Date.now())));
+            if (!this.cleanupActive(cleanupContext)) return false;
+        }
+        return false;
+    }
+
     async performCleanup(category, cleanupContext) {
         const active = () => this.cleanupActive(cleanupContext);
         let proven = true;
         let providerEvidenceFailed = category === 'provider-evidence';
         let preserveStartingEvidence = false;
         let snapshot = [];
+        let cleanupScope = null;
+        let cleanupScopeContradiction = false;
+        const shellAlreadyExited = this.ptyExited;
+        const readyExecId = this.readySent ? this.execId : '';
+        if (this.readySent && !/^[a-f0-9]{64}$/.test(readyExecId)) {
+            proven = false;
+            preserveStartingEvidence = true;
+        }
         if (this.pty && !this.innerProcess) {
             const preReadyProven = await this.proveAndResetPreReadyAttempt(cleanupContext);
             if (!active()) return;
@@ -1048,7 +1155,7 @@ export class AgentTerminalWorker {
                 }
             }
         }
-        if (this.innerProcess && !this.execId) {
+        if (this.innerProcess && !this.execId && !this.readySent) {
             try {
                 const correlatedExecId = await this.correlatePreReadyExec(
                     snapshot,
@@ -1068,6 +1175,16 @@ export class AgentTerminalWorker {
                     && !['target-stale', 'exec-id-ambiguity', 'deadline'].includes(error?.category);
                 providerEvidenceFailed ||= error?.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN'
                     && !targetLocalProcessIdentityFailure(error);
+            }
+        }
+        if (this.readySent && this.innerProcess && !shellAlreadyExited) {
+            try {
+                if (!active()) return;
+                cleanupScope = await this.captureCleanupScope(this.innerProcess);
+                if (!active()) return;
+            } catch (_) {
+                if (!active()) return;
+                proven = false;
             }
         }
         try {
@@ -1156,6 +1273,45 @@ export class AgentTerminalWorker {
                 && error?.category !== 'exec-not-drained'
                 && error?.category !== 'exec-id-ambiguity'
                 && error?.category !== 'deadline';
+        }
+        if (!active()) return;
+        // An already-exited shell keeps the established successful cleanup
+        // path. A later PTY exit cannot exempt a forced close from its vetoes.
+        if (this.readySent && (!shellAlreadyExited || !proven)) {
+            try {
+                if (!cleanupScope) proven = false;
+                else {
+                    const absent = await this.cleanupScopeAbsent(cleanupScope);
+                    if (!active()) return;
+                    if (!absent) proven = false;
+                }
+            } catch (error) {
+                if (!active()) return;
+                proven = false;
+                cleanupScopeContradiction = error?.category === 'cleanup-process-replaced';
+            }
+            const anchored = Array.isArray(snapshot) && snapshot.every((entry) => (
+                Number.isSafeInteger(entry?.pid) && entry.pid > 1
+                && /^linux-proc:[1-9][0-9]*$/.test(entry.startToken)
+                && entry.pidNamespace === this.innerProcess?.pidNamespace
+                && entry.nssid?.at(-1) === this.innerProcess?.innerSessionId
+            )) && snapshot.filter((entry) => (
+                exactLiveAgentMarkerIdentity(entry, this.innerProcess, this.spec.marker)
+            )).length === 1;
+            const originalClient = this.clientProcess;
+            const complete = anchored && originalClient
+                && Number.isSafeInteger(originalClient.pid) && originalClient.pid > 1
+                && /^linux-proc:[1-9][0-9]*$/.test(originalClient.startToken)
+                && Number.isSafeInteger(originalClient.uid) && originalClient.uid >= 0
+                && originalClient.processGroupId === originalClient.pid
+                && originalClient.sessionId === originalClient.pid
+                && /^[a-f0-9]{64}$/.test(readyExecId) && this.execId === readyExecId;
+            if (!complete) proven = false;
+            if (!proven && !providerEvidenceFailed && !preserveStartingEvidence && cleanupScope
+                && !cleanupScopeContradiction && complete) {
+                proven = await this.confirmReadyCleanup(snapshot, cleanupScope, cleanupContext);
+                if (!active()) return;
+            }
         }
         if (!active()) return;
         await this.finalizeCleanup(category, { proven, providerEvidenceFailed });

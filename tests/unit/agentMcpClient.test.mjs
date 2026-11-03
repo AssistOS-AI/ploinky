@@ -133,6 +133,80 @@ test('createAgentClient sends no delegation header by default', async (t) => {
     assert.equal(captured.headers['x-ploinky-user-delegation'], undefined);
 });
 
+test('tool calls classify only an exact Router 503 TARGET_INACTIVE string error', async (t) => {
+    await withCaptureServer(t, (_req, _body, res) => {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'TARGET_INACTIVE', detail: 'synthetic-private-detail' }));
+    });
+    const client = await createAgentClient('dpuAgent');
+    await assert.rejects(client.callTool('probe', {}), error => {
+        assert.equal(error.statusCode, 503);
+        assert.equal(error.code, 'TARGET_INACTIVE');
+        assert.equal(error.data, undefined);
+        assert.equal(error.message.includes('synthetic-private-detail'), false);
+        return true;
+    });
+});
+
+test('tool calls retain structured error message, code and data alongside HTTP status', async (t) => {
+    const structured = { message: 'permission denied', code: 'FORBIDDEN', data: { reason: 'caller' } };
+    await withCaptureServer(t, (_req, _body, res) => {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: '1', error: structured }));
+    });
+    const client = await createAgentClient('dpuAgent');
+    await assert.rejects(client.callTool('probe', {}), error => {
+        assert.equal(error.statusCode, 403);
+        assert.equal(error.message, structured.message);
+        assert.equal(error.code, structured.code);
+        assert.deepEqual(error.data, structured.data);
+        return true;
+    });
+});
+
+test('auth responses and unrelated 503 errors never acquire the inactive-target classification', async (t) => {
+    for (const [status, body] of [[403, { error: 'TARGET_INACTIVE' }], [503, { error: 'OTHER_FAILURE' }]]) {
+        await t.test(`HTTP ${status} ${body.error}`, async (context) => {
+            await withCaptureServer(context, (_req, _body, res) => {
+                res.writeHead(status, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(body));
+            });
+            const client = await createAgentClient('dpuAgent');
+            await assert.rejects(client.callTool('probe', {}), error => {
+                assert.equal(error.statusCode, status);
+                assert.equal(error.code, undefined);
+                return true;
+            });
+        });
+    }
+});
+
+test('HTTP error status retains the original bounded response-text diagnostic', async (t) => {
+    const responseText = `${'x'.repeat(200)}outside-limit`;
+    await withCaptureServer(t, (_req, _body, res) => {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end(responseText);
+    });
+    const client = await createAgentClient('dpuAgent');
+    await assert.rejects(client.callTool('probe', {}), error => {
+        assert.equal(error.statusCode, 502);
+        assert.equal(error.code, undefined);
+        assert.equal(error.message, `agent-to-agent call failed (status 502): ${responseText.slice(0, 200)}`);
+        assert.equal(error.message.includes('outside-limit'), false);
+        return true;
+    });
+});
+
+test('a tool result error remains a result rather than a Router activation error', async (t) => {
+    const result = { isError: true, content: [{ type: 'text', text: 'TARGET_INACTIVE' }] };
+    await withCaptureServer(t, (_req, _body, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: '1', result }));
+    });
+    const client = await createAgentClient('dpuAgent');
+    assert.deepEqual(await client.callTool('probe', {}), result);
+});
+
 test('createAgentClient sends x-ploinky-user-delegation when configured', async (t) => {
     let captured = null;
     await withCaptureServer(t, (req, body, res) => {

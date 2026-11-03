@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    agentCleanupScopeAbsent,
+    captureAgentCleanupScope,
     agentShellMarkerArgument,
     captureAgentInnerProcessIdentity,
     captureAgentSessionSnapshot,
@@ -13,6 +15,7 @@ import {
     parseAgentLinuxProcCmdline,
     parseAgentLinuxProcStat,
     readAgentBoxProcessIdentity,
+    readAgentCleanupProcessIdentity,
     revalidateAgentInnerProcessIdentity,
     signalExactAgentSessionSnapshot,
 } from '../../cli/server/webtty/agentProcessIdentity.mjs';
@@ -61,6 +64,207 @@ function identity({
 function directoryEntries(...pids) {
     return pids.map((pid) => ({ name: String(pid), isDirectory: () => true }));
 }
+
+function cleanupFixture() {
+    const init = identity({ pid: 5001, nspid: [5001, 1] });
+    const wrapper = identity({ pid: 5002, parentPid: 5001, nspid: [5002, 42],
+        nspgid: [5002, 42], nssid: [5002, 42], argv: BASH_WRAPPER_ARGV });
+    const privateInit = identity({ pid: 5003, parentPid: 5002, namespace: 'pid:[9010]', nspid: [5003, 43, 1] });
+    const child = identity({ pid: 5004, parentPid: 5003, namespace: 'pid:[9010]', nspid: [5004, 44, 2] });
+    const records = new Map([init, wrapper, privateInit, child].map((entry) => [entry.pid, entry]));
+    const record = { boxPid: wrapper.pid, boxStartToken: wrapper.startToken,
+        boxProcessGroupId: wrapper.processGroupId, boxSessionId: wrapper.sessionId,
+        pidNamespace: wrapper.pidNamespace, nspid: wrapper.nspid, innerPid: 42,
+        innerProcessGroupId: 42, innerSessionId: 42, innerUid: 0, innerStartToken: wrapper.startToken,
+        containerInitBoxPid: init.pid, containerInitStartToken: init.startToken };
+    const options = { fsApi: { readdir: async () => directoryEntries(...records.keys()) },
+        readIdentity: async (pid) => records.get(pid) || null,
+        readAnchorIdentity: async (pid) => {
+            const current = records.get(pid);
+            if (!current) throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+            return current;
+        } };
+    return { records, record, options, init, wrapper, privateInit, child };
+}
+
+test('a denied first member cannot leave a later independently verified member unsignalled', async () => {
+    for (const code of ['EACCES', 'EPERM']) {
+        const members = [identity({ pid: 5002 }), identity({ pid: 5003 })];
+        const attempted = [];
+        await assert.rejects(signalExactAgentSessionSnapshot(members, 'SIGTERM', {
+            readIdentity: async (pid) => members.find((entry) => entry.pid === pid),
+            signalImpl: (pid) => {
+                attempted.push(pid);
+                if (pid === 5002) throw Object.assign(new Error('denied'), { code });
+            },
+        }), { code });
+        assert.deepEqual(attempted, [5002, 5003]);
+    }
+});
+
+test('signal continuation never waives changed member identities or unrelated signal errors', async () => {
+    const members = [identity({ pid: 5002 }), identity({ pid: 5003 }), identity({ pid: 5004 })];
+    for (const scenario of ['changed-after-denial', 'unrelated-error']) {
+        const attempted = [];
+        await assert.rejects(signalExactAgentSessionSnapshot(members, 'SIGTERM', {
+            readIdentity: async (pid) => {
+                const current = members.find((entry) => entry.pid === pid);
+                return pid === 5003 && scenario === 'changed-after-denial'
+                    ? { ...current, startToken: 'linux-proc:99999' } : current;
+            },
+            signalImpl: (pid) => {
+                attempted.push(pid);
+                if (pid === 5002) throw Object.assign(new Error('failed'), {
+                    code: scenario === 'unrelated-error' ? 'EINVAL' : 'EACCES',
+                });
+            },
+        }), scenario === 'unrelated-error' ? { code: 'EINVAL' } : { category: 'session-member-changed' });
+        assert.deepEqual(attempted, [5002]);
+    }
+});
+
+test('cleanup captures native descendants and private namespace PID 1 without granting signals', async () => {
+    const f = cleanupFixture();
+    const scope = await captureAgentCleanupScope(f.record, f.options);
+    assert.deepEqual(scope.descendants.map((entry) => entry.pid), [5002, 5003, 5004]);
+    assert.deepEqual(scope.privateNamespaces, ['pid:[9010]']);
+    assert.deepEqual(scope.namespaceInits.map((entry) => entry.pid), [5003]);
+    assert.equal(await agentCleanupScopeAbsent(scope, f.options), false);
+    for (const pid of [5002, 5003, 5004]) f.records.delete(pid);
+    assert.equal(await agentCleanupScopeAbsent(scope, f.options), true);
+});
+
+test('cleanup capture retains stable private zombies until they positively disappear', async (t) => {
+    for (const role of ['private-init', 'private-child']) {
+        await t.test(role, async () => {
+            const f = cleanupFixture();
+            const zombie = role === 'private-init' ? f.privateInit : f.child;
+            f.records.set(zombie.pid, { ...zombie, state: 'Z' });
+            if (role === 'private-init') f.records.delete(f.child.pid);
+            const scope = await captureAgentCleanupScope(f.record, f.options);
+            assert.equal(scope.descendants.find(value => value.pid === zombie.pid)?.state, 'Z');
+            if (role === 'private-init') assert.equal(scope.namespaceInits[0].state, 'Z');
+            for (const member of scope.descendants) if (member.pid !== zombie.pid) f.records.delete(member.pid);
+            assert.equal(await agentCleanupScopeAbsent(scope, f.options), false, 'a surviving zombie is still present');
+            f.records.delete(zombie.pid);
+            assert.equal(await agentCleanupScopeAbsent(scope, f.options), true);
+        });
+    }
+});
+
+test('stable zombie capture never admits the wrapper, container init or same-namespace members', async (t) => {
+    const mutations = {
+        wrapper: f => f.records.set(f.wrapper.pid, { ...f.wrapper, state: 'Z' }),
+        'container-init': f => f.records.set(f.init.pid, { ...f.init, state: 'Z' }),
+        'same-namespace-child': f => f.records.set(5005, { ...identity({ pid: 5005,
+            parentPid: f.wrapper.pid, nspid: [5005, 45] }), state: 'Z' }),
+        'private-depth-not-deeper': f => f.records.set(f.privateInit.pid,
+            { ...f.privateInit, state: 'Z', nspid: [f.privateInit.pid, 1] }),
+        'private-namespace-without-init': f => f.records.set(f.privateInit.pid,
+            { ...f.privateInit, state: 'Z', nspid: [f.privateInit.pid, 43, 2] }),
+    };
+    for (const [name, mutate] of Object.entries(mutations)) {
+        await t.test(name, async () => {
+            const f = cleanupFixture(); mutate(f);
+            await assert.rejects(captureAgentCleanupScope(f.record, f.options), error =>
+                /^WEBTTY_AGENT_PROCESS_IDENTITY_(?:STALE|UNPROVEN)$/.test(error.code));
+        });
+    }
+});
+
+test('private zombie capture rejects state transitions and any changed identity component', async (t) => {
+    const mutations = {
+        'live-to-zombie': value => ({ ...value, state: 'Z' }),
+        'zombie-to-live': value => ({ ...value, state: 'S' }),
+        pid: value => ({ ...value, pid: 5999 }),
+        birth: value => ({ ...value, startToken: 'linux-proc:99999' }),
+        parent: value => ({ ...value, parentPid: 1 }),
+        namespace: value => ({ ...value, pidNamespace: 'pid:[9999]' }),
+        nspid: value => ({ ...value, nspid: [value.pid, 99, 1] }),
+        'malformed-nspid': value => ({ ...value, nspid: [value.pid, 0] }),
+    };
+    for (const [name, mutate] of Object.entries(mutations)) {
+        await t.test(name, async () => {
+            const f = cleanupFixture(); f.records.delete(f.child.pid);
+            f.records.set(f.privateInit.pid, { ...f.privateInit, state: name === 'live-to-zombie' ? 'S' : 'Z' });
+            const originalRead = f.options.readIdentity;
+            let reads = 0;
+            f.options.readIdentity = async pid => {
+                const value = await originalRead(pid);
+                return pid === f.privateInit.pid && ++reads === 2 ? mutate(value) : value;
+            };
+            await assert.rejects(captureAgentCleanupScope(f.record, f.options), { category: 'cleanup-scope-changed' });
+        });
+    }
+});
+
+test('complete namespace scan vetoes an uncaptured setsid/reparented private child', async () => {
+    const f = cleanupFixture();
+    const scope = await captureAgentCleanupScope(f.record, f.options);
+    for (const pid of [5002, 5003, 5004]) f.records.delete(pid);
+    f.records.set(5010, identity({ pid: 5010, parentPid: 1, namespace: 'pid:[9010]',
+        nspid: [5010, 50, 3], nssid: [5010, 50, 3] }));
+    assert.equal(await agentCleanupScopeAbsent(scope, f.options), false);
+});
+
+test('cleanup scope rejects missing intermediaries, missing or duplicate private init and changed topology', async () => {
+    for (const mutate of [
+        (f) => f.records.delete(5003),
+        (f) => f.records.set(5003, identity({ pid: 5003, parentPid: 5002,
+            namespace: 'pid:[9010]', nspid: [5003, 43, 2] })),
+        (f) => f.records.set(5005, identity({ pid: 5005, parentPid: 5002,
+            namespace: 'pid:[9010]', nspid: [5005, 45, 1] })),
+        (f) => f.records.set(5004, identity({ pid: 5004, parentPid: 5003,
+            namespace: 'pid:[9010]', nspid: [5004, 44] })),
+    ]) {
+        const f = cleanupFixture();
+        mutate(f);
+        await assert.rejects(captureAgentCleanupScope(f.record, f.options));
+    }
+});
+
+test('cleanup absence rejects PID reuse, namespace init replacement and target init replacement', async () => {
+    for (const pid of [5001, 5003, 5004]) {
+        const f = cleanupFixture();
+        const scope = await captureAgentCleanupScope(f.record, f.options);
+        const original = f.records.get(pid);
+        for (const removed of [5002, 5003, 5004]) f.records.delete(removed);
+        f.records.set(pid, { ...original, startToken: 'linux-proc:99999' });
+        await assert.rejects(agentCleanupScopeAbsent(scope, f.options), { category: 'cleanup-process-replaced' });
+    }
+});
+
+test('cleanup absence never turns persistent read failures or incomplete scans into absence', async () => {
+    for (const code of ['EACCES', 'EIO', 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE']) {
+        const f = cleanupFixture();
+        const scope = await captureAgentCleanupScope(f.record, f.options);
+        await assert.rejects(agentCleanupScopeAbsent(scope, { ...f.options,
+            readIdentity: async () => { throw Object.assign(new Error('unknown'), { code }); } }), { code });
+    }
+    const f = cleanupFixture();
+    const scope = await captureAgentCleanupScope(f.record, f.options);
+    for (const pid of [5002, 5003, 5004]) f.records.delete(pid);
+    await assert.rejects(agentCleanupScopeAbsent(scope, { ...f.options,
+        fsApi: { readdir: async () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } } }),
+    { code: 'EACCES' });
+});
+
+test('absence reader accepts only initial missing stat, preserves partial-read errors and detects parent changes', async () => {
+    const missing = Object.assign(new Error('gone'), { code: 'ENOENT' });
+    assert.equal(await readAgentCleanupProcessIdentity(5002, {
+        fsApi: { readFile: async () => { throw missing; } },
+    }), null);
+    await assert.rejects(readAgentCleanupProcessIdentity(5002, { fsApi: {
+        readFile: async () => Buffer.from(procStat(5002)),
+        readlink: async () => { throw missing; },
+    } }), { code: 'ENOENT' });
+    let stats = 0;
+    await assert.rejects(readAgentCleanupProcessIdentity(5002, { fsApi: {
+        readFile: async (file) => Buffer.from(file.endsWith('status') ? 'NSpid:\t5002\t42\n'
+            : procStat(5002).replace(' S 1 ', ++stats === 1 ? ' S 1 ' : ' S 2 ')),
+        readlink: async () => 'pid:[9001]',
+    } }), { category: 'cleanup-process-changed' });
+});
 
 test('Linux proc parser uses the last parenthesis and exact start token', () => {
     assert.deepEqual(parseAgentLinuxProcStat(procStat(4242), 4242), {

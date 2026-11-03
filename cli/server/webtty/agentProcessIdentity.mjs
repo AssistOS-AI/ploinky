@@ -568,6 +568,189 @@ export async function listAgentRecordedNamespaceMarkerProcesses(record, marker, 
     return scanAgentMarkerProcesses(record, marker, options);
 }
 
+// Absence evidence deliberately needs no argv, UID mapping or signal authority.
+// Only a missing initial stat is positive absence; a partial read is unknown.
+export async function readAgentCleanupProcessIdentity(pid, {
+    procRoot = '/proc', fsApi = fs,
+} = {}) {
+    positiveInteger(pid, 'pid');
+    const directory = path.join(procRoot, String(pid));
+    const statPath = path.join(directory, 'stat');
+    let raw;
+    try {
+        raw = await boundedProcFile(fsApi, statPath, { encoding: 'utf8', category: 'proc-stat' });
+    } catch (error) {
+        if (error?.code === 'ENOENT' || error?.code === 'ESRCH') return null;
+        throw error;
+    }
+    const before = parseAgentLinuxProcStat(raw, pid);
+    const namespaceBefore = validatePidNamespace(await fsApi.readlink(path.join(directory, 'ns/pid')));
+    const status = await boundedProcFile(fsApi, path.join(directory, 'status'), {
+        encoding: 'utf8', category: 'proc-status',
+    });
+    const namespaceAfter = validatePidNamespace(await fsApi.readlink(path.join(directory, 'ns/pid')));
+    const after = parseAgentLinuxProcStat(await boundedProcFile(fsApi, statPath, {
+        encoding: 'utf8', category: 'proc-stat',
+    }), pid);
+    if (before.startToken !== after.startToken || namespaceBefore !== namespaceAfter) {
+        throw agentProcessIdentityError('cleanup-process-replaced');
+    }
+    if (before.parentPid !== after.parentPid) {
+        throw agentProcessIdentityError('cleanup-process-changed');
+    }
+    const nspid = parseStatusVector(status, 'NSpid');
+    if (nspid[0] !== pid) throw agentProcessIdentityError('cleanup-namespace-topology');
+    return Object.freeze({ ...after, pidNamespace: namespaceAfter, nspid });
+}
+
+function validateCleanupProcess(identity, pid) {
+    if (!identity || identity.pid !== pid || !/^[A-Z]$/.test(identity.state)
+        || !/^linux-proc:[1-9][0-9]*$/.test(identity.startToken)
+        || !Number.isSafeInteger(identity.parentPid) || identity.parentPid < 0
+        || !Array.isArray(identity.nspid) || identity.nspid[0] !== pid
+        || identity.nspid.some((value) => !Number.isSafeInteger(value) || value < 1)) {
+        throw agentProcessIdentityError('cleanup-process-malformed');
+    }
+    validatePidNamespace(identity.pidNamespace);
+    return identity;
+}
+
+async function scanCleanupProcesses({ procRoot = '/proc', fsApi = fs,
+    readIdentity = readAgentCleanupProcessIdentity } = {}) {
+    const pids = await numericProcEntries(procRoot, fsApi);
+    const identities = [];
+    for (let index = 0; index < pids.length; index += 4) {
+        const batch = await boundedProcScanCall(Promise.all(pids.slice(index, index + 4).map(
+            async (pid) => {
+                const identity = await readIdentity(pid, { procRoot, fsApi });
+                return identity === null ? null : validateCleanupProcess(identity, pid);
+            },
+        )), pids);
+        identities.push(...batch.filter(Boolean));
+    }
+    return identities;
+}
+
+function sameCleanupIdentity(current, expected, { parent = false, allowStableZombie = false } = {}) {
+    const expectedZombie = allowStableZombie && expected.state === 'Z';
+    return current && (expectedZombie ? current.state === 'Z' : current.state !== 'Z')
+        && current.pid === expected.pid
+        && current.startToken === expected.startToken
+        && current.pidNamespace === expected.pidNamespace
+        && exactArgv(current.nspid, expected.nspid)
+        && (!parent || current.parentPid === expected.parentPid);
+}
+
+export async function captureAgentCleanupScope(record, options = {}) {
+    const readIdentity = options.readIdentity || readAgentCleanupProcessIdentity;
+    const anchor = await revalidateAgentInnerProcessIdentity(record, {
+        ...options, readIdentity: options.readAnchorIdentity || readAgentBoxProcessIdentity,
+    });
+    const processes = await scanCleanupProcesses(options);
+    const byPid = new Map(processes.map((entry) => [entry.pid, entry]));
+    const targetInit = byPid.get(record.containerInitBoxPid);
+    if (!targetInit || targetInit.state === 'Z'
+        || targetInit.startToken !== record.containerInitStartToken
+        || targetInit.pidNamespace !== record.pidNamespace) {
+        throw agentProcessIdentityError('cleanup-scope-init');
+    }
+    if (!sameCleanupIdentity(byPid.get(anchor.pid), anchor, { parent: true })) {
+        throw agentProcessIdentityError('cleanup-scope-anchor');
+    }
+    const descendantState = new Map([[anchor.pid, true]]);
+    const topologyDeadline = Date.now() + PROC_SCAN_TIMEOUT_MS;
+    const descendants = processes.filter((entry) => {
+        const visited = new Set();
+        let current = entry;
+        while (!descendantState.has(current.pid)) {
+            if (Date.now() >= topologyDeadline) throw agentProcessIdentityError('proc-scan-timeout');
+            if (visited.has(current.pid)) throw agentProcessIdentityError('cleanup-scope-cycle');
+            visited.add(current.pid);
+            if (current.parentPid === 0 || current.parentPid === 1) {
+                descendantState.set(current.pid, false);
+                break;
+            }
+            current = byPid.get(current.parentPid);
+            if (!current) throw agentProcessIdentityError('cleanup-scope-intermediary');
+        }
+        const descendant = descendantState.get(current.pid);
+        for (const pid of visited) descendantState.set(pid, descendant);
+        return descendant;
+    });
+    const privateNamespaces = [...new Set(descendants.map((entry) => entry.pidNamespace))]
+        .filter((namespace) => namespace !== record.pidNamespace);
+    if (descendants.some((entry) => entry.nspid[0] !== entry.pid
+        || entry.nspid.length < record.nspid.length
+        || (entry.pidNamespace !== record.pidNamespace && entry.nspid.length <= record.nspid.length))) {
+        throw agentProcessIdentityError('cleanup-namespace-topology');
+    }
+    const initCandidates = new Map();
+    for (const entry of processes) {
+        if (entry.nspid.at(-1) !== 1) continue;
+        const inits = initCandidates.get(entry.pidNamespace) || [];
+        inits.push(entry);
+        initCandidates.set(entry.pidNamespace, inits);
+    }
+    const namespaceInits = privateNamespaces.map((namespace) => {
+        const inits = initCandidates.get(namespace) || [];
+        if (inits.length !== 1 || !descendantState.get(inits[0].pid)) {
+            throw agentProcessIdentityError('cleanup-namespace-init');
+        }
+        return inits[0];
+    });
+    const capturedPrivateNamespaces = new Set(namespaceInits.map(entry => entry.pidNamespace));
+    const deadline = { deadlineAt: Date.now() + PROC_SCAN_TIMEOUT_MS };
+    for (const expected of descendants) {
+        const current = await boundedProcScanCall(readIdentity(expected.pid, options), deadline);
+        const privateMember = expected.pidNamespace !== record.pidNamespace
+            && expected.nspid.length > record.nspid.length
+            && capturedPrivateNamespaces.has(expected.pidNamespace);
+        // Retain stable private zombies as presence evidence until they are reaped.
+        if ((expected.state === 'Z' && !privateMember)
+            || !sameCleanupIdentity(current, expected, { parent: true, allowStableZombie: privateMember })) {
+            throw agentProcessIdentityError('cleanup-scope-changed');
+        }
+    }
+    await revalidateAgentInnerProcessIdentity(record, {
+        ...options, readIdentity: options.readAnchorIdentity || readAgentBoxProcessIdentity,
+    });
+    return Object.freeze({ targetInit, descendants: Object.freeze(descendants),
+        namespaceInits: Object.freeze(namespaceInits), privateNamespaces: Object.freeze(privateNamespaces) });
+}
+
+export async function agentCleanupScopeAbsent(scope, options = {}) {
+    if (!Array.isArray(scope?.descendants) || !scope.descendants.length
+        || scope.descendants.length > MAX_PROC_SCAN_ENTRIES
+        || !scope.targetInit || !Array.isArray(scope.namespaceInits) || !Array.isArray(scope.privateNamespaces)) {
+        throw agentProcessIdentityError('cleanup-scope-missing');
+    }
+    const readIdentity = options.readIdentity || readAgentCleanupProcessIdentity;
+    const deadline = { deadlineAt: Date.now() + PROC_SCAN_TIMEOUT_MS };
+    const checkInit = async () => {
+        const current = await boundedProcScanCall(readIdentity(scope.targetInit.pid, options), deadline);
+        if (!sameCleanupIdentity(current, scope.targetInit)) {
+            throw agentProcessIdentityError('cleanup-process-replaced');
+        }
+    };
+    await checkInit();
+    for (const expected of [...scope.descendants, ...scope.namespaceInits]) {
+        const current = await boundedProcScanCall(readIdentity(expected.pid, options), deadline);
+        if (current !== null) {
+            validateCleanupProcess(current, expected.pid);
+            if (current.startToken !== expected.startToken || current.pidNamespace !== expected.pidNamespace) {
+                throw agentProcessIdentityError('cleanup-process-replaced');
+            }
+            return false;
+        }
+    }
+    // A private child may setsid and reparent after capture. Namespace
+    // membership remains a veto independently of the original SID/PPID.
+    const processes = await scanCleanupProcesses(options);
+    await checkInit();
+    const namespaces = new Set(scope.privateNamespaces);
+    return !processes.some((entry) => namespaces.has(entry.pidNamespace));
+}
+
 export async function signalExactAgentSessionSnapshot(snapshot, signal, {
     procRoot = '/proc',
     fsApi = fs,
@@ -583,6 +766,7 @@ export async function signalExactAgentSessionSnapshot(snapshot, signal, {
     }
     const deadline = { deadlineAt: Date.now() + PROC_SCAN_TIMEOUT_MS };
     let signaled = 0;
+    let denied = null;
     for (const expected of snapshot) {
         let current;
         try {
@@ -600,8 +784,14 @@ export async function signalExactAgentSessionSnapshot(snapshot, signal, {
         }
         // No asynchronous or logging operation belongs between this final
         // identity check and the exact positive-PID signal.
-        signalImpl(current.pid, signal);
-        signaled += 1;
+        try {
+            signalImpl(current.pid, signal);
+            signaled += 1;
+        } catch (error) {
+            if (error?.code !== 'EACCES' && error?.code !== 'EPERM') throw error;
+            denied ||= error;
+        }
     }
+    if (denied) throw denied;
     return Object.freeze({ signal, signaled });
 }

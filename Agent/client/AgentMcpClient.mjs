@@ -693,13 +693,18 @@ export async function createAgentClient(agentName, options = {}) {
             timeoutMs,
         );
         if (json && json.error) {
-            const err = new Error(json.error.message || 'agent-to-agent call failed');
-            err.code = json.error.code;
+            const targetInactive = status === 503 && json.error === 'TARGET_INACTIVE';
+            const err = new Error(json.error.message || (targetInactive
+                ? 'agent-to-agent target is inactive' : 'agent-to-agent call failed'));
+            err.code = targetInactive ? 'TARGET_INACTIVE' : json.error.code;
             err.data = json.error.data;
+            err.statusCode = status;
             throw err;
         }
         if (status >= 400 || !json) {
-            throw new Error(`agent-to-agent call failed (status ${status}): ${(text || '').slice(0, 200)}`.trim());
+            const err = new Error(`agent-to-agent call failed (status ${status}): ${(text || '').slice(0, 200)}`.trim());
+            err.statusCode = status;
+            throw err;
         }
         return {
             result: unwrapToolResult(json.result),

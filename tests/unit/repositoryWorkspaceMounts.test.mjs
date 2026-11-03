@@ -21,6 +21,7 @@ function fixture(t) {
     fs.mkdirSync(path.join(controller, 'data'));
     // Host launches create the host state skeleton before the guards are planned.
     fs.mkdirSync(path.join(workspace, '.ploinky-box'));
+    fs.mkdirSync(path.join(workspace, '.data', '.private'), { recursive: true, mode: 0o700 });
     return { workspace, controller, repositories, code };
 }
 
@@ -35,6 +36,7 @@ test('writable workspace aliases receive only a writable repositories child unde
         { hostPath: workspace, runtimePath: '/root' },
     ]);
     assert.deepEqual(mounts.filter(mount => !mount.readOnly).map(mount => [mount.source, mount.target]), [
+        [path.join(workspace, '.data'), '/root/.data'], [path.join(workspace, '.data'), '/workspace/.data'],
         [repositories, '/root/.ploinky/repos'], [repositories, '/workspace/.ploinky/repos'],
     ]);
     for (const target of ['/root', '/workspace']) {

@@ -24,8 +24,9 @@ import {
     resolveManifestVolumeHostPath,
 } from '../../cli/utils/runtime/manifestVolumePolicy.js';
 
-function fixture() {
+function fixture({ privateData = true } = {}) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agent-data-policy-')));
+    if (privateData) fs.mkdirSync(path.join(root, '.data', '.private'), { recursive: true, mode: 0o700 });
     return { root, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -72,7 +73,7 @@ test('agent data keys are one validated segment', () => {
 });
 
 test('data paths reject sibling prefixes, symlinked roots, and child links', () => {
-    const { root, cleanup } = fixture();
+    const { root, cleanup } = fixture({ privateData: false });
     try {
         fs.mkdirSync(path.join(root, '.data-other'), { recursive: true });
         policyFailure(() => assertCanonicalAgentDataPath(path.join(root, '.data-other', 'agent'), { workspaceRoot: root }));
@@ -168,7 +169,7 @@ test('controller guard targets are derived from broad mounts without creating th
             { hostPath: root, runtimePath: '/workspace' },
         ], { workspaceRoot: root });
         const byKey = Object.fromEntries(targets.map(entry => [entry.key, entry]));
-        assert.deepEqual(Object.keys(byKey).sort(), ['data', 'host']);
+        assert.deepEqual(Object.keys(byKey).sort(), ['data', 'host', 'private']);
         assert.equal(byKey.data.target, '/workspace/.ploinky/data');
         assert.equal(byKey.data.parentTarget, '/workspace/.ploinky');
         assert.equal(byKey.data.protectedParentHostPath, path.join(root, '.ploinky'));
@@ -176,7 +177,7 @@ test('controller guard targets are derived from broad mounts without creating th
         assert.equal(byKey.host.parentTarget, '/workspace');
         assert.equal(byKey.host.protectedParentHostPath, root);
         const sources = ensureControllerGuardSources({ workspaceRoot: root });
-        assert.deepEqual(Array.from(sources.keys()), ['data', 'host']);
+        assert.deepEqual(Array.from(sources.keys()), ['data', 'host', 'private']);
         assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data')), false);
         for (const source of sources.values()) {
             assert.equal(fs.readdirSync(source).length, 0);
@@ -226,8 +227,12 @@ test('controller guard planning neither creates a missing controller parent nor 
         const targets = controllerGuardTargets([{ hostPath: root, runtimePath: '/workspace' }], { workspaceRoot: root });
         const mounts = controllerGuardMounts(targets, { workspaceRoot: root });
         // The host state directory always exists and is always masked.
-        assert.deepEqual(mounts.map(mount => mount.target), ['/workspace/.ploinky', '/workspace/.ploinky-box']);
-        for (const mount of mounts) assert.deepEqual(fs.readdirSync(mount.source), [], mount.target);
+        assert.deepEqual(mounts.map(mount => mount.target), [
+            '/workspace/.data', '/workspace/.ploinky', '/workspace/.data/.private', '/workspace/.ploinky-box',
+        ]);
+        for (const mount of mounts) {
+            assert.deepEqual(fs.readdirSync(mount.source), mount.target === '/workspace/.data' ? ['.private'] : [], mount.target);
+        }
         assert.equal(fs.existsSync(path.join(root, '.ploinky')), false);
     } finally {
         cleanup();
@@ -286,6 +291,7 @@ test('controller guard ancestors remain pinned without making the project read-o
     try {
         const workspaceRoot = path.join(root, 'projects', 'current');
         fs.mkdirSync(path.join(workspaceRoot, '.ploinky', 'data'), { recursive: true });
+        fs.mkdirSync(path.join(workspaceRoot, '.data', '.private'), { recursive: true });
         fs.mkdirSync(path.join(workspaceRoot, '.ploinky-box'));
         const bindings = [{ hostPath: root, runtimePath: '/home' }];
         const targets = controllerGuardTargets(bindings, { workspaceRoot });
@@ -293,6 +299,7 @@ test('controller guard ancestors remain pinned without making the project read-o
         assert.deepEqual(mounts.filter(mount => mount.parent).map(mount => [mount.target, mount.readOnly]), [
             ['/home/projects', false],
             ['/home/projects/current', false],
+            ['/home/projects/current/.data', false],
             ['/home/projects/current/.ploinky', true],
         ]);
     } finally { cleanup(); }
@@ -307,6 +314,7 @@ for (const workspaceAlias of [false, true]) {
                 const framework = path.join(physicalWorkspace, '.state');
                 const running = path.join(framework, '.running-state');
                 fs.mkdirSync(running, { recursive: true });
+                fs.mkdirSync(path.join(physicalWorkspace, '.data', '.private'), { recursive: true });
                 fs.symlinkSync('.state', path.join(physicalWorkspace, '.ploinky'));
                 fs.symlinkSync('.running-state', path.join(framework, 'running'));
                 fs.mkdirSync(path.join(physicalWorkspace, '.ploinky-box'));
@@ -338,9 +346,11 @@ for (const workspaceAlias of [false, true]) {
                 ]);
                 const mounts = controllerGuardMounts(targets, { workspaceRoot, bindings });
                 assert.deepEqual(mounts.filter(mount => mount.parent).map(mount => [mount.target, mount.readOnly]), [
-                    ['/home/project', false], ['/workspace/.state', true], ['/home/project/.state', true],
+                    ['/home/project', false], ['/workspace/.data', false], ['/workspace/.state', true],
+                    ['/home/project/.data', false], ['/home/project/.state', true],
                 ]);
-                assert.deepEqual(mounts.filter(mount => !mount.parent && !mount.target.endsWith('/.ploinky-box'))
+                assert.deepEqual(mounts.filter(mount => !mount.parent && !mount.target.endsWith('/.ploinky-box')
+                    && !mount.target.endsWith('/.data/.private'))
                     .map(mount => [mount.target, mount.readOnly]),
                 existingChildren ? dataTargets.map(guard => [guard.target, true]) : []);
                 assert.deepEqual(mounts.filter(mount => mount.target.endsWith('/.ploinky-box'))

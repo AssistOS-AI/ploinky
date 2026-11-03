@@ -21,6 +21,8 @@ import {
     waitForExactAgentPodmanClient,
 } from '../../cli/server/webtty/agentTerminalWorker.mjs';
 import { agentWorkerMessage } from '../../cli/server/webtty/agentWorkerProtocol.mjs';
+import { agentCleanupScopeAbsent, captureAgentCleanupScope,
+    readAgentCleanupProcessIdentity } from '../../cli/server/webtty/agentProcessIdentity.mjs';
 
 const TERMINAL_ID = 'abcdefghijklmnopqrstuvwx';
 const CONTAINER_ID = 'a'.repeat(64);
@@ -40,6 +42,21 @@ const CLIENT = Object.freeze({
     sessionId: 4200,
     foregroundProcessGroupId: 4200,
     ttyNumber: 34816,
+});
+
+test('a failed session capture leaves the cleanup unproven', async () => {
+    const h = harness({
+        captureSession: async () => {
+            throw Object.assign(new Error('capture failed'), {
+                code: 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN',
+                category: 'session-anchor-missing',
+            });
+        },
+    });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
 });
 
 test('Podman client capture independently binds UID and exact fixed argv', () => {
@@ -346,7 +363,12 @@ function harness(overrides = {}) {
             )),
         captureClient: overrides.captureClient || (() => CLIENT),
         captureInner: overrides.captureInner || (async () => INNER),
-        captureSession: overrides.captureSession || (async () => []),
+        captureSession: overrides.captureSession || (async () => [markerWrapperIdentity()]),
+        captureCleanupScope: overrides.captureCleanupScope || (async () => ({ captured: true })),
+        cleanupScopeAbsent: overrides.cleanupScopeAbsent || (async () => true),
+        readCleanupIdentity: overrides.readCleanupIdentity || (async () => null),
+        listCleanupMarkers: overrides.listCleanupMarkers || (async () => []),
+        listBoxSession: overrides.listBoxSession || (async () => []),
         listSession: overrides.listSession || (async () => []),
         signalSession: overrides.signalSession || (async () => {}),
         readInnerIdentity: overrides.readInnerIdentity || (async (pid) => {
@@ -394,6 +416,359 @@ test('worker sends its first byte only after async exact client capture complete
     assert.equal(h.ptyState.writes.length, 1);
     assert.equal(challengeCalls, 1);
     assert.equal(h.processApi.sent.some((message) => message.type === 'ready'), true);
+});
+
+test('ready cleanup resolves transient EACCES only after two fresh positive snapshots', async () => {
+    const calls = [];
+    const positives = [];
+    const completeScans = [];
+    const h = harness({
+        captureSession: async () => [markerWrapperIdentity()],
+        signalSession: async () => {
+            calls.push('signal');
+            throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        },
+        listSession: async () => {
+            calls.push('list');
+            if (calls.filter((value) => value === 'list').length === 1) {
+                throw Object.assign(new Error('transient'), { code: 'EACCES' });
+            }
+            return [];
+        },
+        drainExec: () => calls.push('drain'),
+        listCleanupMarkers: async () => { completeScans.push(Date.now()); return []; },
+        inspectTargetCleanup: async () => {
+            positives.push(Date.now());
+            return { absent: false, id: CONTAINER_ID, running: true, initPid: 4299, execIds: [] };
+        },
+    });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    const first = h.worker.cleanup('requested');
+    assert.equal(h.worker.cleanup('requested'), first);
+    await first;
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, true);
+    assert.equal(positives.length >= 4, true);
+    assert.equal(completeScans.length >= 2, true);
+    assert.equal(completeScans.at(-1) - completeScans[0] >= 25, true);
+    assert.equal(calls.filter((value) => value === 'signal').length, 1);
+    assert.equal(calls.filter((value) => value === 'drain').length, 1);
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+});
+
+test('otherwise proven ready cleanup is vetoed by a private setsid survivor', async () => {
+    const h = harness({ cleanupScopeAbsent: async () => false });
+    h.worker.cleanupDeadlineMs = 80;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+});
+
+test('normal ready PTY exit succeeds when its wrapper, client and ExecID are already gone', async () => {
+    const stale = () => {
+        throw Object.assign(new Error('original wrapper already exited'), {
+            code: 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE', category: 'process-not-readable',
+        });
+    };
+    const h = harness({
+        captureSession: stale,
+        captureCleanupScope: () => assert.fail('an exited shell must not require new scope tracking'),
+        cleanupScopeAbsent: () => assert.fail('successful natural cleanup must retain its baseline path'),
+        readCleanupIdentity: () => assert.fail('successful natural cleanup must not enter the new proof'),
+        inspectTargetCleanup: async () => ({ absent: false, id: CONTAINER_ID,
+            running: true, initPid: INNER.containerInitBoxPid, execIds: [] }),
+        signalClient: () => assert.fail('the exited client must not be signalled'),
+        signalSession: () => assert.fail('an absent original session must not be signalled'),
+    });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    h.worker.handlePtyExit({ exitCode: 0, signal: null });
+    await h.worker.cleanupPromise;
+    const exit = h.processApi.sent.find((message) => message.type === 'exit');
+    assert.equal(exit?.category, 'clean');
+    assert.equal(exit?.cleanupProven, true);
+    assert.equal(h.processApi.sent.some((message) => message.type === 'error'), false);
+});
+
+test('an already-exited shell with incomplete cleanup remains unproven without a captured scope', async () => {
+    const h = harness({
+        captureSession: async () => {
+            throw Object.assign(new Error('gone'), { code: 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE' });
+        },
+        captureCleanupScope: () => assert.fail('an exited shell cannot provide a live capture'),
+        listSession: async () => { throw Object.assign(new Error('unknown'), { code: 'EACCES' }); },
+        readCleanupIdentity: () => assert.fail('missing scope must not enter the new proof'),
+    });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    h.worker.handlePtyExit({ exitCode: 0, signal: null });
+    await h.worker.cleanupPromise;
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.processApi.sent.some((message) => message.type === 'error'), true);
+});
+
+test('a late PTY exit cannot exempt a forced close from its captured private-scope survivor veto', async () => {
+    const h = harness({
+        captureCleanupScope: async () => {
+            h.worker.handlePtyExit({ exitCode: 0, signal: null });
+            return { captured: true };
+        },
+        cleanupScopeAbsent: async () => false,
+    });
+    h.worker.cleanupDeadlineMs = 80;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.worker.ptyExited, true);
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+});
+
+function cleanupProofHarness(overrides = {}) {
+    const calls = { signals: 0, drains: 0, reads: 0 };
+    const h = harness({
+        captureSession: async () => [markerWrapperIdentity()],
+        signalSession: async () => {
+            calls.signals += 1;
+            throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        },
+        drainExec: () => { calls.drains += 1; },
+        readCleanupIdentity: async () => { calls.reads += 1; return null; },
+        inspectTargetCleanup: async () => ({ absent: false, id: CONTAINER_ID,
+            running: true, initPid: INNER.containerInitBoxPid, execIds: [] }),
+        ...overrides,
+    });
+    h.worker.cleanupDeadlineMs = 100;
+    return { ...h, calls };
+}
+
+test('a captured permanent private zombie keeps ready cleanup unproven through its deadline', async () => {
+    const zombie = { pid: 4310, state: 'Z', startToken: 'linux-proc:43100', parentPid: INNER.boxPid,
+        pidNamespace: 'pid:[9010]', nspid: [4310, 55, 1] };
+    const targetInit = { pid: INNER.containerInitBoxPid, state: 'S', startToken: INNER.containerInitStartToken,
+        parentPid: 1, pidNamespace: INNER.pidNamespace, nspid: [INNER.containerInitBoxPid, 1] };
+    const records = new Map([targetInit, markerWrapperIdentity(), zombie].map(value => [value.pid, value]));
+    const options = {
+        fsApi: { readdir: async () => [...records.keys()].map(pid => ({ name: String(pid), isDirectory: () => true })) },
+        readIdentity: async pid => records.get(pid) || null,
+        readAnchorIdentity: async pid => records.get(pid),
+    };
+    let scope;
+    const h = cleanupProofHarness({
+        captureCleanupScope: async record => { scope = await captureAgentCleanupScope(record, options); return scope; },
+        cleanupScopeAbsent: captured => agentCleanupScopeAbsent(captured, options),
+        drainExec: () => { h.calls.drains++; records.delete(INNER.boxPid); },
+    });
+    h.worker.cleanupDeadlineMs = 120;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    const started = Date.now();
+    await h.worker.cleanup('requested');
+    assert.equal(scope?.namespaceInits[0].state, 'Z');
+    assert.equal(Date.now() - started >= h.worker.cleanupDeadlineMs, true);
+    assert.equal(h.calls.reads >= 2, true);
+    assert.equal(h.calls.signals, 1); assert.equal(h.calls.drains, 1);
+    assert.equal(h.processApi.sent.find(message => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.processApi.sent.filter(message => message.type === 'exit').length, 1);
+    assert.equal(h.ptyState.disposed, 0);
+});
+
+test('ready positive proof fails closed for every live or unknown evidence surface', async (t) => {
+    const extraMember = { ...markerWrapperIdentity(), pid: 4310, startToken: 'linux-proc:43100' };
+    const failures = {
+        'live original client': { readCleanupIdentity: async (pid) => pid === CLIENT.pid ? CLIENT : null },
+        'live original wrapper': { readCleanupIdentity: async (pid) => pid === INNER.boxPid ? markerWrapperIdentity() : null },
+        'live original captured child': {
+            captureSession: async () => [markerWrapperIdentity(), extraMember],
+            readCleanupIdentity: async (pid) => pid === extraMember.pid ? extraMember : null,
+        },
+        'live exact marker': { listCleanupMarkers: async () => [markerWrapperIdentity()] },
+        'live Box SID': { listBoxSession: async () => [{ pid: 4311 }] },
+        'live private TERM-ignoring child': { cleanupScopeAbsent: async () => false },
+        'original ExecID still present': { inspectTargetCleanup: async () => ({ absent: false,
+            id: CONTAINER_ID, running: true, initPid: 4299, execIds: [EXEC_ID] }) },
+        'persistent EACCES': { readCleanupIdentity: async () => {
+            throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        } },
+        'wrapped STALE is unknown': { readCleanupIdentity: async () => {
+            throw Object.assign(new Error('unknown'), { code: 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE' });
+        } },
+        'undefined identity is unknown': { readCleanupIdentity: async () => undefined },
+        'malformed marker scan': { listCleanupMarkers: async () => null },
+        'malformed session scan': { listBoxSession: async () => undefined },
+    };
+    for (const [name, overrides] of Object.entries(failures)) {
+        await t.test(name, async () => {
+            const h = cleanupProofHarness(overrides);
+            await h.worker.initialize(init());
+            await h.worker.launch();
+            await h.worker.cleanup('requested');
+            assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+            assert.equal(h.calls.signals, 1);
+            assert.equal(h.calls.drains, 1);
+            assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+        });
+    }
+});
+
+test('missing, unanchored or malformed original evidence cannot enter the positive proof', async () => {
+    for (const overrides of [
+        { captureSession: async () => [] },
+        { captureSession: async () => [{ ...markerWrapperIdentity(), startToken: 'linux-proc:99999' }] },
+        { captureSession: async () => [markerWrapperIdentity(), { pid: undefined }] },
+        { captureCleanupScope: async () => { throw Object.assign(new Error('incomplete'), { code: 'EACCES' }); } },
+    ]) {
+        const h = cleanupProofHarness(overrides);
+        await h.worker.initialize(init());
+        await h.worker.launch();
+        await h.worker.cleanup('requested');
+        assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+        assert.equal(h.calls.reads, 0);
+    }
+});
+
+test('a ready terminal missing its original ExecID cannot adopt or drain a later foreign exec', async () => {
+    const h = cleanupProofHarness();
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    h.worker.execId = '';
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.worker.execId, '');
+    assert.equal(h.calls.signals, 0);
+    assert.equal(h.calls.drains, 0);
+    assert.equal(h.calls.reads, 0);
+});
+
+test('hard PID/init/namespace contradictions cannot become successful after a later absence', async () => {
+    for (const contradiction of ['pid', 'init', 'namespace', 'scope']) {
+        const h = cleanupProofHarness();
+        await h.worker.initialize(init());
+        await h.worker.launch();
+        let reads = 0;
+        if (contradiction === 'pid' || contradiction === 'namespace') {
+            h.worker.readCleanupIdentity = async () => ++reads === 1 ? {
+                ...CLIENT, startToken: 'linux-proc:99999', pidNamespace: 'pid:[9999]',
+            } : null;
+        } else if (contradiction === 'init') {
+            h.worker.readInnerIdentity = async (pid) => ({ pid, state: 'S',
+                startToken: 'linux-proc:99999', pidNamespace: INNER.pidNamespace });
+        } else {
+            h.worker.cleanupScopeAbsent = async () => {
+                if (++reads === 1) throw Object.assign(new Error('replaced'), { category: 'cleanup-process-replaced' });
+                return true;
+            };
+        }
+        await h.worker.cleanup('requested');
+        assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+        assert.equal(h.calls.drains, 1);
+    }
+});
+
+test('actual absence-reader contradictions stay latched while reparenting and read errors can be retried', async (t) => {
+    for (const phase of ['initial-scope', 'positive-proof']) {
+        for (const change of ['birth', 'namespace', 'parent', 'EACCES']) {
+            await t.test(`${phase}: ${change} then absence`, async () => {
+                const pid = phase === 'initial-scope' ? INNER.boxPid : CLIENT.pid;
+                let stats = 0;
+                let namespaces = 0;
+                const errors = [];
+                const fsApi = {
+                    readFile: async (file) => {
+                        if (file.endsWith('/status')) return Buffer.from(`NSpid:\t${pid}\t42\n`);
+                        stats += 1;
+                        if (stats > 2) throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+                        if (change === 'EACCES') {
+                            stats = 2;
+                            throw Object.assign(new Error('unknown'), { code: 'EACCES' });
+                        }
+                        const fields = ['S', stats === 2 && change === 'parent' ? 2 : 1,
+                            pid, pid, 34816, pid];
+                        while (fields.length < 19) fields.push(0);
+                        fields.push(stats === 2 && change === 'birth' ? 99999 : pid * 10);
+                        return Buffer.from(`${pid} (worker) ${fields.join(' ')} 0\n`);
+                    },
+                    readlink: async () => ++namespaces === 2 && change === 'namespace'
+                        ? 'pid:[9999]' : INNER.pidNamespace,
+                };
+                const read = async (selectedPid) => {
+                    if (selectedPid !== pid) return null;
+                    try {
+                        return await readAgentCleanupProcessIdentity(pid, { fsApi });
+                    } catch (error) {
+                        errors.push(error.category || error.code);
+                        throw error;
+                    }
+                };
+                const overrides = phase === 'initial-scope'
+                    ? { cleanupScopeAbsent: async () => await read(pid) === null }
+                    : { readCleanupIdentity: read };
+                const h = cleanupProofHarness(overrides);
+                h.worker.cleanupDeadlineMs = 300;
+                await h.worker.initialize(init());
+                await h.worker.launch();
+                await h.worker.cleanup('requested');
+                const hard = change === 'birth' || change === 'namespace';
+                assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, !hard);
+                assert.deepEqual(errors, [hard ? 'cleanup-process-replaced'
+                    : change === 'parent' ? 'cleanup-process-changed' : 'EACCES']);
+                assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+                assert.equal(h.processApi.sent.some((message) => message.type === 'error'), hard);
+                assert.equal(h.calls.signals, 1);
+                assert.equal(h.calls.drains, 1);
+            });
+        }
+    }
+});
+
+test('late positive scan cannot replace finalized failure or perform another cleanup action', async () => {
+    let release;
+    const h = cleanupProofHarness({ listCleanupMarkers: () => new Promise((resolve) => { release = resolve; }) });
+    h.worker.cleanupDeadlineMs = 40;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    const calls = { ...h.calls };
+    release([]);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.deepEqual(h.calls, calls);
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+    assert.equal(h.ptyState.disposed, 0);
+});
+
+test('an intervening negative snapshot resets the two-positive stability requirement', async () => {
+    const h = cleanupProofHarness();
+    const snapshots = [];
+    const values = [true, false, true, true];
+    h.worker.cleanupPositiveSnapshot = async () => {
+        snapshots.push(Date.now());
+        return values.shift();
+    };
+    const context = { deadlineAt: Date.now() + 500, signal: new AbortController().signal };
+    assert.equal(await h.worker.confirmReadyCleanup([], {}, context), true);
+    assert.equal(snapshots.length, 4);
+    assert.equal(snapshots[3] - snapshots[2] >= 25, true);
+});
+
+test('one positive snapshot cannot succeed when the second completes after the original deadline', async () => {
+    let scans = 0;
+    const h = cleanupProofHarness({ listBoxSession: async () => {
+        if (++scans === 2) await new Promise((resolve) => setTimeout(resolve, 120));
+        return [];
+    } });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    const started = Date.now();
+    await h.worker.cleanup('requested');
+    assert.equal(Date.now() - started < 300, true);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(scans, 2);
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    assert.equal(h.processApi.sent.filter((message) => message.type === 'exit').length, 1);
+    assert.equal(h.calls.signals, 1);
+    assert.equal(h.calls.drains, 1);
 });
 
 test('invalid readiness challenge fails without input or an unhandled pending readiness rejection', async () => {
@@ -547,6 +922,7 @@ test('the Bash wrapper cannot forward target-controlled fallback statuses', () =
 });
 
 test('worker cleanup has a hard deadline below the Router-side worker grace', async () => {
+    assert.equal(AGENT_WORKER_CLEANUP_DEADLINE_MS, 5_500);
     assert.equal(AGENT_WORKER_CLEANUP_DEADLINE_MS < 8_500, true);
     const h = harness({
         captureSession: () => new Promise(() => {}),
@@ -581,6 +957,7 @@ test('a hanging cleanup inspect finalizes before Router grace and cannot drain l
     await h.worker.initialize(init());
     await h.worker.launch();
     h.worker.execId = '';
+    h.worker.readySent = false;
 
     const startedAt = Date.now();
     await h.worker.cleanup('requested');
@@ -909,12 +1286,7 @@ test('true Bash absence falls back through the same persistent identity-captured
 test('cleanup signals the captured inner session, then client, and drains only its ExecID', async () => {
     const calls = [];
     const h = harness({
-        captureSession: async () => [{
-            pid: 4300,
-            startToken: 'linux-proc:43000',
-            pidNamespace: 'pid:[9001]',
-            nssid: [4300, 42],
-        }],
+        captureSession: async () => [markerWrapperIdentity()],
         signalSession: async (_snapshot, signal) => calls.push(`inner:${signal}`),
         signalClient: (_identity, signal) => calls.push(`client:${signal}`),
         drainExec: (containerId, execId) => calls.push(`drain:${containerId}:${execId}`),
@@ -1341,6 +1713,63 @@ test('ExecID selection tolerates unrelated removals but rejects concurrent addit
 });
 
 const PROFILE = Object.freeze({ provider: 'provider', id: 'p-1', label: 'Profile One' });
+
+test('profile launcher is written only after inner capture, target revalidation and exec correlation', async () => {
+    let inspections = 0;
+    const h = harness({
+        captureInner: async () => {
+            assert.equal(h.ptyState.writes.length, 1, 'only the readiness probe precedes capture');
+            return INNER;
+        },
+        inspectTarget: () => {
+            inspections += 1;
+            assert.equal(h.ptyState.writes.length, inspections === 1 ? 0 : 1);
+            return { absent: false, running: true, id: CONTAINER_ID, initPid: 4299,
+                execIds: inspections === 1 ? [] : [EXEC_ID] };
+        },
+    });
+    await h.worker.initialize(init({ translatedHome: '/data/profiles/p-1/home', profile: PROFILE }));
+    await h.worker.launch();
+    assert.equal(h.ptyState.writes.length, 2);
+    assert.equal(h.ptyState.writes[1],
+        'if [ -x /etc/ploinky/webtty-profile-shell ]; then exec /etc/ploinky/webtty-profile-shell; fi\r');
+    const ready = h.processApi.sent.find(message => message.type === 'ready');
+    assert.equal(ready.recoveryEvidence.execId, EXEC_ID);
+    assert.deepEqual(ready.recoveryEvidence.innerProcess, INNER);
+});
+
+test('profile launcher condition preserves the shell when the fixed hook is not executable', async () => {
+    const h = harness();
+    await h.worker.initialize(init({ translatedHome: '/data/profiles/p-1/home', profile: PROFILE }));
+    await h.worker.launch();
+    assert.equal(h.ptyState.writes.length, 2);
+    const command = h.ptyState.writes[1].replace(/\r$/, '\n');
+    // Interpose the shell predicate without changing the host's /etc tree.
+    const absent = spawnSync('/bin/bash', ['-c',
+        `function [ { printf '%s\\n' "$*" >&2; return 1; }; ${command}printf 'plain-shell'`], { encoding: 'utf8' });
+    assert.equal(absent.status, 0, absent.stderr);
+    assert.equal(absent.stderr, '-x /etc/ploinky/webtty-profile-shell ]\n');
+    assert.equal(absent.stdout, 'plain-shell');
+
+    const plain = harness();
+    await plain.worker.initialize(init());
+    await plain.worker.launch();
+    assert.equal(plain.ptyState.writes.length, 1, 'unprofiled terminals receive only the readiness probe');
+});
+
+test('profile launcher is never written after stale target or ambiguous exec correlation', async () => {
+    for (const after of [{ initPid: 9999, execIds: [EXEC_ID] }, { initPid: 4299, execIds: [] }]) {
+        let inspections = 0;
+        const h = harness({
+            inspectTarget: () => ({ absent: false, running: true, id: CONTAINER_ID,
+                ...(++inspections === 1 ? { initPid: 4299, execIds: [] } : after) }),
+        });
+        await h.worker.initialize(init({ translatedHome: '/data/profiles/p-1/home', profile: PROFILE }));
+        await assert.rejects(h.worker.spawnAttempt('/bin/bash'));
+        assert.equal(h.ptyState.writes.length, 1, 'only the readiness probe was written');
+        assert.equal(h.processApi.sent.some(message => message.type === 'ready'), false);
+    }
+});
 
 test('a profile adds exactly HOME, INPUTRC and three profile variables to the exec, and nothing without one', () => {
     const plain = fixedAgentPodmanArgv(init());

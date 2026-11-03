@@ -46,6 +46,7 @@ import {
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import { readRuntimePredecessor } from '../sandbox/runtimePredecessorStore.js';
+import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 import {
     abortEdgeRoutingPreparation,
     commitAdditiveEdgeRoutingGeneration,
@@ -343,7 +344,7 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         profileName: info.profile || undefined,
         path: `manifest(${info.repoName}/${info.agentName})`,
     });
-    assertManifestStorageAdmission(manifest, profileResolution.profileConfig);
+    assertManifestStorageAdmission(manifest, profileResolution.profileConfig, { agentName: info.agentName });
     const runtimeKind = info.runtime === 'bwrap' || info.runtime === 'seatbelt'
         ? info.runtime
         : 'container';
@@ -2437,6 +2438,19 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             },
         );
         } finally {
+            if (activationCommitted && result.durableCandidate) {
+                try {
+                    retireRuntimeCandidate(result.durableCandidate);
+                } catch (error) {
+                    // Publication already succeeded; reporting must not trigger successor cleanup.
+                    try {
+                        logEvent(monitor, 'warn', 'container_restart_candidate_retirement_failed', {
+                            container: result.containerName,
+                            error: error?.message || error,
+                        });
+                    } catch (_) {}
+                }
+            }
             // Once committed, the replacement serves the deployment run its
             // predecessor belonged to, even if predecessor cleanup failed.
             if (activationCommitted && noWaitLineage) {
