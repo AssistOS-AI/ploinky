@@ -7,9 +7,10 @@ import { debugLog } from '../../utils/utils.js';
 import { imagePullTimeoutMs, probeContainerRuntime, pullImage } from './common.js';
 import { readLocalImageId } from './imageChange.mjs';
 import { parseImageReference, repoDigestSet } from './imageReference.mjs';
+import { IMAGE_REFRESH_VAR, imageRefreshPolicyOf } from './imageRefreshPolicy.mjs';
 import { fetchRemoteManifestDigest, nativeFetchIgnoresProxy } from './registryDigest.mjs';
 
-export const IMAGE_REFRESH_VAR = 'PLOINKY_IMAGE_REFRESH';
+export { IMAGE_REFRESH_VAR };
 // A pull that cannot get at least this long is deferred instead of started.
 const MIN_PULL_BUDGET_MS = 60_000;
 
@@ -24,9 +25,7 @@ export function resolveImageRefreshPolicy({ readVar = resolveVarValue } = {}) {
         debugLog(`[pull] ${IMAGE_REFRESH_VAR}: workspace variables unreadable `
             + `(${error?.message || error}); refreshing`);
     }
-    if (raw === 'off') return { policy: 'off', ignoredValue: '' };
-    // `on` is the explicit default: `ploinky var` has no unset, so it switches a workspace back after `off`.
-    return { policy: 'refresh', ignoredValue: raw === 'on' ? '' : raw };
+    return imageRefreshPolicyOf(raw);
 }
 
 // null when the image is missing locally; otherwise its RepoDigests (maybe empty).

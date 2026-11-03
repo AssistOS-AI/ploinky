@@ -5,6 +5,7 @@ import { findAgent } from '../utils.js';
 import { loadSecretsFile, loadEnvFile } from './secretInjector.js';
 import { deleteSecretValue, readSecretsFile, setSecretValue } from './encryptedSecretsFile.js';
 import { deriveAgentSecret, deriveWorkspaceSecret } from './masterKey.js';
+import { resolveSecretAlias as resolveAlias } from './secretAlias.mjs';
 
 export function parseSecrets() {
     return readSecretsFile();
@@ -20,17 +21,6 @@ export function deleteVar(name) {
 
 export function declareVar(name) {
     return setEnvVar(name, '');
-}
-
-function resolveAlias(value, secrets, seen = new Set()) {
-    if (typeof value !== 'string') return value;
-    if (!value.startsWith('$')) return value;
-    const ref = value.slice(1);
-    if (!ref || seen.has(ref)) return '';
-    seen.add(ref);
-    const next = secrets[ref];
-    if (next === undefined) return '';
-    return resolveAlias(next, secrets, seen);
 }
 
 // `secrets` lets a caller that already holds the current decrypted map (for
