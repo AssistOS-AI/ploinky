@@ -81,11 +81,14 @@ test('a workspace without a static agent has nothing to refresh (default image p
     assert.equal(result.records.some((record) => record.phase === 'image'), false);
 });
 
-test('a refresh that throws is a warning, not a failed update', async () => {
+test('a refresh that throws is a warning and an optional skipped record, not a failed update', async () => {
     const { run, logs } = harness({ refreshImages: async () => { throw new Error('graph exploded'); } });
     const result = await run();
     assert.equal(result.exitCode, 0);
-    assert.deepEqual(result.records.map((record) => record.phase), ['workspace-repository']);
+    assert.deepEqual(result.records.map((record) => [record.phase, record.code]), [
+        ['workspace-repository', ''],
+        ['image', 'image-refresh-error'],
+    ]);
     assert.ok(logs.some((line) => /image refresh skipped \(graph exploded\)/.test(line)));
 });
 

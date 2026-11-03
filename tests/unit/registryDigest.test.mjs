@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { parseImageReference } from '../../cli/sandbox/docker/imageReference.mjs';
-import { fetchRemoteManifestDigest, nativeFetchIgnoresProxy } from '../../cli/sandbox/docker/registryDigest.mjs';
+import { fetchRemoteManifestDigest, nativeFetchIgnoresProxy, nodeHonoursEnvProxy } from '../../cli/sandbox/docker/registryDigest.mjs';
 
 const DIGEST = `sha256:${'bc7c'.repeat(16)}`;
 const parsed = parseImageReference('docker.io/assistos/roboteam-agent:runtime');
@@ -120,9 +120,10 @@ test('nativeFetchIgnoresProxy: a proxy without Node proxy support, and each way 
     assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p:3128' }, []), true);
     assert.equal(nativeFetchIgnoresProxy({ all_proxy: 'socks5://p:1080' }, []), true);
     assert.equal(nativeFetchIgnoresProxy({}, []), false);
-    assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_USE_ENV_PROXY: '1' }, [], 24), false);
-    assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_USE_ENV_PROXY: '1' }, [], 22), true,
-        'on Node 22 the variable is not relied on');
+    assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_USE_ENV_PROXY: '1' }, [], '24.0.0'), false);
+    assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_USE_ENV_PROXY: '1' }, [], '22.20.9'), true,
+        'before 22.21.0 the variable is not relied on');
+    assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_USE_ENV_PROXY: '1' }, [], '22.21.0'), false);
     assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p' }, ['--use-env-proxy']), false);
     assert.equal(nativeFetchIgnoresProxy({ HTTPS_PROXY: 'http://p', NODE_OPTIONS: '--no-warnings --use-env-proxy' }, []), false);
 });
@@ -144,4 +145,11 @@ test('the token never reaches a logger even when the whole flow is observed', as
         Object.assign(console, original);
     }
     assert.equal(lines.join('\n').includes(TOKEN), false);
+});
+
+test('nodeHonoursEnvProxy: from 22.21.0 and from 24, not before', () => {
+    for (const [version, expected] of [['20.18.0', false], ['22.20.0', false], ['22.21.0', true], ['22.23.4', true],
+        ['23.5.0', false], ['24.0.0', true], ['25.1.0', true]]) {
+        assert.equal(nodeHonoursEnvProxy(version), expected, version);
+    }
 });

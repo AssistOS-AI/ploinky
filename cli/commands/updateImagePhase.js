@@ -6,7 +6,7 @@ import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.j
 import { classifyDependencyGraphWaitMode } from '../utils/workspaceDependencyGraph.js';
 import { debugLog } from '../utils/utils.js';
 import { UPDATE_RUNNER_DEFAULTS } from '../../ploinky-box/update/coreRunner.mjs';
-import { createImageRefreshSession } from '../sandbox/docker/imageRefresh.mjs';
+import { createImageRefreshSession, resolveImageRefreshPolicy } from '../sandbox/docker/imageRefresh.mjs';
 import { UpdateCancelledError } from './updateCancellation.js';
 import { createOperationRecord } from './updateOutcome.js';
 import { appendUpdateRecords } from './updateRecords.js';
@@ -85,7 +85,16 @@ const RECORD_MAP = Object.freeze({
     deferred: ['skipped', 'image-refresh-deferred'],
     'retag-deferred': ['skipped', 'image-retag-deferred'],
     error: ['skipped', 'image-refresh-error'],
+    'turned-off': ['skipped', 'image-refresh-turned-off'],
+    'tag-changed': ['skipped', 'image-tag-changed'],
+    // The whole phase was skipped before any ref was checked; `result.code` names why.
+    'phase-skipped': ['skipped', 'image-refresh-skipped'],
 });
+
+const ATTEMPTED = new Set(['refreshed', 'pull-failed', 'retag-deferred', 'turned-off', 'tag-changed']);
+const phaseSkipped = (code, reason) => [{
+    action: 'phase-skipped', canonical: 'image-refresh', ref: 'image-refresh', code, reason, agents: [],
+}];
 
 /** One optional `image` phase record per checked mutable ref. */
 export function imageRefreshUpdateRecords(results = []) {
@@ -97,9 +106,9 @@ export function imageRefreshUpdateRecords(results = []) {
             phase: 'image',
             id: result.canonical || result.ref,
             outcome: mapped[0],
-            attempted: ['refreshed', 'pull-failed', 'retag-deferred'].includes(result.action),
+            attempted: ATTEMPTED.has(result.action),
             required: false,
-            code: mapped[1],
+            code: result.action === 'phase-skipped' ? result.code : mapped[1],
             reason: result.reason || '',
             before: result.beforeId ? { imageId: result.beforeId } : null,
             after: result.afterId ? { imageId: result.afterId } : null,
@@ -134,9 +143,9 @@ export async function refreshWorkspaceGraphImages(session, { includeNoWait = tru
     try {
         admitted = preflightWorkspaceStartRuntimeCapabilities();
     } catch (error) {
-        console.log('[pull] Warning: image refresh skipped; the workspace graph could not be resolved '
-            + `(${error?.message || error}).`);
-        return [];
+        const reason = `the workspace graph could not be resolved (${error?.message || error})`;
+        console.log(`[pull] Warning: image refresh skipped; ${reason}.`);
+        return phaseSkipped('image-refresh-graph-unavailable', reason);
     }
     return refreshAdmittedGraphImages(admitted, session, { includeNoWait, filter });
 }
@@ -150,7 +159,7 @@ export async function refreshUpdateImages({ request, session, log }, deps = {}) 
     if (inspectInFlight().length) {
         log('[update] Image refresh skipped: no-wait workers of an earlier start are still running. '
             + 'Run `ploinky update` again once they finish.');
-        return [];
+        return phaseSkipped('image-refresh-workers-active', 'no-wait workers of an earlier start are still running');
     }
     const refreshGraph = deps.refreshWorkspaceGraphImages || refreshWorkspaceGraphImages;
     return refreshGraph(session, { includeNoWait: true, filter: buildImageFilter(request, deps) });
@@ -161,6 +170,7 @@ export function createRetagLease({
     heldLease = null,
     acquire = acquireWorkspaceMutationLease,
     release = releaseWorkspaceMutationLease,
+    log = console.log,
 } = {}) {
     return async (fn) => {
         // The caller of this update already holds the lease for its whole run.
@@ -175,7 +185,9 @@ export function createRetagLease({
         try {
             return { ok: true, value: await fn() };
         } finally {
-            release(lease);
+            if (!release(lease)) {
+                log('[pull] Warning: the workspace lease taken for the image tag move could not be released exactly.');
+            }
         }
     };
 }
@@ -196,9 +208,9 @@ export async function appendImageRefreshPhase(result, {
     }
     if (ignoredValue) {
         log(`[update] Warning: PLOINKY_IMAGE_REFRESH='${ignoredValue.slice(0, 40)}' is ignored; `
-            + "the only recognised value is 'off'. Refreshing images as usual.");
+            + "the recognised values are 'off' and 'on'. Refreshing images as usual.");
     }
-    if (result.exitCode !== 0 || result.activationAllowed === false) {
+    if (result.activationAllowed === false) {
         return appendUpdateRecords(result, [phaseRecord('image-refresh', 'image-refresh-skipped-git-failed',
             'the repository phases failed or need recovery; image tags were not refreshed')]);
     }
@@ -208,8 +220,9 @@ export async function appendImageRefreshPhase(result, {
         ...result.records, ...imageRefreshUpdateRecords(session.results()),
     ]);
     session = createImageRefreshSession({
-        policy, log, deadlineMs, beforePull: checkpoint, afterPullFailure: checkpoint,
-        withRetagLease: createRetagLease({ heldLease }), ...sessionOptions,
+        policy, log, deadlineMs, beforePull: checkpoint, afterPullFailure: checkpoint, beforeRetag: checkpoint,
+        stillEnabled: () => resolveImageRefreshPolicy().policy !== 'off',
+        withRetagLease: createRetagLease({ heldLease, log }), ...sessionOptions,
     });
     let results;
     try {
@@ -217,7 +230,7 @@ export async function appendImageRefreshPhase(result, {
     } catch (error) {
         if (error instanceof UpdateCancelledError) throw error;
         log(`[pull] Warning: image refresh skipped (${error?.message || error}).`);
-        return result;
+        results = phaseSkipped('image-refresh-error', String(error?.message || error));
     }
     const records = imageRefreshUpdateRecords(results);
     if (!records.length) return result;

@@ -29,7 +29,7 @@ New code is dependency-free Node.js (`engines.node >= 22`). It uses global `fetc
    - Registry reachable but the digest cannot be proven: run `<runtime> pull`.
    - Pull failure: warn and keep the cached image.
    - Nothing in the refresh fails `update`. A failure becomes a `skipped` record and the exit code stays 0.
-6. **Opt-out.** Refreshing is simply what `ploinky update` does by default. The workspace variable `PLOINKY_IMAGE_REFRESH` has one recognised value, `off` (`ploinky var PLOINKY_IMAGE_REFRESH off`): a developer escape hatch for workspaces that build agent images locally under the published tag (`install-roboteam-local-in-box.sh` sets it automatically).
+6. **Opt-out.** Refreshing is simply what `ploinky update` does by default. The workspace variable `PLOINKY_IMAGE_REFRESH` has two recognised values: `off` (`ploinky var PLOINKY_IMAGE_REFRESH off`) and `on` (the default, so a workspace can switch back because `ploinky var` has no unset): a developer escape hatch for workspaces that build agent images locally under the published tag (`install-roboteam-local-in-box.sh` sets it automatically).
    - It is read **only** from the workspace variable, never from the process environment, and is not forwarded from the host.
    - When it is `off`, `update` logs one line saying so and checks and pulls nothing.
    - Any other non-empty value (including the former `check` and `always`) is ignored: `update` logs one warning and refreshes as usual. It never fails the update and adds no record.
@@ -98,7 +98,7 @@ Ploinky reads no credentials, so there is no `registryAuth.mjs`. The token stays
   - a TLS-class error. The code is taken from `err.cause?.code ?? err.code` and matches `CERT_*`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, `SELF_SIGNED_CERT_IN_CHAIN`, `DEPTH_ZERO_SELF_SIGNED_CERT`, `ERR_TLS_*`, `ERR_SSL_*`, or `EPROTO`. `EPROTO` also covers plain-HTTP registries.
 
 **Proxy.** `nativeFetchIgnoresProxy(env = process.env, execArgv = process.execArgv, nodeMajor)` returns true when any of `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` or `all_proxy` is non-empty **and** none of these is present:
-- `env.NODE_USE_ENV_PROXY === '1'` and Node major version >= 24 (on Node 22 the variable is not relied on, so a proxy environment means the engine pulls);
+- `env.NODE_USE_ENV_PROXY === '1'` and `process.versions.node` >= 22.21.0 or >= 24 (`nodeHonoursEnvProxy`; on older Node a proxy environment means the engine pulls);
 - `--use-env-proxy` in `execArgv`;
 - `--use-env-proxy` in `NODE_OPTIONS`.
 
@@ -111,7 +111,7 @@ Ploinky reads no credentials, so there is no `registryAuth.mjs`. The token stays
 ```js
 export const IMAGE_REFRESH_VAR = 'PLOINKY_IMAGE_REFRESH';
 
-// The workspace variable is the only source. `off` is the only recognised value.
+// The workspace variable is the only source. `off` turns the refresh off, `on` is the default; anything else is ignored.
 export function resolveImageRefreshPolicy({ readVar = resolveVarValue } = {})  // { policy: 'off' | 'refresh', ignoredValue }
 ```
 
@@ -139,15 +139,15 @@ Seams for tests: `fetchImpl`, `spawn`, `env`, `execArgv`, `pull` (defaults to `p
    - the registry is `localhost`;
    - no runtime was found.
 2. `local = readRepoDigests(ref)`. This runs `<rt> image inspect --format '{{json .RepoDigests}}' <ref>` with a 30 s timeout. A non-zero exit means the image is missing: skip and do not pull. An empty or `null` array gives an empty set, which proves nothing and so leads to a pull.
-3. If `deadlineMs - now() < 60 s`, the result is `deferred`: no registry call, no pull (code `image-refresh-deferred`).
+3. If `deadlineMs - now() < min(60 s, configured pull timeout)`, the result is `deferred`: no registry call, no pull (code `image-refresh-deferred`).
 4. If `nativeFetchIgnoresProxy()` is true, the digest is unknown and the engine will pull the tag (step 6). Otherwise `remote = await fetchRemoteManifestDigest(parsed, { unreachableHosts })` (one `Set` per session):
    - `ok` and `local.has(remote.digest)`: `current`.
    - `ok` and not present: log, remember the digest, continue.
    - `unavailable`: warn, keep cached.
    - `undetermined`: log `asking <rt> to pull`, digest unknown, continue.
-5. `beforeId = readImageId(ref)`, then `await beforePull?.()`. The pull timeout is `min(PLOINKY_IMAGE_PULL_TIMEOUT_MS, deadlineMs - now())`; below 60 s the result is `deferred`.
+5. `beforeId = readImageId(ref)`, then `await beforePull?.()`. The pull timeout is `min(PLOINKY_IMAGE_PULL_TIMEOUT_MS, deadlineMs - now())`. A pull whose timeout was cut short by the budget and then timed out is `deferred` (no timeout advice), not `pull-failed`. Every `deferred`, `retag-deferred`, `turned-off` and `tag-changed` result logs one `[pull]` line with its reason.
 6. Pull:
-   - **Digest known:** `pull('<registry>/<repository>@<digest>', { runtime, log, timeoutMs })`. The tag does not move. `afterId = readImageId(<digest ref>)`. If it equals `beforeId` the result is `current`. Otherwise the tag moves with `<rt> tag <afterId> <ref>` inside `withRetagLease`, a callback the commands layer implements with a brief workspace mutation lease (5 s wait). If the lease stays busy the result is `retag-deferred` (code `image-retag-deferred`) and nothing is rolled back. A failing `tag` command is `pull-failed`.
+   - **Digest known:** `pull('<registry>/<repository>@<digest>', { runtime, log, timeoutMs })`. The tag does not move. `afterId = readImageId(<digest ref>)`. If it equals `beforeId` the result is `current`. Otherwise `beforeRetag` (the cancellation checkpoint) runs, then `withRetagLease`, which the commands layer implements with a brief workspace mutation lease (5 s wait; a failed release is logged as a warning), runs a callback that **revalidates**: if the workspace policy is now `off` the result is `turned-off` (code `image-refresh-turned-off`); if `readImageId(ref)` no longer equals the `beforeId` read before the pull the result is `tag-changed` (code `image-tag-changed`, the tag moved during the update, for example a local build); otherwise `<rt> tag <afterId> <ref>`. If the lease stays busy the result is `retag-deferred` (code `image-retag-deferred`) and nothing is rolled back. A failing `tag` command is `pull-failed`.
    - **Digest unknown:** `pull(ref, ...)`; `afterId = readImageId(ref)`; `refreshed` when the ID changed, else `current`.
    - On a pull throw: `await afterPullFailure?.()` (a hook error propagates, see below), then `pull-failed`, warn, keep cached.
    - A `refreshed` result prints the rollback hint (D7). There is no automatic rollback retag.
@@ -231,9 +231,9 @@ Code lives in `cli/commands/updateImagePhase.js` (the commands layer: target col
 - **Budget.** `runUpdateCommand` records its start time. The image phase deadline is `start + IMAGE_PHASE_BUDGET_MS`, where `IMAGE_PHASE_BUDGET_MS = UPDATE_RUNNER_DEFAULTS.timeoutMs - 10 min` (the host bounds the whole in-Box update, `ploinky-box/update/coreRunner.mjs`, 30 min). Each pull is capped at the remaining budget; once less than 60 s remain, the remaining refs are recorded `skipped` / `image-refresh-deferred` and the update continues with exit 0.
 - **`appendImageRefreshPhase`** (after the `releaseFailed` block, before the outer `catch`, only when the result is not a cancellation):
   - Unchanged result, with no log, when `request.kind === 'repos'`.
-  - When the git phase failed or needs recovery (`exitCode !== 0` or `!activationAllowed`): one `skipped` record, id `image-refresh`, code `image-refresh-skipped-git-failed`; no image moves while activation is blocked.
+  - When the git phase blocks activation (`activationAllowed === false`; a `partial` update still refreshes): one `skipped` record, id `image-refresh`, code `image-refresh-skipped-git-failed`; no image moves while activation is blocked.
   - Otherwise it creates the session with the budget, `beforePull` and `afterPullFailure` set to `cancellation.checkpoint('image', [...git records, ...image records so far])`, and `withRetagLease` from `createRetagLease` (brief workspace mutation lease; the caller's lease is reused when the caller holds one). A `UpdateCancelledError` keeps all records and reaches the existing `catch` as a `cancelled` record.
-  - A throw from `refreshImages` other than `UpdateCancelledError` is logged as `[pull] Warning: image refresh skipped (...)` and leaves the result unchanged.
+  - A throw from `refreshImages` other than `UpdateCancelledError` is logged as `[pull] Warning: image refresh skipped (...)` and recorded as an optional `skipped` record, code `image-refresh-error`.
   - When something was refreshed and `!hostActivates`, it logs `[update] Refreshed images take effect after \`ploinky restart\` (or \`ploinky restart <agent>\`).` In the Box flow with an active graph, the host's follow-up restart activates them.
 - **`refreshUpdateImages({ request, session, log })`** uses lazy imports, so existing update tests do not load `workspaceUtil.js`:
   1. Return `[]` when `getConfig()?.static?.agent` is unset. A never-started workspace is checked at its first start.
@@ -250,6 +250,9 @@ Code lives in `cli/commands/updateImagePhase.js` (the commands layer: target col
 | `deferred` | `skipped` | `image-refresh-deferred` | budget exhausted |
 | `retag-deferred` | `skipped` | `image-retag-deferred` | lease busy; the digest was pulled, the tag did not move |
 | `error` | `skipped` | `image-refresh-error` | unexpected internal error |
+| `turned-off` | `skipped` | `image-refresh-turned-off` | the policy became `off` during the pull; the tag did not move |
+| `tag-changed` | `skipped` | `image-tag-changed` | the tag moved during the update; the tag did not move |
+| phase skipped | `skipped` | `image-refresh-workers-active`, `image-refresh-graph-unavailable` | id `image-refresh`; no ref was checked, so the update is `complete-with-skips` |
 
 ## 4. Module layout
 

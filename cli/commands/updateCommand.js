@@ -119,6 +119,7 @@ async function runUpdate(normalizedOptions, {
     error: logError = console.error,
     cancellation,
     refreshImages,
+    imageSessionOptions = {},
     startedAtMs = Date.now(),
 }) {
     const args = normalizedOptions.map(value => String(value ?? ''));
@@ -166,6 +167,7 @@ async function runUpdate(normalizedOptions, {
                 request, policy: imageRefreshPolicy, ignoredValue: imageRefreshIgnoredValue, cancellation,
                 hostActivates: Boolean(reportRequest), log, refreshImages,
                 deadlineMs: startedAtMs + IMAGE_PHASE_BUDGET_MS, heldLease: ownsLease ? null : lease,
+                sessionOptions: imageSessionOptions,
             });
         }
     } catch (error) {

@@ -45,7 +45,12 @@ function makeSession(overrides = {}) {
         execArgv: [],
         fetchImpl: async () => { state.heads += 1; return response(200, REMOTE_DIGEST); },
         readRepoDigests: () => state.local,
-        readImageId: () => (state.pulls.length ? state.ids[1] : state.ids[0]),
+        // The image ID depends on the ref asked: a digest ref exists once pulled, a tag changes only when
+        // pulled itself or moved by `tag`.
+        readImageId: (_runtime, ref) => {
+            if (ref.includes('@')) return state.pulls.includes(ref) ? NEW : null;
+            return state.pulls.includes(ref) || state.tags.length ? NEW : OLD;
+        },
         pull: (ref, options) => { state.pulls.push(ref); state.timeouts = [...(state.timeouts || []), options.timeoutMs]; },
         spawn: (_runtime, args) => { state.tags.push(args); return { status: 0 }; },
         ...overrides,
@@ -70,8 +75,12 @@ test('policy: the process environment is not consulted', () => {
     }
 });
 
+test('policy: on is the explicit default and is not reported', () => {
+    assert.deepEqual(resolveImageRefreshPolicy({ readVar: () => 'on' }), { policy: 'refresh', ignoredValue: '' });
+});
+
 test('policy: any other value, including the removed check and always modes, is ignored and reported', () => {
-    for (const value of ['check', 'always', 'Off', 'bogus']) {
+    for (const value of ['check', 'always', 'Off', 'On', 'bogus']) {
         assert.deepEqual(resolveImageRefreshPolicy({ readVar: () => value }), { policy: 'refresh', ignoredValue: value });
     }
 });
@@ -254,4 +263,70 @@ test('session: an unknown runtime is skipped', async () => {
     const { session, state } = makeSession({ runtime: null });
     assert.equal((await session.refresh(REF)).action, 'skipped');
     assert.equal(state.heads, 0);
+});
+
+test('retag: refresh turned off during the pull records turned-off and does not move the tag', async () => {
+    const { session, state } = makeSession({ stillEnabled: () => false });
+    const result = await session.refresh(REF);
+    assert.equal(result.action, 'turned-off');
+    assert.equal(state.tags.length, 0);
+    assert.match(state.logs.join('\n'), /turned off during the update/);
+});
+
+test('retag: a tag that moved during the pull (a local build) is left alone', async () => {
+    // The first read (before the pull) sees OLD; the read under the lease sees another image.
+    let reads = 0;
+    const moved = makeSession({
+        readImageId: (_rt, ref) => {
+            if (ref.includes('@')) return NEW;
+            reads += 1;
+            return reads === 1 ? OLD : `sha256:${'9'.repeat(64)}`;
+        },
+    });
+    const result = await moved.session.refresh(REF);
+    assert.equal(result.action, 'tag-changed');
+    assert.equal(moved.state.tags.length, 0);
+    assert.match(moved.state.logs.join('\n'), /tag moved during the update, for example a local build/);
+});
+
+test('retag: the cancellation hook runs between the pull and the tag move', async () => {
+    const cancelled = new Error('cancelled');
+    const { session, state } = makeSession({ beforeRetag: async () => { throw cancelled; } });
+    await assert.rejects(session.refresh(REF), (error) => error === cancelled);
+    assert.equal(state.pulls.length, 1);
+    assert.equal(state.tags.length, 0);
+});
+
+test('budget: a pull cut short by the budget that times out is deferred, not failed, and gets no timeout advice', async () => {
+    const { session, state } = makeSession({
+        deadlineMs: 120_000, now: () => 0, pullTimeoutMs: () => 30 * 60 * 1000,
+        pull: () => { throw new Error("Image pull for 'x' timed out after 120s. Increase PLOINKY_IMAGE_PULL_TIMEOUT_MS or pre-pull it."); },
+    });
+    const result = await session.refresh(REF);
+    assert.equal(result.action, 'deferred');
+    assert.match(result.reason, /time budget ended during the pull/);
+    assert.equal(state.logs.join('\n').includes('Increase PLOINKY_IMAGE_PULL_TIMEOUT_MS'), false);
+});
+
+test('budget: a timeout that was not cut short by the budget stays a pull failure', async () => {
+    const { session } = makeSession({
+        pullTimeoutMs: () => 30 * 60 * 1000,
+        pull: () => { throw new Error('Image pull for x timed out after 1800s'); },
+    });
+    assert.equal((await session.refresh(REF)).action, 'pull-failed');
+});
+
+test('budget: a small configured pull timeout does not defer everything', async () => {
+    const { session, state } = makeSession({ deadlineMs: 40_000, now: () => 0, pullTimeoutMs: () => 30_000 });
+    assert.equal((await session.refresh(REF)).action, 'refreshed');
+    assert.deepEqual(state.timeouts, [30_000]);
+});
+
+test('deferred results log one line with the reason', async () => {
+    const budget = makeSession({ deadlineMs: 10_000, now: () => 0 });
+    await budget.session.refresh(REF);
+    assert.equal(budget.state.logs.filter((line) => /deferred \(the update time budget is used up\)/.test(line)).length, 1);
+    const busy = makeSession({ withRetagLease: async () => ({ ok: false }) });
+    await busy.session.refresh(REF);
+    assert.equal(busy.state.logs.filter((line) => /tag move deferred \(the workspace lease is busy\)/.test(line)).length, 1);
 });

@@ -18,6 +18,7 @@ const {
     imageRefreshUpdateRecords,
     refreshAdmittedGraphImages,
     refreshUpdateImages,
+    refreshWorkspaceGraphImages,
 } = await import('../../cli/commands/updateImagePhase.js');
 const { createImageRefreshSession } = await import('../../cli/sandbox/docker/imageRefresh.mjs');
 const { decideUpdateStatus, buildUpdateResult, createOperationRecord } = await import('../../cli/commands/updateOutcome.js');
@@ -49,7 +50,8 @@ function makeSession(overrides = {}) {
         execArgv: [],
         fetchImpl: async () => { state.heads += 1; return response(200, REMOTE_DIGEST); },
         readRepoDigests: () => [],
-        readImageId: () => (state.pulls.length ? NEW : OLD),
+        readImageId: (_runtime, ref) => (ref.includes('@') ? (state.pulls.includes(ref) ? NEW : null)
+            : (state.pulls.includes(ref) || state.tags.length ? NEW : OLD)),
         pull: (ref) => { state.pulls.push(ref); },
         spawn: (_runtime, args) => { state.tags.push(args); return { status: 0 }; },
         ...overrides,
@@ -192,7 +194,8 @@ test('refreshUpdateImages: nothing without a static agent; skipped while no-wait
     assert.deepEqual(await refreshUpdateImages({ request, session, log: (l) => logs.push(l) }, deps({ getConfig: () => ({}) })), []);
     assert.equal(calls.length, 0);
     assert.deepEqual(await refreshUpdateImages({ request, session, log: (l) => logs.push(l) },
-        deps({ inspectInFlightNoWaitWorkers: () => [{ containerName: 'c' }] })), []);
+        deps({ inspectInFlightNoWaitWorkers: () => [{ containerName: 'c' }] })).then((r) => r.map((x) => [x.action, x.code])),
+        [['phase-skipped', 'image-refresh-workers-active']]);
     assert.equal(calls.length, 0);
     assert.match(logs.join('\n'), /no-wait workers of an earlier start are still running/);
     assert.deepEqual(await refreshUpdateImages({ request, session, log: (l) => logs.push(l) }, deps()), ['done']);
@@ -304,7 +307,8 @@ test('phase: digest pull plus retag end to end, and a busy lease records image-r
             sessionOptions: {
                 runtime: 'podman', env: {}, execArgv: [], readRepoDigests: () => [],
                 fetchImpl: async () => response(200, REMOTE_DIGEST),
-                readImageId: () => (pulls.length ? NEW : OLD),
+                readImageId: (_rt, ref) => (ref.includes('@') ? (pulls.includes(ref) ? NEW : null)
+                    : (pulls.includes(ref) || tags.length ? NEW : OLD)),
                 pull: (ref) => { pulls.push(ref); },
                 spawn: (_rt, args) => { tags.push(args); return { status: 0 }; },
                 ...(withRetagLease ? { withRetagLease } : {}),
@@ -338,7 +342,7 @@ test('phase: the cancellation checkpoint carries the image records so far; a pul
         sessionOptions: {
             runtime: 'podman', env: {}, execArgv: [], readRepoDigests: () => [],
             fetchImpl: async () => response(200, REMOTE_DIGEST),
-            readImageId: () => (pulls ? NEW : OLD),
+            readImageId: (_rt, ref) => (ref.includes('@') ? (pulls ? NEW : null) : (ref.startsWith('ghcr') && pulls > 1 ? NEW : OLD)),
             pull: () => {
                 pulls += 1;
                 if (pulls === 2) { signal = true; throw new Error('terminated'); }
@@ -357,4 +361,63 @@ test('phase: the cancellation checkpoint carries the image records so far; a pul
         return true;
     });
     assert.ok(seen.some(([, codes]) => codes.includes('image-refreshed')), 'a later checkpoint includes the earlier image record');
+});
+
+test('silent skips leave one optional skipped record each, so the update is not reported as fully verified', async () => {
+    const workers = await refreshUpdateImages({ request: { kind: 'all', folderPath: '' }, session: { enabled: true }, log: () => {} }, {
+        getConfig: () => ({ static: { agent: 'x' } }), inspectInFlightNoWaitWorkers: () => [{ containerName: 'c' }],
+    });
+    const graph = await refreshWorkspaceGraphImages({ enabled: true });
+    assert.deepEqual(graph.map((entry) => entry.code), ['image-refresh-graph-unavailable']);
+    const thrown = await appendImageRefreshPhase(gitResult(), phaseOptions({ refreshImages: async () => { throw new Error('graph exploded'); } }));
+    const cases = [
+        ['image-refresh-workers-active', imageRefreshUpdateRecords(workers)],
+        ['image-refresh-graph-unavailable', imageRefreshUpdateRecords(graph)],
+        ['image-refresh-error', thrown.records.filter((record) => record.phase === 'image')],
+    ];
+    for (const [code, records] of cases) {
+        assert.equal(records.length, 1, code);
+        assert.deepEqual([records[0].outcome, records[0].required, records[0].code], ['skipped', false, code]);
+        const decision = decideUpdateStatus(records);
+        assert.equal(decision.status, 'complete-with-skips', 'not claimed as complete');
+        assert.equal(decision.exitCode, 0);
+    }
+});
+
+test('phase: only activationAllowed === false skips the image phase; a partial update still refreshes', async () => {
+    const partial = buildUpdateResult({ records: [
+        createOperationRecord({ phase: 'workspace-repository', id: 'Gone', outcome: 'failed', required: false }),
+    ] });
+    assert.equal(partial.status, 'partial');
+    assert.equal(partial.activationAllowed, true);
+    let called = false;
+    await appendImageRefreshPhase(partial, phaseOptions({ refreshImages: async () => { called = true; return []; } }));
+    assert.equal(called, true);
+});
+
+test('retag lease: a lease that cannot be released exactly is reported as a warning', async () => {
+    const logs = [];
+    const run = createRetagLease({ acquire: async () => ({}), release: () => false, log: (line) => logs.push(line) });
+    assert.deepEqual(await run(() => 1), { ok: true, value: 1 });
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /could not be released exactly/);
+});
+
+test('phase: the retag callback re-reads the policy, so turning refresh off during the pull keeps the local tag', async () => {
+    const tags = [];
+    let pulled = false;
+    const result = await appendImageRefreshPhase(gitResult(), phaseOptions({
+        sessionOptions: {
+            runtime: 'podman', env: {}, execArgv: [], readRepoDigests: () => [],
+            fetchImpl: async () => response(200, REMOTE_DIGEST),
+            readImageId: (_rt, ref) => (ref.includes('@') ? (pulled ? NEW : null) : OLD),
+            pull: () => { pulled = true; },
+            spawn: (_rt, args) => { tags.push(args); return { status: 0 }; },
+            stillEnabled: () => false,
+        },
+        refreshImages: async ({ session }) => { await session.refresh(REF, { agents: ['r/a'] }); return session.results(); },
+    }));
+    assert.equal(tags.length, 0);
+    assert.equal(result.records.at(-1).code, 'image-refresh-turned-off');
+    assert.equal(result.exitCode, 0);
 });

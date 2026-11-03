@@ -144,8 +144,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             ],
             notes: "Use 'vars' to list variables. "
                 + '`ploinky update` re-pulls changed registry image tags by default; '
-                + '`ploinky var PLOINKY_IMAGE_REFRESH off` turns that off for this workspace (for agent images built locally '
-                + 'under the published tag). '
+                + '`ploinky var PLOINKY_IMAGE_REFRESH off` turns that off for this workspace '
+                + '(for agent images built locally under the published tag) '
+                + 'and `ploinky var PLOINKY_IMAGE_REFRESH on` turns it back on. '
                 + '--stdin takes the value from piped input and removes one trailing newline, '
                 + 'so a secret never appears in a process list. '
                 + 'Router control surfaces use authenticated workspace sessions.',

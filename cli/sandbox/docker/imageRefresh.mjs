@@ -14,17 +14,19 @@ export const IMAGE_REFRESH_VAR = 'PLOINKY_IMAGE_REFRESH';
 const MIN_PULL_BUDGET_MS = 60_000;
 
 // The workspace variable (`ploinky var PLOINKY_IMAGE_REFRESH off`, visible inside the Box) is the only
-// source. `off` is the only recognised value and turns the refresh off; anything else is ignored.
+// source. `off` turns the refresh off, `on` is the default; anything else is ignored.
 // Returns { policy: 'off' | 'refresh', ignoredValue }.
 export function resolveImageRefreshPolicy({ readVar = resolveVarValue } = {}) {
     let raw = '';
     try {
         raw = String(readVar(IMAGE_REFRESH_VAR) || '').trim();
     } catch (error) {
-        debugLog(`[pull] ${IMAGE_REFRESH_VAR}: workspace variables unreadable (${error?.message || error}); refreshing`);
+        debugLog(`[pull] ${IMAGE_REFRESH_VAR}: workspace variables unreadable `
+            + `(${error?.message || error}); refreshing`);
     }
     if (raw === 'off') return { policy: 'off', ignoredValue: '' };
-    return { policy: 'refresh', ignoredValue: raw };
+    // `on` is the explicit default: `ploinky var` has no unset, so it switches a workspace back after `off`.
+    return { policy: 'refresh', ignoredValue: raw === 'on' ? '' : raw };
 }
 
 // null when the image is missing locally; otherwise its RepoDigests (maybe empty).
@@ -63,6 +65,8 @@ export function createImageRefreshSession({
     log = console.log,
     beforePull = null,
     afterPullFailure = null,
+    beforeRetag = null,
+    stillEnabled = () => true,
     withRetagLease = runLeased,
     deadlineMs = Infinity,
     now = Date.now,
@@ -100,12 +104,22 @@ export function createImageRefreshSession({
         }
     }
 
+    const deferredResult = (base, action, reason) => {
+        const what = action === 'retag-deferred' ? 'tag move' : 'refresh';
+        log(`[pull] ${base.ref}: ${what} deferred (${reason}); using the cached image.`);
+        return { ...base, action, reason };
+    };
+
     async function pullAndMove(rt, ref, base, knownDigest, parsed) {
         const beforeId = readImageId(rt, ref);
         await hook(beforePull);
+        const configuredMs = pullTimeoutMs();
         const remaining = deadlineMs - now();
-        const timeoutMs = Math.floor(Math.min(pullTimeoutMs(), remaining));
-        if (timeoutMs < MIN_PULL_BUDGET_MS) return { ...base, action: 'deferred' };
+        if (remaining < Math.min(MIN_PULL_BUDGET_MS, configuredMs)) {
+            return deferredResult(base, 'deferred', 'the update time budget is used up');
+        }
+        const timeoutMs = Math.floor(Math.min(configuredMs, remaining));
+        const budgetCapped = timeoutMs < configuredMs;
         const pulledRef = knownDigest ? `${parsed.registry}/${parsed.repository}@${knownDigest}` : ref;
         const failed = async (error) => {
             await hook(afterPullFailure);
@@ -116,17 +130,38 @@ export function createImageRefreshSession({
         try {
             pull(pulledRef, { runtime: rt, log, timeoutMs });
         } catch (error) {
+            if (budgetCapped && /timed out/i.test(String(error?.message))) {
+                await hook(afterPullFailure);
+                return deferredResult(base, 'deferred', 'the update time budget ended during the pull');
+            }
             return failed(error);
         }
         const afterId = readImageId(rt, pulledRef);
         if (knownDigest) {
             if (!afterId) return failed(new Error('the pulled image could not be inspected'));
             if (afterId !== beforeId) {
+                await hook(beforeRetag);
+                // Revalidated under the lease: the policy, and the tag still being the image seen before the pull.
+                let outcome = '';
+                const withIds = { ...base, beforeId, afterId };
                 try {
-                    const moved = await withRetagLease(() => retag(rt, afterId, ref));
-                    if (!moved.ok) return { ...base, action: 'retag-deferred', beforeId, afterId };
+                    const moved = await withRetagLease(() => {
+                        if (!stillEnabled()) return 'turned-off';
+                        if (readImageId(rt, ref) !== beforeId) return 'tag-changed';
+                        retag(rt, afterId, ref);
+                        return 'retagged';
+                    });
+                    if (!moved.ok) return deferredResult(withIds, 'retag-deferred', 'the workspace lease is busy');
+                    outcome = moved.value;
                 } catch (error) {
                     return failed(error);
+                }
+                if (outcome === 'turned-off') {
+                    return deferredResult(withIds, 'turned-off', 'image refresh was turned off during the update');
+                }
+                if (outcome === 'tag-changed') {
+                    return deferredResult(withIds, 'tag-changed',
+                        'the tag moved during the update, for example a local build');
                 }
             }
         }
@@ -147,7 +182,9 @@ export function createImageRefreshSession({
         const base = { ref, canonical: parsed.canonical, agents };
         const local = readRepoDigests(rt, ref);
         if (local === null) return skipped(ref);
-        if (deadlineMs - now() < MIN_PULL_BUDGET_MS) return { ...base, action: 'deferred' };
+        if (deadlineMs - now() < Math.min(MIN_PULL_BUDGET_MS, pullTimeoutMs())) {
+            return deferredResult(base, 'deferred', 'the update time budget is used up');
+        }
         let knownDigest = '';
         if (!nativeFetchIgnoresProxy(env, execArgv)) {
             const remote = await fetchRemoteManifestDigest(parsed, { fetchImpl, unreachableHosts });
@@ -210,7 +247,7 @@ export function createImageRefreshSession({
             const count = (...actions) => [...memo.values()].filter((entry) => actions.includes(entry.action)).length;
             return `[pull] Image refresh: ${count('refreshed')} refreshed, ${count('current')} current, `
                 + `${count('unavailable')} unavailable, ${count('pull-failed', 'error')} failed, `
-                + `${count('deferred', 'retag-deferred')} deferred.`;
+                + `${count('deferred', 'retag-deferred', 'turned-off', 'tag-changed')} deferred.`;
         },
     });
 }

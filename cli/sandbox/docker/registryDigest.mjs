@@ -21,17 +21,22 @@ function errorLabel(error) {
     return String(error?.cause?.code ?? error?.code ?? error?.name ?? 'fetch error');
 }
 
+// Node honours NODE_USE_ENV_PROXY from 22.21.0 and from 24.
+export function nodeHonoursEnvProxy(version = process.versions.node) {
+    const [major = 0, minor = 0] = String(version).split('.').map(Number);
+    return major >= 24 || (major === 22 && minor >= 21);
+}
+
 /** Whether global fetch would bypass a configured proxy, so the engine must be asked instead. */
 export function nativeFetchIgnoresProxy(
     env = process.env,
     execArgv = process.execArgv,
-    nodeMajor = Number(process.versions.node.split('.')[0]),
+    nodeVersion = process.versions.node,
 ) {
     const proxied = ['HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
         .some((name) => String(env?.[name] || '').trim() !== '');
     if (!proxied) return false;
-    // NODE_USE_ENV_PROXY is only relied on from Node 24; older 22.x may ignore it.
-    if (env?.NODE_USE_ENV_PROXY === '1' && nodeMajor >= 24) return false;
+    if (env?.NODE_USE_ENV_PROXY === '1' && nodeHonoursEnvProxy(nodeVersion)) return false;
     if ((execArgv || []).includes('--use-env-proxy')) return false;
     if (String(env?.NODE_OPTIONS || '').split(/\s+/).includes('--use-env-proxy')) return false;
     return true;
