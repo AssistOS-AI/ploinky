@@ -21,6 +21,7 @@ export const UPDATE_PHASES = Object.freeze([
     'default-skills',
     'skills-manifest',
     'marketplace',
+    'image',
     'activation',
     // Failures outside any phase: request rejection, lock/lease problems and
     // unexpected errors converted into a record so a report always exists.
