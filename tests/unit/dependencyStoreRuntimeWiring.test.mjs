@@ -77,6 +77,22 @@ test('image refresh wiring: an update that re-pulls a tag makes the next start r
     assert.equal(stepValue(third, 'same-image').createdByThisLaunch, false, 'an unchanged image reuses the container');
 });
 
+test('image refresh wiring: Podman prints a bare-hex container image ID and an unchanged image is still reused', (t) => {
+    const w = wiringWorkspace(t, { packageJson: null });
+    const bare = { env: { FAKE_ENGINE_BARE_CONTAINER_IMAGE: '1' } };
+    assert.equal(stepValue(driveWiring(w, [{ action: 'init-edge' }, ...firstStart(w)], bare), 'first').createdByThisLaunch, true);
+    const again = driveWiring(w, [
+        { action: 'prepare-lease' },
+        { label: 'again', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
+    ], bare);
+    assert.equal(stepValue(again, 'again').createdByThisLaunch, false, 'bare-hex and sha256: forms of one ID compare equal');
+    const moved = driveWiring(w, [
+        { action: 'prepare-lease' },
+        { label: 'moved', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
+    ], { env: { ...bare.env, FAKE_ENGINE_IMAGE_HEX: 'b'.repeat(64) } });
+    assert.equal(stepValue(moved, 'moved').createdByThisLaunch, true);
+});
+
 const SEATBELT_MANIFEST = { 'lite-sandbox': true, start: 'node index.js', network: { mode: 'host' }, readiness: { protocol: 'none' } };
 const SEATBELT_SKIP = process.platform !== 'darwin' && 'seatbelt runs on macOS only';
 const ALIAS_B = 'ploinky_repo_demo_b';

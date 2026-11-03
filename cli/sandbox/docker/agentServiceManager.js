@@ -92,6 +92,7 @@ import {
     logRuntimeReplacement,
     shortenHashes,
 } from '../runtimeReplacementLog.js';
+import { containerImageChange, imageChangeDetail } from './imageChange.mjs';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
 import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
@@ -143,7 +144,7 @@ import {
     prepareRuntimeDependencies,
     runtimeDependencyReuseProblem,
 } from '../../utils/dependencies/store/runtimeDependencies.mjs';
-import { containerToolchainIdentity, normalizeImageId } from '../../utils/dependencies/store/installContract.mjs';
+import { containerToolchainIdentity } from '../../utils/dependencies/store/installContract.mjs';
 import {
     agentLibCacheLinkProblem,
     ensureAgentLibCacheLink,
@@ -1403,36 +1404,6 @@ function inspectContainerImageId(runtime, image) {
     } catch (_) {
         return null;
     }
-}
-
-// The immutable ID an existing container runs, or null when it cannot be read.
-function readRuntimeContainerImageId(runtime, containerName, spawn = spawnSync) {
-    try {
-        const result = spawn(runtime, ['container', 'inspect', '--format', '{{.Image}}', containerName], {
-            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
-        });
-        if (result.error || result.status !== 0) return null;
-        return normalizeImageId(String(result.stdout || '').trim().split('\n')[0]);
-    } catch (_) {
-        return null;
-    }
-}
-
-/**
- * Whether an existing managed container runs a different image than its
- * reference resolves to locally now (a re-pulled tag). Null when equal or
- * when either side is unknown: uncertainty never forces a replacement.
- */
-export function containerImageChange({ runtime, containerName, imageRef }, {
-    readContainerImageId = readRuntimeContainerImageId,
-    readImageId = inspectContainerImageId,
-} = {}) {
-    const ref = String(imageRef || '').trim();
-    if (!ref || !containerName || (runtime !== 'podman' && runtime !== 'docker')) return null;
-    const observed = readContainerImageId(runtime, containerName);
-    const desired = observed ? readImageId(runtime, ref) : null;
-    if (!observed || !desired || observed === desired) return null;
-    return Object.freeze({ observed, desired });
 }
 
 /**
@@ -4318,19 +4289,15 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    // A re-pulled mutable tag resolves to a new image ID. Replace the runtime even
-    // when no dependency generation would notice (a start command without
-    // package.json). LLM agents run their catalog image, not the manifest image.
+    // A re-pulled mutable tag resolves to a new image ID: replace the runtime even without a dependency
+    // generation. LLM agents run their catalog image, not the manifest image.
     if (existingRuntimeAtEntry && !recreateReason) {
         const imageChange = containerImageChange({
-            runtime,
-            containerName,
-            imageRef: serviceLlmAdmissionContext.catalogIdentity?.imageRef || image,
+            runtime, containerName, imageRef: serviceLlmAdmissionContext.catalogIdentity?.imageRef || image,
         });
         if (imageChange) {
             debugLog(`[ensureAgentService] ${agentName}: image changed, recreating container`);
-            recreateDetail = hashMismatchDetail('image',
-                imageChange.observed.replace(/^sha256:/, ''), imageChange.desired.replace(/^sha256:/, ''));
+            recreateDetail = imageChangeDetail(imageChange);
             recreateReason = 'imageChanged';
         }
     }
