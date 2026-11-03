@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { readUpdateReport, createUpdateReportNonce, UPDATE_REPORT_CONTEXT_ENV, UPDATE_REPORT_NONCE_ENV } from '../../cli/commands/updateOutcome.js';
+import { buildUpdateResult, createOperationRecord, readUpdateReport, writeUpdateReport, createUpdateReportNonce, UPDATE_REPORT_CONTEXT_ENV, UPDATE_REPORT_NONCE_ENV } from '../../cli/commands/updateOutcome.js';
 import { parseUpdateRequest } from '../../cli/commands/updateRequest.js';
 
 // End-to-end core -> host update report protocol without a live Box. The real
@@ -198,4 +198,26 @@ test('host protocol: exclusions deferred by a container run are listed in the pu
     const exclusion = run.report.result.records.find(record => record.phase === 'default-skills'
         && record.details?.target === 'RequiredRepo')?.details?.exclusions;
     assert.equal(exclusion?.code, 'exclusions-executor-view-unverified');
+});
+
+test('host protocol: an image phase record round-trips through the published report', () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-image-report-'));
+    try {
+        const nonce = createUpdateReportNonce();
+        const result = buildUpdateResult({
+            command: ['update'],
+            records: [createOperationRecord({
+                phase: 'image', id: 'docker.io/o/a:1', outcome: 'skipped', required: false, code: 'image-pull-failed',
+                reason: 'pull failed', details: { agents: ['repo/a'] },
+            })],
+        });
+        writeUpdateReport(scratch, nonce, result);
+        const report = readUpdateReport(scratch, nonce);
+        assert.equal(report.ok, true);
+        assert.equal(report.result.exitCode, 0);
+        assert.equal(report.result.records[0].phase, 'image');
+        assert.deepEqual(report.result.records[0].details, { agents: ['repo/a'] });
+    } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+    }
 });

@@ -96,6 +96,7 @@ import {
   RUNNING_DIR,
 } from '../utils/config.js';
 import { preflightLinkedRepositories } from '../utils/linkInstall.mjs';
+import { refreshAdmittedGraphImages } from '../sandbox/docker/imageRefresh.mjs';
 import { classifyDependencyGraphWaitMode, resolveWorkspaceDependencyGraph, topologicallyGroupDependencyGraph } from '../utils/workspaceDependencyGraph.js';
 import {
   mergeRoutingConfig,
@@ -2912,6 +2913,20 @@ export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { har
     ...(boxMarkerOptions !== undefined ? { boxMarkerOptions } : {}),
   });
   return Object.freeze({ graph, registry, additionalNodes, skippedEnabledAgents, unresolvedDependencies, admissions });
+}
+
+// Image refresh for `ploinky update`: resolves the current workspace graph
+// and refreshes its mutable image tags. Never throws on an unresolvable graph.
+export async function refreshWorkspaceGraphImages(session, { includeNoWait = true, filter = null } = {}) {
+  if (!session?.enabled) return [];
+  let admitted;
+  try {
+    admitted = preflightWorkspaceStartRuntimeCapabilities();
+  } catch (error) {
+    console.log(`[pull] Warning: image refresh skipped; the workspace graph could not be resolved (${error?.message || error}).`);
+    return [];
+  }
+  return refreshAdmittedGraphImages(admitted, session, { includeNoWait, filter });
 }
 
 // Exact refusal/block counts and the overall state; never "all ready" while
