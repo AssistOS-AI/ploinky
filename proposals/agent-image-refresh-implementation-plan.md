@@ -1,234 +1,614 @@
 # Implementation Plan: Agent Image Refresh on start, restart and update
 
-Status: proposed implementation plan (not implemented). Date: 2026-11-03. Branch: `claude/dazzling-fermi-59l84k`.
+Status: proposed implementation plan, revision 2 (not implemented). Date: 2026-11-03. Branch: `claude/dazzling-fermi-59l84k` at `6127f55`.
 
-Executable code and tests are the source of truth (AGENTS.md); every behavior claim below was checked against the current tree. New code is dependency-free Node.js (`engines.node >= 22`): `fetch`, `AbortSignal.timeout`, `node:crypto`, `node:child_process`, `node:test`. No npm dependency is added.
+This revision incorporates `proposals/agent-image-refresh-implementation-plan-review.md` and the coordinator's decisions on it. Executable code and tests are the source of truth (AGENTS.md); every reference below was checked against the tree.
+
+New code is dependency-free Node.js (`engines.node >= 22`). It uses global `fetch`, `AbortSignal.timeout`, `node:child_process`, and `node:test`. No npm dependency is added.
 
 ## 1. Outcome and acceptance contract
 
-1. On `ploinky start`, `ploinky restart` (full or `restart <agent>`) and `ploinky update`, each container agent's image reference is checked against its registry when the reference is mutable (a tag). When the registry's manifest digest for that tag is not one of the local image's repo digests, the image is pulled again.
-2. A running agent whose container was created from a different image ID than the one its reference now resolves to locally is always recreated by the next lifecycle pass. This holds whether or not the agent needs a dependency cache.
-3. Digest-pinned references (`repo@sha256:…`, including `repo:tag@sha256:…`) are never checked or re-pulled. Local-only images are never overwritten.
-4. Pulls happen outside the workspace mutation lease, restart locks and network lock.
-5. Offline or registry errors never fail a start or restart: Ploinky keeps the cached image, prints one warning, and continues. A failed pull for an image the registry proved changed fails the update phase record, but it does not block activation.
-6. `PLOINKY_IMAGE_REFRESH=off` restores today's behavior: images are pulled only when missing.
-7. `restart router` never checks or pulls images.
+1. **Refresh.** On `ploinky start`, `ploinky restart` (full, and `restart <agent>` for a container agent) and `ploinky update`, Ploinky checks a container agent's image reference against its registry when **all** of the following hold:
+   - the reference names an explicit registry host (`docker.io/…`, `ghcr.io/…`);
+   - it is a mutable tag;
+   - it is present locally.
+
+   If the registry's manifest digest for that tag is not one of the local image's repo digests, the image is pulled again. Locally built images are not special: a registry-qualified mutable tag follows its registry.
+2. **Recreation.** An existing container whose image ID differs from the ID its reference now resolves to locally is replaced on its next lifecycle pass. "Next lifecycle pass" means `ensureAgentService` or the no-wait worker's ready-reuse check. This happens whether or not the agent needs dependencies. The log reason is `imageChanged`.
+3. **Never refreshed:**
+   - references pinned by digest (`@<algorithm>:<hex>`);
+   - LLM catalog images whose catalog entry declares `digest`;
+   - unqualified references (`node:18-alpine`), on both engines;
+   - `localhost/…` references;
+   - images that are missing locally. These keep today's path: the worker prefetch or the in-lease `ensureImagePresent`.
+4. **Locks.** Pulls run outside the workspace mutation lease, the restart locks and the network lock. The start pre-pass runs only after earlier no-wait workers have settled.
+5. **Failure handling:**
+   - Registry unreachable: warn and keep the cached image.
+   - Registry reachable but the digest cannot be proven: run `<runtime> pull`.
+   - Pull failure: warn and keep the cached image.
+   - Nothing in the refresh fails `start`, `restart`, or `update`. In `update`, a failure becomes a `skipped` record and the exit code stays 0.
+6. **Policy.** `PLOINKY_IMAGE_REFRESH` = `check` (default) | `always` | `off`. It is read from the workspace variable (`ploinky var PLOINKY_IMAGE_REFRESH off`) first, then from the process environment.
+   - `off` disables registry checks and refresh pulls.
+   - `imageChanged` recreation (contract item 2) stays active under every policy, because it reacts only to local state.
+   - An invalid value refuses the command before any repository mutation. The no-wait worker instead logs the problem and skips the refresh.
+7. **`restart router`** never checks or pulls. It still recreates an agent whose tag already moved locally, the same way it handles every other drift reason.
 
 ## 2. Verified current behavior
 
 | Concern | Source (current line) | Fact |
 | --- | --- | --- |
-| Missing-only pull | `cli/sandbox/docker/common.js:287` `ensureImagePresent` | Returns `false` when `imageExists` (`<rt> image inspect <ref>`, :181) succeeds; otherwise `pullImage` (:204, spawnSync with streamed progress and a timeout from `PLOINKY_IMAGE_PULL_TIMEOUT_MS`, default 30 min), then the local-build fallback (`LOCAL_IMAGE_BUILD_DEFINITIONS` :158, currently empty). |
-| Create path | `agentServiceManager.js:2234` | `ensureImagePresent(image)` and then `inspectImageEntrypoint` are called inside the create path, under the lease. |
-| Managed network path | `agentServiceManager.js:2722-2751` | When `adoptManagedRuntimeOnly` is set, both images must already be present and nothing is pulled. Otherwise the helper image (digest-pinned, `routerAuthorityAttestation.js:30`) and the target image are made present before the network transaction. |
-| No-wait prefetch | `cli/commands/noWaitWorker.js:1470`, call at :1911 | Synchronous and missing-only. It runs outside every lock and skips LLM runtimes because the catalog image may differ from the manifest image. |
-| LLM image | `agentServiceManager.js:1745`; `llmArchitectureSelector.js:254-280` | The catalog `imageRef` (or a `PLOINKY_LLM_AGENT_IMAGE` override) replaces the manifest image. Admissions carry it as `admission.descriptor.catalogIdentity.imageRef` (`runtimeCapabilities.js:523`). |
-| GPU share launch | `selectLaunchImages` :1536; `mpsLifecycle.mjs:151-154,352-354` | These launches create the container from the immutable image ID. MPS re-runs `ensureImagePresent` and re-inspects the reference on every coordination, so it picks up a newly pulled ID. |
-| Recreate reasons | `ensureAgentService` :3805, checks at :4253-4380 | The image ID is checked only inside `runtimeDependencyReuseProblem` (`runtimeDependencies.mjs:391`, `'runtime image changed'`). That check is skipped when `needsDependencies` is false (`containerDependencyReuseProblem` :1413: `start` command, no `package.json`, not LLM). |
-| Graph-level reuse | `workspaceUtil.js:1285` `graphNodeRuntimeReplacementReason` | Start decides per node whether to rotate identity using env hash, limits, LLM reuse hash and contract drift. It has no image check. |
-| Adoption | `agentServiceManager.js:2467,2548`; `routerAuthorityAttestation.js:752` | Adoption compares the container's `.Image` with a fresh `image inspect {{.Id}} <ref>`. Today a re-tagged reference therefore makes managed adoption fail instead of producing a clean recreate. |
-| Start order | `workspaceUtil.js:2950-2970` | Repositories are prepared, then `admittedStart = preflightWorkspaceStartRuntimeCapabilities()` (:2961, pure, includes the LLM catalog ref), then `acquireSettledWorkspaceMutationLease` (:2970). The no-wait split is `classifyDependencyGraphWaitMode` (:3168). |
-| Restart | `cli/commands/cli.js:438-685` | `restart router` (:440) calls `startWorkspace`. In targeted restart the sandbox path uses `ensureAgentService({forceRecreate})` and the container path (:653) uses `reconcileExactHardwareInstance` under `exact-agent-restart`. Full restart (:671-680) settles, stops all agents (so all are recreated as `runtimeStopped`), then calls `startWorkspace`. |
-| Update | `cli/commands/updateCommand.js` `runUpdate` | Git and skills work runs under the lease, and the output is records (`updateOutcome.js:14` phases). In the Box flow the host restarts the whole graph after a full update when the graph is active and activation is allowed (`supervisor.mjs:2404`, `executeBoundedRestart` :1830 with `coreArgv=['restart']`). Targeted forms only record pending activation. |
-| Box | `bin/ploinky` → `ploinky-box`; `ploinky-box/constants.mjs:99-104` | Agents run under nested rootless Podman inside the Box. The image store is the workspace bind `.ploinky/box/images`. Host environment variables are not forwarded to in-Box commands (`ploinky-box/process.mjs` allowlist, `boundedCoreEnvironment` `supervisor.mjs:4423`, `command/execute.mjs:13`), so there are no proxy variables in the Box. The host bounds in-Box start, restart and update to 30 min (`supervisor.mjs:4461,4664`). |
-| Registry probe (live) | `HEAD registry-1.docker.io/v2/assistos/roboteam-agent/manifests/runtime` | Without a token the response is `401` with `WWW-Authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:assistos/roboteam-agent:pull"`. With the anonymous token it is `200` with `content-type: application/vnd.oci.image.index.v1+json` and `docker-content-digest: sha256:bc7c…`, so the tag is a multi-arch index. |
+| Missing-only pull | `cli/sandbox/docker/common.js` | `ensureImagePresent` :287 returns early when `imageExists` :181 succeeds. `pullImage` :204 streams progress and uses `PLOINKY_IMAGE_PULL_TIMEOUT_MS` (default 30 min). `probeContainerRuntime` :115 returns `null` instead of exiting. |
+| Existing image-ID helper | `cli/sandbox/docker/agentServiceManager.js:1400` | `inspectContainerImageId(runtime, imageRef)` is module-local and never throws. It returns the normalized ID of an image **ref**, or `null`. `tests/unit/hardwareLimitsInstallerImage.test.mjs:60` asserts its call text, so **do not rename it**. |
+| Recreate reasons | `ensureAgentService` :3805 | `image` is the manifest image (:4214). `serviceLlmAdmissionContext` (:3899) has `catalogIdentity: null` for non-LLM agents. The AgentLib block is :4281-4289 and the dependency block :4291-4310. The only image-ID check is inside `runtimeDependencyReuseProblem` (`runtimeDependencies.mjs:391`), and it is skipped when `needsDependencies` is false (`containerDependencyReuseProblem` :1413). |
+| ID normalization | `cli/utils/dependencies/store/installContract.mjs:47` | `normalizeImageId` **throws** on bad input. Podman prints bare hex; Docker prints `sha256:` hex. |
+| No-wait worker | `cli/commands/noWaitWorker.js` | The prefetch at :1470 is synchronous and missing-only, and skips LLM runtimes; its call site is :1911. `admittedRuntime` :1788, `llmAdmissionContext` :1790. The ready-reuse shortcut (`adopted`, :1962-1981) adopts a ready `host`/`none` runtime without calling `ensureAgentService`. |
+| Start order | `cli/commands/workspaceUtil.js` | Repository preparation runs at :2950-2958. Then `admittedStart = preflightWorkspaceStartRuntimeCapabilities()` :2961 (pure; admissions carry `admission.descriptor.catalogIdentity`). Then `resetPreinstallRunInProcess()` :2965 and `acquireSettledWorkspaceMutationLease` :2970. `classifyDependencyGraphWaitMode(graph).noWait` is a `Set` of node ids; `additionalNodes` are not graph nodes, so they count as blocking. |
+| Settling | `cli/commands/noWaitRunSettlement.js` | `waitForNoWaitRunsToSettle` :151 holds no lease and throws `PLOINKY_NO_WAIT_RUN_IN_FLIGHT` at its deadline. `inspectInFlightNoWaitWorkers` :101 is exported. `settleWorkspaceBeforeRestart` (`workspaceUtil.js:3711`) releases its lease before returning. |
+| Restart | `cli/commands/cli.js` | `restart router` :440-454 calls `startWorkspace`. The targeted container branch :635-660 checks preconditions, then `reconcileExactHardwareInstance` under `exact-agent-restart` (forced recreate). Full restart :664-684: settle :671, inactivate :672, stop all agents :676, `startWorkspace` :680. |
+| Update | `cli/commands/updateCommand.js` `runUpdate` :101 | `parseUpdateRequest` :120, then the lease and handlers, the release, and `releaseFailed` :146. The `catch` at :152 turns errors into records (`thrownRecord`: `PLOINKY_UPDATE_*` becomes `failed` before mutation). In the Box flow the host restarts an active graph after a full update (`ploinky-box/supervisor.mjs:2404`). Host and Box run the same `/opt/ploinky` source, so the new `image` phase needs no version-skew handling (host validation is at `updateOutcome.js:240`). |
+| Workspace variables | `cli/utils/security/secretVars.js:38` | `resolveVarValue(name)` decrypts `.ploinky` secrets and works in-Box. There is precedent at `agentServiceManager.js:2157`. |
+| Box | `ploinky-box/process.mjs`, `constants.mjs:99-104` | Agents run under nested Podman. The image store is the workspace bind `.ploinky/box/images`. Host environment variables, including proxy variables, are not forwarded into in-Box commands. The host bounds in-Box start, restart and update to 30 min. |
+| Registry (live probe) | `HEAD registry-1.docker.io/v2/assistos/roboteam-agent/manifests/runtime` | Without a token: `401` with `Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:assistos/roboteam-agent:pull"`. With an anonymous token: `200`, OCI index, `docker-content-digest: sha256:bc7c…`. |
 
-Real refs (AssistOSExplorer): most agents use `docker.io/assistos/ploinky-node@sha256:…` (pinned, skipped). `roboTeamAgent` and `roboWorkAgent` use `docker.io/assistos/roboteam-agent:runtime`, which `container-image-builds/.github/workflows/publish-roboteam-agent-image.yml` re-pushes. The default manifest image is the unqualified `node:18-alpine` (`secretVars.js:762`).
+**The motivating case.** In AssistOSExplorer, `roboTeamAgent` and `roboWorkAgent` use `docker.io/assistos/roboteam-agent:runtime`; all other agents are pinned to a digest.
+- Both are **no-wait** nodes (Explorer enables `roboTeamAgent … no-wait`), so on `start` only the worker change reaches them.
+- Both have no `start` command, so the dependency check already recreates them once the tag moves locally. For them the missing piece is the pull.
+- The `imageChanged` reason generalizes recreation to agents that have a `start` command and no `package.json`.
 
 ## 3. Design decisions
 
-### D1. Remote digest lookup (native fetch)
+### D1. Reference parsing (`cli/sandbox/docker/imageReference.mjs`)
 
-- **Reference parsing** (`imageReference.mjs`). Accept `[host[:port]/]path[:tag][@sha256:hex]`. The first component is a host if it contains `.` or `:` or equals `localhost`. Docker semantics apply: no host means `docker.io`, a one-segment Docker Hub path gets a `library/` prefix, and a missing tag means `latest`. The API host for `docker.io` and `index.docker.io` is `registry-1.docker.io`. The result is `{ registry, apiHost, repository, tag, digest, pinned, qualified }` plus a canonical string (`docker.io/library/node:18-alpine`) used as the dedupe key.
-- **Request**: `HEAD https://<apiHost>/v2/<repository>/manifests/<tag>` with `Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json`. All four types are listed so the registry never converts the manifest (a conversion changes the digest). The digest is read from `Docker-Content-Digest` and must match `^sha256:[0-9a-f]{64}$`.
-- **Auth**: try anonymously first. On `401` with `WWW-Authenticate: Bearer realm=…,service=…,scope=…`, parse the challenge generically (quoted params) and `GET realm?service=…&scope=…` (scope defaults to `repository:<repo>:pull`). Use `token` or `access_token`, then retry HEAD once with `Authorization: Bearer`. For Docker Hub this is `auth.docker.io`, with no special case. If the anonymous token still yields `401`/`403`/`404` and basic credentials exist for the host, repeat the token request with `Authorization: Basic`. `WWW-Authenticate: Basic` uses the credentials directly. Any other scheme is `unsupported`.
-- **Credentials** (`registryAuth.mjs`, read-only): Podman order is `REGISTRY_AUTH_FILE`, then `$XDG_RUNTIME_DIR/containers/auth.json`, then `~/.config/containers/auth.json`. Docker uses `$DOCKER_CONFIG/config.json` or `~/.docker/config.json`. Read only `auths[<host>].auth` (Docker Hub keys: `docker.io`, `index.docker.io`, `https://index.docker.io/v1/`). If the host is covered only by `credHelpers` or `credsStore`, the result is `unsupported` (no helper is executed). Tokens and credentials stay in memory for one command and are never logged, persisted or put in records (invariant 8).
-- **Proxy**: Node's fetch ignores `HTTPS_PROXY` unless `NODE_USE_ENV_PROXY=1` or `--use-env-proxy` is set (Node 24, and backported: the local Node 22.23 lists `--use-env-proxy`). If a proxy variable applies to the host (with `NO_PROXY` matching) and neither switch is present in `process.env`, `process.execArgv` or `NODE_OPTIONS`, the result is `unsupported`. The engine honours its own proxy configuration, so D7 delegates to `<runtime> pull`. In-Box processes have no proxy environment today.
-- **Rate limits**: Docker documents that manifest `HEAD` does not count against pull limits; the probe returned `ratelimit-*` headers without being a pull. GET is never used on `docker.io`. For other registries a missing digest header falls back to `GET` of the manifest and `sha256(body)` with `node:crypto` (same Accept header).
-- **Bounds**: each request has a 10 s `AbortSignal.timeout`, with at most one redirect hop and one auth retry. A per-host circuit breaker means that after the first `unreachable` for a host, the other refs on that host in the same session are `unreachable` without a request. The whole check phase has a 60 s budget.
-- **Classification** (returned, never thrown): `{status:'ok', digest}` or one of `'unreachable'` (DNS, connect, timeout, 5xx), `'unsupported'` (proxy, helper, scheme, TLS verification failure, no digest on docker.io), `'denied'` (401/403 after auth), `'not-found'` (404), `'rate-limited'` (429).
+`parseImageReference(ref)` returns `null` for an empty ref, a ref with whitespace, or an uppercase repository path. Otherwise it returns `{ registry, apiHost, repository, tag, digest, pinned, explicitRegistry, canonical }`:
 
-### D2. Local digest and comparison
+- **Digest and pinning.** Split at `@` into the name and an optional digest. `pinned` is true when the digest matches `/^[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[0-9a-fA-F]{32,}$/`.
+- **Registry host.** The first `/`-segment is a host if it contains `.` or `:` or equals `localhost`; `explicitRegistry` records this. Without a host, `registry` is `docker.io` and `explicitRegistry` is false. `index.docker.io` normalizes to `docker.io`.
+- **Repository and tag.** A one-segment Docker Hub repository becomes `library/<name>`. The tag is the text after the last `:` that follows the last `/`; it defaults to `latest`.
+- **API host.** `registry-1.docker.io` for `docker.io`; otherwise the host itself, including any port.
 
-- Read with `<rt> image inspect --format '{{json .RepoDigests}}' <ref>` (spawnSync, 30 s, `--format` like `installContract.mjs:56`). Docker prints `assistos/roboteam-agent@sha256:…` (no `docker.io/`). Podman prints `docker.io/assistos/roboteam-agent@sha256:…` and usually lists both the index digest and the platform manifest digest. Parse each entry with the D1 parser and keep only those whose `registry/repository` equals the reference's.
-- The image is **current** iff the remote digest is in that digest set. A multi-arch tag returns the index digest, and both engines record the index digest when pulling by tag; a single-arch tag returns the manifest digest, which is also recorded. Comparing set membership instead of "first entry" makes Podman's double listing correct.
-- If `image inspect` fails (image missing), pull (missing-image prefetch) without contacting the registry.
-- If the image is present but has an empty or `null` RepoDigests set for that repository, treat it as **local-only** (built or tagged locally) and skip it. Never pull over it.
+`repoDigestSet(repoDigests, parsed)` returns a `Set` of digests. It parses each RepoDigests entry with the same function and keeps those whose `registry/repository` equals the ref's. The Docker form `assistos/x@sha256:…` normalizes to `docker.io`; the Podman form is already qualified.
 
-### D3. Skip rules (no registry contact, no pull)
+### D2. Remote digest (`cli/sandbox/docker/registryDigest.mjs`)
 
-`pinned` (digest in ref); `local-build` (ref in `LOCAL_IMAGE_BUILD_DEFINITIONS`); `local-only` (D2); `localhost/` registry; `unqualified` under Podman, where short names resolve through `registries.conf` and the mapping is ambiguous (they are checked as `docker.io` under Docker); sandbox runtime kinds (`bwrap`, `seatbelt`: no image); unresolved `${…}` placeholders (the transaction reports them); hardware-refused graph nodes. `adoptManagedRuntimeOnly` is not a skip rule in the refresher: refresh runs only in pre-lock phases, and `ensureAgentService` and the adoption path keep their current missing-only or never-pull behavior unchanged.
+`fetchRemoteManifestDigest(parsed, { fetchImpl = fetch, timeoutMs = 10_000, unreachableHosts = new Set() })` returns `{ status: 'ok', digest }`, `{ status: 'unavailable', reason }` or `{ status: 'undetermined', reason }`. It never throws.
 
-LLM catalog images **are refreshed** (they are the agent's image). The ref is taken from `admission.descriptor.catalogIdentity.imageRef` (or the `PLOINKY_LLM_AGENT_IMAGE` override already folded in), so no hardware probe is added. Pinning in the catalog is the opt-out.
+**Request.** `HEAD https://<apiHost>/v2/<repository>/manifests/<tag>` with:
+- `Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json`;
+- `signal: AbortSignal.timeout(timeoutMs)`;
+- default `fetch` redirect handling.
 
-### D4. Policy and configuration
+**Anonymous Bearer only.** On `401`:
+1. Parse `WWW-Authenticate: Bearer realm="…",service="…",scope="…"`. Quoted parameters are separated by commas, and the scheme is matched case-insensitively.
+2. `GET realm?service=…&scope=…`. The scope defaults to `repository:<repository>:pull`. Read `token` or `access_token` from the JSON body.
+3. Send the `HEAD` once more with `Authorization: Bearer <token>`.
 
-- `PLOINKY_IMAGE_REFRESH` = `check` (default) | `always` | `off`. With `always`, Ploinky skips the HTTP check and runs `<runtime> pull` once per mutable ref per command, for proxied or credential-helper setups. `off` means missing-only. An unrecognized value throws before any mutation, the same way as `parseReposSource` (`cli/utils/reposSource.mjs:21`).
-- **Box propagation**: the host validates the variable and forwards it as `--env PLOINKY_IMAGE_REFRESH=<v>` only when it is set, through `boundedCoreEnvironment` (`supervisor.mjs:4423`) and `buildContainerExecArgs` (`ploinky-box/command/execute.mjs:13`). It is not baked into the Box environment, so changing it never replaces the Box. Unlike `PLOINKY_REPOS_SOURCE`, it is not Box identity.
-- There is no manifest field in v1, because pinning a digest is already a per-agent opt-out (open question Q2).
-- **Dedupe**: an `ImageRefreshSession` per top-level command holds a `Map<runtime|canonicalRef, Promise<result>>`. Many agents share refs, and every agent with that ref gets one result. Long-lived REPL processes create a new session per command. Registry checks run with concurrency 4. Pulls run sequentially so engine progress output is not interleaved.
-- **Pull budget**: each pre-pass pull uses `min(imagePullTimeoutMs(), remaining)`, with a default refresh pull budget of 15 min per command. This leaves start or restart work inside the host's 30 min bound. Refs left over after the budget are `deferred`, and their cached image is used.
+Ploinky reads no credentials, so there is no `registryAuth.mjs`. The token stays in a local variable for one call and is never logged, persisted, or returned (invariant 8).
 
-### D5. Where it runs (per command)
+**Classification:**
+- `ok`: `200` with `Docker-Content-Digest` matching `^sha256:[0-9a-f]{64}$`.
+- `unavailable` (warn, keep cached), and the API host is added to `unreachableHosts` so later refs on that host are not re-requested:
+  - HTTP `429` or `5xx`;
+  - a thrown fetch error that is not TLS-class: DNS, connect, reset, `AbortError`/`TimeoutError`, or any other unknown fetch error.
+- `undetermined` (delegate to `<runtime> pull`):
+  - a `200` without a valid digest;
+  - a non-Bearer challenge;
+  - a token request that is refused or has no token;
+  - `401`/`403`/`404` or any other `4xx` after the token;
+  - a TLS-class error. The code is taken from `err.cause?.code ?? err.code` and matches `CERT_*`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, `SELF_SIGNED_CERT_IN_CHAIN`, `DEPTH_ZERO_SELF_SIGNED_CERT`, `ERR_TLS_*`, `ERR_SSL_*`, or `EPROTO`. `EPROTO` also covers plain-HTTP registries.
 
-| Command | Hook | Scope | Lock position |
+**Proxy.** `nativeFetchIgnoresProxy(env = process.env, execArgv = process.execArgv)` returns true when any of `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` or `all_proxy` is non-empty **and** none of these is present:
+- `env.NODE_USE_ENV_PROXY === '1'`;
+- `--use-env-proxy` in `execArgv`;
+- `--use-env-proxy` in `NODE_OPTIONS`.
+
+(Node 24 and recent 22.x support `--use-env-proxy`.) When it returns true, the session skips the `HEAD` and delegates to the engine. `NO_PROXY` is not interpreted. In-Box processes have no proxy variables today.
+
+**Rate limits.** Docker documents that a manifest `HEAD` does not count as a pull; the live probe returned `ratelimit-limit: 100;w=3600`. Delegated pulls and policy `always` do count, because the engine fetches the manifest with `GET`.
+
+### D3. Policy (`cli/sandbox/docker/imageRefresh.mjs`)
+
+```js
+export const IMAGE_REFRESH_VAR = 'PLOINKY_IMAGE_REFRESH';
+const IMAGE_REFRESH_POLICIES = new Set(['check', 'always', 'off']);
+
+// Workspace variable first (`ploinky var PLOINKY_IMAGE_REFRESH off`, visible
+// inside the Box), then the process environment, then 'check'.
+export function resolveImageRefreshPolicy({ env = process.env, readVar = resolveVarValue } = {}) {
+    let raw = '';
+    try {
+        raw = String(readVar(IMAGE_REFRESH_VAR) || '').trim();
+    } catch (error) {
+        debugLog(`[pull] ${IMAGE_REFRESH_VAR}: workspace variables unreadable (${error?.message || error}); using the environment`);
+    }
+    if (!raw) raw = String(env?.[IMAGE_REFRESH_VAR] || '').trim();
+    if (!raw) return 'check';
+    if (!IMAGE_REFRESH_POLICIES.has(raw)) {
+        const error = new Error(`${IMAGE_REFRESH_VAR} must be 'check', 'always' or 'off', not '${raw}'`);
+        error.code = 'PLOINKY_IMAGE_REFRESH_INVALID';
+        throw error;
+    }
+    return raw;
+}
+```
+
+The variable is read inside the in-Box process, so no host-to-Box environment forwarding is needed and nothing changes in `ploinky-box/`. A manifest-level policy is not provided (decision Q2).
+
+### D4. The refresh session (`imageRefresh.mjs`)
+
+`createImageRefreshSession({ policy, runtime = undefined, log = console.log, beforePull = null, …seams })` returns an object with:
+- `enabled`, which is `policy !== 'off'`;
+- `refresh(ref, { agents = [] })`, which returns `Promise<result>`;
+- `results()`;
+- `summaryLine()`.
+
+Seams for tests: `fetchImpl`, `spawn`, `env`, `execArgv`, `pull` (defaults to `pullImage`), `readImageId` (defaults to a non-throwing wrapper of `containerToolchainIdentity`), `readRepoDigests`.
+
+`runtime` resolves lazily to `probeContainerRuntime()`. Never call `getRuntime()` here, because it exits the process on hosts that have only a sandbox runtime. Results are memoized per `runtime|canonical`, and the `agents` lists of all callers are merged.
+
+`refresh` **never throws**. The one exception is an error thrown by the caller's `beforePull`, which propagates unchanged (update cancellation, D8). Steps, in order:
+
+1. Skip, with no registry contact and no pull, when any of these holds:
+   - policy is `off`;
+   - the ref does not parse;
+   - the ref is `pinned`;
+   - the ref is not `explicitRegistry` (both engines);
+   - the registry is `localhost`;
+   - no runtime was found.
+2. `local = readRepoDigests(ref)`. This runs `<rt> image inspect --format '{{json .RepoDigests}}' <ref>` with a 30 s timeout. A non-zero exit means the image is missing: skip and do not pull. An empty or `null` array gives an empty set, which proves nothing and so leads to a pull.
+3. If the policy is `always`, or `nativeFetchIgnoresProxy()` is true, then pull.
+4. Otherwise `remote = await fetchRemoteManifestDigest(parsed, { unreachableHosts })` (one `Set` per session):
+   - `ok` and `local.has(remote.digest)`: `current`.
+   - `ok` and not present: log, then pull.
+   - `unavailable`: warn, keep cached.
+   - `undetermined`: log `asking <rt> to pull`, then pull.
+5. Pull:
+   1. `beforeId = readImageId(ref)`.
+   2. `await beforePull?.()`.
+   3. `pull(ref, { runtime, log })`. On a throw: `pull-failed`, warn, keep cached.
+   4. `afterId = readImageId(ref)`.
+   5. If `beforeId && afterId && beforeId !== afterId`, the result is `refreshed` and the rollback hint (D7) is printed. Otherwise the result is `current`, because the delegated pull found nothing new.
+6. Any unexpected internal error: `unavailable`, with a warning.
+
+Checks are sequential; there are 1-3 mutable refs in practice. There is no concurrency, no phase budget, and no redirect cap. Pulls use the existing `PLOINKY_IMAGE_PULL_TIMEOUT_MS`.
+
+**Target collection.** `collectAdmittedImageTargets(admittedStart, { includeNoWait = false, filter = null })` iterates `admittedStart.admissions` and skips a record when any of these holds:
+- `runtimeKind !== 'container'`;
+- `hardwareRefusal` is set;
+- the node is no-wait and `includeNoWait` is false;
+- `admission.descriptor?.catalogIdentity?.imageDigest` is set (catalog-pinned, decision Q3).
+
+For each remaining record:
+- The ref is `catalogIdentity?.imageRef`. Failing that, it is `resolveManifestImage(manifest, profileConfig, { agentName, repoName })`:
+  - `manifest` is decoded from `manifestBytesBase64`;
+  - `profileConfig` comes from `resolveManifestRuntimeProfile(manifest, { agentName: agentId, profileName: record.profileName || undefined, path: \`manifest(${agentId})\` })`;
+  - `repoName` and `agentName` are split from `admission.agentId` at its last `/`.
+- Each record is wrapped in `try/catch`. An unresolved `${…}` placeholder or a bad manifest becomes a debug line, never a throw.
+- It returns `{ ref, repoName, agentName, manifestPath }`.
+
+`refreshAdmittedGraphImages(admittedStart, session, options)` groups the targets by ref, then calls `await session.refresh(ref, { agents })` once per ref. When anything was checked, it prints `session.summaryLine()`.
+
+### D5. Guaranteed recreation (`imageChanged`)
+
+Add this to `agentServiceManager.js`, next to `inspectContainerImageId` (:1400), and reuse that helper for the desired side. Change the import at :146 to `import { containerToolchainIdentity, normalizeImageId } from '../../utils/dependencies/store/installContract.mjs';`.
+
+```js
+// The immutable ID an existing container runs, or null when it cannot be read.
+function readRuntimeContainerImageId(runtime, containerName, spawn = spawnSync) {
+    try {
+        const result = spawn(runtime, ['container', 'inspect', '--format', '{{.Image}}', containerName], {
+            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+        });
+        if (result.error || result.status !== 0) return null;
+        return normalizeImageId(String(result.stdout || '').trim().split('\n')[0]);
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * Whether an existing managed container runs a different image than its
+ * reference resolves to locally now (a re-pulled tag). Null when equal or
+ * when either side is unknown: uncertainty never forces a replacement.
+ */
+export function containerImageChange({ runtime, containerName, imageRef }, {
+    readContainerImageId = readRuntimeContainerImageId,
+    readImageId = inspectContainerImageId,
+} = {}) {
+    const ref = String(imageRef || '').trim();
+    if (!ref || !containerName || (runtime !== 'podman' && runtime !== 'docker')) return null;
+    const observed = readContainerImageId(runtime, containerName);
+    const desired = observed ? readImageId(runtime, ref) : null;
+    if (!observed || !desired || observed === desired) return null;
+    return Object.freeze({ observed, desired });
+}
+```
+
+**Hook 1, in `ensureAgentService`.** Insert this after the AgentLib block (after :4289) and before the dependency comment (:4291). It runs before the managed adoption and the host/none early return, so a re-pulled tag yields a clean replacement instead of an adoption-attestation mismatch (`:2467`, `:2548`).
+
+```js
+    // A re-pulled mutable tag resolves to a new image ID. Replace the runtime even
+    // when no dependency generation would notice (a start command without
+    // package.json). LLM agents run their catalog image, not the manifest image.
+    if (existingRuntimeAtEntry && !recreateReason) {
+        const imageChange = containerImageChange({
+            runtime,
+            containerName,
+            imageRef: serviceLlmAdmissionContext.catalogIdentity?.imageRef || image,
+        });
+        if (imageChange) {
+            debugLog(`[ensureAgentService] ${agentName}: image changed, recreating container`);
+            recreateDetail = hashMismatchDetail('image',
+                imageChange.observed.replace(/^sha256:/, ''), imageChange.desired.replace(/^sha256:/, ''));
+            recreateReason = 'imageChanged';
+        }
+    }
+```
+
+The existing `logRuntimeReplacement` (:4499) then prints `[start] repo/agent: replacing its runtime (imageChanged: image 0a1b2c3d4e5f -> bc7c8956426d)`.
+
+- **GPU-share (MPS) clients need no special case.** MPS coordination runs `ensureImagePresent` and inspects the same ref under the same locks before it creates the container by ID (`mpsLifecycle.mjs:151-154, 352-354`).
+- **No graph-level check and no new registry-record fields.** This mirrors `dependencyGenerationChanged`, which also lives only in `ensureAgentService`.
+
+**Hook 2, in the no-wait worker's ready reuse** (`noWaitWorker.js`, inside `capture(lifecycle)`, before `const adopted = …` at :1978). Change the import at :25 to `import { admittedRuntimeDependencyProblem, containerImageChange } from '../sandbox/docker/agentServiceManager.js';`.
+
+```js
+                // A ready runtime is adopted only while it still runs the image its
+                // reference resolves to; a re-pulled tag goes through ensure.
+                let imageChange = null;
+                if (lifecycle.targetState === 'ready') {
+                    let desiredImageRef = String(llmAdmissionContext.catalogIdentity?.imageRef || '');
+                    if (!desiredImageRef) {
+                        try {
+                            desiredImageRef = resolveManifestImage(manifest, profileResolution.profileConfig, {
+                                agentName: shortAgent, repoName,
+                            });
+                        } catch (_) {
+                            desiredImageRef = '';
+                        }
+                    }
+                    imageChange = containerImageChange({ runtime: admittedRuntime, containerName, imageRef: desiredImageRef });
+                }
+                const adopted = lifecycle.targetState === 'ready'
+                    && !dependencyProblem
+                    && !imageChange
+                    && !manifest['link-install']?.length
+                    && !['default', 'bridge'].includes(profileResolution.network.mode);
+```
+
+### D6. Where refresh runs (implementation order)
+
+| # | Command | Hook | Targets | Position |
+| --- | --- | --- | --- | --- |
+| 1 | no-wait worker | `prefetchNoWaitRuntimeImage` (D6.1) | its own node | Outside every lock (already the case) |
+| 2 | `restart <agent>` (container) | `cli.js`, after the precondition checks, before `const runtimeAction = 'restart';` (:649) | that agent, unless its hardware admission is refused | Before the lease |
+| 3 | `start` | `startWorkspace`: policy parsed first; after `admittedStart` (:2961), settle, then refresh | blocking graph nodes plus `additionalNodes` | After settle, before the lease |
+| 4 | full `restart` | `cli.js`, after `await settleWorkspaceBeforeRestart();` (:671), before `inactivateEdgeRoutingGeneration('cli-workspace-restart')` (:672) | all container nodes, including no-wait | After settle, while agents still serve |
+| 5 | `update` | `runUpdate`, after the lease is released, inside the outer `try` | scoped by request (D8) | After the lease, only when no no-wait worker is in flight |
+| – | `restart router`, sandbox `restart <agent>`, `reinstall`, `enable` | none | – | – |
+
+**D6.1, the worker.** Make `prefetchNoWaitRuntimeImage` `async` and add two options: `catalogIdentity = null` and `refreshImage = refreshImageOnce`. `refreshImageOnce(ref, { runtime, agents, log })` is exported from `imageRefresh.mjs`. It resolves the policy (an invalid value means log and return `{ action: 'skipped' }`), runs a one-ref session, and never throws.
+
+Behavior, in order:
+1. A sandbox runtime keeps returning `{ prefetched: false, reason: 'sandbox-runtime' }`.
+2. Let `catalogRef = String(catalogIdentity?.imageRef || '').trim()`. If it is empty and `isLlmRuntime(manifest, profileConfig)` is true, keep returning `{ prefetched: false, reason: 'llm-runtime-catalog-image' }`.
+3. `image = catalogRef || resolveImage(…)`. An unresolved image keeps returning `unresolved-image`.
+4. `pulled = ensureImage(image, { runtime, allowLocalBuild: false })`, unchanged. A throw keeps returning `prefetch-failed`. If `pulled`, return `{ prefetched: true, image }`.
+5. If `catalogIdentity?.imageDigest` is set, return `{ prefetched: false, image, refresh: 'pinned' }` without calling `refreshImage`.
+6. Otherwise `const refreshed = await refreshImage(image, { runtime, agents: [\`${repoName}/${agentName}\`], log })`, wrapped in `try/catch`. Return `{ prefetched: refreshed?.action === 'refreshed', image, refresh: String(refreshed?.action || 'failed') }`.
+
+Change the call at :1911 to `await prefetchNoWaitRuntimeImage({ …, catalogIdentity: llmAdmissionContext.catalogIdentity, … })`.
+
+**D6.2, targeted restart.** In `cli.js`, inside the container branch (`} else {` at :635), after the `acceptedFailedDrain` check:
+
+```js
+                    // An invalid PLOINKY_IMAGE_REFRESH refuses here, before the lease. A
+                    // hardware-refused restart never pulls an image it cannot use.
+                    const imageRefresh = createImageRefreshSession({ policy: resolveImageRefreshPolicy() });
+                    if (!hardwareRefusalOf(directAdmission.runtimeAdmission)) {
+                        await refreshAgentImage(imageRefresh, {
+                            manifest,
+                            profileConfig: profileResolution.profileConfig,
+                            repoName: registryRecord?.record?.repoName || resolved.repo,
+                            agentName: resolved.shortAgentName,
+                            catalogIdentity: directAdmission.runtimeAdmission.descriptor?.catalogIdentity || null,
+                        });
+                    }
+```
+
+`refreshAgentImage` (`imageRefresh.mjs`) never throws. When the result is `refreshed`, it also prints: `[pull] Other agents that use <ref> keep the previous image until their next start or restart.`
+
+Imports to add to `cli.js`:
+- `createImageRefreshSession`, `refreshAgentImage` and `resolveImageRefreshPolicy` from `../sandbox/docker/imageRefresh.mjs`;
+- `hardwareRefusalOf` from `../sandbox/runtimeCapabilities.js`.
+
+**D6.3, start.** In `startWorkspace` (`workspaceUtil.js:2933`, two-space indentation), add an `imageRefresh` option. `undefined` creates a session, `false` disables refresh, and a session object is reused.
+
+```js
+async function startWorkspace(staticAgentArg, portArg, {
+  killRouterIfRunning,
+  branchPolicy,
+  imageRefresh,
+} = {}) {
+  // An invalid PLOINKY_IMAGE_REFRESH refuses the start before any repository
+  // is cloned or updated.
+  const imageRefreshSession = imageRefresh === false
+    ? null
+    : (imageRefresh || createImageRefreshSession({ policy: resolveImageRefreshPolicy() }));
+  ...
+  const admittedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  if (imageRefreshSession?.enabled) {
+    // Earlier no-wait workers may still create and attest containers from these
+    // tags under the lease; pull only once they have settled.
+    await waitForNoWaitRunsToSettle({ operation: 'workspace-start' });
+    await refreshAdmittedGraphImages(admittedStart, imageRefreshSession, { includeNoWait: false });
+  }
+  resetPreinstallRunInProcess();
+```
+
+`waitForNoWaitRunsToSettle` throws the same `PLOINKY_NO_WAIT_RUN_IN_FLIGHT` refusal that `acquireSettledWorkspaceMutationLease` would raise a moment later, and nothing has been mutated by then. Imports to add to `workspaceUtil.js`:
+- extend :46 to `import { acquireSettledWorkspaceMutationLease, inspectLiveNoWaitWorkers, waitForNoWaitRunsToSettle } from './noWaitRunSettlement.js';`
+- import `createImageRefreshSession`, `refreshAdmittedGraphImages` and `resolveImageRefreshPolicy` from `../sandbox/docker/imageRefresh.mjs`.
+
+**D6.4, full restart.** Add to `workspaceUtil.js`:
+
+```js
+export async function refreshWorkspaceGraphImages(session, { includeNoWait = true, filter = null } = {}) {
+  if (!session?.enabled) return [];
+  let admitted;
+  try {
+    admitted = preflightWorkspaceStartRuntimeCapabilities();
+  } catch (error) {
+    console.log(`[pull] Warning: image refresh skipped; the workspace graph could not be resolved (${error?.message || error}).`);
+    return [];
+  }
+  return refreshAdmittedGraphImages(admitted, session, { includeNoWait, filter });
+}
+```
+
+In `cli.js`:
+1. After the `cfg` check (:668), add `const imageRefresh = createImageRefreshSession({ policy: resolveImageRefreshPolicy() });`. This refuses an invalid value before anything is stopped.
+2. Directly after `await settleWorkspaceBeforeRestart();` (:671), add `await refreshWorkspaceGraphImages(imageRefresh, { includeNoWait: true });`.
+3. Pass `imageRefresh` into the `startWorkspace` call at :680. The start pre-pass then reuses the memoized results.
+
+`restart router` (:450) passes `imageRefresh: false`.
+
+### D7. Logging and rollback
+
+The prefix is `[pull]`, as in `common.js`. Per-ref "current" lines go to `debugLog`. Reasons pass through `sanitizeReason`, and tokens never appear.
+
+- **Changed:** `[pull] docker.io/assistos/roboteam-agent:runtime: registry digest differs (local sha256:0a1b2c3d4e5f, registry sha256:bc7c8956426d); pulling...` After this come the existing `pullImage` lines.
+- **Delegated:** `[pull] <ref>: registry digest not readable (<reason>); asking podman to pull`.
+- **Refreshed:** `[pull] <ref> refreshed for repo/agent[, …]; previous image <64-hex old ID>. To roll back: <runtime> tag <64-hex old ID> <ref>, then ploinky restart <agent>.`
+- **Warnings:**
+  - `[pull] Warning: registry <host> unreachable for <ref> (<reason>); using the cached image.`
+  - `[pull] Warning: pull of <ref> failed (<message>); using the cached image.`
+- **Summary:** `[pull] Image refresh: 1 refreshed, 2 current, 0 unavailable, 0 failed.`, printed only when at least one ref was checked.
+
+There is **no automatic pruning** in this change. The previous image stays on disk without a tag, and that is what the rollback hint relies on. The Box's automatic graph rollback (`restorePriorGraph`, `supervisor.mjs:1131-1146`) cannot restore it, because the tag has already moved; recovery is the manual `tag` command. Dangling images accumulate in the workspace-backed `.ploinky/box/images` until `destroy --delete-cache`. This is a known follow-up (section 7).
+
+### D8. Update phase and records
+
+- **Phase.** Add `'image'` to `UPDATE_PHASES` (`updateOutcome.js:14`, before `'activation'`).
+- **Policy parse.** In `runUpdate`, directly after `const request = parseUpdateRequest(args);` (:120):
+
+  ```js
+          let imageRefreshPolicy;
+          try {
+              imageRefreshPolicy = resolveImageRefreshPolicy({ env });
+          } catch (error) {
+              error.code = 'PLOINKY_UPDATE_IMAGE_REFRESH_INVALID';   // thrownRecord: failed, before any mutation
+              throw error;
+          }
+  ```
+
+- **Image phase.** After the `if (releaseFailed) { … }` block and before `} catch (error) {` (:152):
+
+  ```js
+          if (!isCancelledResult(result)) {
+              result = await appendImageRefreshPhase(result, {
+                  request, policy: imageRefreshPolicy, cancellation, hostActivates: Boolean(reportRequest), log, refreshImages,
+              });
+          }
+  ```
+
+  Add `refreshImages = refreshUpdateImages` to the `runUpdate` options.
+- **`appendImageRefreshPhase`** (local to `updateCommand.js`):
+  - It returns `result` unchanged when the policy is `off` or `request.kind === 'repos'`.
+  - It creates the session with `beforePull: () => cancellation.checkpoint('image', result.records)`. The resulting `UpdateCancelledError` keeps the git records and reaches the existing `catch` as a `cancelled` record.
+  - It appends `imageRefreshUpdateRecords(results)`.
+  - When something was refreshed and `!hostActivates`, it logs `[update] Refreshed images take effect after \`ploinky restart\` (or \`ploinky restart <agent>\`).` In the Box flow with an active graph, the host's follow-up restart activates them.
+- **`refreshUpdateImages({ request, session, log })`** uses lazy imports, so existing update tests do not load `workspaceUtil.js`:
+  1. Return `[]` when `getConfig()?.static?.agent` is unset. A never-started workspace is checked at its first start.
+  2. Return `[]` with one log line when `inspectInFlightNoWaitWorkers().length` is non-zero (this avoids the race in section 7).
+  3. Otherwise call `refreshWorkspaceGraphImages(session, { includeNoWait: true, filter })`. The filter is `target.repoName === request.repoName` for `kind: 'repo'`, `target.manifestPath` inside `request.folderPath` for a folder-scoped `all`, and `null` for bare `update`.
+- **Records.** One per mutable ref: `id` = canonical ref, `required: false`, `details.agents`, `before`/`after` = `{ imageId }`. Skipped refs (pinned, unqualified, missing, policy `off`) emit **no** record.
+
+| Result | Outcome | Code | Notes |
 | --- | --- | --- | --- |
-| `start` | `startWorkspace` immediately after `admittedStart` (:2961) and before `resetPreinstallRunInProcess()` and `acquireSettledWorkspaceMutationLease` (:2970) | Blocking (non-no-wait) container nodes of `admittedStart`. No-wait nodes are left to their worker. | Before lease |
-| no-wait worker | `prefetchNoWaitRuntimeImage` becomes async: it calls `session.refresh(ref)` and drops the LLM skip, because the ref comes from `runtimeAdmission.descriptor.catalogIdentity` | That one node | Outside all locks (already) |
-| full `restart` | `cli.js` before `settleWorkspaceBeforeRestart()` (:671): `preflightWorkspaceStartRuntimeCapabilities()`, then refresh. The session is passed into `startWorkspace({ imageRefresh: session })`, whose pre-pass then hits the memo (new refs from freshly prepared repos are still checked) | Blocking nodes | Before stop: downtime does not include pull time |
-| `restart <agent>` (container) | `cli.js` before `withHeldOrAcquiredWorkspaceMutationLease` (:653). The image comes from `resolveAgentLaunchImageRef` (manifest image, or LLM catalog image via `resolveLlmRuntimeAdmissionContext`) | That agent | Before lease |
-| `restart <agent>` (sandbox) | none | n/a | n/a |
-| `restart router` | `startWorkspace({ imageRefresh: false })` | none | n/a |
-| `update` | `runUpdate` after the lease is released and before the report is published, so the manifests are the updated ones. Scope: bare `update` covers every graph container node (blocking and no-wait); `update <repo>` covers that repo's nodes; `update <folder>` covers nodes whose `agentPath` is under the folder; `update repos` does nothing. A workspace that was never started (no `static.agent`) gets no image phase. | See left | After lease release; `cancellation.checkpoint('image')` between pulls |
-
-**Update activation** keeps the existing model with no new restart logic. Box full form with an active graph: the host already runs an in-Box `restart` after the update. That restart recreates every agent, and its own pre-pass finds the images current. Targeted forms, an inactive graph, and direct `ploinky-local update`: the image records are reported, and the summary line says to run `ploinky restart` (or `ploinky restart <agent>`). The supervisor's existing "pending activation" note for targeted forms covers this.
-
-### D6. Guaranteed recreation (`imageChanged`)
-
-- **New helper** `imageIdentityReuseReason({ runtime, containerRef, desiredImageRef, desiredImageId, inspect })` (`imageIdentity.mjs`):
-  - It reads `<rt> container inspect --format '{{.Image}}' <containerRef>` and the desired ID: `desiredImageId` when given (GPU share launch: `readMpsLaunch(...).imageId`), otherwise `<rt> image inspect --format '{{.Id}}' <desiredImageRef>`.
-  - Both values are normalized with `normalizeImageId` (`installContract.mjs:47`; Podman prints bare hex, Docker prints `sha256:`).
-  - It returns `{ reason: 'imageChanged', detail: 'image <old12> -> <new12>' }` (prefix stripped, then `shortHash`) or `null`.
-  - Any missing or unparsable evidence returns `null` (no recreate on uncertainty). The existing missing-image and dependency paths handle a pruned image.
-- **Wire into `ensureAgentService`** directly after the AgentLib check (:4283), using the same `if (!recreateReason) recreateDetail = …; recreateReason ||= 'imageChanged'` pattern. Desired ref: `serviceLlmAdmissionContext.catalogIdentity.imageRef || image`. This runs before the dependency check, so the logged reason is the specific one and is independent of `needsDependencies`.
-- **Wire into `graphNodeRuntimeReplacementReason`** (`workspaceUtil.js:1285`) after the LLM reuse-hash check and before the contract inspection. It uses a new injectable `imageIdentityReasonImpl` and sets `plan.runtimeReasonDetail`, so start rotates the instance identity and prints `[start] repo/agent: replacing its runtime (imageChanged: image 1a2b… -> 9f8e…)` through the existing `runtimeReplacementLog.js` path.
-- **Registry record**: add `containerImageId` (normalized ID read back from the created container) at both record writes (`agentServiceManager.js:2994`, `:4744`). Add `containerImageDigest` (the matching repo digest, for display in `status`) when one is known. The recreate decision always uses container inspect, so records without these fields (existing workspaces) work unchanged. `containerMonitor.js:394` already folds `record.containerImageDigest` into its restart snapshot digest. That is intended: image identity becomes a restart input.
-- **Dependency store**: a new image ID gives `runtimeDependencyReuseProblem` a new `imageId`. The recreate plans a new generation keyed by the new ID (`planRuntimeDependencies`), and npm install runs inside the create path (an existing cost, now once per image change). The old generation is left to existing store retention.
-- **GPU or MPS**: MPS coordination re-inspects the ref (D2 facts), so after a pre-pass pull the share launch gets the new ID and the comparison above uses `launch.imageId`. No MPS change is needed.
-- **Adoption**: because `imageChanged` is decided before the reuse and adoption branch, a re-tagged ref now produces a clean replacement instead of an adoption-attestation mismatch.
-
-### D7. Failure handling
-
-| Situation | `check` result | Action |
-| --- | --- | --- |
-| Remote digest equals a local digest | `current` | none |
-| Different digest, or image missing | `pull` | `pullImage(ref, {timeoutMs})`; on error the result is `pull-failed`, with a warning, and the cached image is kept |
-| `unsupported` | delegate | `<runtime> pull` (engine handles auth and proxy; an up-to-date pull fetches manifests only); on error, `pull-failed` |
-| `unreachable`, `rate-limited`, `denied`, `not-found` | `unavailable` | warning, keep cached, no pull (a pull would fail the same way) |
-| Budget exhausted | `deferred` | keep cached |
-
-The pre-pass never throws for registry or pull reasons. Only an invalid policy value throws. A recreated container that fails readiness goes through the existing cleanup (`cleanupFailedPreparedRuntime`, candidate journals). The old image ID stays tagged-less on disk.
-
-Old-image cleanup is optional and later (Phase 5). After a successful start, `<rt> image rm <oldId>` runs only for IDs this command superseded and that no container references (exact IDs, never `image prune`, per DS002 exact-identity rule). This matters because the Box image store lives in the workspace (`.ploinky/box/images`).
-
-### D8. Output and records
-
-- **Logs** (same `[pull]` prefix as `common.js`): `[pull] docker.io/assistos/roboteam-agent:runtime changed in the registry (sha256:bc7c8956426d -> local sha256:0a1b2c3d4e5f); pulling...`, then the existing `pullImage` lines. Warnings: `[pull] Warning: could not check <ref> (<status>: <short reason>); using the cached image.` Print one summary line when anything was checked: `[pull] Image refresh: 1 refreshed, 2 current, 0 unavailable (3 pinned skipped)`. Per-ref "current" details go to `debugLog`. Reasons pass through `sanitizeReason`.
-- **Update records**: add phase `'image'` to `UPDATE_PHASES` (`updateOutcome.js:14`) and emit one record per mutable ref (`id` = canonical ref, `required: false`, `details.agents` = agent refs, `before` / `after` = `{digest, imageId}`). Pinned, local-only and `off` refs emit nothing, so they never turn an update into `complete-with-skips`.
-
-| Result | Outcome | Code |
-| --- | --- | --- |
-| `pulled` | `changed` | `image-refreshed` |
-| `current` | `unchanged` | `image-current` |
-| `unavailable` / `deferred` | `skipped` / `deferred` | `registry-unreachable`, `registry-denied`, `rate-limited`, `refresh-budget` |
-| `pull-failed` | `failed` | `image-pull-failed` (exit 1, status `partial`; activation still allowed because the record is not required) |
+| `refreshed` | `changed` | `image-refreshed` | |
+| `current` | `unchanged` | `image-current` | |
+| `unavailable` | `skipped` | `registry-unreachable` | |
+| `pull-failed` | `skipped` | `image-pull-failed` | `attempted: true`; exit 0 (`complete-with-skips`) |
 
 ## 4. Module layout
 
-All new modules are `.mjs`, under 300 lines each, and have no import-time side effects:
+All new modules are `.mjs`, have no import-time side effects, and stay under 300 lines.
 
-- `cli/sandbox/docker/imageReference.mjs`: `parseImageReference(ref, {runtime})`, `canonicalImageRef(parsed)`, `repoDigestSet(repoDigestsJson, parsed)`.
-- `cli/sandbox/docker/registryAuth.mjs`: `readRegistryCredentials(host, {env, fs, homedir})` returns `{kind:'basic', authorization}`, `{kind:'helper'}` or `null`.
-- `cli/sandbox/docker/registryDigest.mjs`: `fetchRemoteManifestDigest(parsed, {fetchImpl = fetch, env, credentials, timeoutMs, tokenCache, hostBreaker})` returns the D1 classification, and `proxyBlocksNativeFetch(host, env, execArgv)`.
-- `cli/sandbox/docker/imageIdentity.mjs`: `inspectRepoDigests`, `inspectLocalImageId`, `inspectContainerImageId` (all take `spawn = spawnSync`), and `imageIdentityReuseReason`.
+- `cli/sandbox/docker/imageReference.mjs`: `parseImageReference`, `repoDigestSet` (D1).
+- `cli/sandbox/docker/registryDigest.mjs`: `fetchRemoteManifestDigest`, `nativeFetchIgnoresProxy`, `isTlsClassError` (D2).
 - `cli/sandbox/docker/imageRefresh.mjs`:
-  - `parseImageRefreshPolicy(env)` and `IMAGE_REFRESH_ENV`.
-  - `createImageRefreshSession({runtime, policy, log, fetchImpl, spawn, now, pullBudgetMs})` with `refresh(ref, {agents})` returning `{ref, action, status, reason, beforeDigest, afterDigest, beforeId, afterId}`, plus `results()` and `summaryLine()`.
-  - `collectGraphImageTargets(admittedStart, {includeNoWait})` and `resolveAgentLaunchImageRef({manifest, profileConfig, agentName, repoName, alias, runtime})`.
-  - `imageRefreshUpdateRecords(results)`.
-  - Pulls reuse `pullImage` and `ensureImagePresent(..., {allowLocalBuild:false})` from `common.js`, which stay missing-only.
+  - `IMAGE_REFRESH_VAR`, `resolveImageRefreshPolicy`;
+  - `createImageRefreshSession`, `refreshImageOnce`, `refreshAgentImage`;
+  - `collectAdmittedImageTargets`, `refreshAdmittedGraphImages`;
+  - `imageRefreshUpdateRecords`.
+
+  It imports:
+  - `probeContainerRuntime` and `pullImage` from `common.js`;
+  - `containerToolchainIdentity` from `installContract.mjs`;
+  - `resolveVarValue` and `resolveManifestImage` from `secretVars.js`;
+  - `resolveManifestRuntimeProfile` from `profileService.js`;
+  - `classifyDependencyGraphWaitMode` from `workspaceDependencyGraph.js`;
+  - `createOperationRecord` from `updateOutcome.js`;
+  - `debugLog` from `utils.js`.
+
+  None of these imports it back, so there is no cycle.
+- Modified files:
+  - `agentServiceManager.js`: D5;
+  - `noWaitWorker.js`: D5, D6.1;
+  - `cli.js`: D6.2, D6.4;
+  - `workspaceUtil.js`: D6.3, D6.4;
+  - `updateCommand.js` and `updateOutcome.js`: D8;
+  - the docs and help text.
 
 ## 5. Phased implementation steps
 
-**Phase 1: pure building blocks (no behavior change)**
-1. Add `imageReference.mjs`, `registryAuth.mjs`, `registryDigest.mjs` and `imageIdentity.mjs` with injected seams, and their unit tests (section 6).
-2. Add `imageRefresh.mjs` (policy, session, dedupe, budgets, D7 table) and its tests. Nothing calls it yet.
+**Phase 0: empirical checks (no code).** Record the outputs in the PR description.
+1. Inside a Box, run Podman and record `container inspect --format '{{.Image}}'`, `image inspect --format '{{.Id}}'` and `{{json .RepoDigests}}` after `pull docker.io/assistos/roboteam-agent:runtime`. Expect the index digest `bc7c…` in RepoDigests, and the two IDs equal after normalization.
+2. Repeat on Docker with the classic store and with the containerd store. If the containerd store reports IDs in another form, `containerImageChange` must still compare them equal; fix the normalization before Phase 2.
 
-**Phase 2: guaranteed recreation**
-3. `agentServiceManager.js`: in `ensureAgentService`, after :4283, call `imageIdentityReuseReason`. Desired ID comes from `readMpsLaunch(options.mpsLaunch, …)?.imageId` when `serviceAdmission.descriptor.hardwareGpu` is set, otherwise from the ref (LLM catalog ref or manifest image).
-4. `agentServiceManager.js`: record `containerImageId` / `containerImageDigest` at :2994 and :4744 (inspect the created container's `.Image` once, right after create).
-5. `workspaceUtil.js`: add `imageIdentityReasonImpl` to `graphNodeRuntimeReplacementReason` options. Call it after the LLM block (:1420), using `admitted?.llmStartup?.selection?.imageRef || resolveManifestImage(...)`.
-6. `tests/unit/dependencyStoreFakeEngine.mjs`: answer `container inspect --format {{.Image}}` with `found[0].Image` (today it falls through to full JSON, which the helper treats as unknown).
+**Phase 1: pure modules and their unit tests.** Write `imageReference.mjs`, `registryDigest.mjs` and `imageRefresh.mjs` (D1-D4, D8 record mapping). Nothing calls them yet.
 
-**Phase 3: command hooks**
-7. `workspaceUtil.js` `startWorkspace`:
-   - Accept the option `imageRefresh` (session, `false`, or `undefined`, which creates one from env).
-   - After :2961, run `await refreshAdmittedGraphImages(admittedStart, session)`. It excludes nodes in `classifyDependencyGraphWaitMode(admittedStart.graph).noWait` and refused nodes, and is wrapped so that only policy errors propagate.
-8. `cli.js`:
-   - Router restart passes `imageRefresh: false`.
-   - Full restart creates the session and refreshes before `settleWorkspaceBeforeRestart()` (:671), then passes the session into `startWorkspace`.
-   - Targeted container restart refreshes the agent's ref before :653. The sandbox path is untouched.
-9. `noWaitWorker.js`: make `prefetchNoWaitRuntimeImage` async, use `createImageRefreshSession` (this is a separate process with its own session) and the catalog ref from `runtimeAdmission.descriptor.catalogIdentity`. Change the call at :1911 to `await`.
-10. `updateCommand.js` `runUpdate`: after the lease `finally`, compute targets for the request scope (D5), call `cancellation.checkpoint('image', records)` before each pull, and `appendUpdateRecords(result, imageRefreshUpdateRecords(results))`. In `updateOutcome.js`, add `'image'` to `UPDATE_PHASES`. In `updateSummary.js`, add the "run `ploinky restart` to apply refreshed images" line when an `image` record is `changed` and no host activation follows.
+**Phase 2: recreation.**
+3. In `agentServiceManager.js`, add `readRuntimeContainerImageId` and the exported `containerImageChange`, widen the `installContract.mjs` import at :146, and add the `ensureAgentService` hook (D5, hook 1).
+4. In `noWaitWorker.js`, add the import at :25 and the `adopted` predicate (D5, hook 2).
+5. In `tests/unit/dependencyStoreFakeEngine.mjs`, in the container-inspect `--format` branch, add `else if (f.includes('.Image')) out(found[0].Image + '\n');` before the JSON fallback. Without it, the helper reads JSON and returns `null`.
+6. Add the behavioral regression from section 6.
 
-**Phase 4: Box plumbing and docs**
-11. `ploinky-box/supervisor.mjs` `boundedCoreEnvironment` (+ callers) and `ploinky-box/command/execute.mjs` `buildContainerExecArgs`: forward a validated `PLOINKY_IMAGE_REFRESH` when set on the host. Validation uses `parseImageRefreshPolicy` in `ploinky-box/command/route.mjs` for start, restart and update, before any mutation.
-12. Docs (DS002 synchronization): describe the policy and the `imageChanged` reason in `docs/specs/DS006-runtime-execution-and-isolation.md`, and the image-keyed generation consequence in `DS009-dependency-caches-and-startup-readiness.md`. Add the variable to `cli/commands/help.js` and `publicUsageText` (`ploinky-box/bin/ploinky-box.mjs`). Run `fileSizesCheck.sh`.
+**Phase 3: hooks, in this order.**
+7. Worker (D6.1).
+8. Targeted restart (D6.2).
+9. Start (D6.3).
+10. Full restart and `restart router: false` (D6.4).
+11. Update (D8).
 
-**Phase 5 (optional, later)**
-13. Superseded-image cleanup (D7). Optionally create managed containers from the immutable ID resolved once per launch (as GPU launches do) to close the retag race in section 7.
+**Phase 4: docs and the cross-repository step.**
+12. Docs:
+    - `docs/specs/DS006-runtime-execution-and-isolation.md`: the policy, the `imageChanged` reason, the rollback command, and a short note that **production deployments should pin agent images by digest** (a broken re-push otherwise reaches every workspace at its next start, restart or update). Also mention lagging registry mirrors, which cause repeated "changed" checks.
+    - `DS009-dependency-caches-and-startup-readiness.md`: a new image ID creates a new dependency generation.
+    - `DS004-main-behavior.md`: one sentence per command.
+    - `cli/commands/help.js`: `ploinky var PLOINKY_IMAGE_REFRESH off|check|always`.
+
+    Run `fileSizesCheck.sh`.
+13. In `/home/user/container-image-builds/scripts/install-roboteam-local-in-box.sh`, as a separate commit in that repository, insert after the target `case` block and before any build. The script already runs in-Box `/opt/ploinky/bin/ploinky-local`, so it can set the workspace variable itself; it prints the instruction only if that fails.
+
+    ```bash
+    # Local builds reuse the published tags; stop Ploinky from refreshing them from the registry.
+    if /opt/ploinky/bin/ploinky-local var PLOINKY_IMAGE_REFRESH off; then
+        echo "[local-images] image refresh is off for this workspace; 'ploinky var PLOINKY_IMAGE_REFRESH check' follows the registry again"
+    else
+        echo "[local-images] could not set PLOINKY_IMAGE_REFRESH; run 'ploinky var PLOINKY_IMAGE_REFRESH off' before the next start, restart or update" >&2
+    fi
+    ```
+
+    This applies to every target. Refreshing the agent tag would recreate `roboTeamAgent`, which is the container the desktop and browser images were loaded into.
 
 ## 6. Testing
 
-**New unit tests** (`tests/unit/*.test.mjs`, `node:test` plus `assert/strict`, style of `manifestImageResolution.test.mjs`; the seams are `fetchImpl`, `spawn`, `env` and `fs`, with no network and no engine):
+**New unit tests** (`tests/unit/*.test.mjs`, `node:test` plus `node:assert/strict`, style of `manifestImageResolution.test.mjs`). The seams are `fetchImpl`, `spawn`, `env`, `pull` and `readImageId`; there is no network and no engine.
 
 - `imageReference.test.mjs`:
-  - `node:18-alpine` → `docker.io/library/node:18-alpine`.
-  - `assistos/x` → `:latest`.
-  - `localhost:5000/a/b:t` (host with port) and `ghcr.io/o/r:t`.
-  - `repo:tag@sha256:…` is pinned.
-  - Uppercase or invalid refs are rejected.
-  - Unqualified refs are skipped under Podman and checked under Docker.
-  - The `repoDigestSet` filter covers the Docker form without `docker.io/`, the Podman form with two digests, `null`, `[]`, and foreign repos.
+  - `docker.io/assistos/roboteam-agent:runtime`, `node:18-alpine` (`explicitRegistry: false`), `docker.io/node` → `library/node:latest`, `localhost:5000/a/b:t`, `ghcr.io/o/r:t`.
+  - `repo:tag@sha256:…` and `@sha512:…` are pinned; malformed refs return `null`.
+  - `repoDigestSet` handles the Docker form, the Podman form with two digests, `null`, `[]`, and foreign repositories.
 - `registryDigest.test.mjs`:
-  - Anonymous 200, and 401 Bearer → token → 200 (assert the Accept header, the `service`/`scope` query, and one retry).
-  - `access_token` field; a challenge with odd quoting.
-  - Basic creds after anonymous 401; `credsStore` gives `unsupported`.
-  - Proxy env without `NODE_USE_ENV_PROXY` gives `unsupported`; `NO_PROXY` match gives `ok`.
-  - Timeout or abort gives `unreachable`, and the breaker skips the second ref.
-  - 429, 404 and 5xx; a missing digest header (GET + sha256 for a non-Hub registry, `unsupported` for docker.io); a malformed digest.
-  - A spy logger proves tokens never appear in logs or results.
+  - Anonymous `200`.
+  - `401` Bearer → token → `200`: assert the Accept header, the `service` and `scope` query, and exactly one retry. Also the `access_token` field and an odd-quoting challenge.
+  - These are `undetermined`: a non-Bearer challenge, `401`/`403`/`404` after the token, `200` without a digest, and `EPROTO` / `CERT_HAS_EXPIRED` causes.
+  - These are `unavailable`: `429`, `503`, `ENOTFOUND`, `TimeoutError`. The second ref on that host makes no request.
+  - `nativeFetchIgnoresProxy`: true for `HTTPS_PROXY` alone; false with `NODE_USE_ENV_PROXY=1`, with `--use-env-proxy` in `execArgv`, or with it in `NODE_OPTIONS`.
+  - A spy logger proves the token never appears in logs or results.
 - `imageRefresh.test.mjs`:
-  - Policy parsing (`off`, `check`, `always`, invalid throws).
-  - Two agents sharing a ref make one HEAD and at most one pull.
-  - Pinned and local-only refs make zero fetch and zero spawn calls.
-  - Equal digest means no pull; a different digest means a pull with a bounded timeout.
-  - A missing image is pulled without a fetch.
-  - `unsupported` delegates to pull; `unreachable` causes no pull and one warning.
-  - Pull failure gives `pull-failed` and no throw.
-  - `always` causes no fetch; `off` makes no calls.
-  - Budget exhaustion gives `deferred`.
-  - The update record mapping table (D8), with `required:false`; `decideUpdateStatus` keeps `activationAllowed:true` on `pull-failed`.
-- `imageIdentity.test.mjs`:
-  - Equal IDs across formats (`abc…` vs `sha256:abc…`) give `null`; different IDs give `imageChanged` with 12-char detail.
-  - A desired `launch.imageId` overrides the ref.
-  - Unparsable or missing inspect output gives `null`.
+  - Policy: workspace variable before env; env fallback; a throwing `readVar` falls back to env; the default is `check`; an invalid value throws `PLOINKY_IMAGE_REFRESH_INVALID`.
+  - Session:
+    - two agents on one ref make one `HEAD` and at most one pull;
+    - pinned, unqualified, `localhost` and missing images make no fetch and no pull;
+    - an equal digest means no pull;
+    - a different digest means a pull, the result `refreshed`, and the rollback hint containing the old ID;
+    - an empty RepoDigests set means a pull;
+    - `undetermined` means a pull;
+    - `unavailable` means no pull and one warning;
+    - a throwing pull gives `pull-failed` and no throw;
+    - `always` makes no fetch; `off` makes no calls;
+    - an error thrown by `beforePull` propagates;
+    - an unknown runtime is skipped.
+  - `collectAdmittedImageTargets`:
+    - excludes no-wait nodes unless `includeNoWait`;
+    - keeps `additionalNodes`;
+    - skips sandbox, hardware-refused and catalog-digest records;
+    - uses the catalog `imageRef` over the manifest image;
+    - an unresolved `${…}` placeholder is skipped without a throw.
+  - `imageRefreshUpdateRecords`: the D8 table. `decideUpdateStatus` gives `complete-with-skips`, exit 0 and activation allowed for `image-pull-failed`.
+- `containerImageChange`, in a new `agentImageChange.test.mjs` through injected readers:
+  - equal IDs give `null`;
+  - different IDs give `{ observed, desired }`;
+  - a `null` reader on either side gives `null`;
+  - an empty ref or a sandbox runtime gives `null`.
+- Behavioral regression. Add to `tests/unit/dependencyStoreRuntimeWiring.test.mjs`, following the test at :33, with `wiringWorkspace(t, { packageJson: null })` (a start command and no `package.json`):
+  1. Run a first start.
+  2. Run `driveWiring(... { env: { FAKE_ENGINE_IMAGE_HEX: 'b'.repeat(64) } })`.
+  3. Assert `createdByThisLaunch === true` (image changed between two starts → container recreated). Today this reuses the container.
+  4. A third run with the same hex reuses the container.
+- Worker adoption: through the capture seams of `noWaitWorker.test.mjs`, a ready `host`-mode runtime is not adopted when `containerImageChange` reports a change.
+- Command wiring:
+  - an invalid policy is refused before `prepareDefaultBootRepositories`, before the full-restart stop, and as a `failed` update record before the lease;
+  - a throwing `preflightWorkspaceStartRuntimeCapabilities` in full restart or update logs a warning and the command continues;
+  - cancellation during the update image phase yields a `cancelled` record that keeps the git records.
 
-**Existing tests to update**:
-- `cliLifecycleInactivation.test.mjs`: add `refreshAdmittedGraphImages(` between `const admittedStart` and the lease in the start `assertOrdered` list, and assert that the refresh precedes `await settleWorkspaceBeforeRestart();` in the full-restart slice and that `imageRefresh: false` appears in the router slice.
-- `dependencyStoreWorkspaceStartWiring.test.mjs`: VM-sandbox collaborators must supply `refreshAdmittedGraphImages` and `createImageRefreshSession`, or the test fails with a ReferenceError.
-- `noWaitWorker.test.mjs:2930`: `await` the now-async prefetch, and add a case where an LLM node uses the catalog ref.
-- `updateResultPolicy.test.mjs` / `updateReportProtocol.test.mjs`: add `image` records. Prove that a non-required `failed` image record yields `partial` with activation allowed, and that the report round-trips the new phase (`updateOutcome.js:240` validates phases).
-- `ploinkyBoxCli.test.mjs` / `ploinkyBoxSafetyMatrix.test.mjs`: the env is forwarded only when set and valid, and an invalid value is refused before any Box mutation.
-- Graph replacement tests: inject `imageIdentityReasonImpl` where they stub other `…Impl` options.
+**Existing tests that must be updated:**
+1. `tests/unit/noWaitWorker.test.mjs:2930` (`the runtime image is prefetched outside every lifecycle lock`): add `await` to every call and keep the existing shapes. Add a case where `ensureImage` returns `false`: the injected `refreshImage` stub (returning `{ action: 'current' }`) is called once with `'demo/image:1'` and options whose `runtime` is `'podman'` and whose `agents` is `['demo/demoAgent']` (assert those two fields, not the whole object, because the options also carry `log`). The result is `{ prefetched: false, image: 'demo/image:1', refresh: 'current' }`.
+2. `tests/unit/noWaitWorker.test.mjs:3005` (`an LLM runtime never prefetches the manifest image the catalog will replace`): add `await`, and keep the no-catalog skip assertion. Add:
+   - with `catalogIdentity: { imageRef: 'demo/catalog:1' }`, `ensureImage` receives the catalog ref and never the manifest image;
+   - with `imageDigest` set, `refreshImage` is never called and the result has `refresh: 'pinned'`.
 
-**Manual verification recipe** (scratch Docker Hub repo `<you>/refresh-probe`, multi-arch):
-1. `docker buildx build --platform linux/amd64,linux/arm64 -t docker.io/<you>/refresh-probe:runtime --push .` (image A). Point a test agent manifest's `container` at that ref, with a `start` command and no `package.json`, which exercises the previously missed path. Run `ploinky start <agent>`.
-2. Record `podman image inspect --format '{{.Id}} {{json .RepoDigests}}'` inside the Box (`ploinky shell` or `podman exec <box> podman …`) and the agent container's `.Image`.
-3. Push image B under the same tag. Run `ploinky start` again and expect `[pull] … changed in the registry`, then `replacing its runtime (imageChanged: …)`. The new container's `.Image` equals the new local ID.
-4. Run `ploinky start` again: no pull, no replacement, and a `current` summary.
-5. Repeat step 3 with `ploinky restart <agent>`, then with `ploinky update` (graph active: the host restart applies it; check the `image` record in the summary).
-6. Disconnect the network (or `PLOINKY_IMAGE_REFRESH=check` with an unroutable registry host in a test ref): start succeeds with one warning.
-7. `PLOINKY_IMAGE_REFRESH=off ploinky start` makes no registry traffic. `ploinky restart router` makes no `[pull]` lines.
-8. Run steps 3-4 with direct `ploinky-local` on Docker (the classic store and the containerd store) to confirm that the container `.Image` and image `.Id` formats compare equal when unchanged.
+   Rename the test to `an LLM runtime prefetches its catalog image, never the manifest image; a catalog digest pins it`.
+3. `tests/unit/noWaitWorker.test.mjs:2986` and `:3031` (source order around `prefetchNoWaitRuntimeImage({`): these keep passing because `lastIndexOf` still matches inside `await prefetchNoWaitRuntimeImage({`. Re-run them.
+4. `tests/unit/dependencyStoreRuntimeIntegration.test.mjs:368`: extend it to assert that `containerImageChange(` precedes both `adoptManagedRuntimeOnly = !managedReconciliationPreparationLease` and the host/none early-return `debugLog`, and that `recreateReason = 'imageChanged'` is present.
+5. `tests/unit/dependencyStoreRuntimeIntegration.test.mjs:393`: extend the capture assertions with `/&& !imageChange/`. The existing `/&& !dependencyProblem/` still passes.
+6. `tests/unit/dependencyStoreWorkspaceStartWiring.test.mjs`: the VM sandbox (`sandbox(collaborators)`) must supply `createImageRefreshSession: () => ({ enabled: false })`, `resolveImageRefreshPolicy: () => 'check'`, `waitForNoWaitRunsToSettle: async () => {}` and `refreshAdmittedGraphImages: async () => []`. Otherwise it fails with a `ReferenceError`.
+7. `tests/unit/cliLifecycleInactivation.test.mjs:64-70` and the start list at :113. They still pass because `assertOrdered` is non-adjacent. Extend them:
+   - restart: `await settleWorkspaceBeforeRestart();` → `refreshWorkspaceGraphImages(` → `inactivateEdgeRoutingGeneration('cli-workspace-restart')`;
+   - start: `const admittedStart` → `waitForNoWaitRunsToSettle(` → `refreshAdmittedGraphImages(` → `acquireSettledWorkspaceMutationLease`;
+   - router: `imageRefresh: false`.
+8. `tests/unit/dependencyStoreFakeEngine.mjs`: add the `{{.Image}}` format (Phase 2 step 5).
+9. `tests/unit/hardwareLimitsInstallerImage.test.mjs:60`: must keep passing unchanged. It is the guard against renaming `inspectContainerImageId`.
+10. `tests/unit/updateResultPolicy.test.mjs` and `tests/unit/updateReportProtocol.test.mjs`: add `image` records, and check that the report round-trips the new phase (`updateOutcome.js:240`).
+11. `tests/unit/updateCancellation.test.mjs`, `tests/unit/workspaceLeaseOperationOwnership.test.mjs` and `tests/unit/ploinkyBoxHostExclusionsInterrupt.test.mjs`: these call `runUpdateCommand` in workspaces without `static.agent`. They should stay green because of the lazy `refreshUpdateImages` guard. If any fixture configures a static agent, pass `refreshImages: async () => []`.
+12. `startWorkspace.toString()` source assertions in `tests/unit/hardwareLimitsMpsGraph.test.mjs:141`, `tests/unit/workspaceDependencyGraph.test.mjs:506-615` and `tests/unit/reinstallReadiness.test.mjs:98`: these are index or regex checks that the insertion does not reorder. Re-run them.
 
-## 7. Risks, open questions, follow-ups
+**Manual verification recipe.**
+1. Push a multi-arch image A to a scratch repo `docker.io/<you>/refresh-probe:runtime` (`docker buildx build --platform linux/amd64,linux/arm64 --push`).
+2. Point a test agent at that ref, with a `start` command and no `package.json`. Run `ploinky start`.
+3. Push image B under the same tag, then run `ploinky start`. Expect `registry digest differs`, the rollback hint, then `replacing its runtime (imageChanged: …)`. The new container's `.Image` equals the new local ID.
+4. Run `ploinky start` again. Expect `1 current`, no pull, and no replacement.
+5. Repeat step 3 with `ploinky restart <agent>`, with `ploinky restart`, and with `ploinky update`. For update, check the `image` record; with an active Box graph, the host restart activates it.
+6. Run `ploinky var PLOINKY_IMAGE_REFRESH off`, push again, and run `ploinky start`. Expect no registry traffic and no pull. Run `ploinky var PLOINKY_IMAGE_REFRESH bogus`, then `ploinky start`: it is refused before any repository update. Run `ploinky restart router`: no `[pull]` lines.
+7. Offline (block the registry host): start succeeds with one warning. Roll back with the printed `podman tag …` and `ploinky restart <agent>`.
+8. Explorer graph (`ploinky start explorer` in a scratch workspace), then re-push `roboteam-agent:runtime`, then `ploinky start`. Both RoboTeam containers are recreated. Of the two workers, the later-wave one reports `current` and makes no second pull.
+9. In-Box local build: run `install-roboteam-local-in-box.sh agent`, then `ploinky restart`. The local build is kept, and the variable reads `off`.
 
-- **Retag race**: a pre-lock pull by one command can move a tag while another command (an earlier start's no-wait worker) creates or attests a container from that tag under the lease. The likely result is an attestation mismatch (`agentServiceManager.js:2467`) or a container with a stale dependency generation. Both self-heal on the next start through `imageChanged` or dependency drift. Mitigations: blocking-node refs are refreshed before the lease, and workers refresh only their own ref. The full fix is the Phase 5 create-by-ID option.
-- **Docker containerd store**: if container `.Image` and image `.Id` ever differ in form for the same image, every start would recreate. The normalization test and manual step 8 guard this. The helper must return `null` rather than `imageChanged` when either value fails `normalizeImageId`.
-- **Cost**: an LLM image change means a multi-GB pull at start. No-wait LLM agents pull in their worker. Blocking ones pull before the lease, within the 15 min refresh budget.
-- **Q1**: Should `pull-failed` during `update` exit nonzero (current recommendation, consistent with `decideUpdateStatus`) or be `skipped`?
-- **Q2**: Should a manifest-level `imagePullPolicy` exist, or is digest pinning enough?
-- **Q3**: Should LLM catalog entries that declare `digest` (`llmArchitectureCatalog.js:259`) be resolved as `ref@digest`, making them pinned?
-- **Q4**: Should `reinstall` and `enable` also refresh? They are out of scope here; they keep missing-only behavior plus `imageChanged`.
-- **Out of scope**: the Box image policy (`ploinky-box/lifecycle/transactions.mjs`). In AssistOSExplorer, `roboWorkAgent/server/environment.mjs:63` has its own missing-only `podman pull` for `roboteam-desktop:runtime` and `roboteam-browser:runtime`. That needs the same digest check, or pinned refs, as a separate change in that repository.
+## 7. Decisions, risks and known follow-ups
+
+**Decisions on the former open questions:**
+- **Q1.** A failed pull during `update` is a `skipped` record with code `image-pull-failed`. Exit 0.
+- **Q2.** There is no per-manifest pull policy. Digest pinning is the per-agent opt-out, and the workspace variable is the global one.
+- **Q3.** LLM catalog entries that declare `digest` count as pinned and are not refreshed.
+- **Q4.** `reinstall` and `enable` are out of scope. They keep missing-only pulls; `imageChanged` still applies when they go through `ensureAgentService`.
+
+**Retag race (accepted, documented).** A pull outside the locks can move a tag while another command's no-wait worker creates or attests a container from that tag. The attestation then fails closed (`routerAuthorityAttestation.js:752` against `agentServiceManager.js:2467`): the candidate is cleaned up, and the superseding command heals it. The windows are reduced as follows:
+- start refreshes only after earlier workers settle;
+- full restart refreshes after `settleWorkspaceBeforeRestart`;
+- update skips the image phase while workers are in flight;
+- workers refresh only their own ref, and the second worker on a shared ref sees `current`.
+
+Targeted restart does not settle and keeps a small window. Creating containers from image IDs is **not** part of this change.
+
+**Operational risks:**
+- A broken re-push reaches every workspace at its next start, restart or update. Mitigations: the rollback hint, the DS006 recommendation to pin digests in production, and `PLOINKY_IMAGE_REFRESH off`.
+- A lagging registry mirror can report "changed" on every command until it catches up.
+- A delegated pull, or the `always` policy, counts against the Docker Hub pull quota.
+- The pull timeout is the existing 30-minute default, which equals the host's in-Box command bound; cold pulls have this exposure today.
+
+**Known follow-ups:**
+- Superseded-image cleanup, which would remove dangling images from `.ploinky/box/images`. A future change could run `<rt> image rm <oldId>` without `--force`, only after the replacement passed readiness. It is not in this change, so that rollback remains possible.
+- An AssistOSExplorer change: `roboWorkAgent/server/environment.mjs:63` has its own missing-only `podman pull` for `roboteam-desktop:runtime` and `roboteam-browser:runtime`.
+- The Box image policy (`ploinky-box/lifecycle/transactions.mjs`) is out of scope.
