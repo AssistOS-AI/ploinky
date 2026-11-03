@@ -142,7 +142,13 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 'var PLOINKY_IMAGE_REFRESH off',
                 'printf %s "$API_KEY" | ploinky var API_KEY --stdin'
             ],
-            notes: "Use 'vars' to list variables. `ploinky var PLOINKY_IMAGE_REFRESH off|check|always` controls whether `ploinky update` re-pulls changed registry image tags (default check). --stdin takes the value from piped input and removes one trailing newline, so a secret never appears in a process list. Router control surfaces use authenticated workspace sessions."
+            notes: "Use 'vars' to list variables. "
+                + 'PLOINKY_IMAGE_REFRESH (check, always or off; default check) controls whether `ploinky update` '
+                + 're-pulls changed registry image tags; a value from the host environment is also passed '
+                + 'to the update. '
+                + '--stdin takes the value from piped input and removes one trailing newline, '
+                + 'so a secret never appears in a process list. '
+                + 'Router control surfaces use authenticated workspace sessions.',
         },
         'vars': {
             description: 'List workspace variables (from encrypted .ploinky/data/.secrets)',
