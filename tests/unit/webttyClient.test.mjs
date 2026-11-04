@@ -31,6 +31,9 @@ function createHarness({
     embedded = false,
     storage = undefined,
     viewOverride = undefined,
+    fitDimensions = null,
+    deferredAnimationFrames = false,
+    deferredTimers = false,
 } = {}) {
     const requests = [];
     const sources = [];
@@ -38,6 +41,7 @@ function createHarness({
     const historyCalls = [];
     const elements = new Map();
     const timers = new Map();
+    const animationFrames = new Map();
     let timerId = 0;
     let clock = 1000;
     let createResolve;
@@ -81,7 +85,11 @@ function createHarness({
         reset() { this.resets = (this.resets || 0) + 1; this.output = ''; }
         emitData(data) { this.dataListener(data); }
     }
-    class FakeFitAddon { fit() {} }
+    class FakeFitAddon {
+        fit() {
+            if (fitDimensions) Object.assign(FakeTerminal.instance, fitDimensions(elements));
+        }
+    }
     class FakeEventSource {
         static CLOSED = 2;
         constructor(url) {
@@ -111,10 +119,19 @@ function createHarness({
         setTimeout(callback, delay) {
             const id = ++timerId;
             timers.set(id, { callback, delay });
-            if (delay <= 100) queueMicrotask(() => { if (timers.delete(id)) callback(); });
+            if (delay <= 100 && !deferredTimers) queueMicrotask(() => { if (timers.delete(id)) callback(); });
             return id;
         },
         clearTimeout(id) { timers.delete(id); },
+        requestAnimationFrame(callback) {
+            const id = ++timerId;
+            animationFrames.set(id, callback);
+            if (!deferredAnimationFrames) queueMicrotask(() => {
+                if (animationFrames.delete(id)) callback();
+            });
+            return id;
+        },
+        cancelAnimationFrame(id) { animationFrames.delete(id); },
         confirm() { return confirm; },
         addEventListener(type, listener) { windowListeners.set(type, listener); },
     };
@@ -189,6 +206,18 @@ function createHarness({
     return {
         elements,
         timers,
+        runResizeTimer() {
+            const entry = [...timers.entries()].find(([, value]) => value.delay === 100);
+            assert.ok(entry, 'a resize timer must be scheduled');
+            timers.delete(entry[0]);
+            entry[1].callback();
+        },
+        runAnimationFrames() {
+            for (const [id, callback] of animationFrames) {
+                animationFrames.delete(id);
+                callback();
+            }
+        },
         bodyClasses,
         runRecoveryTimer() {
             const entry = [...timers.entries()].find(([, value]) => value.delay > 100);
@@ -231,6 +260,72 @@ function createHarness({
         },
     };
 }
+
+test('session details that reduce terminal space refit after layout and report only owner dimensions', async () => {
+    for (const role of ['owner', 'watcher']) {
+        const harness = createHarness({
+            embedded: true,
+            role,
+            deferredAnimationFrames: true,
+            sessionOverride: { profileLabel: 'Long profile label that wraps the embedded details row' },
+            fitDimensions(elements) {
+                return { cols: 80, rows: elements.get('profile').hidden ? 40 : 38 };
+            },
+        });
+        await flushTasks();
+        assert.equal(JSON.parse(harness.requests[0].options.body).rows, 40);
+        assert.equal(harness.terminal.rows, 40, 'initial dimensions precede the populated details layout');
+        assert.equal(harness.elements.get('profile').hidden, false);
+        harness.runAnimationFrames();
+        await flushTasks();
+        assert.equal(harness.terminal.rows, 38, 'terminal must fit the space left by wrapped session details');
+        assert.equal(harness.elements.get('dimensions').textContent, '80 × 38');
+        const resizes = harness.requests.filter((entry) => entry.url.endsWith('/resize'));
+        assert.equal(resizes.length, role === 'owner' ? 1 : 0);
+        if (role === 'owner') assert.deepEqual(JSON.parse(resizes[0].options.body), { cols: 80, rows: 38 });
+    }
+});
+
+test('disposing before the details layout frame prevents later fitting or resize requests', async () => {
+    const harness = createHarness({ deferredAnimationFrames: true });
+    await flushTasks();
+    harness.windowListeners.get('pagehide')();
+    harness.terminal.rows = 37;
+    harness.elements.get('dimensions').textContent = 'disposed';
+    harness.runAnimationFrames();
+    await flushTasks();
+    assert.equal(harness.elements.get('dimensions').textContent, 'disposed');
+    assert.equal(harness.requests.filter((entry) => entry.url.endsWith('/resize')).length, 0);
+});
+
+test('an unchanged details refit preserves the pending owner resize after slow creation', async () => {
+    let rows = 44;
+    const harness = createHarness({
+        deferredCreate: true,
+        deferredAnimationFrames: true,
+        deferredTimers: true,
+        fitDimensions: () => ({ cols: 166, rows }),
+    });
+    assert.equal(JSON.parse(harness.requests[0].options.body).rows, 44);
+    rows = 21;
+    harness.windowListeners.get('resize')();
+    harness.runResizeTimer();
+    await flushTasks();
+    assert.equal(harness.terminal.rows, 21);
+    assert.equal(harness.requests.filter((entry) => entry.url.endsWith('/resize')).length, 0);
+
+    harness.windowListeners.get('resize')();
+    harness.resolveCreate();
+    await flushTasks();
+    harness.runAnimationFrames();
+    await flushTasks();
+    assert.equal(harness.timers.size, 1, 'the pending report must survive a refit with unchanged local dimensions');
+    harness.runResizeTimer();
+    await flushTasks();
+    const resizes = harness.requests.filter((entry) => entry.url.endsWith('/resize'));
+    assert.equal(resizes.length, 1);
+    assert.deepEqual(JSON.parse(resizes[0].options.body), { cols: 166, rows: 21 });
+});
 
 test('fragment launch is stripped immediately, sent only in JSON, and POST completes before SSE attach', async () => {
     const launch = 'abcdefghijklmnopqrstuvwxyzABCDEF';

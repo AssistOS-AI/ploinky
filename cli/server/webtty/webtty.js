@@ -46,6 +46,7 @@
     let inputTimer = null;
     let inputChain = Promise.resolve();
     let resizeTimer = null;
+    let layoutFrame = null;
     let reconnectTimer = null;
     let reconnectSince = null;
     let reconnectDelay = 1000;
@@ -247,12 +248,16 @@
         }
     });
 
-    async function sendResize() {
-        resizeTimer = null;
+    async function sendResize({ onlyIfChanged = false } = {}) {
+        const previous = boundedDimensions();
         fit();
+        const dimensions = boundedDimensions();
+        if (onlyIfChanged && previous.cols === dimensions.cols && previous.rows === dimensions.rows) return;
+        window.clearTimeout(resizeTimer);
+        resizeTimer = null;
         if (!terminalSessionId || closed || inputStopped || role !== 'owner') return;
         try {
-            await inputMutation(`/webtty/sessions/${encodeURIComponent(terminalSessionId)}/resize`, boundedDimensions());
+            await inputMutation(`/webtty/sessions/${encodeURIComponent(terminalSessionId)}/resize`, dimensions);
         } catch (error) {
             inputFailure(error);
         }
@@ -268,6 +273,8 @@
         closed = true;
         stopInput();
         window.clearTimeout(resizeTimer);
+        window.cancelAnimationFrame(layoutFrame);
+        layoutFrame = null;
         window.clearTimeout(reconnectTimer);
         resizeTimer = reconnectTimer = null;
         eventSource?.close();
@@ -435,6 +442,11 @@
         accessElement.textContent = target.access === 'ro' ? 'Read only folder mapping' : 'Read and write folder mapping';
         accessElement.className = `access-badge access-${target.access}`;
         directoryElement.textContent = target.cwdDisplay;
+        // Populated details can wrap and reduce terminal space without a window resize.
+        layoutFrame = window.requestAnimationFrame(() => {
+            layoutFrame = null;
+            if (!closed) void sendResize({ onlyIfChanged: true });
+        });
         killButton.disabled = false;
         rememberSession();
         announceView();
