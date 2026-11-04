@@ -589,6 +589,18 @@ test('browser auth host binding rejects selector switches and ignores raw candid
     assert.equal(switchedRes.statusCode, 400);
     assert.equal(JSON.parse(switchedRes.body).error, 'auth_route_context_mismatch');
 
+    for (const method of ['GET', 'POST']) {
+        const logoutReq = makeRequest({
+            method,
+            url: '/auth/logout?agent=webAssist',
+            host: 'explorer.localhost:8080',
+        });
+        const logoutRes = new MockResponse();
+        await authHandlers.handleAuthRoutes(logoutReq, logoutRes, new URL(logoutReq.url, 'http://explorer.localhost:8080'), { routePlan });
+        assert.equal(logoutRes.statusCode, 400);
+        assert.equal(JSON.parse(logoutRes.body).error, 'auth_route_context_mismatch');
+    }
+
     const candidatePath = path.join(process.env.PLOINKY_WORKSPACE_ROOT, '.ploinky', 'agents.json');
     const candidate = JSON.parse(readFileSync(candidatePath, 'utf8'));
     candidate.explorer.auth = { mode: 'none' };

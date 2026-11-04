@@ -56,7 +56,9 @@ export function createSessionController({
     }
 
     function bootstrap() {
-        showHistoryGate(!historyLoaded);
+        // Session metadata is optional. Only a requested history load should
+        // cover the chat while an agent that has no session protocol is ready.
+        showHistoryGate(false);
         return Promise.resolve(null);
     }
 

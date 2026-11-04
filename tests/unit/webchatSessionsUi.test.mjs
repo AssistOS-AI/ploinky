@@ -45,6 +45,30 @@ test('formats WebChat session activity as compact relative English time', () => 
     assert.equal(formatRelativeTime('2026-07-12T12:00:00.000Z', now), '1 day ago');
 });
 
+test('agents without session metadata can chat without a permanent history overlay', async (t) => {
+    const originalDocument = globalThis.document;
+    globalThis.document = { addEventListener() {} };
+    t.after(() => { globalThis.document = originalDocument; });
+    const historyGate = makeElement();
+    const sessionsBtn = makeElement();
+    const commands = [];
+    const controller = createSessionController({
+        elements: { historyGate, sessionsBtn },
+        messages: { renderHistory() { assert.fail('No history was supplied by this agent'); } },
+        network: { sendQuickCommand(command) { commands.push(command); } },
+        showBanner() {},
+        hideBanner() {},
+    });
+
+    await controller.bootstrap();
+    assert.equal(historyGate.hidden, true);
+    assert.equal(sessionsBtn.disabled, true);
+    assert.equal(controller.isHistoryLoaded(), false);
+    assert.deepEqual(commands, []);
+    await controller.bootstrap();
+    assert.equal(historyGate.hidden, true);
+});
+
 test('session UI sends AchillesCLI slash commands and renders protocol responses', async () => {
     const originalDocument = globalThis.document;
     const sessionsBtn = makeElement();
@@ -70,7 +94,7 @@ test('session UI sends AchillesCLI slash commands and renders protocol responses
         });
 
         await controller.bootstrap();
-        assert.equal(historyGate.hidden, false);
+        assert.equal(historyGate.hidden, true);
         assert.equal(sessionsBtn.disabled, true);
         controller.handleSessionState(sessionState('current', [{ role: 'user', text: 'Earlier question' }]));
         assert.equal(sessionsBtn.disabled, false);

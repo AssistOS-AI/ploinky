@@ -31,7 +31,8 @@ import { isAdminUser } from '../auth/localService.js';
 import { publishAuthenticatedRequestDecision } from '../auth/authenticatedRequestEvents.mjs';
 import { projectMarketplaceAgent, projectMarketplaceRepository, projectRepositorySource } from './marketplaceProjection.js';
 import { canonicalControlOrigin, verifyAdminMutationRequest } from '../adminControlSecurity.js';
-import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
+import { canonicalBrowserMutationOrigin, verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
+import { createMarketplaceActivationOperations, isMarketplaceOperationId } from './marketplaceActivationOperations.mjs';
 import { resolveAuthContextForRouteKey } from './authContext.js';
 import {
     AUTHENTICATION_UNAVAILABLE_MESSAGE,
@@ -57,6 +58,7 @@ export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
 export const MARKETPLACE_READ_TOOL = 'marketplace.read';
 export const MARKETPLACE_ENABLE_TOOL = 'marketplace.enable_agent';
 const marketplaceAssertionReplayCache = createTokenReplayCache();
+const marketplaceActivationOperations = createMarketplaceActivationOperations();
 
 const SAFE_LIFECYCLE_ERRORS = new Map([
     ['PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED', { status: 503, message: 'Repository operation requires workspace recovery. Stop the exact Box from its host workspace, then start it again.' }],
@@ -177,6 +179,28 @@ function sendMarketplaceError(res, status, code, message = '', details = {}) {
 function safeLifecycleCause(error) {
     const code = String(error?.cause?.code || '');
     return SAFE_LIFECYCLE_ERRORS.has(code) ? { code } : null;
+}
+
+function activationScope(req, routePlan) {
+    const userId = String(req.user?.id || req.user?.userId || req.user?.principalId || '').trim();
+    const context = publicMarketplaceAuthContext(routePlan);
+    const origin = context ? canonicalBrowserMutationOrigin(req, routePlan) : canonicalControlOrigin(req);
+    if (!userId || !origin) return null;
+    return JSON.stringify([req.authMode, userId, origin, context?.boundHostRouteKey || 'control']);
+}
+
+function activationFailure(error) {
+    const code = String(error?.code || '');
+    const contract = SAFE_LIFECYCLE_ERRORS.get(code);
+    const dependencies = (Array.isArray(error?.dependencies) ? error.dependencies : []).slice(0, 64)
+        .filter(item => /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(item?.ref || ''))
+        .map(item => ({ ref: item.ref.slice(0, 256),
+            phase: item.phase === 'after' ? 'after' : 'before',
+            status: ['enabled', 'already-enabled', 'failed', 'queued', 'unavailable'].includes(item.status) ? item.status : 'failed' }));
+    return { code: contract ? code : 'marketplace_action_failed',
+        message: contract?.message || 'Agent activation failed.',
+        ...(safeLifecycleCause(error) ? { cause: safeLifecycleCause(error) } : {}),
+        ...(dependencies.length ? { dependencies } : {}) };
 }
 
 // The dependencies a failed enable had already enabled, as bounded entries.
@@ -822,18 +846,28 @@ async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
     return { ok: false };
 }
 
-export async function handleMarketplaceRoutes(req, res, parsedUrl, {
-    routePlan = null,
-    ensureAdmin = ensureMarketplaceAdmin,
-    enableAgentAction = (body) => enableMarketplaceAgent(body, {
+// Background activation must retain only the admitted lease, never the HTTP
+// handler's parameter environment containing its request and response.
+function createMarketplaceEnableAction(lease) {
+    return (body) => enableMarketplaceAgent(body, {
         beforeEnable: () => {
-            if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+            if (lease?.commit && lease.commit() !== true) {
                 const error = new Error('The routing generation changed before agent activation.');
                 error.code = 'EDGE_GENERATION_CHANGED';
                 throw error;
             }
         },
-    }),
+    });
+}
+
+function createMarketplaceActivationJob(action, body) {
+    return () => action(body);
+}
+
+export async function handleMarketplaceRoutes(req, res, parsedUrl, {
+    routePlan = null,
+    ensureAdmin = ensureMarketplaceAdmin,
+    enableAgentAction = createMarketplaceEnableAction(routePlan?.lease),
     disableAgentAction = (ref) => agentsSvc.disableAgent(ref),
     agentListOptions = {}, // a test's listing observes its own live containers
     collectContainers = collectLiveAgentContainersAsync,
@@ -937,6 +971,20 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });
 
     if (method === 'GET') {
+        if (!isRepos && parsedUrl.searchParams.has('operation')) {
+            res.setHeader('Cache-Control', 'no-store');
+            if (!await ensureAdmin(req, res, parsedUrl, { routePlan })) return true;
+            const id = parsedUrl.searchParams.get('operation');
+            if (parsedUrl.searchParams.getAll('operation').length !== 1 || !isMarketplaceOperationId(id)) {
+                sendMarketplaceError(res, 400, 'invalid_operation');
+                return true;
+            }
+            const scope = activationScope(req, routePlan);
+            const operation = scope ? marketplaceActivationOperations.read(id, scope) : null;
+            if (!operation) sendMarketplaceError(res, 404, 'operation_not_found');
+            else sendJson(res, 200, { ok: true, action: 'enable_agent', operation });
+            return true;
+        }
         if (!await authorizeRead()) return true;
         const marketplace = await marketplacePayload();
         if (marketplace === MARKETPLACE_REQUEST_CLOSED) return true;
@@ -1034,6 +1082,28 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                     ));
                 } else result = await uninstallRepositoryAction(body);
             } else if (action === 'enable_agent') {
+                const prefersAsync = String(req.headers?.prefer || '').split(',').some(value => value.trim().toLowerCase() === 'respond-async');
+                if (!agentRequest && prefersAsync) {
+                    res.setHeader('Cache-Control', 'no-store');
+                    const scope = activationScope(req, routePlan);
+                    if (!scope) {
+                        sendMarketplaceError(res, 403, 'stable_identity_required');
+                        return true;
+                    }
+                    const agentRef = normalizeMarketplaceAgentRef(body?.agentRef);
+                    const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
+                    const activationBody = { action, agentRef, mode };
+                    const operation = marketplaceActivationOperations.start({ scope, agentRef, mode,
+                        run: createMarketplaceActivationJob(enableAgentAction, activationBody), failure: activationFailure });
+                    if (!operation) {
+                        sendMarketplaceError(res, 429, 'marketplace_activation_busy', 'Agent activation queue is full. Retry later.');
+                        return true;
+                    }
+                    res.setHeader('Preference-Applied', 'respond-async');
+                    res.setHeader('Retry-After', '2');
+                    sendJson(res, 202, { ok: true, action, operation });
+                    return true;
+                }
                 ({ result, dependencies } = await enableAgentAction(body));
             } else if (action === 'disable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);

@@ -14,14 +14,15 @@ export function buildWorkspaceDirectoryUrl(workdir, workspaceRoot) {
     }
 }
 
-export function buildLogoutConfirmationUrl(currentUrl, logoutEndpoint) {
+export function buildLogoutConfirmationUrl(currentUrl, logoutEndpoint, { authRouteKey = '' } = {}) {
     const current = new URL(currentUrl);
-    const endpoint = new URL(logoutEndpoint, current.origin);
     const query = new URLSearchParams({
         returnTo: '/auth/logged-out',
         cancelTo: `${current.pathname}${current.search}${current.hash}`,
     });
-    const agent = endpoint.searchParams.get('agent');
+    // The conversation target can differ from the authenticated application.
+    // Only the Router-rendered authentication selector belongs on this URL.
+    const agent = String(authRouteKey || '').trim();
     if (agent) query.set('agent', agent);
     return `/auth/logout?${query.toString()}`;
 }
@@ -107,6 +108,7 @@ export function initDom() {
     const displayName = (body.dataset.title || '').trim();
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
     const agentQuery = (body.dataset.agentQuery || '').trim();
+    const authRouteKey = (body.dataset.authRouteKey || '').trim();
     const workdir = body.dataset.workdir || '';
     // The trusted workspace root admits absolute file references beneath it.
     const workspaceRoot = body.dataset.workspaceRoot || '';
@@ -251,6 +253,7 @@ export function initDom() {
         markdown,
         basePath,
         agentName,
+        authRouteKey,
         displayName: appTitle,
         workdir,
         workspaceRoot,

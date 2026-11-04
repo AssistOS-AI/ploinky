@@ -26,6 +26,7 @@ const {
     dlog,
     markdown,
     basePath,
+    authRouteKey,
     workspaceBase,
     workspaceRoot,
     toEndpoint,
@@ -651,7 +652,7 @@ function handleLogout() {
     if (!logoutBtn) return;
     // The Router's confirmed POST owns logout. Opening its GET must not clear
     // the chat session or stop its connection before the user chooses Sign out.
-    window.location.href = buildLogoutConfirmationUrl(window.location.href, toEndpoint('logout'));
+    window.location.href = buildLogoutConfirmationUrl(window.location.href, toEndpoint('logout'), { authRouteKey });
 }
 
 if (logoutBtn) {

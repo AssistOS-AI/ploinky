@@ -292,6 +292,18 @@ test('H1 host-bound WebChat binds no selector to the host root, not the static a
     const page = await chain('/webchat/', { plan: hostPlan(snapshot), cookie: 'ploinky_sso=sso-all', appConfig, appState });
     assert.equal(page.handled.statusCode, 200);
     assert.match(page.handled.body, /data-agent="hostRoot"/);
+    assert.match(page.handled.body, /data-auth-route-key=""/);
+    const targetPage = await chain('/webchat/?agent=dependency', {
+        plan: hostPlan(snapshot), cookie: 'ploinky_sso=sso-all', appConfig, appState,
+    });
+    assert.equal(targetPage.handled.statusCode, 200);
+    assert.match(targetPage.handled.body, /data-agent="dependency"/);
+    assert.match(targetPage.handled.body, /data-auth-route-key=""/);
+    const controlPage = await chain('/webchat/?agent=dependency', {
+        plan: controlPlan(snapshot), cookie: 'ploinky_sso=sso-all', appConfig, appState,
+    });
+    assert.equal(controlPage.handled.statusCode, 200);
+    assert.match(controlPage.handled.body, /data-auth-route-key="explorer"/);
     const stream = await chain('/webchat/stream?tabId=t1&pageInstanceId=p1', {
         plan: hostPlan(snapshot), cookie: 'ploinky_sso=sso-all', appConfig, appState,
     });

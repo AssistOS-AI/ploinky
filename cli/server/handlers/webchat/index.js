@@ -272,6 +272,7 @@ export async function handleWebChat(req, res, appConfig, appState) {
             '__RUNTIME__': effectiveConfig.runtime || 'local',
             '__BASE_PATH__': `/${appName}`,
             '__AGENT_QUERY__': agentQuery,
+            '__AUTH_ROUTE_KEY__': escapeHtmlAttribute(req.edgeAuthContext?.boundHostRouteKey ? '' : req.edgeAuthContext?.routeKey || ''),
             '__WORKDIR__': escapeHtmlAttribute(workspaceBase.base),
             '__WORKSPACE_ROOT__': escapeHtmlAttribute(workspaceBase.root),
             '__WORKSPACE_BASE__': encodeURIComponent(workspaceBase.relativeBase || ''),
