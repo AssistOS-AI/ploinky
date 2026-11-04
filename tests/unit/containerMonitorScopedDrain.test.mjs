@@ -201,6 +201,34 @@ test('A8 a withdrawal that cannot be proven falls back to global inactivation', 
     assert.deepEqual(inactivations, ['continuous-runtime-probe-failed:bridgeAgent-container']);
 });
 
+test('A8 a runtime already held by an operator drain never inactivates the other routes', () => {
+    seedWorkspace();
+    edge.withEdgeGenerationApplyLock((applyLockCapability) => edge.commitWithdrawalEdgeRoutingGeneration({
+        withdraw: [{ containerName: 'bridgeAgent-container', mode: 'drain' }],
+        reason: 'a8-operator-drain',
+        workspaceRoot: workspace,
+        applyLockCapability,
+    }), { workspaceRoot: workspace });
+    const before = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    assert.equal(before.generation.routing.routes.bridgeAgent.draining, true);
+    assert.equal(before.generation.routing.routes.bridgeAgent.drainOwner, undefined);
+    // The real inactivation runs, so the selector below is the proof.
+    const { monitor, target, events } = monitorFor('bridgeAgent', {
+        inactivateEdgeRoutingGeneration: undefined,
+    });
+    failProbe(monitor, target);
+    clearRestart(target);
+    const after = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    assert.equal(after.selector.state, 'active');
+    assert.equal(after.selector.generation, before.selector.generation);
+    assert.deepEqual(after.generation.routing.routes.otherAgent, before.generation.routing.routes.otherAgent);
+    assert.equal(after.generation.routing.routes.bridgeAgent.draining, true);
+    assert.equal(after.generation.routing.routes.bridgeAgent.drainOwner, undefined, 'the operator keeps the drain');
+    assert.ok(events.some(({ event }) => event === 'container_probe_withdrawal_held'));
+    assert.ok(!events.some(({ event }) => event === 'container_probe_withdrawal_refused'));
+    assert.equal(target.pendingScopedDrain, null);
+});
+
 test('A8 a contended withdrawal is deferred, never global, and a later tick drains the same runtime', () => {
     seedWorkspace();
     let refusals = 1;

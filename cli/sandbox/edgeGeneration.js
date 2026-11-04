@@ -3784,9 +3784,12 @@ export function commitWithdrawalEdgeRoutingGeneration({
 
 /**
  * Classify a refused withdrawal. Lock or preparation contention is retried by
- * its owner (`defer`); anything else falls back to global inactivation.
+ * its owner (`defer`). A route an operator drain already withdrew from the
+ * active generation stays out of service (`held`). Anything else falls back to
+ * global inactivation.
  */
 export function edgeWithdrawalRefusalDisposition(error) {
+    if (error?.code === 'EDGE_WITHDRAWAL_OPERATOR_DRAIN') return 'held';
     return ['EDGE_PREPARATION_BUSY', 'EDGE_GENERATION_BUSY'].includes(error?.code) ? 'defer' : 'global';
 }
 

@@ -461,8 +461,9 @@ function activeProbeWorkerCount(monitor) {
 // Withdraw only the failing runtime's routes from the active generation (D6).
 // Its drain owner admits the restart scheduled next; its identity stays valid
 // until that replacement commits. Contention defers the drain to a later tick
-// (RF-N3); only a withdrawal that cannot be proven falls back to global
-// inactivation (D7).
+// (RF-N3). A route an operator drain already holds is out of service, so the
+// other routes stay up. Only a withdrawal that cannot be proven falls back to
+// global inactivation (D7).
 function withdrawFailedRuntime(monitor, target) {
     const owner = target.instanceId && target.enableGeneration
         ? Object.freeze({
@@ -489,7 +490,18 @@ function withdrawFailedRuntime(monitor, target) {
             });
             return 'drained';
         } catch (error) {
-            if (edgeWithdrawalRefusalDisposition(error) === 'defer') {
+            const disposition = edgeWithdrawalRefusalDisposition(error);
+            if (disposition === 'held') {
+                target.pendingScopedDrain = null;
+                logEvent(monitor, 'warn', 'container_probe_withdrawal_held', {
+                    container: target.containerName,
+                    agent: target.agentName,
+                    repo: target.repoName,
+                    code: error?.code || null,
+                });
+                return 'held';
+            }
+            if (disposition === 'defer') {
                 target.pendingScopedDrain = owner;
                 logEvent(monitor, 'info', 'container_probe_withdrawal_deferred', {
                     container: target.containerName,

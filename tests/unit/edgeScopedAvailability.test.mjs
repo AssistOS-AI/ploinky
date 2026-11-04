@@ -555,6 +555,7 @@ test('A5 a withdrawal refuses an unknown runtime, an outstanding preparation and
     assert.equal(edge.edgeWithdrawalRefusalDisposition({ code: 'EDGE_PREPARATION_BUSY' }), 'defer');
     assert.equal(edge.edgeWithdrawalRefusalDisposition({ code: 'EDGE_GENERATION_BUSY' }), 'defer');
     assert.equal(edge.edgeWithdrawalRefusalDisposition({ code: 'EDGE_WITHDRAWAL_NOT_SUBSET' }), 'global');
+    assert.equal(edge.edgeWithdrawalRefusalDisposition({ code: 'EDGE_WITHDRAWAL_OPERATOR_DRAIN' }), 'held');
 });
 
 test('A5 a failure before the selector commit restores the predecessor sources and keeps it active', () => {

@@ -15,7 +15,8 @@ import {
     stopAndRemove,
     stopAndRemoveMany,
     cleanupExactAgentRuntimeCandidate,
-    ensureAgentService
+    ensureAgentService,
+    assertAgentServiceNotDraining,
 } from '../sandbox/docker/index.js';
 import { findAgent } from './utils.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
@@ -901,7 +902,14 @@ export function prepareAgentEnableBatch(requests, {
                     // A drain that succeeded leaves the route drained; the
                     // inactive replacement below stages the plan's undrained
                     // route, so it may still take over.
-                    if (preparedGeneration || edgeWithdrawalRefusalDisposition(error) === 'defer') throw error;
+                    const disposition = edgeWithdrawalRefusalDisposition(error);
+                    // An operator drain that appeared after enable's preflight.
+                    if (disposition === 'held') {
+                        throw Object.assign(new Error(
+                            `agent '${withdrawn.plan.containerName}' still requires an acknowledged targeted drain; enable is blocked`,
+                        ), { code: 'PLOINKY_AGENT_DRAINING', cause: error });
+                    }
+                    if (preparedGeneration || disposition === 'defer') throw error;
                 }
             }
             if (preparedGeneration) {
@@ -1008,9 +1016,13 @@ export function previewAgentEnable(request, {
 export async function withMpsEnablePreparation(request, stage, {
     network = withNetworkLifecycleLock, preview = previewAgentEnable,
     loadMps = () => import('../sandbox/hardwareLimits/mpsLifecycle.mjs'),
+    assertNotDraining = assertAgentServiceNotDraining,
 } = {}) {
     return network(async (networkLifecycleCapability) => {
         const { plan, predecessor } = preview(request);
+        // The launch would refuse an operator drain anyway. Refuse before anything
+        // is retired or inactivated, so the other routes stay served.
+        assertNotDraining(plan.containerName, { expectedPredecessor: registeredRuntimeTuple(predecessor) });
         const mps = await loadMps();
         const mpsLaunch = await mps.prepareMpsClientLaunch({ key: plan.containerName, record: predecessor || plan.record }, {
             desiredRecord: plan.record, networkLifecycleCapability,
