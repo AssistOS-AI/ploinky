@@ -85,6 +85,88 @@ test('session snapshot includes different groups only under an exact continuous 
     assert.equal(snapshot[1].startToken, child.startToken);
 });
 
+test('session scans ignore valid namespace SID zero while retaining exact owned members', async () => {
+    const namespaceHidden = identity(1657, { sessionId: 0, ttyNumber: 0 });
+    const unrelated = identity(6000);
+    const snapshot = await capturePtySessionSnapshot(shell, sessionFixture(new Map([
+        [namespaceHidden.pid, namespaceHidden], [shell.pid, shell],
+        [child.pid, child], [unrelated.pid, unrelated],
+    ])));
+    assert.deepEqual(snapshot.map((member) => member.pid), [shell.pid, child.pid]);
+    assert.ok(Object.isFrozen(snapshot) && snapshot.every(Object.isFrozen));
+    assert.ok(snapshot.every((member) => member.sessionId === shell.sessionId));
+});
+
+test('valid namespace SID zero does not prevent proof of an empty owned session', async () => {
+    const namespaceHidden = identity(1657, { sessionId: 0, ttyNumber: 0 });
+    const unrelated = identity(6000);
+    const members = new Map([[namespaceHidden.pid, namespaceHidden], [unrelated.pid, unrelated]]);
+    assert.deepEqual(await capturePtySessionSnapshot(shell, sessionFixture(members)), []);
+    members.set(child.pid, child);
+    await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(members)), {
+        category: 'session-anchor-missing',
+    });
+});
+
+test('unrelated scan observations require valid numeric session IDs before exclusion', async () => {
+    for (const sessionId of [undefined, null, '0', '6000', NaN, Infinity, -Infinity,
+        -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+        const unrelated = { ...identity(6000), sessionId };
+        await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(new Map([
+            [shell.pid, shell], [6000, unrelated],
+        ]))), { category: 'session-id' }, `sessionId=${String(sessionId)}`);
+    }
+});
+
+test('unrelated and SID zero observations retain PID, state and start-token validation', async () => {
+    for (const sessionId of [0, 6000]) {
+        for (const invalid of [
+            { pid: 0 }, { pid: -1 }, { pid: Number.MAX_SAFE_INTEGER + 1 }, { pid: 6001 },
+            { state: undefined }, { state: '' }, { state: '?' }, { state: 'SS' },
+            { startToken: undefined }, { startToken: '' }, { startToken: 'linux-proc:0' },
+            { startToken: 'malformed' },
+        ]) {
+            const unrelated = { ...identity(6000), sessionId, ...invalid };
+            await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(new Map([
+                [shell.pid, shell], [6000, unrelated],
+            ]))), { code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN' }, JSON.stringify({ sessionId, ...invalid }));
+        }
+    }
+});
+
+test('only stale unrelated proc disappearance is skippable during a session scan', async () => {
+    const readFailure = (fail) => sessionFixture(new Map([[shell.pid, shell]]), {
+        entries: [String(shell.pid), '6000'],
+        read: (pid) => pid === shell.pid ? shell : fail(),
+    });
+    const snapshot = await capturePtySessionSnapshot(shell, readFailure(gone));
+    assert.deepEqual(snapshot.map((member) => member.pid), [shell.pid]);
+    await assert.rejects(() => capturePtySessionSnapshot(shell, readFailure(() => {
+        throw Object.assign(new Error('denied'), { code: 'EACCES' });
+    })), { code: 'EACCES' });
+    await assert.rejects(() => capturePtySessionSnapshot(shell, readFailure(() => {
+        return parseLinuxProcessStat('malformed', 6000);
+    })), { category: 'proc-stat' });
+});
+
+test('owned targets, trusted anchors and signal revalidation still refuse SID zero', async () => {
+    const hiddenShell = { ...shell, sessionId: 0 };
+    await assert.rejects(() => capturePtySessionSnapshot(hiddenShell, sessionFixture(new Map())), {
+        category: 'session-id',
+    });
+    await assert.rejects(() => capturePtySessionSnapshot(shell, {
+        ...sessionFixture(new Map()), anchors: [hiddenShell],
+    }), { category: 'session-id' });
+    await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(new Map([
+        [shell.pid, hiddenShell],
+    ]))), { category: 'session-id' });
+    assert.throws(() => signalExactPtySessionSnapshot([shell], 'SIGTERM', {
+        deadlineAt: 100, nowImpl: () => 0,
+        readIdentityImpl: () => hiddenShell,
+        killImpl: () => assert.fail('SID zero must not authorize a signal'),
+    }), { category: 'session-id' });
+});
+
 test('session scan refuses unanchored, replaced and disappearing anchors', async () => {
     const members = new Map([[child.pid, child]]);
     await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(members)), {
@@ -102,6 +184,14 @@ test('session scan refuses unanchored, replaced and disappearing anchors', async
             return pid === shell.pid ? shell : child;
         },
     })), { code: 'WEBTTY_PROCESS_IDENTITY_STALE' });
+    reads = 0;
+    await assert.rejects(() => capturePtySessionSnapshot(shell, sessionFixture(members, {
+        entries: [String(shell.pid), String(child.pid)],
+        read: (pid) => {
+            if (pid === shell.pid && ++reads === 3) return identity(shell.pid, { startTicks: '9999' });
+            return pid === shell.pid ? shell : child;
+        },
+    })), { category: 'session-anchor-changed' });
 });
 
 test('captured child can preserve continuity after shell exit, but SID alone cannot', async () => {

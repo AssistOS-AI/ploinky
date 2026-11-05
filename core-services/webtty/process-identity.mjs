@@ -266,10 +266,13 @@ export const PTY_SESSION_CLEANUP_MS = 1_500;
 const TERM_PHASE_MS = 750;
 const EMPTY_SCAN_INTERVAL_MS = 25;
 
-function sessionIdentity(value, sessionId) {
+function sessionObservation(value, pid) {
     positiveInteger(value?.pid, 'session-pid');
-    positiveInteger(value?.sessionId, 'session-id');
-    if (value.sessionId !== sessionId
+    // A visible process can have SID zero when its session is outside this PID namespace.
+    if (!Number.isSafeInteger(value?.sessionId) || value.sessionId < 0) {
+        throw processIdentityError('session-id');
+    }
+    if (value.pid !== pid
         || typeof value.startToken !== 'string'
         || !/^linux-proc:[1-9][0-9]*$/.test(value.startToken)
         || typeof value.state !== 'string' || !/^[RSDZTtXxKWPI]$/.test(value.state)) {
@@ -279,6 +282,13 @@ function sessionIdentity(value, sessionId) {
         pid: value.pid, startToken: value.startToken, sessionId: value.sessionId,
         state: value.state,
     });
+}
+
+function sessionIdentity(value, sessionId) {
+    positiveInteger(value?.pid, 'session-pid');
+    positiveInteger(value?.sessionId, 'session-id');
+    if (value.sessionId !== sessionId) throw processIdentityError('session-identity');
+    return sessionObservation(value, value.pid);
 }
 
 function sameSessionIdentity(current, expected) {
@@ -400,7 +410,7 @@ export async function capturePtySessionSnapshot(record, {
             const pid = positiveInteger(Number(entry.name), 'proc-pid');
             try {
                 const current = await read(pid);
-                const member = sessionIdentity(current, current.sessionId);
+                const member = sessionObservation(current, pid);
                 if (member.sessionId === sessionId && member.state !== 'Z') members.push(member);
             } catch (error) {
                 if (error?.code !== 'WEBTTY_PROCESS_IDENTITY_STALE') throw error;
