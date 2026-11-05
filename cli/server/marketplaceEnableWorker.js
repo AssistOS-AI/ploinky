@@ -5,6 +5,8 @@ import { validateHardwareOutcome } from '../sandbox/hardwareLimits/errors.mjs';
 import { retainWorkspaceMutationLeaseForRecovery } from '../utils/runtime/maintenanceLocks.js';
 
 const MARKETPLACE_ENABLE_WORKER_URL = new URL('./marketplaceEnableWorkerThread.js', import.meta.url);
+export const MARKETPLACE_ENABLE_RECOVERY_INSTRUCTION = 'Workspace recovery is required: child processes or installer runtimes may still run. '
+    + 'Stop the exact Box from its host workspace, then start it again; its mutation lease is retained.';
 // Marketplace performs the same cold image installation as background startup.
 // Its outer watchdog must include the sanctioned image-operation budgets.
 export const MARKETPLACE_ENABLE_TIMEOUT_MS = resolveNoWaitBarrierTimeouts().activeTimeoutMs;
@@ -59,8 +61,7 @@ export function runMarketplaceEnableWorker({ agentRef, mode, alias, profile, ifM
             abnormalEnd = true;
             retainWorkerLease();
             error.recoveryRequired = true;
-            error.message += ' Workspace recovery is required: child processes or installer runtimes may still run. '
-                + 'Stop the exact Box from its host workspace, then start it again; its mutation lease is retained.';
+            error.message += ` ${MARKETPLACE_ENABLE_RECOVERY_INSTRUCTION}`;
             return error;
         };
         const worker = new WorkerClass(workerUrl, {

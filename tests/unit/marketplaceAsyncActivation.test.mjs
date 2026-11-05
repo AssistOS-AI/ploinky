@@ -11,10 +11,12 @@ const previousKey = process.env.PLOINKY_MASTER_KEY;
 process.chdir(workspace);
 process.env.PLOINKY_MASTER_KEY = '6'.repeat(64);
 fs.mkdirSync('.ploinky');
-const { handleMarketplaceRoutes, enableMarketplaceAgent } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
+const { handleMarketplaceRoutes, enableMarketplaceAgent, __testables } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
 const { createMarketplaceActivationOperations } = await import('../../cli/server/authHandlers/marketplaceActivationOperations.mjs');
 const { authService, SSO_AUTH_COOKIE_NAME } = await import('../../cli/server/authHandlers/shared.js');
 const { mintBrowserCsrfToken } = await import('../../cli/server/browserMutationSecurity.js');
+const { HardwareLimitsError, HARDWARE_UNENFORCEABLE, formatHardwareOutcome } = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
+const { MARKETPLACE_ENABLE_RECOVERY_INSTRUCTION } = await import('../../cli/server/marketplaceEnableWorker.js');
 const originalConfigured = authService.isConfigured;
 const originalValidate = authService.validateSession;
 const admin = { sessionId: 'fixture-admin', user: { id: 'admin', roles: ['admin'] } };
@@ -124,6 +126,100 @@ test('terminal failure exposes only safe bounded lifecycle and dependency inform
     const unknown = await response({ enableAgentAction: () => { throw new Error('/SECRET_CANARY'); } });
     await flush();
     assert.equal((await read(unknown.body.operation.id)).body.operation.error.message, 'Agent activation failed.');
+});
+
+const hardwareRefusal = () => ({
+    state: 'refused', code: HARDWARE_UNENFORCEABLE, reasonCode: 'controller_unavailable',
+    key: 'ploinky_demo_agent', ref: 'demo/agent', alias: null, inputFingerprint: 'a'.repeat(64),
+    reason: 'The memory controller is not delegated.', fix: 'Apply the delegation commands, then run ploinky restart.',
+    requested: [{ field: 'memory', value: '512m', source: 'manifest' }], blockedBy: null,
+    rootCause: { key: 'ploinky_demo_agent', ref: 'demo/agent', field: 'memory', reason: 'The memory controller is not delegated.', fix: 'Apply the delegation commands, then run ploinky restart.' },
+    causalPath: ['ploinky_demo_agent'], omittedPathCount: 0, additionalCauseCount: 0,
+});
+
+async function failedOperation(error) {
+    const accepted = await response({ enableAgentAction: async () => { throw error; } });
+    assert.equal(accepted.status, 202);
+    await flush();
+    const failed = await read(accepted.body.operation.id);
+    assert.equal(failed.body.operation.state, 'failed');
+    return failed.body.operation.error;
+}
+
+test('a hardware refusal keeps its typed outcome and fix text, directly or as a cause', async () => {
+    const outcome = hardwareRefusal();
+    const direct = await failedOperation(new HardwareLimitsError(outcome));
+    assert.equal(direct.code, HARDWARE_UNENFORCEABLE);
+    assert.equal(direct.message, formatHardwareOutcome(outcome));
+    assert.match(direct.message, /Apply the delegation commands, then run ploinky restart\./);
+    assert.equal(direct.hardwareOutcome.reasonCode, outcome.reasonCode);
+    const nested = await failedOperation(new Error('/SECRET_CANARY wrapper', { cause: new HardwareLimitsError(outcome) }));
+    assert.equal(nested.message, formatHardwareOutcome(outcome));
+    assert.doesNotMatch(JSON.stringify(nested), /SECRET_CANARY/);
+    // The asynchronous receipt reports what the synchronous response reports.
+    const synchronous = await response({ prefer: false, enableAgentAction: async () => { throw new HardwareLimitsError(outcome); } });
+    assert.equal(synchronous.status, 422);
+    assert.equal(direct.message, synchronous.body.message);
+});
+
+test('an invalid hardware outcome stays generic and does not strand the receipt', async () => {
+    const failure = await failedOperation(Object.assign(new Error('/SECRET_CANARY'), { hardwareOutcome: { state: 'refused', reason: '/SECRET_CANARY' } }));
+    assert.equal(failure.code, 'marketplace_action_failed');
+    assert.equal(failure.message, 'Agent activation failed.');
+    assert.equal(failure.hardwareOutcome, undefined);
+});
+
+test('a recovery-required failure tells the operator how to recover, without the raw worker text', async () => {
+    const workerFailed = await failedOperation(Object.assign(new Error('/SECRET_CANARY worker exited (9).'), {
+        code: 'PLOINKY_MARKETPLACE_ENABLE_WORKER_FAILED', recoveryRequired: true,
+    }));
+    assert.equal(workerFailed.code, 'PLOINKY_MARKETPLACE_ENABLE_WORKER_FAILED');
+    assert.equal(workerFailed.message, `Agent activation failed. ${MARKETPLACE_ENABLE_RECOVERY_INSTRUCTION}`);
+    assert.equal(workerFailed.recoveryRequired, true);
+    assert.doesNotMatch(JSON.stringify(workerFailed), /SECRET_CANARY/);
+    const timedOut = await failedOperation(Object.assign(new Error('/SECRET_CANARY exceeded'), {
+        code: 'PLOINKY_MARKETPLACE_ENABLE_TIMEOUT', recoveryRequired: true,
+    }));
+    assert.equal(timedOut.code, 'PLOINKY_MARKETPLACE_ENABLE_TIMEOUT');
+    assert.equal(timedOut.message, `Agent activation timed out. ${MARKETPLACE_ENABLE_RECOVERY_INSTRUCTION}`);
+    const nested = await failedOperation(new Error('wrapper', { cause: Object.assign(new Error('/SECRET_CANARY'), { recoveryRequired: true }) }));
+    assert.equal(nested.recoveryRequired, true);
+    assert.equal(nested.code, 'marketplace_action_failed');
+    assert.match(nested.message, /Workspace recovery is required/);
+    // A value other than true, or an unrelated worker code, claims nothing.
+    const claimed = await failedOperation(Object.assign(new Error('/SECRET_CANARY'), { code: 'SOME_OTHER_CODE', recoveryRequired: 'yes' }));
+    assert.deepEqual([claimed.code, claimed.message, claimed.recoveryRequired], ['marketplace_action_failed', 'Agent activation failed.', undefined]);
+});
+
+test('the synchronous timeout response also carries the recovery instruction', async () => {
+    const synchronous = await response({ prefer: false, enableAgentAction: async () => {
+        throw Object.assign(new Error('/SECRET_CANARY exceeded'), { code: 'PLOINKY_MARKETPLACE_ENABLE_TIMEOUT', recoveryRequired: true });
+    } });
+    assert.equal(synchronous.status, 504);
+    assert.equal(synchronous.body.message, `Agent activation timed out. ${MARKETPLACE_ENABLE_RECOVERY_INSTRUCTION}`);
+    assert.doesNotMatch(JSON.stringify(synchronous.body), /SECRET_CANARY/);
+});
+
+test('a retry blocked by a retained lease reports recovery without the raw lease text', async () => {
+    const retained = () => Object.assign(new Error('Lease /SECRET_CANARY/lock requires recovery.'), { code: 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED' });
+    const receipt = await failedOperation(retained());
+    assert.equal(receipt.code, 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED');
+    assert.match(receipt.message, /workspace recovery is required\. Stop the exact Box from its host workspace, then start it again\.$/);
+    assert.doesNotMatch(JSON.stringify(receipt), /SECRET_CANARY/);
+    const synchronous = await response({ prefer: false, enableAgentAction: async () => { throw retained(); } });
+    assert.equal(synchronous.status, 503);
+    assert.equal(synchronous.body.message, receipt.message);
+    assert.doesNotMatch(JSON.stringify(synchronous.body), /SECRET_CANARY/);
+});
+
+test('repository recovery keeps its own message without the enable-worker lease claim', () => {
+    let sent;
+    const res = { setHeader() {}, writeHead(status) { sent = { status }; }, end(body) { sent.body = JSON.parse(body); } };
+    const error = Object.assign(new Error('raw'), { code: 'PLOINKY_MARKETPLACE_REPOSITORY_RECOVERY_REQUIRED', recoveryRequired: true });
+    assert.equal(__testables.sendLifecycleError(res, error), true);
+    assert.equal(sent.status, 503);
+    assert.doesNotMatch(sent.body.message, /mutation lease is retained/);
+    assert.equal(sent.body.message.match(/Stop the exact Box/g).length, 1);
 });
 
 test('an accepted queued activation fails the original generation fence before starting its worker', async () => {

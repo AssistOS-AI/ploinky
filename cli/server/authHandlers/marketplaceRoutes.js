@@ -43,7 +43,7 @@ import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHas
 import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { replayRefusalStatus } from '../../../Agent/lib/replayCache.mjs';
-import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
+import { MARKETPLACE_ENABLE_RECOVERY_INSTRUCTION, runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { repositoryWorkerEligible, runMarketplaceRepositoryWorker } from '../marketplaceRepositoryWorker.mjs';
 import { diagnosticIdentity } from '../marketplaceRepositoryDiagnostics.mjs';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
@@ -72,6 +72,7 @@ const SAFE_LIFECYCLE_ERRORS = new Map([
     ['PLOINKY_BWRAP_CAPABILITY_UNAVAILABLE', { status: 422, message: 'The required Bubblewrap capability is unavailable.' }],
     ['PLOINKY_OPEN_INTERPRETER_BOX_UNAVAILABLE', { status: 422, message: 'Open Interpreter is unavailable in this Ploinky Box.' }],
     ['PLOINKY_MARKETPLACE_ENABLE_TIMEOUT', { status: 504, message: 'Agent activation timed out.' }],
+    ['PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED', { status: 503, message: 'A previous workspace change did not finish cleanly, so workspace recovery is required. Stop the exact Box from its host workspace, then start it again.' }],
     ['PLOINKY_AGENT_ENABLE_MODE_UNSUPPORTED', { status: 422, message: 'The agent does not support the selected run mode.' }],
     ['PLOINKY_MANIFEST_ENABLE_MODES_INVALID', { status: 422, message: 'The agent manifest declares invalid enable modes.' }],
     ['MARKETPLACE_DEPENDENCY_UNAVAILABLE', { status: 422, message: 'A required manifest dependency of the agent is unavailable.' }],
@@ -181,6 +182,21 @@ function safeLifecycleCause(error) {
     return SAFE_LIFECYCLE_ERRORS.has(code) ? { code } : null;
 }
 
+// A timed-out or abnormally ended worker may leave child processes behind and
+// retains the mutation lease, so the recovery instruction outlives any safe message.
+function requiresWorkspaceRecovery(error) {
+    let current = error;
+    for (let depth = 0; current && depth < 8; depth += 1) {
+        if (current.recoveryRequired === true) return true;
+        current = current.cause;
+    }
+    return false;
+}
+
+function withRecoveryInstruction(message, error) {
+    return requiresWorkspaceRecovery(error) ? `${message} ${MARKETPLACE_ENABLE_RECOVERY_INSTRUCTION}` : message;
+}
+
 function activationScope(req, routePlan) {
     const userId = String(req.user?.id || req.user?.userId || req.user?.principalId || '').trim();
     const context = publicMarketplaceAuthContext(routePlan);
@@ -197,8 +213,16 @@ function activationFailure(error) {
         .map(item => ({ ref: item.ref.slice(0, 256),
             phase: item.phase === 'after' ? 'after' : 'before',
             status: ['enabled', 'already-enabled', 'failed', 'queued', 'unavailable'].includes(item.status) ? item.status : 'failed' }));
-    return { code: contract ? code : 'marketplace_action_failed',
-        message: contract?.message || 'Agent activation failed.',
+    const hardwareOutcome = findHardwareOutcome(error);
+    if (hardwareOutcome) {
+        return { code: hardwareOutcome.code, message: formatHardwareOutcome(hardwareOutcome), hardwareOutcome,
+            ...(dependencies.length ? { dependencies } : {}) };
+    }
+    const recoveryRequired = requiresWorkspaceRecovery(error);
+    const workerFailed = recoveryRequired && code === 'PLOINKY_MARKETPLACE_ENABLE_WORKER_FAILED';
+    return { code: contract || workerFailed ? code : 'marketplace_action_failed',
+        message: withRecoveryInstruction(contract?.message || 'Agent activation failed.', error),
+        ...(recoveryRequired ? { recoveryRequired } : {}),
         ...(safeLifecycleCause(error) ? { cause: safeLifecycleCause(error) } : {}),
         ...(dependencies.length ? { dependencies } : {}) };
 }
@@ -225,7 +249,8 @@ function sendLifecycleError(res, error) {
     const code = String(error?.code || '');
     const contract = SAFE_LIFECYCLE_ERRORS.get(code);
     if (!contract) return false;
-    sendMarketplaceError(res, contract.status, code, contract.message, {
+    const message = code === 'PLOINKY_MARKETPLACE_ENABLE_TIMEOUT' ? withRecoveryInstruction(contract.message, error) : contract.message;
+    sendMarketplaceError(res, contract.status, code, message, {
         cause: safeLifecycleCause(error),
         ...dependencyDetail(error),
     });
