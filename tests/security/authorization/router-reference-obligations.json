@@ -4733,6 +4733,33 @@
             "anchor": "pathname === '/api/edge/turn-credentials'",
             "statement": "if (pathname === '/api/edge/turn-credentials') {"
           }
+        },
+        "e1a964590066942938e55cb013416495a129a90edf05fba0b68dfa8cbd036c70": {
+          "agent-additional-http.*": {
+            "line": 196,
+            "anchor": "function agentPortPlan({",
+            "statement": "export function agentPortPlan({"
+          },
+          "private-workspace-logs.post": {
+            "line": 808,
+            "anchor": "pathname === '/api/edge/workspace-logs'",
+            "statement": "if (pathname === '/api/edge/workspace-logs') {"
+          },
+          "private-workspace-metrics.get": {
+            "line": 826,
+            "anchor": "pathname === '/api/edge/workspace-metrics'",
+            "statement": "if (pathname === '/api/edge/workspace-metrics') {"
+          },
+          "private-runtime-origins.get": {
+            "line": 844,
+            "anchor": "pathname === '/api/edge/runtime-origins'",
+            "statement": "if (pathname === '/api/edge/runtime-origins') {"
+          },
+          "private-turn-credentials.post": {
+            "line": 865,
+            "anchor": "pathname === '/api/edge/turn-credentials'",
+            "statement": "if (pathname === '/api/edge/turn-credentials') {"
+          }
         }
       },
       "candidate": "ca3a2b27e4bf09a7812725c5d23e68764b49b2dc78c34dc08162699207c9d4d8"

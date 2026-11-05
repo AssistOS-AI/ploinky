@@ -12,6 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // Namespace imports: a missing export fails each case instead of the module link.
 import * as edge from '../../cli/sandbox/edgeGeneration.js';
 import * as authContext from '../../cli/server/authHandlers/authContext.js';
+import { dispatchAgentStartupAfterRouterSurfaces } from '../../cli/server/agentStartupDispatch.js';
 import { sanitizeRequestHeaders } from '../../cli/server/proxy/sanitizeRequestHeaders.js';
 import { assertMutationAllowed } from '../../cli/server/proxy/executeHttpPlan.js';
 import { buildHttpRouteAuthInfoHeader } from '../../cli/server/routerHandlers.js';
@@ -306,6 +307,84 @@ test('root host dispatch follows the C3 precedence table', (t) => {
         assert.notEqual(world.plan(url).routeKey, 'explorer', url);
     }
     assert.equal(world.plan('/', 'unknown.synthetic.test').code, 'UNKNOWN_HOST');
+});
+
+// Explorer proves an agent's route with this header on `/<routeKey>/` before it
+// opens any panel, and the root application must never be the one to answer it.
+const STARTUP_PROBE = Object.freeze({ 'x-ploinky-agent-startup-probe': '1' });
+
+test('the agent startup probe matches a host without a root application for closure agents', (t) => {
+    const world = domainFixture(t);
+    for (const routeKey of ['provider', 'mailer', 'unrelated', 'bizanso']) {
+        const plan = world.plan(`/${routeKey}/`, rootHost, 'http', 'GET', STARTUP_PROBE);
+        const sibling = world.plan(`/${routeKey}/`, siblingHost, 'http', 'GET', STARTUP_PROBE);
+        for (const key of ['kind', 'routeKey', 'upstreamPath', 'canonicalPath', 'decision', 'target']) {
+            assert.deepEqual(plan[key], sibling[key], `${routeKey} ${key}`);
+        }
+        assert.equal(plan.kind, 'agent-root', routeKey);
+        assert.equal(plan.routeKey, 'explorer', routeKey);
+    }
+    assert.equal(world.plan('/%70rovider/', rootHost, 'http', 'GET', STARTUP_PROBE).kind, 'agent-root');
+});
+
+test('everything but an exact startup probe stays with the root application', (t) => {
+    const world = domainFixture(t);
+    const stays = (url, { method = 'GET', transport = 'http', headers = STARTUP_PROBE } = {}) => {
+        const plan = world.plan(url, rootHost, transport, method, headers);
+        assert.equal(plan.kind, 'agent-port', `${method} ${url} ${transport}`);
+        assert.equal(plan.routeKey, 'bizanso', `${method} ${url} ${transport}`);
+    };
+    stays('/provider/', { headers: {} });
+    stays('/provider/', { headers: { 'x-ploinky-agent-startup-probe': '2' } });
+    stays('/provider/', { headers: { 'x-ploinky-agent-startup-probe': ['1', '1'] } });
+    // A bearer request skips the startup slot and would otherwise reach the agent itself.
+    stays('/provider/', { headers: { ...STARTUP_PROBE, authorization: 'Bearer token' } });
+    for (const method of ['HEAD', 'POST', 'PUT', 'DELETE']) stays('/provider/', { method });
+    stays('/provider/', { transport: 'websocket' });
+    for (const url of ['/provider', '/provider/x', '/nosuchagent/', '/']) stays(url);
+    assert.notEqual(world.plan('/provider%2F/', rootHost, 'http', 'GET', STARTUP_PROBE).kind, 'agent-root');
+});
+
+test('the startup probe is limited to agents whose MCP the host admits', (t) => {
+    const world = domainFixture(t);
+    // Without marketplace-ui the SSO extension no longer admits installed agents outside the closure.
+    world.write(world.paths.desiredFile, desiredFor('single', {
+        root: rootHostEntry({ routerSurfaces: ['agent-mcp', 'browser-auth'] }),
+    }));
+    world.apply();
+    const closure = world.plan('/provider/', rootHost, 'http', 'GET', STARTUP_PROBE);
+    assert.equal(closure.kind, 'agent-root');
+    assert.equal(closure.routeKey, 'explorer');
+    const outside = world.plan('/unrelated/', rootHost, 'http', 'GET', STARTUP_PROBE);
+    assert.equal(outside.kind, 'agent-port');
+    assert.equal(outside.routeKey, 'bizanso');
+});
+
+test('a startup probe on a root host answers ready after authorization and never dials an agent', async (t) => {
+    const world = domainFixture(t);
+    const url = '/provider/';
+    const req = { url, method: 'GET', headers: { host: rootHost, origin: `https://${rootHost}`, ...STARTUP_PROBE } };
+    const plan = world.plan(url, rootHost, 'http', 'GET', STARTUP_PROBE);
+    const reply = { status: 0, body: '' };
+    const res = {
+        writeHead(status) { reply.status = status; },
+        end(body) { reply.body = String(body || ''); },
+    };
+    const accessed = [];
+    const handled = await dispatchAgentStartupAfterRouterSurfaces({
+        req,
+        res,
+        parsedUrl: new URL(url, `https://${rootHost}`),
+        routePlan: plan,
+        ensureRouteAccess: async (_req, _res, _url, decision) => { accessed.push(decision); return { ok: true }; },
+        commitPlan: () => true,
+        readMutationState: () => 'idle',
+    });
+    assert.equal(handled, true);
+    assert.deepEqual(accessed, [plan.decision]);
+    assert.equal(reply.status, 200);
+    assert.equal(JSON.parse(reply.body).state, 'ready');
+    assert.equal(JSON.parse(reply.body).generation, plan.lease.id);
 });
 
 test('the bare owner mount redirects only GET and HEAD over HTTP (C4) and never on a WebSocket (R5)', (t) => {
@@ -654,6 +733,26 @@ test('the real Router answers the bare owner mount with an uncached redirect and
         const owner = await request(port, { host: rootHost, target: '/explorer/index.html' });
         assert.equal(owner.status, 302);
         assert.equal(owner.headers.location, '/auth/login?returnTo=%2Fexplorer%2Findex.html');
+        // Anonymous parity only: both hosts refuse before any agent or generation is disclosed.
+        const probeHeaders = { 'x-ploinky-agent-startup-probe': '1', accept: 'application/json' };
+        const rootProbe = await request(port, { host: rootHost, target: '/provider/', headers: probeHeaders });
+        const siblingProbe = await request(port, { host: siblingHost, target: '/provider/', headers: probeHeaders });
+        assert.equal(rootProbe.status, 401, rootProbe.body);
+        assert.equal(rootProbe.status, siblingProbe.status, rootProbe.body);
+        assert.equal(rootProbe.body, siblingProbe.body);
+        // A signed-in caller gets the Router's own ready answer, never the root application's.
+        const signedIn = await request(port, {
+            host: rootHost, target: '/provider/', headers: { ...probeHeaders, cookie: 'ploinky_sso=allowed' },
+        });
+        assert.equal(signedIn.status, 200, signedIn.body);
+        const ready = JSON.parse(signedIn.body);
+        assert.equal(ready.state, 'ready');
+        assert.match(ready.generation, /^sha256:[a-f0-9]{64}$/);
+        const signedInSibling = await request(port, {
+            host: siblingHost, target: '/provider/', headers: { ...probeHeaders, cookie: 'ploinky_sso=allowed' },
+        });
+        assert.equal(signedInSibling.status, 200, signedInSibling.body);
+        assert.equal(JSON.parse(signedInSibling.body).generation, ready.generation);
         const mismatch = await request(port, { host: rootHost, target: '/auth/login?agent=bizanso' });
         assert.equal(mismatch.status, 400);
         assert.equal(JSON.parse(mismatch.body).error, 'auth_route_context_mismatch');

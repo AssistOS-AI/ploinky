@@ -985,6 +985,17 @@ export function resolveEdgeRoutePlan({
                 });
             }
             if (ownerMount !== 'nested') {
+                // The startup probe is the Router's own answer about the route
+                // generation, not a page of the application. It keeps the owner's
+                // authorization context, as on a host without a root application,
+                // and only a plan the startup slot will consume is returned, so it
+                // never dials an agent.
+                if (selectedStartupProbeRoute(pathname, edgeHostServiceRoutes(snapshot, host).agentMcpRoutes)) {
+                    const probePlan = agentRootPlan({
+                        req, host, listener, pathname, parsedUrl: url, hostSelection, selectedRoot: hostSelection.record, routes, snapshot, lease, transport,
+                    });
+                    if (classifyAgentStartupRequest(req, { routePlan: probePlan }) === 'probe') return probePlan;
+                }
                 return agentPortPlan({
                     req, host, listener, parsedUrl: url, hostSelection, routes, snapshot, lease, transport,
                     requestTarget: `/${AGENT_PORT_ROUTE}/${encodeURIComponent(rootApplication.routeKey)}`
@@ -1100,6 +1111,7 @@ export default {
 // Imported here, not with the others above, so the reviewed Router reference
 // lines of this file keep their positions.
 import { EDGE_DENIAL_RETRY_AFTER_SECONDS } from './edgeRetryAfter.js';
+import { classifyAgentStartupRequest } from './agentStartupPage.js';
 
 export const AGENT_EXEC_PATH = '/api/edge/agent-exec';
 
@@ -1134,4 +1146,14 @@ function resolveDrainingAgentPath(pathname, routes) {
         canonicalPath: pathname,
         upstreamPath: firstSlash < 0 ? '/' : pathname.slice(firstSlash) || '/',
     };
+}
+
+// The route key of an exact `/<routeKey>/` startup probe target on a root
+// application host, limited to the agents whose MCP this host already admits.
+function selectedStartupProbeRoute(pathname, routeKeys) {
+    const segments = String(pathname || '').split('/');
+    if (segments.length !== 3 || segments[0] !== '' || !segments[1] || segments[2] !== '') return '';
+    let routeKey = '';
+    try { routeKey = decodeURIComponent(segments[1]); } catch (_) { return ''; }
+    return new Set(routeKeys || []).has(routeKey) ? routeKey : '';
 }
