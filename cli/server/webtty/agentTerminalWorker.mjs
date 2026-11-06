@@ -430,7 +430,10 @@ async function waitForIdentitiesGone(snapshot, readIdentity, timeoutMs) {
                 const current = await readIdentity(expected.pid);
                 if (current.startToken === expected.startToken) live = true;
             } catch (error) {
-                if (error?.code !== 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE') throw error;
+                // An exiting process can briefly deny its ptrace-guarded /proc
+                // entries. It counts as live until it is proven gone.
+                if (error?.category === 'process-access-denied') live = true;
+                else if (error?.code !== 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE') throw error;
             }
         }
         if (!live) return true;
@@ -1123,6 +1126,16 @@ export class AgentTerminalWorker {
 
     async performCleanup(category, cleanupContext) {
         const active = () => this.cleanupActive(cleanupContext);
+        // A member that refuses its /proc entries while exiting is not
+        // signalled, but the others are; the wait below keeps it live until a
+        // fresh read proves it gone, so the grace period and SIGKILL still run.
+        const signalMembers = async (members, signal) => {
+            try {
+                await this.signalSession(members, signal, cleanupContext);
+            } catch (error) {
+                if (error?.category !== 'process-access-denied') throw error;
+            }
+        };
         let proven = true;
         let providerEvidenceFailed = category === 'provider-evidence';
         let preserveStartingEvidence = false;
@@ -1190,11 +1203,11 @@ export class AgentTerminalWorker {
         try {
             if (!preserveStartingEvidence && snapshot.length > 0) {
                 if (!active()) return;
-                await this.signalSession(snapshot, 'SIGTERM', cleanupContext);
+                await signalMembers(snapshot, 'SIGTERM');
                 if (!active()) return;
                 if (!await waitForIdentitiesGone(snapshot, this.readInnerIdentity, TERM_GRACE_MS)) {
                     if (!active()) return;
-                    await this.signalSession(snapshot, 'SIGKILL', cleanupContext);
+                    await signalMembers(snapshot, 'SIGKILL');
                     if (!active()) return;
                     if (!await waitForIdentitiesGone(snapshot, this.readInnerIdentity, KILL_GRACE_MS)) {
                         proven = false;
@@ -1213,11 +1226,11 @@ export class AgentTerminalWorker {
                 let residual = await this.listSession(this.innerProcess);
                 if (!active()) return;
                 if (residual.length > 0) {
-                    await this.signalSession(residual, 'SIGTERM', cleanupContext);
+                    await signalMembers(residual, 'SIGTERM');
                     if (!active()) return;
                     if (!await waitForIdentitiesGone(residual, this.readInnerIdentity, TERM_GRACE_MS)) {
                         if (!active()) return;
-                        await this.signalSession(residual, 'SIGKILL', cleanupContext);
+                        await signalMembers(residual, 'SIGKILL');
                         if (!active()) return;
                         if (!await waitForIdentitiesGone(residual, this.readInnerIdentity, KILL_GRACE_MS)) {
                             proven = false;
@@ -1233,7 +1246,7 @@ export class AgentTerminalWorker {
                 if (error?.code !== 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE') {
                     proven = false;
                     providerEvidenceFailed ||= error?.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN'
-                        && error?.category !== 'session-anchor-missing';
+                        && !targetLocalProcessIdentityFailure(error);
                 }
             }
         }

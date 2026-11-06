@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    isAgentTargetLocalEvidenceFailure,
     agentCleanupScopeAbsent,
     captureAgentCleanupScope,
     agentShellMarkerArgument,
@@ -835,7 +836,8 @@ test('proc namespace prefilter skips only processes that vanish after enumeratio
             },
             readIdentity: async () => identity({ pid: 5002 }),
         }),
-        (error) => error.code === 'EACCES',
+        (error) => error.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN'
+            && error.category === 'process-access-denied',
     );
 });
 
@@ -923,4 +925,91 @@ test('recycled numeric session IDs without the immutable anchor are never classi
         (error) => error.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN'
             && error.category === 'session-anchor-missing',
     );
+});
+
+// A Box-side view of one process whose ns/pid link is refused. statAfterDenial
+// decides what a fresh stat shows once the link was denied.
+function deniedProcFs(pid, { statAfterDenial = 'same', readlinkCode = 'EACCES' } = {}) {
+    let denied = false;
+    const files = {
+        status: `Uid:\t1000\t1000\t1000\t1000\nNSpid:\t${pid}\t42\nNSpgid:\t${pid}\t42\nNSsid:\t${pid}\t42\n`,
+        uid_map: '0 1000 1\n',
+        cmdline: 'pasta\0',
+    };
+    return {
+        readFile: async (file) => {
+            const name = file.split('/').at(-1);
+            if (name !== 'stat') return Buffer.from(files[name]);
+            if (!denied || statAfterDenial === 'same') return Buffer.from(procStat(pid));
+            if (statAfterDenial === 'vanished') throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+            if (statAfterDenial === 'zombie') return Buffer.from(procStat(pid, { state: 'Z' }));
+            if (statAfterDenial === 'dead') return Buffer.from(procStat(pid, { state: 'X' }));
+            if (statAfterDenial === 'replaced') return Buffer.from(procStat(pid, { start: 777777 }));
+            throw new Error(`unknown scenario ${statAfterDenial}`);
+        },
+        readlink: async () => {
+            denied = true;
+            throw Object.assign(new Error('refused'), { code: readlinkCode });
+        },
+    };
+}
+
+test('a refused namespace link on a still-present process is never stale and stays target-local', async () => {
+    for (const code of ['EACCES', 'EPERM']) {
+        const error = await readAgentBoxProcessIdentity(5002, { fsApi: deniedProcFs(5002, { readlinkCode: code }) })
+            .then(() => null, (failure) => failure);
+        assert.equal(error?.code, 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN', code);
+        assert.equal(error.category, 'process-access-denied');
+        assert.equal(isAgentTargetLocalEvidenceFailure(error), true);
+    }
+});
+
+test('a refused namespace link is stale only when stat proves the process vanished, died or was replaced', async () => {
+    for (const statAfterDenial of ['vanished', 'zombie', 'dead', 'replaced']) {
+        await assert.rejects(readAgentBoxProcessIdentity(5002, { fsApi: deniedProcFs(5002, { statAfterDenial }) }),
+            { code: 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE' }, statAfterDenial);
+    }
+});
+
+test('other proc read failures keep provider scope', async () => {
+    const error = await readAgentBoxProcessIdentity(5002, { fsApi: deniedProcFs(5002, { readlinkCode: 'EIO' }) })
+        .then(() => null, (failure) => failure);
+    assert.equal(error?.code, 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN');
+    assert.equal(error.category, 'process-not-readable');
+    assert.equal(isAgentTargetLocalEvidenceFailure(error), false);
+    const malformed = deniedProcFs(5002);
+    malformed.readlink = async () => 'not-a-namespace';
+    await assert.rejects(readAgentBoxProcessIdentity(5002, { fsApi: malformed }), { category: 'pid-namespace' });
+});
+
+test('the cleanup reader treats only a vanished denied process as absent', async () => {
+    assert.equal(await readAgentCleanupProcessIdentity(5002, { fsApi: deniedProcFs(5002, { statAfterDenial: 'vanished' }) }), null);
+    for (const statAfterDenial of ['same', 'zombie', 'dead']) {
+        await assert.rejects(readAgentCleanupProcessIdentity(5002, { fsApi: deniedProcFs(5002, { statAfterDenial }) }),
+            { category: 'process-access-denied' }, statAfterDenial);
+    }
+    await assert.rejects(readAgentCleanupProcessIdentity(5002, { fsApi: deniedProcFs(5002, { statAfterDenial: 'replaced' }) }),
+        { category: 'cleanup-process-replaced' });
+});
+
+test('the namespace prefilter skips a denied process only once it has vanished', async () => {
+    const fsApi = deniedProcFs(5002, { statAfterDenial: 'vanished' });
+    fsApi.readdir = async () => directoryEntries(5002);
+    assert.deepEqual(await listAgentMarkerProcesses({ pidNamespace: 'pid:[9001]' }, MARKER, {
+        fsApi, readIdentity: async () => { throw new Error('must not read a vanished process'); },
+    }), []);
+});
+
+test('an unreadable session member is not signalled, the others still are, and the denial is reported', async () => {
+    const members = [identity({ pid: 5002 }), identity({ pid: 5003 })];
+    const attempted = [];
+    await assert.rejects(signalExactAgentSessionSnapshot(members, 'SIGKILL', {
+        readIdentity: async (pid) => {
+            if (pid === 5002) throw Object.assign(new Error('refused'), {
+                code: 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN', category: 'process-access-denied' });
+            return members.find((entry) => entry.pid === pid);
+        },
+        signalImpl: (pid) => attempted.push(pid),
+    }), { category: 'process-access-denied' });
+    assert.deepEqual(attempted, [5003]);
 });

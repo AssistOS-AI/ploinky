@@ -1819,3 +1819,109 @@ test('a profile init carries HOME into the exec and startup evidence while the l
     await plain.worker.launch();
     assert.deepEqual(plain.spawnCalls[0].options.env, h.spawnCalls[0].options.env);
 });
+
+function accessDenied() {
+    return Object.assign(new Error('refused while exiting'), {
+        code: 'WEBTTY_AGENT_PROCESS_IDENTITY_UNPROVEN', category: 'process-access-denied',
+    });
+}
+
+test('a session member that refuses its proc entries while exiting still ends in proven cleanup', async () => {
+    let reads = 0;
+    const signals = [];
+    const h = harness({
+        captureSession: async () => [markerWrapperIdentity()],
+        signalSession: async (_snapshot, signal) => signals.push(signal),
+        readInnerIdentity: async (pid) => {
+            if (pid === 4299) return { pid: 4299, state: 'S', startToken: 'linux-proc:42990', pidNamespace: 'pid:[9001]' };
+            reads += 1;
+            if (reads <= 2) throw accessDenied();
+            throw Object.assign(new Error('gone'), { code: 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE' });
+        },
+    });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, true);
+    assert.deepEqual(signals, ['SIGTERM']);
+    assert.equal(h.processApi.sent.some((message) => message.type === 'error'), false);
+});
+
+test('a member that keeps refusing its proc entries stays unproven with target scope, never provider scope', async () => {
+    const signals = [];
+    const h = harness({
+        captureSession: async () => [markerWrapperIdentity()],
+        signalSession: async (_snapshot, signal) => signals.push(signal),
+        cleanupScopeAbsent: async () => { throw accessDenied(); },
+        readInnerIdentity: async (pid) => {
+            if (pid === 4299) return { pid: 4299, state: 'S', startToken: 'linux-proc:42990', pidNamespace: 'pid:[9001]' };
+            throw accessDenied();
+        },
+    });
+    h.worker.cleanupDeadlineMs = 2500;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+    const errors = h.processApi.sent.filter((message) => message.type === 'error').map((message) => message.category);
+    assert.deepEqual(errors, ['cleanup-unproven']);
+});
+
+test('a refused leftover-session scan stays target-scoped and never disables the agent provider', async () => {
+    const h = harness({
+        captureSession: async () => [markerWrapperIdentity()],
+        listSession: async () => { throw accessDenied(); },
+    });
+    h.worker.cleanupDeadlineMs = 300;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    const errors = h.processApi.sent.filter((message) => message.type === 'error').map((message) => message.category);
+    assert.deepEqual(errors, ['cleanup-unproven']);
+});
+
+test('a member refusing its proc entries at signal time still gets the grace wait and recovers to proven cleanup', async () => {
+    const signals = [];
+    let reads = 0, lists = 0;
+    const h = harness({
+        captureSession: async () => [markerWrapperIdentity()],
+        signalSession: async (_snapshot, signal) => { signals.push(signal); throw accessDenied(); },
+        listSession: async () => { lists += 1; if (lists === 1) throw accessDenied(); return []; },
+        inspectTargetCleanup: async () => ({ absent: false, id: CONTAINER_ID, running: true, initPid: 4299, execIds: [] }),
+        readInnerIdentity: async (pid) => {
+            if (pid === 4299) return { pid: 4299, state: 'S', startToken: 'linux-proc:42990', pidNamespace: 'pid:[9001]' };
+            reads += 1;
+            if (reads <= 3) throw accessDenied();
+            throw Object.assign(new Error('gone'), { code: 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE' });
+        },
+    });
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.deepEqual(signals, ['SIGTERM']);
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, true);
+    assert.equal(h.processApi.sent.some((message) => message.type === 'error'), false);
+});
+
+test('a refused signal never skips the grace period or SIGKILL', async () => {
+    const signals = [];
+    const h = harness({
+        captureSession: async () => [markerWrapperIdentity()],
+        signalSession: async (_snapshot, signal) => { signals.push(signal); throw accessDenied(); },
+        cleanupScopeAbsent: async () => false,
+        readInnerIdentity: async (pid) => {
+            if (pid === 4299) return { pid: 4299, state: 'S', startToken: 'linux-proc:42990', pidNamespace: 'pid:[9001]' };
+            throw accessDenied();
+        },
+    });
+    h.worker.cleanupDeadlineMs = 2500;
+    await h.worker.initialize(init());
+    await h.worker.launch();
+    await h.worker.cleanup('requested');
+    assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+    assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    const errors = h.processApi.sent.filter((message) => message.type === 'error').map((message) => message.category);
+    assert.deepEqual(errors, ['cleanup-unproven']);
+});

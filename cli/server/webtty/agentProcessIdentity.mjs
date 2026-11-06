@@ -13,6 +13,7 @@ const AGENT_MARKER = /^[A-Za-z0-9_-]{24,128}$/;
 export const AGENT_PROCESS_SIGNALS = Object.freeze(['SIGTERM', 'SIGKILL']);
 const TARGET_LOCAL_EVIDENCE_CATEGORIES = new Set([
     'inner-process-ambiguity',
+    'process-access-denied',
     'inner-topology',
     'marker-correlation',
     'session-anchor-missing',
@@ -137,6 +138,40 @@ function validatePidNamespace(value) {
     return value;
 }
 
+function permissionDenied(error) {
+    return error?.code === 'EACCES' || error?.code === 'EPERM';
+}
+
+// The kernel can refuse ptrace-guarded /proc entries such as ns/pid while a
+// process with its own capabilities exits. stat stays readable, so it decides
+// whether the denial is the exit: a vanished, dead, zombie or replaced process
+// is gone; a process that is still there stays unproven.
+async function deniedProcessGone(fsApi, procRoot, pid, startToken = null) {
+    let current;
+    try {
+        current = parseAgentLinuxProcStat(await boundedProcFile(
+            fsApi, path.join(procRoot, String(pid), 'stat'), { encoding: 'utf8', category: 'proc-stat' },
+        ), pid);
+    } catch (error) {
+        if (error?.code === 'ENOENT' || error?.code === 'ESRCH') return 'vanished';
+        return null;
+    }
+    if (current.state === 'Z' || current.state === 'X') return 'dead';
+    if (startToken !== null && current.startToken !== startToken) return 'replaced';
+    return null;
+}
+
+async function readPidNamespaceLink(fsApi, procRoot, pid, startToken = null) {
+    try {
+        return await fsApi.readlink(path.join(procRoot, String(pid), 'ns/pid'));
+    } catch (error) {
+        if (!permissionDenied(error)) throw error;
+        const gone = await deniedProcessGone(fsApi, procRoot, pid, startToken);
+        if (gone) throw Object.assign(agentProcessIdentityError('changed-during-read', { stale: true }), { gone });
+        throw agentProcessIdentityError('process-access-denied');
+    }
+}
+
 export {
     agentShellMarkerArgument,
     fixedAgentInteractiveShellArgv,
@@ -171,7 +206,7 @@ export async function readAgentBoxProcessIdentity(pid, {
             boundedProcFile(fsApi, path.join(directory, 'status'), {
                 encoding: 'utf8', category: 'proc-status',
             }),
-            fsApi.readlink(path.join(directory, 'ns/pid')),
+            readPidNamespaceLink(fsApi, procRoot, pid, before.startToken),
             boundedProcFile(fsApi, path.join(directory, 'uid_map'), {
                 encoding: 'utf8', category: 'uid-map',
             }),
@@ -191,7 +226,7 @@ export async function readAgentBoxProcessIdentity(pid, {
         if (before.startToken !== middle.startToken
             || middle.startToken !== after.startToken
             || !cmdlineBefore.equals(cmdlineAfter)
-            || after.state === 'Z') {
+            || after.state === 'Z' || after.state === 'X') {
             throw agentProcessIdentityError('changed-during-read', { stale: true });
         }
         return Object.freeze({
@@ -210,6 +245,12 @@ export async function readAgentBoxProcessIdentity(pid, {
         });
     } catch (error) {
         if (error?.code?.startsWith?.('WEBTTY_AGENT_PROCESS_IDENTITY_')) throw error;
+        if (permissionDenied(error)) {
+            if (await deniedProcessGone(fsApi, procRoot, pid)) {
+                throw agentProcessIdentityError('changed-during-read', { stale: true });
+            }
+            throw agentProcessIdentityError('process-access-denied');
+        }
         throw agentProcessIdentityError('process-not-readable', {
             stale: error?.code === 'ENOENT' || error?.code === 'ESRCH',
         });
@@ -319,10 +360,12 @@ async function pidMatchesNamespace(pid, expectedNamespace, procRoot, fsApi, pids
     let observedNamespace;
     try {
         observedNamespace = validatePidNamespace(await boundedProcScanCall(
-            fsApi.readlink(path.join(procRoot, String(pid), 'ns/pid')),
+            readPidNamespaceLink(fsApi, procRoot, pid),
             pids,
         ));
     } catch (error) {
+        // A denied link on a process that has since exited is a vanished process.
+        if (error?.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE') return false;
         // A process may exit after numericProcEntries() enumerates it but
         // before the cheap namespace prefilter runs. Treat only an exact
         // vanished-process error as a non-match; permission and malformed
@@ -584,11 +627,24 @@ export async function readAgentCleanupProcessIdentity(pid, {
         throw error;
     }
     const before = parseAgentLinuxProcStat(raw, pid);
-    const namespaceBefore = validatePidNamespace(await fsApi.readlink(path.join(directory, 'ns/pid')));
+    const namespaceLink = async () => {
+        try {
+            return validatePidNamespace(await readPidNamespaceLink(fsApi, procRoot, pid, before.startToken));
+        } catch (error) {
+            if (error?.gone === 'vanished') return null;
+            if (error?.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE') {
+                throw agentProcessIdentityError(error.gone === 'replaced' ? 'cleanup-process-replaced' : 'process-access-denied');
+            }
+            throw error;
+        }
+    };
+    const namespaceBefore = await namespaceLink();
+    if (namespaceBefore === null) return null;
     const status = await boundedProcFile(fsApi, path.join(directory, 'status'), {
         encoding: 'utf8', category: 'proc-status',
     });
-    const namespaceAfter = validatePidNamespace(await fsApi.readlink(path.join(directory, 'ns/pid')));
+    const namespaceAfter = await namespaceLink();
+    if (namespaceAfter === null) return null;
     const after = parseAgentLinuxProcStat(await boundedProcFile(fsApi, statPath, {
         encoding: 'utf8', category: 'proc-stat',
     }), pid);
@@ -775,7 +831,10 @@ export async function signalExactAgentSessionSnapshot(snapshot, signal, {
             );
         } catch (error) {
             if (error?.code === 'WEBTTY_AGENT_PROCESS_IDENTITY_STALE') continue;
-            throw error;
+            if (error?.category !== 'process-access-denied') throw error;
+            // An unreadable member is not signalled; the others still are.
+            denied ||= error;
+            continue;
         }
         if (current.startToken !== expected.startToken
             || current.pidNamespace !== expected.pidNamespace
