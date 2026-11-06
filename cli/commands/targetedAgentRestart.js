@@ -1,3 +1,4 @@
+import path from 'node:path';
 import {
   TARGETED_DRAIN_ACKNOWLEDGEMENT,
   cleanupExactAgentRuntimeCandidate,
@@ -91,6 +92,14 @@ function assertExactRouteOwner(route, {
   return route;
 }
 
+// True when the route stores a physical agent directory other than the one the
+// restart resolved. Without a resolved directory the stored one is kept.
+function routeHostPathMoved(route, agentPath) {
+  if (!agentPath) return false;
+  const stored = text(route?.hostPath);
+  return !stored || path.resolve(stored) !== agentPath;
+}
+
 function affectedRouteSelectors(generation, routeKey) {
   const selectors = new Set([
     `agent-root:${routeKey}`,
@@ -139,7 +148,7 @@ function assertAcceptedFailedDrain({ acceptedFailedDrain, record, currentRecord,
 // Withdraw the route from the active generation by an operator drain (W8,
 // D3): the selector stays active and every other route stays served. Returns
 // the route as it was before the drain.
-function withdrawTargetedRoute({ containerName, routeKey, repoName, shortAgentName, identity, record, acceptedFailedDrain }, {
+function withdrawTargetedRoute({ containerName, routeKey, repoName, shortAgentName, identity, record, acceptedFailedDrain, agentPath }, {
   loadActive = loadActiveEdgeRoutingGeneration,
   loadAgents = workspaceSvc.loadAgents,
   withApplyLock = withEdgeGenerationApplyLock,
@@ -158,6 +167,12 @@ function withdrawTargetedRoute({ containerName, routeKey, repoName, shortAgentNa
       throw new Error('targeted agent restart registry identity changed before route withdrawal');
     }
     assertAcceptedFailedDrain({ acceptedFailedDrain, record, currentRecord, route, routeKey, containerName });
+    // The stored locator no longer names the directory this restart resolved
+    // (the repository moved, for example from its managed copy to a workspace
+    // checkout). The edge generation hashes the manifest bytes read from that
+    // locator, so no active to active withdrawal can be proven: the caller
+    // refreshes the locator under the inactive drain instead.
+    if (routeHostPathMoved(route, agentPath)) return null;
     const predecessorRoute = structuredClone(route);
     delete predecessorRoute.draining;
     commitWithdrawal({
@@ -223,6 +238,7 @@ export async function prepareTargetedAgentRestart({
   record,
   networkLifecycleCapability,
   acceptedFailedDrain: acceptedFailedDrainInput = null,
+  agentPath: agentPathInput = '',
 } = {}, {
   mergeRouting = mergeRoutingConfig,
   loadActive = loadActiveEdgeRoutingGeneration,
@@ -238,10 +254,16 @@ export async function prepareTargetedAgentRestart({
   }
   const identity = exactRuntimeIdentity(record);
   const acceptedFailedDrain = normalizeAcceptedFailedDrain(acceptedFailedDrainInput);
+  // The agent directory this restart resolved through the repository source
+  // rules (workspace checkout in dev mode, managed copy in prod mode). The
+  // route's stored locator is refreshed to it with the drain, so a repository
+  // moved since the agent was enabled cannot leave the edge reading a vanished
+  // manifest.
+  const agentPath = text(agentPathInput) ? path.resolve(text(agentPathInput)) : '';
   let predecessorRoute = null;
 
   try {
-    predecessorRoute = await withdrawRoute({ containerName, routeKey, repoName, shortAgentName, identity, record, acceptedFailedDrain });
+    predecessorRoute = await withdrawRoute({ containerName, routeKey, repoName, shortAgentName, identity, record, acceptedFailedDrain, agentPath });
   } catch (error) {
     // An invalid acceptance must never fall through to another mutation path.
     if (error?.code === 'TARGETED_DRAIN_INVALID') throw error;
@@ -266,7 +288,7 @@ export async function prepareTargetedAgentRestart({
     assertAcceptedFailedDrain({ acceptedFailedDrain, record, currentRecord, route, routeKey, containerName });
     predecessorRoute = structuredClone(route);
     delete predecessorRoute.draining;
-    routing.routes[routeKey] = { ...route, draining: true };
+    routing.routes[routeKey] = { ...route, ...(agentPath ? { hostPath: agentPath } : {}), draining: true };
     return routing;
   }, {
     reason: `manual-targeted-restart-drain:${containerName}`,

@@ -240,7 +240,7 @@ export async function reconcileExactHardwareInstance(captured, {
             if (!isSandboxRuntime(plan.runtime) && route && (!route.hardwareAvailability || acceptsDrainingRoute)) {
                 check();
                 phase = 'restart-preparation';
-                transition = await prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability,
+                transition = await prepare({ containerName: captured.key, routeKey, repoName: captured.record.repoName, shortAgentName: captured.record.agentName, record: captured.record, networkLifecycleCapability: capability, agentPath: plan.agentPath,
                     ...(acceptedFailedDrain ? { acceptedFailedDrain } : {}) });
                 phase = 'apply';
             } else if (acceptedFailedDrain) {

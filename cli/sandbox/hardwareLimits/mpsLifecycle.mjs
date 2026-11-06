@@ -226,7 +226,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
                     retireExactAgentRuntimePredecessor({ containerName: client.key, containerId: client.containerId, registryRecord: record, runtimeNetwork: plan.profile.network }, { networkLifecycleCapability: capability });
                     return;
                 }
-                const transition = await prepareTargetedAgentRestart({ containerName: client.key, routeKey: record.alias || record.agentName, record, networkLifecycleCapability: capability });
+                const transition = await prepareTargetedAgentRestart({ containerName: client.key, routeKey: record.alias || record.agentName, record, networkLifecycleCapability: capability, agentPath: plan.agentPath });
                 check();
                 drainTargetedContainer(client.key, { ...transition.targetedRestart, runtime: plan.runtime, timeoutMs: Math.min(30_000, Math.max(1, (options.deadline || Date.now() + 30_000) - Date.now())), retireControlSocket: retireRuntimeRelaySocket });
                 check();
