@@ -24,7 +24,8 @@ delete process.env.PLOINKY_REPOS_SOURCE;
 
 const edge = await import('../../cli/sandbox/edgeGeneration.js');
 const { withNetworkLifecycleLock } = await import('../../cli/sandbox/networkLifecycle.js');
-const { prepareTargetedAgentRestart, commitTargetedAgentRestart } = await import('../../cli/commands/targetedAgentRestart.js');
+const { prepareTargetedAgentRestart, commitTargetedAgentRestart, refreshRouteAgentPath } = await import('../../cli/commands/targetedAgentRestart.js');
+const { coordinateReplacementRuntimeIdentity } = await import('../../cli/sandbox/docker/agentServiceManager.js');
 const { reconcileExactHardwareInstance } = await import('../../cli/sandbox/hardwareLimits/reconcile.mjs');
 const { findAgent } = await import('../../cli/utils/utils.js');
 
@@ -260,4 +261,51 @@ test('the exact-instance reconcile hands the resolved checkout to the drain, the
     assert.equal(reopened.selector.state, 'active');
     assert.equal(reopened.generation.routing.routes.agentB.hostPath, agentPath);
     assert.equal(reopened.generation.routing.routes.agentB.draining, undefined);
+});
+
+// The native sandbox runtimes restart through a coordinated replacement
+// without a targeted drain; it prepares its edge generation from every route's
+// stored locator, so the restart refreshes the moved locator first.
+function rotateIdentity() {
+    const existingRecord = JSON.parse(fs.readFileSync(path.join(ploinkyDir, 'agents.json'), 'utf8'))[CONTAINER];
+    return withNetworkLifecycleLock((networkLifecycleCapability) => coordinateReplacementRuntimeIdentity({
+        containerName: CONTAINER,
+        existingRecord,
+        reason: 'moved-repository-restart',
+        networkLifecycleCapability,
+        runtimeNetwork: { mode: 'default' },
+        portMappings: [],
+    }));
+}
+
+test('a no-drain coordinated replacement fails closed on the vanished locator until the restart refreshes it', async () => {
+    seedEnabledFromManagedCopy();
+    moveRepositoryToWorkspaceCheckout();
+    await assert.rejects(async () => rotateIdentity(), /manifest\(agentB\) is unavailable: ENOENT/);
+
+    const agentPath = resolvedAgentPath();
+    const refreshed = await withNetworkLifecycleLock((networkLifecycleCapability) => refreshRouteAgentPath({
+        routeKey: 'agentB', containerName: CONTAINER, agentPath, networkLifecycleCapability,
+    }));
+    assert.equal(refreshed, true);
+    const active = edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+    assert.equal(active.selector.state, 'active');
+    assert.equal(active.generation.routing.routes.agentB.hostPath, agentPath);
+    assert.equal(active.generation.routing.routes.agentB.hostPort, 41002, 'the refresh keeps the route target');
+    const rotated = await rotateIdentity();
+    assert.ok(rotated.instanceId, 'the replacement identity is prepared from the checkout manifest');
+});
+
+test('refreshing the locator is a no-op when the stored directory is already the resolved one', async () => {
+    seedEnabledFromManagedCopy();
+    const before = edge.readEdgeRoutingSelection({ workspaceRoot: workspace }).selector;
+    const refreshed = await withNetworkLifecycleLock((networkLifecycleCapability) => refreshRouteAgentPath({
+        routeKey: 'agentB', containerName: CONTAINER, agentPath: resolvedAgentPath(), networkLifecycleCapability,
+    }));
+    assert.equal(refreshed, false);
+    assert.deepEqual(edge.readEdgeRoutingSelection({ workspaceRoot: workspace }).selector, before);
+    const other = await withNetworkLifecycleLock((networkLifecycleCapability) => refreshRouteAgentPath({
+        routeKey: 'agentB', containerName: 'another-container', agentPath: checkoutRepo, networkLifecycleCapability,
+    }));
+    assert.equal(other, false, 'a route owned by another container is never rewritten');
 });

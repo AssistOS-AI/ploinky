@@ -30,6 +30,7 @@ import {
     commitTargetedAgentRestart,
     parseTargetedRestartArguments,
     prepareTargetedAgentRestart,
+    refreshRouteAgentPath,
 } from './targetedAgentRestart.js';
 import { withHeldOrAcquiredWorkspaceMutationLease, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import { reconcileExactHardwareInstance } from '../sandbox/hardwareLimits/reconcile.mjs';
@@ -529,6 +530,12 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                                     repo: resolved.repo,
                                 },
                             }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+                                await refreshRouteAgentPath({
+                                    routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
+                                    containerName,
+                                    agentPath: path.dirname(resolved.manifestPath),
+                                    networkLifecycleCapability,
+                                });
                                 const result = await ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
                                     containerName,
                                     alias: registryRecord?.record?.alias,
@@ -582,6 +589,12 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                             },
                         }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
                             const agentPath = path.dirname(resolved.manifestPath);
+                            await refreshRouteAgentPath({
+                                routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
+                                containerName,
+                                agentPath,
+                                networkLifecycleCapability,
+                            });
                             const restartResult = await ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
                                 containerName,
                                 alias: registryRecord?.record?.alias,

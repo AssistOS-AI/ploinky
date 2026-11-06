@@ -226,6 +226,44 @@ function reopenTargetedRoute(transition, buildRoute, result, {
 }
 
 /**
+ * Point a route at the agent directory a restart resolved when the stored one
+ * names another (the repository moved since the agent was enabled). A restart
+ * that recreates the runtime without a targeted drain, as the native sandbox
+ * runtimes do, would otherwise have the edge read the vanished stored
+ * manifest while it prepares the replacement. The write is the ordinary
+ * coordinated routing merge, so the edge generation is recomputed from the new
+ * manifest bytes. Returns whether the stored directory was replaced.
+ */
+export async function refreshRouteAgentPath({
+  routeKey: routeKeyInput,
+  containerName: containerNameInput,
+  agentPath: agentPathInput,
+  networkLifecycleCapability,
+} = {}, {
+  mergeRouting = mergeRoutingConfig,
+  readRouting = readRoutingConfig,
+} = {}) {
+  const routeKey = text(routeKeyInput);
+  const containerName = text(containerNameInput);
+  const agentPath = text(agentPathInput) ? path.resolve(text(agentPathInput)) : '';
+  if (!routeKey || !containerName || !agentPath) return false;
+  const route = readRouting().routes?.[routeKey];
+  if (!route || text(route.container) !== containerName || !routeHostPathMoved(route, agentPath)) return false;
+  await mergeRouting((routing) => {
+    const current = routing.routes?.[routeKey];
+    if (!current || text(current.container) !== containerName) {
+      throw new Error(`restart route '${routeKey}' no longer selects its exact registered owner`);
+    }
+    routing.routes[routeKey] = { ...current, hostPath: agentPath };
+    return routing;
+  }, {
+    reason: `manual-restart-locator-refresh:${containerName}`,
+    networkLifecycleCapability,
+  });
+  return true;
+}
+
+/**
  * Withdraw one agent's external selectors while retaining its exact runtime
  * identity and policy in the active generation. The predecessor can therefore
  * finish authenticated drain work, but the Router admits no new traffic to it.
