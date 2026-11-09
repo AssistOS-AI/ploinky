@@ -580,6 +580,10 @@ function gitCommandErrorMessage(err) {
  * Policy: without an explicit branch, the checkout must track the same branch
  * on origin. With an explicit branch, the checkout must already be on that
  * branch and is advanced from origin/<branch>.
+ *
+ * The remote is probed first, as for workspace repositories: an unreachable
+ * remote (for example a private repository whose credentials exist only on the
+ * host, not inside the Box) is a named skip rather than a fetch failure.
  */
 export function updateRegisteredRepository(name, {
     branch = null,
@@ -603,6 +607,7 @@ export function updateRegisteredRepository(name, {
         phase: 'registered-repository',
         id: name,
         policy: { kind: 'registered', branch: normalizeRepoBranch(branch) },
+        probeRemote: true,
         assessGeneratedState,
     });
 }
