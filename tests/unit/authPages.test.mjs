@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
-import { renderLogoutConfirmationHtml } from '../../cli/server/authHandlers/authPages.js';
+import { renderLoggedOutHtml, renderLogoutConfirmationHtml } from '../../cli/server/authHandlers/authPages.js';
 
 test('logout confirmation keeps Cancel separate from the post-logout destination', () => {
     const html = renderLogoutConfirmationHtml({
@@ -52,4 +52,28 @@ test('sign-in retry encodes the selected agent and prompt as separate query valu
     });
     assert.doesNotMatch(html, /<script>|evil\.example/);
     assert.doesNotMatch(renderAuthErrorHtml({ retryAgent, retryPrompt }), /Try again/);
+});
+
+
+test('repeated logout keeps the application return path for sign-in without relying on a POST body', () => {
+    for (const includeAgentSelector of [true, false]) {
+        for (const target of ['/', '/base-agent-additional-server/sample-app/8787/']) {
+            const html = renderLogoutConfirmationHtml({ agentName: 'application-owner', returnTo: target, includeAgentSelector });
+            const action = html.match(/<form method="post" action="([^"]+)"/)[1].replaceAll('&amp;', '&');
+            const request = new URL(action, 'https://app.example');
+            assert.equal(request.pathname, '/auth/logout');
+            assert.equal(request.searchParams.get('returnTo'), target);
+            assert.equal(request.searchParams.get('agent'), includeAgentSelector ? 'application-owner' : null);
+            // The no-session branch uses only the query, as on a duplicate submission.
+            const signedOut = renderLoggedOutHtml(request.searchParams.get('returnTo'));
+            const href = signedOut.match(/href="([^"]+)">Sign in/)[1].replaceAll('&amp;', '&');
+            assert.equal(new URL(href, request).searchParams.get('returnTo'), target);
+        }
+    }
+});
+
+test('logout action normalizes external return destinations', () => {
+    const html = renderLogoutConfirmationHtml({ returnTo: '//external.example/path' });
+    const action = html.match(/<form method="post" action="([^"]+)"/)[1].replaceAll('&amp;', '&');
+    assert.equal(new URL(action, 'https://app.example').searchParams.get('returnTo'), '/');
 });

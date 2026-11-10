@@ -15,7 +15,9 @@ test('WebChat sign-out keeps the exact conversation as Cancel destination and th
     assert.equal(url.searchParams.get('cancelTo'), '/webchat/?agent=sample-agent&workspace-dir=My%20project&robot=default#conversation');
     const html = renderLogoutConfirmationHtml({ agentName: 'sample-agent', returnTo: url.searchParams.get('returnTo'), cancelTo: url.searchParams.get('cancelTo') });
     assert.match(html, /href="\/webchat\/\?agent=sample-agent&amp;workspace-dir=My%20project&amp;robot=default#conversation">Cancel/);
-    assert.match(html, /<form method="post" action="\/auth\/logout\?agent=sample-agent">/);
+    const action = new URL(html.match(/<form method="post" action="([^"]+)"/)[1].replaceAll('&amp;', '&'), current);
+    assert.equal(action.searchParams.get('agent'), 'sample-agent');
+    assert.equal(action.searchParams.get('returnTo'), '/auth/logged-out');
 });
 
 test('host-bound WebChat logout does not invent an agent selector', () => {

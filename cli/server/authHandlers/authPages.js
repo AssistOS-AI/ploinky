@@ -234,9 +234,10 @@ function renderLogoutConfirmationHtml({
     const safeReturnTo = escapeHtml(normalizedReturnTo);
     const safeCancelTo = escapeHtml(normalizeRelativePath(cancelTo, normalizedReturnTo));
     const safeCsrfToken = escapeHtml(csrfToken || '');
-    const logoutAction = includeAgentSelector && rawAgent
-        ? `/auth/logout?agent=${encodeURIComponent(rawAgent)}`
-        : '/auth/logout';
+    // A repeated POST may arrive after the session is gone, before its body is read.
+    const logoutQuery = new URLSearchParams({ returnTo: normalizedReturnTo });
+    if (includeAgentSelector && rawAgent) logoutQuery.set('agent', rawAgent);
+    const logoutAction = `/auth/logout?${logoutQuery}`;
     return `<!doctype html>
 <html lang="en">
 <head>

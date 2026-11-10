@@ -1,3 +1,4 @@
+import { renderLogoutConfirmationHtml } from '../../cli/server/authHandlers/authPages.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -2350,5 +2351,21 @@ test('static-auth DPU WebChat admits only SSO users with Explorer access (G, NX,
             assert.equal(allowed.req.edgeAuthContext.routeKey, 'explorer');
             assert.equal(allowed.req.edgeAuthContext.serviceRouteKey, 'dpuAgent');
         }
+    }
+});
+
+
+test('duplicate logout POST without a session keeps the application destination in the next login', async t => {
+    const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    const target = '/base-agent-additional-server/sample-app/8787/';
+    const confirmation = renderLogoutConfirmationHtml({ returnTo: target, includeAgentSelector: false });
+    const action = confirmation.match(/<form method="post" action="([^"]+)"/)[1].replaceAll('&amp;', '&');
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const req = makeRequest({ method: 'POST', url: action, accept: 'text/html' });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(res.statusCode, 200);
+        const login = res.body.match(/href="([^"]+)">Sign in/)[1].replaceAll('&amp;', '&');
+        assert.equal(new URL(login, 'http://localhost').searchParams.get('returnTo'), target);
     }
 });
