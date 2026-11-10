@@ -109,6 +109,28 @@ function store(options = {}) {
     return new WebttyLaunchRecordStore({ randomBytes: randomSource(), ...options });
 }
 
+test('live discovery binds the trusted directory even with no agents', () => {
+    const records = store();
+    const profile = { provider: 'provider', id: 'robot.default', label: 'Robot', mode: 'live-agent' };
+    const request = { owner: OWNER, routeBinding: ROUTE, directory: directory(), profile };
+    const empty = records.createDiscovery({ ...request, targets: [] });
+    assert.equal(empty.directory, 'projects/demo');
+    assert.deepEqual(empty.targets, []);
+    assert.deepEqual(empty.profile, profile);
+    const row = { ...agent(), home: { translatedHome: '/home/robot' } };
+    const discovery = records.createDiscovery({ ...request, targets: [row] });
+    const record = records.consume({ launch: discovery.targets[0].launch, owner: OWNER, routeBinding: ROUTE });
+    assert.deepEqual(record.target.profile, profile);
+    assert.throws(() => records.createDiscovery({ ...request, targets: [box()] }),
+        { code: 'WEBTTY_LAUNCH_TARGET_INVALID' });
+    assert.throws(() => records.createDiscovery({ ...request, directory: undefined, targets: [] }),
+        { code: 'WEBTTY_LAUNCH_TARGET_INVALID' });
+    assert.throws(() => records.createDiscovery({ ...request, targets: [row], directory: directory('other') }),
+        { code: 'WEBTTY_LAUNCH_DIRECTORY_INVALID' });
+    assert.throws(() => records.createDiscovery({ ...request, profile: { ...profile, mode: 'other' }, targets: [] }),
+        { code: 'WEBTTY_LAUNCH_TARGET_INVALID' });
+});
+
 test('discovery mints 192-bit opaque IDs and returns only safe bounded target rows', () => {
     const records = store();
     const discovery = records.createDiscovery({

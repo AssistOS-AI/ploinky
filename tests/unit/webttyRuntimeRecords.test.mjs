@@ -1,17 +1,22 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough, Writable } from 'node:stream';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
     agentStartupClientMatches,
     inspectExactAgentTargetAsync,
     listExactAgentStartupPodmanClients,
+    listLinuxProcessesWithArgument,
     listLinuxSessionMembers,
     readLinuxProcessIdentity,
     RuntimeRecordStore,
 } from '../../cli/server/webtty/runtimeRecords.mjs';
+import { createHomeMountBroker } from '../../cli/server/webtty/homeMountBroker.mjs';
 import { fixedAgentPodmanArgv } from '../../cli/server/webtty/agentRuntime.mjs';
 import { DEFAULT_WEBTTY_AGENT_WORKER_PATH } from '../../cli/server/webtty/agentWorkerClient.mjs';
 import { WEBTTY_AGENT_BACKEND } from '../../cli/server/webtty/agentWorkerProtocol.mjs';
@@ -143,6 +148,39 @@ async function createAgentRecord(store, { state = 'worker-only' } = {}) {
 function workerIdentity() {
     return { pid: 201, startToken: 'linux-proc:101', uid: process.getuid?.() ?? 0 };
 }
+
+test('projection receipts advance durably and block record removal until exact recovery succeeds', async (t) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'webtty-projection-record-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    let recover = false;
+    const calls = [];
+    const store = new RuntimeRecordStore({ directory, homeMountBroker: { recover: async (input) => {
+        calls.push(input);
+        return recover;
+    } } });
+    const handle = await createAgentRecord(store);
+    const identity = { dev: '1', ino: '2' };
+    const intent = { version: 1, stage: 'intent', target: { containerId: AGENT_CONTAINER_ID,
+        initPid: 4199, initStart: 'linux-proc:41990', root: identity, mountNamespace: identity,
+        userNamespace: identity, mountOwner: identity }, source: identity,
+    destination: { path: `/run/ploinky-webtty-home-${'a'.repeat(32)}` } };
+    await store.update(handle, { ...handle.record, homeProjection: intent });
+    const directoryReceipt = { ...intent, stage: 'directory', destination: { ...intent.destination, ...identity } };
+    await assert.rejects(store.update(handle, { ...handle.record, homeProjection: { ...directoryReceipt, stage: 'attached', mountId: '7' } }));
+    await store.update(handle, { ...handle.record, homeProjection: directoryReceipt });
+    const prepared = { ...directoryReceipt, stage: 'prepared', mountId: '7' };
+    await store.update(handle, { ...handle.record, homeProjection: prepared });
+    const attached = { ...prepared, stage: 'attached' };
+    await store.update(handle, { ...handle.record, homeProjection: attached });
+    await assert.rejects(store.update(handle, { ...handle.record, homeProjection: undefined }));
+    await assert.rejects(store.remove(handle), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+    assert.equal((await fs.readdir(directory)).length, 1);
+    recover = true;
+    assert.equal(await store.remove(handle), true);
+    const { onHelper, ...recoverArgs } = calls.at(-1);
+    assert.deepEqual(recoverArgs, { target: agentTarget(), receipt: attached });
+    assert.equal(typeof onHelper, 'function');
+});
 
 function observedWorker(marker, overrides = {}) {
     return {
@@ -1380,4 +1418,239 @@ test('pty-starting recovery rebuilds the exact profile-bearing Podman client arg
     });
     assert.equal(await store.markAgentPtyStarting(plainHandle, { ...plain, marker }), true);
     assert.deepEqual(Object.keys(plainHandle.record.agentStartup).sort(), Object.keys(plain).sort());
+});
+
+// ---- Home projection helper ownership (helper ownership design D2/D4, R2, T7) ----
+
+const HELPER_PATH = fileURLToPath(new URL('../../cli/server/webtty/homeMountHelper.py', import.meta.url));
+const HELPER_NONCE = 'H'.repeat(32);
+const PROJECTION_IDENTITY = Object.freeze({ dev: '1', ino: '2' });
+
+function attachedProjection() {
+    return {
+        version: 1, stage: 'attached',
+        target: { containerId: AGENT_CONTAINER_ID, initPid: 4199, initStart: 'linux-proc:41990',
+            root: PROJECTION_IDENTITY, mountNamespace: PROJECTION_IDENTITY,
+            userNamespace: PROJECTION_IDENTITY, mountOwner: PROJECTION_IDENTITY },
+        source: PROJECTION_IDENTITY,
+        destination: { path: `/run/ploinky-webtty-home-${'a'.repeat(32)}`, ...PROJECTION_IDENTITY },
+        mountId: '7',
+    };
+}
+
+async function recordDirectory(t) {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'webtty-helper-record-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    return directory;
+}
+
+test('helper ownership is a validated agent-only field that update can set, replace and clear', async (t) => {
+    const directory = await recordDirectory(t);
+    const store = new RuntimeRecordStore({ directory });
+    const handle = await createAgentRecord(store);
+    const uid = process.getuid?.() ?? 0;
+    await store.update(handle, { ...handle.record, homeProjectionHelper: { nonce: HELPER_NONCE, operation: 'prepare' } });
+    const complete = { nonce: HELPER_NONCE, operation: 'prepare', pid: 900, startToken: 'linux-proc:9000', uid };
+    await store.update(handle, { ...handle.record, homeProjectionHelper: complete });
+    const [fileName] = await fs.readdir(directory);
+    assert.deepEqual((await store.readEntry(fileName)).homeProjectionHelper, complete);
+    for (const invalid of [
+        { nonce: HELPER_NONCE },
+        { nonce: 'short', operation: 'prepare' },
+        { ...complete, pid: undefined },
+        { ...complete, extra: true },
+        { nonce: HELPER_NONCE, operation: 'recover' },
+    ]) {
+        await assert.rejects(store.update(handle, { ...handle.record, homeProjectionHelper: invalid }));
+    }
+    assert.deepEqual(handle.record.homeProjectionHelper, complete);
+    await store.update(handle, { ...handle.record, homeProjectionHelper: undefined });
+    assert.equal('homeProjectionHelper' in handle.record, false);
+    assert.equal('homeProjectionHelper' in JSON.parse(await fs.readFile(path.join(directory, fileName), 'utf8')), false);
+    const box = await store.create({ routerEpoch: 'router-epoch-abcdefghijklmnop', marker: 'box-marker-abcdefghijklmnopqrstuvwx', worker: workerIdentity() });
+    await assert.rejects(store.update(box, { ...box.record, homeProjectionHelper: { nonce: HELPER_NONCE, operation: 'prepare' } }));
+});
+
+test('remove reclaims recorded helper ownership, clears it, then releases with durable helper writes', async (t) => {
+    const directory = await recordDirectory(t);
+    const order = [];
+    let reclaimed = false;
+    let store;
+    const broker = {
+        async reclaimHelper(input) { order.push(['reclaim', input]); return reclaimed; },
+        async recover({ onHelper }) {
+            const [fileName] = await fs.readdir(directory);
+            order.push(['recover', (await store.readEntry(fileName)).homeProjectionHelper]);
+            const state = { nonce: 'R'.repeat(32), operation: 'release' };
+            assert.equal(await onHelper(state), true);
+            order.push(['written', (await store.readEntry(fileName)).homeProjectionHelper]);
+            assert.equal(await onHelper(null), true);
+            return true;
+        },
+    };
+    store = new RuntimeRecordStore({ directory, homeMountBroker: broker });
+    const handle = await createAgentRecord(store);
+    const ownership = { nonce: HELPER_NONCE, operation: 'validate' };
+    await store.update(handle, { ...handle.record, homeProjection: attachedProjection(), homeProjectionHelper: ownership });
+    await assert.rejects(store.remove(handle), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN', reason: 'helper_exit_unproven' });
+    assert.equal((await fs.readdir(directory)).length, 1);
+    assert.deepEqual(order, [['reclaim', { ownership, uid: process.getuid?.() ?? 0 }]]);
+    assert.deepEqual(handle.record.homeProjectionHelper, ownership);
+    reclaimed = true;
+    order.length = 0;
+    assert.equal(await store.remove(handle), true);
+    assert.deepEqual(order.map(([step, value]) => [step, value?.nonce]), [
+        ['reclaim', undefined], ['recover', undefined], ['written', 'R'.repeat(32)],
+    ]);
+    assert.deepEqual(await fs.readdir(directory), []);
+});
+
+test('a record holding only helper ownership still requires helper reclamation before deletion', async (t) => {
+    const directory = await recordDirectory(t);
+    let reclaims = 0;
+    const store = new RuntimeRecordStore({ directory, homeMountBroker: { async reclaimHelper() { reclaims += 1; return reclaims > 1; } } });
+    const handle = await createAgentRecord(store);
+    await store.update(handle, { ...handle.record, homeProjectionHelper: { nonce: HELPER_NONCE, operation: 'prepare' } });
+    await assert.rejects(store.remove(handle), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+    assert.equal((await fs.readdir(directory)).length, 1);
+    assert.equal(await store.remove(handle), true);
+    assert.equal(reclaims, 2);
+    assert.deepEqual(await fs.readdir(directory), []);
+    const unavailable = new RuntimeRecordStore({ directory });
+    const other = await createAgentRecord(unavailable);
+    await unavailable.update(other, { ...other.record, homeProjectionHelper: { nonce: HELPER_NONCE, operation: 'prepare' } });
+    await assert.rejects(unavailable.remove(other), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+});
+
+// The real broker over a fake /proc and a fake release helper process.
+function helperRecoveryBroker({ scanError = false } = {}) {
+    const uid = process.getuid?.() ?? 0;
+    const procs = new Map([[4199, { pid: 4199, state: 'S', uid, pgrp: 1, session: 1, startToken: 'linux-proc:41990', cmdline: ['/sbin/init'] }]]);
+    const log = [];
+    const encoded = Buffer.from('{}').toString('base64url');
+    const leftover = (pid, argv) => procs.set(pid, { pid, state: 'S', uid, pgrp: 700, session: 700, startToken: `linux-proc:${pid}0`, cmdline: argv });
+    const podmanArgv = (nonce) => ['/usr/bin/podman', 'unshare', '/usr/bin/python3', '-I', '-S', HELPER_PATH, nonce, encoded];
+    const proof = attachedProjection().target;
+    let nextPid = 800;
+    const broker = createHomeMountBroker({
+        uid, graceMs: 1, delay: () => new Promise((resolve) => setImmediate(resolve)),
+        inspectTarget: async () => ({ id: AGENT_CONTAINER_ID, running: true, initPid: 4199 }),
+        readIdentity: async (pid) => (procs.has(pid) ? { ...procs.get(pid) } : null),
+        listSessionMembers: async (sid) => [...procs.values()].filter((entry) => entry.session === sid),
+        scanNonce: async (nonce) => {
+            log.push('scan');
+            if (scanError) throw Object.assign(new Error('scan'), { code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN', category: 'proc-scan-timeout' });
+            return [...procs.values()].filter((entry) => entry.cmdline.includes(nonce));
+        },
+        signal: (pid, name) => { log.push(`${name}:${pid}`); procs.delete(pid); },
+        spawnImpl: (binary, args) => {
+            log.push('spawn');
+            const pid = nextPid;
+            nextPid += 10;
+            procs.set(pid, { pid, state: 'S', uid, pgrp: pid, session: pid, startToken: `linux-proc:${pid}0`, cmdline: [binary, ...args] });
+            const child = new EventEmitter();
+            child.pid = pid;
+            child.stdout = new PassThrough();
+            child.stderr = new PassThrough();
+            child.stdin = new Writable({ final(done) { done(); }, write(chunk, encoding, done) {
+                const { action } = JSON.parse(chunk.toString());
+                log.push(`send:${action}`);
+                if (action === 'proceed') {
+                    child.stdout.write(`${JSON.stringify({ phase: 'closed' })}\n`);
+                    procs.delete(pid);
+                    process.nextTick(() => child.emit('close', 0, null));
+                }
+                done();
+            } });
+            process.nextTick(() => child.stdout.write(`${JSON.stringify({ phase: 'identity', target: {
+                root: proof.root, mountNamespace: proof.mountNamespace, userNamespace: proof.userNamespace, mountOwner: proof.mountOwner,
+            } })}\n`));
+            return child;
+        },
+    });
+    return { broker, log, leftover, podmanArgv, encoded };
+}
+
+test('T7: restart recovery reclaims a nonce-only helper before releasing the projection', async (t) => {
+    for (const leftover of [true, false]) {
+        const directory = await recordDirectory(t);
+        const fake = helperRecoveryBroker();
+        const store = new RuntimeRecordStore({ directory, homeMountBroker: fake.broker, readIdentity: async () => null, graceMs: 1, delay: async () => {} });
+        const handle = await createAgentRecord(store);
+        await store.update(handle, { ...handle.record, homeProjection: attachedProjection(), homeProjectionHelper: { nonce: HELPER_NONCE, operation: 'prepare' } });
+        if (leftover) {
+            fake.leftover(700, fake.podmanArgv(HELPER_NONCE));
+            fake.leftover(702, ['/usr/bin/python3', '-I', '-S', HELPER_PATH, HELPER_NONCE, fake.encoded]);
+        }
+        const recovery = await store.recover();
+        assert.deepEqual(recovery, { ok: true, evidence: ['dead_record_removed'], agentAvailable: true, quarantinedTargets: [] });
+        assert.deepEqual(await fs.readdir(directory), []);
+        const spawn = fake.log.indexOf('spawn');
+        assert.ok(spawn > fake.log.indexOf('scan'));
+        assert.deepEqual(fake.log.slice(0, spawn), leftover ? ['scan', 'SIGTERM:700', 'SIGTERM:702', 'scan'] : ['scan']);
+        assert.deepEqual(fake.log.slice(spawn), ['spawn', 'send:proceed']);
+    }
+});
+
+test('R2/T7: unproven helper recovery quarantines only the target and retains the record', async (t) => {
+    const directory = await recordDirectory(t);
+    const fake = helperRecoveryBroker({ scanError: true });
+    const store = new RuntimeRecordStore({ directory, homeMountBroker: fake.broker, readIdentity: async () => null, graceMs: 1, delay: async () => {} });
+    const handle = await createAgentRecord(store);
+    await store.update(handle, { ...handle.record, homeProjection: attachedProjection(), homeProjectionHelper: { nonce: HELPER_NONCE, operation: 'validate' } });
+    const recovery = await store.recover();
+    assert.deepEqual(recovery, {
+        ok: true,
+        evidence: ['home_projection_helper_unproven'],
+        agentAvailable: true,
+        quarantinedTargets: [{ target: agentTarget(), category: 'home_projection_helper_unproven' }],
+    });
+    assert.equal((await fs.readdir(directory)).length, 1);
+    assert.equal(fake.log.includes('spawn'), false);
+    const [fileName] = await fs.readdir(directory);
+    assert.deepEqual((await store.readEntry(fileName)).homeProjectionHelper, { nonce: HELPER_NONCE, operation: 'validate' });
+});
+
+test('R2: a live worker-only record with unproven helper ownership is target-quarantined after worker reclamation', async (t) => {
+    const directory = await recordDirectory(t);
+    let alive = true;
+    const signals = [];
+    const store = new RuntimeRecordStore({
+        directory,
+        readIdentity: async () => (alive ? agentWorkerObserved() : null),
+        signal: (pid, name) => { signals.push([pid, name]); alive = false; },
+        homeMountBroker: { async reclaimHelper() { throw Object.assign(new Error('scan'), { code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN' }); } },
+        graceMs: 1, workerGraceMs: 1, delay: async () => {},
+    });
+    const handle = await createAgentRecord(store);
+    await store.update(handle, { ...handle.record, homeProjectionHelper: { nonce: HELPER_NONCE, operation: 'prepare' } });
+    const recovery = await store.recover();
+    assert.deepEqual(signals, [[201, 'SIGTERM']]);
+    assert.deepEqual(recovery, {
+        ok: true,
+        evidence: ['home_projection_helper_unproven'],
+        agentAvailable: true,
+        quarantinedTargets: [{ target: agentTarget(), category: 'home_projection_helper_unproven' }],
+    });
+    assert.equal((await fs.readdir(directory)).length, 1);
+});
+
+test('the nonce scan matches only an exact argv element and skips oversized command lines', async (t) => {
+    const procRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ploinky-webtty-nonce-proc-'));
+    t.after(() => fs.rm(procRoot, { recursive: true, force: true }));
+    const uid = process.getuid?.() ?? 0;
+    const entries = [
+        [501, ['/usr/bin/python3', '-I', '-S', HELPER_PATH, HELPER_NONCE, 'e30']],
+        [502, ['/usr/bin/python3', `${HELPER_NONCE}x`]],
+        [503, ['/bin/sh', 'x'.repeat(70 * 1024), HELPER_NONCE]],
+    ];
+    for (const [pid, argv] of entries) {
+        await fs.mkdir(path.join(procRoot, String(pid)));
+        await fs.writeFile(path.join(procRoot, String(pid), 'stat'), procStat(pid, { session: 500, pgrp: 500 }));
+        await fs.writeFile(path.join(procRoot, String(pid), 'status'), `Name:\tx\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`);
+        await fs.writeFile(path.join(procRoot, String(pid), 'cmdline'), `${argv.join('\0')}\0`);
+    }
+    const matches = await listLinuxProcessesWithArgument(HELPER_NONCE, { procRoot });
+    assert.deepEqual(matches.map((entry) => [entry.pid, entry.session, entry.uid]), [[501, 500, uid]]);
+    await assert.rejects(listLinuxProcessesWithArgument('short', { procRoot }));
 });

@@ -14,6 +14,8 @@ import { finalizePlanAfterAdmission } from '../proxy/RoutePlan.js';
 import { sanitizeRequestHeaders } from '../proxy/sanitizeRequestHeaders.js';
 import { buildHttpRouteAuthInfoHeader } from '../routerHandlers.js';
 import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
+import { workspaceNetworkIdentity } from '../../sandbox/networkIdentity.js';
+import { assertOwnedInspection, exactCandidate, inspectExactTerminalContainer, translateWorkspaceDirectoryToMount } from './terminalTargetResolver.mjs';
 
 // A home profile is an optional, agent-nominated directory that becomes a
 // terminal's HOME. The owning agent declares one resolve endpoint on its own
@@ -55,12 +57,13 @@ export function validateHomeProfileLabel(value) {
 }
 
 export function validateHomeProfileRequest(profile) {
-    if (!exactKeys(profile, ['provider', 'id'])
+    const live = exactKeys(profile, ['provider', 'id', 'mode']) && profile.mode === 'live-agent';
+    if ((!live && !exactKeys(profile, ['provider', 'id']))
         || typeof profile.provider !== 'string' || !HOME_PROFILE_PROVIDER_PATTERN.test(profile.provider)
         || typeof profile.id !== 'string' || !HOME_PROFILE_ID_PATTERN.test(profile.id)) {
         return null;
     }
-    return Object.freeze({ provider: profile.provider, id: profile.id });
+    return Object.freeze({ provider: profile.provider, id: profile.id, ...(live ? { mode: 'live-agent' } : {}) });
 }
 
 // Only the agent-port surface can be planned through agentPortPlan, so the
@@ -68,7 +71,7 @@ export function validateHomeProfileRequest(profile) {
 // own `/base-agent-additional-server/<routeKey>/<port>/...` surface.
 export function homeProfileDeclaration(manifest, routeKey) {
     const declaration = plainObject(manifest?.webtty) ? manifest.webtty.homeProfiles : undefined;
-    if (!exactKeys(declaration, ['version', 'resolve']) || declaration.version !== 1) return null;
+    if (!exactKeys(declaration, ['version', 'resolve']) || ![1, 2].includes(declaration.version)) return null;
     const resolve = declaration.resolve;
     if (typeof resolve !== 'string' || !resolve.startsWith(`/${AGENT_PORT_ROUTE}/`)
         || Buffer.byteLength(resolve, 'utf8') > WEBTTY_HOME_PROFILE_LIMITS.resolvePathBytes
@@ -85,7 +88,7 @@ export function homeProfileDeclaration(manifest, routeKey) {
         || selector.query !== '' || selector.suffix === '/' || selector.policyPath !== resolve) {
         return null;
     }
-    return Object.freeze({ version: 1, resolve });
+    return Object.freeze({ version: declaration.version, resolve });
 }
 
 function activeRoute(routes, routeKey) {
@@ -135,7 +138,8 @@ function sameProvider(left, right) {
     return Boolean(left && right)
         && ['routeKey', 'containerName', 'agentName', 'repoName', 'containerId', 'instanceId', 'enableGeneration']
             .every((field) => left[field] === right[field])
-        && left.declaration.resolve === right.declaration.resolve;
+        && left.declaration.resolve === right.declaration.resolve
+        && left.declaration.version === right.declaration.version;
 }
 
 // The returned home is relative to the provider's data directory. Reject every
@@ -193,7 +197,7 @@ function directoryIdentity(absolutePath, fsApi) {
     return Object.freeze({ dev: String(stat.dev), ino: String(stat.ino) });
 }
 
-export function validateHomeProfileResponse(statusCode, bodyBytes, requestedId) {
+export function validateHomeProfileResponse(statusCode, bodyBytes, requestedId, mode) {
     if (statusCode !== 200) return null;
     let value;
     try {
@@ -205,7 +209,10 @@ export function validateHomeProfileResponse(statusCode, bodyBytes, requestedId) 
         || !exactKeys(value.profile, ['id', 'label', 'home'])
         || value.profile.id !== requestedId
         || !validateHomeProfileLabel(value.profile.label)
-        || typeof value.profile.home !== 'string') {
+        || (mode === 'live-agent'
+            ? (!exactKeys(value.profile.home, ['root', 'path']) || value.profile.home.root !== 'private'
+                || !validateHomeProfileHome(value.profile.home.path))
+            : typeof value.profile.home !== 'string')) {
         return null;
     }
     return Object.freeze({ id: value.profile.id, label: value.profile.label, home: value.profile.home });
@@ -216,6 +223,8 @@ export class WebttyHomeProfileProvider {
         workspaceRoot,
         relayManager,
         providerDataDirectory = (agentName) => getAgentWorkDir(agentName),
+        inspectContainer = inspectExactTerminalContainer,
+        workspaceIdentity = workspaceNetworkIdentity,
         signRouteRequest = buildHttpRouteAuthInfoHeader,
         planAgentPort = agentPortPlan,
         fsApi = fs,
@@ -226,6 +235,8 @@ export class WebttyHomeProfileProvider {
         this.workspaceRoot = workspaceRoot;
         this.relayManager = relayManager;
         this.providerDataDirectory = providerDataDirectory;
+        this.inspectContainer = inspectContainer;
+        this.workspaceIdentity = workspaceIdentity;
         this.signRouteRequest = signRouteRequest;
         this.planAgentPort = planAgentPort;
         this.fsApi = fsApi;
@@ -246,18 +257,55 @@ export class WebttyHomeProfileProvider {
         if (!snapshot) throw profileError('generation');
         const provider = findHomeProfileProvider(snapshot, requested.provider);
         if (!provider) throw profileError('provider');
-        const answer = await this.callProvider({ req, routePlan, snapshot, provider, id: requested.id });
+        if (requested.mode === 'live-agent' && provider.declaration.version !== 2) throw profileError('provider');
+        const answer = await this.callProvider({ req, routePlan, snapshot, provider, id: requested.id, mode: requested.mode });
         // The generation, and with it the provider's exact runtime record,
         // must still be the one that answered.
         const after = currentSnapshot(routePlan);
         if (after !== snapshot || !sameProvider(findHomeProfileProvider(after, requested.provider), provider)) {
             throw profileError('generation');
         }
-        const home = this.confineHome(provider, answer.home);
+        let home = requested.mode === 'live-agent'
+            ? await this.confinePrivateHome(provider, answer.home.path, snapshot)
+            : this.confineHome(provider, answer.home);
+        if (currentSnapshot(routePlan) !== snapshot) throw profileError('generation');
+        if (requested.mode === 'live-agent') home = Object.freeze({ ...home, providerBinding: provider });
         return Object.freeze({
-            profile: Object.freeze({ provider: requested.provider, id: answer.id, label: answer.label }),
+            profile: Object.freeze({ provider: requested.provider, id: answer.id, label: answer.label,
+                ...(requested.mode ? { mode: requested.mode } : {}) }),
             home,
         });
+    }
+
+    async confinePrivateHome(provider, homeValue, snapshot) {
+        const home = validateHomeProfileHome(homeValue);
+        if (!home) throw profileError('home');
+        try {
+            const root = this.fsApi.realpathSync(this.workspaceRoot);
+            const privateRoot = path.join(root, '.data', '.private', provider.agentName);
+            const relativePath = `.data/.private/${provider.agentName}/${home}`;
+            let current = root;
+            for (const segment of relativePath.split('/')) {
+                current = path.join(current, segment);
+                const stat = this.fsApi.lstatSync(current);
+                if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('not a directory');
+            }
+            if (this.fsApi.realpathSync(current) !== current || this.fsApi.realpathSync(privateRoot) !== privateRoot) {
+                throw new Error('noncanonical private path');
+            }
+            const candidate = exactCandidate(provider.containerName, snapshot.agents?.[provider.containerName], new Set(['podman']));
+            const hash = this.workspaceIdentity()?.hash;
+            if (!candidate || !hash) throw new Error('provider identity');
+            const inspected = assertOwnedInspection(candidate,
+                await this.inspectContainer(candidate.runtime, candidate.containerId), hash);
+            const mounts = inspected.mounts.filter((mount) => mount.type === 'bind' && mount.source === privateRoot && mount.rw === true);
+            if (mounts.length !== 1) throw new Error('private bind');
+            const mapping = await translateWorkspaceDirectoryToMount(current, inspected.mounts, { fsApi: this.fsApi });
+            if (!mapping || mapping.access !== 'rw'
+                || mapping.translatedCwd !== path.posix.join(mounts[0].destination, home)) throw new Error('private bind shadowed');
+            return Object.freeze({ relativePath, absolutePath: current, workspaceRealPath: root,
+                identity: directoryIdentity(current, this.fsApi) });
+        } catch (_) { throw profileError('home'); }
     }
 
     confineHome(provider, homeValue) {
@@ -297,7 +345,7 @@ export class WebttyHomeProfileProvider {
         return Object.freeze({ relativePath, absolutePath: resolved.absolutePath, identity });
     }
 
-    async callProvider({ req, routePlan, snapshot, provider, id }) {
+    async callProvider({ req, routePlan, snapshot, provider, id, mode }) {
         const resolvePath = provider.declaration.resolve;
         let plan;
         try {
@@ -327,7 +375,8 @@ export class WebttyHomeProfileProvider {
             || !providerRouteAdmitsCaller(plan, req, snapshot)) {
             throw profileError('route');
         }
-        const body = Buffer.from(JSON.stringify({ version: 1, id }), 'utf8');
+        const body = Buffer.from(JSON.stringify(mode === 'live-agent'
+            ? { version: 2, action: 'resolve', id, mode } : { version: 1, id }), 'utf8');
         const bodyHash = sha256RawBodyHash(body);
         let authInfo;
         let finalized;
@@ -354,7 +403,7 @@ export class WebttyHomeProfileProvider {
             throw profileError('signature');
         }
         const response = await this.exchange({ plan: finalized, lease: routePlan.lease, headers, body, bodyHash });
-        const answer = validateHomeProfileResponse(response.statusCode, response.body, id);
+        const answer = validateHomeProfileResponse(response.statusCode, response.body, id, mode);
         if (!answer) throw profileError('response');
         return answer;
     }

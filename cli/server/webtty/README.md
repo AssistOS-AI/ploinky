@@ -1,0 +1,9 @@
+# WebTTY home profiles
+
+An administrator can request a provider's named home profile. A version 1 provider returns a home under its public data directory. A version 2 provider also accepts the `live-agent` resolve request and nominates a directory under its own private data directory. The Router signs the request, checks the provider's running container and private bind, and keeps the nominated path out of the browser response.
+
+For a live-agent launch, discovery lists running agents that can reach the selected working directory. If an agent already has a writable mapping to the selected home, WebTTY uses that mapping. Otherwise it projects the original home into that agent for the session. The terminal runs as the target's configured user and retains the selected working directory, including a read-only directory.
+
+The recovery record tracks projection creation before each filesystem or mount operation. Cleanup first reclaims the terminal processes, then verifies and detaches the recorded mount. Ambiguous cleanup retains the record and quarantines the target. A detached mount prevents new pathname access through that projection; processes that already opened files or copied data retain them. Other processes in the target can access the projected home while it is mounted.
+
+Each projection helper runs as its own session and carries a random nonce in its arguments. Before starting it, WebTTY durably records the nonce, and before sending any command it records the verified session leader. On failure or timeout WebTTY signals only individually verified helper processes, never a process group, and clears the record only after the helper's exit is proven. A record that still names a helper keeps its journal. Recovery first reclaims that helper by its recorded session or, if the crash came before the leader was recorded, by a bounded scan for the nonce. If exit cannot be proven, only that target is quarantined.

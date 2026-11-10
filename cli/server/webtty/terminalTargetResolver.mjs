@@ -282,6 +282,7 @@ function profileHome(home, translatedHome) {
         absolutePath: home.absolutePath,
         identity: Object.freeze({ dev: home.identity.dev, ino: home.identity.ino }),
         translatedHome,
+        ...(home.providerBinding ? { providerBinding: home.providerBinding } : {}),
     });
 }
 
@@ -418,9 +419,12 @@ async function resolveOneAgent(candidate, directory, context) {
         );
         if (!mapping) return null;
         const display = safeAgentDisplay(candidate, mapping);
-        const profile = context.home
+        let profile = context.home
             ? await translateProfileHome(context.home, inspected.mounts, context.fsApi)
             : null;
+        if (context.live && profile?.unavailable) {
+            profile = { home: Object.freeze({ ...context.home }) };
+        }
         return Object.freeze({
             kind: 'agent',
             directory,
@@ -577,7 +581,7 @@ export class TerminalTargetResolver {
         );
     }
 
-    async discover({ routePlan, requestedDirectory, agentProviderAvailable = true, home = null } = {}) {
+    async discover({ routePlan, requestedDirectory, agentProviderAvailable = true, home = null, live = false } = {}) {
         const snapshot = routeSnapshot(routePlan);
         const directory = resolveDirectory(requestedDirectory, this);
         const box = boxProfileTarget(directory, home);
@@ -586,13 +590,13 @@ export class TerminalTargetResolver {
             return Object.freeze({
                 directory,
                 agentTargetsAvailable: false,
-                targets: Object.freeze([box]),
+                targets: Object.freeze(live ? [] : [box]),
             });
         }
         const workspaceHash = exactText(this.workspaceIdentity()?.hash);
         if (!workspaceHash) {
             routeSnapshot(routePlan);
-            return Object.freeze({ directory, agentTargetsAvailable: false, targets: Object.freeze([box]) });
+            return Object.freeze({ directory, agentTargetsAvailable: false, targets: Object.freeze(live ? [] : [box]) });
         }
         const candidates = Object.entries(snapshot.agents || {})
             .map(([name, record]) => exactCandidate(name, record, this.supportedRuntimes))
@@ -625,6 +629,7 @@ export class TerminalTargetResolver {
                     isTargetQuarantined: this.isTargetQuarantined,
                     fsApi: this.fsApi,
                     home,
+                    live,
                 }), { signal: controller.signal, output: partialResults }),
                 budget,
             ]);
@@ -640,14 +645,14 @@ export class TerminalTargetResolver {
             return Object.freeze({
                 directory,
                 agentTargetsAvailable: false,
-                targets: Object.freeze([box]),
+                targets: Object.freeze(live ? [] : [box]),
             });
         }
         const agents = disambiguateAgentDisplays(resolved.filter(Boolean));
         return Object.freeze({
             directory,
             agentTargetsAvailable: true,
-            targets: Object.freeze([box, ...agents]),
+            targets: Object.freeze(live ? agents : [box, ...agents]),
         });
     }
 
@@ -676,6 +681,16 @@ export class TerminalTargetResolver {
                 throw targetError('WEBTTY_TARGET_STALE');
             }
             if (!sameDirectory(home, target.home)) throw targetError('WEBTTY_TARGET_STALE');
+            if (target.profile?.mode === 'live-agent') {
+                try {
+                    let current = home.workspaceRealPath;
+                    for (const segment of home.relativePath.split('/')) {
+                        current = path.join(current, segment);
+                        const stat = this.fsApi.lstatSync(current);
+                        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('unsafe home path');
+                    }
+                } catch (_) { throw targetError('WEBTTY_TARGET_STALE'); }
+            }
         }
         if (target.kind === 'box') {
             if (home && target.home.translatedHome !== home.absolutePath) throw targetError('WEBTTY_TARGET_STALE');
@@ -704,7 +719,7 @@ export class TerminalTargetResolver {
                 || mapping.translatedCwd !== target.translatedCwd || mapping.access !== target.access) {
                 throw targetError('WEBTTY_TARGET_STALE');
             }
-            if (home) {
+            if (home && target.home.translatedHome !== undefined && !target.home.projected) {
                 const translated = await translateProfileHome(home, inspected.mounts, this.fsApi);
                 if (translated.home?.translatedHome !== target.home.translatedHome) {
                     throw targetError('WEBTTY_TARGET_STALE');

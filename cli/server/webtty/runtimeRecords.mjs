@@ -21,6 +21,7 @@ import {
     validateAgentRecoveryEvidence,
     validateAgentStartupEvidence,
 } from './agentWorkerProtocol.mjs';
+import { validateHomeHelperOwnership, validateHomeMountReceipt } from './homeMountBroker.mjs';
 
 export const WEBTTY_RECOVERY_RECORD_SCHEMA = 'ploinky-webtty-recovery/v2';
 export const DEFAULT_WEBTTY_RUNTIME_DIRECTORY = '/run/ploinky/webtty';
@@ -183,7 +184,7 @@ function validateRecord(value) {
     }
     const allowed = new Set([
         'schema', 'routerEpoch', 'marker', 'targetKind', 'target', 'worker', 'pty', 'agent',
-        'agentStartup',
+        'agentStartup', 'homeProjection', 'homeProjectionHelper',
         'createdAt', 'cleanupState', 'ptyState',
     ]);
     if (Object.keys(value).some((key) => !allowed.has(key))) throw new Error('record has unsupported fields');
@@ -201,6 +202,17 @@ function validateRecord(value) {
         throw new Error('record metadata is invalid');
     }
     if (!['box', 'agent'].includes(value.targetKind)) throw new Error('record target kind is invalid');
+    if (value.homeProjection !== undefined) {
+        if (value.targetKind !== 'agent') throw new Error('Box projection is invalid');
+        validateHomeMountReceipt(value.homeProjection);
+        if (value.homeProjection.target.containerId !== value.target?.containerId) throw new Error('projection target mismatch');
+    }
+    // Durable helper-process ownership is a sibling of the receipt stage. An
+    // explicit undefined value is the cleared field and is never persisted.
+    if (value.homeProjectionHelper !== undefined) {
+        if (value.targetKind !== 'agent') throw new Error('Box projection helper is invalid');
+        validateHomeHelperOwnership(value.homeProjectionHelper);
+    }
     const worker = assertIdentity(value.worker, 'worker');
     const pty = assertIdentity(value.pty, 'pty', { optional: true });
     let target = null;
@@ -245,6 +257,10 @@ function validateRecord(value) {
         pty,
         agent,
         agentStartup,
+        ...(value.homeProjection ? { homeProjection: cloneFrozen(value.homeProjection) } : {}),
+        ...(value.homeProjectionHelper !== undefined
+            ? { homeProjectionHelper: cloneFrozen(value.homeProjectionHelper) }
+            : {}),
         createdAt: value.createdAt,
         ...(value.cleanupState === 'unproven' ? { cleanupState: 'unproven' } : {}),
         ptyState: value.ptyState,
@@ -508,6 +524,49 @@ export async function listLinuxSessionMembers(sessionId, {
     return Object.freeze(members);
 }
 
+async function readLinuxCmdlineArgv(procRoot, pid, checkScan) {
+    checkScan();
+    const handle = await fs.open(path.join(procRoot, String(pid), 'cmdline'), 'r');
+    try {
+        checkScan();
+        const buffer = Buffer.alloc(MAX_LINUX_PROC_BYTES + 1);
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+        checkScan();
+        // A longer command line cannot be a bounded fixed-argv candidate.
+        if (bytesRead > MAX_LINUX_PROC_BYTES) return null;
+        return buffer.subarray(0, bytesRead).toString('utf8').split('\0').filter(Boolean);
+    } finally {
+        await handle.close();
+    }
+}
+
+// Bounded /proc scan for processes whose argv contains one exact element (a
+// random helper nonce). Candidates are filtered on the command line before
+// the full identity read; callers apply their own exact ownership rule.
+export async function listLinuxProcessesWithArgument(argument, {
+    procRoot = '/proc',
+    maxEntries = MAX_LINUX_PROC_SCAN_ENTRIES,
+    scanTimeoutMs = LINUX_PROC_SCAN_TIMEOUT_MS,
+} = {}) {
+    if (typeof argument !== 'string' || argument.length < 16 || argument.includes('\0')) {
+        throw new Error('invalid Linux process argument');
+    }
+    const matches = [];
+    await scanLinuxProc(procRoot, async (entry, checkScan) => {
+        const pid = Number(entry.name);
+        try {
+            const argv = await readLinuxCmdlineArgv(procRoot, pid, checkScan);
+            if (!argv?.includes(argument)) return;
+            checkScan();
+            const observed = await readLinuxProcessIdentity(pid, { procRoot });
+            if (observed?.cmdline?.includes(argument)) matches.push(Object.freeze(observed));
+        } catch (error) {
+            if (error?.code !== 'ENOENT' && error?.code !== 'ESRCH') throw error;
+        }
+    }, { maxEntries, timeoutMs: scanTimeoutMs, concurrency: LINUX_SESSION_SCAN_CONCURRENCY });
+    return Object.freeze(matches);
+}
+
 function identityMatches(observed, expected) {
     return Boolean(observed
         && observed.pid === expected.pid
@@ -522,6 +581,7 @@ function liveIdentityMatches(observed, expected) {
 }
 
 export function classifyAgentEvidenceFailure(error) {
+    if (error?.code === 'WEBTTY_HOME_PROJECTION_UNPROVEN') return 'target';
     if (error?.code === 'WEBTTY_AGENT_PODMAN_FAILURE') {
         return ['exec-not-drained', 'exec-id-ambiguity'].includes(error?.category)
             ? 'target'
@@ -552,6 +612,7 @@ export class RuntimeRecordStore {
         signal = process.kill.bind(process),
         graceMs = 750,
         workerGraceMs = 5_000,
+        homeMountBroker = null,
         delay = sleep,
     } = {}) {
         this.directory = path.resolve(directory);
@@ -568,6 +629,7 @@ export class RuntimeRecordStore {
         this.graceMs = graceMs;
         this.workerGraceMs = Math.max(graceMs, workerGraceMs);
         this.delay = delay;
+        this.homeMountBroker = homeMountBroker;
     }
 
     async ensureDirectory() {
@@ -607,6 +669,12 @@ export class RuntimeRecordStore {
         await this.ensureDirectory();
         if (!handle || !RECORD_NAME.test(String(handle.fileName || ''))) throw new Error('invalid record handle');
         const record = validateRecord(next);
+        if (handle.record?.homeProjection) {
+            if (!record.homeProjection) throw new Error('projection evidence cannot be removed');
+            if (JSON.stringify(record.homeProjection) !== JSON.stringify(handle.record.homeProjection)) {
+                validateHomeMountReceipt(record.homeProjection, { previous: handle.record.homeProjection });
+            }
+        }
         const bytes = Buffer.from(JSON.stringify(record));
         if (bytes.length > MAX_RECORD_BYTES) throw new Error('record is too large');
         const target = path.join(this.directory, handle.fileName);
@@ -630,6 +698,41 @@ export class RuntimeRecordStore {
 
     async remove(handle) {
         if (!handle || !RECORD_NAME.test(String(handle.fileName || ''))) return false;
+        if (handle.record?.homeProjectionHelper) {
+            // A recorded helper (possibly from a pre-intent spawn) must be
+            // proven gone before its journal can disappear or be released.
+            if (typeof this.homeMountBroker?.reclaimHelper !== 'function') {
+                throw Object.assign(new Error('projection helper reclamation unavailable'), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+            }
+            try {
+                if (await this.homeMountBroker.reclaimHelper({
+                    ownership: handle.record.homeProjectionHelper,
+                    uid: this.uid,
+                }) !== true) throw new Error('unconfirmed');
+                await this.update(handle, { ...handle.record, homeProjectionHelper: undefined });
+            } catch (error) {
+                throw Object.assign(new Error('projection helper exit unconfirmed'), {
+                    code: 'WEBTTY_HOME_PROJECTION_UNPROVEN', reason: 'helper_exit_unproven', cause: error,
+                });
+            }
+        }
+        if (handle.record?.homeProjection) {
+            if (typeof this.homeMountBroker?.recover !== 'function') {
+                throw Object.assign(new Error('projection recovery unavailable'), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+            }
+            try {
+                if (await this.homeMountBroker.recover({
+                    target: handle.record.target,
+                    receipt: handle.record.homeProjection,
+                    onHelper: async (state) => {
+                        await this.update(handle, { ...handle.record, homeProjectionHelper: state ?? undefined });
+                        return true;
+                    },
+                }) !== true) throw new Error('unconfirmed');
+            } catch (_) {
+                throw Object.assign(new Error('projection cleanup unconfirmed'), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+            }
+        }
         const target = path.join(this.directory, handle.fileName);
         try {
             const stat = await fs.lstat(target);
@@ -829,7 +932,14 @@ export class RuntimeRecordStore {
             if (!(await this.confirmReclaimed(record, { waitForExit: true }))) {
                 return this.agentRecoveryFailure(record, 'agent_worker_cleanup_unconfirmed', 'provider');
             }
-            if (await this.remove({ fileName, record }) !== true) {
+            let removed;
+            try {
+                removed = await this.remove({ fileName, record });
+            } catch (error) {
+                if (error?.code !== 'WEBTTY_HOME_PROJECTION_UNPROVEN') throw error;
+                return this.agentRecoveryFailure(record, 'home_projection_helper_unproven', classifyAgentEvidenceFailure(error));
+            }
+            if (removed !== true) {
                 return this.agentRecoveryFailure(record, 'agent_record_remove_unconfirmed', 'provider');
             }
             return { recovered: true, category: 'verified_agent_worker_reclaimed' };
@@ -1174,7 +1284,15 @@ export class RuntimeRecordStore {
             }
         }
         if (alreadyReclaimed) {
-            if (await this.remove({ fileName, record }) !== true) {
+            let removed;
+            try {
+                removed = await this.remove({ fileName, record });
+            } catch (error) {
+                if (record.targetKind !== 'agent' || error?.code !== 'WEBTTY_HOME_PROJECTION_UNPROVEN') throw error;
+                // An unproven helper or projection quarantines only its target.
+                return this.agentRecoveryFailure(record, 'home_projection_helper_unproven', classifyAgentEvidenceFailure(error));
+            }
+            if (removed !== true) {
                 return record.targetKind === 'agent'
                     ? this.agentRecoveryFailure(record, 'agent_record_remove_unconfirmed', 'provider')
                     : { recovered: false, category: 'recovery_record_remove_unconfirmed' };

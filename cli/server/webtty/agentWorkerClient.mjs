@@ -43,7 +43,7 @@ function sameProfileEvidence(initSpec, evidence) {
     if (expected !== Object.hasOwn(evidence, 'translatedHome')) return false;
     if (!expected) return !Object.hasOwn(evidence, 'profile');
     return evidence.translatedHome === initSpec.translatedHome
-        && ['provider', 'id', 'label'].every((field) => evidence.profile?.[field] === initSpec.profile[field]);
+        && ['provider', 'id', 'label', 'mode'].every((field) => evidence.profile?.[field] === initSpec.profile[field]);
 }
 
 export class AgentWebttyWorkerClient extends EventEmitter {

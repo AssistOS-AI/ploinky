@@ -241,7 +241,8 @@ function translatedHome(value) {
 }
 
 function profileIdentity(value) {
-    exactObject(value, PROFILE_IDENTITY_FIELDS, 'profile-fields');
+    const live = value?.mode === 'live-agent';
+    exactObject(value, live ? [...PROFILE_IDENTITY_FIELDS, 'mode'] : PROFILE_IDENTITY_FIELDS, 'profile-fields');
     boundedString(value.provider, {
         min: 1, max: 128, pattern: /^[A-Za-z0-9][A-Za-z0-9_.-]*$/, category: 'profile',
     });

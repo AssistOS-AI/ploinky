@@ -22,6 +22,8 @@ import {
     terminalTargetRouteBinding,
 } from './terminalTargetResolver.mjs';
 import { WebttyWorkerClient } from './workerClient.mjs';
+import { createHomeMountBroker } from './homeMountBroker.mjs';
+import { findHomeProfileProvider } from './homeProfileProvider.mjs';
 
 const DEFAULT_AUTH_ADAPTER = Object.freeze({
     createLease: createBrowserSessionLease,
@@ -143,8 +145,10 @@ export class WebttySessionManager {
         limits = WEBTTY_SESSION_LIMITS,
         workerFactory = (options) => new WebttyWorkerClient(options),
         agentWorkerFactory = (options) => new AgentWebttyWorkerClient(options),
+        homeMountBroker = createHomeMountBroker(),
         recordStore = new RuntimeRecordStore({
             directory: process.env.PLOINKY_WEBTTY_RUNTIME_DIR || undefined,
+            homeMountBroker,
         }),
         launchStore = new WebttyLaunchRecordStore(),
         targetResolver = null,
@@ -163,6 +167,7 @@ export class WebttySessionManager {
         this.workerFactory = workerFactory;
         this.agentWorkerFactory = agentWorkerFactory;
         this.recordStore = recordStore;
+        this.homeMountBroker = homeMountBroker;
         this.launchStore = launchStore;
         this.auth = Object.freeze({ ...DEFAULT_AUTH_ADAPTER, ...auth });
         this.now = now;
@@ -462,6 +467,7 @@ export class WebttySessionManager {
             requestedDirectory: directory,
             agentProviderAvailable: this.agentProviderReady,
             ...(resolvedProfile ? { home: resolvedProfile.home } : {}),
+            ...(resolvedProfile?.profile?.mode === 'live-agent' ? { live: true } : {}),
         });
         if (this.agentProviderReady && discovered.agentTargetsAvailable === false) {
             this.disableAgentProvider('discovery_provider_unavailable');
@@ -476,6 +482,7 @@ export class WebttySessionManager {
                 owner: this.launchOwner(lease),
                 routeBinding: binding,
                 targets: discovered.targets,
+                directory: discovered.directory,
                 agentTargetsAvailable: discovered.agentTargetsAvailable,
                 ...(resolvedProfile ? { profile: resolvedProfile.profile } : {}),
             });
@@ -500,7 +507,8 @@ export class WebttySessionManager {
             current = await this.resolveHomeProfile({
                 req,
                 routePlan,
-                profile: { provider: target.profile.provider, id: target.profile.id },
+                profile: { provider: target.profile.provider, id: target.profile.id,
+                    ...(target.profile.mode ? { mode: target.profile.mode } : {}) },
             });
         } catch (_) {
             throw errorWithCode('WEBTTY_TARGET_STALE');
@@ -509,6 +517,7 @@ export class WebttySessionManager {
         if (!home || current.profile.provider !== target.profile.provider
             || current.profile.id !== target.profile.id
             || current.profile.label !== target.profile.label
+            || current.profile.mode !== target.profile.mode
             || current.home.relativePath !== home.relativePath
             || current.home.absolutePath !== home.absolutePath
             || current.home.identity.dev !== home.identity.dev
@@ -1001,7 +1010,7 @@ export class WebttySessionManager {
             this.cleanupLaunchSubscription(lease.sessionFingerprint);
         }
         this.assertCreationActive(attempt);
-        const target = consumed.target;
+        let target = consumed.target;
         await this.revalidateLease(lease);
         this.assertCreationActive(attempt);
         if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
@@ -1073,6 +1082,7 @@ export class WebttySessionManager {
             targetValidation: null,
             targetUndecidedSince: null,
             recordWritePromise: Promise.resolve(),
+            homeHelperOperation: Promise.resolve(),
         };
         let subscriptionActive = false;
         let synchronousInvalidation = '';
@@ -1189,6 +1199,41 @@ export class WebttySessionManager {
                             agentProviderAvailable: this.agentProviderReady,
                         });
                         this.assertStartupActive(session);
+                        if (target.profile?.mode === 'live-agent' && !target.home.translatedHome) {
+                            // Nothing throws inside the ordered write chain. The
+                            // intent precedes every helper mutation and is refused
+                            // after cancellation. A later receipt records a mutation
+                            // already made, so it is always written; cancellation
+                            // then returns false and the broker aborts before its
+                            // next mutating command, leaving release to recovery.
+                            const persistProjection = async (receipt) => {
+                                const recordsMutation = receipt?.stage !== 'intent';
+                                const written = await this.queueRecordWrite(session, async () => {
+                                    if (!recordsMutation && !this.startupStillActive(session)) return false;
+                                    await this.recordStore.update(session.recordHandle, {
+                                        ...session.recordHandle.record, homeProjection: receipt,
+                                    });
+                                    return true;
+                                });
+                                return written === true && this.startupStillActive(session);
+                            };
+                            const projection = await this.runHomeHelper(session, (onHelper) => (
+                                this.homeMountBroker.prepare({
+                                    target, home: target.home, sessionId: id, onHelper,
+                                    onIntent: persistProjection, onDirectory: persistProjection,
+                                    onPrepared: persistProjection, onAttached: persistProjection,
+                                })
+                            ));
+                            target = Object.freeze({ ...target, home: Object.freeze({ ...target.home,
+                                translatedHome: projection.home, projected: true }) });
+                            session.target = target;
+                        }
+                        if (session.recordHandle.record.homeProjection) {
+                            await this.runHomeHelper(session, (onHelper) => this.homeMountBroker.validate({
+                                target, home: target.home, onHelper,
+                                receipt: session.recordHandle.record.homeProjection,
+                            }));
+                        }
                         const prepared = await worker.prepare({
                             runtime: target.runtime,
                             containerId: target.containerId,
@@ -1232,6 +1277,12 @@ export class WebttySessionManager {
                             target,
                             agentProviderAvailable: this.agentProviderReady,
                         });
+                        if (session.recordHandle.record.homeProjection) {
+                            await this.runHomeHelper(session, (onHelper) => this.homeMountBroker.validate({
+                                target, home: target.home, onHelper,
+                                receipt: session.recordHandle.record.homeProjection,
+                            }));
+                        }
                         this.assertStartupActive(session);
                     } catch (error) {
                         // Keep the immutable-container lock until the durable
@@ -1352,6 +1403,15 @@ export class WebttySessionManager {
         }
         await deferredClosePromise;
         throw deferredStartupError;
+    }
+
+    startupStillActive(session) {
+        try {
+            this.assertStartupActive(session);
+            return true;
+        } catch (_) {
+            return false;
+        }
     }
 
     assertStartupActive(session) {
@@ -1784,6 +1844,37 @@ export class WebttySessionManager {
         return pending;
     }
 
+    // Every home-mount broker operation of one session runs on this chain.
+    // Admission is synchronous inside the step, immediately before the
+    // broker's pre-spawn ownership write, so nothing spawns once close began.
+    runHomeHelper(session, operation, { admit = null } = {}) {
+        const step = session.homeHelperOperation.catch(() => {}).then(() => {
+            if (session.closing || session.closed || (admit && admit() !== true)) {
+                throw errorWithCode('WEBTTY_SESSION_CLOSING');
+            }
+            return operation(this.homeHelperOwnershipWriter(session));
+        });
+        session.homeHelperOperation = step;
+        return step;
+    }
+
+    homeHelperOwnershipWriter(session) {
+        return (state) => this.queueRecordWrite(session, async () => {
+            if (state) {
+                // A new ownership claim is refused, never thrown into the
+                // ordered write chain; the broker then refuses to proceed.
+                if (session.closing || session.closed) return false;
+                if (session.startupInProgress && !this.startupStillActive(session)) return false;
+            }
+            // Clearing proven helper ownership is never gated.
+            await this.recordStore.update(session.recordHandle, {
+                ...session.recordHandle.record,
+                homeProjectionHelper: state ?? undefined,
+            });
+            return true;
+        });
+    }
+
     closeSession(sessionOrId, reason = 'requested', options = {}) {
         const session = typeof sessionOrId === 'string' ? this.sessions.get(sessionOrId) : sessionOrId;
         if (!session) return Promise.resolve(false);
@@ -1846,8 +1937,19 @@ export class WebttySessionManager {
         // A cleanup-error message and the process-exit notification can be
         // adjacent. Never recover or remove the same durable handle until the
         // ordered cleanup-evidence write has reached stable storage.
-        let recordWrite;
-        do {
+        // The sealed helper chain is drained first: an in-flight broker
+        // operation is bounded and may still queue its ownership writes.
+        let recordWrite = null;
+        let helperOperation = null;
+        while (helperOperation !== session.homeHelperOperation
+            || recordWrite !== session.recordWritePromise) {
+            if (helperOperation !== session.homeHelperOperation) {
+                helperOperation = session.homeHelperOperation;
+                // A failed helper operation keeps its durable ownership for
+                // remove() reclamation; it is not a record-write failure.
+                try { await helperOperation; } catch (_) { }
+                continue;
+            }
             recordWrite = session.recordWritePromise;
             try {
                 await recordWrite;
@@ -1856,7 +1958,7 @@ export class WebttySessionManager {
                 this.noteCleanupFailure(session, 'global');
                 this.disableForUnprovenCleanup('recovery_record_write_failed', session);
             }
-        } while (recordWrite !== session.recordWritePromise);
+        }
         let cleanupProven = session.terminalCleanupProven === true;
         let cleanupFailureCategory = '';
         let cleanupFailureScope = '';
@@ -1964,13 +2066,14 @@ export class WebttySessionManager {
                             'agent_record_remove_unconfirmed',
                         );
                     }
-                } catch (_) {
+                } catch (error) {
                     recordCleanupFailed = true;
-                    this.disableForRecordRemovalFailure(
-                        session,
-                        'recovery_record_remove_failed',
-                        'agent_record_remove_failed',
-                    );
+                    if (error?.code === 'WEBTTY_HOME_PROJECTION_UNPROVEN' && session.target.kind === 'agent') {
+                        this.noteCleanupFailure(session, 'target');
+                        this.quarantineAgentTarget(session.target, 'home_projection_cleanup_unconfirmed');
+                    } else {
+                        this.disableForRecordRemovalFailure(session, 'recovery_record_remove_failed', 'agent_record_remove_failed');
+                    }
                 }
             }
             // An earlier cleanup failure of this session (for example a
@@ -2063,12 +2166,30 @@ export class WebttySessionManager {
                         routePlan: plan, target: session.target, signal: controller.signal,
                         agentProviderAvailable: this.agentProviderReady,
                     });
+                    if (session.profile?.mode === 'live-agent') {
+                        const expected = session.target.home.providerBinding;
+                        const provider = findHomeProfileProvider(plan.snapshot, session.profile.provider);
+                        if (!expected || !provider || !['routeKey', 'containerName', 'agentName', 'repoName',
+                            'containerId', 'instanceId', 'enableGeneration'].every((key) => provider[key] === expected[key])
+                            || provider.declaration.version !== expected.declaration.version
+                            || provider.declaration.resolve !== expected.declaration.resolve) {
+                            throw errorWithCode('WEBTTY_TARGET_STALE');
+                        }
+                        await this.targetResolver.revalidate({ routePlan: plan, target: session.target,
+                            agentProviderAvailable: this.agentProviderReady });
+                        if (session.recordHandle?.record?.homeProjection) {
+                            await this.runHomeHelper(session, (onHelper) => this.homeMountBroker.validate({
+                                target: session.target, home: session.target.home, onHelper,
+                                receipt: session.recordHandle.record.homeProjection,
+                            }), { admit: current });
+                        }
+                    }
                     if (current()) session.targetUndecidedSince = null;
                     return;
                 } catch (error) {
                     if (!current()) return;
                     if (error?.code === 'WEBTTY_TARGET_GENERATION_STALE') continue;
-                    if (error?.code === 'WEBTTY_TARGET_IDENTITY_STALE') {
+                    if (['WEBTTY_TARGET_IDENTITY_STALE', 'WEBTTY_TARGET_STALE', 'WEBTTY_HOME_PROJECTION_UNPROVEN'].includes(error?.code)) {
                         void this.closeSession(session, 'target_identity_changed').catch(() => {});
                     } else if (error?.code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') {
                         this.disableAgentProvider('target_provider_unavailable');

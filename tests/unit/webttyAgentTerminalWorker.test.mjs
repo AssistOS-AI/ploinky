@@ -1714,6 +1714,43 @@ test('ExecID selection tolerates unrelated removals but rejects concurrent addit
 
 const PROFILE = Object.freeze({ provider: 'provider', id: 'p-1', label: 'Profile One' });
 
+test('live profile preserves its mode in startup evidence and does not invoke the provider shell hook', async () => {
+    const h = harness();
+    const profile = { ...PROFILE, mode: 'live-agent' };
+    const argv = fixedAgentPodmanArgv(init({ translatedHome: '/run/terminal-home', profile }));
+    assert.ok(argv.includes('ENV='));
+    assert.ok(argv.includes('BASH_ENV='));
+    await h.worker.initialize(init({ translatedHome: '/run/terminal-home', profile }));
+    await h.worker.launch();
+    assert.equal(h.ptyState.writes.length, 1);
+    const prepared = h.processApi.sent.find((message) => message.type === 'prepared');
+    assert.deepEqual(prepared.startupEvidence.profile, profile);
+});
+
+test('live readiness restores selected HOME and cwd and refuses an inaccessible HOME', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'webtty-live-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const home = path.join(root, 'home');
+    const cwd = path.join(root, 'cwd');
+    fs.mkdirSync(home);
+    fs.mkdirSync(cwd);
+    const stat = path.join(root, 'stat');
+    const status = path.join(root, 'status');
+    fs.writeFileSync(stat, `42 (sh) ${['S', '1', '42', '42', ...Array(15).fill('0'), '98765', '0'].join(' ')}\n`);
+    fs.writeFileSync(status, 'Name:\tsh\nUid:\t1234\t1234\t1234\t1234\n');
+    const command = agentReadinessCommand(READINESS_CHALLENGE, true).replaceAll('/proc/$$/stat', stat)
+        .replaceAll('/proc/$$/status', status).replace(/\r$/, '');
+    const env = { ...process.env, HOME: root, PLOINKY_WEBTTY_SELECTED_HOME: home,
+        PLOINKY_WEBTTY_SELECTED_CWD: cwd, PLOINKY_WEBTTY_MARKER: MARKER };
+    const result = spawnSync('/bin/sh', ['-c', `${command}; printf 'STATE:%s|%s' "$HOME" "$PWD"`], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /__PLOINKY_AGENT_READY__/);
+    assert.ok(result.stdout.includes(`STATE:${home}|${cwd}`));
+    const missing = spawnSync('/bin/sh', ['-c', command], { env: { ...env, PLOINKY_WEBTTY_SELECTED_HOME: `${home}-missing` }, encoding: 'utf8' });
+    assert.equal(missing.status, 124);
+    assert.doesNotMatch(missing.stdout, /__PLOINKY_AGENT_READY__/);
+});
+
 test('profile launcher is written only after inner capture, target revalidation and exec correlation', async () => {
     let inspections = 0;
     const h = harness({

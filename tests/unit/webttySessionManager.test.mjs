@@ -312,6 +312,7 @@ async function createManager(t, options = {}) {
         launchStore: options.launchStore,
         targetResolver: options.targetResolver,
         homeProfiles: options.homeProfiles,
+        homeMountBroker: options.homeMountBroker,
         agentProviderAvailable: options.agentProviderAvailable,
         audit: options.audit,
         now: options.now,
@@ -3054,6 +3055,37 @@ test('an agent profile session sends the translated HOME and profile to the agen
     assert.deepEqual(agentWorker.factoryOptions, { terminalId: created.id });
 });
 
+test('live agent projection is journaled before the worker starts and revalidated before readiness', async (t) => {
+    const profile = { ...PROFILE, mode: 'live-agent' };
+    const answer = { profile, home: PROFILE_HOME };
+    const agentWorker = new FakeWorker();
+    agentWorker.start = async function start() { return { recoveryEvidence: { exact: true } }; };
+    const target = { ...terminalTargets()[1], home: PROFILE_HOME };
+    const directory = target.directory;
+    const stages = [];
+    const broker = {
+        async prepare({ onIntent, onDirectory, onPrepared, onAttached }) {
+            for (const [stage, callback] of [['intent', onIntent], ['directory', onDirectory],
+                ['prepared', onPrepared], ['attached', onAttached]]) {
+                assert.equal(await callback({ stage }), true);
+                stages.push(stage);
+            }
+            return { home: '/run/terminal-home', receipt: { stage: 'attached' } };
+        },
+        async validate() { stages.push('validate'); return true; },
+    };
+    const targetResolver = { async discover() { return { directory, targets: [target], agentTargetsAvailable: true }; },
+        async revalidate({ target: value }) { return value; } };
+    const manager = await createManager(t, { agentProviderAvailable: true, homeMountBroker: broker,
+        targetResolver, homeProfiles: homeProfiles([answer, answer]), agentWorkerFactory: () => agentWorker });
+    const discovery = await manager.discoverTargets({ req: {}, routePlan: routePlan(), directory: 'Projects',
+        profile: { provider: profile.provider, id: profile.id, mode: profile.mode } });
+    const created = await manager.create({ req: {}, routePlan: routePlan(), launch: discovery.targets[0].launch, cols: 80, rows: 24 });
+    assert.deepEqual(stages, ['intent', 'directory', 'prepared', 'attached', 'validate', 'validate']);
+    assert.equal(agentWorker.startFields.translatedHome, '/run/terminal-home');
+    assert.deepEqual(manager.sessions.get(created.id).recordHandle.record.homeProjection, { stage: 'attached' });
+});
+
 test('creation fails as target-stale when the provider answer or home identity changed', async (t) => {
     const refusal = Object.assign(new Error('refused'), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
     for (const [name, answer] of [
@@ -4567,4 +4599,291 @@ test('retained reads keep authentication refusals and survive failed writes with
         assert.equal(snapshot(), before, failing);
     }
     assertRetainedExit(await f.stream(), 'target_identity_changed', 'the record still answers');
+});
+
+// ---- Home projection helper ownership (helper ownership design D6, R1) ----
+
+const HELPER_OWNER_NONCE = 'O'.repeat(32);
+
+async function liveProjectionManager(t, broker, {
+    store = recordStore(), home = PROFILE_HOME, capturePlan, resolver = {},
+} = {}) {
+    const profile = { ...PROFILE, mode: 'live-agent' };
+    const answer = { profile, home };
+    const agentWorker = new FakeWorker();
+    agentWorker.start = async function start() { return { recoveryEvidence: { exact: true } }; };
+    const target = { ...terminalTargets()[1], home };
+    const targetResolver = { async discover() { return { directory: target.directory, targets: [target], agentTargetsAvailable: true }; },
+        async revalidate({ target: value }) { return value; }, ...resolver };
+    const manager = await createManager(t, { agentProviderAvailable: true, homeMountBroker: broker, recordStore: store,
+        targetResolver, homeProfiles: homeProfiles([answer, answer]), agentWorkerFactory: () => agentWorker, capturePlan });
+    const discovery = await manager.discoverTargets({ req: {}, routePlan: routePlan(), directory: 'Projects',
+        profile: { provider: profile.provider, id: profile.id, mode: profile.mode } });
+    const create = () => manager.create({ req: {}, routePlan: routePlan(), launch: discovery.targets[0].launch, cols: 80, rows: 24 });
+    return { manager, store, create };
+}
+
+function ownershipBroker(observe = () => {}) {
+    const ownership = (operation) => ({ nonce: HELPER_OWNER_NONCE, operation, pid: 900, startToken: 'linux-proc:9000', uid: 0 });
+    return {
+        validates: 0,
+        async prepare({ onHelper, onIntent, onDirectory, onPrepared, onAttached }) {
+            assert.equal(await onHelper({ nonce: HELPER_OWNER_NONCE, operation: 'prepare' }), true);
+            observe('prepare-nonce');
+            assert.equal(await onHelper(ownership('prepare')), true);
+            observe('prepare-pid');
+            for (const [stage, callback] of [['intent', onIntent], ['directory', onDirectory], ['prepared', onPrepared], ['attached', onAttached]]) {
+                assert.equal(await callback({ stage }), true);
+            }
+            assert.equal(await onHelper(null), true);
+            observe('prepare-null');
+            return { home: '/run/terminal-home', receipt: { stage: 'attached' } };
+        },
+        async validate({ onHelper }) {
+            this.validates += 1;
+            if (!(await onHelper({ nonce: HELPER_OWNER_NONCE, operation: 'validate' }))) {
+                throw Object.assign(new Error('refused'), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+            }
+            assert.equal(await onHelper(null), true);
+            return true;
+        },
+    };
+}
+
+test('broker helper ownership is written and cleared through the ordered record chain', async (t) => {
+    const seen = [];
+    let fixture;
+    const broker = ownershipBroker((step) => {
+        const [session] = fixture.manager.sessions.values();
+        seen.push([step, session.recordHandle.record.homeProjectionHelper]);
+    });
+    fixture = await liveProjectionManager(t, broker);
+    const created = await fixture.create();
+    assert.deepEqual(seen, [
+        ['prepare-nonce', { nonce: HELPER_OWNER_NONCE, operation: 'prepare' }],
+        ['prepare-pid', { nonce: HELPER_OWNER_NONCE, operation: 'prepare', pid: 900, startToken: 'linux-proc:9000', uid: 0 }],
+        ['prepare-null', undefined],
+    ]);
+    assert.equal(broker.validates, 2);
+    const session = fixture.manager.sessions.get(created.id);
+    assert.equal(session.recordHandle.record.homeProjectionHelper, undefined);
+    assert.deepEqual(session.recordHandle.record.homeProjection, { stage: 'attached' });
+});
+
+test('startup cancellation refuses new helper ownership without poisoning the record chain', async (t) => {
+    let fixture;
+    let accepted = null;
+    const broker = ownershipBroker();
+    broker.validate = async function validate({ onHelper }) {
+        this.validates += 1;
+        authAdapter.listener('revoked');
+        accepted = await onHelper({ nonce: HELPER_OWNER_NONCE, operation: 'validate' });
+        if (!accepted) throw Object.assign(new Error('refused'), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+        return true;
+    };
+    fixture = await liveProjectionManager(t, broker);
+    const updates = [];
+    const update = fixture.store.update;
+    fixture.store.update = async function tracked(handle, value) {
+        updates.push(value.homeProjectionHelper);
+        return update.call(this, handle, value);
+    };
+    await assert.rejects(fixture.create());
+    assert.equal(accepted, false);
+    assert.equal(broker.validates, 1);
+    assert.deepEqual(updates.filter((state) => state?.operation === 'validate'), []);
+    assert.deepEqual(fixture.manager.availability(), { ok: true });
+    assert.equal(fixture.manager.activeCount(), 0);
+});
+
+test('D6/R1: close seals the helper chain, drains the in-flight operation and admits no later validate', async (t) => {
+    const broker = ownershipBroker();
+    const fixture = await liveProjectionManager(t, broker);
+    const created = await fixture.create();
+    const { manager, store } = fixture;
+    const session = manager.sessions.get(created.id);
+    // A periodic step that is no longer current is refused before the broker.
+    let admittedRan = false;
+    await assert.rejects(manager.runHomeHelper(session, () => { admittedRan = true; }, { admit: () => false }), { code: 'WEBTTY_SESSION_CLOSING' });
+    assert.equal(admittedRan, false);
+
+    let releaseInFlight;
+    const gate = new Promise((resolve) => { releaseInFlight = resolve; });
+    let started;
+    const running = new Promise((resolve) => { started = resolve; });
+    const inFlight = manager.runHomeHelper(session, async (onHelper) => {
+        started();
+        await gate;
+        return onHelper({ nonce: HELPER_OWNER_NONCE, operation: 'validate' });
+    });
+    await running;
+    const validatesBefore = broker.validates;
+    const updatesBefore = store.calls.updated;
+    const closing = manager.closeSession(session, 'requested');
+    assert.equal(session.closing, true);
+    // Queued behind the in-flight step; its admission runs only when it starts.
+    const late = manager.runHomeHelper(session, (onHelper) => broker.validate({ onHelper }));
+    for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(store.calls.removed, 0, 'record removal waits for the in-flight helper operation');
+    releaseInFlight();
+    assert.equal(await inFlight, false, 'an ownership claim after close began is refused');
+    await assert.rejects(late, { code: 'WEBTTY_SESSION_CLOSING' });
+    await closing;
+    assert.equal(broker.validates, validatesBefore, 'the late validate never reached the broker');
+    assert.equal(store.calls.updated, updatesBefore, 'no ownership write after close began');
+    assert.equal(store.calls.removed, 1);
+});
+
+test('D6/R1: a periodic validate whose revalidation straddles close start never reaches the broker or writes', async (t) => {
+    const resolve = '/base-agent-additional-server/provider/7001/api/profiles/resolve';
+    const provider = { type: 'agent', repoName: 'fixtures', agentName: 'provider', containerId: 'c'.repeat(64),
+        instanceId: 'provider-instance', enableGeneration: 'provider-generation' };
+    const snapshot = Object.freeze({
+        routing: { routes: { provider: { repo: 'fixtures', agent: 'provider', container: 'provider-container' } } },
+        agents: { 'provider-container': provider },
+        manifests: { provider: { webtty: { homeProfiles: { version: 2, resolve } } } },
+    });
+    const providerBinding = { routeKey: 'provider', containerName: 'provider-container', agentName: 'provider',
+        repoName: 'fixtures', containerId: provider.containerId, instanceId: provider.instanceId,
+        enableGeneration: provider.enableGeneration, declaration: { version: 2, resolve } };
+    let block = null;
+    let entered = () => {};
+    const broker = ownershipBroker();
+    const fixture = await liveProjectionManager(t, broker, {
+        home: { ...PROFILE_HOME, providerBinding },
+        capturePlan: () => ({ ...routePlan(), snapshot }),
+        resolver: {
+            async revalidateRunningAgent() {},
+            async revalidate({ target }) {
+                if (block) { entered(); await block; }
+                return target;
+            },
+        },
+    });
+    const created = await fixture.create();
+    const { manager, store } = fixture;
+    const session = manager.sessions.get(created.id);
+    assert.equal(broker.validates, 2);
+    // Positive control: the periodic path reaches the broker through the helper chain.
+    await manager.validateLiveSessions();
+    await settleTarget(session);
+    assert.equal(broker.validates, 3);
+    assert.equal(manager.activeCount(), 1);
+
+    const helperWrites = [];
+    const update = store.update;
+    store.update = async function tracked(handle, value) {
+        if (value.homeProjectionHelper) helperWrites.push(value.homeProjectionHelper);
+        return update.call(this, handle, value);
+    };
+    let release;
+    block = new Promise((resolve) => { release = resolve; });
+    const revalidating = new Promise((resolve) => { entered = resolve; });
+    await manager.validateLiveSessions();
+    const periodic = session.targetValidation.promise;
+    await revalidating;
+    const closing = manager.closeSession(session, 'requested');
+    release();
+    await periodic;
+    await closing;
+    assert.equal(broker.validates, 3, 'the straddling periodic validate never reached the broker');
+    assert.deepEqual(helperWrites, []);
+    assert.equal(store.calls.removed, 1);
+});
+
+// A fake store whose removal, like the real one, first requires a proven
+// release of any recorded projection receipt.
+function releasingStore(broker) {
+    const store = recordStore();
+    const remove = store.remove;
+    store.releases = [];
+    store.projections = [];
+    const update = store.update;
+    store.update = async function tracked(handle, value) {
+        if (value.homeProjection && value.homeProjection !== handle.record.homeProjection) {
+            store.projections.push(value.homeProjection.stage);
+        }
+        store.handle = handle;
+        return update.call(this, handle, value);
+    };
+    store.remove = async function releasingRemove(handle) {
+        if (handle.record?.homeProjection) {
+            store.releases.push(handle.record.homeProjection.stage);
+            if (await broker.recover({ receipt: handle.record.homeProjection }) !== true) {
+                throw Object.assign(new Error('projection cleanup unconfirmed'), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+            }
+        }
+        return remove.call(this, handle);
+    };
+    return store;
+}
+
+function journalAbort() {
+    return Object.assign(new Error('home projection journal update failed'), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+}
+
+test('startup cancellation before the intent receipt aborts prepare with no journal write and no global disable', async (t) => {
+    const broker = ownershipBroker();
+    let intentAccepted = null;
+    broker.recover = async () => assert.fail('nothing was mutated, so nothing is released');
+    broker.prepare = async function prepare({ onHelper, onIntent }) {
+        assert.equal(await onHelper({ nonce: HELPER_OWNER_NONCE, operation: 'prepare' }), true);
+        assert.equal(await onHelper({ nonce: HELPER_OWNER_NONCE, operation: 'prepare', pid: 900, startToken: 'linux-proc:9000', uid: 0 }), true);
+        authAdapter.listener('revoked');
+        intentAccepted = await onIntent({ stage: 'intent' });
+        if (intentAccepted) return { home: '/run/terminal-home', receipt: { stage: 'attached' } };
+        // The broker aborts: the helper's exit is proven, then ownership clears.
+        assert.equal(await onHelper(null), true);
+        throw journalAbort();
+    };
+    const store = releasingStore(broker);
+    const { manager, create } = await liveProjectionManager(t, broker, { store });
+    await assert.rejects(create(), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+    assert.equal(intentAccepted, false);
+    assert.deepEqual(store.projections, []);
+    assert.equal(store.handle.record.homeProjectionHelper, undefined);
+    assert.deepEqual(manager.availability(), { ok: true });
+    assert.equal(manager.activeCount(), 0);
+    assert.deepEqual(store.releases, []);
+    assert.equal(store.calls.removed, 1);
+    assert.equal(manager.quarantinedAgentTargets.size, 0);
+});
+
+test('startup cancellation after the directory receipt journals the mutation, stops the broker and releases only by proof', async (t) => {
+    for (const released of [true, false]) {
+        const broker = ownershipBroker();
+        let directoryAccepted = null;
+        let preparedCalls = 0;
+        broker.recover = async ({ receipt }) => { assert.equal(receipt.stage, 'directory'); return released; };
+        broker.prepare = async function prepare({ onHelper, onIntent, onDirectory, onPrepared }) {
+            assert.equal(await onHelper({ nonce: HELPER_OWNER_NONCE, operation: 'prepare' }), true);
+            assert.equal(await onHelper({ nonce: HELPER_OWNER_NONCE, operation: 'prepare', pid: 900, startToken: 'linux-proc:9000', uid: 0 }), true);
+            assert.equal(await onIntent({ stage: 'intent' }), true);
+            // The helper has created the destination directory; startup is then cancelled.
+            authAdapter.listener('revoked');
+            directoryAccepted = await onDirectory({ stage: 'directory' });
+            if (directoryAccepted) {
+                preparedCalls += 1;
+                await onPrepared({ stage: 'prepared' });
+            }
+            assert.equal(await onHelper(null), true);
+            throw journalAbort();
+        };
+        const store = releasingStore(broker);
+        const { manager, create } = await liveProjectionManager(t, broker, { store });
+        await assert.rejects(create(), { code: 'WEBTTY_HOME_PROJECTION_UNPROVEN' });
+        const label = released ? 'released' : 'unproven';
+        assert.equal(directoryAccepted, false, label);
+        assert.equal(preparedCalls, 0, label);
+        assert.deepEqual(store.projections, ['intent', 'directory'], label);
+        assert.equal(store.handle.record.homeProjection.stage, 'directory', label);
+        assert.equal(store.handle.record.homeProjectionHelper, undefined, label);
+        assert.deepEqual(manager.availability(), { ok: true }, label);
+        assert.equal(manager.activeCount(), 0, label);
+        assert.deepEqual(store.releases, ['directory'], label);
+        // Removed only after a proven release; otherwise retained with only the target quarantined.
+        assert.equal(store.calls.removed, released ? 1 : 0, label);
+        assert.equal(manager.quarantinedAgentTargets.size, released ? 0 : 1, label);
+        assert.equal(manager.agentProviderReady, true, label);
+    }
 });

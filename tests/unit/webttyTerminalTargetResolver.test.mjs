@@ -869,6 +869,19 @@ test('profile HOME is the same-path Box home and a writable live-mount translati
     assert.equal(isolated.unavailable, 'home-unreachable');
     assert.equal(isolated.home, undefined);
 
+    const live = await targetResolver.discover({
+        routePlan: plan, requestedDirectory: '.data/isolated/work', home, live: true,
+    });
+    assert.equal(live.targets.length, 2);
+    const liveIsolated = live.targets.find((target) => target.agentName === 'isolated');
+    assert.deepEqual(liveIsolated.home.identity, home.identity);
+    assert.equal(liveIsolated.home.translatedHome, undefined);
+    assert.equal(liveIsolated.unavailable, undefined);
+    const empty = await targetResolver.discover({
+        routePlan: plan, requestedDirectory: 'projects/demo', home, live: true, agentProviderAvailable: false,
+    });
+    assert.deepEqual(empty.targets, []);
+
     // Without a profile the same discovery is exactly today's.
     const plain = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
     assert.equal(plain.targets.some((target) => 'home' in target || 'unavailable' in target), false);

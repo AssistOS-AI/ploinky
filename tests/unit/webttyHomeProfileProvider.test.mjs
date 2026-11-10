@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 import { applyEdgeRoutingGeneration, initializeFreshEdgeRoutingSources } from '../../cli/sandbox/edgeGeneration.js';
 import { NETWORK_LABELS } from '../../cli/sandbox/networkLifecycle.js';
+import { NETWORK_SCHEMA_VERSION } from '../../cli/sandbox/networkContract.js';
 import { RelayRequestMinter } from '../../cli/server/runtimeRelay/relayRequestMinter.js';
 import { RuntimeRelayManager } from '../../cli/server/runtimeRelay/RuntimeRelayManager.js';
 import { agentPortPlan, resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
@@ -230,10 +231,12 @@ async function refused(promise, category) {
 
 test('declarations name only the declaring agent\'s own canonical agent-port path', () => {
     assert.deepEqual(homeProfileDeclaration(keeperManifest(), 'keeper'), { version: 1, resolve: RESOLVE });
+    assert.deepEqual(homeProfileDeclaration(keeperManifest({ webtty: { homeProfiles: { version: 2, resolve: RESOLVE } } }), 'keeper'),
+        { version: 2, resolve: RESOLVE });
     for (const webtty of [
         undefined,
         null,
-        { homeProfiles: { version: 2, resolve: RESOLVE } },
+        { homeProfiles: { version: 3, resolve: RESOLVE } },
         { homeProfiles: { version: 1, resolve: RESOLVE, extra: true } },
         { homeProfiles: { version: 1 } },
         { homeProfiles: { version: 1, resolve: '/keeper/api/profiles/resolve' } },
@@ -248,6 +251,83 @@ test('declarations name only the declaring agent\'s own canonical agent-port pat
         const manifest = webtty === undefined ? {} : { webtty };
         assert.equal(homeProfileDeclaration(manifest, 'keeper'), null, JSON.stringify(webtty));
     }
+});
+
+test('live profile requests and responses use the exact v2 shape', () => {
+    const request = { provider: 'keeper', id: 'robot.default', mode: 'live-agent' };
+    assert.deepEqual(validateHomeProfileRequest(request), request);
+    assert.equal(validateHomeProfileRequest({ ...request, mode: 'other' }), null);
+    assert.equal(validateHomeProfileRequest({ ...request, path: '/tmp' }), null);
+    const response = { allowed: true, profile: { id: request.id, label: 'Robot',
+        home: { root: 'private', path: 'robots/robot/home' } } };
+    const bytes = (value) => Buffer.from(JSON.stringify(value));
+    assert.deepEqual(validateHomeProfileResponse(200, bytes(response), request.id, request.mode), response.profile);
+    for (const home of [{ root: 'public', path: 'robots/robot/home' },
+        { root: 'private', path: '../other' }, { root: 'private', path: '/etc' }, 'robots/robot/home']) {
+        assert.equal(validateHomeProfileResponse(200, bytes({ ...response, profile: { ...response.profile, home } }),
+            request.id, request.mode), null);
+    }
+});
+
+test('live resolution sends the signed administrator request with the exact v2 body', async (t) => {
+    const fx = workspaceFixture(t, keeperManifest({ webtty: { homeProfiles: { version: 2, resolve: RESOLVE } } }));
+    const server = await providerServer(t, ({ req, res, body }) => {
+        const verified = verifyHttpRouteAuthInfoFromHeaders(req.headers, {
+            env: agentEnv(), replayCache: createMemoryReplayCache(), method: req.method,
+            path: UPSTREAM_PATH, query: '', body,
+        });
+        assert.equal(verified.ok, true);
+        assert.ok(verified.payload.actor.roles.includes('admin'));
+        assert.deepEqual(JSON.parse(body), { version: 2, action: 'resolve', id: 'robot.default', mode: 'live-agent' });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ allowed: true, profile: { id: 'robot.default', label: 'Robot',
+            home: { root: 'private', path: 'robots/robot/home' } } }));
+        return true;
+    });
+    const client = provider(fx, tcpRelayManager(server.port));
+    const nominated = { relativePath: '.data/.private/keeper/robots/robot/home', absolutePath: '/fixture/home',
+        identity: { dev: '1', ino: '2' } };
+    client.confinePrivateHome = async (_provider, home) => {
+        assert.equal(home, 'robots/robot/home');
+        return nominated;
+    };
+    const resolved = await client.resolve({ req: ADMIN_REQ, routePlan: fx.webttyPlan(),
+        profile: { provider: 'keeper', id: 'robot.default', mode: 'live-agent' } });
+    assert.deepEqual(resolved.profile, { provider: 'keeper', id: 'robot.default', label: 'Robot', mode: 'live-agent' });
+    assert.equal(resolved.home.absolutePath, nominated.absolutePath);
+    assert.equal(resolved.home.providerBinding.containerName, 'keeper-container');
+    assert.equal(server.received.length, 1);
+});
+
+test('private nominations require the exact owned bind and refuse links or shadowed homes', async (t) => {
+    const fx = workspaceFixture(t);
+    const privateRoot = path.join(fs.realpathSync(fx.workspace), '.data', '.private', 'keeper');
+    fs.mkdirSync(path.join(privateRoot, 'robots', 'r', 'home'), { recursive: true });
+    const record = { type: 'agent', runtime: 'podman', containerId: 'a'.repeat(64),
+        instanceId: 'instance', enableGeneration: 'generation', repoName: 'fixtures', agentName: 'keeper' };
+    const provider = { containerName: 'keeper-container', agentName: 'keeper' };
+    const hash = 'c1d2e3f40506';
+    let mounts = [{ Type: 'bind', Source: privateRoot, Destination: '/data', RW: true }];
+    const profileProvider = new WebttyHomeProfileProvider({ workspaceRoot: fx.workspace,
+        workspaceIdentity: () => ({ hash }), inspectContainer: async () => ({
+            Id: record.containerId, Name: '/keeper-container', State: { Running: true, Status: 'running' },
+            HostConfig: { Init: true }, Config: { Labels: {
+                [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'agent',
+                [NETWORK_LABELS.schema]: NETWORK_SCHEMA_VERSION, [NETWORK_LABELS.workspace]: hash,
+                [NETWORK_LABELS.contract]: 'b'.repeat(64), [NETWORK_LABELS.instanceId]: record.instanceId,
+                [NETWORK_LABELS.enableGeneration]: record.enableGeneration,
+            } }, Mounts: mounts,
+        }) });
+    const snapshot = { agents: { 'keeper-container': record } };
+    const result = await profileProvider.confinePrivateHome(provider, 'robots/r/home', snapshot);
+    assert.equal(result.absolutePath, path.join(privateRoot, 'robots', 'r', 'home'));
+    mounts = [];
+    await assert.rejects(profileProvider.confinePrivateHome(provider, 'robots/r/home', snapshot), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
+    mounts = [{ Type: 'bind', Source: privateRoot, Destination: '/data', RW: true },
+        { Type: 'bind', Source: fx.data, Destination: '/data/robots/r/home', RW: true }];
+    await assert.rejects(profileProvider.confinePrivateHome(provider, 'robots/r/home', snapshot), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
+    fs.symlinkSync(path.join(privateRoot, 'robots', 'r'), path.join(privateRoot, 'robots', 'link'));
+    await assert.rejects(profileProvider.confinePrivateHome(provider, 'robots/link/home', snapshot), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
 });
 
 test('a provider name must select exactly one enabled agent with a valid declaration', () => {

@@ -119,6 +119,12 @@ function profileEnvArgv(spec) {
         `PLOINKY_WEBTTY_PROFILE_ID=${spec.profile.id}`,
         '--env',
         `PLOINKY_WEBTTY_PROFILE_LABEL=${spec.profile.label}`,
+        ...(spec.profile.mode === 'live-agent' ? [
+            '--env', 'ENV=',
+            '--env', 'BASH_ENV=',
+            '--env', `PLOINKY_WEBTTY_SELECTED_HOME=${spec.translatedHome}`,
+            '--env', `PLOINKY_WEBTTY_SELECTED_CWD=${spec.translatedCwd}`,
+        ] : []),
     ];
 }
 

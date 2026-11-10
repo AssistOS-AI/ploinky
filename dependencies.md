@@ -1,5 +1,15 @@
 # Dependencies for graph skill scope persistence
 
+Live-agent WebTTY home projections use the Box's existing `/usr/bin/python3`
+standard library `ctypes` solely for Linux mount and namespace system calls;
+Node.js has no equivalent built-in interface and the Box deliberately omits a
+compiler. The fixed helper needs libc `open_tree`, `move_mount`, `setns`, and
+`umount2` symbols and a kernel and rootless Podman configuration that admit the
+operations. Missing prerequisites fail the projection without installing or
+downloading anything. The Box distribution supplies Python (PSF license), libc
+and their notices; this repository adds no Python package or vendored source.
+Removing this exception requires an equivalent supported Node.js syscall API.
+
 The optional Apple CPU and measurement tests use Node.js built-ins and repository modules. They add no package or runtime dependency. Live execution uses the existing pinned Podman, Node.js, llama.cpp image and macOS observers through the owned process provider. Preparation checks executable and image pins before execution; it never installs a missing prerequisite. The fixed cache observer imports the path resolver of the pworker engine package by the absolute path `/code/node_modules/pworker/lib/local-llm/controller/downloader.mjs`, where Ploinky binds the agent's installed dependencies read-only (a bare package name would resolve from the exec's working directory), and reads only the controller's `/data/models/gguf` tree. Offline tests use the existing engine-spawn guard and need `PLOINKY_AGENTLIB_DIR` to name the canonical AchillesAgentLib checkout.
 
 The offline hardware-limits suites of the local-llms candidate run in a runner-owned scratch copy of the exact candidate (a clean candidate is archived from its commit, a dirty one is copied byte for byte and must match its configured digest first; a dirty candidate that already holds a `node_modules` is refused). The harness runs `npm --prefix local-llm install --ignore-scripts --no-bin-links --no-package-lock` in that copy on every tree without looking at the tree's layout: the command installs the pworker engine when `local-llm/package.json` pins it, which needs network access to the pinned commit, and does nothing for a tree without dependencies. The report records the install separately from the source identity (the pworker commit npm resolved, which must equal the pinned one, and a digest of the installed package; both null when nothing is installed). After the suites, the candidate and the copy are checked again, excluding only `local-llm/node_modules`, and the copy is removed. The candidate itself, the frozen live stage and the agent's `/code` never get a `node_modules`.

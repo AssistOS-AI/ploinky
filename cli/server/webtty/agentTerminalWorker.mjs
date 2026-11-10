@@ -365,7 +365,7 @@ function outputChunks(value) {
     return chunks;
 }
 
-export function agentReadinessCommand(challenge) {
+export function agentReadinessCommand(challenge, live = false) {
     const normalizedChallenge = String(challenge || '');
     if (!READINESS_CHALLENGE.test(normalizedChallenge)) {
         const error = new Error('WebTTY agent readiness challenge is invalid');
@@ -386,11 +386,14 @@ export function agentReadinessCommand(challenge) {
     ].join('; ');
     // Both Bash and POSIX sh retain the interactive shell's `$$` in a
     // subshell while isolating IFS, positional parameters, and probe locals.
-    return `( ${probe} )\r`;
+    const restore = live
+        ? 'HOME=$PLOINKY_WEBTTY_SELECTED_HOME; export HOME; cd "$PLOINKY_WEBTTY_SELECTED_CWD" && [ "$PWD" = "$PLOINKY_WEBTTY_SELECTED_CWD" ] && [ -r "$HOME" ] && [ -w "$HOME" ] && [ -x "$HOME" ] || exit 124; unset PLOINKY_WEBTTY_SELECTED_HOME PLOINKY_WEBTTY_SELECTED_CWD; '
+        : '';
+    return `${restore}( ${probe} )\r`;
 }
 
-export function agentFallbackReadinessCommand(challenge) {
-    return `[ ! -e /bin/bash ] || exit 125; ${agentReadinessCommand(challenge)}`;
+export function agentFallbackReadinessCommand(challenge, live = false) {
+    return `[ ! -e /bin/bash ] || exit 125; ${agentReadinessCommand(challenge, live)}`;
 }
 
 function targetLocalProcessIdentityFailure(error) {
@@ -645,6 +648,7 @@ export class AgentTerminalWorker {
                 provider: message.profile.provider,
                 id: message.profile.id,
                 label: message.profile.label,
+                ...(message.profile.mode === 'live-agent' ? { mode: 'live-agent' } : {}),
             }),
         } : {};
         this.spec = Object.freeze({
@@ -755,9 +759,10 @@ export class AgentTerminalWorker {
             throw error;
         }
         this.readinessChallenge = challenge;
+        const live = this.spec.profile?.mode === 'live-agent';
         const readinessCommand = fallback
-            ? agentFallbackReadinessCommand(challenge)
-            : agentReadinessCommand(challenge);
+            ? agentFallbackReadinessCommand(challenge, live)
+            : agentReadinessCommand(challenge, live);
         this.assertStartupActive(deadlineAt, generation);
         let readinessTimer;
         let match;
@@ -797,7 +802,7 @@ export class AgentTerminalWorker {
             throw podmanRuntimeError('target-stale');
         }
         this.execId = selectExactNewExecId(this.baselineExecIds, after.execIds);
-        if (this.spec.profile) {
+        if (this.spec.profile && this.spec.profile.mode !== 'live-agent') {
             this.pty.write('if [ -x /etc/ploinky/webtty-profile-shell ]; then exec /etc/ploinky/webtty-profile-shell; fi\r');
         }
         return match;

@@ -96,7 +96,8 @@ function safeTarget(target) {
 function safeProfile(profile) {
     if (profile === null || profile === undefined) return null;
     const keys = profile && typeof profile === 'object' && !Array.isArray(profile) ? Object.keys(profile).sort() : [];
-    if (keys.join(',') !== 'id,label,provider'
+    const live = keys.join(',') === 'id,label,mode,provider' && profile.mode === 'live-agent';
+    if ((!live && keys.join(',') !== 'id,label,provider')
         || typeof profile.provider !== 'string' || !profile.provider
         || typeof profile.id !== 'string' || !profile.id
         || typeof profile.label !== 'string' || !profile.label
@@ -104,7 +105,8 @@ function safeProfile(profile) {
         || Buffer.byteLength(profile.label, 'utf8') > DISPLAY_LIMITS.label) {
         throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
     }
-    return Object.freeze({ provider: profile.provider, id: profile.id, label: profile.label });
+    return Object.freeze({ provider: profile.provider, id: profile.id, label: profile.label,
+        ...(live ? { mode: 'live-agent' } : {}) });
 }
 
 function cloneInternal(value) {
@@ -115,9 +117,10 @@ function cloneInternal(value) {
     return Object.freeze(cloned);
 }
 
-function canonicalDirectory(targets) {
-    const relative = exactText(targets[0]?.directory?.relativePath) || (
-        targets[0]?.directory?.relativePath === '' ? '' : null
+function canonicalDirectory(targets, trustedDirectory) {
+    const directory = trustedDirectory ?? targets[0]?.directory;
+    const relative = exactText(directory?.relativePath) || (
+        directory?.relativePath === '' ? '' : null
     );
     if (relative === null) throw launchError('WEBTTY_LAUNCH_DIRECTORY_INVALID');
     for (const target of targets) {
@@ -213,19 +216,21 @@ export class WebttyLaunchRecordStore {
         targets,
         agentTargetsAvailable = true,
         profile = null,
+        directory: trustedDirectory,
     } = {}) {
         const now = this.now();
         this.cleanupExpired(now);
         const owner = exactOwner(ownerInput);
         const routeBinding = exactRouteBinding(routeBindingInput);
-        if (!Array.isArray(targets) || targets.length < 1
-            || targets.length > this.limits.maxTargetsPerDiscovery
-            || targets[0]?.kind !== 'box') {
+        const responseProfile = safeProfile(profile);
+        const live = responseProfile?.mode === 'live-agent';
+        if (!Array.isArray(targets) || targets.length > this.limits.maxTargetsPerDiscovery
+            || (live ? (!trustedDirectory || targets.some((target) => target.kind !== 'agent'))
+                : (targets.length < 1 || targets[0]?.kind !== 'box'))) {
             throw launchError('WEBTTY_LAUNCH_TARGET_INVALID');
         }
-        const directory = canonicalDirectory(targets);
+        const directory = canonicalDirectory(targets, trustedDirectory);
         const rows = targets.map(safeTarget);
-        const responseProfile = safeProfile(profile);
         // With a profile, every launchable record binds that profile and its
         // per-target HOME; without one, records are exactly as before.
         for (const target of targets) {
