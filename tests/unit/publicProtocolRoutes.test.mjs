@@ -474,4 +474,13 @@ test('two tied routes that differ only in allowHeaders are rejected as conflicti
         sendRoute(), { path: `${PREFIX}/api/*`, access: 'public', publicProtocol: SEND_PROTOCOL },
     ] });
     assert.throws(state.activate, /conflicting execution metadata/);
+    // The same names in another order and case normalize equal, so they tie cleanly.
+    fs.writeFileSync(state.manifestPath, JSON.stringify({ routerAccess: { httpRoutes: [
+        sendRoute(),
+        { path: `${PREFIX}/api/*`, access: 'public', publicProtocol: {
+            methods: ['OPTIONS', 'POST'], allowCors: true, allowHeaders: [...TRACKER_HEADERS].reverse().map(name => name.toUpperCase()),
+        } },
+    ] } }));
+    state.activate();
+    assert.deepEqual(resolve(trackerPreflight(SEND_PATH)).responsePolicy.publicProtocol.allowHeaders, [...TRACKER_HEADERS].sort());
 });
