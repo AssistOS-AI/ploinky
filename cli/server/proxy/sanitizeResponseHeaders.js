@@ -1,3 +1,4 @@
+import { publicProtocolCorsAllowHeaders } from '../policy/PublicProtocolPolicy.js';
 import { HOP_BY_HOP, isRouterCookie, ROUTER_HEADERS } from './sanitizeRequestHeaders.js';
 
 function isPrivateIpv4(host) {
@@ -84,7 +85,8 @@ function protocolCorsHeaders(headers, policy) {
         if (permitted.length) result[name] = permitted.join(', ');
     };
     pickTokens('access-control-allow-methods', policy.publicProtocol.methods, value => value.toUpperCase());
-    pickTokens('access-control-allow-headers', ['authorization', 'content-type'], value => value.toLowerCase());
+    // Only headers the manifest route admits and the provider advertises.
+    pickTokens('access-control-allow-headers', publicProtocolCorsAllowHeaders(policy.publicProtocol), value => value.toLowerCase());
     pickTokens('access-control-expose-headers', ['www-authenticate'], value => value.toLowerCase());
     const maxAge = String(normalized['access-control-max-age'] || '');
     if (/^\d+$/.test(maxAge)) result['access-control-max-age'] = String(Math.min(Number(maxAge), 600));

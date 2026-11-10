@@ -10,6 +10,7 @@ import { applyEdgeRoutingGeneration } from '../../cli/sandbox/edgeGeneration.js'
 import { resolveEdgeRoutePlan, httpAccessForEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
 import { ensureHttpRouteAccess } from '../../cli/server/authHandlers/authContext.js';
 import { normalizeManifestHttpRouteAccess } from '../../cli/server/policy/HttpRouteProviders.js';
+import { normalizePublicProtocol } from '../../cli/server/policy/PublicProtocolPolicy.js';
 import { executeHttpPlan } from '../../cli/server/proxy/executeHttpPlan.js';
 import { sanitizeResponseHeaders } from '../../cli/server/proxy/sanitizeResponseHeaders.js';
 
@@ -281,4 +282,196 @@ test('a public protocol lease loses authority on generation replacement before a
     assert.equal(res.statusCode, 503);
     const denied = resolve(request());
     assert.equal(denied.code, 'PUBLIC_ROUTE_WRITE_DENIED');
+});
+
+// A tracker-style route: browsers on other origins POST with custom headers,
+// so the manifest admits exactly those names for this one route.
+const SEND_PATH = '/api/send';
+const TRACKER_HEADERS = ['content-type', 'x-umami-website-id', 'x-umami-hostname', 'x-umami-cache'];
+const SEND_PROTOCOL = { methods: ['POST', 'OPTIONS'], allowCors: true };
+const sendRoute = (publicProtocol = { ...SEND_PROTOCOL, allowHeaders: TRACKER_HEADERS }) => ({
+    path: `${PREFIX}${SEND_PATH}`, access: 'public', publicProtocol,
+});
+const TRACKED_ORIGIN = 'https://tracked.example';
+
+async function relayThrough(req, upstreamLines) {
+    const plan = resolve(req);
+    assert.equal(plan.ok, true, plan.code);
+    const res = new Response();
+    let opened;
+    await executeHttpPlan({ req, res, plan, lease: plan.lease, authorized: true, prebufferedBody: Buffer.alloc(0),
+        relayManager: { checkout: async ({ lease }) => {
+            assert.equal(lease.commit(), true);
+            return { openRequest: async args => {
+                opened = args;
+                return new RelayResponse(upstreamLines.join('\r\n'));
+            }, close() {} };
+        } },
+    });
+    return { plan, res, opened };
+}
+
+function trackerPreflight(suffix) {
+    return request('OPTIONS', suffix, {
+        origin: TRACKED_ORIGIN,
+        'access-control-request-method': 'POST',
+        // Browsers send the non-safelisted names lowercased and sorted.
+        'access-control-request-headers': [...TRACKER_HEADERS].sort().join(','),
+    });
+}
+
+// What a browser checks before sending the real cross-origin POST.
+function browserAdmitsTracker(headers) {
+    const allowed = new Set(String(headers['access-control-allow-headers'] || '')
+        .split(',').map(value => value.trim().toLowerCase()).filter(Boolean));
+    const methods = String(headers['access-control-allow-methods'] || '').split(',').map(value => value.trim());
+    return headers['access-control-allow-origin'] === TRACKED_ORIGIN
+        && methods.includes('POST')
+        && TRACKER_HEADERS.every(name => allowed.has(name));
+}
+
+const PROVIDER_PREFLIGHT = [
+    'HTTP/1.1 204 No Content', 'Connection: close',
+    `Access-Control-Allow-Origin: ${TRACKED_ORIGIN}`,
+    'Access-Control-Allow-Methods: POST, OPTIONS, PUT',
+    // A provider may advertise more than the route admits; the Router keeps
+    // only the base pair and the route's declared names.
+    'Access-Control-Allow-Headers: Content-Type, X-Umami-Website-Id, X-Umami-Hostname, X-Umami-Cache, Authorization, X-Ploinky-Auth-Info, X-Other, *',
+    'Access-Control-Max-Age: 86400', '', '',
+];
+
+test('allowHeaders admits a few plain application header names only on an allowCors protocol route', t => {
+    const admitted = normalizeManifestHttpRouteAccess(sendRoute({
+        ...SEND_PROTOCOL, allowHeaders: ['Content-Type', 'X-Umami-Website-Id', 'x-umami-hostname', 'x-umami-cache'],
+    }), { routeKey: 'alpha' });
+    assert.equal(admitted.ok, true, admitted.error);
+    assert.deepEqual(admitted.publicProtocol, {
+        methods: ['OPTIONS', 'POST'], allowLoopbackRedirects: false, allowCors: true,
+        allowHeaders: ['content-type', 'x-umami-cache', 'x-umami-hostname', 'x-umami-website-id'],
+    });
+    // A route without the field keeps its exact previous normalized shape, so
+    // saved generations still verify.
+    assert.deepEqual(normalizeManifestHttpRouteAccess(sendRoute(SEND_PROTOCOL), { routeKey: 'alpha' }).publicProtocol,
+        { methods: ['OPTIONS', 'POST'], allowLoopbackRedirects: false, allowCors: true });
+    const eight = Array.from({ length: 8 }, (_, index) => `x-app-${index}`);
+    assert.equal(normalizeManifestHttpRouteAccess(sendRoute({ ...SEND_PROTOCOL, allowHeaders: eight }), { routeKey: 'alpha' }).ok, true);
+
+    for (const allowHeaders of [
+        'x-umami-cache', [], [...eight, 'x-app-8'], {}, ['*'], ['x-umami-*'], [''], [7], [null],
+        ['x umami'], ['x-umami, x-other'], ['x_umami'], ['x-umami:'], ['-x-umami'], ['x-umami\r\nx-other'], ['x'.repeat(65)],
+        ['x-umami-cache', 'X-Umami-Cache'],
+        ['authorization'], ['Authorization'], ['cookie'], ['Cookie'], ['host'], ['content-length'], ['forwarded'],
+        ['x-csrf-token'], ['connection'], ['keep-alive'], ['te'], ['trailer'], ['transfer-encoding'], ['upgrade'],
+        ['x-ploinky-auth-info'], ['X-Ploinky-User-Id'], ['x-ploinky-anything'], ['x-forwarded-for'], ['x-forwarded-host'],
+        ['proxy-authorization'], ['proxy-anything'], ['sec-fetch-site'],
+        ['x-umami-cache', 'authorization'],
+    ]) {
+        const result = normalizeManifestHttpRouteAccess(sendRoute({ ...SEND_PROTOCOL, allowHeaders }), { routeKey: 'alpha' });
+        assert.equal(result.ok, false, JSON.stringify(allowHeaders));
+        assert.equal(result.code, 'INVALID_PUBLIC_PROTOCOL', JSON.stringify(allowHeaders));
+        assert.match(result.error, /publicProtocol allowHeaders/, JSON.stringify(allowHeaders));
+    }
+    for (const publicProtocol of [
+        { methods: ['POST', 'OPTIONS'], allowHeaders: ['x-umami-cache'] },
+        { methods: ['POST', 'OPTIONS'], allowCors: false, allowHeaders: ['x-umami-cache'] },
+        { methods: ['POST'], allowCors: true, allowHeaders: ['x-umami-cache'] },
+    ]) {
+        const result = normalizeManifestHttpRouteAccess(sendRoute(publicProtocol), { routeKey: 'alpha' });
+        assert.equal(result.ok, false, JSON.stringify(publicProtocol));
+        assert.match(result.error, /allowHeaders requires allowCors and the OPTIONS method/);
+    }
+    // Only a public manifest route owns publicProtocol, allowHeaders included.
+    assert.throws(() => normalizePublicProtocol({ ...SEND_PROTOCOL, allowHeaders: ['x-umami-cache'] }, {
+        access: 'public', source: 'policy', path: `${PREFIX}${SEND_PATH}`, routeKey: 'alpha',
+    }), /requires a public manifest route/);
+    const fakeManifestSource = fixture(t, { routes: [], policyRoutes: [{ ...sendRoute(), routeKey: 'alpha', source: 'manifest' }] });
+    assert.throws(fakeManifestSource.activate, /publicProtocol requires a public manifest route/);
+});
+
+test('cross-origin preflight admits the declared tracker headers only on the route that declares them', async t => {
+    fixture(t, { routes: [protocolRoute(), sendRoute(), { path: `${PREFIX}/public/*`, access: 'public' }] }).activate();
+
+    const send = await relayThrough(trackerPreflight(SEND_PATH), PROVIDER_PREFLIGHT);
+    assert.deepEqual(send.plan.responsePolicy.publicProtocol.allowHeaders, [...TRACKER_HEADERS].sort());
+    assert.equal(send.opened.headers.origin, TRACKED_ORIGIN);
+    assert.equal(send.opened.headers['access-control-request-headers'], [...TRACKER_HEADERS].sort().join(','));
+    assert.equal(send.res.statusCode, 204);
+    assert.equal(send.res.headers['access-control-allow-origin'], TRACKED_ORIGIN);
+    assert.equal(send.res.headers['access-control-allow-methods'], 'POST, OPTIONS');
+    assert.equal(send.res.headers['access-control-allow-headers'],
+        'content-type, x-umami-website-id, x-umami-hostname, x-umami-cache, authorization');
+    assert.equal(send.res.headers['access-control-max-age'], '600');
+    assert.match(send.res.headers.vary, /Origin/);
+    assert.equal(browserAdmitsTracker(send.res.headers), true);
+
+    // The same provider answer on another allowCors route of the same agent
+    // keeps the base pair only, so a browser refuses the tracker's POST there.
+    const other = await relayThrough(trackerPreflight('/service/protocol/send'), PROVIDER_PREFLIGHT);
+    assert.equal(other.plan.responsePolicy.publicProtocol.allowHeaders, undefined);
+    assert.equal(other.res.headers['access-control-allow-origin'], TRACKED_ORIGIN);
+    assert.equal(other.res.headers['access-control-allow-headers'], 'content-type, authorization');
+    assert.equal(browserAdmitsTracker(other.res.headers), false);
+
+    // An ordinary public route neither accepts the preflight nor relays CORS.
+    assert.equal(resolve(trackerPreflight('/public/send')).code, 'PUBLIC_ROUTE_WRITE_DENIED');
+    const ordinary = resolve(request('GET', '/public/file', { origin: TRACKED_ORIGIN }));
+    const ordinaryHeaders = sanitizeResponseHeaders({
+        'access-control-allow-origin': TRACKED_ORIGIN,
+        'access-control-allow-headers': TRACKER_HEADERS.join(', '),
+    }, ordinary);
+    assert.equal(ordinaryHeaders['access-control-allow-origin'], undefined);
+    assert.equal(ordinaryHeaders['access-control-allow-headers'], undefined);
+
+    // A declared name the provider does not advertise is never added.
+    const narrow = await relayThrough(trackerPreflight(SEND_PATH), [
+        'HTTP/1.1 204 No Content', 'Connection: close', `Access-Control-Allow-Origin: ${TRACKED_ORIGIN}`,
+        'Access-Control-Allow-Methods: POST', 'Access-Control-Allow-Headers: Content-Type, X-Umami-Website-Id', '', '',
+    ]);
+    assert.equal(narrow.res.headers['access-control-allow-headers'], 'content-type, x-umami-website-id');
+    assert.equal(browserAdmitsTracker(narrow.res.headers), false);
+
+    // Without an exact origin echo from the provider the route grants nothing.
+    for (const origin of ['*', 'https://other.example']) {
+        const denied = await relayThrough(trackerPreflight(SEND_PATH), [
+            'HTTP/1.1 204 No Content', 'Connection: close', `Access-Control-Allow-Origin: ${origin}`,
+            `Access-Control-Allow-Headers: ${TRACKER_HEADERS.join(', ')}`, '', '',
+        ]);
+        assert.equal(denied.res.headers['access-control-allow-origin'], undefined, origin);
+        assert.equal(denied.res.headers['access-control-allow-headers'], undefined, origin);
+    }
+});
+
+test('the cross-origin tracker POST relays its custom headers and the exact origin grant', async t => {
+    fixture(t, { routes: [sendRoute()] }).activate();
+    const body = '{"type":"event","payload":{}}';
+    const req = request('POST', SEND_PATH, {
+        origin: TRACKED_ORIGIN, 'content-type': 'application/json',
+        'x-umami-website-id': 'site-id', 'x-umami-hostname': 'tracked.example', 'x-umami-cache': 'cache-token',
+    }, body);
+    const plan = resolve(req);
+    const res = new Response();
+    let opened;
+    await executeHttpPlan({ req, res, plan, lease: plan.lease, authorized: true, prebufferedBody: Buffer.from(body),
+        relayManager: { checkout: async ({ lease }) => {
+            assert.equal(lease.commit(), true);
+            return { openRequest: async args => {
+                opened = args;
+                return new RelayResponse([
+                    'HTTP/1.1 200 OK', 'Content-Length: 2', 'Connection: close', 'Content-Type: application/json',
+                    `Access-Control-Allow-Origin: ${TRACKED_ORIGIN}`, '', '{}',
+                ].join('\r\n'));
+            }, close() {} };
+        } },
+    });
+    assert.equal(res.statusCode, 200);
+    for (const name of ['x-umami-website-id', 'x-umami-hostname', 'x-umami-cache']) assert.equal(opened.headers[name], req.headers[name], name);
+    assert.equal(res.headers['access-control-allow-origin'], TRACKED_ORIGIN);
+    assert.equal(res.body, '{}');
+});
+
+test('two tied routes that differ only in allowHeaders are rejected as conflicting', t => {
+    const state = fixture(t, { routes: [
+        sendRoute(), { path: `${PREFIX}/api/*`, access: 'public', publicProtocol: SEND_PROTOCOL },
+    ] });
+    assert.throws(state.activate, /conflicting execution metadata/);
 });
