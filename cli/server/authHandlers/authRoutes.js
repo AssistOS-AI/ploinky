@@ -1,6 +1,6 @@
 import { getSession as getLocalSession, isAdminUser, verifySessionJwt, revokeSession as revokeLocalSession } from '../auth/localService.js';
 import { revokeSessionIds } from '../auth/sessionRevocations.js';
-import { isSsoProviderUnavailable } from '../auth/ssoAdmission.js';
+import { authenticationUnavailableHeaders, isSsoProviderUnavailable } from '../auth/ssoAdmission.js';
 import { publishAuthenticatedRequestDecision } from '../auth/authenticatedRequestEvents.mjs';
 import { canonicalControlOrigin, mintAdminCsrfToken } from '../adminControlSecurity.js';
 import {
@@ -102,6 +102,19 @@ function requireCurrentGeneration(res, routePlan) {
         return false;
     }
     return true;
+}
+
+// The SSO session store is not open (Router starting or handing over): the
+// session is neither confirmed nor refused, so the cookie stays.
+function sendAuthenticationUnavailable(res) {
+    appendLog('auth_session_store_unavailable', {});
+    res.writeHead(503, { 'Content-Type': 'application/json', ...authenticationUnavailableHeaders() });
+    res.end(JSON.stringify({ ok: false, error: 'authentication_unavailable' }));
+    return true;
+}
+
+function ssoSessionStoreUnavailable() {
+    return typeof authService.isSessionStoreAvailable === 'function' && !authService.isSessionStoreAvailable();
 }
 
 function setAuthenticatedRequest(req, { session, sessionId, mode }) {
@@ -383,6 +396,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             try {
                 result = await authService.handleCallback({ code, state, browserBinding, baseUrl });
             } catch (err) {
+                if (isSsoProviderUnavailable(err)) return sendAuthenticationUnavailable(res);
                 if (err?.statusCode === 400 || err?.statusCode === 401 || err?.statusCode === 403) {
                     appendLog('auth_callback_rejected', { statusCode: err.statusCode });
                     sendJson(res, 400, { ok: false, error: 'invalid_authorization_code' });
@@ -424,6 +438,11 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 return respondGuestRouteUnresolved(res);
             }
             const sessionId = cookies.get(cookieName) || '';
+            // Without an open store an SSO session can be neither found nor
+            // ended; answering "logged out" would leave it alive on disk.
+            if (authContext.mode === 'sso' && sessionId && ssoSessionStoreUnavailable()) {
+                return sendAuthenticationUnavailable(res);
+            }
             const session = sessionId
                 ? (authContext.mode === 'guest'
                     ? getLocalSession(sessionId, { policy: authContext.policy })
@@ -497,14 +516,30 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 payloads.push(...others.payloads);
                 revokeSessionIds(uniqueRevocations(payloads, 'logout'));
             }
-            const outcome = authContext.mode === 'guest'
-                ? (revokeLocalSession(sessionId), { redirect: requestedReturnTo || '/' })
-                : await authService.logout(sessionId, {
-                    baseUrl,
-                    postLogoutRedirectUri: requestedReturnTo
-                });
+            let outcome;
+            try {
+                outcome = authContext.mode === 'guest'
+                    ? (revokeLocalSession(sessionId), { redirect: requestedReturnTo || '/' })
+                    : await authService.logout(sessionId, {
+                        baseUrl,
+                        postLogoutRedirectUri: requestedReturnTo
+                    });
+            } catch (error) {
+                if (isSsoProviderUnavailable(error)) return sendAuthenticationUnavailable(res);
+                throw error;
+            }
             const clearCookie = buildCookie(cookieName, '', req, '/', { maxAge: 0, sameSite: 'Lax' });
             const clearCsrfCookie = buildCookie(BROWSER_CSRF_COOKIE_NAME, '', req, '/', { maxAge: 0, sameSite: 'Strict' });
+            if (outcome.persisted === false) {
+                // The session is gone from this Router's memory but its removal
+                // is not durable yet: clear the cookies, never report success.
+                appendSetCookie(res, clearCookie);
+                appendSetCookie(res, clearCsrfCookie);
+                appendLog('auth_logout_not_persisted', { level: 'error' });
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+                res.end(JSON.stringify({ ok: false, error: 'logout_not_persisted' }));
+                return true;
+            }
             const redirectTarget = outcome.redirect || requestedReturnTo || '/';
             appendSetCookie(res, clearCookie);
             for (const name of guestClearNames) {

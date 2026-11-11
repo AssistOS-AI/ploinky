@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -407,6 +408,37 @@ async function freshFixture(t, options = {}) {
     const { sessionId } = await bridge.handleCallback({ state, browserBinding, code: 'fixture', baseUrl: 'http://localhost:8080' });
     t.after(() => { delete globalThis.__bridgeValidationFixture; });
     return { bridge, sessionId };
+}
+
+const { decodeSessionsFile, hashSessionId, SSO_SESSIONS_FILE_NAME } = await import('../../cli/server/auth/sessionPersistence.js');
+const persistenceKey = crypto.randomBytes(32);
+
+// A bridge as a restarted Router builds it: persistence armed on `directory`,
+// then opened. Abandoned bridges stand in for a crashed process, so their
+// batch timer is far beyond the test run.
+function restartedBridge(directory, options = {}) {
+    const bridge = createGenericAuthBridge(options);
+    bridge.configureSessionPersistence({
+        directory,
+        deriveKey: () => Buffer.from(persistenceKey),
+        flushDelayMs: 60 * 60 * 1000,
+    });
+    return { bridge, opened: bridge.openSessionStore() };
+}
+
+async function persistentFixture(t) {
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    const directory = fs.mkdtempSync(path.join(tempDir, 'sso-sessions-'));
+    const { bridge } = restartedBridge(directory);
+    const { state, browserBinding } = await bridge.beginLogin({ baseUrl: 'http://localhost:8080' });
+    const { sessionId } = await bridge.handleCallback({ state, browserBinding, code: 'fixture', baseUrl: 'http://localhost:8080' });
+    t.after(() => { delete globalThis.__bridgeValidationFixture; });
+    return { bridge, sessionId, directory };
+}
+
+function persistedEntry(directory, sessionId) {
+    const text = fs.readFileSync(path.join(directory, SSO_SESSIONS_FILE_NAME), 'utf8');
+    return decodeSessionsFile(text, () => Buffer.from(persistenceKey)).sessions[hashSessionId(sessionId)];
 }
 
 function described(providerSession, roles = ['admin'], id = 'u1') {
@@ -924,4 +956,181 @@ test('Router login restarts on the canonical origin before creating a fresh cook
     assert.equal(callback.statusCode, 302, callback.body);
     assert.equal(callback.getHeader('location'), returnTo);
     assert.ok(callback.getHeader('set-cookie').some((value) => value.startsWith('ploinky_sso=')));
+});
+
+for (const graceful of [true, false]) {
+    test(`a session survives a simulated restart (${graceful ? 'graceful stop' : 'crash'})`, async (t) => {
+        const { bridge, sessionId, directory } = await persistentFixture(t);
+        const issued = structuredClone(bridge.getSession(sessionId).providerSession);
+        const seen = [];
+        globalThis.__bridgeValidationFixture = providerSession => {
+            seen.push(structuredClone(providerSession));
+            return described(providerSession, ['admin']);
+        };
+        assert.equal((await bridge.validateSession(sessionId)).user.id, 'u1');
+        const latest = structuredClone(bridge.getSession(sessionId).providerSession);
+        if (graceful) bridge.closeSessionStore();
+        const { bridge: restarted, opened } = restartedBridge(directory);
+        assert.deepEqual(opened, { restored: 1, dropped: 0, rejected: null });
+        const admitted = await restarted.validateSession(sessionId, { reportUnavailable: true });
+        assert.equal(admitted.user.id, 'u1');
+        // A crash loses at most the batched slide; the issued session remains.
+        assert.deepEqual(seen.at(-1), graceful ? latest : issued);
+        restarted.closeSessionStore();
+    });
+}
+
+test('logout then restart stays logged out', async (t) => {
+    const { bridge, sessionId, directory } = await persistentFixture(t);
+    const outcome = await bridge.logout(sessionId, { baseUrl: 'http://localhost:8080' });
+    assert.equal(outcome.persisted, true);
+    const { bridge: restarted } = restartedBridge(directory);
+    assert.equal(restarted.getSession(sessionId), null);
+    assert.equal(await restarted.validateSession(sessionId), null);
+    assert.equal(persistedEntry(directory, sessionId), undefined);
+    restarted.closeSessionStore();
+});
+
+test('a changed account generation is still refused after a restart', async (t) => {
+    const { bridge, sessionId, directory } = await persistentFixture(t);
+    globalThis.__bridgeValidationFixture = providerSession => ({
+        user: { id: 'u1', roles: ['admin'] },
+        providerSession: { ...providerSession, generation: 7, tokens: { accessToken: 'generation-7' } },
+    });
+    await bridge.validateSession(sessionId);
+    bridge.closeSessionStore();
+    const { bridge: restarted } = restartedBridge(directory);
+    const invalidations = recordInvalidations(t);
+    let presented;
+    globalThis.__bridgeValidationFixture = providerSession => {
+        presented = providerSession.generation;
+        throw Object.assign(new Error('account generation changed'), { code: 'session_revoked' });
+    };
+    assert.equal(await restarted.validateSession(sessionId, { reportUnavailable: true }), null);
+    assert.equal(presented, 7, 'the provider generation round-trips through the file unchanged');
+    assert.deepEqual(invalidations.map(event => [event.sessionId, event.reason]), [[sessionId, 'validation_failed']]);
+    const { bridge: third } = restartedBridge(directory);
+    assert.equal(third.getSession(sessionId), null);
+    assert.equal(persistedEntry(directory, sessionId), undefined);
+    third.closeSessionStore();
+});
+
+test('an unchanged provider keeps the session across a restart; a different provider ends it', async (t) => {
+    const otherDir = path.join(tempDir, '.ploinky', 'repos', 'fake', 'otherProvider');
+    fs.mkdirSync(path.join(otherDir, 'runtime'), { recursive: true });
+    fs.copyFileSync(path.join(providerDir, 'manifest.json'), path.join(otherDir, 'manifest.json'));
+    fs.copyFileSync(path.join(providerDir, 'runtime', 'index.mjs'), path.join(otherDir, 'runtime', 'index.mjs'));
+    const originalPort = process.env.PORT;
+    t.after(() => {
+        if (originalPort === undefined) delete process.env.PORT;
+        else process.env.PORT = originalPort;
+    });
+
+    const { bridge, sessionId, directory } = await persistentFixture(t);
+    bridge.closeSessionStore();
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: { clientId: 'rotated-client' } });
+    process.env.PORT = String(Number(originalPort || 8080) + 1);
+    const { bridge: restarted } = restartedBridge(directory);
+    globalThis.__bridgeValidationFixture = providerSession => described(providerSession, ['user']);
+    assert.deepEqual((await restarted.validateSession(sessionId)).user.roles, ['user']);
+
+    // Swapped while the Router runs: ended at the next admission.
+    const invalidations = recordInvalidations(t);
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/otherProvider', providerConfig: {} });
+    assert.equal(await restarted.validateSession(sessionId, { reportUnavailable: true }), null);
+    assert.deepEqual(invalidations.map(event => [event.sessionId, event.reason]), [[sessionId, 'provider_changed']]);
+    assert.equal(restarted.getSession(sessionId), null);
+    assert.equal(persistedEntry(directory, sessionId), undefined);
+    restarted.closeSessionStore();
+
+    // Swapped while the Router was down: dropped when the file is opened.
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    const second = await persistentFixture(t);
+    second.bridge.closeSessionStore();
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/otherProvider', providerConfig: {} });
+    const { bridge: swapped, opened } = restartedBridge(second.directory);
+    assert.deepEqual(opened, { restored: 0, dropped: 1, rejected: null });
+    assert.equal(swapped.getSession(second.sessionId), null);
+    swapped.closeSessionStore();
+    assert.equal(persistedEntry(second.directory, second.sessionId), undefined);
+});
+
+test('handover: a closed store neither admits nor mutates', async (t) => {
+    const { bridge, sessionId, directory } = await persistentFixture(t);
+    const entered = deferred();
+    const release = deferred();
+    t.after(() => release.resolve());
+    let calls = 0;
+    globalThis.__bridgeValidationFixture = async providerSession => {
+        if (++calls === 1) { entered.resolve(); await release.promise; }
+        return described(providerSession, ['user']);
+    };
+    const inFlight = Array.from({ length: 6 }, () => bridge.validateSession(sessionId, { reportUnavailable: true })
+        .then(() => 'granted', error => error.code));
+    await entered.promise;
+    bridge.closeSessionStore();
+    assert.deepEqual(await Promise.all(inFlight), Array(6).fill('SSO_PROVIDER_UNAVAILABLE'),
+        'validations in flight at close are undecided, never refused');
+    const { bridge: successor } = restartedBridge(directory);
+    const bytes = fs.readFileSync(path.join(directory, SSO_SESSIONS_FILE_NAME));
+    release.resolve();
+    await assert.rejects(bridge.validateSession(sessionId, { reportUnavailable: true }), { code: 'SSO_PROVIDER_UNAVAILABLE' });
+    await assert.rejects(bridge.logout(sessionId), { code: 'SSO_PROVIDER_UNAVAILABLE' });
+    assert.throws(() => bridge.revokeSession(sessionId), { code: 'SSO_PROVIDER_UNAVAILABLE' });
+    assert.equal(bridge.admissionFence(sessionId)(), false);
+    assert.deepEqual(fs.readFileSync(path.join(directory, SSO_SESSIONS_FILE_NAME)), bytes);
+    assert.deepEqual((await successor.validateSession(sessionId)).user.roles, ['user']);
+    successor.closeSessionStore();
+});
+
+test('handover: a refusal that lands after close is undecided and leaves the session in the file', async (t) => {
+    const { bridge, sessionId, directory } = await persistentFixture(t);
+    const invalidations = recordInvalidations(t);
+    const unhandled = [];
+    const onUnhandled = reason => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => process.off('unhandledRejection', onUnhandled));
+    const entered = deferred();
+    const release = deferred();
+    globalThis.__bridgeValidationFixture = async () => {
+        entered.resolve();
+        await release.promise;
+        throw Object.assign(new Error('session_revoked'), { code: 'session_revoked', statusCode: 401 });
+    };
+    const caller = bridge.validateSession(sessionId, { reportUnavailable: true })
+        .then(() => 'granted', error => error.code);
+    await entered.promise;
+    bridge.closeSessionStore();
+    assert.equal(await caller, 'SSO_PROVIDER_UNAVAILABLE', 'the caller is undecided, never denied');
+    release.resolve();
+    // Let the lane run to its end after the provider answered.
+    await sleep(20);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(unhandled, [], 'nothing throws out of the lane');
+    assert.deepEqual(invalidations, [], 'a refusal after close ends nothing');
+    assert.ok(persistedEntry(directory, sessionId), 'the session entry is still in the file');
+    await assert.rejects(bridge.validateSession(sessionId, { reportUnavailable: true }), { code: 'SSO_PROVIDER_UNAVAILABLE' });
+});
+
+test('an unopened store reports admissions and callbacks as undecided, never as refusals', async (t) => {
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    const directory = fs.mkdtempSync(path.join(tempDir, 'sso-sessions-'));
+    const bridge = createGenericAuthBridge();
+    bridge.configureSessionPersistence({ directory, deriveKey: () => Buffer.from(persistenceKey), flushDelayMs: 60 * 60 * 1000 });
+    assert.equal(bridge.isSessionStoreAvailable(), false);
+    await assert.rejects(bridge.validateSession('any-cookie', { reportUnavailable: true }), { code: 'SSO_PROVIDER_UNAVAILABLE' });
+    const login = await bridge.beginLogin({ baseUrl: 'http://localhost:8080' });
+    await assert.rejects(bridge.handleCallback({ ...login, code: 'fixture', baseUrl: 'http://localhost:8080' }),
+        { code: 'SSO_PROVIDER_UNAVAILABLE' });
+    assert.throws(() => bridge.configureSessionPersistence({ directory }), /cannot be configured/);
+    assert.deepEqual(bridge.openSessionStore(), { restored: 0, dropped: 0, rejected: null });
+    assert.equal(bridge.isSessionStoreAvailable(), true);
+    // The pending login was not consumed by the refused callback.
+    const { sessionId } = await bridge.handleCallback({ ...login, code: 'fixture', baseUrl: 'http://localhost:8080' });
+    assert.ok(persistedEntry(directory, sessionId), 'the create is durable before the callback returns');
+    assert.deepEqual(bridge.openSessionStore(), { restored: 0, dropped: 0, rejected: null }, 'a second open never reloads');
+    bridge.closeSessionStore();
+    bridge.closeSessionStore();
+    assert.equal(bridge.isSessionStoreAvailable(), false);
+    t.after(() => { delete globalThis.__bridgeValidationFixture; });
 });

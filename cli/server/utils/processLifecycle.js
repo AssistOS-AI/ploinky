@@ -106,7 +106,7 @@ function closeWebchatSessions(globalState) {
     }
 }
 
-function createGracefulShutdown(server, globalState, agentSessionStore, { beforeClose = [], requiredBeforeClose = [] } = {}) {
+function createGracefulShutdown(server, globalState, agentSessionStore, { beforeClose = [], beforeListenersClose = [], requiredBeforeClose = [] } = {}) {
     const servers = Array.isArray(server) ? server.filter(Boolean) : [server].filter(Boolean);
     const primaryServer = servers[0];
     return function gracefulShutdown(signal, exitCode = 0) {
@@ -182,6 +182,19 @@ function createGracefulShutdown(server, globalState, agentSessionStore, { before
             process.exit(exitCode);
         };
         const closeServers = () => {
+            // Synchronous hooks run in the same tick as the listener close, so
+            // nothing can slip between the final flush and the handover.
+            const listenerHooks = Array.isArray(beforeListenersClose) ? beforeListenersClose : [];
+            for (const hook of listenerHooks) {
+                if (typeof hook !== 'function') continue;
+                try {
+                    hook();
+                } catch (error) {
+                    appendLog('shutdown_preclose_error', {
+                        error: error?.message || String(error),
+                    });
+                }
+            }
             if (!servers.length) afterClose(null);
             for (const entry of servers) entry.close(afterClose);
 
@@ -309,5 +322,6 @@ function setupProcessLifecycle(server, globalState, agentSessionStore, options =
 export {
     ensurePidFile,
     clearPidFile,
+    createGracefulShutdown,
     setupProcessLifecycle
 };
