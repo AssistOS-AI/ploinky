@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { workspaceRepositories } from './repositorySource.mjs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { withGitCredentialEnv } from './git/gitCredentials.js';
 
 function repository(value) {
     if (typeof value !== 'string' || !value.trim()) throw new Error('link-install entries must be Git URLs');
@@ -46,7 +47,7 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
     const strict = branchPolicy?.fallback === 'fail';
     const root = fs.realpathSync(workspaceRoot);
     const git = args => execFile('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 120000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+        timeout: 120000, env: withGitCredentialEnv({ ...process.env, GIT_TERMINAL_PROMPT: '0' }) });
     const origin = directory => {
         // Never inherit the workspace's own origin for a non-repository directory.
         if (!fs.existsSync(path.join(directory, '.git'))) return null;

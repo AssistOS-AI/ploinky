@@ -100,6 +100,7 @@ import { ensureHostLaunchSkeleton, withHostLaunchExclusion } from '../hostLaunch
 import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
+    ensureGitCredentialsHostDir,
     ensurePersistentStorageHostDir
 } from '../../utils/runtime/runtimeResourcePlanner.js';
 import {
@@ -1080,6 +1081,7 @@ function appendExactManagedBindMount(args, value) {
 function appendControllerStateGuards(args, runtime, {
     workspaceRoot,
     agentName,
+    privateDataGrants = [],
     canonicalRuntimeWorkspaceGuards = isPloinkyBoxRuntime(),
 } = {}) {
     // The guards always mask `.ploinky-box`, so its skeleton exists before
@@ -1090,7 +1092,7 @@ function appendControllerStateGuards(args, runtime, {
         runtimePath: mount.destination,
         readOnly: !mount.rw,
     }));
-    const guardOptions = { workspaceRoot, bindings, agentName };
+    const guardOptions = { workspaceRoot, bindings, agentName, privateDataGrants };
     const targets = controllerGuardTargets(bindings, guardOptions);
     // Narrow repository grants can still cause the container engine to create
     // the canonical workspace parents. Guard those synthetic parents too so
@@ -2123,10 +2125,22 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         assertCanonicalAgentDataPath(resourcePlan.persistentStorage.hostPath);
         args.push('-v', `${resourcePlan.persistentStorage.hostPath}:${resourcePlan.persistentStorage.containerPath}${runtime === 'podman' ? ':z' : ''}`);
     }
+    // The workspace git credentials directory, for an agent that declares it.
+    if (resourcePlan.gitCredentials) {
+        if (adoptManagedRuntimeOnly) {
+            requireManagedAdoptionDirectory(resourcePlan.gitCredentials.hostPath, 'git credentials directory');
+        } else {
+            ensureGitCredentialsHostDir(resourcePlan);
+        }
+        args.push('-v', `${resourcePlan.gitCredentials.hostPath}:${resourcePlan.gitCredentials.containerPath}${runtime === 'podman' ? ':z' : ''}`);
+    }
 
     // Apply controller-state guards after every broad, manifest, staged, and
     // resource bind so no later agent-controlled mount can expose old state.
-    appendControllerStateGuards(args, runtime, { agentName });
+    appendControllerStateGuards(args, runtime, {
+        agentName,
+        privateDataGrants: resourcePlan.gitCredentials ? [resourcePlan.gitCredentials.hostPath] : [],
+    });
 
     const envStrings = [
         ...buildEnvFlags(manifest, profileConfig, { agentName, repoName, profileName: activeProfile, forRuntime: true }),

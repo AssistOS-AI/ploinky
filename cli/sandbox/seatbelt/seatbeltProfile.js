@@ -45,6 +45,7 @@ function buildSeatbeltProfile(options) {
         workspaceRoot = PLOINKY_WORKSPACE_ROOT,
         extraReadPaths = [],
         extraWritePaths = [],
+        privateDataGrants = [],
         agentLibGrant: grant = null,
     } = options;
 
@@ -274,6 +275,26 @@ function buildSeatbeltProfile(options) {
     }
     lines.push(')');
     lines.push('');
+
+    // Exact directories below `.data/.private` this launch was granted (for
+    // example the workspace git credentials directory of a declaring agent).
+    // They follow the opacity rule so that they, and only they, stay usable.
+    const privateRoot = path.join(path.resolve(workspaceRoot), '.data', '.private');
+    const privateGrants = normalizePathList(privateDataGrants);
+    for (const grantPath of privateGrants) {
+        if (grantPath === privateRoot || !isPathWithin(grantPath, privateRoot)) {
+            throw new Error(`[seatbelt] private data grant '${grantPath}' must be a directory below '${privateRoot}'`);
+        }
+    }
+    if (privateGrants.length) {
+        lines.push('; Exact private data grants of this launch');
+        lines.push('(allow file-read* file-write*');
+        for (const grantPath of privateGrants.flatMap(pathAliases)) {
+            lines.push(`    (subpath ${sbplQuote(grantPath)})`);
+        }
+        lines.push(')');
+        lines.push('');
+    }
 
     return lines.join('\n') + '\n';
 }

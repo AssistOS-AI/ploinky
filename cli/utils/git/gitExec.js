@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 
 import { sanitizeGitDiagnostic } from '../gitCommand.js';
+import { withGitCredentialEnv } from './gitCredentials.js';
 
 // Bounded, noninteractive Git execution for update transactions. Every
 // command runs as `git -C <checkout> ...` with a closed stdin, a timeout and a
@@ -40,6 +41,8 @@ export function buildGitEnvironment(baseEnv = process.env, { sshConfigured = fal
 
 /**
  * Run one Git command. Never throws for a nonzero exit; the caller decides.
+ * The workspace git credentials (see gitCredentials.js) are added to the
+ * child's environment unless `gitCredentials` is false.
  *
  * @returns {{ ok: boolean, status: number|null, signal: string|null,
  *   stdout: string, stderr: string, error: string, timedOut: boolean, argv: string[] }}
@@ -49,12 +52,14 @@ export function runGit(repoPath, args, {
     timeoutMs = DEFAULT_LOCAL_TIMEOUT_MS,
     maxBuffer = DEFAULT_MAX_BUFFER,
     sshConfigured = false,
+    gitCredentials = true,
     spawn = spawnSync,
 } = {}) {
     const argv = ['-C', repoPath, ...args];
+    const childEnv = gitCredentials ? withGitCredentialEnv(env) : env;
     const result = spawn('git', argv, {
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: buildGitEnvironment(env, { sshConfigured }),
+        env: buildGitEnvironment(childEnv, { sshConfigured }),
         timeout: timeoutMs,
         killSignal: 'SIGKILL',
         maxBuffer,
@@ -71,6 +76,11 @@ export function runGit(repoPath, args, {
         timedOut,
         argv,
     };
+}
+
+/** runGit without the workspace git credentials (the host Ploinky self-update). */
+export function runGitWithoutCredentials(repoPath, args, options = {}) {
+    return runGit(repoPath, args, { ...options, gitCredentials: false });
 }
 
 export function describeGitFailure(result) {

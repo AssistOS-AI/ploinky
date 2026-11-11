@@ -45,6 +45,7 @@ import { sanitizeDiagnosticText } from '../../utils/diagnosticText.js';
 import { guardSpawnedChild } from '../../utils/childSpawn.js';
 import {
     planRuntimeResources,
+    ensureGitCredentialsHostDir,
     applyRuntimeResourceEnv,
     ensurePersistentStorageHostDir
 } from '../../utils/runtime/runtimeResourcePlanner.js';
@@ -514,7 +515,7 @@ function writableBwrapBinds({ agentName, agentCodePath, codeReadOnly, cwd, cwdMo
     return binds;
 }
 
-function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT, agentName } = {}) {
+function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT, agentName, privateDataGrants = [] } = {}) {
     // The guards always mask `.ploinky-box`, so its skeleton exists before
     // they are planned; a launch that cannot create it fails here.
     ensureHostLaunchSkeleton(workspaceRoot);
@@ -530,7 +531,7 @@ function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_R
         });
         index += 2;
     }
-    const targets = controllerGuardTargets(bindings, { workspaceRoot, agentName });
+    const targets = controllerGuardTargets(bindings, { workspaceRoot, agentName, privateDataGrants });
     const guards = controllerGuardMounts(targets, { workspaceRoot, bindings, agentName });
     if (!guards.length) return targets;
     for (const guard of guards) {
@@ -736,6 +737,12 @@ function buildBwrapArgs(options) {
         ensurePersistentStorageHostDir(options.runtimeResourcePlan);
         args.push('--bind', ps.hostPath, ps.containerPath);
     }
+    // The workspace git credentials directory, for an agent that declares it.
+    const gitCredentials = options.runtimeResourcePlan?.gitCredentials || null;
+    if (gitCredentials) {
+        ensureGitCredentialsHostDir(options.runtimeResourcePlan);
+        args.push('--bind', gitCredentials.hostPath, gitCredentials.containerPath);
+    }
 
     const projectSourceWritable = cwdMountTarget !== '/root'
         && isPathWithin(agentCodePath, cwd);
@@ -764,7 +771,11 @@ function buildBwrapArgs(options) {
     }
 
     // Apply the old-root opacity boundary after every ordinary bind.
-    appendControllerStateGuards(args, { workspaceRoot: options.workspaceRoot, agentName });
+    appendControllerStateGuards(args, {
+        workspaceRoot: options.workspaceRoot,
+        agentName,
+        privateDataGrants: gitCredentials ? [gitCredentials.hostPath] : [],
+    });
 
     // Process isolation — do NOT unshare network (agents need host network)
     // NOTE: --die-with-parent is intentionally omitted. Agent processes must survive

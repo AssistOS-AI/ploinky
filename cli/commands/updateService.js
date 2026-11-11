@@ -10,7 +10,11 @@ import {
 } from '../utils/git/verifiedUpdate.js';
 import { acquireSourceLock, createDefaultSourceLockManager, ploinkySourceLockIdentity } from '../utils/git/sourceLock.js';
 import { assessGeneratedCheckoutState } from '../utils/git/generatedState.js';
-import { DEFAULT_NETWORK_TIMEOUT_MS, describeGitFailure, runGit } from '../utils/git/gitExec.js';
+import {
+    DEFAULT_NETWORK_TIMEOUT_MS,
+    describeGitFailure,
+    runGitWithoutCredentials,
+} from '../utils/git/gitExec.js';
 
 export const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 export const INTERACTIVE_PLOINKY_UPDATE_MESSAGE = [
@@ -45,10 +49,11 @@ export function isGitRepo(repoPath) {
  * Read-only upstream probe for an interactive session. It asks the branch's
  * configured remote for the upstream commit with `ls-remote` through the
  * bounded, noninteractive Git runner, so it never writes a ref and needs no
- * lock. A remote that fails or does not answer in time throws.
+ * lock. A remote that fails or does not answer in time throws. Like the
+ * self-update itself, it runs without the workspace git credentials.
  */
 export function checkGitUpstreamUpdate(repoPath, {
-    exec = runGit,
+    exec = runGitWithoutCredentials,
     env = process.env,
     timeoutMs = DEFAULT_NETWORK_TIMEOUT_MS,
 } = {}) {
@@ -219,7 +224,9 @@ export async function updatePloinkySelf({
     let record;
     try {
         lock.assertHeld(source.lockIdentity);
+        // The host self-update never uses the workspace git credentials.
         record = updateCheckout({
+            exec: runGitWithoutCredentials,
             ...checkoutOptions,
             repoPath: source.canonicalRoot,
             phase,

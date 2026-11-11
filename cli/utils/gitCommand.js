@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { sanitizeDiagnosticText } from './diagnosticText.js';
+import { withGitCredentialEnv } from './git/gitCredentials.js';
 
 const MAX_DIAGNOSTIC_LENGTH = 8192;
 
@@ -32,7 +33,9 @@ function diagnosticTail(fd) {
 
 // Capture stderr even for inherited output so a bulk update can repeat Git's
 // actual reason in its final summary. Keep stdout and stdin behavior unchanged.
-export function runGitCommand(args, { stdio = 'inherit', ...options } = {}) {
+// The workspace git credentials are added to the child's environment unless
+// `gitCredentials` is false.
+export function runGitCommand(args, { stdio = 'inherit', gitCredentials = true, env, ...options } = {}) {
     const streams = Array.isArray(stdio) ? [...stdio] : [stdio, stdio, stdio];
     const stderrTarget = streams[2];
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-git-'));
@@ -46,7 +49,8 @@ export function runGitCommand(args, { stdio = 'inherit', ...options } = {}) {
         // avoids killing otherwise successful commands on a pipe buffer limit.
         fs.unlinkSync(stderrPath);
         streams[2] = fd;
-        result = spawnSync('git', args, { ...options, stdio: streams });
+        const childEnv = gitCredentials ? withGitCredentialEnv(env || process.env) : env;
+        result = spawnSync('git', args, { ...options, ...(childEnv ? { env: childEnv } : {}), stdio: streams });
         detail = diagnosticTail(fd);
     } finally {
         if (fd !== undefined) fs.closeSync(fd);

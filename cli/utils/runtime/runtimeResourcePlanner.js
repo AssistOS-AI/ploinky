@@ -4,6 +4,12 @@ import { PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import { ensurePersistentSecret, resolveVarValue } from '../security/secretVars.js';
 import { deriveAgentSecret } from '../security/masterKey.js';
 import {
+    DEFAULT_GIT_CREDENTIALS_CONTAINER_PATH,
+    ensureGitCredentialsDir,
+    gitCredentialsKeyHex,
+    resolveGitCredentialsDir,
+} from '../git/gitCredentials.js';
+import {
     assertCanonicalAgentDataPath,
     ensureAgentDataDirectory,
     resolveAgentDataPath,
@@ -19,10 +25,17 @@ import {
  * Supported resources:
  *   - persistentStorage: per-agent writable host dir mounted at containerPath,
  *     optionally chmod'd. Host dir lives under <workspace>/.data/<key>/.
+ *   - gitCredentials: the workspace git credentials directory (see
+ *     cli/utils/git/gitCredentials.js), mounted read-write at containerPath
+ *     (default /git-credentials). Host dir is
+ *     <workspace>/.data/.private/.git-credentials unless the ploinky var
+ *     PLOINKY_GIT_CREDENTIALS_DIR moves it inside the workspace.
  *   - env: declarative environment variables supporting template placeholders:
  *       {{PLOINKY_WORKSPACE_ROOT}}
  *       {{STORAGE_CONTAINER_PATH}}   (only when persistentStorage declared)
  *       {{STORAGE_HOST_PATH}}
+ *       {{GIT_CREDENTIALS_CONTAINER_PATH}} (only when gitCredentials declared)
+ *       {{GIT_CREDENTIALS_KEY}}      (only when gitCredentials declared; hex mirror key)
  *       {{secret:<NAME>}}            (ensurePersistentSecret)
  *       {{generatedSecret:<NAME>}}            (per-agent generated secret)
  *       {{var:<NAME>}}               (resolveVarValue / process.env)
@@ -39,7 +52,37 @@ function resolveDataRootForKey(key) {
     return resolveAgentDataPath(key, { label: 'persistentStorage.key' });
 }
 
-function expandTemplate(raw, { hostPath, containerPath, useHostStoragePath = false, agentName = '', repoName = '' }) {
+function policyViolation(message) {
+    const error = new Error(message);
+    error.code = 'PLOINKY_AGENT_DATA_POLICY_VIOLATION';
+    error.status = 422;
+    return error;
+}
+
+function planGitCredentials(raw) {
+    if (raw == null || raw === false) return null;
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+        throw policyViolation('gitCredentials must be an object with an optional containerPath');
+    }
+    const containerPath = (toNonEmptyString(raw.containerPath) || DEFAULT_GIT_CREDENTIALS_CONTAINER_PATH).replace(/\/+$/, '');
+    if (!containerPath.startsWith('/') || containerPath.includes(':')
+        || containerPath.split('/').some(segment => segment === '..' || segment === '.')) {
+        throw policyViolation('gitCredentials.containerPath must be an absolute path without "." or ".." segments');
+    }
+    return {
+        hostPath: resolveGitCredentialsDir(PLOINKY_WORKSPACE_ROOT),
+        containerPath,
+    };
+}
+
+function expandTemplate(raw, {
+    hostPath,
+    containerPath,
+    gitCredentials = null,
+    useHostStoragePath = false,
+    agentName = '',
+    repoName = '',
+}) {
     if (typeof raw !== 'string') return raw == null ? '' : String(raw);
     return raw.replace(/\{\{([^}]+)\}\}/g, (match, exprRaw) => {
         const expr = String(exprRaw).trim();
@@ -47,6 +90,18 @@ function expandTemplate(raw, { hostPath, containerPath, useHostStoragePath = fal
         if (expr === 'PLOINKY_WORKSPACE_ROOT') return PLOINKY_WORKSPACE_ROOT || '';
         if (expr === 'STORAGE_CONTAINER_PATH') return useHostStoragePath ? hostPath || '' : containerPath || '';
         if (expr === 'STORAGE_HOST_PATH') return hostPath || '';
+        if (expr === 'GIT_CREDENTIALS_CONTAINER_PATH') {
+            if (!gitCredentials) return '';
+            return useHostStoragePath ? gitCredentials.hostPath : gitCredentials.containerPath;
+        }
+        if (expr === 'GIT_CREDENTIALS_KEY') {
+            if (!gitCredentials) return '';
+            try {
+                return gitCredentialsKeyHex();
+            } catch (_) {
+                return '';
+            }
+        }
         if (expr.startsWith('secret:')) {
             const name = expr.slice('secret:'.length).trim();
             if (!name) return '';
@@ -86,9 +141,9 @@ export function planRuntimeResources(manifest, options = {}) {
     const runtime = manifest && typeof manifest === 'object' ? manifest.runtime : null;
     const resources = runtime && typeof runtime === 'object' ? runtime.resources : null;
     if (!resources || typeof resources !== 'object') {
-        return { persistentStorage: null, env: {} };
+        return { persistentStorage: null, gitCredentials: null, env: {} };
     }
-    const plan = { persistentStorage: null, env: {} };
+    const plan = { persistentStorage: null, gitCredentials: null, env: {} };
 
     if (resources.persistentStorage && typeof resources.persistentStorage === 'object') {
         const ps = resources.persistentStorage;
@@ -109,10 +164,13 @@ export function planRuntimeResources(manifest, options = {}) {
         };
     }
 
+    plan.gitCredentials = planGitCredentials(resources.gitCredentials);
+
     const rawEnv = resources.env && typeof resources.env === 'object' ? resources.env : {};
     const ctx = {
         hostPath: plan.persistentStorage?.hostPath || '',
         containerPath: plan.persistentStorage?.containerPath || '',
+        gitCredentials: plan.gitCredentials,
         useHostStoragePath: options.useHostStoragePath === true,
         agentName: options.agentName || '',
         repoName: options.repoName || '',
@@ -135,6 +193,17 @@ export function ensurePersistentStorageHostDir(plan) {
     }
     assertCanonicalAgentDataPath(ps.hostPath);
     return ps.hostPath;
+}
+
+/** Create the planned git credentials host dir (0700) and return it, or null. */
+export function ensureGitCredentialsHostDir(plan) {
+    const credentials = plan?.gitCredentials;
+    if (!credentials) return null;
+    const hostPath = ensureGitCredentialsDir(PLOINKY_WORKSPACE_ROOT);
+    if (hostPath !== credentials.hostPath) {
+        throw policyViolation(`git credentials directory changed from '${credentials.hostPath}' to '${hostPath}'`);
+    }
+    return hostPath;
 }
 
 /**

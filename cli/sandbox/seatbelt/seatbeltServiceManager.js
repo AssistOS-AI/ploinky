@@ -75,6 +75,7 @@ import {
     getManifestEnvNames
 } from '../../utils/security/secretVars.js';
 import {
+    ensureGitCredentialsHostDir,
     ensurePersistentStorageHostDir,
     planRuntimeResources
 } from '../../utils/runtime/runtimeResourcePlanner.js';
@@ -87,6 +88,15 @@ function isPathWithin(childPath, parentPath) {
     const relativePath = path.relative(parentPath, childPath);
     return relativePath === ''
         || (relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+// The planned git credentials directory needs an explicit grant only when it
+// lies below `.data/.private`, which the profile otherwise keeps opaque.
+function seatbeltPrivateDataGrants(runtimeResourcePlan) {
+    const hostPath = runtimeResourcePlan?.gitCredentials?.hostPath;
+    if (!hostPath) return [];
+    const privateRoot = path.join(PLOINKY_WORKSPACE_ROOT, '.data', '.private');
+    return hostPath !== privateRoot && isPathWithin(hostPath, privateRoot) ? [hostPath] : [];
 }
 // Reuse bwrap PID management (platform-agnostic)
 import {
@@ -649,6 +659,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
 
     const runtimeResourcePlan = planRuntimeResources(manifest, { useHostStoragePath: true, agentName, repoName });
     ensurePersistentStorageHostDir(runtimeResourcePlan);
+    ensureGitCredentialsHostDir(runtimeResourcePlan);
 
     // Build environment map (reuse bwrap's builder with 'seatbelt' runtimeName)
     const envMap = buildFullEnvMap(agentName, manifest, profileConfig, cwd, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
@@ -703,8 +714,10 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
-            ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : [])
-        ]
+            ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : []),
+            ...(runtimeResourcePlan.gitCredentials?.hostPath ? [runtimeResourcePlan.gitCredentials.hostPath] : [])
+        ],
+        privateDataGrants: seatbeltPrivateDataGrants(runtimeResourcePlan),
     });
     const profilePath = writeSeatbeltProfile(agentName, profileContent);
 
@@ -1142,6 +1155,7 @@ async function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir
 
     const runtimeResourcePlan = planRuntimeResources(manifest, { useHostStoragePath: true, agentName, repoName });
     ensurePersistentStorageHostDir(runtimeResourcePlan);
+    ensureGitCredentialsHostDir(runtimeResourcePlan);
 
     // Build environment (same as running agent)
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
@@ -1190,8 +1204,10 @@ async function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
-            ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : [])
-        ]
+            ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : []),
+            ...(runtimeResourcePlan.gitCredentials?.hostPath ? [runtimeResourcePlan.gitCredentials.hostPath] : [])
+        ],
+        privateDataGrants: seatbeltPrivateDataGrants(runtimeResourcePlan),
     });
     const profilePath = writeSeatbeltProfile(agentName, profileContent);
 

@@ -16,7 +16,8 @@ const { setSecretValue } = await import(`../../cli/utils/security/encryptedSecre
 setSecretValue('DPU_MASTER_KEY', 'test-master-key-123');
 const { deriveAgentSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 const plannerModule = await import(`../../cli/utils/runtime/runtimeResourcePlanner.js${moduleSuffix}`);
-const { planRuntimeResources, applyRuntimeResourceEnv, ensurePersistentStorageHostDir } = plannerModule;
+const { planRuntimeResources, applyRuntimeResourceEnv, ensurePersistentStorageHostDir, ensureGitCredentialsHostDir } = plannerModule;
+const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -31,6 +32,7 @@ test.after(() => {
 test('planRuntimeResources returns empty plan for manifest without runtime block', () => {
     const plan = planRuntimeResources({});
     assert.equal(plan.persistentStorage, null);
+    assert.equal(plan.gitCredentials, null);
     assert.deepEqual(plan.env, {});
 });
 
@@ -181,4 +183,61 @@ test('applyRuntimeResourceEnv copies env map as new object', () => {
     assert.deepEqual(applied, { FOO: 'bar' });
     applied.FOO = 'baz';
     assert.equal(plan.env.FOO, 'bar', 'mutating the applied map must not affect the plan');
+});
+
+const gitCredentialsManifest = (resource = { containerPath: '/git-credentials' }) => ({
+    runtime: {
+        resources: {
+            gitCredentials: resource,
+            env: {
+                MIRROR_DIR: '{{GIT_CREDENTIALS_CONTAINER_PATH}}',
+                MIRROR_KEY: '{{GIT_CREDENTIALS_KEY}}',
+            },
+        },
+    },
+});
+
+test('gitCredentials plans the workspace credentials directory and its two templates', () => {
+    const hostPath = path.join(tempDir, '.data', '.private', '.git-credentials');
+    const plan = planRuntimeResources(gitCredentialsManifest());
+    assert.deepEqual(plan.gitCredentials, { hostPath, containerPath: '/git-credentials' });
+    assert.equal(plan.env.MIRROR_DIR, '/git-credentials');
+    assert.equal(plan.env.MIRROR_KEY, deriveSubkey('git-credentials-v1', 32).toString('hex'));
+    assert.match(plan.env.MIRROR_KEY, /^[0-9a-f]{64}$/);
+
+    // Host sandboxes see the host path, as for STORAGE_CONTAINER_PATH.
+    const hostPlan = planRuntimeResources(gitCredentialsManifest(), { useHostStoragePath: true });
+    assert.equal(hostPlan.env.MIRROR_DIR, hostPath);
+
+    // The container path defaults to /git-credentials.
+    assert.equal(planRuntimeResources(gitCredentialsManifest({})).gitCredentials.containerPath, '/git-credentials');
+
+    const created = ensureGitCredentialsHostDir(plan);
+    assert.equal(created, hostPath);
+    assert.equal(fs.statSync(created).mode & 0o777, 0o700);
+    assert.equal(ensureGitCredentialsHostDir(plan), created);
+    assert.equal(ensureGitCredentialsHostDir(planRuntimeResources({})), null);
+});
+
+test('gitCredentials templates expand to nothing unless the resource is declared', () => {
+    const manifest = gitCredentialsManifest();
+    delete manifest.runtime.resources.gitCredentials;
+    const plan = planRuntimeResources(manifest);
+    assert.equal(plan.gitCredentials, null);
+    assert.equal(plan.env.MIRROR_DIR, '');
+    assert.equal(plan.env.MIRROR_KEY, '');
+});
+
+test('gitCredentials rejects unsafe container paths', () => {
+    for (const containerPath of ['relative', '/', '/a/../b', '/a:/b']) {
+        assert.throws(
+            () => planRuntimeResources(gitCredentialsManifest({ containerPath })),
+            error => error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION',
+            containerPath,
+        );
+    }
+    assert.throws(
+        () => planRuntimeResources(gitCredentialsManifest('yes')),
+        error => error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION',
+    );
 });

@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
+import { withGitCredentialEnv } from '../../utils/git/gitCredentials.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -354,10 +355,10 @@ function ensureRemoteClone(repoUrl, ref, cacheDir) {
     }
     const target = path.join(cacheDir, crypto.createHash('sha256').update(`${repoUrl}#${ref || 'default'}`).digest('hex').slice(0, 16));
     if (!fs.existsSync(path.join(target, '.git'))) {
-        execFileSync('git', ['clone', '--quiet', '--depth', '1', repoUrl, target], { stdio: 'pipe' });
+        execFileSync('git', ['clone', '--quiet', '--depth', '1', repoUrl, target], { stdio: 'pipe', env: withGitCredentialEnv() });
     } else {
         try {
-            execFileSync('git', ['-C', target, 'fetch', '--quiet', '--depth', '1', 'origin', ref || 'HEAD'], { stdio: 'pipe' });
+            execFileSync('git', ['-C', target, 'fetch', '--quiet', '--depth', '1', 'origin', ref || 'HEAD'], { stdio: 'pipe', env: withGitCredentialEnv() });
         } catch (_) {}
     }
     if (ref) {

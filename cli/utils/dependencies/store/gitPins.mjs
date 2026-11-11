@@ -18,6 +18,7 @@ import { spawnSync } from 'node:child_process';
 
 import { dependencyStoreError, canonicalDigest, canonicalJson, isFullGitSha } from './canonical.mjs';
 import { lsRemoteQuery, parseGitDependencySpec, parseLsRemoteOutput, resolveRefFromLsRemote } from './gitSpec.mjs';
+import { withGitCredentialEnv } from '../../git/gitCredentials.js';
 
 export const PIN_SCHEMA = 1;
 export const PIN_STATE_FORMAT = 'ploinky-deps-pins';
@@ -124,10 +125,12 @@ export function desiredPinsFor(pins, entries) {
     return desired;
 }
 
-export function gitLookupEnv(env = process.env) {
+export function gitLookupEnv(env = process.env, options = {}) {
     const rawCount = Number.parseInt(env.GIT_CONFIG_COUNT || '0', 10);
     const base = Number.isFinite(rawCount) && rawCount >= 0 ? rawCount : 0;
-    return {
+    // The workspace git credentials are appended after the rewrites, so a
+    // private GitHub pin is reachable through the https rewrite as well.
+    return withGitCredentialEnv({
         ...env,
         GIT_TERMINAL_PROMPT: '0',
         GCM_INTERACTIVE: 'never',
@@ -137,7 +140,7 @@ export function gitLookupEnv(env = process.env) {
         [`GIT_CONFIG_VALUE_${base}`]: 'ssh://git@github.com/',
         [`GIT_CONFIG_KEY_${base + 1}`]: 'url.https://github.com/.insteadOf',
         [`GIT_CONFIG_VALUE_${base + 1}`]: 'git@github.com:',
-    };
+    }, options);
 }
 
 export function defaultRunGit(argv, { env, timeoutMs }) {

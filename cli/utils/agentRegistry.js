@@ -70,6 +70,14 @@ function normalizeRuntimeResources(rawRuntime) {
             };
         }
     }
+    const gitCredentials = resources.gitCredentials && typeof resources.gitCredentials === 'object'
+        && !Array.isArray(resources.gitCredentials)
+        ? resources.gitCredentials
+        : null;
+    if (gitCredentials) {
+        const containerPath = toNonEmptyString(gitCredentials.containerPath);
+        normalized.gitCredentials = containerPath ? { containerPath } : {};
+    }
     if (resources.env && typeof resources.env === 'object') {
         const envOut = {};
         for (const [envName, envValue] of Object.entries(resources.env)) {

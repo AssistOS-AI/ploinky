@@ -648,3 +648,31 @@ test('generated profile keeps .ploinky-box opaque and unrenamable through a writ
         fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
+
+test('buildSeatbeltProfile re-grants only exact private data directories after the opacity rule', () => {
+    const workspaceRoot = '/Users/alice/workspace';
+    const grant = `${workspaceRoot}/.data/.private/.git-credentials`;
+    const options = {
+        agentLibGrant: seatbeltGrantFor(workspaceRoot),
+        agentCodePath: `${workspaceRoot}/repo/agent`,
+        agentLibPath: '/Users/alice/tools/ploinky/Agent',
+        nodeModulesDir: `${workspaceRoot}/.ploinky/deps/agent/node_modules`,
+        agentWorkDir: `${workspaceRoot}/.data/demo`,
+        sharedDir: `${workspaceRoot}/.data/shared`,
+        cwd: workspaceRoot,
+        skillsPath: null,
+        codeReadOnly: false,
+        skillsReadOnly: true,
+        volumes: {},
+        workspaceRoot,
+    };
+    const profile = buildSeatbeltProfile({ ...options, extraWritePaths: [grant], privateDataGrants: [grant] });
+    const opacity = profile.indexOf('; Protected controller state is opaque');
+    const regrant = profile.indexOf('; Exact private data grants of this launch');
+    assert.ok(opacity >= 0 && regrant > opacity, 'the grant follows the opacity rule');
+    assert.ok(profile.slice(regrant).includes(`(subpath "${grant}")`));
+    assert.equal(buildSeatbeltProfile(options).includes('Exact private data grants'), false);
+    for (const invalid of [`${workspaceRoot}/.data/.private`, `${workspaceRoot}/.data/other`]) {
+        assert.throws(() => buildSeatbeltProfile({ ...options, privateDataGrants: [invalid] }), /private data grant/);
+    }
+});

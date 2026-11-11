@@ -192,11 +192,16 @@ function protectedRootSymlinks(target) {
     return links;
 }
 
+// `privateDataGrants` names further exact directories below `.data/.private`
+// that this launch may bind, besides the agent's own private directory (for
+// example the workspace git credentials directory of a declaring agent).
 export function controllerGuardTargets(bindings, {
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     agentName,
+    privateDataGrants = [],
 } = {}) {
     const targets = new Map();
+    const grantedPrivateSources = new Set((privateDataGrants || []).map(grant => path.resolve(String(grant))));
     const frameworkRoot = projectedCanonicalPath(path.join(workspaceRoot, '.ploinky'));
     for (const binding of bindings || []) {
         const rawSource = String(binding?.hostPath || binding?.source || '').trim();
@@ -233,6 +238,10 @@ export function controllerGuardTargets(bindings, {
             if (isPathWithin(canonicalSource, canonicalProtectedRoot)) {
                 if (privateData && agentName
                     && source === path.join(protectedRoot.hostPath, validateAgentDataKey(agentName))) {
+                    assertCanonicalAgentDataPath(source, { workspaceRoot });
+                    continue;
+                }
+                if (privateData && grantedPrivateSources.has(source) && source !== protectedRoot.hostPath) {
                     assertCanonicalAgentDataPath(source, { workspaceRoot });
                     continue;
                 }

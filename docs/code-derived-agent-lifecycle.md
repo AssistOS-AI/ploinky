@@ -44,6 +44,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | `.ploinky/.secrets` | Encrypted secret store used by `var`, authentication configuration, and manifest env. |
 | `.ploinky/profile` | Active profile name, defaulting to `default`. |
 | `.data/<key>` | Mandatory host location for `runtime.resources.persistentStorage`; the key must be one safe path segment. |
+| `.data/.private/.git-credentials` | Workspace git credentials directory (mode 0700), created on demand for an agent that declares `runtime.resources.gitCredentials`. Holds the encrypted `credentials.json`, written by the agent that owns the workspace credentials (in AchillesIDE, RoboWork for the default robot, whose only copy of the token this is), that Ploinky reads before its git operations. The ploinky var `PLOINKY_GIT_CREDENTIALS_DIR` may move it to another workspace-relative or absolute path inside the workspace, never into `.ploinky`, `.ploinky-box` or another `.data/.private` directory. |
 | `.ploinky/container-runtime/<container>` | Podman staging directory used when symlink-heavy code needs a real mounted tree. |
 | `.ploinky/seatbelt-runtime/<agent>` | macOS seatbelt staging area for copied `Agent/` runtime files. |
 
@@ -215,7 +216,8 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `image` | No | Secondary image field. Fallback is `node:18-alpine`. Supports `${VAR}` interpolation during startup. |
 | `runtime` | No | Must be an object when used for resources. A string `runtime` selector is explicitly rejected as legacy/unsupported. |
 | `runtime.resources.persistentStorage` | No | A declaration requires a one-segment `key` and non-empty `containerPath`, then creates/mounts `.data/<key>`. Environment-based host-path overrides are not accepted. |
-| `runtime.resources.env` | No | Adds env vars with templates such as `{{PLOINKY_WORKSPACE_ROOT}}`, `{{STORAGE_CONTAINER_PATH}}`, `{{STORAGE_HOST_PATH}}`, `{{secret:NAME}}`, `{{generatedSecret:NAME}}`, and `{{var:NAME}}`. |
+| `runtime.resources.gitCredentials` | No | Object with an optional absolute `containerPath` (default `/git-credentials`). Creates the workspace git credentials directory and mounts it read-write at `containerPath` for Podman/Docker, bwrap and seatbelt. |
+| `runtime.resources.env` | No | Adds env vars with templates such as `{{PLOINKY_WORKSPACE_ROOT}}`, `{{STORAGE_CONTAINER_PATH}}`, `{{STORAGE_HOST_PATH}}`, `{{GIT_CREDENTIALS_CONTAINER_PATH}}`, `{{GIT_CREDENTIALS_KEY}}`, `{{secret:NAME}}`, `{{generatedSecret:NAME}}`, and `{{var:NAME}}`. The two `GIT_CREDENTIALS_*` templates expand to an empty string unless `gitCredentials` is declared; `GIT_CREDENTIALS_CONTAINER_PATH` becomes the host path on host sandboxes, like `STORAGE_CONTAINER_PATH`, and `GIT_CREDENTIALS_KEY` is the credentials file key as 64 lowercase hex characters. |
 | `lite-sandbox` | No | If true and host sandbox is enabled, selects bwrap on Linux or seatbelt on macOS. If host sandbox is disabled, it falls back to container runtime. |
 | `profiles` | No | If present, `profiles.default` is required. Active profile comes from record profile or `.ploinky/profile`; non-default profiles are merged over default. |
 | `profiles.<name>.openPorts` | No | Private inner-runtime mappings read by `parseManifestPorts`; they never alter physical-host publications. TCP overlaps with Router `8080`/`8081` and UDP overlap with the reserved media port (default `7882`) are rejected. Without an entry, execution modes that include AgentServer receive an engine-assigned private mapping to container port 7000; start-only services do not. |
@@ -470,6 +472,7 @@ For Docker-style runtime, the main mounts are:
 | Global or devel `projectPath` / current working directory | Same absolute path inside container | read-write |
 | Agent `skills/`, when it exists outside code | `/code/skills` | profile-controlled read-write/read-only |
 | `runtime.resources.persistentStorage.hostPath` | `runtime.resources.persistentStorage.containerPath` | read-write |
+| Workspace git credentials directory (`runtime.resources.gitCredentials`) | `runtime.resources.gitCredentials.containerPath` | read-write |
 | Root or active profile `volumes` host path | configured container path | read-write by default |
 | LLM model/state/shared paths | `/models`, `/runtime`, `/Agent/llm-runtime` | runtime-specific |
 
@@ -602,6 +605,12 @@ Numeric `chmod` is applied best-effort. `makeWorldWritableSubdirs` creates/chmod
 `volumeOptions.<containerPath>.readOnly: true` is enforced across backends: Podman uses `:z,ro`, Docker uses `:ro`, bwrap uses `--ro-bind`, and Seatbelt excludes the host path from write grants.
 
 `runtime.resources.persistentStorage` is separate from `manifest.volumes`. It creates a per-resource host directory and mounts it to the configured `containerPath`; env templates can refer to the storage paths.
+
+`runtime.resources.gitCredentials` gives one agent write access to the workspace git credentials directory, which is otherwise hidden like the rest of `.data/.private`: the runtime guards admit exactly that directory as an extra private bind, and seatbelt re-grants exactly that path after its private-data opacity rule. The declaring agent writes `credentials.json` as `{ "schema": "ploinky-git-credentials-v1", "alg": "aes-256-gcm", "iv", "tag", "data" }` (base64 fields, AAD `ploinky-git-credentials-v1`) whose plaintext is `{ "host": "github.com", "username", "token", "updatedAt" }`, encrypted with the key from `{{GIT_CREDENTIALS_KEY}}` (the HKDF subkey `git-credentials-v1` of the workspace master key). Ploinky then authenticates its own git operations to `https://github.com` with it (see Git credentials for Ploinky's git operations).
+
+## Git Credentials for Ploinky's Git Operations
+
+`cli/utils/git/gitCredentials.js` reads the credentials file before each Ploinky git spawn: the update runner (`runGit`), clone/fetch/checkout (`runGitCommand`), the `ls-remote` probes in `repos.js`, dependency pin lookups (`gitPins.mjs`), linked-repository installs (`linkInstall.mjs`) and the LLM architecture catalog clone. When the credentials file decrypts, the child receives `http.https://github.com/.extraheader = Authorization: Basic base64(username:token)` through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, appended after any entries already present. The token is never placed in argv, logs or diagnostics. A missing, malformed or undecryptable credentials file, or a rejected directory override, means no credentials: git runs exactly as before, so public repositories still update and private ones are skipped as remote-unreachable. The key is derived only when a credentials file file exists. The host self-update of the Ploinky checkout never uses the credentials file, and host `~/.git-credentials` are not part of this mechanism.
 
 ## Environment and Secrets
 

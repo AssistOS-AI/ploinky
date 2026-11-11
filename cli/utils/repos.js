@@ -12,6 +12,7 @@ import { runGitCommand, sanitizeGitDiagnostic } from './gitCommand.js';
 import { createOperationRecord } from '../commands/updateOutcome.js';
 import { throwUnlessVerified, updateCheckoutFastForward } from './git/verifiedUpdate.js';
 import { assessGeneratedCheckoutState } from './git/generatedState.js';
+import { withGitCredentialEnv } from './git/gitCredentials.js';
 
 export const REPO_SOURCES_FILE = path.join(PLOINKY_DIR, 'repo_sources.json');
 export const ENABLED_REPOS_FILE = path.join(PLOINKY_DIR, 'enabled_repos.json');
@@ -692,6 +693,7 @@ export function checkGitRemoteReachable(repoPath, { remote = 'origin' } = {}) {
     try {
         execFileSync('git', ['-C', repoPath, 'ls-remote', '--quiet', remoteName], {
             stdio: ['ignore', 'ignore', 'pipe'],
+            env: withGitCredentialEnv(),
         });
         return {
             reachable: true,
@@ -828,6 +830,7 @@ export function remoteBranchExists(repoPathOrUrl, branch) {
     try {
         const output = execFileSync('git', ['ls-remote', '--heads', repoPathOrUrl, `refs/heads/${branch}`], {
             stdio: ['ignore', 'pipe', 'pipe'],
+            env: withGitCredentialEnv(),
         });
         return String(output).trim().length > 0;
     } catch (_) {
