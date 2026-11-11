@@ -36,7 +36,7 @@ Ploinky must let an operator supply configuration and credentials to an agent wi
 | Persistent random secret | Is created by `ensurePersistentSecret` when no accepted explicit value exists, stored in `.ploinky/.secrets`, and reused on later starts. It is distinct from deterministic generated secrets. |
 | Agent request secret | Is derived for canonical principal `agent:<repo>/<agent>` and is injected only into credential-capable confined runtimes after exact identity and generation attestation. It signs public Router-facing Agent Assertions. |
 | Private agent request secret | Is derived from principal, effective instance id, and enable generation. It signs private-listener assertions and becomes invalid when the runtime tuple changes. |
-| Session, password-store, delegation, relay, and publication keys | Use separate HKDF purposes and verifier paths. Possession of one derived key must not permit derivation or use of another protocol family. |
+| Session, SSO session storage, password-store, delegation, relay, and publication keys | Use separate HKDF purposes and verifier paths. Possession of one derived key must not permit derivation or use of another protocol family. |
 | Ephemeral token or channel credential | Is short-lived, request- or generation-bound, replay-protected, and delivered only to its intended recipient. It must not be persisted as an ordinary workspace variable. |
 
 ### Resolution precedence

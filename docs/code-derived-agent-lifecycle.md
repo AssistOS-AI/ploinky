@@ -658,6 +658,7 @@ Startup config providers can write values into encrypted `.ploinky/.secrets` bef
 | Watchdog start | Router PID and supervisor diagnostics | `.ploinky/running/router.pid`, `.ploinky/logs/watchdog.log` | Router supervisor |
 | Router output | Router operational output and UTC daily archives | `.ploinky/logs/router.log`, `.ploinky/logs/router-archive/YYYY-MM-DD[.N].jsonl` | Ploinky writes the active file; Workspace Monitor requests rotation and retention maintenance |
 | Policy audit | Router policy decisions and UTC daily archives | `.ploinky/data/router-security/policy-audit.log`, `.ploinky/data/router-security/policy-audit-archive/YYYY-MM-DD[.N].jsonl` | Ploinky writes the active file; Workspace Monitor requests rotation and retention maintenance |
+| SSO sessions | Router SSO session records, encrypted | `.ploinky/data/router-security/sso-sessions.enc` | Router only |
 
 ## Startup Readiness vs Health Probes
 
