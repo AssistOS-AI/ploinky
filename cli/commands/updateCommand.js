@@ -13,6 +13,7 @@ import { printUpdateSummary } from './updateSummary.js';
 import { withUpdateSkillScopes } from './updateGraph.js';
 import { updateAllRepos, updatePloinkyRepos, updateRepoResult } from './repoAgentCommands.js';
 import { UpdateCancelledError, createUpdateCancellation } from './updateCancellation.js';
+import { refreshAgentImagesForUpdate } from './updateImages.js';
 
 // The core `ploinky update` command boundary.
 //
@@ -107,6 +108,7 @@ async function runUpdate(normalizedOptions, {
     ploinkyDir = PLOINKY_DIR,
     leaseWaitMs = UPDATE_LEASE_WAIT_MS,
     handlers = { updateAllRepos, updatePloinkyRepos, updateRepoResult },
+    refreshAgentImages = refreshAgentImagesForUpdate,
     log = console.log,
     error: logError = console.error,
     cancellation,
@@ -135,9 +137,17 @@ async function runUpdate(normalizedOptions, {
             result = await runWithWorkspaceMutationLease(lease, () => withUpdateSkillScopes(
                 reportRequest?.context?.source?.skillScopes,
                 async () => {
-                    if (request.kind === 'repos') return handlers.updatePloinkyRepos(options);
-                    if (request.kind === 'repo') return handlers.updateRepoResult(request.repoName, { command, cancellation, boxRun });
-                    return handlers.updateAllRepos(request.folderPath || undefined, options);
+                    let sources;
+                    if (request.kind === 'repos') sources = await handlers.updatePloinkyRepos(options);
+                    else if (request.kind === 'repo') sources = await handlers.updateRepoResult(request.repoName, { command, cancellation, boxRun });
+                    else sources = await handlers.updateAllRepos(request.folderPath || undefined, options);
+                    // Tagged agent images are refreshed from the updated
+                    // manifests; `update repo <name>` refreshes that
+                    // repository's agents only. After a signal no pull
+                    // starts; the late-signal check below records it.
+                    if (await cancellation.signalReceived()) return sources;
+                    const imageRecords = refreshAgentImages({ repoName: request.kind === 'repo' ? request.repoName : null });
+                    return imageRecords.length ? appendUpdateRecords(sources, imageRecords) : sources;
                 },
             ));
         } finally {

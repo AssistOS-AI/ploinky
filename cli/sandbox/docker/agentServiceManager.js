@@ -92,6 +92,11 @@ import {
     logRuntimeReplacement,
     shortenHashes,
 } from '../runtimeReplacementLog.js';
+import {
+    inspectContainerImageId as inspectRuntimeContainerImageId,
+    inspectLocalImageId,
+    runtimeImageReuseProblem,
+} from './runtimeImageIdentity.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
 import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
@@ -4320,6 +4325,23 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (dependencyProblem) {
             debugLog(`[ensureAgentService] ${agentName}: ${dependencyProblem}, recreating container`);
             recreateReason ||= 'dependencyGenerationChanged';
+        }
+    }
+
+    // A tag-referenced image can name a newer local image (pulled by
+    // `ploinky update`) than the one the container was created from. A GPU
+    // share container is created from the same reference's immutable ID, so
+    // the comparison holds for it too. LLM runtime agents run their
+    // catalog-selected image and are compared by the LLM reuse hash below.
+    if (existingRuntimeAtEntry && !recreateReason && image && !isLlmRuntimeManifest(manifest, profileConfig)) {
+        const imageProblem = runtimeImageReuseProblem({
+            containerImageId: inspectRuntimeContainerImageId(containerName, runtime),
+            referenceImageId: inspectLocalImageId(image, runtime),
+        });
+        if (imageProblem) {
+            debugLog(`[ensureAgentService] ${agentName}: ${imageProblem}, recreating container`);
+            recreateDetail = imageProblem;
+            recreateReason = 'runtimeImageChanged';
         }
     }
 
