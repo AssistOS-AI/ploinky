@@ -23,6 +23,8 @@ import {
     handleUserAdminRoutes,
     resolveRouteDefaultHttpAccess,
 } from './authHandlers/index.js';
+import { authService } from './authHandlers/shared.js';
+import { discardPersistedSessions } from './auth/sessionPersistence.js';
 import {
     buildHttpRouteAuthInfoHeader,
     buildHttpRouteRateSourceHeader,
@@ -1109,6 +1111,20 @@ function prepareHealthSocket() {
     }
 }
 
+// Durable SSO sessions are on by default; `off` is the only opt-out. Arming runs
+// before any listener starts so no request can be answered from an empty map.
+const ssoSessionPersistence = String(process.env.PLOINKY_SSO_SESSION_PERSISTENCE || '').trim().toLowerCase() !== 'off';
+const ssoSessionDirectory = path.join(PLOINKY_DIR, 'data', 'router-security');
+if (ssoSessionPersistence) {
+    try {
+        authService.configureSessionPersistence({ directory: ssoSessionDirectory, log: appendLog });
+    } catch (error) {
+        console.error('[FATAL] SSO session persistence could not be configured:', error);
+        appendLog('sso_session_persistence_configure_error', { error: String(error?.message || error) });
+        process.exit(2);
+    }
+}
+
 prepareHealthSocket();
 
 // Setup process lifecycle management for every listener.
@@ -1132,6 +1148,9 @@ const lifecycle = setupProcessLifecycle(
             const { agentUpstreamSessionPool } = await import('./mcp-proxy/index.js');
             await agentUpstreamSessionPool.closeAll();
         }],
+        // Final session flush in the same tick as the listener close, so a
+        // successor Router never meets a late write from this process.
+        beforeListenersClose: ssoSessionPersistence ? [() => authService.closeSessionStore()] : [],
         requiredBeforeClose: [async () => {
             const { shutdownMarketplaceRepositoryWorkers } = await import('./marketplaceRepositoryWorker.mjs');
             return shutdownMarketplaceRepositoryWorkers();
@@ -1220,6 +1239,19 @@ hardwareAvailabilityLatcher.start();
 
 // Start server
 server.listen(port, '0.0.0.0', () => {
+    // Binding the port proves the previous Router closed its listener, so the
+    // session file is safe to read now. Must not throw past this block.
+    try {
+        if (ssoSessionPersistence) {
+            const { restored, dropped, rejected } = authService.openSessionStore() || {};
+            appendLog('sso_session_store_opened', { restored, dropped, rejected });
+        } else {
+            const { removed } = discardPersistedSessions({ directory: ssoSessionDirectory, log: appendLog }) || {};
+            appendLog('sso_session_persistence_off', { removed });
+        }
+    } catch (error) {
+        appendLog('sso_session_store_open_error', { error: String(error?.message || error) });
+    }
     cloudflaredRouterIntegration.markPublicListenerReady();
     console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
     console.log('  WebChat:         /webchat');

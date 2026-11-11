@@ -3,7 +3,7 @@ import path from 'path';
 import { timingSafeEqual } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'url';
 
-import { createSessionStore } from './sessionStore.js';
+import { createSessionStore, SSO_SESSION_STORE_UNAVAILABLE } from './sessionStore.js';
 import { randomId } from './utils.js';
 import { resolveVarValue } from '../../utils/security/secretVars.js';
 import { getConfigSnapshot } from '../../utils/workspace.js';
@@ -285,6 +285,9 @@ export function createGenericAuthBridge(options = {}) {
 
     async function handleCallback({ code, state, browserBinding, baseUrl, rawQuery }) {
         cleanupPending();
+        // Before the pending state is consumed, so the browser can retry the
+        // same callback once the store opens.
+        if (!sessionStore.isAvailable()) throw ssoProviderUnavailableError();
         const pending = pendingAuth.get(state);
         if (!pending) throw new Error('Invalid or expired authorization state');
         // The proof travels only in a host-only HttpOnly cookie, never in the
@@ -316,13 +319,21 @@ export function createGenericAuthBridge(options = {}) {
         const now = Date.now();
         const expiresAt = providerSession?.expiresAt || (now + sessionStore.sessionTtlMs);
         const refreshExpiresAt = providerSession?.refreshExpiresAt || null;
-        const { id: sessionId } = sessionStore.createSession({
-            user,
-            tokens: providerSession?.tokens || {},
-            providerSession,
-            expiresAt,
-            refreshExpiresAt
-        });
+        if (!sessionStore.isAvailable()) throw ssoProviderUnavailableError();
+        let sessionId;
+        try {
+            ({ id: sessionId } = sessionStore.createSession({
+                providerAgent,
+                user,
+                tokens: providerSession?.tokens || {},
+                providerSession,
+                expiresAt,
+                refreshExpiresAt
+            }));
+        } catch (error) {
+            if (error?.code === SSO_SESSION_STORE_UNAVAILABLE) throw ssoProviderUnavailableError();
+            throw error;
+        }
         const redirectTo = pending.returnTo || '/';
         const postLogoutRedirectUri = resolvePostLogoutUri(baseUrl, null, config);
         return {
@@ -358,15 +369,28 @@ export function createGenericAuthBridge(options = {}) {
         };
     }
 
+    // Removes a session the bridge has decided to end. Never throws: it runs
+    // inside validation lanes that nobody awaits with a catch.
+    function endSession(sessionId, reason) {
+        let result = { existed: false, persisted: false };
+        try {
+            result = sessionStore.deleteSession(sessionId);
+        } catch (_) { }
+        cancelValidation(sessionId);
+        emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason });
+        return result;
+    }
+
     // One provider attempt. `isAbandoned` turns true once the deadline settled
     // the cohort; every later continuation then neither publishes nor deletes.
     async function attemptRemoteValidation(sessionId, session, epoch, { signal, isAbandoned }) {
-        const current = () => !isAbandoned() && epoch === validationEpoch && sessionStore.getSession(sessionId) === session;
-        const refuse = () => {
+        // A store that stopped being usable makes every later step a no-op;
+        // admitSession reports that as undecided, never as a refusal.
+        const current = () => !isAbandoned() && epoch === validationEpoch && sessionStore.isAvailable()
+            && sessionStore.getSession(sessionId) === session;
+        const refuse = (reason = 'validation_failed') => {
             if (!current()) return DENIED;
-            sessionStore.deleteSession(sessionId);
-            cancelValidation(sessionId);
-            emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'validation_failed' });
+            endSession(sessionId, reason);
             return DENIED;
         };
         let context;
@@ -377,6 +401,9 @@ export function createGenericAuthBridge(options = {}) {
             return UNAVAILABLE;
         }
         if (!current()) return DENIED;
+        // The session belongs to the provider agent that issued it; a different
+        // configured agent is another identity namespace.
+        if (session.providerAgent !== context.providerAgent) return refuse('provider_changed');
         let outcome;
         let provider;
         let fingerprint;
@@ -468,10 +495,12 @@ export function createGenericAuthBridge(options = {}) {
         }
     }
 
-    function cancelValidation(sessionId) {
+    // Lanes stay keyed by the cookie value the caller supplied; they live only
+    // in memory and end with the process.
+    function cancelValidation(sessionId, result = DENIED) {
         const lane = validationLanes.get(sessionId);
         if (!lane) return;
-        for (const caller of [...lane.active, ...lane.queued]) caller.resolve(DENIED);
+        for (const caller of [...lane.active, ...lane.queued]) caller.resolve(result);
         lane.queued = [];
         // Release a provider call nobody is waiting for; the deadline still
         // bounds providers that ignore the signal.
@@ -499,6 +528,9 @@ export function createGenericAuthBridge(options = {}) {
     }
 
     async function admitSession(sessionId) {
+        // Checked before any lookup: an empty answer from a store that is not
+        // open would become a 401 that clears the browser cookie.
+        if (!sessionStore.isAvailable()) return UNAVAILABLE;
         const session = sessionStore.getSession(sessionId);
         if (!session) return DENIED;
         const epoch = validationEpoch;
@@ -509,6 +541,7 @@ export function createGenericAuthBridge(options = {}) {
             queueMicrotask(() => { void drainValidationLane(sessionId, lane); });
         }
         const result = await new Promise(resolve => lane.queued.push({ session, epoch, resolve }));
+        if (!sessionStore.isAvailable()) return UNAVAILABLE;
         // A deleted or replaced record is a refusal; a configuration change
         // while the session record survives is retryable.
         if (sessionStore.getSession(sessionId) !== session) return DENIED;
@@ -530,15 +563,18 @@ export function createGenericAuthBridge(options = {}) {
         const epoch = validationEpoch;
         const record = sessionStore.getSession(sessionId);
         if (!record) return () => false;
-        return () => epoch === validationEpoch && sessionStore.getSession(sessionId) === record;
+        return () => epoch === validationEpoch && sessionStore.isAvailable()
+            && sessionStore.getSession(sessionId) === record;
     }
 
+    // `persisted` is false when the deletion could not be made durable; the
+    // caller must not report a completed logout then.
     async function logout(sessionId, { baseUrl, postLogoutRedirectUri } = {}) {
+        if (!sessionStore.isAvailable()) throw ssoProviderUnavailableError();
         const session = sessionStore.getSession(sessionId);
+        let persisted = true;
         if (session) {
-            sessionStore.deleteSession(sessionId);
-            cancelValidation(sessionId);
-            emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'logout' });
+            ({ persisted } = endSession(sessionId, 'logout'));
         }
         let redirect;
         try {
@@ -554,13 +590,41 @@ export function createGenericAuthBridge(options = {}) {
         } catch (err) {
             redirect = postLogoutRedirectUri;
         }
-        return { redirect };
+        return { redirect, persisted };
     }
 
     function revokeSession(sessionId) {
-        sessionStore.deleteSession(sessionId);
-        cancelValidation(sessionId);
-        emitAuthenticationSessionInvalidated({ mode: 'sso', sessionId, reason: 'revoked' });
+        if (!sessionStore.isAvailable()) throw ssoProviderUnavailableError();
+        return endSession(sessionId, 'revoked');
+    }
+
+    // Persistence is armed by the Router only; every other importer of the
+    // bridge keeps the memory-only store.
+    function configureSessionPersistence(config) {
+        sessionStore.configurePersistence(config);
+    }
+
+    function openSessionStore() {
+        try {
+            return sessionStore.open({ providerAgent: resolveConfiguredSsoProvider() });
+        } catch (_) {
+            return { restored: 0, dropped: 0, rejected: 'open_failed' };
+        }
+    }
+
+    function closeSessionStore() {
+        try {
+            sessionStore.close();
+        } catch (_) { }
+        if (sessionStore.isAvailable()) return;
+        // Callers still waiting get an undecided answer, never a refusal.
+        for (const sessionId of [...validationLanes.keys()]) {
+            try { cancelValidation(sessionId, UNAVAILABLE); } catch (_) { }
+        }
+    }
+
+    function isSessionStoreAvailable() {
+        return sessionStore.isAvailable();
     }
 
     function isConfigured() {
@@ -624,6 +688,10 @@ export function createGenericAuthBridge(options = {}) {
         refreshSession,
         logout,
         revokeSession,
+        configureSessionPersistence,
+        openSessionStore,
+        closeSessionStore,
+        isSessionStoreAvailable,
         getSessionCookieMaxAge,
         authenticateAgent,
         listUsers,
