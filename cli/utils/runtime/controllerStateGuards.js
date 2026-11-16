@@ -144,6 +144,107 @@ function ownAgentDataProjection(agentDataDir, workspaceRoot) {
     return Object.freeze({ view, source: projectedCanonicalPath(source), name });
 }
 
+// The mountpoints that binds nested strictly below `maskTarget` need, relative to
+// it. Only the topmost nested targets count: a deeper target's mountpoint lives in
+// that bind's own source. A bind of a regular file needs a file mountpoint.
+function nestedMaskEntries(bindings, maskTarget) {
+    const prefix = maskTarget === '/' ? '/' : `${maskTarget}/`;
+    const nested = bindings.filter(binding => binding.target.startsWith(prefix));
+    const kinds = new Map();
+    for (const binding of nested) {
+        if (nested.some(other => other.target !== binding.target && binding.target.startsWith(`${other.target}/`))) continue;
+        const relative = binding.target.slice(prefix.length);
+        const segments = relative.split('/');
+        if (segments.some(segment => !segment || segment === '.' || segment === '..' || segment.includes('\0'))) {
+            throw guardError(`runtime bind target '${binding.target}' below '${maskTarget}' is not a plain path`, {
+                target: binding.target,
+            });
+        }
+        let kind;
+        try {
+            kind = fs.statSync(binding.source).isFile() ? 'file' : 'dir';
+        } catch (error) {
+            if (error?.code === 'ENOENT') {
+                throw guardError(`runtime bind source '${binding.source}' for '${binding.target}' is missing`, {
+                    source: binding.source,
+                    target: binding.target,
+                });
+            }
+            throw error;
+        }
+        if (kinds.has(relative) && kinds.get(relative) !== kind) {
+            throw guardError(`runtime bind target '${binding.target}' has conflicting kinds`, { target: binding.target });
+        }
+        kinds.set(relative, kind);
+    }
+    return Array.from(kinds.entries())
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([relative, kind]) => Object.freeze({ relative, kind }));
+}
+
+function expectedMaskViewListing(entries) {
+    const listed = new Set();
+    for (const { relative, kind } of entries) {
+        const segments = relative.split('/');
+        for (let depth = 1; depth < segments.length; depth += 1) listed.add(`${segments.slice(0, depth).join('/')}/`);
+        listed.add(kind === 'file' ? relative : `${relative}/`);
+    }
+    return Array.from(listed).sort();
+}
+
+function setTreeModes(directory, { dirMode, fileMode }) {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const child = path.join(directory, entry.name);
+        if (entry.isDirectory()) setTreeModes(child, { dirMode, fileMode });
+        else if (entry.isFile()) fs.chmodSync(child, fileMode);
+    }
+    fs.chmodSync(directory, dirMode);
+}
+
+// A read-only tree under the guard base holding only the given mountpoints. The
+// name is derived from the entries, and the tree is built aside and published by
+// one rename, so concurrent launches either publish it or reuse an identical one.
+// Never writable once published; verified exactly on every use.
+function nestedMaskView(workspaceRoot, entries) {
+    const viewsRoot = path.join(guardBase(workspaceRoot), 'mask-views');
+    fs.mkdirSync(viewsRoot, { recursive: true, mode: 0o700 });
+    if (fs.lstatSync(viewsRoot).isSymbolicLink() || !fs.lstatSync(viewsRoot).isDirectory()) {
+        throw guardError(`runtime mask view root '${viewsRoot}' must be a physical directory`, { viewsRoot });
+    }
+    const key = JSON.stringify(entries.map(({ relative, kind }) => [relative, kind]));
+    const view = path.join(viewsRoot, crypto.createHash('sha256').update(key).digest('hex').slice(0, 24));
+    if (!fs.existsSync(view)) {
+        const build = fs.mkdtempSync(path.join(viewsRoot, '.build-'));
+        try {
+            for (const { relative, kind } of entries) {
+                const mountpoint = path.join(build, ...relative.split('/'));
+                fs.mkdirSync(path.dirname(mountpoint), { recursive: true, mode: 0o755 });
+                if (kind === 'file') fs.writeFileSync(mountpoint, '', { flag: 'wx', mode: 0o444 });
+                else fs.mkdirSync(mountpoint, { mode: 0o755 });
+            }
+            setTreeModes(build, { dirMode: 0o555, fileMode: 0o444 });
+            try {
+                fs.renameSync(build, view);
+            } catch (error) {
+                if (error?.code !== 'EEXIST' && error?.code !== 'ENOTEMPTY') throw error;
+            }
+        } finally {
+            if (fs.existsSync(build)) {
+                setTreeModes(build, { dirMode: 0o755, fileMode: 0o644 });
+                fs.rmSync(build, { recursive: true, force: true });
+            }
+        }
+    }
+    const stat = fs.lstatSync(view);
+    const listing = stat.isSymbolicLink() || !stat.isDirectory()
+        ? null
+        : guardSourceEntries(view, { maxDepth: Infinity, maxEntries: Infinity });
+    if (!listing || [...listing].sort().join('\n') !== expectedMaskViewListing(entries).join('\n')) {
+        throw guardError(`runtime mask view '${view}' holds unexpected entries`, { view, entries: listing });
+    }
+    return view;
+}
+
 // Lists what a guard source holds, for the error only: relative paths, directories
 // with a trailing `/`, links with a trailing `@` and never followed, depth- and
 // count-bounded, sorted. A listing failure is reported in place of the entries.
@@ -480,7 +581,18 @@ export function controllerGuardMounts(targets, options = {}) {
             });
             continue;
         }
-        if (exists || !guard.parentTarget) children.push({ source: sources.get(guard.key), target: guard.target, readOnly: true });
+        if (exists || !guard.parentTarget) {
+            // The shared source is mounted by every launch of the workspace, so the
+            // engine must never create a mountpoint in it. A bind nested below the
+            // `.data` mask (for example a staged real-path node_modules under the
+            // agent's home) gets a launch-specific view that already holds exactly
+            // those mountpoints and nothing else.
+            const nested = guard.key === DATA_GUARD_KEY ? nestedMaskEntries(bindings, guard.target) : [];
+            const source = nested.length
+                ? nestedMaskView(options.workspaceRoot || PLOINKY_WORKSPACE_ROOT, nested)
+                : sources.get(guard.key);
+            children.push({ source, target: guard.target, readOnly: true });
+        }
     }
     return [
         ...Array.from(parents.values()).sort((left, right) => left.target.split('/').length - right.target.split('/').length || left.target.localeCompare(right.target)),
