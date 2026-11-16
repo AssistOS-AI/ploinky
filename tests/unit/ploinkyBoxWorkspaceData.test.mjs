@@ -206,7 +206,8 @@ test('cache deletion removes exactly the two Box directories and nothing else', 
     fs.writeFileSync(path.join(workspace, '.ploinky', 'box', 'images', 'layer'), 'image data');
     fs.writeFileSync(path.join(workspace, '.ploinky', 'box', 'dependencies', 'marker.json'), '{}');
     fs.mkdirSync(path.join(workspace, '.ploinky', 'data'));
-    fs.writeFileSync(path.join(workspace, '.ploinky', 'data', 'master-key'), 'secret');
+    fs.mkdirSync(path.join(workspace, '.data', 'dpu-data'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, '.data', 'dpu-data', 'master-key'), 'secret');
     fs.mkdirSync(path.join(workspace, '.ploinky', 'repos'), { recursive: true });
     fs.writeFileSync(path.join(workspace, '.ploinky', 'agents.json'), '{}');
     fs.writeFileSync(path.join(workspace, 'workspace-file.txt'), 'user data');
@@ -222,7 +223,7 @@ test('cache deletion removes exactly the two Box directories and nothing else', 
         fs.readdirSync(path.join(workspace, '.ploinky')).sort(),
         ['agents.json', 'data', 'repos'],
     );
-    assert.equal(fs.readFileSync(path.join(workspace, '.ploinky', 'data', 'master-key'), 'utf8'), 'secret');
+    assert.equal(fs.readFileSync(path.join(workspace, '.data', 'dpu-data', 'master-key'), 'utf8'), 'secret');
     assert.equal(fs.readFileSync(path.join(workspace, 'workspace-file.txt'), 'utf8'), 'user data');
 });
 

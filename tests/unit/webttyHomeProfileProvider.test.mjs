@@ -259,14 +259,30 @@ test('live profile requests and responses use the exact v2 shape', () => {
     assert.equal(validateHomeProfileRequest({ ...request, mode: 'other' }), null);
     assert.equal(validateHomeProfileRequest({ ...request, path: '/tmp' }), null);
     const response = { allowed: true, profile: { id: request.id, label: 'Robot',
-        home: { root: 'private', path: 'robots/robot/home' } } };
+        home: { root: 'robots', path: 'robot/home' } } };
     const bytes = (value) => Buffer.from(JSON.stringify(value));
     assert.deepEqual(validateHomeProfileResponse(200, bytes(response), request.id, request.mode), response.profile);
-    for (const home of [{ root: 'public', path: 'robots/robot/home' },
-        { root: 'private', path: '../other' }, { root: 'private', path: '/etc' }, 'robots/robot/home']) {
+    for (const home of [{ root: 'public', path: 'robot/home' },
+        { root: 'robots', path: '../other' }, { root: 'robots', path: '/etc' }, 'robot/home']) {
         assert.equal(validateHomeProfileResponse(200, bytes({ ...response, profile: { ...response.profile, home } }),
             request.id, request.mode), null);
     }
+});
+
+test('both modes accept only exact robots descriptors while nonlive retains legacy strings', () => {
+    const validate = (home, mode) => validateHomeProfileResponse(200,
+        Buffer.from(JSON.stringify({ allowed: true, profile: { id: 'r', label: 'Robot', home } })), 'r', mode);
+    for (const mode of [undefined, 'live-agent']) {
+        const home = { root: 'robots', path: 'r/terminal' };
+        assert.deepEqual(validate(home, mode).home, home);
+        for (const invalid of [{ root: 'private', path: 'r/home' }, { root: 'robots' },
+            { root: 'robots', path: 'r/home', extra: true }, { root: 'robots', path: '../r' },
+            { root: 'robots', path: '/r' }, { root: 'robots', path: '' }, null, []]) {
+            assert.equal(validate(invalid, mode), null);
+        }
+    }
+    assert.equal(validate('profiles/r/home').home, 'profiles/r/home');
+    assert.equal(validate('profiles/r/home', 'live-agent'), null);
 });
 
 test('live resolution sends the signed administrator request with the exact v2 body', async (t) => {
@@ -281,14 +297,14 @@ test('live resolution sends the signed administrator request with the exact v2 b
         assert.deepEqual(JSON.parse(body), { version: 2, action: 'resolve', id: 'robot.default', mode: 'live-agent' });
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ allowed: true, profile: { id: 'robot.default', label: 'Robot',
-            home: { root: 'private', path: 'robots/robot/home' } } }));
+            home: { root: 'robots', path: 'robot/home' } } }));
         return true;
     });
     const client = provider(fx, tcpRelayManager(server.port));
-    const nominated = { relativePath: '.data/.private/keeper/robots/robot/home', absolutePath: '/fixture/home',
+    const nominated = { relativePath: '.data/robots/robot/home', absolutePath: '/fixture/home',
         identity: { dev: '1', ino: '2' } };
-    client.confinePrivateHome = async (_provider, home) => {
-        assert.equal(home, 'robots/robot/home');
+    client.confineRobotsHome = async (_provider, home) => {
+        assert.equal(home, 'robot/home');
         return nominated;
     };
     const resolved = await client.resolve({ req: ADMIN_REQ, routePlan: fx.webttyPlan(),
@@ -299,35 +315,116 @@ test('live resolution sends the signed administrator request with the exact v2 b
     assert.equal(server.received.length, 1);
 });
 
-test('private nominations require the exact owned bind and refuse links or shadowed homes', async (t) => {
+function robotsFixture(t) {
     const fx = workspaceFixture(t);
-    const privateRoot = path.join(fs.realpathSync(fx.workspace), '.data', '.private', 'keeper');
-    fs.mkdirSync(path.join(privateRoot, 'robots', 'r', 'home'), { recursive: true });
+    const robotsRoot = path.join(fs.realpathSync(fx.workspace), '.data', 'robots');
+    fs.mkdirSync(path.join(robotsRoot, 'r', 'home'), { recursive: true });
+    fs.mkdirSync(path.join(robotsRoot, 'r', 'terminal'));
     const record = { type: 'agent', runtime: 'podman', containerId: 'a'.repeat(64),
         instanceId: 'instance', enableGeneration: 'generation', repoName: 'fixtures', agentName: 'keeper' };
-    const provider = { containerName: 'keeper-container', agentName: 'keeper' };
+    const provider = { containerName: 'keeper-container', agentName: 'keeper', routeKey: 'keeper' };
     const hash = 'c1d2e3f40506';
-    let mounts = [{ Type: 'bind', Source: privateRoot, Destination: '/data', RW: true }];
-    const profileProvider = new WebttyHomeProfileProvider({ workspaceRoot: fx.workspace,
-        workspaceIdentity: () => ({ hash }), inspectContainer: async () => ({
-            Id: record.containerId, Name: '/keeper-container', State: { Running: true, Status: 'running' },
-            HostConfig: { Init: true }, Config: { Labels: {
-                [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'agent',
-                [NETWORK_LABELS.schema]: NETWORK_SCHEMA_VERSION, [NETWORK_LABELS.workspace]: hash,
-                [NETWORK_LABELS.contract]: 'b'.repeat(64), [NETWORK_LABELS.instanceId]: record.instanceId,
-                [NETWORK_LABELS.enableGeneration]: record.enableGeneration,
-            } }, Mounts: mounts,
-        }) });
-    const snapshot = { agents: { 'keeper-container': record } };
-    const result = await profileProvider.confinePrivateHome(provider, 'robots/r/home', snapshot);
-    assert.equal(result.absolutePath, path.join(privateRoot, 'robots', 'r', 'home'));
-    mounts = [];
-    await assert.rejects(profileProvider.confinePrivateHome(provider, 'robots/r/home', snapshot), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
-    mounts = [{ Type: 'bind', Source: privateRoot, Destination: '/data', RW: true },
-        { Type: 'bind', Source: fx.data, Destination: '/data/robots/r/home', RW: true }];
-    await assert.rejects(profileProvider.confinePrivateHome(provider, 'robots/r/home', snapshot), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
-    fs.symlinkSync(path.join(privateRoot, 'robots', 'r'), path.join(privateRoot, 'robots', 'link'));
-    await assert.rejects(profileProvider.confinePrivateHome(provider, 'robots/link/home', snapshot), { code: 'WEBTTY_PROFILE_UNAVAILABLE' });
+    const inspection = {
+        Id: record.containerId, Name: '/keeper-container', State: { Running: true, Status: 'running' },
+        HostConfig: { Init: true }, Config: { Labels: {
+            [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'agent',
+            [NETWORK_LABELS.schema]: NETWORK_SCHEMA_VERSION, [NETWORK_LABELS.workspace]: hash,
+            [NETWORK_LABELS.contract]: 'b'.repeat(64), [NETWORK_LABELS.instanceId]: record.instanceId,
+            [NETWORK_LABELS.enableGeneration]: record.enableGeneration,
+        } }, Mounts: [{ Type: 'bind', Source: robotsRoot, Destination: '/robots', RW: true }],
+    };
+    const client = new WebttyHomeProfileProvider({ workspaceRoot: fx.workspace,
+        workspaceIdentity: () => ({ hash }), inspectContainer: async (runtime, id) => {
+            assert.equal(runtime, 'podman');
+            assert.equal(id, record.containerId);
+            return inspection;
+        } });
+    const snapshot = { agents: { 'keeper-container': record },
+        manifests: { keeper: { volumes: { '.data/robots': '/robots' } } } };
+    return { ...fx, robotsRoot, provider, inspection, client, snapshot };
+}
+
+test('robots nominations require a declared volume and the exact owned writable bind', async (t) => {
+    const fx = robotsFixture(t);
+    const resolve = () => fx.client.confineRobotsHome(fx.provider, 'r/home', fx.snapshot);
+    const result = await resolve();
+    assert.equal(result.absolutePath, path.join(fx.robotsRoot, 'r', 'home'));
+    assert.equal(result.relativePath, '.data/robots/r/home');
+    const mount = fx.inspection.Mounts[0];
+    for (const mounts of [[], [{ ...mount, RW: false }], [{ ...mount, Type: 'volume' }],
+        [{ ...mount, Source: fx.data }], [{ ...mount, Destination: '/other' }], [mount, mount],
+        [mount, { Type: 'bind', Source: fx.data, Destination: '/robots/r/home', RW: true }]]) {
+        fx.inspection.Mounts = mounts;
+        await refused(resolve(), 'home');
+    }
+    fx.inspection.Mounts = [mount];
+    for (const volumes of [undefined, {}, { '.data': '/robots' }, { '.data/robots/r': '/robots' },
+        { '.data/.private/keeper': '/robots' }, { '.data/robots': '/other' },
+        { '.data/robots': '/robots:ro' }, { '.data/robots': null }]) {
+        fx.snapshot.manifests.keeper.volumes = volumes;
+        await refused(resolve(), 'home');
+    }
+    fx.snapshot.manifests.keeper.volumes = { '.data/robots': '/robots' };
+    for (const key of [NETWORK_LABELS.enableGeneration, NETWORK_LABELS.instanceId, NETWORK_LABELS.workspace]) {
+        const previous = fx.inspection.Config.Labels[key];
+        fx.inspection.Config.Labels[key] = 'stale';
+        await refused(resolve(), 'home');
+        fx.inspection.Config.Labels[key] = previous;
+    }
+    fx.inspection.Id = 'b'.repeat(64);
+    await refused(resolve(), 'home');
+});
+
+test('robots nominations reject traversal, files, and symlinks at every path component', async (t) => {
+    const fx = robotsFixture(t);
+    fs.writeFileSync(path.join(fx.robotsRoot, 'file'), 'file');
+    fs.symlinkSync(path.join(fx.robotsRoot, 'r'), path.join(fx.robotsRoot, 'link'));
+    for (const home of ['../keeper', '/etc', 'r//home', 'r/./home', 'r/%2e/home', 'missing', 'file', 'link/home']) {
+        await refused(fx.client.confineRobotsHome(fx.provider, home, fx.snapshot), 'home');
+    }
+    for (const directory of [path.join(fx.robotsRoot, 'r', 'home'), path.join(fx.robotsRoot, 'r'),
+        fx.robotsRoot, path.dirname(fx.robotsRoot)]) {
+        const moved = `${directory}-real`;
+        fs.renameSync(directory, moved);
+        fs.symlinkSync(moved, directory);
+        await refused(fx.client.confineRobotsHome(fx.provider, 'r/home', fx.snapshot), 'home');
+        fs.unlinkSync(directory);
+        fs.renameSync(moved, directory);
+    }
+});
+
+test('nonlive robots descriptors resolve outside the provider home with the same bind checks', async (t) => {
+    const fx = robotsFixture(t);
+    const manifest = keeperManifest();
+    manifest.volumes = { '.data/robots': '/robots' };
+    fx.writeManifest(manifest);
+    fx.activate();
+    fx.inspection.Config.Labels[NETWORK_LABELS.instanceId] = 'keeper-instance';
+    fx.inspection.Config.Labels[NETWORK_LABELS.enableGeneration] = 'keeper-enable';
+    const server = await providerServer(t, ({ res, body }) => {
+        assert.deepEqual(JSON.parse(body), { version: 1, id: 'r' });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ allowed: true, profile: { id: 'r', label: 'Robot',
+            home: { root: 'robots', path: 'r/terminal' } } }));
+        return true;
+    });
+    fx.client.relayManager = tcpRelayManager(server.port);
+    fx.client.providerDataDirectory = () => assert.fail('robots must not resolve against the agent home');
+    const resolve = () => fx.client.resolve({ req: ADMIN_REQ, routePlan: fx.webttyPlan(),
+        profile: { provider: 'keeper', id: 'r' } });
+    const result = await resolve();
+    assert.equal(result.home.relativePath, '.data/robots/r/terminal');
+    assert.equal(result.home.providerBinding, undefined);
+    fx.inspection.Mounts[0].RW = false;
+    await refused(resolve(), 'home');
+    fx.inspection.Mounts[0].RW = true;
+    const inspect = fx.client.inspectContainer;
+    fx.client.inspectContainer = async (...args) => {
+        const result = await inspect(...args);
+        fx.activate();
+        return result;
+    };
+    await refused(resolve(), 'generation');
 });
 
 test('a provider name must select exactly one enabled agent with a valid declaration', () => {

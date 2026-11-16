@@ -26,7 +26,7 @@ import {
 
 function fixture({ privateData = true } = {}) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agent-data-policy-')));
-    if (privateData) fs.mkdirSync(path.join(root, '.data', '.private'), { recursive: true, mode: 0o700 });
+    if (privateData) fs.mkdirSync(path.join(root, '.data'), { recursive: true, mode: 0o700 });
     return { root, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -97,7 +97,7 @@ test('missing descendants are created only after repeated canonical validation',
         assert.equal(fs.existsSync(target), false);
         ensureAgentDataDirectory(target, { workspaceRoot: root });
         assert.equal(fs.statSync(target).isDirectory(), true);
-        assert.equal(target, path.join(root, '.data', 'agent'));
+        assert.equal(target, path.join(root, '.data', 'agents', 'agent'));
     } finally {
         cleanup();
     }
@@ -139,7 +139,6 @@ test('manifest policy rejects every lexical, absolute, normalized, and symlinked
             '.ploinky/deps/store/objects',
             '.ploinky/.secrets',
             '.ploinky/data/.secrets',
-            '.ploinky/data/master-key',
             '.ploinky/agents',
             '.ploinky/repos',
             '.ploinky/running',
@@ -150,9 +149,27 @@ test('manifest policy rejects every lexical, absolute, normalized, and symlinked
         }
         fs.symlinkSync(path.join(root, '.ploinky', 'data', 'missing-state'), path.join(root, 'dangling-link'));
         policyFailure(() => assertManifestVolumeStoragePolicy('dangling-link', { workspaceRoot: root }));
+        // Explicit data volumes can grant the master key; broad workspace mounts cannot.
+        assert.equal(
+            assertManifestVolumeStoragePolicy('.data/dpu-data/master-key', { workspaceRoot: root }),
+            path.join(root, '.data', 'dpu-data', 'master-key'),
+        );
+        // Flat-layout sources resolve into `.data/agents`; reserved stores do not move.
         assert.equal(
             assertManifestVolumeStoragePolicy('.data/demo/state', { workspaceRoot: root }),
-            path.join(root, '.data', 'demo', 'state'),
+            path.join(root, '.data', 'agents', 'demo', 'state'),
+        );
+        assert.equal(
+            assertManifestVolumeStoragePolicy(path.join(root, '.data', 'demo'), { workspaceRoot: root }),
+            path.join(root, '.data', 'agents', 'demo'),
+        );
+        assert.equal(
+            assertManifestVolumeStoragePolicy('.data/agents/demo', { workspaceRoot: root }),
+            path.join(root, '.data', 'agents', 'demo'),
+        );
+        assert.equal(
+            assertManifestVolumeStoragePolicy('.data/dpu-data', { workspaceRoot: root }),
+            path.join(root, '.data', 'dpu-data'),
         );
         assert.equal(assertManifestVolumeStoragePolicy('.', { workspaceRoot: root }), root,
             'a broad workspace volume reaches the controller root only through the read-only guards');
@@ -169,7 +186,10 @@ test('controller guard targets are derived from broad mounts without creating th
             { hostPath: root, runtimePath: '/workspace' },
         ], { workspaceRoot: root });
         const byKey = Object.fromEntries(targets.map(entry => [entry.key, entry]));
-        assert.deepEqual(Object.keys(byKey).sort(), ['data', 'host', 'private']);
+        // Workspace data has one broad mask.
+        assert.deepEqual(Object.keys(byKey).sort(), ['data', 'host', 'workspace-data']);
+        assert.equal(byKey['workspace-data'].target, '/workspace/.data');
+        assert.equal(byKey['workspace-data'].parentTarget, '/workspace');
         assert.equal(byKey.data.target, '/workspace/.ploinky/data');
         assert.equal(byKey.data.parentTarget, '/workspace/.ploinky');
         assert.equal(byKey.data.protectedParentHostPath, path.join(root, '.ploinky'));
@@ -177,7 +197,7 @@ test('controller guard targets are derived from broad mounts without creating th
         assert.equal(byKey.host.parentTarget, '/workspace');
         assert.equal(byKey.host.protectedParentHostPath, root);
         const sources = ensureControllerGuardSources({ workspaceRoot: root });
-        assert.deepEqual(Array.from(sources.keys()), ['data', 'host', 'private']);
+        assert.deepEqual(Array.from(sources.keys()), ['data', 'host', 'workspace-data']);
         assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data')), false);
         for (const source of sources.values()) {
             assert.equal(fs.readdirSync(source).length, 0);
@@ -228,10 +248,11 @@ test('controller guard planning neither creates a missing controller parent nor 
         const mounts = controllerGuardMounts(targets, { workspaceRoot: root });
         // The host state directory always exists and is always masked.
         assert.deepEqual(mounts.map(mount => mount.target), [
-            '/workspace/.data', '/workspace/.ploinky', '/workspace/.data/.private', '/workspace/.ploinky-box',
+            '/workspace/.ploinky', '/workspace/.data', '/workspace/.ploinky-box',
         ]);
         for (const mount of mounts) {
-            assert.deepEqual(fs.readdirSync(mount.source), mount.target === '/workspace/.data' ? ['.private'] : [], mount.target);
+            assert.deepEqual(fs.readdirSync(mount.source), [], mount.target);
+            assert.equal(mount.readOnly, true, mount.target);
         }
         assert.equal(fs.existsSync(path.join(root, '.ploinky')), false);
     } finally {
@@ -299,9 +320,9 @@ test('controller guard ancestors remain pinned without making the project read-o
         assert.deepEqual(mounts.filter(mount => mount.parent).map(mount => [mount.target, mount.readOnly]), [
             ['/home/projects', false],
             ['/home/projects/current', false],
-            ['/home/projects/current/.data', false],
             ['/home/projects/current/.ploinky', true],
         ]);
+        assert.ok(mounts.some(mount => mount.target === '/home/projects/current/.data' && mount.readOnly && !mount.parent));
     } finally { cleanup(); }
 });
 
@@ -346,11 +367,13 @@ for (const workspaceAlias of [false, true]) {
                 ]);
                 const mounts = controllerGuardMounts(targets, { workspaceRoot, bindings });
                 assert.deepEqual(mounts.filter(mount => mount.parent).map(mount => [mount.target, mount.readOnly]), [
-                    ['/home/project', false], ['/workspace/.data', false], ['/workspace/.state', true],
-                    ['/home/project/.data', false], ['/home/project/.state', true],
+                    ['/home/project', false], ['/workspace/.state', true], ['/home/project/.state', true],
                 ]);
+                assert.deepEqual(mounts.filter(mount => mount.target.endsWith('/.data'))
+                    .map(mount => [mount.target, mount.readOnly]).sort(),
+                [['/home/project/.data', true], ['/workspace/.data', true]]);
                 assert.deepEqual(mounts.filter(mount => !mount.parent && !mount.target.endsWith('/.ploinky-box')
-                    && !mount.target.endsWith('/.data/.private'))
+                    && !mount.target.endsWith('/.data'))
                     .map(mount => [mount.target, mount.readOnly]),
                 existingChildren ? dataTargets.map(guard => [guard.target, true]) : []);
                 assert.deepEqual(mounts.filter(mount => mount.target.endsWith('/.ploinky-box'))

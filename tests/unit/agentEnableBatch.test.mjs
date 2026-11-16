@@ -38,6 +38,8 @@ writeManifest('media', 'livekit', {
 const edge = await import(new URL('../../cli/sandbox/edgeGeneration.js', import.meta.url).href);
 const routing = await import(new URL('../../cli/server/routingFile.js', import.meta.url).href);
 const agents = await import(new URL('../../cli/utils/agents.js', import.meta.url).href);
+const workspaceStructure = await import(new URL('../../cli/utils/workspaceStructure.js', import.meta.url).href);
+const dataPolicy = await import(new URL('../../cli/utils/runtime/agentDataPathPolicy.js', import.meta.url).href);
 const manager = await import(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url).href);
 const coordinated = await import(new URL('../../cli/sandbox/coordinatedEdgeApply.js', import.meta.url).href);
 const predecessors = await import(new URL('../../cli/sandbox/runtimePredecessorStore.js', import.meta.url).href);
@@ -54,6 +56,35 @@ test.after(() => {
     if (originalRouterHostPort === undefined) delete process.env.PLOINKY_ROUTER_HOST_PORT;
     else process.env.PLOINKY_ROUTER_HOST_PORT = originalRouterHostPort;
     fs.rmSync(workspace, { recursive: true, force: true });
+});
+
+test('shared is reserved for common storage, including aliases and direct home resolution', () => {
+    const initialized = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    routing.writeRoutingConfig({ port: 8080, routes: {} }, { coordinate: false });
+    const readState = file => fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+    const selectorBefore = readState(initialized.paths.activeSelectorFile);
+    const registryBefore = readState(initialized.paths.agentsFile);
+    workspaceStructure.initWorkspaceStructure(workspace);
+    const shared = path.join(workspace, '.data', 'agents', 'shared');
+    const marker = path.join(shared, 'keep.txt');
+    fs.writeFileSync(marker, 'shared contents');
+    for (const name of ['shared', 'Shared', 'SHARED']) {
+        writeManifest('demo', name, { container: 'node:20-alpine', network: { mode: 'default' } });
+        for (const mode of ['isolated', 'global']) {
+            for (const request of [
+                { agentName: `demo/${name}`, mode },
+                { agentName: 'demo/nonHostDependency', aliasParam: name, mode },
+            ]) {
+                assert.throws(() => agents.prepareAgentEnableBatch([request]), /reserved for shared storage/);
+            }
+        }
+        assert.throws(() => workspaceStructure.getAgentWorkDir(name), /reserved for shared storage/);
+        assert.throws(() => workspaceStructure.getAgentDataDir(name), /reserved for shared storage/);
+    }
+    assert.equal(dataPolicy.resolveAgentDataPath('shared', { workspaceRoot: workspace }), shared);
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'shared contents');
+    assert.equal(readState(initialized.paths.activeSelectorFile), selectorBefore);
+    assert.equal(readState(initialized.paths.agentsFile), registryBefore);
 });
 
 test('explicit auth options cannot disable a manifest-required identity provider', () => {

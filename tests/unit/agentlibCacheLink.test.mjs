@@ -287,8 +287,8 @@ test('the interactive container carries the same grant as the detached service',
     );
     const workspaceRoot = tempDir('interactive-agentlib-grant-');
     const sourceDir = path.join(workspaceRoot, 'achillesAgentLib');
-    const homeDir = path.join(workspaceRoot, '.data', 'demo');
-    const sharedDir = path.join(workspaceRoot, '.data', 'shared');
+    const homeDir = path.join(workspaceRoot, '.data', 'agents', 'demo');
+    const sharedDir = path.join(workspaceRoot, '.data', 'agents', 'shared');
     const agentLibPath = path.join(workspaceRoot, 'Agent');
     const absAgentPath = path.join(workspaceRoot, '.ploinky', 'repos', 'demo');
     for (const dir of [sourceDir, homeDir, sharedDir, agentLibPath, absAgentPath]) {

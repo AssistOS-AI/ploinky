@@ -29,7 +29,7 @@ function link(relativePath, target) {
 
 write('.ploinky/routing.json', JSON.stringify({ routes: {}, marker: SENTINEL }));
 write('.ploinky/agents.json');
-write('.ploinky/data/master-key');
+write('.data/dpu-data/master-key');
 write('.ploinky/data/.secrets');
 write('.ploinky/data/router-key');
 write('.ploinky/repos/repo/agent/manifest.json', '{}');
@@ -39,7 +39,7 @@ write('.ploinky/repos/repo/agent/master-key');
 write('.ploinky/repos/repo/agent/.data/state.json');
 write('.ploinky/repos/repo/README.md', '# Repository\n');
 write('.data/userPersistoAgent/users.json');
-write('.data/shared/blob.bin');
+write('.data/agents/shared/blob.bin');
 write('.data/site/index.html');
 write('docs/readme.md', '# Ordinary\n');
 write('docs/app.secrets');
@@ -108,7 +108,7 @@ async function assertPositiveControls() {
 test('controller state under .ploinky is refused, including the master key and the secret store', async (t) => {
     await assertPositiveControls();
     for (const target of [
-        '.ploinky/data/master-key',
+        '.data/dpu-data/master-key',
         '.ploinky/data/.secrets',
         '.ploinky/data/router-key',
         '.ploinky/agents.json',
@@ -119,14 +119,14 @@ test('controller state under .ploinky is refused, including the master key and t
     ]) {
         await t.test(target, () => assertDenied(`/workspace-files/${target}`));
     }
-    await t.test('HEAD .ploinky/data/master-key', () => assertDenied('/workspace-files/.ploinky/data/master-key', 'HEAD'));
+    await t.test('HEAD .data/dpu-data/master-key', () => assertDenied('/workspace-files/.data/dpu-data/master-key', 'HEAD'));
 });
 
 test('agent private data under .data is refused, including blobs and directory indexes', async (t) => {
     await assertPositiveControls();
     for (const target of [
         '.data/userPersistoAgent/users.json',
-        '.data/shared/blob.bin',
+        '.data/agents/shared/blob.bin',
         '.data/site/',
         '.data/site/index.html',
         '.data/userPersistoAgent/missing.json',
@@ -192,10 +192,10 @@ test('encoded, doubled, dotted and trailing spellings of a protected path are re
         '/workspace-files/.ploinky%5Cdata%5Crouter-key',
         '/workspace-files//.ploinky//data//master-key',
         '/workspace-files/./.ploinky/./data/./master-key',
-        '/workspace-files/docs/%2e%2e/.ploinky/data/master-key',
+        '/workspace-files/docs/%2e%2e/.data/dpu-data/master-key',
         '/workspace-files/docs/%2e/../.data/userPersistoAgent/users.json',
-        '/workspace-files/.ploinky/data/master-key/',
-        '/workspace-files/.ploinky/data/master-key.',
+        '/workspace-files/.data/dpu-data/master-key/',
+        '/workspace-files/.data/dpu-data/master-key.',
         '/workspace-files/.ploinky/data/.',
         '/workspace-files/.data./userPersistoAgent/users.json',
         '/workspace-files/%2Edata/userPersistoAgent/users.json',

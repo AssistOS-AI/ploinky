@@ -292,7 +292,7 @@ function restore(ctx, masked) {
     keepOnly(host, ['empty', 'hardware-limits']);
     if (ctx.options.steps.includes('HS')) fs.mkdirSync(ctx.paths.store, { recursive: true });
     fs.mkdirSync(data, { recursive: true });
-    // The Box entrypoint itself writes `.ploinky/data/master-key`; keep what the baseline had.
+    // The Box entrypoint itself writes `.data/dpu-data/master-key`; keep what the baseline had.
     keepOnly(data, [...ctx.baseline.data.keys()].filter((key) => key !== '.' && !key.includes('/')));
     fs.mkdirSync(path.join(checkout, '.git'), { recursive: true });
     keepOnly(checkout, ['README', '.git']);

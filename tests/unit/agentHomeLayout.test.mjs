@@ -12,7 +12,7 @@ test('HOME survives isolated, static, and project mode changes with one exact pr
     const agentHomeDir = '/workspace/.data/namedAlias';
     for (const [cwd, cwdMountTarget, expectedHome] of [
         [agentHomeDir, '/root', '/root'],
-        ['/workspace', '/root', '/home/agent'],
+        ['/workspace', '/root', '/root'],
         ['/workspace/project', '/workspace/project', '/root'],
         [agentHomeDir, '/root', '/root'],
         [agentHomeDir, agentHomeDir, '/root'],
@@ -23,8 +23,8 @@ test('HOME survives isolated, static, and project mode changes with one exact pr
         assert.deepEqual(layout.binds.filter(bind => bind.target === expectedHome), [{
             source: agentHomeDir, target: expectedHome,
         }]);
-        assert.deepEqual(layout.binds.find(bind => bind.target === cwdMountTarget), {
-            source: cwd, target: cwdMountTarget,
+        assert.deepEqual(layout.binds.find(bind => bind.target === (cwdMountTarget === '/root' && cwd !== agentHomeDir ? cwd : cwdMountTarget)), {
+            source: cwd, target: cwdMountTarget === '/root' && cwd !== agentHomeDir ? cwd : cwdMountTarget,
         });
         assert.equal(new Set(layout.binds.map(bind => bind.target)).size, layout.binds.length);
         assert.deepEqual(resolveAgentHomeLayout(input), layout, 'restart must select the same layout');
@@ -44,7 +44,7 @@ test('HOME layout normalizes equivalent paths before deduplicating /root mounts'
         cwd: '/workspace/',
         cwdMountTarget: '/root/./',
         agentHomeDir: '/workspace/.data/demo',
-    }).containerHome, '/home/agent');
+    }).containerHome, '/root');
 });
 
 test('host/none reuse rejects legacy static HOME and requires the actual private writable bind', () => {
@@ -57,10 +57,10 @@ test('host/none reuse rejects legacy static HOME and requires the actual private
     };
     assert.equal(hasExactAgentHomeLayout(legacy, layout), false);
     const correctedEnvOnly = structuredClone(legacy);
-    correctedEnvOnly.Config.Env = ['HOME=/home/agent'];
+    correctedEnvOnly.Config.Env = ['HOME=/root'];
     assert.equal(hasExactAgentHomeLayout(correctedEnvOnly, layout), false);
     const current = {
-        Config: { Env: ['HOME=/home/agent'] },
+        Config: { Env: ['HOME=/root'] },
         Mounts: layout.binds.map(bind => ({ Type: 'bind', Source: bind.source, Destination: bind.target, RW: true })),
     };
     assert.equal(hasExactAgentHomeLayout(current, layout), true);
@@ -109,4 +109,15 @@ exec /bin/sh "$@"
     } finally {
         fs.rmSync(fixture, { recursive: true, force: true });
     }
+});
+
+test('a manifest home replaces the isolated home without duplicate /root targets', t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'manifest-home-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const home = path.join(root, '.data/agents/demo');
+    const layout = resolveAgentHomeLayout({ cwd: home, cwdMountTarget: '/root', agentHomeDir: home, workspaceRoot: root,
+        volumes: { '.data/dpu-data': '/root' } });
+    assert.deepEqual(layout.binds, [{ source: path.join(root, '.data/dpu-data'), target: '/root' }]);
+    assert.throws(() => resolveAgentHomeLayout({ cwd: home, cwdMountTarget: '/root', agentHomeDir: home, workspaceRoot: root,
+        volumes: { '.data/dpu-data': '/root', '.data/agents/other': '/root/' } }), /Multiple manifest volumes/);
 });

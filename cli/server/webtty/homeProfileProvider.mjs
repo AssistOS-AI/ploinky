@@ -20,7 +20,7 @@ import { assertOwnedInspection, exactCandidate, inspectExactTerminalContainer, t
 // A home profile is an optional, agent-nominated directory that becomes a
 // terminal's HOME. The owning agent declares one resolve endpoint on its own
 // routed agent-port surface; the Router alone calls it, signed for the admitted
-// administrator, and confines the answer to that agent's data directory.
+// administrator, and confines the answer to the agent's data or declared robots root.
 export const WEBTTY_HOME_PROFILE_LIMITS = Object.freeze({
     deadlineMs: 2_000,
     responseBytes: 16 * 1024,
@@ -209,10 +209,9 @@ export function validateHomeProfileResponse(statusCode, bodyBytes, requestedId, 
         || !exactKeys(value.profile, ['id', 'label', 'home'])
         || value.profile.id !== requestedId
         || !validateHomeProfileLabel(value.profile.label)
-        || (mode === 'live-agent'
-            ? (!exactKeys(value.profile.home, ['root', 'path']) || value.profile.home.root !== 'private'
-                || !validateHomeProfileHome(value.profile.home.path))
-            : typeof value.profile.home !== 'string')) {
+        || !((mode !== 'live-agent' && typeof value.profile.home === 'string')
+            || (exactKeys(value.profile.home, ['root', 'path']) && value.profile.home.root === 'robots'
+                && validateHomeProfileHome(value.profile.home.path)))) {
         return null;
     }
     return Object.freeze({ id: value.profile.id, label: value.profile.label, home: value.profile.home });
@@ -265,8 +264,8 @@ export class WebttyHomeProfileProvider {
         if (after !== snapshot || !sameProvider(findHomeProfileProvider(after, requested.provider), provider)) {
             throw profileError('generation');
         }
-        let home = requested.mode === 'live-agent'
-            ? await this.confinePrivateHome(provider, answer.home.path, snapshot)
+        let home = typeof answer.home !== 'string'
+            ? await this.confineRobotsHome(provider, answer.home.path, snapshot)
             : this.confineHome(provider, answer.home);
         if (currentSnapshot(routePlan) !== snapshot) throw profileError('generation');
         if (requested.mode === 'live-agent') home = Object.freeze({ ...home, providerBinding: provider });
@@ -277,32 +276,40 @@ export class WebttyHomeProfileProvider {
         });
     }
 
-    async confinePrivateHome(provider, homeValue, snapshot) {
+    async confineRobotsHome(provider, homeValue, snapshot) {
         const home = validateHomeProfileHome(homeValue);
         if (!home) throw profileError('home');
         try {
+            const volumes = snapshot.manifests?.[provider.routeKey]?.volumes;
+            const destination = plainObject(volumes) && Object.hasOwn(volumes, '.data/robots')
+                ? volumes['.data/robots'] : null;
+            if (typeof destination !== 'string' || !destination.startsWith('/')
+                || path.posix.normalize(destination) !== destination || /[\u0000-\u0020\u007f\\:]/.test(destination)) {
+                throw new Error('robots volume declaration');
+            }
             const root = this.fsApi.realpathSync(this.workspaceRoot);
-            const privateRoot = path.join(root, '.data', '.private', provider.agentName);
-            const relativePath = `.data/.private/${provider.agentName}/${home}`;
+            const robotsRoot = path.join(root, '.data', 'robots');
+            const relativePath = `.data/robots/${home}`;
             let current = root;
             for (const segment of relativePath.split('/')) {
                 current = path.join(current, segment);
                 const stat = this.fsApi.lstatSync(current);
                 if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('not a directory');
             }
-            if (this.fsApi.realpathSync(current) !== current || this.fsApi.realpathSync(privateRoot) !== privateRoot) {
-                throw new Error('noncanonical private path');
+            if (this.fsApi.realpathSync(current) !== current || this.fsApi.realpathSync(robotsRoot) !== robotsRoot) {
+                throw new Error('noncanonical robots path');
             }
             const candidate = exactCandidate(provider.containerName, snapshot.agents?.[provider.containerName], new Set(['podman']));
             const hash = this.workspaceIdentity()?.hash;
             if (!candidate || !hash) throw new Error('provider identity');
             const inspected = assertOwnedInspection(candidate,
                 await this.inspectContainer(candidate.runtime, candidate.containerId), hash);
-            const mounts = inspected.mounts.filter((mount) => mount.type === 'bind' && mount.source === privateRoot && mount.rw === true);
-            if (mounts.length !== 1) throw new Error('private bind');
+            const mounts = inspected.mounts.filter((mount) => mount.type === 'bind' && mount.source === robotsRoot
+                && mount.destination === destination && mount.rw === true);
+            if (mounts.length !== 1) throw new Error('robots bind');
             const mapping = await translateWorkspaceDirectoryToMount(current, inspected.mounts, { fsApi: this.fsApi });
             if (!mapping || mapping.access !== 'rw'
-                || mapping.translatedCwd !== path.posix.join(mounts[0].destination, home)) throw new Error('private bind shadowed');
+                || mapping.translatedCwd !== path.posix.join(destination, home)) throw new Error('robots bind shadowed');
             return Object.freeze({ relativePath, absolutePath: current, workspaceRealPath: root,
                 identity: directoryIdentity(current, this.fsApi) });
         } catch (_) { throw profileError('home'); }

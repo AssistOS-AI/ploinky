@@ -31,7 +31,7 @@ function readyHostRuntime(t) {
     const first = stepValue(driveWiring(w, [
         { action: 'init-edge' },
         { action: 'set-router-port', port: 8080 },
-        { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'agents', 'demo') } },
         { action: 'prepare-lease' },
         { label: 'first', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true, hostRouter: true },
     ]), 'first');

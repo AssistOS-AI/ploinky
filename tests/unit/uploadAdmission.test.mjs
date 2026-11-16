@@ -135,8 +135,8 @@ test('agent blob storage is rooted in canonical .data and ignores projectPath', 
     const first = resolveAgentBlobStorage({ agentName: 'webassist', projectPath: '/first/project' }, { workspaceRoot });
     const second = resolveAgentBlobStorage({ agentName: 'webassist', projectPath: '/different/project' }, { workspaceRoot });
     assert.deepEqual(first, second);
-    assert.equal(first.agentDataDir, path.join(workspaceRoot, '.data', 'webassist'));
-    assert.equal(first.blobsDir, path.join(workspaceRoot, '.data', 'webassist', 'blobs'));
+    assert.equal(first.agentDataDir, path.join(workspaceRoot, '.data', 'agents', 'webassist'));
+    assert.equal(first.blobsDir, path.join(workspaceRoot, '.data', 'agents', 'webassist', 'blobs'));
     assert.equal(fs.existsSync(path.join(workspaceRoot, '.ploinky', 'data')), false);
     assert.throws(
         () => resolveAgentBlobStorage({ agentName: '../escape', projectPath: workspaceRoot }, { workspaceRoot }),
@@ -161,7 +161,7 @@ test('agent blob endpoint keeps selectors and run modes on one short-name storag
                 projectPath: path.join(workspaceRoot, '.ploinky', 'repos', runMode, 'webassist'),
                 runMode,
             };
-            const blobsDir = path.join(workspaceRoot, '.data', 'webassist', 'blobs');
+            const blobsDir = path.join(workspaceRoot, '.data', 'agents', 'webassist', 'blobs');
             const agentMap = { [`${runMode}-webassist`]: record };
             const agentRecordResolver = requestSegment => resolveAgentRecord(requestSegment, {
                 agentMap,
@@ -186,7 +186,7 @@ test('agent blob endpoint keeps selectors and run modes on one short-name storag
 
             assert.equal(response.statusCode, 201, `${runMode} ${selector}`);
             const payload = JSON.parse(response.bodyText());
-            assert.equal(payload.localPath, `.data/webassist/blobs/${payload.id}`);
+            assert.equal(payload.localPath, `.data/agents/webassist/blobs/${payload.id}`);
             assert.equal(payload.agent, 'webassist');
             assert.equal(fs.readFileSync(path.join(blobsDir, payload.id), 'utf8'), 'abc');
             const metadata = JSON.parse(fs.readFileSync(path.join(blobsDir, `${payload.id}.json`), 'utf8'));

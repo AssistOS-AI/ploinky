@@ -16,8 +16,8 @@ fs.writeFileSync(path.join(workspace, '.ploinky', 'agents.json'), JSON.stringify
 }));
 const { handleBlobs } = await import('../../cli/server/handlers/blobs.js');
 const { readAgentsSnapshot } = await import('../../cli/utils/workspace.js');
-const agentDir = path.join(workspace, '.data', 'fixture', 'blobs');
-const sharedDir = path.join(workspace, '.data', 'shared');
+const agentDir = path.join(workspace, '.data', 'agents', 'fixture', 'blobs');
+const sharedDir = path.join(workspace, '.data', 'agents', 'shared');
 fs.mkdirSync(agentDir, { recursive: true });
 fs.mkdirSync(sharedDir, { recursive: true });
 for (const directory of [agentDir, sharedDir]) {
@@ -142,7 +142,7 @@ test('missing agent/id, rejected id and directory reads have no mkdir side effec
     }
     assert.equal((await get('/blobs/fixture/%2e%2e%2ffile')).statusCode, 400);
     assert.equal(mkdirs, 0);
-    assert.equal(fs.existsSync(path.join(workspace, '.data', 'empty')), false);
+    assert.equal(fs.existsSync(path.join(workspace, '.data', 'agents', 'empty')), false);
 });
 
 test('200 early-disconnected and 200 midstream downloads close all owned handles and streams', async t => {
@@ -210,12 +210,12 @@ test('50 parallel blob reads and ten uploads preserve complete bytes and metadat
 });
 
 test('first POST creates missing shared and agent blob roots inside admission and persists data plus metadata', async () => {
-    const missingShared = path.join(workspace, '.data', 'missingShared');
+    const missingShared = path.join(workspace, '.data', 'agents', 'missingShared');
     for (const [url, directory, options] of [
         ['/blobs', missingShared, { sharedRecordResolver: () => ({ ok: true, agent: {
             blobsDir: missingShared, workspaceRoot: workspace, canonicalName: 'shared', isShared: true,
         } }) }],
-        ['/blobs/empty', path.join(workspace, '.data', 'empty', 'blobs'), {}],
+        ['/blobs/empty', path.join(workspace, '.data', 'agents', 'empty', 'blobs'), {}],
     ]) {
         assert.equal(fs.existsSync(directory), false);
         const req = request(url, { 'content-length': '1' }, 'POST');

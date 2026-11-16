@@ -1,20 +1,28 @@
 import path from 'node:path';
+import { resolveManifestVolumeHostPath } from '../../utils/runtime/manifestVolumePolicy.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
+
+export function manifestHomeDirectory(volumes = {}, fallback, workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
+    const entries = Object.entries(volumes).filter(([, target]) => path.posix.resolve('/', target) === '/root');
+    if (entries.length > 1) throw new Error('Multiple manifest volumes target /root');
+    return entries.length ? resolveManifestVolumeHostPath(entries[0][0], workspaceRoot) : fallback;
+}
+
 import { normalizeRuntimeMountTarget } from '../../utils/runtime/controllerStateGuards.js';
 
-export function resolveAgentHomeLayout({ cwd, cwdMountTarget, agentHomeDir }) {
+export function resolveAgentHomeLayout({ cwd, cwdMountTarget, agentHomeDir, volumes = {}, workspaceRoot }) {
     const projectSource = path.resolve(cwd);
-    const homeSource = path.resolve(agentHomeDir);
-    const projectTarget = normalizeRuntimeMountTarget(cwdMountTarget);
-    // Static agents project the workspace at /root. Keep their project CWD and
-    // output paths while giving HOME its own persistent per-instance directory.
-    const containerHome = projectTarget === '/root' && projectSource !== homeSource
-        ? '/home/agent'
-        : '/root';
+    const homeSource = path.resolve(manifestHomeDirectory(volumes, agentHomeDir, workspaceRoot));
+    const requestedTarget = normalizeRuntimeMountTarget(cwdMountTarget);
+    const explicitHome = Object.values(volumes).some(target => path.posix.resolve('/', target) === '/root');
+    const projectTarget = requestedTarget === '/root' && projectSource !== path.resolve(agentHomeDir)
+        ? projectSource : requestedTarget;
+    const containerHome = '/root';
     return {
         containerHome,
         binds: [
-            { source: projectSource, target: projectTarget },
-            ...(projectSource === homeSource && projectTarget === containerHome ? [] : [
+            ...(explicitHome && projectTarget === '/root' ? [] : [{ source: projectSource, target: projectTarget }]),
+            ...(!explicitHome && projectSource === homeSource && projectTarget === containerHome ? [] : [
                 { source: homeSource, target: containerHome },
             ]),
         ],

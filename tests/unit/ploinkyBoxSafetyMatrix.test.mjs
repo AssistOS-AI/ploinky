@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import { assertDataLayoutCurrent } from '../../cli/utils/dataLayoutMigration.js';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
@@ -30,6 +31,7 @@ function bufferStream(isTTY = false) {
 }
 
 function owned(identity, { running = true, agentLib = agentLibFixture(identity.workspaceRoot) } = {}) {
+    assertDataLayoutCurrent(identity.workspaceRoot);
     return {
         state: 'owned',
         engine: { name: 'podman', identity: 'engine-fingerprint' },

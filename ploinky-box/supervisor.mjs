@@ -1,3 +1,5 @@
+import { ensureDataLayout } from '../cli/utils/dataLayoutMigration.js';
+import { createQuiescenceGate } from './hostState/quiescence.mjs';
 import { buildHostSkillScope } from './skillScope.mjs';
 import { readGraphSkillScope, validateGraphSkillScope, writeGraphSkillScope } from './graphSkillScope.mjs';
 import os from 'node:os';
@@ -903,6 +905,23 @@ export function createBoxSupervisor({
                 assertBoxWorkspaceRoot(identity.workspaceRoot);
                 const ownership = authorize(inspect(identity));
                 guard.underLock(identity, lock, ownership, { policy });
+                if (policy !== HOST_STATE_POLICY.restrict) {
+                    ensureDataLayout(identity.workspaceRoot, {
+                        log: message => stderr?.write?.(`[data-layout] ${message}\n`),
+                        assertMigrationAllowed() {
+                            lock.assertHeld(identity.instance);
+                            const current = authorize(inspect(identity));
+                            if (current.handles?.container) throw supervisorError(
+                                'Old data layout requires ploinky destroy before migration; a stopped Box is not sufficient.',
+                                'PLOINKY_DATA_LAYOUT_MIGRATION');
+                            const view = guard.quiescence({ identity, engine: current.engine });
+                            if (!Array.isArray(view)) throw supervisorError(
+                                'Migration requires a complete runtime quiescence observation.', 'PLOINKY_DATA_LAYOUT_MIGRATION');
+                            // Migration never excuses a live host agent.
+                            createQuiescenceGate({ platform }).assert(identity, { view });
+                        },
+                    });
+                }
                 return ownership;
             },
             execute,

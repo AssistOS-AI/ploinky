@@ -55,21 +55,7 @@ export function isSsoProviderManifest(manifest) {
 function normalizeRuntimeResources(rawRuntime) {
     if (!rawRuntime || typeof rawRuntime !== 'object') return {};
     const resources = resourcesFromRuntime(rawRuntime);
-    const persistent = resources.persistentStorage && typeof resources.persistentStorage === 'object'
-        ? resources.persistentStorage
-        : null;
     const normalized = {};
-    if (persistent) {
-        const key = toNonEmptyString(persistent.key);
-        const containerPath = toNonEmptyString(persistent.containerPath);
-        if (key && containerPath) {
-            normalized.persistentStorage = {
-                key,
-                containerPath,
-                chmod: typeof persistent.chmod === 'number' ? persistent.chmod : null,
-            };
-        }
-    }
     const gitCredentials = resources.gitCredentials && typeof resources.gitCredentials === 'object'
         && !Array.isArray(resources.gitCredentials)
         ? resources.gitCredentials

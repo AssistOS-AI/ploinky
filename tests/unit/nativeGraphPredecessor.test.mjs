@@ -202,7 +202,7 @@ function bwrapOccupantFixture(t) {
     const record = {
         ...registration({ instanceId: 'successor-instance', enableGeneration: 'successor-generation' }),
         runtime: 'bwrap',
-        projectPath: path.join(w.ws, '.data', 'demo'),
+        projectPath: path.join(w.ws, '.data', 'agents', 'demo'),
     };
     const setup = [
         { action: 'init-edge' },
@@ -242,7 +242,7 @@ const SEATBELT_MANIFEST = { 'lite-sandbox': true, start: 'node index.js', networ
 
 function seatbeltStart(w, record, label, options = {}) {
     return [
-        { action: 'register', containerName: CONTAINER, record: { ...registration(record), runtime: 'seatbelt', projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'register', containerName: CONTAINER, record: { ...registration(record), runtime: 'seatbelt', projectPath: path.join(w.ws, '.data', 'agents', 'demo') } },
         { action: 'prepare-lease' },
         { label, action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, startPath: true, activate: true, routeKey: 'demo', ...options },
     ];

@@ -35,7 +35,7 @@ const { controllerGuardTargets } = await import('../../cli/utils/runtime/control
 const { AGENT_DATA_POLICY_CODE } = await import('../../cli/utils/runtime/agentDataPathPolicy.js');
 
 const TOKEN = 'ghp_unitTestTokenValue0123456789';
-const credentialsDir = path.join(workspace, '.data', '.private', '.git-credentials');
+const credentialsDir = path.join(workspace, '.data', 'dpu-data', 'git-credentials');
 const mirrorFile = path.join(credentialsDir, 'credentials.json');
 const expectedHeader = `Authorization: Basic ${Buffer.from(`x-access-token:${TOKEN}`).toString('base64')}`;
 
@@ -206,7 +206,7 @@ test('the directory override stays inside the workspace and outside protected st
     assert.equal(resolveGitCredentialsDir(workspace, { override: '.data/git' }), path.join(workspace, '.data', 'git'));
     assert.equal(resolveGitCredentialsDir(workspace, { override: path.join(workspace, 'creds') }), path.join(workspace, 'creds'));
     assert.equal(
-        resolveGitCredentialsDir(workspace, { override: '.data/.private/.git-credentials' }),
+        resolveGitCredentialsDir(workspace, { override: '.data/dpu-data/git-credentials' }),
         credentialsDir,
     );
 
@@ -218,7 +218,16 @@ test('the directory override stays inside the workspace and outside protected st
         policyFailure(() => resolveGitCredentialsDir(workspace, { override: 'a/../../escape' }));
         policyFailure(() => resolveGitCredentialsDir(workspace, { override: '.ploinky/data/git' }));
         policyFailure(() => resolveGitCredentialsDir(workspace, { override: '.ploinky-box/git' }));
-        policyFailure(() => resolveGitCredentialsDir(workspace, { override: '.data/.private/otherAgent' }));
+        for (const segment of ['agents', 'robots']) {
+            for (const suffix of ['', '/demo', '/demo/credentials']) {
+                policyFailure(() => resolveGitCredentialsDir(workspace, { override: `.data/${segment}${suffix}` }));
+            }
+            const target = path.join(workspace, '.data', segment);
+            fs.mkdirSync(target, { recursive: true });
+            const alias = path.join(workspace, `alias-${segment}`);
+            fs.symlinkSync(target, alias);
+            policyFailure(() => resolveGitCredentialsDir(workspace, { override: alias + '/credentials' }));
+        }
         fs.symlinkSync(outside, path.join(workspace, 'link-out'));
         policyFailure(() => resolveGitCredentialsDir(workspace, { override: 'link-out/creds' }));
         // An escaping override is "no credentials" for git, never a crash.
@@ -230,31 +239,31 @@ test('the directory override stays inside the workspace and outside protected st
     }
 });
 
+test('the former default override follows the relocated store without recreating it', () => {
+    for (const override of ['.data/.private/.git-credentials', path.join(workspace, '.data', '.private', '.git-credentials')]) {
+        assert.equal(resolveGitCredentialsDir(workspace, { override }), credentialsDir);
+        assert.equal(ensureGitCredentialsDir(workspace, { override }), credentialsDir);
+        assert.equal(fs.existsSync(path.join(workspace, '.data', '.private')), false);
+    }
+});
+
 test('ensureGitCredentialsDir creates a private 0700 directory', () => {
     fs.rmSync(path.join(workspace, '.data'), { recursive: true, force: true });
     const dir = ensureGitCredentialsDir(workspace, { override: '' });
     assert.equal(dir, credentialsDir);
     assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
-    assert.equal(fs.statSync(path.join(workspace, '.data', '.private')).mode & 0o777, 0o700);
+    assert.equal(fs.existsSync(path.join(workspace, '.data', '.private')), false);
 });
 
-test('runtime guards admit only the exact granted private directory', () => {
+test('runtime guards admit the explicit credentials bind and mask broad data access', () => {
     fs.mkdirSync(credentialsDir, { recursive: true, mode: 0o700 });
-    const other = path.join(workspace, '.data', '.private', 'other');
-    fs.mkdirSync(other, { recursive: true });
-    const bind = hostPath => [{ hostPath, runtimePath: '/git-credentials' }];
-    policyFailure(() => controllerGuardTargets(bind(credentialsDir), { workspaceRoot: workspace }));
-    assert.deepEqual(controllerGuardTargets(bind(credentialsDir), {
-        workspaceRoot: workspace,
-        privateDataGrants: [credentialsDir],
-    }), []);
-    policyFailure(() => controllerGuardTargets(bind(other), {
-        workspaceRoot: workspace,
-        privateDataGrants: [credentialsDir],
-    }));
-    const privateRoot = path.join(workspace, '.data', '.private');
-    policyFailure(() => controllerGuardTargets(bind(privateRoot), {
-        workspaceRoot: workspace,
-        privateDataGrants: [privateRoot],
-    }));
+    fs.mkdirSync(path.join(workspace, '.ploinky-box'), { recursive: true });
+    const bindings = [
+        { hostPath: workspace, runtimePath: '/workspace' },
+        { hostPath: credentialsDir, runtimePath: '/git-credentials' },
+    ];
+    const targets = controllerGuardTargets(bindings, { workspaceRoot: workspace });
+    assert.ok(targets.some(entry => entry.target === '/workspace/.data'));
+    assert.ok(!targets.some(entry => entry.target === '/git-credentials'));
+    assert.ok(!targets.some(entry => entry.key === 'private'));
 });

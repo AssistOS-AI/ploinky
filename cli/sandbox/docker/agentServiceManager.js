@@ -106,7 +106,6 @@ import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
     ensureGitCredentialsHostDir,
-    ensurePersistentStorageHostDir
 } from '../../utils/runtime/runtimeResourcePlanner.js';
 import {
     assertCanonicalAgentDataPath,
@@ -993,6 +992,7 @@ function buildPersistentAgentRunArgs({
     cwd,
     cwdMountTarget,
     agentHomeDir = '',
+    volumes = {},
     agentLibGrant: grant = null,
 } = {}) {
     if (!grant) {
@@ -1001,10 +1001,11 @@ function buildPersistentAgentRunArgs({
     if (!healthProbeHostDir) {
         throw new Error('agent admission requires its dedicated health-probe control directory');
     }
-    const storageWorkspaceRoot = path.dirname(path.dirname(path.resolve(sharedDir)));
+    // sharedDir is <workspace>/.data/agents/shared.
+    const storageWorkspaceRoot = path.resolve(sharedDir, '..', '..', '..');
     assertCanonicalAgentDataPath(sharedDir, { workspaceRoot: storageWorkspaceRoot });
     assertCanonicalAgentDataPath(agentHomeDir, { workspaceRoot: storageWorkspaceRoot });
-    const homeLayout = resolveAgentHomeLayout({ cwd, cwdMountTarget, agentHomeDir });
+    const homeLayout = resolveAgentHomeLayout({ cwd, cwdMountTarget, agentHomeDir, volumes });
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const readOnlyMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const args = [
@@ -1030,7 +1031,7 @@ function buildPersistentAgentRunArgs({
         // cancellation to the broker in the container's main process tree.
         // Health checks therefore create no target OCI exec sessions.
         '-v', `${healthProbeHostDir}:${PROBE_CONTROL_CONTAINER_ROOT}${runtime === 'podman' ? ':z' : ''}`,
-        ...homeLayout.binds.flatMap(({ source, target }) => [
+        ...homeLayout.binds.filter(({ target }) => target !== '/root' || !Object.values(volumes).some(value => path.posix.resolve('/', value) === '/root')).flatMap(({ source, target }) => [
             '-v', `${source}:${target}${runtime === 'podman' ? ':z' : ''}`,
         ]),
     ];
@@ -1086,7 +1087,7 @@ function appendExactManagedBindMount(args, value) {
 function appendControllerStateGuards(args, runtime, {
     workspaceRoot,
     agentName,
-    privateDataGrants = [],
+    agentDataDir,
     canonicalRuntimeWorkspaceGuards = isPloinkyBoxRuntime(),
 } = {}) {
     // The guards always mask `.ploinky-box`, so its skeleton exists before
@@ -1097,7 +1098,7 @@ function appendControllerStateGuards(args, runtime, {
         runtimePath: mount.destination,
         readOnly: !mount.rw,
     }));
-    const guardOptions = { workspaceRoot, bindings, agentName, privateDataGrants };
+    const guardOptions = { workspaceRoot, bindings, agentName, agentDataDir };
     const targets = controllerGuardTargets(bindings, guardOptions);
     // Narrow repository grants can still cause the container engine to create
     // the canonical workspace parents. Guard those synthetic parents too so
@@ -1662,11 +1663,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const cwd = (preservePreparedRegistryRecord || adoptManagedRuntimeOnly) && launchRecord.projectPath
         ? launchRecord.projectPath
         : getConfiguredProjectPath(agentName, repoName, options.alias);
-    const isolatedHome = (launchRecord.runMode || 'isolated') === 'isolated';
     const agentHomeDir = getAgentWorkDir(instanceName);
+    const isolatedHome = (launchRecord.runMode || 'isolated') === 'isolated' && path.resolve(cwd) === path.resolve(agentHomeDir);
     const containerCwd = isolatedHome ? '/root' : cwd;
     const cwdMountTarget = isolatedHome ? '/root' : cwd;
-    const homeLayout = resolveAgentHomeLayout({ cwd, cwdMountTarget, agentHomeDir });
+    const homeLayout = resolveAgentHomeLayout({ cwd, cwdMountTarget, agentHomeDir, volumes: mergeManifestVolumes(manifest, profileConfig) });
     const llmRuntimeSharedPath = resolveLlmRuntimeSharedPath(agentPath);
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
@@ -1777,7 +1778,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     } = getProfileMountModes(activeProfile, runtime, profileConfig || {});
 
     // New workspace structure paths
-    const agentWorkDir = agentHomeDir;
+    const agentWorkDir = homeLayout.binds.find(bind => bind.target === homeLayout.containerHome)?.source || agentHomeDir;
     const agentCodePathSymlink = getAgentCodePath(agentName);
     const agentSkillsPathSymlink = getAgentSkillsPath(agentName);
 
@@ -2009,6 +2010,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         cwd,
         cwdMountTarget,
         agentHomeDir,
+        volumes: mergeManifestVolumes(manifest, profileConfig),
         agentLibGrant: containerAgentLibGrant,
     });
     const topologyMount = edgeTopologyMount();
@@ -2109,27 +2111,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.splice(1, 0, '-p', String(p));
     }
 
-    // Manifest-driven runtime resources (persistent storage + declared env).
+    // Manifest-driven runtime resources (Git credentials and declared env).
     // Replaces former agentName-specific runtime wiring with manifest-driven resources.
     const resourcePlan = planRuntimeResources(manifest, { agentName, repoName });
-    if (resourcePlan.persistentStorage) {
-        if (adoptManagedRuntimeOnly) {
-            requireManagedAdoptionDirectory(
-                resourcePlan.persistentStorage.hostPath,
-                'persistent runtime storage',
-            );
-            if (typeof resourcePlan.persistentStorage.chmod === 'number') {
-                const mode = fs.statSync(resourcePlan.persistentStorage.hostPath).mode & 0o777;
-                if (mode !== (resourcePlan.persistentStorage.chmod & 0o777)) {
-                    throw managedAdoptionMismatch('persistent runtime storage permissions drifted');
-                }
-            }
-        } else {
-            ensurePersistentStorageHostDir(resourcePlan);
-        }
-        assertCanonicalAgentDataPath(resourcePlan.persistentStorage.hostPath);
-        args.push('-v', `${resourcePlan.persistentStorage.hostPath}:${resourcePlan.persistentStorage.containerPath}${runtime === 'podman' ? ':z' : ''}`);
-    }
     // The workspace git credentials directory, for an agent that declares it.
     if (resourcePlan.gitCredentials) {
         if (adoptManagedRuntimeOnly) {
@@ -2144,7 +2128,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // resource bind so no later agent-controlled mount can expose old state.
     appendControllerStateGuards(args, runtime, {
         agentName,
-        privateDataGrants: resourcePlan.gitCredentials ? [resourcePlan.gitCredentials.hostPath] : [],
+        agentDataDir: homeLayout.binds.find(bind => bind.target === homeLayout.containerHome)?.source || agentHomeDir,
     });
 
     const envStrings = [
@@ -4467,6 +4451,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 cwd: desiredProject,
                 cwdMountTarget: (launchRecord.runMode || 'isolated') === 'isolated' ? '/root' : desiredProject,
                 agentHomeDir: getAgentWorkDir(aliasOverride || agentName),
+                volumes: mergeManifestVolumes(manifest, profileConfig),
             });
             const inspection = spawnSync(runtime, ['inspect', reuseInspection.id], {
                 encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5_000,
@@ -4755,6 +4740,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         cwd: projPath,
         cwdMountTarget: finalWorkTarget,
         agentHomeDir: finalAgentWorkDir,
+        volumes: mergeManifestVolumes(manifest, profileConfig),
     });
     const hasStartedBinds = Array.isArray(startedRecord.config?.binds) && startedRecord.config.binds.length > 0;
     const startedEnvNames = Array.isArray(startedRecord.config?.env)

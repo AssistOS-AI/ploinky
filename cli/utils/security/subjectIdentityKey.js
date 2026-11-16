@@ -65,7 +65,7 @@ function resolveKeypairStoreFile() {
 
 function getStorageKey() {
     // masterKey.js applies the active runtime's single source of truth. Managed
-    // Boxes use `.ploinky/data/master-key` exclusively; non-Box execution retains
+    // Boxes use `.data/dpu-data/master-key` exclusively; non-Box execution retains
     // its explicit environment and local fallback sources.
     resolveConfiguredMasterKey({ purpose: 'subject identity signing keypair storage' });
     return deriveSubkey(SUBKEY_PURPOSE);

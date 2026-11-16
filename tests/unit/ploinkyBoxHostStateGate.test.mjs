@@ -54,6 +54,8 @@ async function world(t, { old = 'running', dataPaths = false, prepare = () => {}
     fs.mkdirSync(outside);
     const workspace = path.join(base, 'W');
     fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
+    fs.mkdirSync(path.join(workspace, '.data'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, '.data', '.layout.json'), '{"version":4}');
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     if (dataPaths) for (const target of Object.values(identity.dataPaths)) fs.mkdirSync(target, { recursive: true });
     prepare(identity, workspace);

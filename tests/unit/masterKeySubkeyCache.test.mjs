@@ -21,19 +21,20 @@ function expectedSubkey(seed, purpose, length = 32) {
 function createWorkspace(t, seed = KEY_A) {
     const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-subkey-')));
     t.after(() => {
-        for (const dir of [workspace, path.join(workspace, '.ploinky'), path.join(workspace, '.ploinky', 'data')]) {
+        for (const dir of [workspace, path.join(workspace, '.ploinky'), path.join(workspace, '.data', 'dpu-data')]) {
             try { fs.chmodSync(dir, 0o700); } catch (_) { }
         }
         fs.rmSync(workspace, { recursive: true, force: true });
     });
+    fs.mkdirSync(path.join(workspace, '.ploinky'));
     initializeWorkspaceMasterKey({
         workspaceRoot: workspace,
         randomBytes: () => Buffer.from(seed, 'hex'),
     });
     return {
         workspace,
-        keyPath: path.join(workspace, '.ploinky', 'data', 'master-key'),
-        dataDir: path.join(workspace, '.ploinky', 'data'),
+        keyPath: path.join(workspace, '.data', 'dpu-data', 'master-key'),
+        dataDir: path.join(workspace, '.data', 'dpu-data'),
     };
 }
 
@@ -146,7 +147,7 @@ test('managed subkeys: any state directory fingerprint change re-reads the key t
     assert.equal(counts.keyReads, 1, 'an unchanged stamp must not re-read the key');
 
     // A permission change on .ploinky leaves the key file's lstat untouched.
-    fs.chmodSync(path.join(workspace, '.ploinky'), 0o711);
+    fs.chmodSync(path.join(workspace, '.data'), 0o711);
     clock.now += 500;
     assert.deepEqual(deriver.derive('session'), expected);
     assert.equal(counts.keyReads, 1, 'the stamp is re-checked at most once per window');

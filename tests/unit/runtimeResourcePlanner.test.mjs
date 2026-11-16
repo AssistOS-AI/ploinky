@@ -16,7 +16,7 @@ const { setSecretValue } = await import(`../../cli/utils/security/encryptedSecre
 setSecretValue('DPU_MASTER_KEY', 'test-master-key-123');
 const { deriveAgentSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 const plannerModule = await import(`../../cli/utils/runtime/runtimeResourcePlanner.js${moduleSuffix}`);
-const { planRuntimeResources, applyRuntimeResourceEnv, ensurePersistentStorageHostDir, ensureGitCredentialsHostDir } = plannerModule;
+const { planRuntimeResources, applyRuntimeResourceEnv, ensureGitCredentialsHostDir } = plannerModule;
 const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
 test.after(() => {
@@ -31,53 +31,31 @@ test.after(() => {
 
 test('planRuntimeResources returns empty plan for manifest without runtime block', () => {
     const plan = planRuntimeResources({});
-    assert.equal(plan.persistentStorage, null);
+    assert.equal(Object.hasOwn(plan, 'persistentStorage'), false);
     assert.equal(plan.gitCredentials, null);
     assert.deepEqual(plan.env, {});
 });
 
-test('planRuntimeResources resolves persistentStorage and templated env', () => {
-    const plan = planRuntimeResources({
-        runtime: {
-            resources: {
-                persistentStorage: { key: 'dpu-data', containerPath: '/dpu-data' },
-                env: {
-                    DPU_DATA_ROOT: '{{STORAGE_CONTAINER_PATH}}',
-                    DPU_MASTER_KEY: '{{secret:DPU_MASTER_KEY}}'
-                }
-            }
-        }
-    });
-    assert.equal(plan.persistentStorage.containerPath, '/dpu-data');
-    assert.equal(plan.persistentStorage.hostPath, path.join(tempDir, '.data', 'dpu-data'));
-    assert.equal(plan.env.DPU_DATA_ROOT, '/dpu-data');
-    assert.equal(plan.env.DPU_MASTER_KEY, 'test-master-key-123');
+test('retired storage declarations and templates fail with migration guidance', () => {
+    for (const resources of [
+        { persistentStorage: { key: 'demo', containerPath: '/data' } },
+        { persistentStorage: null },
+        { env: { DATA_ROOT: '{{STORAGE_CONTAINER_PATH}}' } },
+        { env: { DATA_ROOT: '{{ STORAGE_HOST_PATH }}' } },
+    ]) {
+        assert.throws(() => planRuntimeResources({ runtime: { resources } }), error => {
+            assert.equal(error.code, 'PLOINKY_REMOVED_PERSISTENT_STORAGE');
+            assert.match(error.message, /automatic persistent home at \/root/);
+            return true;
+        });
+    }
 });
 
-test('persistent storage keys are mandatory single path segments and legacy host overrides are inert', () => {
-    const previousOverride = process.env.PLOINKY_RESOURCE_DPU_DATA_HOST;
-    const previousDpuRoot = process.env.DPU_DATA_ROOT;
-    process.env.PLOINKY_RESOURCE_DPU_DATA_HOST = path.join(tempDir, 'override');
-    process.env.DPU_DATA_ROOT = path.join(tempDir, 'legacy-dpu-root');
-    try {
-        const plan = planRuntimeResources({
-            runtime: { resources: { persistentStorage: { key: 'dpu-data', containerPath: '/data' } } },
-        });
-        assert.equal(plan.persistentStorage.hostPath, path.join(tempDir, '.data', 'dpu-data'));
-        for (const key of ['', ' dpu-data ', '.', '..', 'a/b', 'a\\b', 'space key']) {
-            assert.throws(() => planRuntimeResources({
-                runtime: { resources: { persistentStorage: { key, containerPath: '/data' } } },
-            }), error => {
-                assert.equal(error.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
-                return true;
-            });
-        }
-    } finally {
-        if (previousOverride === undefined) delete process.env.PLOINKY_RESOURCE_DPU_DATA_HOST;
-        else process.env.PLOINKY_RESOURCE_DPU_DATA_HOST = previousOverride;
-        if (previousDpuRoot === undefined) delete process.env.DPU_DATA_ROOT;
-        else process.env.DPU_DATA_ROOT = previousDpuRoot;
-    }
+test('runtime env uses explicit home paths and preserves secret templates', () => {
+    const plan = planRuntimeResources({ runtime: { resources: { env: {
+        DATA_ROOT: '/root', KEY: '{{secret:DPU_MASTER_KEY}}',
+    } } } });
+    assert.deepEqual(plan.env, { DATA_ROOT: '/root', KEY: 'test-master-key-123' });
 });
 
 test('planRuntimeResources resolves generatedSecret templates', () => {
@@ -144,35 +122,6 @@ test('planRuntimeResources rejects removed derivedMasterSecret templates', () =>
     });
 });
 
-test('planRuntimeResources can expand storage container path to host path for host sandboxes', () => {
-    const plan = planRuntimeResources({
-        runtime: {
-            resources: {
-                persistentStorage: { key: 'dpu-data', containerPath: '/dpu-data' },
-                env: {
-                    DPU_DATA_ROOT: '{{STORAGE_CONTAINER_PATH}}',
-                },
-            },
-        },
-    }, { useHostStoragePath: true });
-    assert.equal(plan.env.DPU_DATA_ROOT, plan.persistentStorage.hostPath);
-    assert.match(plan.env.DPU_DATA_ROOT, /dpu-data$/);
-});
-
-test('ensurePersistentStorageHostDir is idempotent', () => {
-    const plan = planRuntimeResources({
-        runtime: {
-            resources: {
-                persistentStorage: { key: 'test-key', containerPath: '/data' }
-            }
-        }
-    });
-    const created = ensurePersistentStorageHostDir(plan);
-    assert.ok(fs.existsSync(created));
-    // second call should be a no-op
-    assert.equal(ensurePersistentStorageHostDir(plan), created);
-});
-
 test('applyRuntimeResourceEnv copies env map as new object', () => {
     const plan = planRuntimeResources({
         runtime: {
@@ -198,14 +147,14 @@ const gitCredentialsManifest = (resource = { containerPath: '/git-credentials' }
 });
 
 test('gitCredentials plans the workspace credentials directory and its two templates', () => {
-    const hostPath = path.join(tempDir, '.data', '.private', '.git-credentials');
+    const hostPath = path.join(tempDir, '.data', 'dpu-data', 'git-credentials');
     const plan = planRuntimeResources(gitCredentialsManifest());
     assert.deepEqual(plan.gitCredentials, { hostPath, containerPath: '/git-credentials' });
     assert.equal(plan.env.MIRROR_DIR, '/git-credentials');
     assert.equal(plan.env.MIRROR_KEY, deriveSubkey('git-credentials-v1', 32).toString('hex'));
     assert.match(plan.env.MIRROR_KEY, /^[0-9a-f]{64}$/);
 
-    // Host sandboxes see the host path, as for STORAGE_CONTAINER_PATH.
+    // Host sandboxes see the physical Git credentials path.
     const hostPlan = planRuntimeResources(gitCredentialsManifest(), { useHostStoragePath: true });
     assert.equal(hostPlan.env.MIRROR_DIR, hostPath);
 

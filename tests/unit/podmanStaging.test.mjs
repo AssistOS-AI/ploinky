@@ -843,7 +843,7 @@ test(`real interactive podman keeps the controller root read-only with ${project
     try {
         const controllerData = path.join(root, '.ploinky', 'data');
         const homeDir = path.join(root, '.data', 'demo');
-        const sharedDir = path.join(root, '.data', 'shared');
+        const sharedDir = path.join(root, '.data', 'agents', 'shared');
         const agentLibPath = path.join(root, 'Agent');
         const absAgentPath = path.join(root, 'agent-code');
         const grantSource = path.join(root, 'achillesAgentLib');
@@ -894,7 +894,7 @@ test('persistent runtime production wiring appends guards after all writable mou
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.match(
         source,
-        /for \(const \{ resolvedHostPath[\s\S]*resourcePlan\.persistentStorage[\s\S]*appendControllerStateGuards\(args, runtime\);[\s\S]*const envStrings/,
+        /for \(const \{ resolvedHostPath[\s\S]*resourcePlan\.gitCredentials[\s\S]*appendControllerStateGuards\(args, runtime, \{[\s\S]*?\}\);[\s\S]*const envStrings/,
     );
 });
 

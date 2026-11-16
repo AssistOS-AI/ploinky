@@ -22,6 +22,20 @@ function markerFixture() {
     return { root, markerPath };
 }
 
+test('admission refuses retired storage resources and templates before launch', () => {
+    for (const resources of [
+        { persistentStorage: { key: 'demo', containerPath: '/data' } },
+        { persistentStorage: false },
+        { env: { DATA_ROOT: '{{STORAGE_CONTAINER_PATH}}' } },
+        { env: { DATA_ROOT: '{{ STORAGE_HOST_PATH }}' } },
+    ]) {
+        assert.throws(
+            () => admitManifestRuntimeCapabilities({ runtime: { resources } }),
+            { code: 'PLOINKY_REMOVED_PERSISTENT_STORAGE' },
+        );
+    }
+});
+
 test('runtime capability validation checks every profile, selected or not', () => {
     const manifest = {
         profiles: {

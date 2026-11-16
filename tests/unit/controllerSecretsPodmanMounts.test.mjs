@@ -68,8 +68,8 @@ function controllerSecrets(workspace, operation, name = '', value = '') {
 function productionRunArgs(workspace, layout, containerName) {
     const agentName = 'demo';
     const agentCodePath = path.join(workspace, '.ploinky', 'repos', 'demoRepo', agentName);
-    const sharedDir = path.join(workspace, '.data', 'shared');
-    const agentHomeDir = path.join(workspace, '.data', agentName);
+    const sharedDir = path.join(workspace, '.data', 'agents', 'shared');
+    const agentHomeDir = path.join(workspace, '.data', 'agents', agentName);
     const healthProbeHostDir = path.join(workspace, '.ploinky', 'run', 'health-probes', agentName);
     const nodeModulesDir = path.join(workspace, '.ploinky', 'deps', 'synthetic', 'node_modules');
     const agentLib = makeAgentLib(workspace, { name: 'ploinky/node_modules/achillesAgentLib' });
@@ -112,7 +112,7 @@ function productionRunArgs(workspace, layout, containerName) {
         args.push('-v', `${mount.source}:${mount.target}${podmanMountSuffix(mount.ro)}`);
     }
     appendControllerStateGuards(args, 'podman', { workspaceRoot: workspace, canonicalRuntimeWorkspaceGuards: false });
-    return { args, alias: cwdMountTarget };
+    return { args, alias: workspace };
 }
 
 // A readable, non-empty file is key material in the agent's hands; no bytes are
@@ -138,7 +138,7 @@ function probe(containerName, files, alias) {
 }
 
 function secretProbes(alias, relativeDirectory) {
-    return SECRET_NAMES.map(name => [name, path.posix.join(alias, '.ploinky', relativeDirectory, name)]);
+    return SECRET_NAMES.map(name => [name, name === 'master-key' && relativeDirectory === 'data' ? path.posix.join(alias, '.data', 'dpu-data', name) : path.posix.join(alias, '.ploinky', relativeDirectory, name)]);
 }
 
 function withRunningAgent(t, workspace, layout, suffix, callback) {
@@ -157,12 +157,12 @@ for (const layout of LAYOUTS) {
         const workspace = tempRoot(t, 'controller-secrets-podman-');
         const { path: keyPath } = initializeWorkspaceMasterKey({ workspaceRoot: workspace });
         const dataDir = path.join(workspace, '.ploinky', 'data');
-        assert.equal(keyPath, path.join(dataDir, 'master-key'));
+        assert.equal(keyPath, path.join(workspace, '.data', 'dpu-data', 'master-key'));
         assert.deepEqual(controllerSecrets(workspace, 'set', 'SYNTHETIC_TOKEN', 'synthetic-value-1'),
             { SYNTHETIC_TOKEN: 'synthetic-value-1' });
         fs.writeFileSync(path.join(dataDir, SECRET_NAMES[2]), 'synthetic-envelope\n', { mode: 0o600 });
         for (const name of SECRET_NAMES) {
-            const stat = fs.statSync(path.join(dataDir, name));
+            const stat = fs.statSync(name === 'master-key' ? keyPath : path.join(dataDir, name));
             assert.equal(stat.uid, process.getuid(), `${name} is owned by the workspace owner`);
             assert.equal(stat.mode & 0o777, 0o600);
         }
@@ -220,7 +220,7 @@ for (const layout of LAYOUTS) {
         ], { cwd: workspace, env, encoding: 'utf8' });
         assert.notEqual(refused.status, 0);
         assert.match(refused.stderr, /PLOINKY_RETIRED_CONTROLLER_SECRETS|retired agent-readable location/);
-        assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'data', 'master-key')), false);
+        assert.equal(fs.existsSync(path.join(workspace, '.data', 'dpu-data', 'master-key')), false);
     });
 }
 
@@ -228,7 +228,7 @@ for (const layout of LAYOUTS) {
 // (Podman/Docker and bwrap guards, Seatbelt read denial).
 test('every controller secret path lies inside a masked controller-state root', () => {
     const roots = protectedControllerStateRoots(PLOINKY_WORKSPACE_ROOT).map(entry => entry.hostPath);
-    const inside = file => roots.some(root => path.dirname(file) === root);
+    const inside = file => roots.some(root => file === root || file.startsWith(root + path.sep));
     for (const file of [
         SECRETS_FILE,
         workspaceMasterKeyPath(PLOINKY_WORKSPACE_ROOT),

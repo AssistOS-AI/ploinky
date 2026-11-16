@@ -91,6 +91,30 @@ export function validateAgentDataKey(value, { label = 'storage key' } = {}) {
     return value;
 }
 
+// Top-level `.data` entries that are not an agent's own data. Every other
+// entry of the old flat layout (`.data/<x>`) now lives in `.data/agents/<x>`.
+export const AGENTS_DATA_SEGMENT = 'agents';
+export const RESERVED_DATA_ENTRIES = Object.freeze([AGENTS_DATA_SEGMENT, 'robots', 'dpu-data']);
+
+export function agentsDataRoot(workspaceRoot) {
+    return path.join(resolvePolicyWorkspaceRoot(workspaceRoot), '.data', AGENTS_DATA_SEGMENT);
+}
+
+// Maps a workspace-relative or absolute path written for the flat layout
+// (`.data/<x>/...`) to its place in `.data/agents/<x>/...`. Paths outside
+// `.data`, the data root itself, reserved entries and dot entries are returned
+// unchanged (resolved against the workspace root).
+export function translateLegacyDataPath(target, { workspaceRoot } = {}) {
+    const root = resolvePolicyWorkspaceRoot(workspaceRoot);
+    const dataRoot = path.join(root, '.data');
+    const resolved = path.resolve(root, String(target));
+    if (!isPathWithin(resolved, dataRoot) || resolved === dataRoot) return resolved;
+    const relative = path.relative(dataRoot, resolved);
+    const first = relative.split(path.sep)[0];
+    if (RESERVED_DATA_ENTRIES.includes(first) || first.startsWith('.')) return resolved;
+    return path.join(dataRoot, AGENTS_DATA_SEGMENT, relative);
+}
+
 export function assertCanonicalAgentDataPath(target, {
     workspaceRoot,
     allowDataRoot = false,
@@ -125,7 +149,7 @@ export function resolveAgentDataPath(key, {
 } = {}) {
     const safeKey = validateAgentDataKey(key, { label });
     const root = resolvePolicyWorkspaceRoot(workspaceRoot);
-    return assertCanonicalAgentDataPath(path.join(root, '.data', safeKey), {
+    return assertCanonicalAgentDataPath(path.join(root, '.data', AGENTS_DATA_SEGMENT, safeKey), {
         workspaceRoot: root,
     });
 }
@@ -241,6 +265,15 @@ export async function assertCanonicalAgentDataPathAsync(target, {
     return resolvedTarget;
 }
 
+// A reserved top-level data store (`.data/robots`, `.data/dpu-data`).
+export function resolveReservedDataPath(name, { workspaceRoot } = {}) {
+    if (name === AGENTS_DATA_SEGMENT || !RESERVED_DATA_ENTRIES.includes(name)) {
+        throw policyError(`'${name}' is not a reserved data store`, { name: String(name) });
+    }
+    const root = resolvePolicyWorkspaceRoot(workspaceRoot);
+    return assertCanonicalAgentDataPath(path.join(root, '.data', name), { workspaceRoot: root });
+}
+
 export async function resolveAgentDataPathAsync(key, {
     workspaceRoot,
     label = 'storage key',
@@ -248,7 +281,7 @@ export async function resolveAgentDataPathAsync(key, {
 } = {}) {
     const safeKey = validateAgentDataKey(key, { label });
     const root = resolvePolicyWorkspaceRoot(workspaceRoot);
-    return assertCanonicalAgentDataPathAsync(path.join(root, '.data', safeKey), {
+    return assertCanonicalAgentDataPathAsync(path.join(root, '.data', AGENTS_DATA_SEGMENT, safeKey), {
         workspaceRoot: root,
         check,
     });
@@ -294,9 +327,9 @@ export function assertManifestVolumeStoragePolicy(source, {
     agentName,
 } = {}) {
     const root = resolvePolicyWorkspaceRoot(workspaceRoot);
-    const resolvedSource = path.isAbsolute(String(source))
-        ? path.resolve(String(source))
-        : path.resolve(root, String(source));
+    // Sources written for the flat layout (`.data/<x>`) keep working: they
+    // resolve to `.data/agents/<x>`.
+    const resolvedSource = translateLegacyDataPath(String(source), { workspaceRoot: root });
     // The Box host state directory (`<workspace>/.ploinky-box`, of this or any
     // other workspace) is host-only: no agent volume may resolve into it.
     if (hasHostStateComponent(resolvedSource) || hasHostStateComponent(projectedCanonicalPath(resolvedSource))) {
@@ -313,15 +346,6 @@ export function assertManifestVolumeStoragePolicy(source, {
         path.join(root, '.ploinky'),
     ];
     const canonicalSource = projectedCanonicalPath(resolvedSource);
-    const privateRoot = path.join(root, '.data', '.private');
-    if (isPathWithin(resolvedSource, privateRoot)
-        || isPathWithin(canonicalSource, projectedCanonicalPath(privateRoot))) {
-        const ownRoot = agentName ? path.join(privateRoot, validateAgentDataKey(agentName)) : null;
-        if (!ownRoot || resolvedSource !== ownRoot || canonicalSource !== projectedCanonicalPath(ownRoot)) {
-            throw policyError(`manifest volume source '${source}' is not the agent's exact private data directory`);
-        }
-        assertCanonicalAgentDataPath(ownRoot, { workspaceRoot: root });
-    }
     for (const protectedRoot of protectedRoots) {
         const canonicalProtected = canonicalProtectedPath(protectedRoot);
         if (isPathWithin(resolvedSource, protectedRoot)

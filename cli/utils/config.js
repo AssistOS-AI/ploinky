@@ -73,7 +73,10 @@ export const AGENTS_FILE = path.join(PLOINKY_DIR, 'agents.json');
 export const CONTROLLER_STATE_DIR = path.join(PLOINKY_DIR, 'data');
 export const SECRETS_FILE = path.join(CONTROLLER_STATE_DIR, '.secrets');
 export const PROFILE_FILE = path.join(PLOINKY_DIR, 'profile');
-export const AGENTS_DATA_DIR = path.join(PLOINKY_WORKSPACE_ROOT, '.data');
+// Workspace data root. Each agent owns `.data/agents/<instance>` (its /root);
+// `.data/robots` and `.data/dpu-data` are separate top-level stores.
+export const DATA_ROOT = path.join(PLOINKY_WORKSPACE_ROOT, '.data');
+export const AGENTS_DATA_DIR = path.join(DATA_ROOT, 'agents');
 
 export const CODE_DIR = path.join(PLOINKY_DIR, 'code');
 export const SKILLS_DIR = path.join(PLOINKY_DIR, 'skills');

@@ -95,7 +95,7 @@ function setenvs(args) {
 }
 
 test('attachBwrapInteractive grants the selected AgentLib source and its environment like the service path', (t) => {
-    const { w, result, args } = attach(t, (workspace) => path.join(workspace.ws, '.data', 'demo'));
+    const { w, result, args } = attach(t, (workspace) => path.join(workspace.ws, '.data', 'agents', 'demo'));
     assert.equal(result.code, 0);
     const { grant } = result;
     const all = mounts(args);
@@ -110,18 +110,18 @@ test('attachBwrapInteractive grants the selected AgentLib source and its environ
     }
     assert.equal(env.get('HOME'), '/root');
     assert.deepEqual(all.filter(mount => mount.target === '/root').map(mount => mount.source),
-        [path.join(w.ws, '.data', 'demo')]);
+        [path.join(w.ws, '.data', 'agents', 'demo')]);
 });
 
-test('attachBwrapInteractive gives a static agent the workspace at /root and HOME at /home/agent', (t) => {
+test('attachBwrapInteractive gives a static agent its private HOME at /root and workspace at its real path', (t) => {
     const { w, result, args } = attach(t, (workspace) => workspace.ws);
     assert.equal(result.code, 0);
     const all = mounts(args);
-    assert.deepEqual(all.filter(mount => mount.target === '/root').map(mount => mount.source), [w.ws]);
-    assert.deepEqual(all.filter(mount => mount.target === '/home/agent').map(mount => mount.source),
-        [path.join(w.ws, '.data', 'demo')]);
-    assert.equal(setenvs(args).get('HOME'), '/home/agent');
-    const controller = all.filter(mount => mount.target === '/root/.ploinky');
+    assert.deepEqual(all.filter(mount => mount.target === w.ws).map(mount => mount.source), [w.ws]);
+    assert.deepEqual(all.filter(mount => mount.target === '/root').map(mount => mount.source),
+        [path.join(w.ws, '.data', 'agents', 'demo')]);
+    assert.equal(setenvs(args).get('HOME'), '/root');
+    const controller = all.filter(mount => mount.target === path.join(w.ws, '.ploinky'));
     assert.deepEqual(controller.map(({ readOnly, source }) => [readOnly, source]), [[true, path.join(w.ws, '.ploinky')]]);
     const { grant } = result;
     assert.ok(all.some(mount => mount.readOnly && mount.source === grant.sourceDir && mount.target === grant.runtimePath));
@@ -133,8 +133,8 @@ test('attachBwrapInteractive shadows a writable alias of the selected AgentLib s
     const { grant } = result;
     assert.equal(grant.sourceDir, path.join(w.ws, 'achillesAgentLib'));
     const all = mounts(args);
-    const workspaceBind = all.find(mount => mount.target === '/root');
-    const shadow = all.find(mount => mount.target === '/root/achillesAgentLib');
+    const workspaceBind = all.find(mount => mount.target === w.ws);
+    const shadow = all.find(mount => mount.target === path.join(w.ws, 'achillesAgentLib'));
     assert.ok(workspaceBind && shadow, 'the workspace bind and the alias shadow are both present');
     assert.deepEqual([shadow.readOnly, shadow.source], [true, grant.sourceDir]);
     assert.ok(shadow.index > workspaceBind.index, 'the shadow follows the writable workspace bind');

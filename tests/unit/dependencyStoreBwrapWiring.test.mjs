@@ -74,7 +74,7 @@ test('dependency store wiring (bwrap): an unchanged sandbox is reused and a chan
             bwrap.launches();
         }
     };
-    const record = { ...registration(), runtime: 'bwrap', projectPath: path.join(w.ws, '.data', 'demo') };
+    const record = { ...registration(), runtime: 'bwrap', projectPath: path.join(w.ws, '.data', 'agents', 'demo') };
 
     const started = drive([
         { action: 'init-edge' },

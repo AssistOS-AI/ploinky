@@ -6,6 +6,7 @@ import { readBoxWorkspaceRoot } from '../../../ploinky-box/contract/workspace-ro
 import {
     assertNoRetiredControllerSecrets,
     readWorkspaceMasterKey,
+    initializeWorkspaceMasterKey,
     workspaceMasterKeyPath,
 } from '../../../ploinky-box/entrypoint/initialize-workspace.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
@@ -110,61 +111,24 @@ function resolveGeneratedMasterKeyRoot(startDir = process.cwd()) {
     }
 }
 
-// Inside the agent-masked controller-state root, like the managed Box key.
+// The dedicated private-data store is visible only to explicitly granted agents.
 function resolveGeneratedMasterKeyPath(startDir = process.cwd()) {
-    return path.join(resolveGeneratedMasterKeyRoot(startDir), '.ploinky', 'data', GENERATED_MASTER_KEY_FILE);
-}
-
-function readGeneratedMasterKeySeed(filePath) {
-    try {
-        const raw = String(fs.readFileSync(filePath, 'utf8') || '').trim();
-        return raw || '';
-    } catch (_) {
-        return '';
-    }
-}
-
-function writeGeneratedMasterKeySeed(filePath) {
-    const generated = crypto.randomBytes(32).toString('hex');
-    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-    try {
-        fs.writeFileSync(filePath, `${generated}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-        try { fs.chmodSync(filePath, 0o600); } catch (_) { }
-        return generated;
-    } catch (error) {
-        if (error?.code === 'EEXIST') {
-            for (let attempt = 0; attempt < 50; attempt += 1) {
-                const existing = readGeneratedMasterKeySeed(filePath);
-                if (existing) {
-                    return existing;
-                }
-                const waitBuffer = new SharedArrayBuffer(4);
-                Atomics.wait(new Int32Array(waitBuffer), 0, 0, 10);
-            }
-            throw new Error(`Generated master key file exists but is empty: ${filePath}`);
-        }
-        throw error;
-    }
+    return path.join(resolveGeneratedMasterKeyRoot(startDir), '.data', 'dpu-data', GENERATED_MASTER_KEY_FILE);
 }
 
 function resolveGeneratedMasterKeySeed(startDir = process.cwd()) {
+    const root = resolveGeneratedMasterKeyRoot(startDir);
     const filePath = resolveGeneratedMasterKeyPath(startDir);
-    const existing = readGeneratedMasterKeySeed(filePath);
-    if (existing) {
-        return { seed: existing, filePath, source: 'existing generated fallback' };
+    const legacy = path.join(root, '.ploinky', 'data', 'master-key');
+    if (!fs.existsSync(filePath) && fs.existsSync(legacy)) {
+        throw new Error('Legacy master key requires offline migration: run ploinky destroy, then ploinky start.');
     }
-    try {
-        return {
-            seed: writeGeneratedMasterKeySeed(filePath),
-            filePath,
-            source: 'generated fallback',
-        };
-    } catch (error) {
-        throw new Error(
-            `Unable to persist generated workspace master key at ${filePath}: ${error?.message || String(error)}`,
-            { cause: error },
-        );
-    }
+    const initialized = initializeWorkspaceMasterKey({ workspaceRoot: root });
+    return {
+        seed: readWorkspaceMasterKey({ workspaceRoot: root }).key,
+        filePath,
+        source: initialized.created ? 'generated fallback' : 'existing generated fallback',
+    };
 }
 
 function warnGeneratedFallback({ purpose, source, filePath }) {
@@ -257,11 +221,11 @@ function managedMasterKeyStamp(workspaceRoot, fsApi) {
     const controllerStateDirectory = path.dirname(keyPath);
     const stateDirectory = path.dirname(controllerStateDirectory);
     // Same inspection as readWorkspaceMasterKey: stat for the workspace root
-    // and .ploinky, lstat for the controller-state directory and the key.
+    // and physical checks for both data directories and the key.
     const parts = [
         workspaceRoot,
         directoryStamp(workspaceRoot, fsApi),
-        directoryStamp(stateDirectory, fsApi),
+        directoryStamp(stateDirectory, fsApi, { physical: true }),
         directoryStamp(controllerStateDirectory, fsApi, { physical: true }),
     ];
     const key = fsApi.lstatSync(keyPath);
@@ -431,7 +395,7 @@ function deriveDerivedMasterKey() {
 // the replacement for the shared `derived-master` invocation key (DS015):
 //   PLOINKY_AGENT_SECRET = HKDF_SHA256(master, salt="", info="ploinky/agent-secret/<agentId>/v1", 32)
 // Reuses deriveSubkey so the whole workspace keeps one derivation story; the
-// master key itself never leaves the router.
+// raw master key is never injected into an agent's environment.
 function deriveAgentRequestSecret(agentId, { encoding = 'hex' } = {}) {
     const id = String(agentId || '').trim();
     if (!id) {

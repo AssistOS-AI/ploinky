@@ -10,8 +10,8 @@ import {
     isPathWithin,
     projectedCanonicalPath,
     assertCanonicalAgentDataPath,
-    ensureAgentDataDirectory,
     validateAgentDataKey,
+    AGENTS_DATA_SEGMENT,
 } from './agentDataPathPolicy.js';
 
 function guardError(message, context = {}) {
@@ -22,9 +22,11 @@ function guardError(message, context = {}) {
     return error;
 }
 
-// Router security, edge routing and edge publication state, the workspace
-// master key and the stores it encrypts live under `.ploinky/data`. Agents
-// never see it, even through a broad workspace bind; the rest of the controller
+// Router security, edge routing and edge publication state, and encrypted
+// controller stores live under `.ploinky/data`. Agents never see that directory,
+// even through a broad workspace bind. The master key lives under
+// `.data/dpu-data`, accessible only through an explicit data grant.
+// The rest of the controller
 // root (`.ploinky`, including the dependency store) is pinned read-only by
 // `controllerGuardMounts`, which does not make it confidential. Existing writable
 // workspace grants retain a separate writable projection of `.ploinky/repos`.
@@ -35,21 +37,21 @@ function guardError(message, context = {}) {
 // mask is always there, so an absent or symlinked directory is a guard error,
 // never a reason to pin the workspace read-only or to skip the mask.
 export const HOST_STATE_GUARD_KEY = 'host';
-export const PRIVATE_DATA_GUARD_KEY = 'private';
+// The whole workspace `.data` is opaque through a broad workspace bind. A
+// launch sees its own `.data/agents/<instance>` at its real path inside that
+// mask (and at /root); every other store under `.data` reaches an agent only
+// through an explicit, separately validated bind (home, volume, storage).
+export const DATA_GUARD_KEY = 'workspace-data';
 
-export function ensurePrivateDataRoot(workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
-    return ensureAgentDataDirectory(path.join(workspaceRoot, '.data', '.private'), { workspaceRoot, mode: 0o700 });
-}
-
-function canonicalPrivateDataRoot(hostPath, workspaceRoot) {
-    assertCanonicalAgentDataPath(hostPath, { workspaceRoot });
+function canonicalWorkspaceDataRoot(hostPath, workspaceRoot) {
+    assertCanonicalAgentDataPath(hostPath, { workspaceRoot, allowDataRoot: true });
     let stat;
     try { stat = fs.lstatSync(hostPath); } catch (error) {
         if (error?.code !== 'ENOENT') throw error;
-        throw guardError(`the private data directory '${hostPath}' is missing`);
+        throw guardError(`the workspace data directory '${hostPath}' is missing`);
     }
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
-        throw guardError(`the private data directory '${hostPath}' must be a real directory`);
+        throw guardError(`the workspace data directory '${hostPath}' must be a real directory`);
     }
     return projectedCanonicalPath(hostPath);
 }
@@ -59,7 +61,7 @@ export function protectedControllerStateRoots(workspaceRoot = PLOINKY_WORKSPACE_
     return Object.freeze([
         Object.freeze({ key: 'data', hostPath: path.join(root, '.ploinky', 'data') }),
         Object.freeze({ key: HOST_STATE_GUARD_KEY, hostPath: path.join(root, HOST_STATE_DIRECTORY_NAME) }),
-        Object.freeze({ key: PRIVATE_DATA_GUARD_KEY, hostPath: path.join(root, '.data', '.private') }),
+        Object.freeze({ key: DATA_GUARD_KEY, hostPath: path.join(root, '.data') }),
     ]);
 }
 
@@ -98,6 +100,50 @@ function guardBase(workspaceRoot) {
     return selected;
 }
 
+// A read-only view of `.data` that holds nothing but the mountpoint
+// `agents/<name>` for the launch's own home. It lives beside the guard sources,
+// outside the workspace, and is never written by the runtime: the home is bound
+// over the pre-created, permanently empty mountpoint.
+function ownAgentDataProjection(agentDataDir, workspaceRoot) {
+    const root = path.resolve(workspaceRoot);
+    const source = path.resolve(String(agentDataDir));
+    const agentsRoot = path.join(root, '.data', AGENTS_DATA_SEGMENT);
+    // Only an agent home (`.data/agents/<name>`) is projected; any other home
+    // (the workspace itself for a static agent) leaves the plain mask.
+    if (path.dirname(source) !== agentsRoot) return null;
+    const name = validateAgentDataKey(path.basename(source), { label: 'agent data directory name' });
+    assertCanonicalAgentDataPath(source, { workspaceRoot: root });
+    let stat;
+    try { stat = fs.lstatSync(source); } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw guardError(`agent data directory '${source}' must be a real directory`, { source });
+    }
+    const digest = crypto.createHash('sha256').update(source).digest('hex').slice(0, 24);
+    const view = path.join(guardBase(root), 'data-views', digest);
+    const viewAgents = path.join(view, AGENTS_DATA_SEGMENT);
+    const mountpoint = path.join(viewAgents, name);
+    fs.mkdirSync(path.dirname(view), { recursive: true, mode: 0o700 });
+    for (const directory of [view, viewAgents, mountpoint]) {
+        try {
+            fs.mkdirSync(directory, { mode: 0o755 });
+        } catch (error) {
+            if (error?.code !== 'EEXIST') throw error;
+        }
+        if (fs.lstatSync(directory).isSymbolicLink() || !fs.lstatSync(directory).isDirectory()) {
+            throw guardError(`runtime data view '${directory}' must be a physical directory`, { directory });
+        }
+    }
+    const listing = (directory) => fs.readdirSync(directory).sort().join('/');
+    if (listing(view) !== AGENTS_DATA_SEGMENT || listing(viewAgents) !== name || listing(mountpoint) !== '') {
+        throw guardError(`runtime data view '${view}' holds unexpected entries`, { view });
+    }
+    for (const directory of [mountpoint, viewAgents, view]) fs.chmodSync(directory, 0o555);
+    return Object.freeze({ view, source: projectedCanonicalPath(source), name });
+}
+
 export function ensureControllerGuardSources({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
@@ -123,13 +169,14 @@ export function ensureControllerGuardSources({
     return sources;
 }
 
-// The host and private state skeletons persist. Only the controller data root
+// The host and workspace data skeletons persist. Only the controller data root
 // can be a runtime-created mountpoint.
 export function prepareControllerGuardMountpointCleanup({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
     const missingRoots = protectedControllerStateRoots(workspaceRoot)
-        .filter(({ key, hostPath }) => key !== HOST_STATE_GUARD_KEY && key !== PRIVATE_DATA_GUARD_KEY && !fs.existsSync(hostPath));
+        .filter(({ key, hostPath }) => key !== HOST_STATE_GUARD_KEY
+            && key !== DATA_GUARD_KEY && !fs.existsSync(hostPath));
     return () => {
         for (const { hostPath } of missingRoots) {
             let stat;
@@ -192,16 +239,10 @@ function protectedRootSymlinks(target) {
     return links;
 }
 
-// `privateDataGrants` names further exact directories below `.data/.private`
-// that this launch may bind, besides the agent's own private directory (for
-// example the workspace git credentials directory of a declaring agent).
 export function controllerGuardTargets(bindings, {
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
-    agentName,
-    privateDataGrants = [],
 } = {}) {
     const targets = new Map();
-    const grantedPrivateSources = new Set((privateDataGrants || []).map(grant => path.resolve(String(grant))));
     const frameworkRoot = projectedCanonicalPath(path.join(workspaceRoot, '.ploinky'));
     for (const binding of bindings || []) {
         const rawSource = String(binding?.hostPath || binding?.source || '').trim();
@@ -212,9 +253,9 @@ export function controllerGuardTargets(bindings, {
         const canonicalSource = projectedCanonicalPath(source);
         for (const protectedRoot of protectedControllerStateRoots(workspaceRoot)) {
             const hostState = protectedRoot.key === HOST_STATE_GUARD_KEY;
-            const privateData = protectedRoot.key === PRIVATE_DATA_GUARD_KEY;
+            const workspaceData = protectedRoot.key === DATA_GUARD_KEY;
             let canonicalProtectedRoot;
-            if (privateData) canonicalProtectedRoot = canonicalPrivateDataRoot(protectedRoot.hostPath, workspaceRoot);
+            if (workspaceData) canonicalProtectedRoot = canonicalWorkspaceDataRoot(protectedRoot.hostPath, workspaceRoot);
             else if (hostState) {
                 canonicalProtectedRoot = path.join(
                     projectedCanonicalPath(path.dirname(protectedRoot.hostPath)), path.basename(protectedRoot.hostPath),
@@ -223,7 +264,7 @@ export function controllerGuardTargets(bindings, {
             // Workspace and controller aliases are allowed. Inspect indirection
             // introduced below the canonical controller root instead. The host
             // state directory takes no indirection at all (checked below).
-            for (const symlink of hostState || privateData ? [] : protectedRootSymlinks(path.join(frameworkRoot, protectedRoot.key))) {
+            for (const symlink of hostState || workspaceData ? [] : protectedRootSymlinks(path.join(frameworkRoot, protectedRoot.key))) {
                 const parent = projectedCanonicalPath(path.dirname(symlink));
                 if (binding.readOnly !== true && !isPathWithin(parent, frameworkRoot)
                     && isPathWithin(parent, canonicalSource)) {
@@ -236,13 +277,10 @@ export function controllerGuardTargets(bindings, {
                 canonicalHostStateRoot(protectedRoot.hostPath);
             }
             if (isPathWithin(canonicalSource, canonicalProtectedRoot)) {
-                if (privateData && agentName
-                    && source === path.join(protectedRoot.hostPath, validateAgentDataKey(agentName))) {
-                    assertCanonicalAgentDataPath(source, { workspaceRoot });
-                    continue;
-                }
-                if (privateData && grantedPrivateSources.has(source) && source !== protectedRoot.hostPath) {
-                    assertCanonicalAgentDataPath(source, { workspaceRoot });
+                // Binds of or below `.data` (homes, volumes, storage) were
+                // validated by the agent data policy and are explicit grants.
+                if (workspaceData) {
+                    assertCanonicalAgentDataPath(source, { workspaceRoot, allowDataRoot: true });
                     continue;
                 }
                 throw guardError(
@@ -371,8 +409,8 @@ export function controllerGuardMounts(targets, options = {}) {
         // absent (which would pin the whole workspace read-only).
         const exists = guard.key === HOST_STATE_GUARD_KEY
             ? Boolean(canonicalHostStateRoot(guard.protectedHostPath))
-            : guard.key === PRIVATE_DATA_GUARD_KEY
-                ? Boolean(canonicalPrivateDataRoot(guard.protectedHostPath, options.workspaceRoot || PLOINKY_WORKSPACE_ROOT))
+            : guard.key === DATA_GUARD_KEY
+                ? Boolean(canonicalWorkspaceDataRoot(guard.protectedHostPath, options.workspaceRoot || PLOINKY_WORKSPACE_ROOT))
             : fs.existsSync(guard.protectedHostPath);
         if (guard.parentTarget) {
             for (const binding of bindings) {
@@ -381,8 +419,9 @@ export function controllerGuardMounts(targets, options = {}) {
             }
             // Retain the standalone planner contract for callers that already
             // supplied resolved targets rather than the original bind list. The
-            // host state parent is the workspace itself: never pin it.
-            if (!bindings.length && guard.key !== HOST_STATE_GUARD_KEY) {
+            // host state and workspace data parents are the workspace itself:
+            // never pin it.
+            if (!bindings.length && guard.key !== HOST_STATE_GUARD_KEY && guard.key !== DATA_GUARD_KEY) {
                 const source = fs.existsSync(guard.protectedParentHostPath)
                     ? guard.protectedParentHostPath : sources.get(guard.key);
                 parents.set(guard.parentTarget, { source, target: guard.parentTarget, readOnly: true, parent: true });
@@ -390,6 +429,19 @@ export function controllerGuardMounts(targets, options = {}) {
         }
         // An absent child must stay absent: a child bind would create a host
         // mountpoint which is unreachable if removed after container creation.
+        const ownData = guard.key === DATA_GUARD_KEY && guard.parentTarget && options.agentDataDir
+            ? ownAgentDataProjection(options.agentDataDir, options.workspaceRoot || PLOINKY_WORKSPACE_ROOT)
+            : null;
+        if (ownData) {
+            // Inside the mask, the launch's own home stays at its real path.
+            children.push({ source: ownData.view, target: guard.target, readOnly: true });
+            children.push({
+                source: ownData.source,
+                target: path.posix.join(guard.target, AGENTS_DATA_SEGMENT, ownData.name),
+                readOnly: false,
+            });
+            continue;
+        }
         if (exists || !guard.parentTarget) children.push({ source: sources.get(guard.key), target: guard.target, readOnly: true });
     }
     return [

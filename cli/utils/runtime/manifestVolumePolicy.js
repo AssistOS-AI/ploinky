@@ -27,7 +27,7 @@ export function resolveManifestVolumeHostPath(hostPath, workspaceRoot = PLOINKY_
     }
     const dataRoot = path.join(path.resolve(workspaceRoot), '.data');
     if (isPathWithin(resolved, dataRoot)) {
-        assertCanonicalAgentDataPath(resolved, { workspaceRoot });
+        assertCanonicalAgentDataPath(resolved, { workspaceRoot, allowDataRoot: true });
     }
     return resolved;
 }
@@ -41,10 +41,13 @@ export function ensureManifestVolumeHostPath(resolvedHostPath, _containerPath, o
     const dataBacked = isPathWithin(resolvedHostPath, dataRoot);
     const revalidate = () => {
         assertManifestVolumeStoragePolicy(resolvedHostPath, { workspaceRoot, agentName });
-        if (dataBacked) assertCanonicalAgentDataPath(resolvedHostPath, { workspaceRoot });
+        if (dataBacked) assertCanonicalAgentDataPath(resolvedHostPath, { workspaceRoot, allowDataRoot: true });
     };
     const ensureDirectory = (directory) => {
-        if (dataBacked) {
+        if (directory === dataRoot) {
+            assertCanonicalAgentDataPath(dataRoot, { workspaceRoot, allowDataRoot: true });
+            fs.mkdirSync(dataRoot, { recursive: true });
+        } else if (dataBacked) {
             ensureAgentDataDirectory(directory, { workspaceRoot });
         } else {
             fs.mkdirSync(directory, { recursive: true });

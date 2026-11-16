@@ -305,7 +305,7 @@ test('ensureAgentService keeps a prepared registry record only when asked to pre
     const prepared = { ...registration(), instanceId: 'prepared-instance', enableGeneration: 'prepared-generation' };
     const preserved = stepValue(driveWiring(w, [
         { action: 'init-edge' },
-        { action: 'register', containerName: CONTAINER, record: { ...prepared, projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'register', containerName: CONTAINER, record: { ...prepared, projectPath: path.join(w.ws, '.data', 'agents', 'demo') } },
         { action: 'prepare-lease' },
         { label: 'start', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
     ]), 'start');
@@ -322,7 +322,7 @@ test('ensureAgentService keeps a prepared registry record only when asked to pre
     const other = wiringWorkspace(t, { prefix: 'depstore-rotate-' });
     const rotated = driveWiring(other, [
         { action: 'init-edge' },
-        { action: 'register', containerName: CONTAINER, record: { ...prepared, projectPath: path.join(other.ws, '.data', 'demo') } },
+        { action: 'register', containerName: CONTAINER, record: { ...prepared, projectPath: path.join(other.ws, '.data', 'agents', 'demo') } },
         { action: 'prepare-lease' },
         { label: 'start', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, preserve: false, activate: true, allowFailure: true },
     ]);

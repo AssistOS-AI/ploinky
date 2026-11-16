@@ -159,7 +159,7 @@ function resolveAgentRecordForUpload(agentSegment) {
     const workspaceRoot = getWorkspaceRoot();
     const key = validateAgentDataKey(selected.record.agentName, { label: 'blob agent name' });
     return agentRecordResult(agentSegment, selected.record,
-        path.join(workspaceRoot, '.data', key, 'blobs'), workspaceRoot);
+        path.join(workspaceRoot, '.data', 'agents', key, 'blobs'), workspaceRoot);
 }
 
 function getRouteUrl(agent, id) {
@@ -175,7 +175,7 @@ function getLocalPath(agent, id) {
     if (agent?.isShared) {
         return `/shared/${id}`;
     }
-    return `.data/${agent.canonicalName}/blobs/${id}`;
+    return `.data/agents/${agent.canonicalName}/blobs/${id}`;
 }
 
 async function ensureAgentBlobsDirAsync(agent, check) {

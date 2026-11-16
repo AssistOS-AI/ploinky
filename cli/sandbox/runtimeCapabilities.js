@@ -14,6 +14,7 @@ import {
 import { hasHostStateComponent } from '../../ploinky-box/hostState/paths.mjs';
 import { NESTED_PODMAN_SECCOMP_BOX_PATH } from '../../ploinky-box/seccomp.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
+import { assertNoRetiredStorage } from '../utils/runtime/retiredStoragePolicy.js';
 import {
     buildEffectivePolicy,
     canonicalize,
@@ -670,6 +671,7 @@ export function admitManifestRuntimeCapabilities(manifest, {
             code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
         });
     }
+    assertNoRetiredStorage(manifest);
     let exactManifest = manifest;
     if (manifestBytes !== undefined) {
         try {

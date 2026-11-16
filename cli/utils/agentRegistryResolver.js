@@ -18,6 +18,16 @@
 
 export const RESERVED_AGENT_REGISTRY_KEYS = Object.freeze(new Set(['_config']));
 
+// Instance homes must not overlap the common /shared store. Keep this separate
+// from registry metadata keys so existing records remain addressable for cleanup.
+export const RESERVED_AGENT_INSTANCE_NAMES = Object.freeze(new Set(['shared']));
+
+export function assertAgentInstanceName(name) {
+    if (RESERVED_AGENT_INSTANCE_NAMES.has(String(name).toLowerCase())) {
+        throw new Error(`Agent instance name '${name}' is reserved for shared storage. Choose a different name or alias.`);
+    }
+}
+
 // The alias spelling the registry accepts (see normalizeAlias in agents.js).
 export const AGENT_ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 

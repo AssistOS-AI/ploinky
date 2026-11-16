@@ -100,7 +100,7 @@ test('bwrap appends final read-only opacity guards for broad workspace binds', (
         fs.mkdirSync(path.join(root, '.ploinky', 'data'), { recursive: true });
         const args = ['--bind', root, '/workspace'];
         const targets = appendControllerStateGuards(args, { workspaceRoot: root });
-        assert.deepEqual(targets.map(entry => entry.target).sort(), ['/workspace/.ploinky-box', '/workspace/.ploinky/data']);
+        assert.deepEqual(targets.map(entry => entry.target).sort(), ['/workspace/.data', '/workspace/.ploinky-box', '/workspace/.ploinky/data']);
         for (const target of targets) {
             const index = args.lastIndexOf(target.target);
             assert.equal(args[index - 2], '--ro-bind', target.target);
@@ -145,12 +145,13 @@ test('production bwrap args re-expose no controller secret through the masked st
         for (const file of secrets) fs.writeFileSync(file, 'synthetic\n', { mode: 0o600 });
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'fake', 'node_modules');
-        const sharedDir = path.join(root, '.data', 'shared');
-        const agentHomeDir = path.join(root, '.data', 'demo');
+        const sharedDir = path.join(root, '.data', 'agents', 'shared');
+        const agentHomeDir = path.join(root, '.data', 'agents', 'demo');
         const agentLibPath = path.join(root, 'Agent');
         for (const dir of [agentCodePath, nodeModulesDir, sharedDir, agentHomeDir, path.join(agentLibPath, 'node_modules')]) {
             fs.mkdirSync(dir, { recursive: true });
         }
+        fs.writeFileSync(path.join(root, '.data', '.layout.json'), JSON.stringify({ version: 4 }));
         const moduleUrl = new URL('../../cli/sandbox/bwrap/bwrapServiceManager.js', import.meta.url).href;
         const script = `
             const { buildBwrapArgs } = await import(${JSON.stringify(moduleUrl)});
@@ -218,9 +219,9 @@ test('global bwrap preserves writable project source and protects code and depen
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const cacheRoot = path.join(root, '.ploinky', 'deps', 'store', 'objects', '11111111-2222-4333-8444-555555555555', 'payload');
         const nodeModulesDir = path.join(cacheRoot, 'node_modules');
-        const sharedDir = path.join(root, '.data', 'shared');
+        const sharedDir = path.join(root, '.data', 'agents', 'shared');
         const agentLibPath = path.join(root, 'Agent');
-        const agentHomeDir = path.join(root, '.data', 'demo');
+        const agentHomeDir = path.join(root, '.data', 'agents', 'demo');
         const nodeRuntimePath = path.join(root, 'node-runtime');
         for (const dir of [agentCodePath, nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), agentHomeDir, nodeRuntimePath]) {
             fs.mkdirSync(dir, { recursive: true });
@@ -262,9 +263,9 @@ test(`real bwrap production args pin ancestors, keep ${dataExists ? 'existing' :
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agent', 'node_modules');
-        const sharedDir = path.join(root, '.data', 'shared');
+        const sharedDir = path.join(root, '.data', 'agents', 'shared');
         const agentLibPath = path.join(root, 'Agent');
-        const agentHomeDir = path.join(root, '.data', 'demo');
+        const agentHomeDir = path.join(root, '.data', 'agents', 'demo');
         for (const directory of [path.join(agentCodePath, 'node_modules'), nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), agentHomeDir]) {
             fs.mkdirSync(directory, { recursive: true });
         }
@@ -288,10 +289,19 @@ test(`real bwrap production args pin ancestors, keep ${dataExists ? 'existing' :
             envMap: {},
             codeReadOnly: true,
             skillsReadOnly: true,
-            volumes: { [path.join(root, '.ploinky')]: '/framework/././' },
+            volumes: {},
         });
+        // Exercise controller aliases produced by runtime bindings; manifests refuse this source.
+        args.push('--bind', path.join(root, '.ploinky'), '/framework/././');
+        appendControllerStateGuards(args, { workspaceRoot: root, agentDataDir: agentHomeDir });
         const probe = [
             'set -eu',
+            'test "$(/opt/ploinky-node/bin/node -p 1)" = 1',
+            'rename_dir() { /opt/ploinky-node/bin/node -e \'require("node:fs").renameSync(process.argv[1], process.argv[2])\' "$1" "$2"; }',
+            'test "$(cat /code/source)" = source',
+            'test "$(cat /code/node_modules/dependency-sentinel)" = prepared',
+            'test "$(cat /Agent/node_modules/dependency-sentinel)" = prepared',
+            'if touch /code/source /code/node_modules/dependency-sentinel 2>/dev/null; then exit 73; fi',
             dataExists ? 'test -z "$(ls -A "$1/.ploinky/data")"' : 'test ! -e "$1/.ploinky/data"',
             dataExists ? 'test -z "$(ls -A /framework/data)"' : 'test ! -e /framework/data',
             'if touch /framework/data/escaped 2>/dev/null; then exit 76; fi',
@@ -304,19 +314,17 @@ test(`real bwrap production args pin ancestors, keep ${dataExists ? 'existing' :
             'if mkdir "$1/.ploinky/data/dir" 2>/dev/null; then exit 65; fi',
             'if mkdir "$1/.ploinky/new-dir" 2>/dev/null; then exit 66; fi',
             ...(dataExists ? [] : ['if mkdir "$1/.ploinky/data" 2>/dev/null; then exit 67; fi']),
-            'if mv "$1/.ploinky" "$1/moved" 2>/dev/null; then exit 68; fi',
+            // Test rename itself. mv falls back to copy/delete on mount points,
+            // and repositories are intentionally writable through the workspace.
+            'if rename_dir "$1/.ploinky" "$1/moved" 2>/dev/null; then exit 68; fi',
             'if rm -rf "$1/.ploinky" 2>/dev/null; then exit 69; fi',
             'if ln -sfn "$1/replacement" "$1/.ploinky" 2>/dev/null; then exit 70; fi',
-            'if mv "$1" "$2/moved" 2>/dev/null; then exit 71; fi',
-            'if mv "$2/projects" "$2/moved" 2>/dev/null; then exit 72; fi',
-            'test "$(cat /code/source)" = source',
-            'test "$(cat /code/node_modules/dependency-sentinel)" = prepared',
-            'test "$(cat /Agent/node_modules/dependency-sentinel)" = prepared',
-            'if touch /code/source /code/node_modules/dependency-sentinel 2>/dev/null; then exit 73; fi',
-            // mv may copy/delete writable project siblings before failing on
-            // a mounted ancestor; recreating the private home remains allowed.
-            'mkdir -p "$1/.data/demo"',
-            'touch "$1/project-write" "$1/.data/demo/persisted"',
+            'if rename_dir "$1" "$2/moved" 2>/dev/null; then exit 71; fi',
+            'if rename_dir "$2/projects" "$2/moved" 2>/dev/null; then exit 72; fi',
+            // Recursive removal may delete writable repository contents, but
+            // controller records and the projected home mount remain protected.
+            'test -d "$1/.data/agents/demo"',
+            'touch "$1/project-write" "$1/.data/agents/demo/persisted"',
             'echo BWRAP_OPAQUE_OK',
         ].join('; ');
         const result = spawnSync('bwrap', [
@@ -358,9 +366,9 @@ test('buildBwrapArgs allows manifest volumes outside .ploinky', () => {
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'store', 'objects', '11111111-2222-4333-8444-555555555555', 'payload', 'node_modules');
-        const sharedDir = path.join(root, '.data', 'shared');
+        const sharedDir = path.join(root, '.data', 'agents', 'shared');
         const agentLibPath = path.join(root, 'Agent');
-        const agentHomeDir = path.join(root, '.data', 'demo');
+        const agentHomeDir = path.join(root, '.data', 'agents', 'demo');
         const dataDir = path.join(root, 'workspace-data', 'uploads');
         for (const dir of [agentCodePath, nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), agentHomeDir, dataDir]) {
             fs.mkdirSync(dir, { recursive: true });
@@ -394,9 +402,9 @@ test('buildBwrapArgs enforces read-only manifest volume options', () => {
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'store', 'objects', '11111111-2222-4333-8444-555555555555', 'payload', 'node_modules');
-        const sharedDir = path.join(root, '.data', 'shared');
+        const sharedDir = path.join(root, '.data', 'agents', 'shared');
         const agentLibPath = path.join(root, 'Agent');
-        const secretDir = path.join(root, '.data', 'secret');
+        const secretDir = path.join(root, '.data', 'agents', 'secret');
         for (const dir of [agentCodePath, nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), secretDir]) {
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -428,9 +436,9 @@ test('buildBwrapArgs uses the persistent home as /root for isolated agents', () 
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agent', 'node_modules');
-        const sharedDir = path.join(root, '.data', 'shared');
+        const sharedDir = path.join(root, '.data', 'agents', 'shared');
         const agentLibPath = path.join(root, 'Agent');
-        const agentHomeDir = path.join(root, '.data', 'demoAlias');
+        const agentHomeDir = path.join(root, '.data', 'agents', 'demoAlias');
         for (const dir of [agentCodePath, nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), agentHomeDir]) {
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -515,9 +523,9 @@ test('buildBwrapArgs grants the selected AgentLib source read-only and shadows i
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'store', 'objects', '11111111-2222-4333-8444-555555555555', 'payload', 'node_modules');
-        const sharedDir = path.join(root, '.data', 'shared');
+        const sharedDir = path.join(root, '.data', 'agents', 'shared');
         const agentLibPath = path.join(root, 'Agent');
-        const agentHomeDir = path.join(root, '.data', 'demo');
+        const agentHomeDir = path.join(root, '.data', 'agents', 'demo');
         const nodeRuntimePath = path.join(root, 'node-runtime');
         for (const dir of [agentCodePath, nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), agentHomeDir, nodeRuntimePath]) {
             fs.mkdirSync(dir, { recursive: true });

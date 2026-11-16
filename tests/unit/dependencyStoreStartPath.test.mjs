@@ -84,7 +84,7 @@ for (const runtime of ['podman', 'docker']) {
         const w = workspace(t, { runtime });
         const steps = byStep(drive(w, [
             { action: 'init-edge' },
-            { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'demo') } },
+            { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'agents', 'demo') } },
             { action: 'prepare-lease' },
             { label: 'first', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
             { action: 'prepare-lease' },
@@ -150,7 +150,7 @@ test('dependency store start path: a runtime without a dependency record is repl
     fs.mkdirSync(unrecorded, { recursive: true });
     const steps = byStep(drive(w, [
         { action: 'init-edge' },
-        { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'agents', 'demo') } },
         { action: 'prepare-lease' },
         { label: 'first', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
     ]));
@@ -178,7 +178,7 @@ test('dependency store start path: a start-only agent without package.json keeps
     const w = workspace(t, { packageJson: null });
     const steps = byStep(drive(w, [
         { action: 'init-edge' },
-        { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'agents', 'demo') } },
         { action: 'prepare-lease' },
         { label: 'first', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
         { label: 'warm', action: 'ensure-with-lease', containerName: CONTAINER, activate: true },
@@ -196,7 +196,7 @@ test('dependency store start path: a coordinated same-name host/none replacement
     const w = workspace(t);
     const steps = byStep(drive(w, [
         { action: 'init-edge' },
-        { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'register', containerName: CONTAINER, record: { ...registration(), projectPath: path.join(w.ws, '.data', 'agents', 'demo') } },
         { action: 'prepare-lease' },
         { label: 'first', action: 'ensure-with-lease', containerName: CONTAINER, startPath: true, activate: true },
     ]));
@@ -222,7 +222,7 @@ test('dependency store start path (seatbelt): first start builds, warm reuses, a
     const steps = byStep(drive(w, [
         { action: 'init-edge' },
         { action: 'enable-sandbox' },
-        { action: 'register', containerName: CONTAINER, record: { ...registration(), runtime: 'seatbelt', projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'register', containerName: CONTAINER, record: { ...registration(), runtime: 'seatbelt', projectPath: path.join(w.ws, '.data', 'agents', 'demo') } },
         { action: 'prepare-lease' },
         { label: 'first', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, startPath: true, activate: true },
         { label: 'warm', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, activate: true },
@@ -288,7 +288,7 @@ test('dependency store start path (seatbelt): a package change through the works
     const steps = byStep(drive(w, [
         { action: 'init-edge' },
         { action: 'enable-sandbox' },
-        { action: 'register', containerName: CONTAINER, record: { ...registration(), runtime: 'seatbelt', projectPath: path.join(w.ws, '.data', 'demo') } },
+        { action: 'register', containerName: CONTAINER, record: { ...registration(), runtime: 'seatbelt', projectPath: path.join(w.ws, '.data', 'agents', 'demo') } },
         { action: 'prepare-lease' },
         { label: 'first', action: 'ensure-with-lease', hostRouter: true, containerName: CONTAINER, startPath: true, activate: true },
     ]));

@@ -27,7 +27,7 @@ import {
 } from './common.js';
 import { loadAgents } from '../../utils/workspace.js';
 import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
-import { resolveAgentHomeLayout } from './agentHomeLayout.js';
+import { resolveAgentHomeLayout, manifestHomeDirectory } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
 import { SHARED_DIR } from '../../utils/config.js';
 import { ensureAgentDataDirectory } from '../../utils/runtime/agentDataPathPolicy.js';
@@ -213,7 +213,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
     const runtime = getRuntime();
     let agents = loadAgentsMap();
     const projectDir = getConfiguredProjectPath(agentName, repoName);
-    const homeDir = getAgentWorkDir(agentName);
+    const homeDir = manifestHomeDirectory({ ...manifest.volumes, ...resolveInteractiveProfileConfig(manifest, { agentName, repoName })?.volumes }, getAgentWorkDir(agentName));
     const homeLayout = resolveAgentHomeLayout({
         cwd: projectDir, cwdMountTarget: projectDir, agentHomeDir: homeDir,
     });
@@ -418,7 +418,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     const runtime = getRuntime();
     const containerName = getAgentContainerName(agentName, repoName);
     const projectDir = getConfiguredProjectPath(agentName, repoName);
-    const homeDir = getAgentWorkDir(agentName);
+    const homeDir = manifestHomeDirectory({ ...manifest.volumes, ...resolveInteractiveProfileConfig(manifest, { agentName, repoName })?.volumes }, getAgentWorkDir(agentName));
     const homeLayout = resolveAgentHomeLayout({
         cwd: projectDir, cwdMountTarget: projectDir, agentHomeDir: homeDir,
     });

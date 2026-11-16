@@ -1,3 +1,4 @@
+import { manifestHomeDirectory } from '../docker/agentHomeLayout.js';
 import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
@@ -76,7 +77,6 @@ import {
 } from '../../utils/security/secretVars.js';
 import {
     ensureGitCredentialsHostDir,
-    ensurePersistentStorageHostDir,
     planRuntimeResources
 } from '../../utils/runtime/runtimeResourcePlanner.js';
 import {
@@ -90,14 +90,6 @@ function isPathWithin(childPath, parentPath) {
         || (relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath));
 }
 
-// The planned git credentials directory needs an explicit grant only when it
-// lies below `.data/.private`, which the profile otherwise keeps opaque.
-function seatbeltPrivateDataGrants(runtimeResourcePlan) {
-    const hostPath = runtimeResourcePlan?.gitCredentials?.hostPath;
-    if (!hostPath) return [];
-    const privateRoot = path.join(PLOINKY_WORKSPACE_ROOT, '.data', '.private');
-    return hostPath !== privateRoot && isPathWithin(hostPath, privateRoot) ? [hostPath] : [];
-}
 // Reuse bwrap PID management (platform-agnostic)
 import {
     assertBwrapPidSlotAvailable,
@@ -544,7 +536,7 @@ function seatbeltDependencyReuseProblem({ agentName, manifest, record, container
     }, deps);
 }
 
-function resolveSeatbeltRuntimeLayout({ agentName, alias, cwd }) {
+function resolveSeatbeltRuntimeLayout({ agentName, alias, cwd, manifest = {}, profileConfig = {} }) {
     const canonicalAgentName = String(agentName || '').trim();
     const instanceName = String(alias || canonicalAgentName).trim();
     const cwdInput = String(cwd || '').trim();
@@ -554,11 +546,20 @@ function resolveSeatbeltRuntimeLayout({ agentName, alias, cwd }) {
     return Object.freeze({
         instanceName,
         cwd: path.resolve(cwdInput),
-        agentWorkDir: getAgentWorkDir(instanceName),
+        agentWorkDir: manifestHomeDirectory({ ...manifest.volumes, ...profileConfig?.volumes }, getAgentWorkDir(instanceName)),
     });
 }
 
-function applySeatbeltRuntimeEnvironment(envMap, layout) {
+function applySeatbeltRuntimeEnvironment(envMap, layout, manifest = {}, profileConfig = {}) {
+    const projections = Object.entries({ ...manifest.volumes, ...profileConfig?.volumes })
+        .map(([source, target]) => [target.replace(/\/+$/, ''), resolveManifestVolumeHostPath(source)])
+        .concat([['/root', layout.agentWorkDir]])
+        .sort((a, b) => b[0].length - a[0].length);
+    for (const [key, value] of Object.entries(envMap)) {
+        if (typeof value !== 'string') continue;
+        const match = projections.find(([target]) => value === target || value.startsWith(`${target}/`));
+        if (match) envMap[key] = match[1] + value.slice(match[0].length);
+    }
     envMap.WORKSPACE_PATH = layout.cwd;
     envMap.HOME = layout.agentWorkDir;
     return envMap;
@@ -581,17 +582,18 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     const profileRecord = loadAgentsMap()[containerName] || {};
     const alias = options.alias || profileRecord.alias;
     const runtimeIdentity = normalizeSandboxRuntimeIdentity(options);
-    const layout = resolveSeatbeltRuntimeLayout({
-        agentName,
-        alias,
-        cwd: getConfiguredProjectPath(agentName, repoName, alias),
-    });
-    const { instanceName, cwd, agentWorkDir } = layout;
 
     // Profile and network are resolved atomically before any sandbox work.
     const profileResolution = resolveSeatbeltRuntimeProfile(agentName, manifest, agentPath, options, profileRecord);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
+    const layout = resolveSeatbeltRuntimeLayout({
+        manifest, profileConfig,
+        agentName,
+        alias,
+        cwd: getConfiguredProjectPath(agentName, repoName, alias),
+    });
+    const { instanceName, cwd, agentWorkDir } = layout;
     admitSeatbeltBoundary(agentName, manifest, agentPath, options, profileResolution);
     assertHostModeGenerationCapability({
         agentId: deriveAgentPrincipalId(repoName, agentName),
@@ -658,7 +660,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     const hostPort = allPortMappings[0]?.hostPort;
 
     const runtimeResourcePlan = planRuntimeResources(manifest, { useHostStoragePath: true, agentName, repoName });
-    ensurePersistentStorageHostDir(runtimeResourcePlan);
     ensureGitCredentialsHostDir(runtimeResourcePlan);
 
     // Build environment map (reuse bwrap's builder with 'seatbelt' runtimeName)
@@ -677,7 +678,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
 
     // NODE_PATH for module resolution
     envMap.NODE_PATH = nodeModulesDir;
-    applySeatbeltRuntimeEnvironment(envMap, layout);
+    applySeatbeltRuntimeEnvironment(envMap, layout, manifest, profileConfig);
     envMap.PATH = buildSeatbeltPathEnv();
 
     // Rewrite mcp-config.json for real paths
@@ -714,10 +715,8 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
-            ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : []),
             ...(runtimeResourcePlan.gitCredentials?.hostPath ? [runtimeResourcePlan.gitCredentials.hostPath] : [])
         ],
-        privateDataGrants: seatbeltPrivateDataGrants(runtimeResourcePlan),
     });
     const profilePath = writeSeatbeltProfile(agentName, profileContent);
 
@@ -938,11 +937,6 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
     if (!aliasOverride && existingRecord.alias) {
         aliasOverride = existingRecord.alias;
     }
-    const reuseLayout = resolveSeatbeltRuntimeLayout({
-        agentName,
-        alias: aliasOverride,
-        cwd: getConfiguredProjectPath(agentName, repoName, aliasOverride),
-    });
 
     // Profile config and host-network compatibility are validated even when the
     // existing sandbox can otherwise be reused.
@@ -952,6 +946,12 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
     }, existingRecord);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
+    const reuseLayout = resolveSeatbeltRuntimeLayout({
+        manifest, profileConfig,
+        agentName,
+        alias: aliasOverride,
+        cwd: getConfiguredProjectPath(agentName, repoName, aliasOverride),
+    });
     const runtimeBoundary = admitSeatbeltBoundary(
         agentName,
         manifest,
@@ -1093,6 +1093,7 @@ async function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
     const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
     const layout = resolveSeatbeltRuntimeLayout({
+        manifest, profileConfig,
         agentName,
         alias: record.alias,
         cwd: record.projectPath || getConfiguredProjectPath(agentName, repoName, record.alias),
@@ -1154,7 +1155,6 @@ async function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
 
     const runtimeResourcePlan = planRuntimeResources(manifest, { useHostStoragePath: true, agentName, repoName });
-    ensurePersistentStorageHostDir(runtimeResourcePlan);
     ensureGitCredentialsHostDir(runtimeResourcePlan);
 
     // Build environment (same as running agent)
@@ -1167,7 +1167,7 @@ async function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir
     envMap.PLOINKY_INVOCATION_AUTH_MODULE = path.join(seatbeltAgentLibPath, 'lib/invocation-auth.mjs');
     envMap.PLOINKY_CODE_DIR = agentCodePath;
     envMap.NODE_PATH = nodeModulesDir;
-    applySeatbeltRuntimeEnvironment(envMap, layout);
+    applySeatbeltRuntimeEnvironment(envMap, layout, manifest, profileConfig);
     envMap.PATH = buildSeatbeltPathEnv();
 
     // Rewrite mcp-config
@@ -1204,10 +1204,8 @@ async function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
-            ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : []),
             ...(runtimeResourcePlan.gitCredentials?.hostPath ? [runtimeResourcePlan.gitCredentials.hostPath] : [])
         ],
-        privateDataGrants: seatbeltPrivateDataGrants(runtimeResourcePlan),
     });
     const profilePath = writeSeatbeltProfile(agentName, profileContent);
 

@@ -34,7 +34,7 @@ export const GIT_CREDENTIALS_FILE = 'credentials.json';
 export const GIT_CREDENTIALS_HOST = 'github.com';
 export const DEFAULT_GIT_CREDENTIALS_CONTAINER_PATH = '/git-credentials';
 
-const DEFAULT_RELATIVE_DIR = path.join('.data', '.private', '.git-credentials');
+const DEFAULT_RELATIVE_DIR = path.join('.data', 'dpu-data', 'git-credentials');
 const AAD = Buffer.from(GIT_CREDENTIALS_SCHEMA, 'utf8');
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
@@ -92,7 +92,7 @@ function readDirectoryVar(root) {
 
 /**
  * The host directory that holds the credentials file. The default is
- * `<workspace>/.data/.private/.git-credentials`; the ploinky var
+ * `<workspace>/.data/dpu-data/git-credentials`; the ploinky var
  * PLOINKY_GIT_CREDENTIALS_DIR may move it to another workspace-relative or
  * absolute path that stays inside the workspace and outside the controller
  * root and the Box host state. An escaping override throws a policy error.
@@ -103,6 +103,10 @@ export function resolveGitCredentialsDir(workspaceRoot, { override } = {}) {
     if (!configured) return path.join(root, DEFAULT_RELATIVE_DIR);
 
     const target = path.isAbsolute(configured) ? path.resolve(configured) : path.resolve(root, configured);
+    // A persisted override of the former default follows the relocated store.
+    if (target === path.join(root, '.data', '.private', '.git-credentials')) {
+        return resolveGitCredentialsDir(root, { override: DEFAULT_RELATIVE_DIR });
+    }
     const escapes = (candidate, parent) => !isPathWithin(candidate, parent) || candidate === parent;
     const canonicalRoot = projectedCanonicalPath(root);
     const canonicalTarget = projectedCanonicalPath(target);
@@ -116,12 +120,12 @@ export function resolveGitCredentialsDir(workspaceRoot, { override } = {}) {
         || hasHostStateComponent(path.relative(canonicalRoot, canonicalTarget))) {
         throw policyError(`${GIT_CREDENTIALS_DIR_VAR} must not point into the controller root or the Box host state`);
     }
-    // Other agents' private data directories are never a valid target.
-    const defaultDir = path.join(root, DEFAULT_RELATIVE_DIR);
-    const privateRoot = path.join(root, '.data', '.private');
-    if (target !== defaultDir && (isPathWithin(target, privateRoot)
-        || isPathWithin(canonicalTarget, projectedCanonicalPath(privateRoot)))) {
-        throw policyError(`${GIT_CREDENTIALS_DIR_VAR} must not point into another private data directory`);
+    for (const segment of ['agents', 'robots']) {
+        const protectedRoot = path.join(root, '.data', segment);
+        if (isPathWithin(target, protectedRoot)
+            || isPathWithin(canonicalTarget, projectedCanonicalPath(protectedRoot))) {
+            throw policyError(`${GIT_CREDENTIALS_DIR_VAR} must not point into agent or robot data`);
+        }
     }
     return target;
 }
@@ -134,9 +138,8 @@ export function resolveGitCredentialsFile(workspaceRoot, options = {}) {
 export function ensureGitCredentialsDir(workspaceRoot, options = {}) {
     const root = workspaceRoot ? path.resolve(String(workspaceRoot)) : defaultWorkspaceRoot();
     const dir = resolveGitCredentialsDir(root, options);
-    const privateRoot = path.join(root, '.data', '.private');
-    if (isPathWithin(dir, privateRoot)) {
-        ensureAgentDataDirectory(privateRoot, { workspaceRoot: root, mode: 0o700 });
+    if (isPathWithin(dir, path.join(root, '.data'))) {
+        ensureAgentDataDirectory(dir, { workspaceRoot: root, mode: 0o700 });
     } else {
         fs.mkdirSync(path.dirname(dir), { recursive: true });
     }

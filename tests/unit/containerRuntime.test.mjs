@@ -438,7 +438,7 @@ process.stdout.write(getConfiguredProjectPath('demo', 'repo'));`,
         );
 
         assert.equal(result.status, 0, result.stderr);
-        assert.equal(result.stdout, path.join(workspaceDir, '.data', 'demo'));
+        assert.equal(result.stdout, path.join(workspaceDir, '.data', 'agents', 'demo'));
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
@@ -466,7 +466,7 @@ process.stdout.write(getConfiguredProjectPath('demo', 'repo', 'demoAlias'));`,
         );
 
         assert.equal(result.status, 0, result.stderr);
-        assert.equal(result.stdout, path.join(workspaceDir, '.data', 'demoAlias'));
+        assert.equal(result.stdout, path.join(workspaceDir, '.data', 'agents', 'demoAlias'));
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
@@ -478,10 +478,10 @@ test('configured project and MCP sync reject symlinked agent data homes before w
     try {
         const agentSource = path.join(workspaceDir, 'agent-source');
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
-        fs.mkdirSync(path.join(workspaceDir, '.data'), { recursive: true });
+        fs.mkdirSync(path.join(workspaceDir, '.data', 'agents'), { recursive: true });
         fs.mkdirSync(agentSource, { recursive: true });
         fs.writeFileSync(path.join(agentSource, 'mcp-config.json'), '{}');
-        fs.symlinkSync(externalDir, path.join(workspaceDir, '.data', 'demo'), 'dir');
+        fs.symlinkSync(externalDir, path.join(workspaceDir, '.data', 'agents', 'demo'), 'dir');
         fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'agents.json'), JSON.stringify({
             demoContainer: {
                 type: 'agent',
@@ -493,7 +493,7 @@ test('configured project and MCP sync reject symlinked agent data homes before w
 
         for (const snippet of [
             `const { getConfiguredProjectPath } = await import(${JSON.stringify(dockerCommonUrl)});\ngetConfiguredProjectPath('demo', 'repo');`,
-            `const { syncAgentMcpConfig } = await import(${JSON.stringify(dockerCommonUrl)});\nsyncAgentMcpConfig('demoContainer', ${JSON.stringify(agentSource)}, 'demo', { workDir: ${JSON.stringify(path.join(workspaceDir, '.data', 'demo'))} });`,
+            `const { syncAgentMcpConfig } = await import(${JSON.stringify(dockerCommonUrl)});\nsyncAgentMcpConfig('demoContainer', ${JSON.stringify(agentSource)}, 'demo', { workDir: ${JSON.stringify(path.join(workspaceDir, '.data', 'agents', 'demo'))} });`,
         ]) {
             const result = runModuleSnippet(snippet, {}, { cwd: workspaceDir });
             assert.notEqual(result.status, 0, 'symlinked .data home must fail closed');
@@ -720,7 +720,7 @@ console.log(JSON.stringify({ record, mcpTools: policyState.mcpTools }));`,
             bind.source === workspaceDir && bind.target === workspaceDir
         )));
         assert.ok(record.config.binds.some((bind) => (
-            bind.source === path.join(workspaceDir, '.data', 'demo') && bind.target === '/root'
+            bind.source === path.join(workspaceDir, '.data', 'agents', 'demo') && bind.target === '/root'
         )));
         assert.deepEqual(
             mcpTools.map(({ agent, tool, access, enabled }) => ({ agent, tool, access, enabled })),
@@ -767,18 +767,18 @@ test('shell and one-shot commands use recorded project CWD without selecting the
         type: 'agent', runMode: 'isolated', projectPath: '/workspace',
         config: { binds: [
             { source: '/workspace', target: '/root' },
-            { source: '/workspace/.data/staticAlias', target: '/home/agent' },
+            { source: '/workspace/.data/agents/staticAlias', target: '/home/agent' },
         ] },
     };
     assert.equal(resolveContainerWorkdir('static', '/workspace/', { static: staticRecord }), '/root');
     const interactiveRecord = {
-        type: 'interactive', projectPath: '/workspace/.data/demo',
+        type: 'interactive', projectPath: '/workspace/.data/agents/demo',
         config: { binds: [
-            { source: '/workspace/.data/demo', target: '/workspace/.data/demo' },
-            { source: '/workspace/.data/demo', target: '/root' },
+            { source: '/workspace/.data/agents/demo', target: '/workspace/.data/agents/demo' },
+            { source: '/workspace/.data/agents/demo', target: '/root' },
         ] },
     };
-    assert.equal(resolveContainerWorkdir('demo', '/workspace/.data/demo', { demo: interactiveRecord }), '/workspace/.data/demo');
+    assert.equal(resolveContainerWorkdir('demo', '/workspace/.data/agents/demo', { demo: interactiveRecord }), '/workspace/.data/agents/demo');
     assert.equal(resolveContainerWorkdir('static', '/workspace/explicit-subdir', { static: staticRecord }), '/workspace/explicit-subdir');
 });
 

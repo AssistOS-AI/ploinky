@@ -45,7 +45,6 @@ function buildSeatbeltProfile(options) {
         workspaceRoot = PLOINKY_WORKSPACE_ROOT,
         extraReadPaths = [],
         extraWritePaths = [],
-        privateDataGrants = [],
         agentLibGrant: grant = null,
     } = options;
 
@@ -276,23 +275,32 @@ function buildSeatbeltProfile(options) {
     lines.push(')');
     lines.push('');
 
-    // Exact directories below `.data/.private` this launch was granted (for
-    // example the workspace git credentials directory of a declaring agent).
-    // They follow the opacity rule so that they, and only they, stay usable.
-    const privateRoot = path.join(path.resolve(workspaceRoot), '.data', '.private');
-    const privateGrants = normalizePathList(privateDataGrants);
-    for (const grantPath of privateGrants) {
-        if (grantPath === privateRoot || !isPathWithin(grantPath, privateRoot)) {
-            throw new Error(`[seatbelt] private data grant '${grantPath}' must be a directory below '${privateRoot}'`);
+    // `.data` is opaque like the controller state; this launch's own home,
+    // the shared directory, and the volumes and storage it declared below
+    // `.data` are re-granted. Read-only volumes stay read-only.
+    const workspaceDataRoot = path.join(path.resolve(workspaceRoot), '.data');
+    const insideWorkspaceData = (value) => value && path.resolve(value) !== workspaceDataRoot
+        && isPathWithin(value, workspaceDataRoot);
+    const dataWriteGrants = normalizePathList([
+        agentWorkDir, sharedDir, ...writableVolumes, ...normalizedExtraWritePaths,
+    ]).filter(insideWorkspaceData);
+    const dataReadOnlyGrants = normalizePathList(volumeAccess.filter(entry => entry.readOnly).map(entry => entry.hostPath))
+        .filter(insideWorkspaceData);
+    if (dataWriteGrants.length || dataReadOnlyGrants.length) {
+        lines.push('; Workspace data granted to this launch');
+        if (dataWriteGrants.length) {
+            lines.push('(allow file-read* file-write*');
+            for (const grantPath of dataWriteGrants.flatMap(pathAliases)) lines.push(`    (subpath ${sbplQuote(grantPath)})`);
+            lines.push(')');
         }
-    }
-    if (privateGrants.length) {
-        lines.push('; Exact private data grants of this launch');
-        lines.push('(allow file-read* file-write*');
-        for (const grantPath of privateGrants.flatMap(pathAliases)) {
-            lines.push(`    (subpath ${sbplQuote(grantPath)})`);
+        if (dataReadOnlyGrants.length) {
+            lines.push('(allow file-read*');
+            for (const grantPath of dataReadOnlyGrants.flatMap(pathAliases)) lines.push(`    (subpath ${sbplQuote(grantPath)})`);
+            lines.push(')');
+            lines.push('(deny file-write*');
+            for (const grantPath of dataReadOnlyGrants.flatMap(pathAliases)) lines.push(`    (subpath ${sbplQuote(grantPath)})`);
+            lines.push(')');
         }
-        lines.push(')');
         lines.push('');
     }
 

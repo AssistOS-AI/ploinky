@@ -62,14 +62,14 @@ test('buildSeatbeltProfile grants root and parent literals for scoped paths', ()
         agentCodePath: '/Users/alice/workspace/repo/agent',
         agentLibPath: '/Users/alice/tools/ploinky/Agent',
         nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/agent/node_modules',
-        agentWorkDir: '/Users/alice/workspace/.data/demo',
-        sharedDir: '/Users/alice/workspace/.data/shared',
+        agentWorkDir: '/Users/alice/workspace/.data/agents/demo',
+        sharedDir: '/Users/alice/workspace/.data/agents/shared',
         cwd: '/Users/alice/workspace',
         skillsPath: null,
         codeReadOnly: false,
         skillsReadOnly: true,
         volumes: {
-            '.data/webassist/data': '/data',
+            '.data/agents/webassist/data': '/data',
             'workspace-data/uploads': '/uploads',
         },
         workspaceRoot: '/Users/alice/workspace',
@@ -85,7 +85,7 @@ test('buildSeatbeltProfile grants root and parent literals for scoped paths', ()
     assert.ok(profile.includes('(subpath "/opt/homebrew")'));
     assert.ok(profile.includes('(subpath "/Users/alice/workspace/.ploinky/logs")'));
     assert.ok(profile.includes('(allow file-write* (subpath "/Users/alice/workspace/.ploinky/logs"))'));
-    assert.ok(profile.includes('(subpath "/Users/alice/workspace/.data/webassist/data")'));
+    assert.ok(profile.includes('(subpath "/Users/alice/workspace/.data/agents/webassist/data")'));
     assert.ok(profile.includes('(subpath "/Users/alice/workspace/workspace-data/uploads")'));
     assert.ok(profile.includes('(allow file-write* (subpath "/Users/alice/workspace/workspace-data/uploads"))'));
 });
@@ -96,8 +96,8 @@ test('buildSeatbeltProfile does not grant writes to read-only manifest volumes',
         agentCodePath: '/Users/alice/workspace/.ploinky/repos/repo/agent',
         agentLibPath: '/Users/alice/workspace/Agent',
         nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/node_modules',
-        agentWorkDir: '/Users/alice/workspace/.data/agent',
-        sharedDir: '/Users/alice/workspace/.data/shared',
+        agentWorkDir: '/Users/alice/workspace/.data/agents/agent',
+        sharedDir: '/Users/alice/workspace/.data/agents/shared',
         cwd: '/Users/alice/workspace',
         skillsPath: null,
         codeReadOnly: true,
@@ -111,9 +111,11 @@ test('buildSeatbeltProfile does not grant writes to read-only manifest volumes',
         workspaceRoot: '/Users/alice/workspace',
     });
 
-    assert.match(profile, /\(subpath "\/Users\/alice\/workspace\/\.data\/secret"\)/);
-    assert.doesNotMatch(profile, /\(allow file-write\* \(subpath "\/Users\/alice\/workspace\/\.data\/secret"\)\)/);
-    assert.match(profile, /\(deny file-write\*[\s\S]*\(subpath "\/Users\/alice\/workspace\/\.data\/secret"\)/);
+    // The flat-layout source resolves into `.data/agents`.
+    assert.match(profile, /\(subpath "\/Users\/alice\/workspace\/\.data\/agents\/secret"\)/);
+    assert.doesNotMatch(profile, /\(allow file-write\* \(subpath "\/Users\/alice\/workspace\/\.data\/agents\/secret"\)\)/);
+    assert.doesNotMatch(profile, /\(allow file-read\* file-write\*[^)]*\n[^)]*\.data\/agents\/secret/);
+    assert.match(profile, /\(deny file-write\*[\s\S]*\(subpath "\/Users\/alice\/workspace\/\.data\/agents\/secret"\)/);
     assert.match(profile, /\(deny file-write\*[\s\S]*\(subpath "\/Users\/alice\/workspace\/\.ploinky\/data"\)/);
     assert.match(profile, /\(deny file-read\*[\s\S]*\(subpath "\/Users\/alice\/workspace\/\.ploinky\/data"\)/);
     assert.doesNotMatch(profile, /\.ploinky\/shared/);
@@ -125,8 +127,8 @@ test('buildSeatbeltProfile protects read-only paths even under writable workspac
         agentCodePath: '/Users/alice/workspace/.ploinky/repos/AchillesIDE/explorer',
         agentLibPath: '/Users/alice/workspace/.ploinky/seatbelt-runtime/explorer/Agent-123',
         nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/agents/AchillesIDE/explorer/seatbelt-darwin-arm64-node25/node_modules',
-        agentWorkDir: '/Users/alice/workspace/.data/explorer',
-        sharedDir: '/Users/alice/workspace/.data/shared',
+        agentWorkDir: '/Users/alice/workspace/.data/agents/explorer',
+        sharedDir: '/Users/alice/workspace/.data/agents/shared',
         cwd: '/Users/alice/workspace',
         skillsPath: '/Users/alice/workspace/.ploinky/skills/explorer',
         codeReadOnly: true,
@@ -210,8 +212,8 @@ test('generated profile denies writes to read-only code, cache, and staged lib',
     const cacheDir = path.join(workspace, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'seatbelt-darwin-arm64-node25');
     const nodeModulesDir = path.join(cacheDir, 'node_modules');
     const libDir = path.join(workspace, '.ploinky', 'seatbelt-runtime', 'agent', 'Agent-123');
-    const agentWorkDir = path.join(workspace, '.data', 'agent');
-    const sharedDir = path.join(workspace, '.data', 'shared');
+    const agentWorkDir = path.join(workspace, '.data', 'agents', 'agent');
+    const sharedDir = path.join(workspace, '.data', 'agents', 'shared');
     const logsDir = path.join(workspace, '.ploinky', 'logs');
     try {
         for (const dir of [codeDir, nodeModulesDir, libDir, agentWorkDir, sharedDir, logsDir]) {
@@ -286,8 +288,8 @@ test('generated profile makes both canonical aliases of the controller state roo
     const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'seatbelt-state-alias-')));
     const canonicalStateData = path.join(workspace, 'state-data-target');
     const stateRoot = path.join(workspace, '.ploinky', 'data');
-    const agentWorkDir = path.join(workspace, '.data', 'agent');
-    const sharedDir = path.join(workspace, '.data', 'shared');
+    const agentWorkDir = path.join(workspace, '.data', 'agents', 'agent');
+    const sharedDir = path.join(workspace, '.data', 'agents', 'shared');
     try {
         fs.mkdirSync(path.dirname(stateRoot), { recursive: true });
         fs.mkdirSync(canonicalStateData, { recursive: true });
@@ -353,8 +355,8 @@ test('buildSeatbeltProfile pins the controller root and its ancestors read-only 
         agentCodePath: '/Users/alice/workspace/.ploinky/repos/repo/agent',
         agentLibPath: '/Users/alice/workspace/.ploinky/seatbelt-runtime/agent/Agent-1',
         nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/store/node_modules',
-        agentWorkDir: '/Users/alice/workspace/.data/agent',
-        sharedDir: '/Users/alice/workspace/.data/shared',
+        agentWorkDir: '/Users/alice/workspace/.data/agents/agent',
+        sharedDir: '/Users/alice/workspace/.data/agents/shared',
         cwd: '/Users/alice/workspace',
         skillsPath: null,
         codeReadOnly: false,
@@ -383,15 +385,15 @@ function seatbeltControllerFixture({ codeWritable = false, symlinkedControllerRo
     const at = (...segments) => path.join(workspace, ...segments);
     const seed = {
         '.ploinky/agents.json': '{"synthetic":true}',
-        '.ploinky/data/master-key': 'SYNTHETIC-MASTER-KEY\n',
+        '.data/dpu-data/master-key': 'SYNTHETIC-MASTER-KEY\n',
         '.ploinky/data/.secrets': 'SYNTHETIC_SECRET=1\n',
         '.ploinky/running/router.pid': '1',
         '.ploinky/run/lease': 'L',
         '.ploinky/repos/repo/agent/README': 'CODE',
         '.ploinky/repos/repo/agent/node_modules/marker': 'NM',
         '.ploinky/repos/other/agent/README': 'OTHER',
-        '.data/agent/.keep': '',
-        '.data/shared/.keep': '',
+        '.data/agents/agent/.keep': '',
+        '.data/agents/shared/.keep': '',
         'project-file': 'PROJECT',
     };
     for (const [relative, content] of Object.entries(seed)) {
@@ -410,8 +412,8 @@ function seatbeltControllerFixture({ codeWritable = false, symlinkedControllerRo
         agentCodePath: at('.ploinky', 'repos', 'repo', 'agent'),
         agentLibPath: grant.sourceDir,
         nodeModulesDir: at('.ploinky', 'deps', 'store', 'node_modules'),
-        agentWorkDir: at('.data', 'agent'),
-        sharedDir: at('.data', 'shared'),
+        agentWorkDir: at('.data', 'agents', 'agent'),
+        sharedDir: at('.data', 'agents', 'shared'),
         cwd: workspace,
         skillsPath: null,
         codeReadOnly: !codeWritable,
@@ -448,7 +450,7 @@ for (const symlinkedControllerRoot of [false, true]) {
         const renameTarget = path.join('/tmp', `seatbelt-controller-rename-${process.pid}-${Date.now()}`);
         try {
             const projectWrite = run('printf more >> "$1" && mkdir "$2" && printf new > "$3"',
-                at('project-file'), at('new-dir'), at('.data', 'agent', 'state'));
+                at('project-file'), at('new-dir'), at('.data', 'agents', 'agent', 'state'));
             assert.equal(projectWrite.status, 0, projectWrite.stderr);
             assert.equal(fs.readFileSync(at('project-file'), 'utf8'), 'PROJECTmore');
             const registryRead = run('cat "$1"', at('.ploinky', 'agents.json'));
@@ -461,12 +463,12 @@ for (const symlinkedControllerRoot of [false, true]) {
             for (const target of controllerPaths) {
                 assertSandboxDenied(run('printf TAMPER >> "$1"', target), `write ${target}`);
             }
-            for (const target of [at('.ploinky', 'data', 'master-key'), at('.ploinky', 'data', '.secrets')]) {
+            for (const target of [at('.data', 'dpu-data', 'master-key'), at('.ploinky', 'data', '.secrets')]) {
                 assertSandboxDenied(run('cat "$1"', target), `read ${target}`);
             }
             assertSandboxDenied(run('printf X > "$1"', at('.ploinky', 'forged')), 'create a controller entry');
             assertSandboxDenied(run('mkdir "$1"', at('.ploinky', 'running', 'forged')), 'create a running entry');
-            assertSandboxDenied(run('rm "$1"', at('.ploinky', 'data', 'master-key')), 'unlink master-key');
+            assertSandboxDenied(run('rm "$1"', at('.data', 'dpu-data', 'master-key')), 'unlink master-key');
             assertSandboxDenied(run('ln "$1" "$2"', at('.ploinky', 'agents.json'), at('registry-link')), 'hard-link the registry');
             assertSandboxDenied(run(RENAME_SCRIPT, at('.ploinky'), at('moved')), 'rename the controller root');
             assertSandboxDenied(run(RENAME_SCRIPT, at('.ploinky', 'running'), at('moved')), 'rename running state');
@@ -523,8 +525,8 @@ test('buildSeatbeltProfile keeps a dangling protected link lexical and overrides
             agentCodePath: codeDir,
             agentLibPath: path.join(workspace, 'Agent'),
             nodeModulesDir: path.join(workspace, '.ploinky', 'deps', 'store', 'node_modules'),
-            agentWorkDir: path.join(workspace, '.data', 'agent'),
-            sharedDir: path.join(workspace, '.data', 'shared'),
+            agentWorkDir: path.join(workspace, '.data', 'agents', 'agent'),
+            sharedDir: path.join(workspace, '.data', 'agents', 'shared'),
             cwd: workspace,
             skillsPath: null,
             codeReadOnly: true,
@@ -555,8 +557,8 @@ test('generated profile denies reads of the master key and encrypted stores but 
     }
 
     const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'seatbelt-controller-secrets-')));
-    const agentWorkDir = path.join(workspace, '.data', 'agent');
-    const sharedDir = path.join(workspace, '.data', 'shared');
+    const agentWorkDir = path.join(workspace, '.data', 'agents', 'agent');
+    const sharedDir = path.join(workspace, '.data', 'agents', 'shared');
     try {
         const { path: keyPath } = initializeWorkspaceMasterKey({ workspaceRoot: workspace });
         const names = ['master-key', '.secrets', 'ploinky_subject_identity_ed25519_v1.enc'];
@@ -607,8 +609,8 @@ test('buildSeatbeltProfile denies reading and writing the Box host state directo
         agentCodePath: '/Users/alice/workspace/.ploinky/repos/repo/agent',
         agentLibPath: '/Users/alice/workspace/.ploinky/seatbelt-runtime/agent/Agent-1',
         nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/store/node_modules',
-        agentWorkDir: '/Users/alice/workspace/.data/agent',
-        sharedDir: '/Users/alice/workspace/.data/shared',
+        agentWorkDir: '/Users/alice/workspace/.data/agents/agent',
+        sharedDir: '/Users/alice/workspace/.data/agents/shared',
         cwd: '/Users/alice/workspace',
         skillsPath: null,
         codeReadOnly: false,
@@ -649,16 +651,16 @@ test('generated profile keeps .ploinky-box opaque and unrenamable through a writ
     }
 });
 
-test('buildSeatbeltProfile re-grants only exact private data directories after the opacity rule', () => {
+test('buildSeatbeltProfile re-grants explicit git credentials storage after the opacity rule', () => {
     const workspaceRoot = '/Users/alice/workspace';
-    const grant = `${workspaceRoot}/.data/.private/.git-credentials`;
+    const grant = `${workspaceRoot}/.data/dpu-data/git-credentials`;
     const options = {
         agentLibGrant: seatbeltGrantFor(workspaceRoot),
         agentCodePath: `${workspaceRoot}/repo/agent`,
         agentLibPath: '/Users/alice/tools/ploinky/Agent',
         nodeModulesDir: `${workspaceRoot}/.ploinky/deps/agent/node_modules`,
-        agentWorkDir: `${workspaceRoot}/.data/demo`,
-        sharedDir: `${workspaceRoot}/.data/shared`,
+        agentWorkDir: `${workspaceRoot}/.data/agents/demo`,
+        sharedDir: `${workspaceRoot}/.data/agents/shared`,
         cwd: workspaceRoot,
         skillsPath: null,
         codeReadOnly: false,
@@ -666,13 +668,10 @@ test('buildSeatbeltProfile re-grants only exact private data directories after t
         volumes: {},
         workspaceRoot,
     };
-    const profile = buildSeatbeltProfile({ ...options, extraWritePaths: [grant], privateDataGrants: [grant] });
+    const profile = buildSeatbeltProfile({ ...options, extraWritePaths: [grant] });
     const opacity = profile.indexOf('; Protected controller state is opaque');
-    const regrant = profile.indexOf('; Exact private data grants of this launch');
+    const regrant = profile.indexOf('; Workspace data granted to this launch');
     assert.ok(opacity >= 0 && regrant > opacity, 'the grant follows the opacity rule');
     assert.ok(profile.slice(regrant).includes(`(subpath "${grant}")`));
-    assert.equal(buildSeatbeltProfile(options).includes('Exact private data grants'), false);
-    for (const invalid of [`${workspaceRoot}/.data/.private`, `${workspaceRoot}/.data/other`]) {
-        assert.throws(() => buildSeatbeltProfile({ ...options, privateDataGrants: [invalid] }), /private data grant/);
-    }
+    assert.equal(buildSeatbeltProfile(options).includes(`(subpath "${grant}")`), false);
 });

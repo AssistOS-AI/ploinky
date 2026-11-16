@@ -34,12 +34,12 @@ test('static workspace agents keep project output and private HOME on distinct b
             agentLibMountPath: '/workspace/.ploinky/runtime/Agent',
             codeMountPath: '/workspace/.ploinky/runtime/code',
             codeMountMode: ':ro',
-            sharedDir: '/workspace/.data/shared',
+            sharedDir: '/workspace/.data/agents/shared',
             healthProbeHostDir: '/workspace/.ploinky/run/health-probes/static',
             cwd: '/workspace',
             cwdMountTarget: '/root',
             isolatedHome: true,
-            agentHomeDir: '/workspace/.data/staticAlias',
+            agentHomeDir: '/workspace/.data/agents/staticAlias',
             agentLibGrant: {
                 sourceDir: '/workspace/achillesAgentLib',
                 runtimePath: '/opt/ploinky-agentlib',
@@ -51,11 +51,11 @@ test('static workspace agents keep project output and private HOME on distinct b
             },
         });
         const mounts = expectedBindMountsFromArgs(args);
-        assert.deepEqual(mounts.filter(mount => mount.destination === '/root'), [{
-            source: '/workspace', destination: '/root', rw: true,
+        assert.deepEqual(mounts.filter(mount => mount.destination === '/workspace'), [{
+            source: '/workspace', destination: '/workspace', rw: true,
         }]);
-        assert.deepEqual(mounts.filter(mount => mount.source === '/workspace/.data/staticAlias'), [{
-            source: '/workspace/.data/staticAlias', destination: '/home/agent', rw: true,
+        assert.deepEqual(mounts.filter(mount => mount.source === '/workspace/.data/agents/staticAlias'), [{
+            source: '/workspace/.data/agents/staticAlias', destination: '/root', rw: true,
         }]);
         assert.equal(args[args.indexOf('-w') + 1], '/root');
         assert.equal(new Set(mounts.map(mount => mount.destination)).size, mounts.length);
@@ -80,9 +80,9 @@ test('nested agents receive the Box workspace at its host path without broader g
         agentLibMountPath: `${root}/.ploinky/runtime/Agent`,
         codeMountPath: `${root}/.ploinky/runtime/code`,
         codeMountMode: ':ro',
-        sharedDir: `${root}/.data/shared`,
+        sharedDir: `${root}/.data/agents/shared`,
         healthProbeHostDir: `${root}/.ploinky/run/health-probes/agent`,
-        agentHomeDir: `${root}/.data/agentAlias`,
+        agentHomeDir: `${root}/.data/agents/agentAlias`,
         agentLibGrant,
     };
     for (const runtime of ['docker', 'podman']) {
@@ -96,15 +96,16 @@ test('nested agents receive the Box workspace at its host path without broader g
             });
             const mounts = expectedBindMountsFromArgs(args);
             const writable = mounts.filter(mount => mount.rw).map(mount => mount.destination).sort();
-            const expectedHome = mode === 'isolated' ? '/home/agent' : '/root';
+            const expectedHome = '/root';
+            const projectTarget = mode === 'isolated' ? cwd : cwdMountTarget;
             assert.deepEqual(writable, [
-                PROBE_CONTROL_CONTAINER_ROOT, cwdMountTarget, expectedHome, '/shared',
+                PROBE_CONTROL_CONTAINER_ROOT, projectTarget, expectedHome, '/shared',
             ].sort(), mode);
-            assert.deepEqual(mounts.find(mount => mount.destination === cwdMountTarget), {
-                source: cwd, destination: cwdMountTarget, rw: true,
+            assert.deepEqual(mounts.find(mount => mount.destination === projectTarget), {
+                source: cwd, destination: projectTarget, rw: true,
             });
             assert.deepEqual(mounts.find(mount => mount.destination === expectedHome), {
-                source: `${root}/.data/agentAlias`, destination: expectedHome, rw: true,
+                source: `${root}/.data/agents/agentAlias`, destination: expectedHome, rw: true,
             });
             // Only a bind that exposes the selected AgentLib source gets a read-only shadow.
             const aliases = mounts.filter(mount => mount.source === agentLibGrant.sourceDir
@@ -112,7 +113,7 @@ test('nested agents receive the Box workspace at its host path without broader g
             const expectedAliases = {
                 global: [`${root}/achillesAgentLib`],
                 devel: [],
-                isolated: ['/root/achillesAgentLib'],
+                isolated: [`${root}/achillesAgentLib`],
             }[mode];
             assert.deepEqual(aliases.map(mount => mount.destination), expectedAliases, mode);
             assert.ok(aliases.every(mount => mount.rw === false), mode);

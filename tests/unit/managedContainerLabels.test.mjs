@@ -65,11 +65,11 @@ test('persistent agent run builder carries the exact managed label', () => {
         agentLibMountPath: '/workspace/.ploinky/runtime/Agent',
         codeMountPath: '/workspace/.ploinky/runtime/code',
         codeMountMode: ':z,ro',
-        sharedDir: '/workspace/.data/shared',
+        sharedDir: '/workspace/.data/agents/shared',
         healthProbeHostDir: '/workspace/.ploinky/run/health-probes/ploinky_demo',
-        cwd: '/workspace/.data/demo',
+        cwd: '/workspace/.data/agents/demo',
         cwdMountTarget: '/root',
-        agentHomeDir: '/workspace/.data/demo',
+        agentHomeDir: '/workspace/.data/agents/demo',
         // Every container admission now carries the selected achillesAgentLib grant.
         agentLibGrant: {
             sourceDir: '/workspace/achillesAgentLib',
@@ -108,12 +108,12 @@ test('static workspace projection keeps its persistent home beneath .data', () =
         agentLibMountPath: '/workspace/.ploinky/runtime/Agent',
         codeMountPath: '/workspace/.ploinky/runtime/code',
         codeMountMode: ':z,ro',
-        sharedDir: '/workspace/.data/shared',
+        sharedDir: '/workspace/.data/agents/shared',
         healthProbeHostDir: '/workspace/.ploinky/run/health-probes/ploinky_static',
         cwd: '/workspace',
         cwdMountTarget: '/root',
         isolatedHome: true,
-        agentHomeDir: '/workspace/.data/static',
+        agentHomeDir: '/workspace/.data/agents/static',
         agentLibGrant: {
             sourceDir: '/workspace/achillesAgentLib',
             runtimePath: '/opt/ploinky-agentlib',
@@ -125,14 +125,14 @@ test('static workspace projection keeps its persistent home beneath .data', () =
         },
     });
     assert.equal(args.includes('/workspace:/root:z'), true);
-    assert.equal(args.includes('/workspace/.data/static:/home/agent:z'), true);
+    assert.equal(args.includes('/workspace/.data/agents/static:/home/agent:z'), true);
 });
 
 test('interactive isolated agents mount their private HOME while preserving project passthrough', () => {
     const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interactive-home-')));
     try {
-        const homeDir = path.join(workspaceRoot, '.data', 'namedAlias');
-        const sharedDir = path.join(workspaceRoot, '.data', 'shared');
+        const homeDir = path.join(workspaceRoot, '.data', 'agents', 'namedAlias');
+        const sharedDir = path.join(workspaceRoot, '.data', 'agents', 'shared');
         const grantSource = path.join(workspaceRoot, 'achillesAgentLib');
         for (const directory of [homeDir, sharedDir, grantSource]) fs.mkdirSync(directory, { recursive: true });
         const command = buildInteractiveAgentCreateCommand({
@@ -165,7 +165,7 @@ test('interactive isolated agents mount their private HOME while preserving proj
 test('static HOME layout retains opaque controller state under the project projection', () => {
     const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'static-home-guards-')));
     try {
-        const homeDir = path.join(workspaceRoot, '.data', 'static');
+        const homeDir = path.join(workspaceRoot, '.data', 'agents', 'static');
         for (const dir of [homeDir, path.join(workspaceRoot, '.ploinky', 'data')]) {
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -294,7 +294,7 @@ test('both interactive create/retry command families carry the exact managed lab
             containerName: 'ploinky_demo',
             envHash: 'hash',
             projectDir: '/workspace',
-            homeDir: '/workspace/.data/demo',
+            homeDir: '/workspace/.data/agents/demo',
             agentLibPath: '/opt/ploinky/Agent',
             agentLibGrant: {
                 sourceDir: '/workspace/achillesAgentLib',
@@ -306,7 +306,7 @@ test('both interactive create/retry command families carry the exact managed lab
                 namespaced: true,
             },
             absAgentPath: '/workspace/.ploinky/repos/demo/agent',
-            sharedDir: '/workspace/.data/shared',
+            sharedDir: '/workspace/.data/agents/shared',
             volumeSuffix: ':z',
             readOnlySuffix: ':ro,z',
             portOptions: '-p 127.0.0.1:17002:7000',
@@ -320,8 +320,8 @@ test('interactive container creation rejects a project below protected controlle
     const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interactive-state-child-')));
     try {
         const projectDir = path.join(workspaceRoot, '.ploinky', 'data', 'router-security');
-        const homeDir = path.join(workspaceRoot, '.data', 'demo');
-        const sharedDir = path.join(workspaceRoot, '.data', 'shared');
+        const homeDir = path.join(workspaceRoot, '.data', 'agents', 'demo');
+        const sharedDir = path.join(workspaceRoot, '.data', 'agents', 'shared');
         const agentLibPath = path.join(workspaceRoot, 'Agent');
         const absAgentPath = path.join(workspaceRoot, 'agent-code');
         const grantSource = path.join(workspaceRoot, 'achillesAgentLib');
@@ -365,10 +365,10 @@ test('interactive containers protect the controller parent without mounting an a
                 containerName: 'ploinky_demo',
                 envHash: 'hash',
                 projectDir: workspaceRoot,
-                homeDir: path.join(workspaceRoot, '.data', 'demo'),
+                homeDir: path.join(workspaceRoot, '.data', 'agents', 'demo'),
                 agentLibPath: path.join(workspaceRoot, 'Agent'),
                 absAgentPath: path.join(workspaceRoot, 'agent-code'),
-                sharedDir: path.join(workspaceRoot, '.data', 'shared'),
+                sharedDir: path.join(workspaceRoot, '.data', 'agents', 'shared'),
                 containerImage: 'node:24',
                 workspaceRoot,
                 agentLibGrant: {
@@ -397,8 +397,8 @@ test('interactive agent guards canonical controller-state aliases exposed by rea
     try {
         const agentCode = path.join(workspaceRoot, 'agent-code');
         const canonicalStateData = path.join(agentCode, 'state-data');
-        const homeDir = path.join(workspaceRoot, '.data', 'demo');
-        const sharedDir = path.join(workspaceRoot, '.data', 'shared');
+        const homeDir = path.join(workspaceRoot, '.data', 'agents', 'demo');
+        const sharedDir = path.join(workspaceRoot, '.data', 'agents', 'shared');
         const agentLibPath = path.join(workspaceRoot, 'Agent');
         const grantSource = path.join(workspaceRoot, 'achillesAgentLib');
         fs.mkdirSync(path.join(workspaceRoot, '.ploinky'), { recursive: true });

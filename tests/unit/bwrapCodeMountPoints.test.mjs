@@ -49,9 +49,9 @@ function mounts(args) {
 function fixture(prefix, { deps = false } = {}) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
     const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent', 'code');
-    const sharedDir = path.join(root, '.data', 'shared');
+    const sharedDir = path.join(root, '.data', 'agents', 'shared');
     const agentLibPath = path.join(root, 'Agent');
-    const agentHomeDir = path.join(root, '.data', 'lifecycle');
+    const agentHomeDir = path.join(root, '.data', 'agents', 'lifecycle');
     const nodeModulesDir = deps
         ? path.join(root, '.ploinky', 'deps', 'store', 'objects', '11111111-2222-4333-8444-555555555555', 'payload', 'node_modules')
         : path.join(agentHomeDir, 'node_modules');
@@ -242,7 +242,7 @@ test('a webAssist-like /code volume gets a mount point in a read-only /code', ()
             const mountPoint = path.join(layout.agentCodePath, rel);
             assert.deepEqual([fs.lstatSync(mountPoint).isDirectory(), fs.readdirSync(mountPoint)], [true, []], rel);
             const volume = all.find(mount => mount.target === `/code/${rel}`);
-            assert.deepEqual([volume.readOnly, volume.source], [false, path.join(layout.root, '.data', 'webAssist', host)]);
+            assert.deepEqual([volume.readOnly, volume.source], [false, path.join(layout.root, '.data', 'agents', 'webAssist', host)]);
             assert.ok(volume.index > code.index, 'the volume bind follows the read-only /code bind');
         }
     } finally {

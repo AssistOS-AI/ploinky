@@ -43,7 +43,6 @@ test('buildAgentIndex surfaces installed agents, runtime resources, principals, 
     writeManifest('dpu', 'dpuAgent', {
         runtime: {
             resources: {
-                persistentStorage: { key: 'dpu-data', containerPath: '/dpu-data' },
                 gitCredentials: { containerPath: '/git-credentials' },
             },
         },
@@ -56,7 +55,7 @@ test('buildAgentIndex surfaces installed agents, runtime resources, principals, 
     assert.ok(index.agents.has('dpu/dpuAgent'));
     assert.ok(index.agents.has('basic/keycloak'));
     assert.equal(index.byPrincipal.get('agent:dpu/dpuAgent').agent, 'dpuAgent');
-    assert.equal(index.agents.get('dpu/dpuAgent').runtimeResources.persistentStorage.key, 'dpu-data');
+    assert.equal(Object.hasOwn(index.agents.get('dpu/dpuAgent').runtimeResources, 'persistentStorage'), false);
     assert.deepEqual(index.agents.get('dpu/dpuAgent').runtimeResources.gitCredentials, { containerPath: '/git-credentials' });
     assert.deepEqual(index.ssoProviders.map((d) => d.agentRef), ['basic/keycloak']);
 });

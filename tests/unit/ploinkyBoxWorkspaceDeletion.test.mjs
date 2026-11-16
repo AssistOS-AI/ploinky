@@ -33,7 +33,7 @@ function scratch(t) {
 function seedWorkspace(workspace) {
     fs.mkdirSync(path.join(workspace, '.ploinky/data'), { recursive: true });
     fs.mkdirSync(path.join(workspace, '.ploinky/box/images'), { recursive: true });
-    fs.writeFileSync(path.join(workspace, '.ploinky/data/master-key'), 'key');
+    fs.writeFileSync(path.join(workspace, '.data/dpu-data/master-key'), 'key');
     fs.writeFileSync(path.join(workspace, '.ploinky/edge-desired.json'), '{"hosts":{}}');
     fs.mkdirSync(path.join(workspace, '.data/app'), { recursive: true });
     fs.writeFileSync(path.join(workspace, '.data/app/state'), 'data');
@@ -384,7 +384,7 @@ test('a failed removal reports counts only and leaves the identity for the rerun
         assert.equal(error.message.includes(state.workspace), false);
         return true;
     });
-    assert.equal(fs.readFileSync(path.join(state.workspace, '.ploinky/data/master-key'), 'utf8'), 'key');
+    assert.equal(fs.readFileSync(path.join(state.workspace, '.data/dpu-data/master-key'), 'utf8'), 'key');
     assert.equal(stubborn.calls.some((call) => call.args[2] === path.join(state.workspace, '.ploinky')), false);
 
     removeWorkspaceContents(state.identity, {

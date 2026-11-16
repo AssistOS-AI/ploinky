@@ -13,7 +13,7 @@ const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const SUBKEY_PURPOSE = 'storage/secrets';
 const SECRETS_STORAGE_SUBKEY_PURPOSE = SUBKEY_PURPOSE;
-const KEY_MISMATCH_HINT = 'Check PLOINKY_MASTER_KEY, a walked-up .env, or .ploinky/data/master-key as appropriate; managed Boxes use only .ploinky/data/master-key, and .ploinky/data/.secrets may have been written with a different master seed.';
+const KEY_MISMATCH_HINT = 'Check PLOINKY_MASTER_KEY, a walked-up .env, or .data/dpu-data/master-key as appropriate; managed Boxes use only .data/dpu-data/master-key, and .ploinky/data/.secrets may have been written with a different master seed.';
 
 function getStorageKey() {
     return deriveSubkey(SUBKEY_PURPOSE);

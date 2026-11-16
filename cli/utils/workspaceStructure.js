@@ -3,10 +3,11 @@ import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import path from 'path';
 import { PLOINKY_WORKSPACE_ROOT, PLOINKY_DIR, AGENTS_DATA_DIR, CODE_DIR, SKILLS_DIR, REPOS_DIR } from './config.js';
 import { ensureAgentDataDirectory, resolveAgentDataPath } from './runtime/agentDataPathPolicy.js';
+import { assertAgentInstanceName } from './agentRegistryResolver.js';
 
 /**
  * Initialize the workspace directory structure.
- * Creates: .ploinky/, .ploinky/code/, .ploinky/skills/, .ploinky/logs/, .data/, .data/shared/
+ * Creates: .ploinky/, .ploinky/code/, .ploinky/skills/, .ploinky/logs/, .data/, .data/agents/shared/
  * @param {string} [workspacePath] - Optional workspace path, defaults to CWD
  */
 export function initWorkspaceStructure(workspacePath = PLOINKY_WORKSPACE_ROOT) {
@@ -23,7 +24,7 @@ export function initWorkspaceStructure(workspacePath = PLOINKY_WORKSPACE_ROOT) {
             fs.mkdirSync(dir, { recursive: true });
         }
     }
-    ensureAgentDataDirectory(path.join(workspacePath, '.data', 'shared'), { workspaceRoot: workspacePath });
+    ensureAgentDataDirectory(path.join(workspacePath, '.data', 'agents', 'shared'), { workspaceRoot: workspacePath });
 }
 
 /**
@@ -146,7 +147,7 @@ export function removeAgentSymlinks(agentName) {
 /**
  * Get the agent working directory path.
  * @param {string} agentName - The agent name
- * @returns {string} The path to $PLOINKY_WORKSPACE_ROOT/.data/<agentName>/
+ * @returns {string} The path to $PLOINKY_WORKSPACE_ROOT/.data/agents/<agentName>/
  */
 export function getAgentWorkDir(agentName) {
     return path.join(AGENTS_DATA_DIR, sanitizeAgentDataName(agentName));
@@ -157,7 +158,9 @@ export function getAgentDataDir(instanceName) {
 }
 
 function sanitizeAgentDataName(value) {
-    return String(value || 'agent').replace(/[^A-Za-z0-9_.-]/g, '_');
+    const name = String(value || 'agent').replace(/[^A-Za-z0-9_.-]/g, '_');
+    assertAgentInstanceName(name);
+    return name;
 }
 
 /**
@@ -250,8 +253,8 @@ export function verifyWorkspaceStructure() {
         { path: path.join(runtimeRoot, 'code'), name: '.ploinky/code' },
         { path: path.join(runtimeRoot, 'skills'), name: '.ploinky/skills' },
         { path: path.join(runtimeRoot, 'logs'), name: '.ploinky/logs' },
-        { path: AGENTS_DATA_DIR, name: '.data' },
-        { path: path.join(AGENTS_DATA_DIR, 'shared'), name: '.data/shared' }
+        { path: AGENTS_DATA_DIR, name: '.data/agents' },
+        { path: path.join(AGENTS_DATA_DIR, 'shared'), name: '.data/agents/shared' }
     ];
 
     for (const dir of requiredDirs) {

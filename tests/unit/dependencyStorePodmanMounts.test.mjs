@@ -143,8 +143,8 @@ for (const layout of LAYOUTS) for (const stateRoot of [false, true]) {
         const cwd = layout.cwd(workspace);
         const cwdMountTarget = layout.target(workspace);
         const agentCodePath = path.join(workspace, '.ploinky', 'repos', 'demoRepo', agentName);
-        const sharedDir = path.join(workspace, '.data', 'shared');
-        const agentHomeDir = path.join(workspace, '.data', agentName);
+        const sharedDir = path.join(workspace, '.data', 'agents', 'shared');
+        const agentHomeDir = path.join(workspace, '.data', 'agents', agentName);
         const healthProbeHostDir = path.join(workspace, '.ploinky', 'run', 'health-probes', agentName);
         for (const dir of [agentCodePath, sharedDir, agentHomeDir, healthProbeHostDir]) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(agentCodePath, 'index.js'), 'export default 1;\n');

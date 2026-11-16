@@ -88,6 +88,7 @@ import {
 import {
     AGENT_ALIAS_PATTERN,
     RESERVED_AGENT_REGISTRY_KEYS,
+    assertAgentInstanceName,
     parseQualifiedAgentReference,
     resolveEnabledAgentRecordFromMap,
 } from './agentRegistryResolver.js';
@@ -180,6 +181,7 @@ function normalizeAlias(aliasInput) {
     if (RESERVED_AGENT_KEYS.has(alias)) {
         throw new Error(`Alias '${alias}' is reserved. Choose a different alias.`);
     }
+    assertAgentInstanceName(alias);
     return alias;
 }
 
@@ -402,6 +404,7 @@ function resolveAgentEnableInput({
     // Graph staging admits hardware eligibility as metadata so a refused
     // agent is recorded rather than aborting unrelated staging (plan §9.1).
     const instanceAlias = normalizeAlias(aliasParam);
+    assertAgentInstanceName(instanceAlias || shortAgentName);
     const admissionOptions = {
         manifestBytes,
         manifestPath,
@@ -485,7 +488,7 @@ function planAgentEnable({
         runtimeAdmission,
         runtimeKind,
         shortAgentName,
-    } = resolvedInput || resolveAgentEnableInput({ agentName, mode, repoNameParam, authOptions });
+    } = resolvedInput || resolveAgentEnableInput({ agentName, mode, repoNameParam, aliasParam, authOptions });
     const alias = normalizeAlias(aliasParam);
     if (alias) {
         const aliasExists = Object.entries(map || {}).some(([key, value]) => {

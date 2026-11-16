@@ -61,9 +61,9 @@ test('getConfiguredProjectPath without an alias skips alias records registered f
         ploinky_repo_demo2: record({ alias: 'demo2', instanceId: 'a' }),
         ploinky_repo_demo: record({ instanceId: 'b' }),
     });
-    assert.equal(result.canonical, path.join(result.root, '.data', 'demo'));
-    assert.equal(result.canonicalExplicit, path.join(result.root, '.data', 'demo'));
-    assert.equal(result.alias, path.join(result.root, '.data', 'demo2'));
+    assert.equal(result.canonical, path.join(result.root, '.data', 'agents', 'demo'));
+    assert.equal(result.canonicalExplicit, path.join(result.root, '.data', 'agents', 'demo'));
+    assert.equal(result.alias, path.join(result.root, '.data', 'agents', 'demo2'));
 });
 
 test('getConfiguredProjectPath keeps the canonical record when the alias comes second', () => {
@@ -71,16 +71,16 @@ test('getConfiguredProjectPath keeps the canonical record when the alias comes s
         ploinky_repo_demo: record({ instanceId: 'b' }),
         ploinky_repo_demo2: record({ alias: 'demo2', instanceId: 'a' }),
     });
-    assert.equal(result.canonical, path.join(result.root, '.data', 'demo'));
-    assert.equal(result.alias, path.join(result.root, '.data', 'demo2'));
+    assert.equal(result.canonical, path.join(result.root, '.data', 'agents', 'demo'));
+    assert.equal(result.alias, path.join(result.root, '.data', 'agents', 'demo2'));
 });
 
 test('getConfiguredProjectPath does not hand an alias-only agent the alias home as canonical', () => {
     const result = resolveProjectPaths({
         ploinky_repo_demo2: record({ alias: 'demo2', instanceId: 'a' }),
     });
-    assert.equal(result.canonical, path.join(result.root, '.data', 'demo'));
-    assert.equal(result.alias, path.join(result.root, '.data', 'demo2'));
+    assert.equal(result.canonical, path.join(result.root, '.data', 'agents', 'demo'));
+    assert.equal(result.alias, path.join(result.root, '.data', 'agents', 'demo2'));
 });
 
 test('getConfiguredProjectPath still gives the static agent the workspace root', () => {
@@ -135,8 +135,8 @@ setTimeout(() => {}, 60000);
             try { process.kill(entry.pid, 'SIGKILL'); } catch { /* gone */ }
         }
     });
-    const home = path.join(w.ws, '.data', 'demo');
-    const aliasHome = path.join(w.ws, '.data', 'demo2');
+    const home = path.join(w.ws, '.data', 'agents', 'demo');
+    const aliasHome = path.join(w.ws, '.data', 'agents', 'demo2');
     const steps = driveWiring(w, [
         { action: 'init-edge' },
         // The alias instance was enabled first, then the canonical one.
@@ -162,7 +162,7 @@ function setenv(argv, name) {
 }
 
 test('bwrap start of the canonical instance mounts its own home', async (t) => {
-    const { home, aliasHome, started, argv, recorded } = await startCanonical(t, (w) => path.join(w.ws, '.data', 'demo'));
+    const { home, aliasHome, started, argv, recorded } = await startCanonical(t, (w) => path.join(w.ws, '.data', 'agents', 'demo'));
     assert.deepEqual(bindSources(argv, '/root'), [home], 'the canonical home is the only /root bind');
     assert.equal(argv.includes(aliasHome), false, 'the alias instance data is never mounted');
     assert.equal(started.runtime, 'bwrap');
@@ -170,7 +170,7 @@ test('bwrap start of the canonical instance mounts its own home', async (t) => {
     assert.equal(setenv(argv, 'HOME'), '/root');
 });
 
-// The registry lookup alone would answer `.data/demo` here (no static agent is
+// The registry lookup alone would answer `.data/agents/demo` here (no static agent is
 // configured), so only honouring the prepared record yields the workspace.
 test('bwrap start uses the prepared record\'s project path over the registry lookup', async (t) => {
     const { w, home, argv, recorded } = await startCanonical(t, (workspace) => workspace.ws);

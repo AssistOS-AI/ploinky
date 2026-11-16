@@ -36,10 +36,13 @@ test('writable workspace aliases receive only a writable repositories child unde
         { hostPath: workspace, runtimePath: '/root' },
     ]);
     assert.deepEqual(mounts.filter(mount => !mount.readOnly).map(mount => [mount.source, mount.target]), [
-        [path.join(workspace, '.data'), '/root/.data'], [path.join(workspace, '.data'), '/workspace/.data'],
         [repositories, '/root/.ploinky/repos'], [repositories, '/workspace/.ploinky/repos'],
     ]);
     for (const target of ['/root', '/workspace']) {
+        // Agent data is opaque through a broad workspace bind.
+        const agentData = mounts.find(mount => mount.target === `${target}/.data`);
+        assert.equal(agentData.readOnly, true);
+        assert.notEqual(agentData.source, path.join(workspace, '.data'));
         assert.ok(mounts.some(mount => mount.source === controller && mount.target === `${target}/.ploinky` && mount.readOnly));
         const data = mounts.find(mount => mount.target === `${target}/.ploinky/data`);
         assert.equal(data.readOnly, true);
@@ -164,7 +167,7 @@ test('interactive shells use the same scoped repository overlay without relaxing
         const ro = runtime === 'podman' ? ':z,ro' : ':ro';
         const command = buildInteractiveAgentCreateCommand({
             runtime, containerName: 'repository-mount-test', envHash: 'test', projectDir: workspace,
-            homeDir: path.join(workspace, '.data', 'demo'), sharedDir: path.join(workspace, '.data', 'shared'),
+            homeDir: path.join(workspace, '.data', 'demo'), sharedDir: path.join(workspace, '.data', 'agents', 'shared'),
             absAgentPath: code, agentLibPath: path.join(workspace, 'Agent'), containerImage: 'node:24',
             volumeSuffix: rw, readOnlySuffix: ro, workspaceRoot: workspace,
             agentLibGrant: {
@@ -237,7 +240,7 @@ test('an interactive shell on a fresh workspace creates the host state skeleton 
         const ro = runtime === 'podman' ? ':z,ro' : ':ro';
         const command = buildInteractiveAgentCreateCommand({
             runtime, containerName: 'host-state-mask-test', envHash: 'test', projectDir: workspace,
-            homeDir: path.join(workspace, '.data', 'demo'), sharedDir: path.join(workspace, '.data', 'shared'),
+            homeDir: path.join(workspace, '.data', 'demo'), sharedDir: path.join(workspace, '.data', 'agents', 'shared'),
             absAgentPath: code, agentLibPath: path.join(workspace, 'Agent'), containerImage: 'node:24',
             volumeSuffix: runtime === 'podman' ? ':z' : '', readOnlySuffix: ro, workspaceRoot: workspace,
             agentLibGrant: {

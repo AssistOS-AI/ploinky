@@ -8,7 +8,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { createMutationLockManager } from '../../ploinky-box/locks.mjs';
 import { heldHostLaunchExclusion, setHeldHostLaunchExclusion } from './hostLaunchExclusionState.js';
-import { ensurePrivateDataRoot } from '../utils/runtime/controllerStateGuards.js';
+import { assertDataLayoutCurrent } from '../utils/dataLayoutMigration.js';
 
 // Host-runtime launches (bwrap, seatbelt, host Podman) and Box transactions
 // exclude each other through the workspace lock (D4). A Box transaction holds
@@ -38,15 +38,17 @@ function absoluteRoot(workspaceRoot) {
 /**
  * Creates the host state skeleton of the workspace before a host-runtime
  * launch, without any lock. A launch that cannot create it must fail. Inside a
- * Box the host state already has its inherited mask; private agent data still
- * needs its real directory before runtime guard planning.
+ * Box the host state already has its inherited mask.
  */
 export function ensureHostLaunchSkeleton(workspaceRoot, {
     insideBox = isInsideBox,
     ensureSkeleton = ensureHostStateSkeleton,
 } = {}) {
     const root = absoluteRoot(workspaceRoot);
-    ensurePrivateDataRoot(root);
+    // Only the locked host lifecycle moves old data, after destroy and before
+    // creating a Box. Launch admission can initialize fresh storage but must
+    // refuse an old version whose launch paths would address the wrong data.
+    assertDataLayoutCurrent(root);
     if (insideBox()) return null;
     try {
         return ensureSkeleton(root);

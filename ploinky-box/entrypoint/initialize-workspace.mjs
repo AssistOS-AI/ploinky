@@ -155,7 +155,7 @@ function selectedWorkspaceRoot(workspaceRoot) {
 
 export function workspaceMasterKeyPath(workspaceRoot) {
     return path.join(
-        selectedWorkspaceRoot(workspaceRoot), PLOINKY_DIRECTORY, CONTROLLER_STATE_DIRECTORY, MASTER_KEY_FILE,
+        selectedWorkspaceRoot(workspaceRoot), '.data', 'dpu-data', MASTER_KEY_FILE,
     );
 }
 
@@ -187,18 +187,18 @@ function stateDirectories(root, fsApi, { create = false } = {}) {
     const rootEntry = {
         path: root, fingerprint: inspectDirectory(root, fsApi), inspect: inspectDirectory, label: 'Workspace root',
     };
-    const ploinkyPath = path.join(root, PLOINKY_DIRECTORY);
+    const ploinkyPath = path.join(root, '.data');
     const ploinky = create
-        ? ensureStateDirectory(ploinkyPath, fsApi, inspectDirectory)
-        : { path: ploinkyPath, fingerprint: inspectDirectory(ploinkyPath, fsApi) };
+        ? ensureStateDirectory(ploinkyPath, fsApi, inspectPhysicalDirectory)
+        : { path: ploinkyPath, fingerprint: inspectPhysicalDirectory(ploinkyPath, fsApi) };
     assertNoRetiredControllerSecrets(root, fsApi);
-    const dataPath = path.join(ploinky.path, CONTROLLER_STATE_DIRECTORY);
+    const dataPath = path.join(ploinky.path, 'dpu-data');
     const data = create
         ? ensureStateDirectory(dataPath, fsApi, inspectPhysicalDirectory)
         : { path: dataPath, fingerprint: inspectPhysicalDirectory(dataPath, fsApi) };
     return [
         rootEntry,
-        { ...ploinky, inspect: inspectDirectory, label: 'Workspace state directory' },
+        { ...ploinky, inspect: inspectPhysicalDirectory, label: 'Workspace state directory' },
         { ...data, inspect: inspectPhysicalDirectory, label: 'Workspace controller-state directory' },
     ];
 }
@@ -236,6 +236,13 @@ export function initializeWorkspaceMasterKey({
         if (error.code !== 'ENOENT') throw error;
     }
 
+    const legacy = path.join(root, '.ploinky', 'data', 'master-key');
+    try {
+        fsApi.lstatSync(legacy);
+        throw initializerError('A legacy master key or migration marker exists without its destination; run offline migration or restore the destination key.');
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+    }
     const key = randomBytes(32).toString('hex');
     if (!MASTER_KEY_PATTERN.test(key)) {
         throw initializerError('Secure random source did not return a 32-byte master key');

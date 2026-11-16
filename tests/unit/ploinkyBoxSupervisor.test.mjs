@@ -75,6 +75,10 @@ function fakeLockManager(root, events) {
 }
 
 function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
+    // Existing current-generation Boxes were admitted on the current layout.
+    fs.mkdirSync(path.join(identity.workspaceRoot, '.data'), { recursive: true });
+    const layout = path.join(identity.workspaceRoot, '.data', '.layout.json');
+    if (!fs.existsSync(layout)) fs.writeFileSync(layout, '{"version":4}');
     const agentLib = agentLibFixture(identity.workspaceRoot);
     return {
         state: 'owned',
@@ -2250,4 +2254,59 @@ test('restart passes PLOINKY_REPOS_SOURCE to Box reconciliation, keeps the Box s
     assert.equal(rest.length, 0, 'an invalid value never reaches reconciliation');
     assert.equal(refusal.code, 'PLOINKY_BOX_ARGUMENT_INVALID');
     assert.match(refusal.message, /PLOINKY_REPOS_SOURCE must be/);
+});
+
+for (const running of [true, false]) {
+    test(`old layout refuses an existing ${running ? 'running' : 'stopped'} Box before reconciliation; destroy remains usable`, async t => {
+        const state = fixture(t);
+        const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+        const ownership = owned(identity, { running });
+        const layout = path.join(state.workspace, '.data', '.layout.json');
+        fs.writeFileSync(layout, '{"version":2}');
+        const events = [];
+        const supervisor = createBoxSupervisor({
+            hostStateGuard: PERMISSIVE_HOST_STATE_GUARD, ...state.stores,
+            resolveIdentity: () => identity, launchCwd: identity.workspaceRoot,
+            lockManager: fakeLockManager(state.root, events), discover: () => ownership,
+            reconcile: () => { throw Error('must not reconcile an old layout'); },
+            runner: { run(_command, args) { events.push(args.join(' ')); } },
+        });
+        await assert.rejects(supervisor.prepareBoxForCommand(), /ploinky destroy/);
+        assert.equal(fs.readFileSync(layout, 'utf8'), '{"version":2}');
+        await supervisor.runDestroyTransaction(ownership.handles.container.id);
+        assert.ok(events.some(event => event.startsWith('container rm')));
+        assert.equal(fs.readFileSync(layout, 'utf8'), '{"version":2}');
+    });
+}
+
+test('host migrates an absent Box workspace under lock before preparation and refuses live host launch records', async t => {
+    for (const active of [false, true]) {
+        const state = fixture(t);
+        const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+        fs.mkdirSync(path.join(state.workspace, '.data'), { recursive: true });
+        const layout = path.join(state.workspace, '.data', '.layout.json');
+        fs.writeFileSync(layout, '{"version":2}');
+        if (active) {
+            fs.mkdirSync(path.join(state.workspace, '.ploinky', 'bwrap-pids'), { recursive: true });
+            fs.writeFileSync(path.join(state.workspace, '.ploinky', 'bwrap-pids', 'live.pid'), JSON.stringify({
+                pid: process.pid, schemaVersion: 3, hostStateMasked: true,
+            }));
+        }
+        const events = [];
+        const supervisor = createBoxSupervisor({
+            hostStateGuard: { ...PERMISSIVE_HOST_STATE_GUARD, quiescence() { events.push('quiescence'); return []; } },
+            ...state.stores, resolveIdentity: () => identity,
+            lockManager: fakeLockManager(state.root, events),
+            discover: () => ({ state: 'absent', engine: { name: 'podman' }, handles: {} }),
+            selectAgentLib: () => {
+                assert.equal(JSON.parse(fs.readFileSync(layout)).version, 4);
+                assert.deepEqual(events, ['lock', 'quiescence']);
+                throw Error('prepared after migration');
+            },
+            stderr: { write() {} },
+        });
+        await assert.rejects(supervisor.prepareBoxForCommand(), active ? /running agent/ : /prepared after migration/);
+        assert.equal(JSON.parse(fs.readFileSync(layout)).version, active ? 2 : 4);
+        assert.equal(events.at(-1), 'release');
+    }
 });
