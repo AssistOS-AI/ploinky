@@ -345,7 +345,7 @@ function normalizeRateSourceAddress(value) {
  * source address; local aliases use the TCP peer observed by the Router.
  */
 export function buildHttpRouteRateSourceHeader(req, routePlan) {
-    if (routePlan?.decision?.access !== 'guest') return {};
+    if ((routePlan?.kind === 'agent-port' ? routePlan?.access : routePlan?.decision)?.access !== 'guest') return {};
     const publicConnectorRequest = routePlan?.hostSelection?.source === 'public-host';
     const sourceClass = publicConnectorRequest ? 'cloudflare' : 'socket';
     const rawAddress = publicConnectorRequest

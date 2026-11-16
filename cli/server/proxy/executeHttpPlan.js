@@ -196,6 +196,8 @@ function readBoundedBody(req, limit) {
 
 export function proxyErrorStatus(error) {
     if (error?.code === 'PROTOCOL_REJECTED') return 400;
+    // A guest request refused before any relay is asked for: no usable transport source, or no route scope.
+    if (error?.code === 'INVALID_RATE_SOURCE') return error.statusCode === 503 ? 503 : 400;
     if (error?.code === 'METHOD_REJECTED') return 405;
     if (error?.code === 'REQUEST_TOO_LARGE') return 413;
     if (['AUTH_REQUIRED', 'ORIGIN_REJECTED', 'CSRF_REJECTED'].includes(error?.code)) return 403;
