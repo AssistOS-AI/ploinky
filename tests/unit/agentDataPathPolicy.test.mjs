@@ -14,6 +14,7 @@ import {
 } from '../../cli/utils/runtime/agentDataPathPolicy.js';
 import {
     ensureControllerGuardSources,
+    guardSourceEntries,
     controllerGuardMounts,
     controllerGuardTargets,
     normalizeRuntimeMountTarget,
@@ -209,6 +210,35 @@ test('controller guard targets are derived from broad mounts without creating th
             );
         }
     } finally {
+        cleanup();
+    }
+});
+
+test('a non-empty guard source is refused with the paths it holds', () => {
+    const { root, cleanup } = fixture();
+    let source;
+    try {
+        fs.mkdirSync(path.join(root, '.ploinky-box'));
+        source = ensureControllerGuardSources({ workspaceRoot: root }).get('workspace-data');
+        // What a runtime leaves when it creates a nested bind's mountpoint inside the shared mask.
+        fs.chmodSync(source, 0o755);
+        fs.mkdirSync(path.join(source, 'agents', 'workspace-monitor'), { recursive: true });
+        fs.symlinkSync('/etc', path.join(source, 'link'));
+        fs.chmodSync(source, 0o555);
+        assert.throws(() => ensureControllerGuardSources({ workspaceRoot: root }), (error) => {
+            assert.equal(error.code, AGENT_DATA_POLICY_CODE);
+            assert.deepEqual(error.context.entries, ['agents/', 'agents/workspace-monitor/', 'link@']);
+            assert.match(error.message, /is not empty \(entries: agents\/, agents\/workspace-monitor\/, link@\)$/);
+            return true;
+        });
+        assert.deepEqual(guardSourceEntries(source, { maxEntries: 1 }), ['agents/', '...']);
+        assert.deepEqual(guardSourceEntries(source, { maxDepth: 1 }), ['agents/', 'link@']);
+        assert.deepEqual(guardSourceEntries(path.join(root, 'missing')), ['<listing failed: ENOENT>']);
+    } finally {
+        if (source) {
+            fs.chmodSync(source, 0o755);
+            fs.rmSync(path.dirname(source), { recursive: true, force: true });
+        }
         cleanup();
     }
 });
