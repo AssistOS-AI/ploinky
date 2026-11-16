@@ -144,6 +144,38 @@ function ownAgentDataProjection(agentDataDir, workspaceRoot) {
     return Object.freeze({ view, source: projectedCanonicalPath(source), name });
 }
 
+// Lists what a guard source holds, for the error only: relative paths, directories
+// with a trailing `/`, links with a trailing `@` and never followed, depth- and
+// count-bounded, sorted. A listing failure is reported in place of the entries.
+export function guardSourceEntries(source, { maxDepth = 4, maxEntries = 20 } = {}) {
+    const entries = [];
+    let truncated = false;
+    const walk = (directory, relative, depth) => {
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+            if (entries.length >= maxEntries) {
+                truncated = true;
+                return;
+            }
+            const name = relative ? `${relative}/${entry.name}` : entry.name;
+            if (entry.isSymbolicLink()) {
+                entries.push(`${name}@`);
+            } else if (entry.isDirectory()) {
+                entries.push(`${name}/`);
+                if (depth < maxDepth) walk(path.join(directory, entry.name), name, depth + 1);
+            } else {
+                entries.push(name);
+            }
+        }
+    };
+    try {
+        walk(source, '', 1);
+    } catch (error) {
+        entries.push(`<listing failed: ${error?.code || error?.message || 'unknown error'}>`);
+    }
+    if (truncated) entries.push('...');
+    return entries;
+}
+
 export function ensureControllerGuardSources({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
@@ -161,7 +193,13 @@ export function ensureControllerGuardSources({
             throw guardError(`runtime guard source '${source}' must be a physical directory`, { source });
         }
         if (fs.readdirSync(source).length !== 0) {
-            throw guardError(`runtime guard source '${source}' is not empty`, { source });
+            // A runtime that creates a mountpoint inside a shared source leaves a path such as
+            // `agents/<name>/`. Naming it identifies the launch that nested a bind under the mask.
+            const entries = guardSourceEntries(source);
+            throw guardError(`runtime guard source '${source}' is not empty (entries: ${entries.join(', ')})`, {
+                source,
+                entries,
+            });
         }
         fs.chmodSync(source, 0o555);
         sources.set(protectedRoot.key, source);
