@@ -192,6 +192,15 @@ function expectedMaskViewListing(entries) {
     return Array.from(listed).sort();
 }
 
+function lstatOrNull(target) {
+    try {
+        return fs.lstatSync(target);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+    }
+}
+
 function setTreeModes(directory, { dirMode, fileMode }) {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
         const child = path.join(directory, entry.name);
@@ -226,12 +235,21 @@ function nestedMaskView(workspaceRoot, entries) {
             try {
                 fs.renameSync(build, view);
             } catch (error) {
-                if (error?.code !== 'EEXIST' && error?.code !== 'ENOTEMPTY') throw error;
+                // A concurrent launch published first. The error differs by platform
+                // (ENOTEMPTY or EEXIST on Linux, EACCES for a read-only tree on Darwin),
+                // so reuse whatever now exists and let the exact check below decide.
+                if (!lstatOrNull(view)) throw error;
             }
         } finally {
-            if (fs.existsSync(build)) {
-                setTreeModes(build, { dirMode: 0o755, fileMode: 0o644 });
-                fs.rmSync(build, { recursive: true, force: true });
+            // Best effort: a leftover build directory is harmless and must not hide the
+            // original error; the Box /tmp is a fresh tmpfs on every boot.
+            try {
+                if (fs.existsSync(build)) {
+                    setTreeModes(build, { dirMode: 0o755, fileMode: 0o644 });
+                    fs.rmSync(build, { recursive: true, force: true });
+                }
+            } catch {
+                // Ignored on purpose.
             }
         }
     }

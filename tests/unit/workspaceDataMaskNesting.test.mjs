@@ -10,6 +10,7 @@ import {
     buildPodmanStagedTargetMounts,
     podmanMountSuffix,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
+import { assertDataLayoutCurrent } from '../../cli/utils/dataLayoutMigration.js';
 import { AGENT_DATA_POLICY_CODE } from '../../cli/utils/runtime/agentDataPathPolicy.js';
 import { ensureControllerGuardSources, guardSourceEntries } from '../../cli/utils/runtime/controllerStateGuards.js';
 
@@ -22,6 +23,8 @@ import { ensureControllerGuardSources, guardSourceEntries } from '../../cli/util
 function workspace(t) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mask-nest-')));
     fs.mkdirSync(path.join(root, '.data', 'agents'), { recursive: true, mode: 0o700 });
+    // Stamp the current data layout once, so concurrent launches never race on initializing it.
+    assertDataLayoutCurrent(root);
     const shared = ensureControllerGuardSources({ workspaceRoot: root }).get('workspace-data');
     t.after(() => {
         const base = path.dirname(shared);
@@ -203,6 +206,51 @@ test('a nested bind with a missing source is refused', (t) => {
     const missing = path.join(launch.home, 'missing');
     launch.args.push('-v', `${missing}:${missing}:z,ro`);
     assert.throws(() => guard(root, launch, 'gone'), /missing/);
+});
+
+test('a launch that loses the publication race reuses the identical view', (t) => {
+    const { root } = workspace(t);
+    // Force the race: just before this launch renames its build, a competitor publishes the identical view.
+    const original = fs.renameSync;
+    let raced = 0;
+    fs.renameSync = (from, to) => {
+        if (String(to).includes(`${path.sep}mask-views${path.sep}`) && !fs.existsSync(to)) {
+            const mountpoint = path.join(to, 'agents', 'liveKitServerAgent', 'node_modules');
+            fs.mkdirSync(mountpoint, { recursive: true });
+            for (const directory of [mountpoint, path.dirname(mountpoint), path.join(to, 'agents'), to]) fs.chmodSync(directory, 0o555);
+            raced += 1;
+        }
+        return original(from, to);
+    };
+    let view;
+    try {
+        view = dataMask(root, guard(root, isolatedNoCacheLaunch(root, 'liveKitServerAgent'), 'liveKitServerAgent'));
+    } finally {
+        fs.renameSync = original;
+    }
+    assert.equal(raced, 1);
+    assert.deepEqual(guardSourceEntries(view, { maxDepth: Infinity, maxEntries: Infinity }),
+        ['agents/', 'agents/liveKitServerAgent/', 'agents/liveKitServerAgent/node_modules/']);
+    assert.equal(fs.readdirSync(path.dirname(view)).some(name => name.startsWith('.build-')), false);
+});
+
+test('a launch that loses the race to a different tree is refused', (t) => {
+    const { root } = workspace(t);
+    const original = fs.renameSync;
+    fs.renameSync = (from, to) => {
+        if (String(to).includes(`${path.sep}mask-views${path.sep}`) && !fs.existsSync(to)) {
+            fs.mkdirSync(path.join(to, 'planted'), { recursive: true });
+        }
+        return original(from, to);
+    };
+    try {
+        assert.throws(
+            () => guard(root, isolatedNoCacheLaunch(root, 'liveKitServerAgent'), 'liveKitServerAgent'),
+            error => error?.code === AGENT_DATA_POLICY_CODE && /holds unexpected entries/.test(error.message),
+        );
+    } finally {
+        fs.renameSync = original;
+    }
 });
 
 test('concurrent launches publish one exact view and leave no build directories', async (t) => {
