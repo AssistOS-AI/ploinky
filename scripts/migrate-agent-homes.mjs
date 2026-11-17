@@ -12,7 +12,7 @@ if (args.length !== 2 || args[0] !== '--plan') {
     try {
         const plan = JSON.parse(fs.readFileSync(path.resolve(args[1]), 'utf8'));
         const result = await createBoxSupervisor().runAgentHomeMigration(plan);
-        for (const entry of result) console.log(`${entry.source} -> ${entry.target}: ${entry.action}`);
+        for (const entry of result) console.log(`${entry.source} -> ${entry.target}: ${entry.action}; rewritten rows: ${entry.rewrittenRows || 0}`);
     } catch (error) {
         console.error(error.message);
         process.exitCode = 1;

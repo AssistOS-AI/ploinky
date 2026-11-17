@@ -81,3 +81,58 @@ test('unchanged canonical homes do not move or rewrite files', t => {
     assert.equal(migrateAgentHomes(root, [{ ...plan[0], sourceKey: 'app' }], admitted)[0].action, 'unchanged');
     assert.equal(fs.statSync(source).ino, inode);
 });
+
+test('SQLite references are rebased offline while unrelated JSON and logs remain unchanged', async t => {
+    const { DatabaseSync } = await import('node:sqlite');
+    const { root, file, home } = fixture(t);
+    file('legacy', 'jobs/a.log', 'historical /data/jobs/a.log');
+    const db = new DatabaseSync(path.join(home('legacy'), 'state.sqlite'));
+    db.exec('CREATE TABLE jobs(id TEXT PRIMARY KEY, result_json TEXT)');
+    const result = { files: ['/data/jobs/a.log', `${root}/.data/legacy/jobs/b`, `${root}/.data/agents/legacy/jobs/c`, '/other/file', '/database/file'], message: '/data/keep-history' };
+    db.prepare('INSERT INTO jobs VALUES (?,?)').run('job', JSON.stringify(result)); db.close();
+    const migration = [{ ...plan[0], sqliteJsonPaths: [{ file: 'state.sqlite', table: 'jobs', key: 'id', column: 'result_json', array: 'files' }] }];
+    migrateAgentHomes(root, migration, admitted);
+    const moved = new DatabaseSync(path.join(home('app'), 'state.sqlite'));
+    const after = JSON.parse(moved.prepare('SELECT result_json FROM jobs').get().result_json);
+    assert.deepEqual(after, { ...result, files: ['/root/jobs/a.log', '/root/jobs/b', '/root/jobs/c', '/other/file', '/database/file'] });
+    assert.equal(moved.prepare('PRAGMA integrity_check').get().integrity_check, 'ok'); moved.close();
+    assert.equal(fs.readFileSync(path.join(home('app'), 'jobs/a.log'), 'utf8'), 'historical /data/jobs/a.log');
+    assert.equal(fs.existsSync(path.join(root, '.ploinky', 'agent-home-migration-pending.json')), false);
+    migrateAgentHomes(root, migration, admitted);
+    assert.equal(fs.existsSync(home('legacy')), false);
+});
+
+test('failed SQL migration blocks launch after the directory move, rolls back rows, and resumes', async t => {
+    const { DatabaseSync } = await import('node:sqlite');
+    const { assertNoPendingHomeMigration } = await import('../../cli/utils/runtime/agentHomeMigrationPolicy.js');
+    const { root, file, home } = fixture(t); file('legacy', 'log');
+    const db = new DatabaseSync(path.join(home('legacy'), 'state.sqlite'));
+    db.exec(`CREATE TABLE jobs(id TEXT PRIMARY KEY, result_json TEXT);
+        INSERT INTO jobs VALUES ('a','{"files":["/data/a"]}'), ('b','{"files":["/data/b"]}');
+        CREATE TRIGGER fail_update BEFORE UPDATE ON jobs WHEN old.id='b' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;`);
+    db.close();
+    const migration = [{ ...plan[0], sqliteJsonPaths: [{ file: 'state.sqlite', table: 'jobs', key: 'id', column: 'result_json', array: 'files' }] }];
+    assert.throws(() => migrateAgentHomes(root, migration, admitted), /fixture failure/);
+    assert.equal(fs.existsSync(home('legacy')), false);
+    assert.throws(() => assertNoPendingHomeMigration(root), /interrupted migration/);
+    assert.throws(() => migrateAgentHomes(root, [], admitted), /same plan/);
+    const moved = new DatabaseSync(path.join(home('app'), 'state.sqlite'));
+    assert.deepEqual(moved.prepare('SELECT result_json FROM jobs ORDER BY id').all().map(r => JSON.parse(r.result_json).files[0]), ['/data/a', '/data/b']);
+    moved.exec('DROP TRIGGER fail_update'); moved.close();
+    migrateAgentHomes(root, migration, admitted);
+    assert.doesNotThrow(() => assertNoPendingHomeMigration(root));
+});
+
+test('SQLite preflight refuses unsafe references without moving or creating a replacement database', async t => {
+    const { DatabaseSync } = await import('node:sqlite');
+    const { root, file, home } = fixture(t); file('legacy', 'log');
+    const db = new DatabaseSync(path.join(home('legacy'), 'state.sqlite'));
+    db.exec(`CREATE TABLE jobs(id TEXT PRIMARY KEY, result_json TEXT); INSERT INTO jobs VALUES('a','{"files":["/data/../secret"]}');`); db.close();
+    const migration = [{ ...plan[0], sqliteJsonPaths: [{ file: 'state.sqlite', table: 'jobs', key: 'id', column: 'result_json', array: 'files' }] }];
+    assert.throws(() => migrateAgentHomes(root, migration, admitted), /Unsafe legacy/);
+    assert.equal(fs.existsSync(home('app')), false);
+    assert.equal(fs.existsSync(path.join(root, '.ploinky', 'agent-home-migration-pending.json')), false);
+    file('app', 'state.sqlite', 'new database');
+    assert.throws(() => migrateAgentHomes(root, migration, admitted), /conflict/);
+    assert.equal(fs.readFileSync(path.join(home('app'), 'state.sqlite'), 'utf8'), 'new database');
+});

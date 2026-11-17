@@ -1,6 +1,31 @@
 [
-  { "repoName": "PromotionScoutV2", "agentName": "promotionScout", "sourceKey": "promotionScout" },
-  { "repoName": "PloinkyProxies", "agentName": "proxyAgent", "sourceKey": "proxyAgent" },
-  { "repoName": "local-llms", "agentName": "local-llm", "sourceKey": "local-llm" },
-  { "repoName": "bizanso", "agentName": "bizanso", "sourceKey": "bizansoAgent" }
+  {
+    "repoName": "PromotionScoutV2",
+    "agentName": "promotionScout",
+    "sourceKey": "promotionScout"
+  },
+  {
+    "repoName": "PloinkyProxies",
+    "agentName": "proxyAgent",
+    "sourceKey": "proxyAgent"
+  },
+  {
+    "repoName": "local-llms",
+    "agentName": "local-llm",
+    "sourceKey": "local-llm"
+  },
+  {
+    "repoName": "bizanso",
+    "agentName": "bizanso",
+    "sourceKey": "bizansoAgent",
+    "sqliteJsonPaths": [
+      {
+        "file": "state.sqlite",
+        "table": "jobs",
+        "key": "id",
+        "column": "result_json",
+        "array": "files"
+      }
+    ]
+  }
 ]

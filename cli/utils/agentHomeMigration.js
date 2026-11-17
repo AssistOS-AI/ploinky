@@ -1,3 +1,6 @@
+import crypto from 'node:crypto';
+import { HOME_MIGRATION_PENDING } from './runtime/agentHomeMigrationPolicy.js';
+import { validateSqliteHomeRules, inspectSqliteHomePaths, applySqliteHomePaths } from './sqliteHomePathMigration.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { assertDataLayoutCurrent } from './dataLayoutMigration.js';
@@ -44,6 +47,15 @@ export function migrateAgentHomes(workspaceRoot, plan, { assertMigrationAllowed 
     const root = path.resolve(workspaceRoot);
     assertDataLayoutCurrent(root);
     if (!Array.isArray(plan) || plan.length > 256) throw new Error('Expected a bounded agent home migration plan');
+    const pending = path.join(root, '.ploinky', HOME_MIGRATION_PENDING);
+    safe(root, pending);
+    const planHash = crypto.createHash('sha256').update(JSON.stringify(plan)).digest('hex');
+    if (stat(pending)) {
+        if (!stat(pending).isFile() || stat(pending).size > 1024
+            || JSON.parse(fs.readFileSync(pending, 'utf8')).planHash !== planHash) {
+            throw new Error('Resume the interrupted home migration with the same plan');
+        }
+    }
     const records = readRegistry(root);
     const base = path.join(root, '.data', 'agents');
     safe(root, base);
@@ -57,7 +69,7 @@ export function migrateAgentHomes(workspaceRoot, plan, { assertMigrationAllowed 
             && (record.repoName !== repo || record.agentName !== agent))) {
             throw new Error(`Home ${target} belongs to another agent`);
         }
-        return { source, target };
+        return { source, target, sqliteJsonPaths: validateSqliteHomeRules(entry.sqliteJsonPaths) };
     });
     for (let i = 0; i < mappings.length; i++) {
         for (let j = i + 1; j < mappings.length; j++) {
@@ -93,6 +105,29 @@ export function migrateAgentHomes(workspaceRoot, plan, { assertMigrationAllowed 
         collect(source, target);
         results.push({ ...mapping, action: 'migrated' });
     }
+    const databaseUpdates = [];
+    for (const mapping of mappings) {
+        for (const rule of mapping.sqliteJsonPaths) {
+            const sourceFile = path.join(base, mapping.source, rule.file);
+            const targetFile = path.join(base, mapping.target, rule.file);
+            const file = stat(sourceFile) ? sourceFile : targetFile;
+            safe(root, file);
+            if (!stat(file)) continue; // A genuinely new deployment has no database to migrate.
+            if (!stat(file).isFile() || stat(file).nlink !== 1) throw new Error('SQLite home migration requires a regular database without hard links');
+            for (const suffix of ['-wal', '-shm', '-journal']) {
+                safe(root, file + suffix);
+                const sidecar = stat(file + suffix);
+                if (sidecar && (!sidecar.isFile() || sidecar.nlink !== 1)) throw new Error('Unsafe SQLite sidecar');
+            }
+            const prefixes = ['/data/', `${root}/.data/${mapping.source}/`, `${root}/.data/agents/${mapping.source}/`];
+            const changes = inspectSqliteHomePaths(file, rule, prefixes);
+            databaseUpdates.push({ targetFile, rule, changes });
+            if (changes.length) {
+                const result = results.find(result => result.target === mapping.target);
+                result.rewrittenRows = (result.rewrittenRows || 0) + changes.length;
+            }
+        }
+    }
     // Preflight every entry before the first rename. A retry after interruption
     // continues with the entries left in the source; existing files never win.
     assertMigrationAllowed();
@@ -100,6 +135,13 @@ export function migrateAgentHomes(workspaceRoot, plan, { assertMigrationAllowed 
         const fd = fs.openSync(directory, 'r');
         try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     };
+    if (!moves.length && !directories.length && !databaseUpdates.some(update => update.changes.length) && !stat(pending)) return results;
+    if (!stat(pending)) {
+        fs.mkdirSync(path.dirname(pending), { recursive: true });
+        const fd = fs.openSync(pending, 'wx', 0o600);
+        try { fs.writeFileSync(fd, JSON.stringify({ planHash }) + '\n'); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        sync(path.dirname(pending));
+    }
     for (const [source, target] of moves) {
         safe(root, source); safe(root, target);
         if (stat(target)) throw new Error(`Agent home migration conflict: ${target}`);
@@ -108,5 +150,12 @@ export function migrateAgentHomes(workspaceRoot, plan, { assertMigrationAllowed 
         if (path.dirname(source) !== path.dirname(target)) sync(path.dirname(source));
     }
     for (const directory of directories) { fs.rmdirSync(directory); sync(path.dirname(directory)); }
+    for (const { targetFile, rule, changes } of databaseUpdates) {
+        safe(root, targetFile);
+        if (!stat(targetFile)?.isFile() || stat(targetFile).nlink !== 1) throw new Error('SQLite migration destination disappeared or became unsafe');
+        applySqliteHomePaths(targetFile, rule, changes);
+    }
+    fs.unlinkSync(pending);
+    sync(path.dirname(pending));
     return results;
 }

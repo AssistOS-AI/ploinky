@@ -1,3 +1,4 @@
+import { assertNoPendingHomeMigration } from '../utils/runtime/agentHomeMigrationPolicy.js';
 import { spawn as defaultSpawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -49,6 +50,7 @@ export function ensureHostLaunchSkeleton(workspaceRoot, {
     // creating a Box. Launch admission can initialize fresh storage but must
     // refuse an old version whose launch paths would address the wrong data.
     assertDataLayoutCurrent(root);
+    assertNoPendingHomeMigration(root);
     if (insideBox()) return null;
     try {
         return ensureSkeleton(root);

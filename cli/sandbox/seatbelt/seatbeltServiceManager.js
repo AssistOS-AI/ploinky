@@ -153,6 +153,7 @@ function admitSeatbeltBoundary(agentName, manifest, agentPath, options, profileR
         manifestBytes,
         manifestPath,
         agentId: `${repoName}/${agentName}`,
+        alias: optionBag.alias || loadAgentsMap()[optionBag.containerName || getAgentContainerName(agentName, repoName)]?.alias || '',
         profileName: profileResolution.resolvedProfileName,
         profileConfig: profileResolution.profileConfig,
         network: profileResolution.network,

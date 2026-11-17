@@ -343,3 +343,14 @@ Modificarea local-llm este în checkout-ul `.ploinky/repos/local-llms`; trebuie 
 
 
 Verificare: 120 teste Ploinky pentru layout, migrarea home-urilor și supervisor; 35 teste Bizanso; 5 teste de contract local-llm. Toate au trecut. Cele patru manifeste trec validatorul și nu au `volumes`. Proba pe workspace-ul activ a fost refuzată cu mesajul că este necesar `ploinky destroy`, fără mutarea datelor. Aplicarea efectivă pe instanța locală și pe remote necesită secvența offline de mai sus.
+
+
+### SQLite references and launch admission
+
+The offline plan's Bizanso entry includes a declarative SQLite rewrite for `jobs.result_json.files`. The same host command that moves the home rebases `/data/`, the old flat host source, and the old `.data/agents/<sourceKey>/` host source to `/root/`. It changes only the declared array's matching paths, preserves other JSON fields and log contents, and does not delete or merge databases. The SQLite primary key and JSON column must exist; invalid JSON, unsafe paths, links, and competing database files are refused. No database is created when no source or destination database exists.
+
+The complete filesystem and database preflight happens before moves. A durable `.ploinky/agent-home-migration-pending.json` marker precedes mutations. SQLite updates use a transaction; the marker is removed only after all moves and rewrites succeed. An interrupted operation must be resumed with the same plan. The marker blocks launches even if the source directory has already disappeared.
+
+Bizanso ships `home-migration.json` with historical home keys, separately from `manifest.json`. This file defines no volumes. Shared runtime admission checks it before container, bwrap, and seatbelt launches, including monitor-driven recovery. If the legacy home contains data, launch is refused even when a new database already exists at the destination. A genuinely fresh installation remains allowed. Ploinky and the agent repository must both be upgraded for this guard to apply.
+
+This is an explicit offline operation, not an agent install hook: `ploinky destroy`, update Ploinky and agents, run `scripts/migrate-agent-homes.mjs --plan proposals/automatic-agent-homes.json` from the workspace using absolute checkout paths, then `ploinky start`. Install is not allowed to resolve conflicts or discard a destination database. Two databases require a separate operator decision; the migration preserves both and refuses the conflict.

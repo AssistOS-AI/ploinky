@@ -1,3 +1,4 @@
+import { assertAgentHomeMigrationReady } from '../utils/runtime/agentHomeMigrationPolicy.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -672,6 +673,7 @@ export function admitManifestRuntimeCapabilities(manifest, {
         });
     }
     assertNoRetiredStorage(manifest);
+    assertAgentHomeMigrationReady({ workspaceRoot, manifestPath, instanceName: alias || String(agentId).split('/').pop() });
     let exactManifest = manifest;
     if (manifestBytes !== undefined) {
         try {
