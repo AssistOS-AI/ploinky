@@ -121,7 +121,7 @@ function resolveGeneratedMasterKeySeed(startDir = process.cwd()) {
     const filePath = resolveGeneratedMasterKeyPath(startDir);
     const legacy = path.join(root, '.ploinky', 'data', 'master-key');
     if (!fs.existsSync(filePath) && fs.existsSync(legacy)) {
-        throw new Error('Legacy master key requires offline migration: run ploinky destroy, then ploinky start.');
+        throw new Error('Unsupported master-key location: expected .data/dpu-data/master-key.');
     }
     const initialized = initializeWorkspaceMasterKey({ workspaceRoot: root });
     return {

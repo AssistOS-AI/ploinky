@@ -1,4 +1,3 @@
-import { assertNoPendingHomeMigration } from '../utils/runtime/agentHomeMigrationPolicy.js';
 import { spawn as defaultSpawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,7 +8,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { createMutationLockManager } from '../../ploinky-box/locks.mjs';
 import { heldHostLaunchExclusion, setHeldHostLaunchExclusion } from './hostLaunchExclusionState.js';
-import { assertDataLayoutCurrent } from '../utils/dataLayoutMigration.js';
+import { assertDataLayoutCurrent } from '../utils/workspaceDataLayout.js';
 
 // Host-runtime launches (bwrap, seatbelt, host Podman) and Box transactions
 // exclude each other through the workspace lock (D4). A Box transaction holds
@@ -46,11 +45,8 @@ export function ensureHostLaunchSkeleton(workspaceRoot, {
     ensureSkeleton = ensureHostStateSkeleton,
 } = {}) {
     const root = absoluteRoot(workspaceRoot);
-    // Only the locked host lifecycle moves old data, after destroy and before
-    // creating a Box. Launch admission can initialize fresh storage but must
-    // refuse an old version whose launch paths would address the wrong data.
+    // Launch admission initializes fresh storage and rejects unsupported layouts.
     assertDataLayoutCurrent(root);
-    assertNoPendingHomeMigration(root);
     if (insideBox()) return null;
     try {
         return ensureSkeleton(root);

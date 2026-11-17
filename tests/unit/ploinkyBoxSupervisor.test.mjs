@@ -2271,70 +2271,10 @@ for (const running of [true, false]) {
             reconcile: () => { throw Error('must not reconcile an old layout'); },
             runner: { run(_command, args) { events.push(args.join(' ')); } },
         });
-        await assert.rejects(supervisor.prepareBoxForCommand(), /ploinky destroy/);
+        await assert.rejects(supervisor.prepareBoxForCommand(), /Unsupported workspace data layout/);
         assert.equal(fs.readFileSync(layout, 'utf8'), '{"version":2}');
         await supervisor.runDestroyTransaction(ownership.handles.container.id);
         assert.ok(events.some(event => event.startsWith('container rm')));
         assert.equal(fs.readFileSync(layout, 'utf8'), '{"version":2}');
     });
 }
-
-test('host migrates an absent Box workspace under lock before preparation and refuses live host launch records', async t => {
-    for (const active of [false, true]) {
-        const state = fixture(t);
-        const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
-        fs.mkdirSync(path.join(state.workspace, '.data'), { recursive: true });
-        const layout = path.join(state.workspace, '.data', '.layout.json');
-        fs.writeFileSync(layout, '{"version":2}');
-        if (active) {
-            fs.mkdirSync(path.join(state.workspace, '.ploinky', 'bwrap-pids'), { recursive: true });
-            fs.writeFileSync(path.join(state.workspace, '.ploinky', 'bwrap-pids', 'live.pid'), JSON.stringify({
-                pid: process.pid, schemaVersion: 3, hostStateMasked: true,
-            }));
-        }
-        const events = [];
-        const supervisor = createBoxSupervisor({
-            hostStateGuard: { ...PERMISSIVE_HOST_STATE_GUARD, quiescence() { events.push('quiescence'); return []; } },
-            ...state.stores, resolveIdentity: () => identity,
-            lockManager: fakeLockManager(state.root, events),
-            discover: () => ({ state: 'absent', engine: { name: 'podman' }, handles: {} }),
-            selectAgentLib: () => {
-                assert.equal(JSON.parse(fs.readFileSync(layout)).version, 4);
-                assert.deepEqual(events, ['lock', 'quiescence']);
-                throw Error('prepared after migration');
-            },
-            stderr: { write() {} },
-        });
-        await assert.rejects(supervisor.prepareBoxForCommand(), active ? /running agent/ : /prepared after migration/);
-        assert.equal(JSON.parse(fs.readFileSync(layout)).version, active ? 2 : 4);
-        assert.equal(events.at(-1), 'release');
-    }
-});
-
-test('agent home migration requires a destroyed Box and a complete quiescence observation', async t => {
-    const state = fixture(t);
-    fs.mkdirSync(path.join(state.workspace, '.ploinky'), { recursive: true });
-    fs.mkdirSync(path.join(state.workspace, '.data', 'agents', 'legacy'), { recursive: true });
-    fs.writeFileSync(path.join(state.workspace, '.data', '.layout.json'), '{"version":4}');
-    fs.writeFileSync(path.join(state.workspace, '.data', 'agents', 'legacy', 'state.sqlite'), 'old data');
-    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
-    const plan = [{ repoName: 'fixture', agentName: 'app', sourceKey: 'legacy' }];
-    const make = (ownership, quiescence = () => []) => createBoxSupervisor({
-        hostStateGuard: { ...PERMISSIVE_HOST_STATE_GUARD, quiescence },
-        ...state.stores,
-        resolveIdentity: () => identity,
-        lockManager: fakeLockManager(fs.mkdtempSync(path.join(state.root, 'locks-')), []),
-        discover: () => ownership,
-        runner: { run() { assert.fail('migration must not create a Box'); } },
-    });
-    for (const running of [true, false]) {
-        await assert.rejects(make(owned(identity, { running })).runAgentHomeMigration(plan), /ploinky destroy/);
-    }
-    const absent = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: null };
-    await assert.rejects(make(absent, () => null).runAgentHomeMigration(plan), /complete runtime/);
-    await assert.rejects(make(absent, () => { throw new Error('live host agent'); }).runAgentHomeMigration(plan), /live host agent/);
-    assert.equal(fs.existsSync(path.join(state.workspace, '.data', 'agents', 'legacy', 'state.sqlite')), true);
-    const result = await make(absent).runAgentHomeMigration(plan);
-    assert.equal(result[0].action, 'migrated');
-    assert.equal(fs.readFileSync(path.join(state.workspace, '.data', 'agents', 'app', 'state.sqlite'), 'utf8'), 'old data');
-});

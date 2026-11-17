@@ -1,6 +1,4 @@
-import { migrateAgentHomes } from '../cli/utils/agentHomeMigration.js';
-import { ensureDataLayout } from '../cli/utils/dataLayoutMigration.js';
-import { createQuiescenceGate } from './hostState/quiescence.mjs';
+import { assertDataLayoutCurrent } from '../cli/utils/workspaceDataLayout.js';
 import { buildHostSkillScope } from './skillScope.mjs';
 import { readGraphSkillScope, validateGraphSkillScope, writeGraphSkillScope } from './graphSkillScope.mjs';
 import os from 'node:os';
@@ -907,21 +905,7 @@ export function createBoxSupervisor({
                 const ownership = authorize(inspect(identity));
                 guard.underLock(identity, lock, ownership, { policy });
                 if (policy !== HOST_STATE_POLICY.restrict) {
-                    ensureDataLayout(identity.workspaceRoot, {
-                        log: message => stderr?.write?.(`[data-layout] ${message}\n`),
-                        assertMigrationAllowed() {
-                            lock.assertHeld(identity.instance);
-                            const current = authorize(inspect(identity));
-                            if (current.handles?.container) throw supervisorError(
-                                'Old data layout requires ploinky destroy before migration; a stopped Box is not sufficient.',
-                                'PLOINKY_DATA_LAYOUT_MIGRATION');
-                            const view = guard.quiescence({ identity, engine: current.engine });
-                            if (!Array.isArray(view)) throw supervisorError(
-                                'Migration requires a complete runtime quiescence observation.', 'PLOINKY_DATA_LAYOUT_MIGRATION');
-                            // Migration never excuses a live host agent.
-                            createQuiescenceGate({ platform }).assert(identity, { view });
-                        },
-                    });
+                    assertDataLayoutCurrent(identity.workspaceRoot);
                 }
                 return ownership;
             },
@@ -3859,23 +3843,6 @@ export function createBoxSupervisor({
 
     // Saves the host-owned edge input under the workspace lock. Only a later
     // start stages it and activates a routing generation.
-    async function runAgentHomeMigration(plan) {
-        return lockedMutation(async (identity, lock) => {
-            const assertMigrationAllowed = () => {
-                lock.assertHeld(identity.instance);
-                const current = assertMutableOwnership(inspect(identity));
-                if (current.handles?.container) throw supervisorError(
-                    'Agent home migration requires ploinky destroy; a stopped Box is not sufficient.',
-                    'PLOINKY_DATA_LAYOUT_MIGRATION');
-                const view = guard.quiescence({ identity, engine: current.engine });
-                if (!Array.isArray(view)) throw supervisorError(
-                    'Migration requires a complete runtime quiescence observation.', 'PLOINKY_DATA_LAYOUT_MIGRATION');
-                createQuiescenceGate({ platform }).assert(identity, { view });
-            };
-            return migrateAgentHomes(identity.workspaceRoot, plan, { assertMigrationAllowed });
-        });
-    }
-
     async function runEdgeSetTransaction(bytes) {
         return lockedMutation(async (identity, lock, ownership) => {
             const assertHeld = () => lock.assertHeld(identity.instance);
@@ -4257,7 +4224,6 @@ export function createBoxSupervisor({
         runStopTransaction,
         runDestroyTransaction,
         runEdgeSetTransaction,
-        runAgentHomeMigration,
         inspectBoxStatus,
         planDryRun,
         planBindDryRun,

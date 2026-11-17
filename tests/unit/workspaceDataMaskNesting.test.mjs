@@ -10,7 +10,7 @@ import {
     buildPodmanStagedTargetMounts,
     podmanMountSuffix,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
-import { assertDataLayoutCurrent } from '../../cli/utils/dataLayoutMigration.js';
+import { assertDataLayoutCurrent } from '../../cli/utils/workspaceDataLayout.js';
 import { AGENT_DATA_POLICY_CODE } from '../../cli/utils/runtime/agentDataPathPolicy.js';
 import { ensureControllerGuardSources, guardSourceEntries } from '../../cli/utils/runtime/controllerStateGuards.js';
 

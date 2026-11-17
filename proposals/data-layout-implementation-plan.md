@@ -1,3 +1,5 @@
+> Plan istoric. Migrările de stocare au fost finalizate. Utilitarele de migrare și compatibilitatea `/data` din agenții migrați au fost eliminate; instrucțiunile de migrare de mai jos nu mai descriu codul executabil curent.
+
 # Noua structură a `.data`: agents / robots / dpu-data
 
 Plan de implementare în 4 pași.
@@ -314,43 +316,3 @@ Actualizare ulterioară pașilor 1–4: suportul `persistentStorage` a fost elim
 3. **Agenții din alte repo-uri.** Extinderea de mai jos trece promotionScout, proxyAgent, local-llm și bizanso pe `/root`. WebMeet este amânat. webSearchAgent, browserUseAgent și openInterpreterAgent nu mai sunt folosiți și sunt excluși din migrare.
 4. **Istoricul robotului șters.** Decizie confirmată: ștergerea robotului păstrează istoricul execuțiilor și logurile.
 5. **Referințele OAuth Soul Gateway.** Corectate prin migrare la pornirea serviciului, înainte de încărcarea conturilor: prefixul `/data/credentials/` este înlocuit cu `CREDENTIALS_DIR` numai după verificarea și decriptarea fișierului relocat. Tranzacția nu schimbă fișierele criptate. Validat pe o copie izolată a bazei și credențialelor instanței active, plus citire și refresh în teste. Suita Soul Gateway: 1350 trecute, 0 eșecuri, 2 omise. Instanța activă nu a fost repornită; migrarea ei se aplică la următoarea pornire cu codul nou.
-
-
-### Extinderea migrării la agenții folosiți din alte repo-uri
-
-promotionScout, proxyAgent, local-llm și bizanso nu mai declară volume de date în manifest. Ploinky le oferă automat `/root`, din `.data/agents/<numele instanței sau alias>`. WebMeet rămâne amânat; webSearchAgent, browserUseAgent și openInterpreterAgent sunt excluși. Varianta intermediară cu volume explicite la `/root` a fost înlocuită.
-
-Pentru numele canonice, Scout, proxyAgent și local-llm au deja datele în home-ul corect. Bizanso necesită mutarea din `.data/agents/bizansoAgent` în `.data/agents/bizanso`, păstrând metadatele existente în home. Pentru alias-uri, migrarea citește registrul și mută vechiul director fix în home-ul alias-ului. Nu se șterg loguri, baze de date sau modele.
-
-Migrarea generică este `scripts/migrate-agent-homes.mjs`. Numele agenților sunt în planul de operator `proposals/automatic-agent-homes.json`, nu în runtime sau în manifeste. Rulează sub lock-ul workspace-ului, cu verificarea că Box-ul a fost distrus și că nu rulează agenți pe host. Aplică întâi layout-ul curent dacă este necesar. Verifică toate mutările înainte să înceapă, refuză conflictele și symlink-urile, apoi folosește rename și fsync. O reluare continuă mutările rămase fără să suprascrie fișierele mutate anterior. Dacă mai multe instanțe foloseau același director vechi, refuză migrarea până când operatorul separă explicit datele; nu alege arbitrar un proprietar.
-
-Pe fiecare server, cu versiunile noi publicate și disponibile:
-
-1. Din workspace, rulează `ploinky destroy`, fără `--delete-data`. Nu folosi operația `destroy` a helper-ului Bizanso, care poate șterge datele.
-2. Păstrează un backup al `.data` și `.ploinky`, apoi actualizează Ploinky și repo-urile agenților cu totul oprit.
-3. Tot din workspace, rulează:
-
-   ```sh
-   node /cale/catre/ploinky/scripts/migrate-agent-homes.mjs --plan /cale/catre/ploinky/proposals/automatic-agent-homes.json
-   ```
-
-   Planul folosește numele repo-urilor înregistrate `PromotionScoutV2`, `PloinkyProxies`, `local-llms` și `bizanso`. Dacă un deployment le-a înregistrat sub alte nume, adaptează `repoName` în copia planului înainte de rulare. Alias-urile de instanță sunt citite automat.
-4. Numai după succesul migrării, rulează `ploinky start`. Verifică fișierele existente prin `/root`, configurația serviciilor Scout și inventarul modelelor local-llm. Rutele HTTP Bizanso `/data/*` rămân neschimbate.
-
-Scout migrează separat, la pornire, căile persistate ale serviciilor din `config.json`, sub lock-ul de lifecycle. Override-urile vechi cu prefix `/data` sunt traduse la `/root`; cele către alte directoare rămân păstrate. Helper-ele remote Bizanso verifică acum home-ul canonic `.data/agents/bizanso`.
-
-Modificarea local-llm este în checkout-ul `.ploinky/repos/local-llms`; trebuie păstrată și publicată înaintea unui update care îl înlocuiește. Modificările nu au fost publicate sau aplicate pe servere remote.
-
-
-Verificare: 120 teste Ploinky pentru layout, migrarea home-urilor și supervisor; 35 teste Bizanso; 5 teste de contract local-llm. Toate au trecut. Cele patru manifeste trec validatorul și nu au `volumes`. Proba pe workspace-ul activ a fost refuzată cu mesajul că este necesar `ploinky destroy`, fără mutarea datelor. Aplicarea efectivă pe instanța locală și pe remote necesită secvența offline de mai sus.
-
-
-### SQLite references and launch admission
-
-The offline plan's Bizanso entry includes a declarative SQLite rewrite for `jobs.result_json.files`. The same host command that moves the home rebases `/data/`, the old flat host source, and the old `.data/agents/<sourceKey>/` host source to `/root/`. It changes only the declared array's matching paths, preserves other JSON fields and log contents, and does not delete or merge databases. The SQLite primary key and JSON column must exist; invalid JSON, unsafe paths, links, and competing database files are refused. No database is created when no source or destination database exists.
-
-The complete filesystem and database preflight happens before moves. A durable `.ploinky/agent-home-migration-pending.json` marker precedes mutations. SQLite updates use a transaction; the marker is removed only after all moves and rewrites succeed. An interrupted operation must be resumed with the same plan. The marker blocks launches even if the source directory has already disappeared.
-
-Bizanso ships `home-migration.json` with historical home keys, separately from `manifest.json`. This file defines no volumes. Shared runtime admission checks it before container, bwrap, and seatbelt launches, including monitor-driven recovery. If the legacy home contains data, launch is refused even when a new database already exists at the destination. A genuinely fresh installation remains allowed. Ploinky and the agent repository must both be upgraded for this guard to apply.
-
-This is an explicit offline operation, not an agent install hook: `ploinky destroy`, update Ploinky and agents, run `scripts/migrate-agent-homes.mjs --plan proposals/automatic-agent-homes.json` from the workspace using absolute checkout paths, then `ploinky start`. Install is not allowed to resolve conflicts or discard a destination database. Two databases require a separate operator decision; the migration preserves both and refuses the conflict.

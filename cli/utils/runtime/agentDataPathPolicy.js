@@ -91,8 +91,7 @@ export function validateAgentDataKey(value, { label = 'storage key' } = {}) {
     return value;
 }
 
-// Top-level `.data` entries that are not an agent's own data. Every other
-// entry of the old flat layout (`.data/<x>`) now lives in `.data/agents/<x>`.
+// Top-level shared infrastructure stores. Agent volume shorthand resolves below agents/.
 export const AGENTS_DATA_SEGMENT = 'agents';
 export const RESERVED_DATA_ENTRIES = Object.freeze([AGENTS_DATA_SEGMENT, 'robots', 'dpu-data']);
 
@@ -100,11 +99,11 @@ export function agentsDataRoot(workspaceRoot) {
     return path.join(resolvePolicyWorkspaceRoot(workspaceRoot), '.data', AGENTS_DATA_SEGMENT);
 }
 
-// Maps a workspace-relative or absolute path written for the flat layout
-// (`.data/<x>/...`) to its place in `.data/agents/<x>/...`. Paths outside
+// Resolves the supported volume shorthand `.data/<x>/...` to
+// `.data/agents/<x>/...` without moving any files. Paths outside
 // `.data`, the data root itself, reserved entries and dot entries are returned
 // unchanged (resolved against the workspace root).
-export function translateLegacyDataPath(target, { workspaceRoot } = {}) {
+export function resolveManagedDataPath(target, { workspaceRoot } = {}) {
     const root = resolvePolicyWorkspaceRoot(workspaceRoot);
     const dataRoot = path.join(root, '.data');
     const resolved = path.resolve(root, String(target));
@@ -327,9 +326,8 @@ export function assertManifestVolumeStoragePolicy(source, {
     agentName,
 } = {}) {
     const root = resolvePolicyWorkspaceRoot(workspaceRoot);
-    // Sources written for the flat layout (`.data/<x>`) keep working: they
-    // resolve to `.data/agents/<x>`.
-    const resolvedSource = translateLegacyDataPath(String(source), { workspaceRoot: root });
+    // Volume shorthand `.data/<x>` resolves to `.data/agents/<x>`.
+    const resolvedSource = resolveManagedDataPath(String(source), { workspaceRoot: root });
     // The Box host state directory (`<workspace>/.ploinky-box`, of this or any
     // other workspace) is host-only: no agent volume may resolve into it.
     if (hasHostStateComponent(resolvedSource) || hasHostStateComponent(projectedCanonicalPath(resolvedSource))) {
