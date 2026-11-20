@@ -59,6 +59,7 @@ function mainHelpText(surface) {
   list agents | repos | routes   List agents, predefined repos, or router routes
   /settings | settings           Open the interactive model/settings menu
   profile [name|list|show]       Inspect or change the active profile
+  cs | coding-sessions           Attach, resume or start robot coding sessions in this folder
 
 
 ▶ CLIENT OPERATIONS
@@ -178,6 +179,18 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                     params: { '<agentName>': 'Agent name', '[args...]': 'Arguments appended to the cli command' },
                     examples: [ 'cli MyAPI --help' ],
                     notes: 'Attaches to a persistent container. REPLs stay attached until exit. Requires the agent manifest to define a "cli" entry. WebChat uses the same launch path and appends forwarded URL parameters as long-form CLI flags.'
+                }
+            }
+        },
+        'cs': {
+            description: 'Open a menu of the coding sessions an enabled agent provides in the current folder (alias: coding-sessions)',
+            subcommands: {
+                'default': {
+                    syntax: 'cs | coding-sessions',
+                    description: 'Choose a robot (the default robot is preselected), one of its coding agents, then a session: attach a running one, resume an earlier conversation, or start a new one.',
+                    params: {},
+                    examples: [ 'cs', 'coding-sessions' ],
+                    notes: 'In the menu: arrows select, Enter opens, n starts a new session, k kills a running session, r refreshes, Backspace goes back to the coding agents and then to the robots, q quits. Only the conversations a person started in this folder are listed. In a session, Ctrl+] detaches back to the menu; closing the terminal or losing the connection also detaches, and the session keeps running. Exiting the coding agent ends the session; k in the menu or Kill in Live Sessions kills a running one. The window used most recently sets the terminal size: attaching, typing or clicking in a window takes it, and every other window renders at that size. Run it from a project folder inside the workspace.'
                 }
             }
         },

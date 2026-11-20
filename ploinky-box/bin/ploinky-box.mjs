@@ -116,6 +116,8 @@ Commands:
                                   process list; removes one trailing newline
   ploinky cli                     Open Bash in the Box
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
+  ploinky cs | coding-sessions    Attach, resume or start robot coding sessions in the
+                                  current folder; they are also listed in Live Sessions
   ploinky logs tail [TARGET]      Follow Router or agent logs; inspect-only
   ploinky logs last [N] [TARGET]  Show the last N lines; inspect-only
   ploinky help                    Show this help without engine discovery
@@ -654,7 +656,7 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
         execute,
         input,
         output,
-        interactive: ['repl', 'agent-cli'].includes(route.kind),
+        interactive: ['repl', 'agent-cli', 'coding-sessions'].includes(route.kind),
         launchCwd: launchDirectory,
         engineEnv,
         stdinValue,

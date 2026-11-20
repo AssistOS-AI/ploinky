@@ -315,6 +315,32 @@ test('local CLI administrator mutations require direct browser proof before body
     assert.equal(allocations, 0);
 });
 
+test('resize accepts exactly dimensions with an optional literal claim and sending view', async () => {
+    const seen = [];
+    const session = { id: 'a'.repeat(32) };
+    const mgr = manager({
+        authorize: async () => session,
+        async requestResize(args) { seen.push(args); },
+    });
+    const call = async (body) => {
+        const input = request({ url: `/webtty/sessions/${'a'.repeat(32)}/resize`, body, routePlan: plan() });
+        const res = new MockResponse();
+        await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), { manager: mgr, routePlan: plan() });
+        return { status: res.statusCode, body: JSON.parse(res.body) };
+    };
+    assert.deepEqual(await call({ cols: 80, rows: 24 }), { status: 200, body: { ok: true } });
+    assert.deepEqual(await call({ cols: 100, rows: 30, claim: true }), { status: 200, body: { ok: true } });
+    assert.deepEqual(await call({ cols: 90, rows: 20, claim: true, view: 'v'.repeat(32) }), { status: 200, body: { ok: true } });
+    assert.deepEqual(seen.map(args => [args.cols, args.rows, args.claim, args.view]),
+        [[80, 24, false, null], [100, 30, true, null], [90, 20, true, 'v'.repeat(32)]]);
+    for (const body of [{ cols: 80, rows: 24, claim: 'yes' }, { cols: 80, rows: 24, claim: false },
+        { cols: 80, rows: 24, claim: 1 }, { cols: 80, rows: 24, extra: 1 }, { cols: 80, claim: true },
+        { cols: 80, rows: 24, view: 'short' }, { cols: 80, rows: 24, view: 7 }]) {
+        assert.deepEqual(await call(body), { status: 400, body: { ok: false, error: 'invalid_dimensions' } });
+    }
+    assert.equal(seen.length, 3);
+});
+
 test('create-time authentication races map invalid auth to 401 and administrator loss to 403', async () => {
     for (const [code, expectedStatus] of [
         ['WEBTTY_AUTH_INVALID', 401],

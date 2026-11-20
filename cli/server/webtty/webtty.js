@@ -5,6 +5,7 @@
     const MAX_INPUT_REQUEST_BYTES = 8 * 1024;
     const INPUT_FLUSH_MS = 20;
     const RESIZE_FLUSH_MS = 100;
+    const SIZE_CLAIM_INTERVAL_MS = 500;
     const RECONNECT_LIMIT_MS = 10 * 60_000;
     const STORAGE_KEY = 'ploinky.webtty.session';
     const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{32}$/;
@@ -37,6 +38,9 @@
     let closePolicy = 'keep';
     let intentSentForView = '';
     let role = 'watcher';
+    // Whether this window currently sets the terminal's size; a shared
+    // terminal has one size, held by one window until another claims it.
+    let holdsSize = true;
     let eventSource = null;
     let closed = false;
     let deletionStarted = false;
@@ -232,6 +236,7 @@
 
     terminal.onData((data) => {
         if (closed || inputStopped || role !== 'owner' || !terminalSessionId) return;
+        claimSizeOnUse();
         const nextBytes = inputQueueBytes + encoder.encode(data).length;
         if (nextBytes > MAX_PENDING_INPUT_BYTES) {
             stopInput();
@@ -248,23 +253,56 @@
         }
     });
 
-    async function sendResize({ onlyIfChanged = false } = {}) {
+    // A redraw first sets one row less: a program repaints only when its size
+    // changes, and an attach at the size it already has must repaint it too.
+    async function sendResize({ onlyIfChanged = false, claim = false, redraw = false } = {}) {
         const previous = boundedDimensions();
         fit();
         const dimensions = boundedDimensions();
-        if (onlyIfChanged && previous.cols === dimensions.cols && previous.rows === dimensions.rows) return;
+        if (onlyIfChanged && !redraw && previous.cols === dimensions.cols && previous.rows === dimensions.rows) return;
         window.clearTimeout(resizeTimer);
         resizeTimer = null;
         if (!terminalSessionId || closed || inputStopped || role !== 'owner') return;
         try {
-            await inputMutation(`/webtty/sessions/${encodeURIComponent(terminalSessionId)}/resize`, dimensions);
+            const path = `/webtty/sessions/${encodeURIComponent(terminalSessionId)}/resize`;
+            const view = viewId ? { view: viewId } : {};
+            if (redraw && dimensions.rows > 2) {
+                await inputMutation(path, { cols: dimensions.cols, rows: dimensions.rows - 1, ...(claim ? { claim: true } : {}), ...view });
+            }
+            await inputMutation(path, { ...dimensions, ...(claim ? { claim: true } : {}), ...view });
+            if (claim) holdsSize = true;
         } catch (error) {
             inputFailure(error);
         }
     }
+
+    // The terminal has one size: the window used most recently sets it. A
+    // window that does not hold it renders at the terminal's size instead of
+    // its own, so the program never draws over a stale, larger screen.
+    function applyTerminalSize(size) {
+        if (!size || !Number.isSafeInteger(size.cols) || !Number.isSafeInteger(size.rows)) return;
+        holdsSize = !size.view || size.view === viewId;
+        if (holdsSize) { fit(); return; }
+        if (terminal.cols !== size.cols || terminal.rows !== size.rows) {
+            try { terminal.resize(size.cols, size.rows); } catch (_) {}
+        }
+    }
+
+    // Using this window (a key or a click in the terminal) takes the size back.
+    let lastClaimAt = 0;
+    function claimSizeOnUse() {
+        if (holdsSize || closed || inputStopped || role !== 'owner' || !terminalSessionId) return;
+        const now = Date.now();
+        if (now - lastClaimAt < SIZE_CLAIM_INTERVAL_MS) return;
+        lastClaimAt = now;
+        void sendResize({ claim: true });
+    }
+
+    terminalElement.addEventListener('pointerdown', claimSizeOnUse);
     window.addEventListener('resize', () => {
         window.clearTimeout(resizeTimer);
-        if (!closed) resizeTimer = window.setTimeout(sendResize, RESIZE_FLUSH_MS);
+        // A window that does not hold the size keeps rendering at the terminal's size.
+        if (!closed && holdsSize) resizeTimer = window.setTimeout(sendResize, RESIZE_FLUSH_MS);
     });
 
     let shellExited = false;
@@ -319,6 +357,10 @@
         source.addEventListener('output', (event) => {
             if (!current()) return;
             try { terminal.write(JSON.parse(event.data).data); } catch (_) {}
+        });
+        source.addEventListener('size', (event) => {
+            if (!current()) return;
+            try { applyTerminalSize(JSON.parse(event.data)); } catch (_) {}
         });
         source.addEventListener('replay-truncated', () => {
             if (current()) showMessage('Showing recent terminal output. Older output is no longer available.');
@@ -436,6 +478,7 @@
         }
         viewId = result.view.id;
         closePolicy = session.closePolicy;
+        holdsSize = session.holdsSize !== false;
         setRole(session.role);
         showProfile(typeof session.profileLabel === 'string' ? session.profileLabel : '');
         targetElement.textContent = `${target.label}${target.detail ? ` — ${target.detail}` : ''}`;
@@ -445,7 +488,9 @@
         // Populated details can wrap and reduce terminal space without a window resize.
         layoutFrame = window.requestAnimationFrame(() => {
             layoutFrame = null;
-            if (!closed) void sendResize({ onlyIfChanged: true });
+            // Attaching to a running terminal takes its size, and the program
+            // repaints at this window's size.
+            if (!closed) void (kind === 'launch' ? sendResize({ onlyIfChanged: true }) : sendResize({ claim: true, redraw: true }));
         });
         killButton.disabled = false;
         rememberSession();

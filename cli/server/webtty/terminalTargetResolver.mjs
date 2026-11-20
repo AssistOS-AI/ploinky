@@ -403,7 +403,11 @@ export function assertOwnedInspection(candidate, raw, workspaceHash) {
 
 async function resolveOneAgent(candidate, directory, context) {
     if (context.signal?.aborted) return null;
-    if (context.isTargetQuarantined(candidate)) return null;
+    // A quarantined target never launches. A profile discovery still lists it
+    // with its reason, so a caller can tell quarantine from an unreachable cwd;
+    // a plain discovery keeps omitting it.
+    const quarantined = context.isTargetQuarantined(candidate);
+    if (quarantined && !context.home) return null;
     let raw;
     try {
         raw = await context.inspectContainer(candidate.runtime, candidate.containerId, {
@@ -419,6 +423,17 @@ async function resolveOneAgent(candidate, directory, context) {
         );
         if (!mapping) return null;
         const display = safeAgentDisplay(candidate, mapping);
+        if (quarantined) {
+            return Object.freeze({
+                kind: 'agent',
+                directory,
+                agentName: candidate.agentName,
+                repoName: candidate.repoName,
+                access: mapping.access,
+                ...display,
+                unavailable: 'quarantined',
+            });
+        }
         let profile = context.home
             ? await translateProfileHome(context.home, inspected.mounts, context.fsApi)
             : null;

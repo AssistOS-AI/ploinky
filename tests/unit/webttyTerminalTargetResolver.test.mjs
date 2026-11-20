@@ -887,6 +887,30 @@ test('profile HOME is the same-path Box home and a writable live-mount translati
     assert.equal(plain.targets.some((target) => 'home' in target || 'unavailable' in target), false);
 });
 
+test('a quarantined target is listed as unavailable for a profile discovery and omitted otherwise', async (t) => {
+    const { root, data } = spacedProfileFixture(t);
+    const home = resolvedHome(root);
+    const record = agentRecord();
+    const targetResolver = resolver(root, async () => ({
+        ...inspectedAgent(root, CONTAINER_NAME, record),
+        Mounts: [bind(root, root, true), bind(data, '/data', true)],
+    }), { isTargetQuarantined: () => true });
+    const plan = routePlan({ [CONTAINER_NAME]: record });
+
+    const profiled = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo', home });
+    const agent = profiled.targets[1];
+    assert.equal(agent.unavailable, 'quarantined');
+    assert.equal(agent.home, undefined);
+    assert.equal(agent.containerId, undefined, 'a quarantined row carries no launch identity');
+    assert.equal(agent.cwdDisplay, path.join(root, 'projects', 'demo'));
+
+    const live = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo', home, live: true });
+    assert.deepEqual(live.targets.map((target) => target.unavailable), ['quarantined']);
+
+    const plain = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    assert.deepEqual(plain.targets.map((target) => target.kind), ['box']);
+});
+
 test('read-only, conflicting-alias and shadowed profile homes are refused, never bypassed', async (t) => {
     const { root, data } = spacedProfileFixture(t);
     const home = resolvedHome(root);

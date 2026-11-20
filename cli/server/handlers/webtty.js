@@ -455,7 +455,17 @@ export async function handleWebtty(req, res, parsedUrl, {
             sendError(res, error.code === 'UNSUPPORTED_MEDIA_TYPE' ? 415 : error.code === 'BODY_TOO_LARGE' ? 413 : 400, error.code.toLowerCase());
             return true;
         }
-        if (!exactBodyKeys(body, ['cols', 'rows']) || !validateDimensions(body.cols, body.rows)) {
+        // A claim is the explicit size hand-over of a shared terminal; it is
+        // exactly the literal boolean true, never a truthy value. `view` names
+        // the sending view, so every viewer learns which one set the size.
+        const keys = body && typeof body === 'object' && !Array.isArray(body) ? Object.keys(body) : [];
+        const claimsSize = keys.includes('claim') && body.claim === true;
+        const namesView = keys.includes('view');
+        if (!keys.includes('cols') || !keys.includes('rows')
+            || keys.some(key => !['cols', 'rows', 'claim', 'view'].includes(key))
+            || (keys.includes('claim') && !claimsSize)
+            || (namesView && (typeof body.view !== 'string' || !VIEW_ID_PATTERN.test(body.view)))
+            || !validateDimensions(body.cols, body.rows)) {
             sendError(res, 400, 'invalid_dimensions');
             return true;
         }
@@ -464,7 +474,11 @@ export async function handleWebtty(req, res, parsedUrl, {
         catch (error) { mapOperationError(res, error); return true; }
         if (!session) { sendError(res, 404, 'not_found'); return true; }
         if (!commitMutation(routePlan, res)) return true;
-        try { await manager.resize(session, body.cols, body.rows); sendJson(res, 200, { ok: true }); }
+        try {
+            await manager.requestResize({ req, session, cols: body.cols, rows: body.rows, claim: claimsSize,
+                view: namesView ? body.view : null });
+            sendJson(res, 200, { ok: true });
+        }
         catch (error) { mapOperationError(res, error); }
         return true;
     }

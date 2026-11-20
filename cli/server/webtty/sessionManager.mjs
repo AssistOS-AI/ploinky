@@ -124,6 +124,15 @@ function bindingMatches(left, right) {
         && left.hostRouteKey === right.hostRouteKey;
 }
 
+// A shared terminal was opened by the signed local CLI operator. Every
+// administrator may control it, on any host name of the same control route,
+// because the operator who opened it never used a browser origin.
+function recordBindingMatches(record, binding) {
+    return record?.shared === true
+        ? record.binding.hostRouteKey === binding.hostRouteKey
+        : bindingMatches(record.binding, binding);
+}
+
 function errorWithCode(code, message = code) {
     const error = new Error(message);
     error.code = code;
@@ -209,7 +218,7 @@ export class WebttySessionManager {
             this.agentProviderDisabledCategory = 'recovery_unproven';
         }
         for (const entry of recovery.quarantinedTargets || []) {
-            this.quarantineAgentTarget(entry.target, entry.category);
+            this.quarantineAgentTarget(entry.target, entry.category, entry.evidence);
         }
         if (!this.ready) this.audit('webtty_recovery_unproven', { category: this.disabledCategory });
         this.leaseTimer = setInterval(
@@ -258,7 +267,7 @@ export class WebttySessionManager {
         ));
     }
 
-    quarantineAgentTarget(target, category = 'cleanup_unproven') {
+    quarantineAgentTarget(target, category = 'cleanup_unproven', evidence = '') {
         const key = this.agentTargetKey(target);
         if (!key) {
             this.disableAgentProvider('target_identity_unclassifiable');
@@ -273,6 +282,7 @@ export class WebttySessionManager {
         this.audit('webtty_agent_target_quarantined', {
             target: this.auditId(key),
             category: String(category || 'cleanup_unproven'),
+            ...(evidence ? { evidence: String(evidence) } : {}),
         });
         return true;
     }
@@ -559,11 +569,12 @@ export class WebttySessionManager {
     sessionDescription(session, principal) {
         return {
             id: session.id,
-            role: principal === session.owner.principal ? 'owner' : 'watcher',
+            role: this.controls(session, principal) ? 'owner' : 'watcher',
             state: session.viewers.size ? 'attached' : 'detached',
             cwd: session.cwdRelative || '.',
             cols: session.cols,
             rows: session.rows,
+            holdsSize: principal === session.sizeHolder,
             target: Object.fromEntries(['kind', 'label', 'detail', 'access', 'cwdDisplay']
                 .map(key => [key, session.target[key]])),
             closePolicy: this.closePolicyOf(session),
@@ -573,7 +584,7 @@ export class WebttySessionManager {
     }
 
     displayRow(session, principal, endedAt = null) {
-        const isOwner = principal === session.owner.principal;
+        const isOwner = this.controls(session, principal);
         const live = endedAt === null;
         return {
             id: session.id, source: 'webtty', kind: 'shell',
@@ -590,6 +601,10 @@ export class WebttySessionManager {
             pendingStopUntil: live ? session.pendingStop?.deadline ?? null : null,
             ownerViewOpen: live && this.ownerViewOpen(session),
             profileLabel: this.profileLabel(session),
+            // The home profile that opened the terminal, so a provider's own client can find its sessions.
+            profileProvider: displayText(session.profile?.provider, 128) || null,
+            profileId: displayText(session.profile?.id, 128) || null,
+            cwd: session.cwdRelative || '',
             capabilities: { watch: true, input: isOwner, stop: true, message: false },
             attach: { mode: 'webtty' },
         };
@@ -598,7 +613,7 @@ export class WebttySessionManager {
     // Tombstone rows carry the close outcome. Optional keys are omitted, never
     // null: a scope only for an unconfirmed stop, the record flag only if set.
     tombstoneRow(tombstone, principal) {
-        const isOwner = principal === tombstone.principal;
+        const isOwner = principal === tombstone.principal || tombstone.shared === true;
         return {
             ...tombstone.row,
             isOwner,
@@ -621,12 +636,12 @@ export class WebttySessionManager {
         const sessions = available
             ? [...this.sessions.values()]
                 .filter(session => !session.startupInProgress && !session.closed && !session.closing
-                    && bindingMatches(session.binding, binding))
+                    && recordBindingMatches(session, binding))
                 .map(session => this.displayRow(session, principal))
             : [];
         for (const [id, tombstone] of this.tombstones) {
             if (this.now() >= tombstone.expiresAt) { this.tombstones.delete(id); continue; }
-            if (!bindingMatches(tombstone.binding, binding)) continue;
+            if (!recordBindingMatches(tombstone, binding)) continue;
             sessions.push(this.tombstoneRow(tombstone, principal));
         }
         return { sessions, available };
@@ -651,9 +666,34 @@ export class WebttySessionManager {
         return session.views;
     }
 
+    // The owner controls a terminal; every administrator controls a shared one.
+    controls(session, principal) {
+        return principal === session.owner.principal || session.shared === true;
+    }
+
+    // The views whose documents can type into, resize and stop the terminal.
     ownerViews(session) {
         return [...this.sessionViews(session).values()]
-            .filter(view => view.principal === session.owner.principal);
+            .filter(view => this.controls(session, view.principal));
+    }
+
+    // The controller views with a live stream: the windows currently showing
+    // the terminal. A shared terminal has one PTY size, so the windows decide
+    // in order: the owner's window keeps it, and a lone remaining window of
+    // any administrator adopts it back when the others leave.
+    controllerViewsOpen(session) {
+        return this.ownerViews(session)
+            .filter(view => !this.viewTerminal(view) && view.state === 'open');
+    }
+
+    adoptSoleControllerSize(session) {
+        if (session.shared !== true || session.closed || session.closing) return;
+        const open = this.controllerViewsOpen(session);
+        if (open.length !== 1) return;
+        session.sizeHolder = open[0].principal;
+        const dimensions = open[0].dimensions;
+        if (!dimensions || (dimensions.cols === session.cols && dimensions.rows === session.rows)) return;
+        void this.resize(session, dimensions.cols, dimensions.rows, open[0].id).catch(() => {});
     }
 
     ownerViewOpen(session) {
@@ -690,7 +730,7 @@ export class WebttySessionManager {
             id: randomId(24),
             seq: session.viewSeq,
             principal,
-            role: principal === session.owner.principal ? 'owner' : 'watcher',
+            role: this.controls(session, principal) ? 'owner' : 'watcher',
             state: 'detached',
             detachedAt: now,
             endedBy: null,
@@ -713,9 +753,9 @@ export class WebttySessionManager {
         const auditId = this.auditId(session.id);
         const claimed = this.sessionViews(session).get(String(claimedId));
         let ignored = '';
-        if (principal !== session.owner.principal) ignored = 'not_owner';
+        if (!this.controls(session, principal)) ignored = 'not_owner';
         else if (!claimed || claimed === view) ignored = 'unknown_view';
-        else if (claimed.principal !== session.owner.principal) ignored = 'foreign_view';
+        else if (claimed.principal !== principal) ignored = 'foreign_view';
         else if (claimed.state === 'superseded') ignored = 'already_superseded';
         if (ignored) {
             this.safeAudit('webtty_view_supersede_ignored', { id: auditId, reason: ignored });
@@ -745,7 +785,7 @@ export class WebttySessionManager {
         const views = this.sessionViews(session);
         let current = claimant;
         for (let hops = 0; current && hops < this.limits.viewsPerSession; hops += 1) {
-            if (current.principal !== session.owner.principal) return false;
+            if (!this.controls(session, current.principal)) return false;
             if (current.state !== 'superseded') return !this.viewTerminal(current);
             current = views.get(current.supersededBy);
         }
@@ -773,6 +813,7 @@ export class WebttySessionManager {
         for (const viewer of [...session.viewers.values()]) {
             if (viewer.view === view) this.removeViewer(session, viewer, { event: 'detached', reason: 'view_ended' });
         }
+        this.adoptSoleControllerSize(session);
     }
 
     clearPendingStop(session) {
@@ -876,7 +917,7 @@ export class WebttySessionManager {
         const view = this.sessionViews(session).get(String(viewId || ''));
         // (1) Unknown, foreign and already ended or superseded views have no
         // effect, which also deduplicates a repeated or delayed signal.
-        if (!view || view.principal !== session.owner.principal || this.viewTerminal(view)) {
+        if (!view || !this.controls(session, view.principal) || this.viewTerminal(view)) {
             this.safeAudit('webtty_close_intent_ignored', { id: auditId, reason: 'view_stale' });
             throw errorWithCode('WEBTTY_VIEW_STALE');
         }
@@ -929,12 +970,23 @@ export class WebttySessionManager {
         const session = await this.authorize(req, routePlan, record.sessionId, 'attach');
         if (!session) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
         const principal = browserPrincipal(lease.mode, lease.userId);
-        if (principal === session.owner.principal) await this.resize(session, cols, rows);
+        // A second window of another size must not redraw the terminal under
+        // the window that already shows it: the window that holds the size
+        // always sets it, and any other window only when none is attached yet.
+        const takesSize = session.shared === true
+            ? principal === session.sizeHolder || !this.controllerViewsOpen(session).length
+            : this.controls(session, principal);
+        if (takesSize) await this.resize(session, cols, rows);
         if (session.closed || session.closing) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
         // A refused view (WEBTTY_VIEW_LIMIT) leaves any recovery claim unused.
         // An owner's claimed view is kept out of eviction so the claim can apply.
-        const claimed = principal === session.owner.principal ? record.supersedes || null : null;
+        const claimed = this.controls(session, principal) ? record.supersedes || null : null;
         const view = this.createView(session, principal, { retain: claimed });
+        view.dimensions = { cols, rows };
+        if (takesSize) {
+            session.sizeView = view.id;
+            this.broadcastSize(session);
+        }
         this.applyRecoveryClaim(session, principal, view, record.supersedes || null);
         this.touch(session);
         // The handler lifts `view` to the top level of its response.
@@ -1036,6 +1088,12 @@ export class WebttySessionManager {
             routerEpoch: this.routerEpoch,
             lease,
             owner: attempt.owner,
+            // A terminal opened by the local CLI operator is shared with every
+            // administrator, who can take it over from Live Sessions.
+            shared: lease.mode === 'local' && lease.authChannel === 'cli',
+            // The principal whose window currently sets this terminal's size.
+            // It starts with the creator and moves by an explicit claim.
+            sizeHolder: attempt.owner.principal,
             binding,
             routePlan,
             routeLease: routePlan.lease,
@@ -1360,6 +1418,8 @@ export class WebttySessionManager {
                 access: target.access,
             });
             const view = this.createView(session, attempt.owner.principal);
+            view.dimensions = { cols, rows };
+            session.sizeView = view.id;
             return {
                 id,
                 role: 'owner',
@@ -1367,6 +1427,7 @@ export class WebttySessionManager {
                 cwd: target.directory.relativePath || '.',
                 cols,
                 rows,
+                holdsSize: true,
                 target: {
                     kind: target.kind,
                     label: target.label,
@@ -1433,7 +1494,7 @@ export class WebttySessionManager {
             || session.routerEpoch !== this.routerEpoch) return null;
         let binding;
         try { binding = routeBinding(routePlan); } catch (_) { return null; }
-        if (!bindingMatches(binding, session.binding)) return null;
+        if (!recordBindingMatches(session, binding)) return null;
         if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
         const lease = this.auth.createLease(req);
         const principal = browserPrincipal(lease.mode, lease.userId);
@@ -1445,7 +1506,7 @@ export class WebttySessionManager {
         }
         if (routePlan?.lease?.commit?.() !== true) throw errorWithCode('WEBTTY_GENERATION_CHANGED');
         if (session.closed || session.closing || this.sessions.get(session.id) !== session) return null;
-        if (['input', 'resize', 'control'].includes(need) && principal !== session.owner.principal) {
+        if (['input', 'resize', 'control'].includes(need) && !this.controls(session, principal)) {
             throw errorWithCode('WEBTTY_OWNER_REQUIRED');
         }
         if (principal === session.owner.principal && ['input', 'attach'].includes(need)) {
@@ -1508,12 +1569,57 @@ export class WebttySessionManager {
         this.touch(session);
     }
 
-    async resize(session, cols, rows) {
+    // Every viewer learns the terminal's size and the view that set it, so a
+    // window that does not hold the size can render at it instead of its own.
+    async resize(session, cols, rows, view = undefined) {
         if (!session || session.closed || session.closing) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
         await session.worker.resize(cols, rows);
         session.cols = cols;
         session.rows = rows;
+        if (view !== undefined) session.sizeView = view;
         this.touch(session);
+        this.broadcastSize(session);
+    }
+
+    sizeEvent(session) {
+        return this.encodeSse('size', { cols: session.cols, rows: session.rows, view: session.sizeView || null });
+    }
+
+    broadcastSize(session) {
+        const encoded = this.sizeEvent(session);
+        for (const viewer of session.viewers.values()) this.enqueueViewer(session, viewer, encoded);
+    }
+
+    // A resize from the HTTP surface follows the same size ownership as an
+    // attach: while the holding window is attached, only it sets the shared
+    // terminal's size, so a browser window cannot redraw the owner's
+    // command-line terminal at its own dimensions. A claim is the explicit
+    // hand-over: the claiming window takes the size, and with it the holder
+    // role, so its later window resizes apply directly.
+    async requestResize({ req, session, cols, rows, claim = false, view = null }) {
+        if (!session || session.closed || session.closing) throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
+        if (session.shared === true) {
+            let principal = '';
+            try {
+                const lease = this.auth.createLease(req);
+                principal = browserPrincipal(lease.mode, lease.userId);
+            } catch (_) { }
+            if (principal && principal !== session.sizeHolder) {
+                const holderOpen = this.controllerViewsOpen(session)
+                    .some(view => view.principal === session.sizeHolder);
+                if (holderOpen && !claim) return;
+                if (claim) {
+                    if (!this.controls(session, principal)) throw errorWithCode('WEBTTY_OWNER_REQUIRED');
+                    session.sizeHolder = principal;
+                    for (const view of this.controllerViewsOpen(session)) {
+                        if (view.principal === principal) view.dimensions = { cols, rows };
+                    }
+                    this.safeAudit('webtty_size_claimed', { id: this.auditId(session.id) });
+                }
+            }
+        }
+        // Only a view of this terminal is named as the one that set the size.
+        await this.resize(session, cols, rows, view && this.sessionViews(session).has(view) ? view : null);
     }
 
     encodeSse(event, data, id = null) {
@@ -1531,6 +1637,7 @@ export class WebttySessionManager {
             if (!view.streams && !this.viewTerminal(view)) {
                 view.state = 'detached';
                 view.detachedAt = this.now();
+                this.adoptSoleControllerSize(session);
             }
         }
         clearTimeout(viewer.drainTimer);
@@ -1634,7 +1741,7 @@ export class WebttySessionManager {
         const principal = browserPrincipal(lease.mode, lease.userId);
         const viewer = {
             id: randomId(), req, res, lease, principal, view,
-            role: principal === session.owner.principal ? 'owner' : 'watcher',
+            role: this.controls(session, principal) ? 'owner' : 'watcher',
             routeLease: routePlan.lease, queue: [], queuedBytes: 0,
             drainDeadline: null, drainTimer: null, waitingDrain: false,
         };
@@ -1679,6 +1786,7 @@ export class WebttySessionManager {
         for (const event of session.replay) {
             if (event.sequence > requested && !this.enqueueViewer(session, viewer, event.encoded)) return false;
         }
+        if (!this.enqueueViewer(session, viewer, this.sizeEvent(session))) return false;
         session.everAttached = true;
         clearTimeout(session.detachTimer);
         session.detachTimer = null;
@@ -1706,6 +1814,7 @@ export class WebttySessionManager {
             expiresAt: Infinity,
             principal: session.owner.principal,
             binding: session.binding,
+            shared: session.shared === true,
             row: this.displayRow(session, session.owner.principal, now),
             closure: 'pending',
             closureScope: '',
@@ -1768,7 +1877,7 @@ export class WebttySessionManager {
         }
         const requestBinding = routeBinding(routePlan);
         this.auth.createLease(req);
-        return bindingMatches(tombstone.binding, requestBinding);
+        return recordBindingMatches(tombstone, requestBinding);
     }
 
     // The unexpired retained close outcome on this host-route that still
@@ -1778,7 +1887,7 @@ export class WebttySessionManager {
         if (!record?.retiredViews?.has(String(viewId || '')) || this.now() >= record.expiresAt) return null;
         let binding;
         try { binding = routeBinding(routePlan); } catch (_) { return null; }
-        return bindingMatches(record.binding, binding) ? record : null;
+        return recordBindingMatches(record, binding) ? record : null;
     }
 
     // Used only after live authorization found no session. A stream dropped
@@ -1962,6 +2071,7 @@ export class WebttySessionManager {
         let cleanupProven = session.terminalCleanupProven === true;
         let cleanupFailureCategory = '';
         let cleanupFailureScope = '';
+        let cleanupFailureEvidence = '';
         let recordAlreadyRemoved = false;
         if (exited && session.target.kind === 'agent'
             && !preserveRecord
@@ -1976,6 +2086,7 @@ export class WebttySessionManager {
                     recovered?.category || 'agent_crash_recovery_unproven',
                 );
                 cleanupFailureScope = cleanupProven ? '' : String(recovered?.scope || 'target');
+                cleanupFailureEvidence = cleanupProven ? '' : String(recovered?.evidence || '');
                 if (!cleanupProven && !this.hasScopedAgentRecoveryRecord(session)) {
                     cleanupFailureScope = 'global';
                     if (cleanupFailureCategory === 'agent_record_remove_unconfirmed') {
@@ -2048,7 +2159,7 @@ export class WebttySessionManager {
                     this.disableAgentProvider(category);
                 } else {
                     this.noteCleanupFailure(session, 'target');
-                    this.quarantineAgentTarget(session.target, category);
+                    this.quarantineAgentTarget(session.target, category, cleanupFailureEvidence);
                 }
             } else {
                 this.noteCleanupFailure(session, 'global');

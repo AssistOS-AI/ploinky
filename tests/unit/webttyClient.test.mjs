@@ -84,6 +84,7 @@ function createHarness({
         write(data) { this.output = `${this.output || ''}${data}`; }
         reset() { this.resets = (this.resets || 0) + 1; this.output = ''; }
         emitData(data) { this.dataListener(data); }
+        resize(cols, rows) { this.cols = cols; this.rows = rows; }
     }
     class FakeFitAddon {
         fit() {
@@ -261,6 +262,63 @@ function createHarness({
     };
 }
 
+// A resize names the view that sent it, so every viewer learns who set the size.
+function resizeBody(request) {
+    const { view, ...body } = JSON.parse(request.options.body);
+    assert.match(String(view), /^[A-Za-z0-9_-]{32}$/);
+    return body;
+}
+
+test('the most recently used window sets the size; another renders at it and takes it back on use', async () => {
+    const harness = createHarness({ fitDimensions: () => ({ cols: 188, rows: 38 }) });
+    await flushTasks();
+    const source = harness.sources[0];
+    const viewId = source.url.split('?view=')[1];
+    const resizes = () => harness.requests.filter((entry) => entry.url.endsWith('/resize'));
+    // Another view (a command line) set the terminal to its own size.
+    source.emit('size', { cols: 100, rows: 30, view: 'c'.repeat(32) });
+    assert.deepEqual([harness.terminal.cols, harness.terminal.rows], [100, 30], 'rendered at the terminal size, not the window');
+    const before = resizes().length;
+    harness.windowListeners.get('resize')();
+    await flushTasks(4);
+    assert.equal(resizes().length, before, 'a window that does not hold the size never resizes the terminal');
+    // A click in the terminal takes the size back at this window's size.
+    harness.elements.get('terminal').listeners.get('pointerdown')();
+    await flushTasks(4);
+    assert.deepEqual(resizeBody(resizes().at(-1)), { cols: 188, rows: 38, claim: true });
+    source.emit('size', { cols: 188, rows: 38, view: viewId });
+    // Losing it again, typing takes it back too.
+    source.emit('size', { cols: 90, rows: 20, view: 'c'.repeat(32) });
+    await new Promise((resolve) => setTimeout(resolve, 520));
+    harness.terminal.emitData('x');
+    await flushTasks(4);
+    assert.deepEqual(resizeBody(resizes().at(-1)), { cols: 188, rows: 38, claim: true });
+});
+
+test('a window that does not hold a shared terminal size claims it with one click in the terminal', async () => {
+    const harness = createHarness({
+        sessionOverride: { holdsSize: false },
+        fitDimensions: () => ({ cols: 96, rows: 32 }),
+    });
+    await flushTasks();
+    assert.equal(harness.elements.has('size'), false, 'there is no size button');
+    const resizes = () => harness.requests.filter((entry) => entry.url.endsWith('/resize'));
+    harness.elements.get('terminal').listeners.get('pointerdown')();
+    await flushTasks(4);
+    assert.deepEqual(resizeBody(resizes().at(-1)), { cols: 96, rows: 32, claim: true });
+    // Once it holds the size, further clicks claim nothing more.
+    const count = resizes().length;
+    harness.elements.get('terminal').listeners.get('pointerdown')();
+    await flushTasks(4);
+    assert.equal(resizes().length, count);
+
+    const watcher = createHarness({ role: 'watcher' });
+    await flushTasks();
+    watcher.elements.get('terminal').listeners.get('pointerdown')();
+    await flushTasks(4);
+    assert.equal(watcher.requests.filter((entry) => entry.url.endsWith('/resize')).length, 0, 'a watcher never claims');
+});
+
 test('session details that reduce terminal space refit after layout and report only owner dimensions', async () => {
     for (const role of ['owner', 'watcher']) {
         const harness = createHarness({
@@ -282,7 +340,7 @@ test('session details that reduce terminal space refit after layout and report o
         assert.equal(harness.elements.get('dimensions').textContent, '80 × 38');
         const resizes = harness.requests.filter((entry) => entry.url.endsWith('/resize'));
         assert.equal(resizes.length, role === 'owner' ? 1 : 0);
-        if (role === 'owner') assert.deepEqual(JSON.parse(resizes[0].options.body), { cols: 80, rows: 38 });
+        if (role === 'owner') assert.deepEqual(resizeBody(resizes[0]), { cols: 80, rows: 38 });
     }
 });
 
@@ -324,7 +382,7 @@ test('an unchanged details refit preserves the pending owner resize after slow c
     await flushTasks();
     const resizes = harness.requests.filter((entry) => entry.url.endsWith('/resize'));
     assert.equal(resizes.length, 1);
-    assert.deepEqual(JSON.parse(resizes[0].options.body), { cols: 166, rows: 21 });
+    assert.deepEqual(resizeBody(resizes[0]), { cols: 166, rows: 21 });
 });
 
 test('fragment launch is stripped immediately, sent only in JSON, and POST completes before SSE attach', async () => {
@@ -409,7 +467,7 @@ test('UTF-8 input chunks and resize requests stay bounded and page close only de
     harness.windowListeners.get('resize')();
     await flushTasks(4);
     const resize = harness.requests.findLast((entry) => entry.url.endsWith('/resize'));
-    assert.deepEqual(JSON.parse(resize.options.body), { cols: 120, rows: 40 });
+    assert.deepEqual(resizeBody(resize), { cols: 120, rows: 40 });
 
     harness.windowListeners.get('pagehide')();
     await flushTasks(4);
@@ -431,7 +489,7 @@ test('initial and resized terminal dimensions are clamped to protocol bounds', a
     harness.windowListeners.get('resize')();
     await flushTasks(4);
     const resize = harness.requests.findLast((entry) => entry.url.endsWith('/resize'));
-    assert.deepEqual(JSON.parse(resize.options.body), { cols: 2, rows: 2 });
+    assert.deepEqual(resizeBody(resize), { cols: 2, rows: 2 });
 });
 
 test('missing or malformed fragment is stripped and creates no terminal', async () => {
@@ -985,7 +1043,12 @@ test('A9: a top-level reload re-attaches the remembered id with a fresh token an
     assert.deepEqual(reload.requests.map(({ url, options }) => `${options.method} ${url}`), [
         `POST /webtty/live-sessions/${SESSION_ID}/attach-tokens`,
         'POST /webtty/attachments',
+        // Attaching takes the size and makes the program repaint: one row less, then the window size.
+        `POST /webtty/sessions/${SESSION_ID}/resize`,
+        `POST /webtty/sessions/${SESSION_ID}/resize`,
     ]);
+    assert.deepEqual(reload.requests.slice(2).map(resizeBody),
+        [{ cols: 80, rows: 23, claim: true }, { cols: 80, rows: 24, claim: true }]);
     // The reload supersedes the view it remembers.
     assert.deepEqual(JSON.parse(reload.requests[0].options.body), { supersedes: STORED_VIEW });
     assert.deepEqual(JSON.parse(reload.requests[1].options.body), { attach: ATTACH_TOKEN, cols: 80, rows: 24 });
@@ -1047,7 +1110,7 @@ test('A9: a back/forward restore re-enables the page, re-attaches as a new view 
         harness.windowListeners.get('pageshow')({ persisted: true });
         await flushTasks();
         const order = harness.requests.map(({ url }) => url).filter((url) => !url.endsWith('/close-intents'));
-        assert.deepEqual(order.slice(-2), [`/webtty/live-sessions/${SESSION_ID}/attach-tokens`, '/webtty/attachments']);
+        assert.deepEqual(order.filter(url => !url.endsWith('/resize')).slice(-2), [`/webtty/live-sessions/${SESSION_ID}/attach-tokens`, '/webtty/attachments']);
         // The restored page supersedes its own previous view (addendum A1 r2).
         const mint = harness.requests.findLast(({ url }) => url.endsWith('/attach-tokens'));
         assert.deepEqual(JSON.parse(mint.options.body), { supersedes: firstView });

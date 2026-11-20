@@ -85,6 +85,7 @@ import {
 import { handleSsoCommand } from './ssoCommands.js';
 import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
 import ClientCommands from './client.js';
+import { runCodingSessionsCommand } from './codingSessionsCommand.js';
 import {
     getValidProfiles,
     isValidProfile,
@@ -771,6 +772,13 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         case 'profile': {
             await handleProfileCommand(options);
             break;
+        }
+        case 'cs':
+        case 'coding-sessions': {
+            if (inputState.getInterface()) {
+                throw new Error('Coding sessions open from your shell: leave the Ploinky prompt and run `ploinky cs`.');
+            }
+            return runCodingSessionsCommand();
         }
         default: {
             if (!isKnownCommand(command)) {

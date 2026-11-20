@@ -580,6 +580,14 @@ function liveIdentityMatches(observed, expected) {
     return observed?.state !== 'Z' && identityMatches(observed, expected);
 }
 
+// The failing evidence step, for the audit only: a fixed code and category,
+// never a path or message.
+export function evidenceCategory(error) {
+    const parts = [error?.code, error?.category]
+        .filter((value) => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(value));
+    return parts.join('/');
+}
+
 export function classifyAgentEvidenceFailure(error) {
     if (error?.code === 'WEBTTY_HOME_PROJECTION_UNPROVEN') return 'target';
     if (error?.code === 'WEBTTY_AGENT_PODMAN_FAILURE') {
@@ -900,12 +908,13 @@ export class RuntimeRecordStore {
         return this.reclamationSnapshot(record);
     }
 
-    agentRecoveryFailure(record, category, scope = 'target') {
+    agentRecoveryFailure(record, category, scope = 'target', evidence = '') {
         return {
             recovered: false,
             category,
             scope,
             target: record.target,
+            ...(evidence ? { evidence } : {}),
         };
     }
 
@@ -1154,6 +1163,7 @@ export class RuntimeRecordStore {
                     ? 'agent_provider_evidence_failed'
                     : 'agent_target_evidence_failed',
                 scope,
+                evidenceCategory(error),
             );
         }
     }
@@ -1246,6 +1256,7 @@ export class RuntimeRecordStore {
                     ? 'agent_provider_evidence_failed'
                     : 'agent_target_evidence_failed',
                 scope,
+                evidenceCategory(error),
             );
         }
     }
@@ -1280,6 +1291,7 @@ export class RuntimeRecordStore {
                         ? 'agent_provider_evidence_failed'
                         : 'agent_target_evidence_failed',
                     scope,
+                    evidenceCategory(error),
                 );
             }
         }
@@ -1397,7 +1409,7 @@ export class RuntimeRecordStore {
                 if (record.targetKind === 'agent') sawAgent = true;
                 evidence.push(result.category);
                 if (!result.recovered && record.targetKind === 'agent' && result.scope === 'target') {
-                    quarantinedTargets.push({ target: result.target || record.target, category: result.category });
+                    quarantinedTargets.push({ target: result.target || record.target, category: result.category, ...(result.evidence ? { evidence: result.evidence } : {}) });
                     continue;
                 }
                 if (!result.recovered && record.targetKind === 'agent' && result.scope === 'provider') {

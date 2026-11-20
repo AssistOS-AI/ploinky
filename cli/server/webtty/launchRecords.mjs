@@ -11,7 +11,7 @@ export const WEBTTY_LAUNCH_LIMITS = Object.freeze({
 
 const SAFE_TARGET_KEYS = Object.freeze(['kind', 'label', 'detail', 'access', 'cwdDisplay']);
 const DISPLAY_LIMITS = Object.freeze({ label: 128, detail: 256, cwdDisplay: 4 * 1024 });
-const TARGET_UNAVAILABLE_REASONS = new Set(['home-unreachable', 'home-read-only']);
+const TARGET_UNAVAILABLE_REASONS = new Set(['home-unreachable', 'home-read-only', 'quarantined']);
 
 function launchError(code, message = code) {
     const error = new Error(message);

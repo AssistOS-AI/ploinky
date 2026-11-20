@@ -292,6 +292,14 @@ export function routeOuterCommand(parsed, options = {}) {
             coreArgv: parsed.forwardingArgv,
         });
     }
+    // The coding sessions menu and the terminals it opens are interactive, so
+    // they are forwarded with a TTY like the REPL.
+    if (parsed.command === 'cs' || parsed.command === 'coding-sessions') {
+        return Object.freeze({
+            kind: parsed.dryRun ? 'dry-run' : 'coding-sessions',
+            coreArgv: parsed.forwardingArgv,
+        });
+    }
     // The secret travels on stdin so it never reaches a process argument list.
     const stdinValue = parsed.command === 'var'
         && parsed.commandArgs.length === 2

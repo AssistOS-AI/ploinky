@@ -3122,7 +3122,7 @@ const SHELL_ROW_KEYS = [
 ];
 const SHELL_OPTIONAL_KEYS = [
     'endedAt', 'exitReason', 'closePolicy', 'pendingStopUntil', 'ownerViewOpen', 'profileLabel',
-    'closure', 'closureScope', 'recordCleanup',
+    'profileProvider', 'profileId', 'cwd', 'closure', 'closureScope', 'recordCleanup',
 ];
 
 // The Explorer row constraints recorded in the implementation checkpoint:
@@ -3138,6 +3138,10 @@ function assertExplorerShellRow(row) {
         || (Number.isSafeInteger(row.pendingStopUntil) && row.pendingStopUntil > 0));
     assert.equal(typeof row.ownerViewOpen, 'boolean');
     assert.ok(row.profileLabel === null || (typeof row.profileLabel === 'string' && row.profileLabel.length > 0));
+    for (const key of ['profileProvider', 'profileId']) {
+        assert.ok(row[key] === null || (typeof row[key] === 'string' && row[key].length > 0), key);
+    }
+    assert.equal(typeof row.cwd, 'string');
     if (Object.hasOwn(row, 'closure')) {
         assert.equal(row.status, 'exited');
         assert.ok(['pending', 'proven', 'unconfirmed'].includes(row.closure));
@@ -3433,7 +3437,7 @@ test('tombstone eviction under the cap removes proven outcomes first and audits 
 // ---- Close policy, views and tab-close ordering (plan r3 3.4, A8) ----
 // Deterministic: setTimeout and Date are mocked, so deadlines fire only on tick.
 
-async function closePolicyFixture(t, { closePolicy = 'stop', limits = {} } = {}) {
+async function closePolicyFixture(t, { closePolicy = 'stop', limits = {}, owner = { lease: lease('owner') } } = {}) {
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
     const audits = [];
     const store = recordStore();
@@ -3443,7 +3447,6 @@ async function closePolicyFixture(t, { closePolicy = 'stop', limits = {} } = {})
         audit: (event, details) => audits.push({ event, details }), limits,
     });
     const plan = routePlan();
-    const owner = { lease: lease('owner') };
     const created = await manager.create({ req: owner, routePlan: plan, cwdRelative: '', closePolicy });
     const session = manager.sessions.get(created.id);
     const fixture = {
@@ -3666,6 +3669,141 @@ test('A8: another device keeps the shell open until its own signal, and a reconn
         await f.tick(10 * 60_000);
         assert.equal(f.alive(), true);
     });
+});
+
+test('a terminal opened by the local CLI operator is controlled by every administrator on any control host', async (t) => {
+    const cliOwner = { lease: { ...lease('cli'), authChannel: 'cli' } };
+    const f = await closePolicyFixture(t, { owner: cliOwner });
+    const admin = { lease: lease('browser', 'sso-admin') };
+    assert.equal(f.session.shared, true);
+    const otherHost = routePlan();
+    otherHost.host = 'box.example.test';
+    otherHost.hostSelection = { host: 'box.example.test', record: { routeKey: 'control' } };
+    const [row] = await f.manager.listSessions({ req: admin, routePlan: otherHost });
+    assert.deepEqual([row.isOwner, row.capabilities.input], [true, true]);
+    for (const need of ['input', 'resize', 'control']) {
+        assert.equal(await f.manager.authorize(admin, otherHost, f.created.id, need), f.session);
+    }
+    const agentRoute = routePlan();
+    agentRoute.hostSelection = { host: 'localhost', record: { routeKey: 'explorer' } };
+    assert.equal(await f.manager.authorize(admin, agentRoute, f.created.id, 'input'), null);
+    const browser = await f.attach(admin);
+    assert.equal(browser.role, 'owner');
+    f.open(f.created.view.id, cliOwner);
+    const browserStream = f.open(browser.view.id, admin);
+    // The CLI leaving with a stop intent keeps the terminal while the browser still shows it.
+    assert.equal((await f.intent(f.created.view.id, 'stop', cliOwner)).pending, true);
+    await f.tick(30_000);
+    assert.equal(f.alive(), true);
+    assert.deepEqual(f.events('webtty_close_intent_cancelled').map(entry => entry.details.reason), ['open-elsewhere']);
+    // The last controlling view leaving stops it.
+    browserStream.drop();
+    assert.equal((await f.intent(browser.view.id, 'stop', admin)).pending, true);
+    await f.tick(30_000);
+    assert.equal(f.alive(), false);
+});
+
+test('a shared terminal keeps its owner window size and hands it to the last window left', async (t) => {
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { auth: requestAuthAdapter(), workerFactory: () => worker });
+    const plan = routePlan();
+    const cli = { lease: { ...lease('cli'), authChannel: 'cli' } };
+    const admin = { lease: lease('browser', 'sso-admin') };
+    const created = await manager.create({ req: cli, routePlan: plan, cwdRelative: '', cols: 120, rows: 40 });
+    const session = manager.sessions.get(created.id);
+    const cliRequest = Object.assign(new EventEmitter(), cli);
+    assert.equal(manager.attachStream(session, cliRequest, streamResponse(), '', plan, created.view.id), true);
+    // A smaller browser window attaches: it shows the terminal without moving it to its size.
+    const token = await manager.createAttachToken({ req: admin, routePlan: plan, id: created.id });
+    const attached = await manager.attach({ req: admin, routePlan: plan, attach: token.attach, cols: 80, rows: 24 });
+    assert.equal(attached.role, 'owner');
+    assert.deepEqual(worker.resizes, []);
+    assert.equal(session.cols, 120);
+    const adminRequest = Object.assign(new EventEmitter(), admin);
+    assert.equal(manager.attachStream(session, adminRequest, streamResponse(), '', plan, attached.view.id), true);
+    // While the owner window is attached, only the owner sets the size.
+    await manager.requestResize({ req: adminRequest, session, cols: 90, rows: 30 });
+    assert.deepEqual(worker.resizes, []);
+    await manager.requestResize({ req: cliRequest, session, cols: 118, rows: 38 });
+    assert.deepEqual(worker.resizes, [[118, 38]]);
+    assert.equal(session.cols, 118);
+    // When the owner window leaves, the remaining window gets its size back.
+    cliRequest.emit('close');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(worker.resizes, [[118, 38], [80, 24]]);
+    assert.equal(session.cols, 80);
+    await manager.requestResize({ req: adminRequest, session, cols: 100, rows: 32 });
+    assert.deepEqual(worker.resizes, [[118, 38], [80, 24], [100, 32]]);
+});
+
+test('an explicit claim hands a shared terminal size to another window and back', async (t) => {
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { auth: requestAuthAdapter(), workerFactory: () => worker });
+    const plan = routePlan();
+    const cli = { lease: { ...lease('cli'), authChannel: 'cli' } };
+    const admin = { lease: lease('browser', 'sso-admin') };
+    const created = await manager.create({ req: cli, routePlan: plan, cwdRelative: '', cols: 120, rows: 40 });
+    const session = manager.sessions.get(created.id);
+    const cliRequest = Object.assign(new EventEmitter(), cli);
+    assert.equal(manager.attachStream(session, cliRequest, streamResponse(), '', plan, created.view.id), true);
+    const token = await manager.createAttachToken({ req: admin, routePlan: plan, id: created.id });
+    const attached = await manager.attach({ req: admin, routePlan: plan, attach: token.attach, cols: 80, rows: 24 });
+    assert.equal(attached.holdsSize, false);
+    const adminRequest = Object.assign(new EventEmitter(), admin);
+    assert.equal(manager.attachStream(session, adminRequest, streamResponse(), '', plan, attached.view.id), true);
+    // A claim moves the size and the holder role to the claiming window.
+    await manager.requestResize({ req: adminRequest, session, cols: 80, rows: 24, claim: true });
+    assert.deepEqual(worker.resizes, [[80, 24]]);
+    assert.equal(session.sizeHolder, browserPrincipal(admin.lease.mode, admin.lease.userId));
+    // The new holder resizes plainly; the former one is gated while it is attached.
+    await manager.requestResize({ req: adminRequest, session, cols: 100, rows: 30 });
+    assert.deepEqual(worker.resizes, [[80, 24], [100, 30]]);
+    await manager.requestResize({ req: cliRequest, session, cols: 118, rows: 38 });
+    assert.deepEqual(worker.resizes, [[80, 24], [100, 30]]);
+    // The former holder claims back by resizing its own terminal.
+    await manager.requestResize({ req: cliRequest, session, cols: 118, rows: 38, claim: true });
+    assert.deepEqual(worker.resizes, [[80, 24], [100, 30], [118, 38]]);
+    assert.equal(session.sizeHolder, browserPrincipal(cli.lease.mode, cli.lease.userId));
+    // Leaving with the holder's window gone adopts the lone window's size and holder role.
+    adminRequest.emit('close');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(session.cols, 118);
+    assert.equal(session.sizeHolder, browserPrincipal(cli.lease.mode, cli.lease.userId));
+});
+
+test('every viewer learns the terminal size and the view that set it last', async (t) => {
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { auth: requestAuthAdapter(), workerFactory: () => worker });
+    const plan = routePlan();
+    const cli = { lease: { ...lease('cli'), authChannel: 'cli' } };
+    const admin = { lease: lease('browser', 'sso-admin') };
+    const sizes = (response) => [...response.body.matchAll(/event: size\ndata: (.*)\n/g)].map(match => JSON.parse(match[1]));
+    const created = await manager.create({ req: cli, routePlan: plan, cwdRelative: '', cols: 120, rows: 40 });
+    const session = manager.sessions.get(created.id);
+    const cliRequest = Object.assign(new EventEmitter(), cli);
+    const cliStream = streamResponse();
+    assert.equal(manager.attachStream(session, cliRequest, cliStream, '', plan, created.view.id), true);
+    // A new stream starts with the current size, set by the creating view.
+    assert.deepEqual(sizes(cliStream).at(-1), { cols: 120, rows: 40, view: created.view.id });
+    const token = await manager.createAttachToken({ req: admin, routePlan: plan, id: created.id });
+    const attached = await manager.attach({ req: admin, routePlan: plan, attach: token.attach, cols: 80, rows: 24 });
+    const adminRequest = Object.assign(new EventEmitter(), admin);
+    const adminStream = streamResponse();
+    assert.equal(manager.attachStream(session, adminRequest, adminStream, '', plan, attached.view.id), true);
+    assert.deepEqual(sizes(adminStream).at(-1), { cols: 120, rows: 40, view: created.view.id }, 'a window that did not take the size renders at it');
+    // A claim names its view; both viewers learn it.
+    await manager.requestResize({ req: adminRequest, session, cols: 188, rows: 38, claim: true, view: attached.view.id });
+    for (const stream of [cliStream, adminStream]) assert.deepEqual(sizes(stream).at(-1), { cols: 188, rows: 38, view: attached.view.id });
+    // A view that is not one of this terminal is never named.
+    await manager.requestResize({ req: cliRequest, session, cols: 100, rows: 30, claim: true, view: 'x'.repeat(32) });
+    assert.deepEqual(sizes(cliStream).at(-1), { cols: 100, rows: 30, view: null });
+});
+
+test('a browser terminal of the local operator session stays owned by that session', async (t) => {
+    const f = await closePolicyFixture(t);
+    assert.equal(f.session.shared, false);
+    const admin = { lease: lease('browser', 'sso-admin') };
+    await assert.rejects(f.manager.authorize(admin, f.plan, f.created.id, 'input'), { code: 'WEBTTY_OWNER_REQUIRED' });
 });
 
 test('A8: watchers neither signal nor cancel, and the toggle race arms only with a stop body', async (t) => {

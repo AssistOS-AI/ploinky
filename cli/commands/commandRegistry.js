@@ -11,6 +11,8 @@ const rawCommands = {
     network: ['status', 'prune'],
     shell: [],
     cli: [],
+    cs: [],
+    'coding-sessions': [],
     start: [],
     restart: [],
     clean: [],
