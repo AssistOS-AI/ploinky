@@ -70,12 +70,34 @@ function sameRuntimeIdentity(record, expected) {
     && text(record.enableGeneration) === expected.enableGeneration;
 }
 
-function sameSelector(left, right) {
-  return left?.state === 'active'
-    && left.generation === right.generation
-    && left.activationId === right.activationId
-    && left.selectorDigest === right.selectorDigest;
+// The transition this process prepared last for each container and has not
+// yet published. A later preparation of the same container supersedes it.
+// Restarts of one container in other processes are serialized by the
+// maintenance lock and the workspace lease.
+const LIVE_TRANSITIONS = new Map();
+
+function releaseTransition(transition) {
+  if (LIVE_TRANSITIONS.get(transition.containerName) === transition.transactionToken) {
+    LIVE_TRANSITIONS.delete(transition.containerName);
+  }
 }
+
+function transitionRefusal(message, code) {
+  return Object.assign(new Error(message), { code });
+}
+
+// Short contention on the edge apply lock or the withdrawn preparation is
+// retried by a fresh reopen against the then-active generation.
+const REOPEN_RETRY_DELAYS_MS = Object.freeze([100, 250, 500, 1000, 2000]);
+const REOPEN_RETRY_CODES = new Set([
+  'EDGE_GENERATION_BUSY',
+  'EDGE_PREPARATION_BUSY',
+  'EDGE_GENERATION_RACE',
+  'EDGE_PREPARATION_RACE',
+  'EDGE_PREPARATION_STALE',
+  'EDGE_GENERATION_SOURCE_CHANGED',
+]);
+const TERMINAL_TRANSITION_CODES = new Set(['TARGETED_RESTART_OWNERSHIP_LOST', 'TARGETED_RESTART_SUPERSEDED']);
 
 function assertExactRouteOwner(route, {
   containerName,
@@ -111,19 +133,58 @@ function affectedRouteSelectors(generation, routeKey) {
   return Object.freeze([...selectors].sort());
 }
 
-function assertTransitionSelected(transition, loadActive) {
-  const active = loadActive();
-  if (!sameSelector(active?.selector, transition.selector)) {
-    throw new Error('targeted agent restart drain generation is no longer selected');
+// The container's routes split into draining and still served ones.
+function containerRouteState(generation, containerName) {
+  const owned = Object.entries(generation?.routing?.routes || {})
+    .filter(([, route]) => text(route?.container) === containerName);
+  const keys = (draining) => owned
+    .filter(([, route]) => (route.draining === true) === draining)
+    .map(([routeKey]) => routeKey)
+    .sort();
+  return Object.freeze({ draining: Object.freeze(keys(true)), served: Object.freeze(keys(false)) });
+}
+
+/**
+ * Prove that a transition still owns its withdrawn route in the active
+ * generation: it is this process's live transition for the container, the
+ * route still names its exact owner and is draining, and the predecessor keeps
+ * its registered identity. Unrelated commits that select a new generation do
+ * not invalidate it. The drain proof also passes the drain-time affected
+ * selectors and route state of the container: no draining route may reopen and
+ * no served route may be added to the container.
+ */
+function assertTransitionCurrent(transition, loadActive, { affectedSelectors = null, drainedRoutes = null } = {}) {
+  if (LIVE_TRANSITIONS.get(transition.containerName) !== transition.transactionToken) {
+    throw transitionRefusal(
+      `targeted agent restart transition for '${transition.containerName}' was superseded by a later restart`,
+      'TARGETED_RESTART_SUPERSEDED',
+    );
   }
+  const active = loadActive();
+  const ownershipLost = (message) => transitionRefusal(message, 'TARGETED_RESTART_OWNERSHIP_LOST');
   const route = active.generation?.routing?.routes?.[transition.routeKey];
-  assertExactRouteOwner(route, transition);
+  try {
+    assertExactRouteOwner(route, transition);
+  } catch (error) {
+    throw ownershipLost(error.message);
+  }
   if (route.draining !== true) {
-    throw new Error('targeted agent restart route is no longer marked draining');
+    throw ownershipLost('targeted agent restart route is no longer marked draining');
   }
   const record = active.generation?.agents?.[transition.containerName];
   if (!sameRuntimeIdentity(record, transition.identity)) {
-    throw new Error('targeted agent restart predecessor identity changed during drain');
+    throw ownershipLost('targeted agent restart predecessor identity changed during drain');
+  }
+  const currentSelectors = affectedSelectors && affectedRouteSelectors(active.generation, transition.routeKey);
+  if (affectedSelectors && JSON.stringify(currentSelectors) !== JSON.stringify(affectedSelectors)) {
+    throw ownershipLost('targeted agent restart affected selectors changed during drain');
+  }
+  if (drainedRoutes) {
+    const current = containerRouteState(active.generation, transition.containerName);
+    if (drainedRoutes.draining.some((routeKey) => !current.draining.includes(routeKey))
+      || current.served.some((routeKey) => !drainedRoutes.served.includes(routeKey))) {
+      throw ownershipLost('targeted agent restart routes of the predecessor changed during drain');
+    }
   }
   return active;
 }
@@ -333,30 +394,44 @@ export async function prepareTargetedAgentRestart({
     networkLifecycleCapability,
   });
 
-  const active = loadActive();
-  const transition = {
-    containerName,
-    routeKey,
-    repoName,
-    shortAgentName,
-    identity,
-    predecessorRecord: structuredClone(record),
-    predecessorRoute,
-    selector: Object.freeze({
-      state: active.selector?.state,
-      generation: active.selector?.generation,
-      activationId: active.selector?.activationId,
-      selectorDigest: active.selector?.selectorDigest,
-    }),
-  };
-  assertTransitionSelected(transition, loadActive);
+  // This preparation supersedes any earlier transition of the container, even
+  // when its own post-drain check refuses it below.
+  const transactionToken = Symbol(containerName);
+  LIVE_TRANSITIONS.set(containerName, transactionToken);
+  let transition;
+  let active;
+  try {
+    active = loadActive();
+    transition = {
+      containerName,
+      routeKey,
+      repoName,
+      shortAgentName,
+      identity,
+      predecessorRecord: structuredClone(record),
+      predecessorRoute,
+      transactionToken,
+      // Diagnostic only: unrelated commits may select newer generations.
+      selector: Object.freeze({
+        state: active.selector?.state,
+        generation: active.selector?.generation,
+        activationId: active.selector?.activationId,
+        selectorDigest: active.selector?.selectorDigest,
+      }),
+    };
+    assertTransitionCurrent(transition, loadActive);
+  } catch (error) {
+    if (LIVE_TRANSITIONS.get(containerName) === transactionToken) LIVE_TRANSITIONS.delete(containerName);
+    throw error;
+  }
   const affectedSelectors = affectedRouteSelectors(active.generation, routeKey);
   const expectedSelectors = JSON.stringify(affectedSelectors);
+  const drainedRoutes = containerRouteState(active.generation, containerName);
   const assertSelectorsInactive = (payload) => {
     try {
       if (text(payload?.containerName) !== containerName
         || JSON.stringify(payload?.affectedSelectors) !== expectedSelectors) return false;
-      assertTransitionSelected(transition, loadActive);
+      assertTransitionCurrent(transition, loadActive, { affectedSelectors, drainedRoutes });
       return true;
     } catch (_) {
       return false;
@@ -391,6 +466,8 @@ export async function commitTargetedAgentRestart({
   retireEntriesAfterApply = retireSameTupleAfterApply,
   reportRetirementFailure = (error) => console.warn(`[edge] published targeted restart candidate receipt could not be retired: ${error?.message || error}`),
   reopenRoute = reopenTargetedRoute,
+  inspectActive = loadActiveEdgeRoutingGeneration,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   if (!transition || !result?.containerName || !result?.registryRecord) {
     throw new Error('targeted agent restart commit requires its transition and exact ready runtime');
@@ -399,7 +476,7 @@ export async function commitTargetedAgentRestart({
     || !sameRuntimeIdentity(result.registryRecord, transition.identity)) {
     throw new Error('targeted agent restart successor does not preserve the coordinated runtime identity');
   }
-  assertTransitionSelected(transition, loadActive);
+  assertTransitionCurrent(transition, loadActive);
 
   const restoredRoute = () => {
     const restored = mergeRoute({
@@ -416,14 +493,42 @@ export async function commitTargetedAgentRestart({
     delete restored.hardwareAvailability;
     return restored;
   };
-  // Reopen the withdrawn route active to active; only a reopen that cannot be
-  // proven takes the inactive merge below (D7).
-  const mergeRouting = async (mutator, options) => {
+  // A failed reopen attempt may still have selected the successor (a refusal
+  // raised after the selector write). Read-only; an unreadable generation is
+  // not a publication.
+  const publishedBySelectedGeneration = () => {
     try {
-      return await reopenRoute(transition, restoredRoute, result);
-    } catch (error) {
-      if (edgeWithdrawalRefusalDisposition(error) === 'defer') throw error;
+      const active = inspectActive();
+      const route = active?.generation?.routing?.routes?.[transition.routeKey];
+      const record = active?.generation?.agents?.[transition.containerName];
+      return Boolean(route) && route.draining !== true
+        && text(route.container) === transition.containerName
+        && text(route.repo) === transition.repoName
+        && text(route.agent) === transition.shortAgentName
+        && (route.hostPort || 0) === (result.hostPort || 0)
+        && sameRuntimeIdentity(record, transition.identity)
+        && Boolean(text(result.registryRecord.containerId))
+        && text(record.containerId) === text(result.registryRecord.containerId);
+    } catch (_) {
+      return false;
     }
+  };
+  // Reopen the withdrawn route active to active, retrying short contention;
+  // only a reopen that cannot be proven takes the inactive merge below (D7).
+  const mergeRouting = async (mutator, options) => {
+    let lastError = null;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await reopenRoute(transition, restoredRoute, result);
+      } catch (error) {
+        if (TERMINAL_TRANSITION_CODES.has(error?.code)) throw error;
+        lastError = error;
+      }
+      if (publishedBySelectedGeneration()) return null;
+      if (!REOPEN_RETRY_CODES.has(lastError?.code) || attempt >= REOPEN_RETRY_DELAYS_MS.length) break;
+      await sleep(REOPEN_RETRY_DELAYS_MS[attempt]);
+    }
+    if (edgeWithdrawalRefusalDisposition(lastError) === 'defer') throw lastError;
     return mergeRoutingDependency(mutator, options);
   };
 
@@ -468,6 +573,8 @@ export async function commitTargetedAgentRestart({
       !== text(result.registryRecord.containerId)) {
     throw new Error('targeted agent restart successor was not published exactly');
   }
+  // Published exactly: a replay of this transition is refused as superseded.
+  releaseTransition(transition);
   // D2S.13 site T: the successor is applied and verified exactly. Retire the entries of the published tuple under a
   // fresh apply lock; failure keeps them, is logged, and does not undo the publication.
   await retireEntriesAfterApply({
@@ -510,6 +617,7 @@ export function cleanupFailedTargetedAgentRestart(result, error, {
 
 export const _test = Object.freeze({
   affectedRouteSelectors,
-  assertTransitionSelected,
+  assertTransitionCurrent,
+  reopenTargetedRoute,
   sameRuntimeIdentity,
 });

@@ -169,6 +169,45 @@ export function hardwareApplyIsUnchanged(captured, plan, {
         && readLabel(captured.key, 'ploinky.limitshash') === hash);
 }
 
+const TARGETED_RESTART_REFUSALS = new Set(['TARGETED_RESTART_OWNERSHIP_LOST', 'TARGETED_RESTART_SUPERSEDED']);
+
+// A targeted restart that failed while publishing its ready successor keeps it
+// running when the restart still owns the route and registry identity: its
+// predecessor is already gone, so removing the successor would leave the agent
+// with no runtime. Ownership is read from the current mutable sources, never
+// from the error text; an unreadable source counts as lost ownership. GPU/MPS
+// launches keep their cohort cleanup. Returns the kept successor or null.
+function keptTargetedSuccessor({ error, phase, transition, result, mpsLaunch, loadRouting, loadRegistry }) {
+    if (!transition || !result?.containerId || mpsLaunch || phase !== 'activation') return null;
+    if (TARGETED_RESTART_REFUSALS.has(error?.code)) return null;
+    try {
+        const { containerName, routeKey, identity } = transition;
+        const route = loadRouting()?.routes?.[routeKey];
+        const record = loadRegistry()?.[containerName];
+        const owned = Boolean(routeKey && containerName && identity?.instanceId && identity?.enableGeneration)
+            && route?.container === containerName && route.repo === transition.repoName && route.agent === transition.shortAgentName
+            && record?.type === 'agent' && record.instanceId === identity.instanceId
+            && record.enableGeneration === identity.enableGeneration;
+        if (!owned) return null;
+        const published = record.containerId === result.containerId && route.draining !== true
+            && (route.hostPort || 0) === (result.hostPort || 0);
+        return Object.freeze({ containerName: result.containerName, containerId: result.containerId, published });
+    } catch (_) {
+        return null;
+    }
+}
+
+function reportKeptTargetedSuccessor(error, kept, agent) {
+    if (!error || typeof error !== 'object') return;
+    try {
+        Object.defineProperty(error, 'preservedTargetedSuccessor', { value: kept, configurable: true, enumerable: false });
+    } catch (_) { /* a frozen error keeps no annotation */ }
+    const state = kept.published ? ' and is published' : ` with its route withdrawn; rerun ploinky restart ${agent} to replace it`;
+    try {
+        error.message = `${error.message || error}; the ready successor ${String(kept.containerId).slice(0, 12)} was kept running${state}`;
+    } catch (_) { /* a frozen error keeps its message */ }
+}
+
 // Mark a refused instance's routes unavailable in the active generation
 // without an inactive window (W9, D3 'unavailable').
 function withdrawUnavailableRuntime({ containerName, projection }) {
@@ -278,7 +317,9 @@ export async function reconcileExactHardwareInstance(captured, {
         } catch (error) {
             markApplyStep(error, phase);
             releaseMpsRuntimeOwner(result);
-            if (transition) cleanupTargeted(result, error);
+            const kept = keptTargetedSuccessor({ error, phase, transition, result, mpsLaunch, loadRouting, loadRegistry });
+            if (kept) reportKeptTargetedSuccessor(error, kept, captured.record.alias || captured.record.agentName);
+            else if (transition) cleanupTargeted(result, error);
             else cleanupPrepared(result, error, 'hardware-reconcile-failed');
             const problem = findHardwareOutcome(error);
             if (problem && problem.key === captured.key) {

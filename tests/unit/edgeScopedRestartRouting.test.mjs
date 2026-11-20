@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 
 // A6: a host-network agent with a fixed host mapping rotates under its own
 // name. While its replacement is launching (paused here before readiness),
@@ -27,7 +28,7 @@ const { coordinateReplacementRuntimeIdentity } = await import('../../cli/sandbox
 const { resolveEdgeRoutePlan } = await import('../../cli/server/edgeRoutePlan.js');
 const { dispatchAgentStartupAfterRouterSurfaces } = await import('../../cli/server/agentStartupDispatch.js');
 const { saveAgents } = await import('../../cli/utils/workspace.js');
-const { prepareTargetedAgentRestart, commitTargetedAgentRestart } = await import('../../cli/commands/targetedAgentRestart.js');
+const { prepareTargetedAgentRestart, commitTargetedAgentRestart, _test: restartInternals } = await import('../../cli/commands/targetedAgentRestart.js');
 const { withEdgeSelectionObserver } = await import('../../cli/sandbox/edgeSelectionMutations.mjs');
 const { reconcileExactHardwareInstance } = await import('../../cli/sandbox/hardwareLimits/reconcile.mjs');
 const { HardwareLimitsError } = await import('../../cli/sandbox/hardwareLimits/errors.mjs');
@@ -63,19 +64,26 @@ function record(agentName) {
     };
 }
 
-function seedWorkspace({ predecessorId } = {}) {
+// `bystander` adds agentC, an unrelated default-network agent whose
+// Watchdog withdrawal can land in the middle of agentB's targeted restart.
+function seedWorkspace({ predecessorId, bystander = false } = {}) {
     fs.rmSync(ploinkyDir, { recursive: true, force: true });
     writeJson(path.join(repoDir, 'agentA', 'manifest.json'), { container: 'node:20-alpine', network: { mode: 'host' } });
     writeJson(path.join(repoDir, 'agentB', 'manifest.json'), { container: 'node:20-alpine' });
+    if (bystander) writeJson(path.join(repoDir, 'agentC', 'manifest.json'), { container: 'node:20-alpine' });
     writeJson(path.join(ploinkyDir, 'routing.json'), {
         routes: {
             agentA: { repo: 'media', agent: 'agentA', container: 'agentA-container', hostPath: path.join(repoDir, 'agentA'), hostPort: 7880 },
             agentB: { repo: 'media', agent: 'agentB', container: 'agentB-container', hostPath: path.join(repoDir, 'agentB'), hostPort: 41002 },
+            ...(bystander ? {
+                agentC: { repo: 'media', agent: 'agentC', container: 'agentC-container', hostPath: path.join(repoDir, 'agentC'), hostPort: 41003 },
+            } : {}),
         },
     });
     writeJson(path.join(ploinkyDir, 'agents.json'), {
         'agentA-container': record('agentA'),
         'agentB-container': { ...record('agentB'), ...(predecessorId ? { containerId: predecessorId, runtime: 'podman' } : {}) },
+        ...(bystander ? { 'agentC-container': record('agentC') } : {}),
     });
     writeJson(path.join(ploinkyDir, 'data', 'edge-routing', 'desired.json'), {
         hosts: { [PUBLIC_HOST]: { agent: 'media/agentB', routerSurfaces: ['browser-auth'] } },
@@ -281,6 +289,135 @@ test('W8 a targeted restart drains and reopens its route active to active, keepi
     assert.equal(reopened.generation.routing.routes.agentB.hostPort, 41012);
     assert.equal(reopened.generation.agents['agentB-container'].instanceId, agentRecord.instanceId);
     assert.equal(reopened.selector.publicationState, 'ready');
+});
+
+function loadActive() {
+    return edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace });
+}
+
+function prepareAgentB(agentRecord) {
+    return withNetworkLifecycleLock((networkLifecycleCapability) => prepareTargetedAgentRestart({
+        containerName: 'agentB-container',
+        routeKey: 'agentB',
+        repoName: 'media',
+        shortAgentName: 'agentB',
+        record: agentRecord,
+        networkLifecycleCapability,
+    }));
+}
+
+function commitAgentB(transition, agentRecord, dependencies = {}) {
+    return withNetworkLifecycleLock((networkLifecycleCapability) => commitTargetedAgentRestart({
+        transition,
+        result: {
+            containerName: 'agentB-container',
+            hostPort: 41012,
+            registryRecord: { ...agentRecord, containerId: 'd'.repeat(64), runtime: 'podman' },
+        },
+        agentPath: path.join(repoDir, 'agentB'),
+        networkLifecycleCapability,
+    }, { retireEntriesAfterApply: async () => {}, ...dependencies }));
+}
+
+// The Watchdog's probe-driven withdrawal of the unrelated agentC: an active to
+// active commit that writes a new selector (new activationId).
+function withdrawBystander() {
+    return edge.withEdgeGenerationApplyLock((applyLockCapability) => edge.commitWithdrawalEdgeRoutingGeneration({
+        withdraw: [{
+            containerName: 'agentC-container',
+            mode: 'drain',
+            drainOwner: { containerName: 'agentC-container', instanceId: 'agentC-instance', enableGeneration: 'agentC-generation', reason: 'probe-failure' },
+        }],
+        reason: 'continuous-runtime-probe-failed:agentC-container',
+        applyLockCapability,
+    }));
+}
+
+test('W8b a targeted restart survives an unrelated Watchdog withdrawal committed between its drain and its reopen', async () => {
+    seedWorkspace({ bystander: true });
+    const agentRecord = loadActive().generation.agents['agentB-container'];
+    const writes = [];
+    const observe = (operation) => withEdgeSelectionObserver((entry) => writes.push(entry), operation);
+    const transition = await observe(() => prepareAgentB(agentRecord));
+    const drained = loadActive();
+    await observe(() => withdrawBystander());
+    const withdrawn = loadActive();
+    assert.notEqual(withdrawn.selector.activationId, drained.selector.activationId, 'the bystander withdrawal selected a new generation');
+
+    await observe(() => commitAgentB(transition, agentRecord));
+    const reopened = loadActive();
+    const routes = reopened.generation.routing.routes;
+    assert.equal(routes.agentB.draining, undefined);
+    assert.equal(routes.agentB.hostPort, 41012);
+    assert.equal(reopened.generation.agents['agentB-container'].containerId, 'd'.repeat(64));
+    assert.equal(routes.agentC.draining, true, 'the bystander stays withdrawn');
+    assert.equal(routes.agentC.drainOwner.reason, 'probe-failure');
+    assert.equal(routes.agentC.hostPort, undefined);
+    assert.equal(plan(CONTROL_HOST, '/agentB/').target.hostPort, 41012);
+    assert.equal(plan(CONTROL_HOST, '/agentC/').diagnosticCategory, 'AGENT_ROUTE_DRAINING');
+    assert.ok(writes.length >= 3);
+    assert.deepEqual([...new Set(writes.map((entry) => entry.after.state))], ['active']);
+});
+
+test('W8c a targeted restart retries the reopen while another holder owns the edge apply lock', async () => {
+    seedWorkspace({ bystander: true });
+    const agentRecord = loadActive().generation.agents['agentB-container'];
+    const transition = await prepareAgentB(agentRecord);
+    const delays = [];
+    // The apply lock is held across the holder's async callback, so the sleep
+    // must really wait for the holder to release it.
+    const recordingSleep = async (ms) => { delays.push(ms); await delay(ms); };
+    const holder = edge.withEdgeGenerationApplyLock(async () => { await delay(300); });
+    await commitAgentB(transition, agentRecord, { sleep: recordingSleep });
+    await holder;
+    assert.ok(delays.length >= 1, 'the reopen waited for the lock holder');
+    assert.deepEqual(delays, [100, 250, 500, 1000, 2000].slice(0, delays.length));
+    const reopened = loadActive();
+    assert.equal(reopened.generation.routing.routes.agentB.draining, undefined);
+    assert.equal(reopened.generation.routing.routes.agentB.hostPort, 41012);
+    assert.equal(reopened.generation.agents['agentB-container'].containerId, 'd'.repeat(64));
+    assert.equal(plan(CONTROL_HOST, '/agentB/').target.hostPort, 41012);
+});
+
+test('W8e a Watchdog withdrawal attempted while the reopen holds its withdrawn preparation is deferred and the reopen publishes', async () => {
+    seedWorkspace({ bystander: true });
+    const agentRecord = loadActive().generation.agents['agentB-container'];
+    const transition = await prepareAgentB(agentRecord);
+    let refusal = null;
+    // The real reopen; just before its additive commit, the bystander's
+    // withdrawal runs with the held apply-lock capability, as it would once
+    // the lock is free while the withdrawn preparation is still outstanding.
+    const reopenRoute = (transitionArg, buildRoute, result) => restartInternals.reopenTargetedRoute(transitionArg, buildRoute, result, {
+        commitAdditive: (lease, options) => {
+            try {
+                edge.commitWithdrawalEdgeRoutingGeneration({
+                    withdraw: [{ containerName: 'agentC-container', mode: 'drain' }],
+                    reason: 'continuous-runtime-probe-failed:agentC-container',
+                    applyLockCapability: options.applyLockCapability,
+                });
+            } catch (error) {
+                refusal = error;
+            }
+            return edge.commitAdditiveEdgeRoutingGeneration(lease, options);
+        },
+    });
+    await commitAgentB(transition, agentRecord, { reopenRoute });
+    assert.equal(refusal?.code, 'EDGE_PREPARATION_BUSY');
+    assert.equal(edge.edgeWithdrawalRefusalDisposition(refusal), 'defer');
+    const reopened = loadActive();
+    assert.equal(reopened.generation.routing.routes.agentB.hostPort, 41012);
+    assert.equal(reopened.generation.routing.routes.agentC.hostPort, 41003, 'the deferred withdrawal changed nothing');
+});
+
+test('W8d a targeted restart whose drain proof runs after an unrelated withdrawal still drains', async () => {
+    seedWorkspace({ bystander: true });
+    const agentRecord = loadActive().generation.agents['agentB-container'];
+    const transition = await prepareAgentB(agentRecord);
+    await withdrawBystander();
+    assert.equal(transition.targetedRestart.assertSelectorsInactive({
+        containerName: 'agentB-container',
+        affectedSelectors: transition.targetedRestart.affectedSelectors,
+    }), true);
 });
 
 function refusedReconcile(withdrawUnavailable) {
