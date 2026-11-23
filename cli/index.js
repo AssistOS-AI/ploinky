@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { showHelp } from './commands/help.js';
 import { parseStatusOptions } from './statusOptions.js';
+import { isInsideBox } from '../ploinky-box/lib/boxMarker.mjs';
 import { bootstrapAgentLibRuntime } from '../agentlib/bootstrap.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
 import { agentLibIdentityEquals } from '../agentlib/contract.mjs';
@@ -83,6 +84,8 @@ export async function launchCli(args = process.argv.slice(2), {
     // `logs` loadable without any AgentLib runtime contract at all.
     runOuterRuntimeShellImpl = null,
     statusWorkspaceImpl,
+    runCanaryCommandImpl,
+    detectInsideBox = isInsideBox,
     importCoreImpl = () => import('./main.js'),
     importLogCommandsImpl = () => import('./commands/logCommands.js'),
     importConfigImpl = () => import('./utils/config.js'),
@@ -161,6 +164,16 @@ export async function launchCli(args = process.argv.slice(2), {
         return 0;
     }
     const { commandArgs, debug } = extractGlobalDebugFlag(args);
+    if (commandArgs[0] === 'canary' && commandArgs[1] === 'status') {
+        if (!detectInsideBox()) {
+            throw new Error('canary status requires a running managed Box. Run `ploinky canary status` from its workspace.');
+        }
+        // The local administrator client signs its request with AgentLib.
+        await bootstrapAgentLibImpl({ env, readOnly: true });
+        const runCanary = runCanaryCommandImpl || (await import('./commands/canaryCommand.js')).runCanaryCommand;
+        await runCanary(commandArgs.slice(1));
+        return 0;
+    }
     if (commandArgs[0] === 'status') {
         const statusOptions = parseStatusOptions(commandArgs.slice(1), { debug });
         // Status reports the selected AgentLib source, so it needs the runtime
@@ -212,8 +225,7 @@ export async function launchCli(args = process.argv.slice(2), {
     }
     // Establish the achillesAgentLib runtime contract before importing any core
     // module. Outside the Box this selects the one local workspace source;
-    // inside the Box it only validates the source the host supervisor selected. Help, logs, and single-word status returned
-    // above, so they stay free of any clone or fetch side effect.
+    // inside the Box it only validates the source the host supervisor selected.
     const branchPolicy = ['restart', 'update'].includes(commandArgs[0])
         ? parseBranchPolicy(args)
         : safeBranchPolicy(args);

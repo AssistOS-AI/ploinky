@@ -457,22 +457,26 @@ async function processRequest(req, res) {
         return;
     }
     if (requestedUrl.pathname === '/api/router/canary/status' && routePlan.hostSelection?.kind === 'control') {
-        const headers = { 'Cache-Control': 'no-store' };
+        res.setHeader('Cache-Control', 'no-store');
+        if (!['localhost', '127.0.0.1', '::1', 'router.localhost'].includes(exactHost)) {
+            sendJsonResponse(res, 403, { error: 'loopback_control_host_required' });
+            return;
+        }
         const auth = await ensureAuthenticated(req, res, requestedUrl, { routePlan });
         if (!auth.ok || !requireAdminControlRequest(req, res)) return;
         if (req.authMode !== 'local' || req.authChannel !== 'cli') {
-            sendJsonResponse(res, 403, { error: 'local_cli_session_required' }, headers);
+            sendJsonResponse(res, 403, { error: 'local_cli_session_required' });
             return;
         }
         if (req.method !== 'GET') {
-            sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { ...headers, Allow: 'GET' });
+            sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
             return;
         }
         if (!commitRouteGeneration(routePlan)) {
-            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, headers);
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' });
             return;
         }
-        sendJsonResponse(res, 200, canaryStatus(routePlan.lease.snapshot.routing.routes), headers);
+        sendJsonResponse(res, 200, canaryStatus(routePlan.lease.snapshot.routing.routes));
         return;
     }
     if (routePlan.kind === 'mount-redirect') {

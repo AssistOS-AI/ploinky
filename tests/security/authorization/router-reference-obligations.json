@@ -3238,6 +3238,123 @@
             "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
           }
         },
+        "a1619ac4e28e91a56f7952b69452991e22b4f3442cd9472d72f84d6708c913fc": {
+          "root.get": {
+            "line": 833,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "root-index.get": {
+            "line": 833,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "health.get": {
+            "line": 706,
+            "anchor": null,
+            "statement": "if (pathname === '/health') {"
+          },
+          "agent-card.get": {
+            "line": 793,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-card-slash.get": {
+            "line": 793,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "mcp-browser-client.get": {
+            "line": 528,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 528,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 794,
+            "anchor": null,
+            "statement": "} else if (agentName && isActiveAgentRootPlan(routePlan)) {"
+          },
+          "agent-mcp.post": {
+            "line": 803,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.get": {
+            "line": 803,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.delete": {
+            "line": 803,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-task-status.get": {
+            "line": 666,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-status-alias.get": {
+            "line": 666,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-cancel.post": {
+            "line": 607,
+            "anchor": null,
+            "statement": "} else if (isDelegatedAgentTaskCancelRoute) {"
+          },
+          "agent-openai.post": {
+            "line": 810,
+            "anchor": null,
+            "statement": "return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath, {"
+          },
+          "agent-root-websocket.get": {
+            "line": 1095,
+            "anchor": null,
+            "statement": "const handled = await handleAgentRootUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 1057,
+            "anchor": null,
+            "statement": "if (routePlan.kind === 'agent-port') {"
+          },
+          "internal-agent-control.*": {
+            "line": 543,
+            "anchor": null,
+            "statement": "if (hasInternalAgentSegment(pathname)) {"
+          },
+          "reserved--metrics.*": {
+            "line": 845,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--health-internal.*": {
+            "line": 845,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin.*": {
+            "line": 845,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin-*.*": {
+            "line": 845,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "unix-health.get": {
+            "line": 1008,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          }
+        },
         "acee67c7fd42d103b8ff66b8f63a557f8c8de14be393b285ca29928b13aa70b0": {
           "root.get": {
             "line": 829,

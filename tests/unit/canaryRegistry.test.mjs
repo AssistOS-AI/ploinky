@@ -66,7 +66,7 @@ function reset(mutate = () => {}) {
         rolloutId: 'rollout-1', container: secondary, commit: '1'.repeat(40), codeDigest: 'sha256:' + '2'.repeat(64),
         codePath: '.ploinky/canary/alpha/release', share: 10, testAccounts: ['tester'], salt: 'fixture-salt',
         splitStartedAt: '2026-11-23T00:00:00Z', mode: 'split', probe: { port: 8787, path: '/healthz', status: 200 },
-        thresholds: { errorRate: 0.05, windowSeconds: 300 },
+        thresholds: { minFailures: 2, errorDeltaPoints: 3.5 },
     };
     const agents = {
         [secondary]: { ...record('alpha', 'canary'), canaryOf: 'alpha', launchId: 'launch-2', hostPort: 43103 },
@@ -100,6 +100,69 @@ for (const [label, change] of [
     ['invalid share', ({ routing }) => { routing.routes.alpha.canary.share = -1; }],
     ['abbreviated digest', ({ routing }) => { routing.routes.alpha.canary.codeDigest = 'sha256:aaaa'; }],
 ]) test('compile rejects ' + label, () => assert.throws(() => reset(change), { code: 'EDGE_GENERATION_INVALID' }));
+
+test('registry and rollout thresholds accept the same fields and bounds', async () => {
+    const { validateCanaryField } = await import('../../cli/sandbox/canaryRecord.mjs');
+    const { DEFAULT_THRESHOLDS } = await import('../../cli/server/canary/tripRules.js');
+    const field = reset().routing.routes.alpha.canary;
+    const validate = thresholds => validateCanaryField({ ...field, thresholds }, 'canary');
+    for (const overrides of [{}, DEFAULT_THRESHOLDS, { slowMs: 0.5, errorMultiple: 0 }, { slowDeltaPoints: 100 }]) {
+        assert.doesNotThrow(() => validate(overrides));
+    }
+    for (const overrides of [null, undefined, [], 3, { windowSeconds: 600 }, { errorRate: 0.05 }, { [Symbol('x')]: 1 },
+        { minFailures: 0 }, { minResponses: 1.5 }, { consecutiveProbes: 2 ** 53 },
+        { consecutiveConnections: -1 }, { slowWithoutBaselinePercent: 100.1 },
+        { slowMs: Infinity }, { errorMultiple: NaN }, { errorDeltaPoints: -0.1 }]) {
+        assert.throws(() => validate(overrides), { code: 'EDGE_GENERATION_INVALID' });
+    }
+});
+
+test('Router startup isolates invalid overrides and honors the compiled thresholds on the next route', async t => {
+    const { canarySignals } = await import('../../cli/server/canary/routerSignals.js');
+    const { validateCanaryField } = await import('../../cli/sandbox/canaryRecord.mjs');
+    const { canary } = reset().routing.routes.alpha;
+    validateCanaryField(canary, 'alpha.canary');
+    const events = [];
+    t.mock.method(canarySignals, 'log', (type, data) => events.push({ type, ...data }));
+    const routes = {
+        legacy: { canary: { ...canary, mode: 'retiring', thresholds: { windowSeconds: 300 } } },
+        valid: { canary },
+    };
+    t.after(() => {
+        for (const key of Object.keys(routes)) canarySignals.removeRollout(key, canary.rolloutId);
+    });
+    canarySignals.startRollout({ ...canary, routeKey: 'legacy', thresholds: { minFailures: 1 } });
+    canarySignals.routerStarted(routes);
+    const status = key => canarySignals.status().rollouts.find(row => row.routeKey === key);
+    for (const [key, minFailures] of [['legacy', 5], ['valid', 2]]) {
+        assert.equal(status(key).state, 'paused');
+        assert.equal(canarySignals.resume(key, canary.rolloutId), true);
+        const fail = () => canarySignals.recordOutcome({ routeKey: key, rolloutId: canary.rolloutId,
+            copy: 'canary', status: 503 });
+        for (let n = 1; n < minFailures; n++) fail();
+        assert.equal(status(key).state, 'split');
+        fail();
+        assert.equal(status(key).state, 'tripped');
+    }
+    assert.deepEqual(events.filter(event => event.type === 'canary_restore_error').map(event => event.routeKey), ['legacy']);
+});
+
+test('a committed generation retires only missing route baselines, including their lifetime counts', async () => {
+    const { canarySignals, canaryStatus } = await import('../../cli/server/canary/routerSignals.js');
+    const first = reset().routing.routes;
+    canaryStatus(first);
+    for (const routeKey of ['alpha', 'beta']) canarySignals.recordOutcome({ routeKey, status: 503 });
+    const onlyAlpha = reset(({ routing }) => { delete routing.routes.beta; }).routing.routes;
+    assert.deepEqual(canaryStatus(onlyAlpha).baselines.map(row => row.routeKey), ['alpha']);
+    canarySignals.recordOutcome({ routeKey: 'beta', status: 503 });
+    assert.deepEqual(canarySignals.status().baselines.map(row => row.routeKey), ['alpha']);
+    const restored = reset().routing.routes;
+    canarySignals.recordOutcome({ routeKey: 'beta', status: 200 });
+    const { baselines } = canaryStatus(restored);
+    assert.deepEqual(baselines.map(row => [row.routeKey, row.sinceStart.requests, row.sinceStart.backendFailures]),
+        [['alpha', 1, 1], ['beta', 1, 0]]);
+    assert.deepEqual(canaryStatus(undefined).baselines, []);
+});
 
 test('withdrawn compiles with both records; canary-first name resolution selects the primary', () => {
     const generation = reset(({ routing }) => { routing.routes.alpha.canary.mode = 'withdrawn'; });

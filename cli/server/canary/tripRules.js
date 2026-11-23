@@ -14,14 +14,21 @@ const countThresholds = new Set(['minFailures', 'minResponses', 'consecutiveConn
 const percentThresholds = new Set(['errorDeltaPoints', 'slowDeltaPoints', 'slowWithoutBaselinePercent']);
 
 export function rolloutThresholds(overrides = {}) {
-    for (const [key, value] of Object.entries(overrides)) {
+    if (!overrides || typeof overrides !== 'object'
+        || ![Object.prototype, null].includes(Object.getPrototypeOf(overrides))) {
+        throw new RangeError('canary thresholds must be an object');
+    }
+    const thresholds = { ...DEFAULT_THRESHOLDS };
+    for (const key of Reflect.ownKeys(overrides)) {
+        const value = overrides[key];
         if (!Object.hasOwn(DEFAULT_THRESHOLDS, key) || !Number.isFinite(value) || value < 0
             || (countThresholds.has(key) && (!Number.isSafeInteger(value) || value < 1))
             || (percentThresholds.has(key) && value > 100)) {
-            throw new RangeError(`invalid canary threshold: ${key}`);
+            throw new RangeError(`invalid canary threshold: ${String(key)}`);
         }
+        thresholds[key] = value;
     }
-    return Object.freeze({ ...DEFAULT_THRESHOLDS, ...overrides });
+    return Object.freeze(thresholds);
 }
 
 // Cross-multiply before comparing: equal shares plus the configured margin
