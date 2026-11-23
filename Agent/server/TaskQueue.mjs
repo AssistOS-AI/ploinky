@@ -14,7 +14,7 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const DEFAULT_PERSIST_DEBOUNCE_MS = 100;
 const DEFAULT_TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_TERMINAL_TASKS = 500;
-const ROLLOUT_ID_RE = /^[A-Za-z0-9._-]+$/;
+const ROLLOUT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 /** Return the rollout ID from canary.<rolloutId>.<16 hex digits>, or null for other task IDs. */
 export function parseCanaryTaskId(taskId) {
@@ -113,8 +113,9 @@ export class TaskQueue {
     static forAgent(options, env = process.env) {
         // Agent code is read-only in production. Both copies share the writable HOME.
         const home = String(env.HOME || '').trim();
-        const rolloutId = env.PLOINKY_CANARY === '1' ? env.PLOINKY_CANARY_ROLLOUT || '' : '';
-        if (rolloutId && !ROLLOUT_ID_RE.test(rolloutId)) {
+        const isCanary = env.PLOINKY_CANARY === '1';
+        const rolloutId = isCanary ? env.PLOINKY_CANARY_ROLLOUT : '';
+        if (isCanary && (typeof rolloutId !== 'string' || !ROLLOUT_ID_RE.test(rolloutId))) {
             throw new Error('Invalid PLOINKY_CANARY_ROLLOUT for task queue');
         }
         const fileName = rolloutId ? `.tasksQueue.canary.${rolloutId}` : '.tasksQueue';

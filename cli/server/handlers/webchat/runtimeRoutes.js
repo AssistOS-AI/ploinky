@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { getSession } from './browserSession.js';
 import {
     parseInputEnvelope,
+    resolveWebchatInvocationTarget,
     serializeWebchatEnvelopeForAgent,
     shouldForwardWebchatEnvelope
 } from './messageEnvelope.js';
@@ -68,6 +69,20 @@ function runtimeAgentName(effectiveConfig) {
     return String(effectiveConfig?.agentName || effectiveConfig?.displayName || 'webchat').trim();
 }
 
+// A launch-bound TTY can survive an unrelated generation change. Legacy
+// routes have no launch proof, so reuse them only within the opening generation.
+function runtimeTargetId(target) {
+    if (!target) return null;
+    const { container, targetRecord, snapshot } = target;
+    return JSON.stringify([container, targetRecord?.containerId, targetRecord?.launchId, targetRecord?.launchId ? null : snapshot.generation]);
+}
+
+function failWebchatInvocation(res, error) {
+    console.error('[webchat] Failed to authorize message for the agent:', error.message);
+    res.writeHead(503, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+    return res.end('Unable to authorize this WebChat message. Reconnect and try again.');
+}
+
 function isIdleRuntime(tab) {
     const connected = tab.subscribers instanceof Map ? tab.subscribers.size > 0 : Boolean(tab.sseRes);
     if (connected) return false;
@@ -125,8 +140,16 @@ export function handleRuntimeRoute({
         const runtimes = getRuntimeMap(appState);
         const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery, principal);
         let tab = runtimes.get(runtimeKey);
+        let targetId = null;
+        if (shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)) {
+            try {
+                targetId = runtimeTargetId(resolveWebchatInvocationTarget(req, effectiveConfig));
+            } catch (error) {
+                return failWebchatInvocation(res, error);
+            }
+        }
 
-        if (tab && !isRuntimeWritable(tab)) {
+        if (tab && (!isRuntimeWritable(tab) || (targetId !== null && tab.targetId !== targetId))) {
             disposeUnavailableRuntime(tab, runtimeKey, runtimes);
             tab = null;
         }
@@ -160,6 +183,7 @@ export function handleRuntimeRoute({
                     cleanupTimer: null,
                     ttyClosed: false,
                     runtimeKey,
+                    targetId,
                     runtimePrincipal: principal,
                     runtimeAgent: runtimeAgentName(effectiveConfig),
                     workspaceDirectory,
@@ -322,16 +346,20 @@ export function handleRuntimeRoute({
             const isSlashCommand = rawMessage.trimStart().startsWith('/');
             const isVisibleMessage = envelope.presentation?.visible !== false;
             const forwardEnvelope = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig);
-            const text = forwardEnvelope
-                ? serializeWebchatEnvelopeForAgent({
-                    req,
-                    effectiveConfig,
-                    tabId,
-                    pageInstanceId,
-                    envelope,
-                    fallbackText: rawMessage
-                })
-                : rawMessage;
+            let text = rawMessage;
+            if (forwardEnvelope) {
+                try {
+                    const target = resolveWebchatInvocationTarget(req, effectiveConfig);
+                    if (runtimeTargetId(target) !== (tab.targetId ?? null)) {
+                        throw new Error('WebChat runtime target changed');
+                    }
+                    text = serializeWebchatEnvelopeForAgent({
+                        req, effectiveConfig, tabId, pageInstanceId, envelope, fallbackText: rawMessage, target
+                    });
+                } catch (error) {
+                    return failWebchatInvocation(res, error);
+                }
+            }
             if (!writeRuntimeInput(tab, `${text}\n`)) {
                 disposeUnavailableRuntime(tab, runtimeKey, runtimes);
                 res.writeHead(409);

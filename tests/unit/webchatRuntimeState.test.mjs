@@ -404,7 +404,7 @@ test('large task log snapshots are split into bounded ordered SSE events', () =>
 
 test('a failed runtime write is rejected and the zombie runtime is removed', async () => {
     const workspaceDirectory = '/workspace';
-    const effectiveConfig = { agentName: 'demo-agent', forwardEnvelope: true };
+    const effectiveConfig = { displayName: 'test shell', forwardEnvelope: true };
     const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
     const sseWrites = [];
     let disposed = false;
@@ -452,7 +452,7 @@ test('a failed runtime write is rejected and the zombie runtime is removed', asy
 
 test('visible slash commands broadcast as transcript input while UI control commands stay silent', async () => {
     const workspaceDirectory = '/workspace';
-    const effectiveConfig = { agentName: 'demo-agent', forwardEnvelope: true };
+    const effectiveConfig = { displayName: 'test shell', forwardEnvelope: true };
     const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
     const ttyWrites = [];
     const sseWrites = [];

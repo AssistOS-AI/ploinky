@@ -102,7 +102,7 @@ test('serializeWebchatEnvelopeForAgent leaves history ownership to AchillesCLI',
 test('serializeWebchatEnvelopeForAgent binds task interactions to the current page instance', () => {
     const payload = JSON.parse(serializeWebchatEnvelopeForAgent({
         req: { headers: { host: 'localhost' }, socket: {} },
-        effectiveConfig: { agentName: 'achilles-cli' },
+        effectiveConfig: { agentName: '' },
         tabId: 'tab_origin',
         pageInstanceId: 'page_origin',
         envelope: { text: '/task login task_111111111111111111111111' },

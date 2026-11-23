@@ -93,15 +93,34 @@ export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal, 
     throw unresolvedProvider(providerAgentRef);
 }
 
-// Select by the route used for the dial. A route handed in by a caller
-// must still belong to that snapshot, even if a replacement reused its name.
-export function resolveRouteTargetRecord({ routeKey, route, snapshot = tryLoadActiveSnapshot({ forMint: true }) } = {}) {
+function routeInSnapshot(snapshot, routeKey) {
     const routes = snapshot?.routing?.routes;
-    const currentRoute = routes && Object.hasOwn(routes, routeKey) ? routes[routeKey] : undefined;
+    return routes && Object.hasOwn(routes, routeKey) ? routes[routeKey] : undefined;
+}
+
+// A generation digest survives cache reconstruction. The route key and
+// container select the dial target within that immutable generation.
+export function resolveRouteTargetRecord({ routeKey, route, generation, snapshot } = {}) {
+    const expectedGeneration = generation ?? snapshot?.generation;
+    // A host-port-only dial supplies no container selection. The issuer
+    // still requires a selected record if this principal has a launch ID.
+    if (route && !route.container && expectedGeneration === undefined) return undefined;
+    const active = expectedGeneration === undefined && snapshot ? snapshot : tryLoadActiveSnapshot({ forMint: true });
+    const currentRoute = routeInSnapshot(active, routeKey);
+    if (expectedGeneration !== undefined && (!expectedGeneration || expectedGeneration !== active?.generation
+        || (snapshot && snapshot.generation !== expectedGeneration))) {
+        throw new Error('invocationMinter: selected route generation changed');
+    }
+    // A raw route has no digest. When the caller omits its generation, the
+    // route must belong to the selection snapshot (or the current snapshot).
+    if (route && ((generation === undefined && route !== routeInSnapshot(snapshot ?? active, routeKey))
+        || (route.routeKey !== undefined && route.routeKey !== routeKey)
+        || !currentRoute || (currentRoute.container ?? '') !== (route.container ?? ''))) {
+        throw new Error('invocationMinter: selected route generation changed');
+    }
     const selected = route ?? currentRoute;
     if (!selected?.container) return undefined;
-    if (currentRoute !== selected) throw new Error('invocationMinter: selected route generation changed');
-    const agents = snapshot.agents;
+    const agents = active.agents;
     if (!agents || !Object.hasOwn(agents, selected.container) || !agents[selected.container]) {
         throw new Error('invocationMinter: selected target container missing');
     }
@@ -117,10 +136,10 @@ function requestLaunchId(targetAgentId, { targetRecord, routeDefinition, snapsho
         && `agent:${record.repoName}/${record.agentName}` === targetAgentId;
     let record = targetRecord;
     if (record === undefined) {
-        const generation = snapshot ?? tryLoadActiveSnapshot({ forMint: true });
         if (routeDefinition?.route?.container) {
-            record = resolveRouteTargetRecord({ routeKey: routeDefinition.routeKey, route: routeDefinition.route, snapshot: generation });
+            record = resolveRouteTargetRecord({ routeKey: routeDefinition.routeKey, route: routeDefinition.route, snapshot });
         } else {
+            const generation = snapshot ?? tryLoadActiveSnapshot({ forMint: true });
             const agents = generation?.agents;
             if (!agents) return undefined;
             const matches = Object.values(agents).filter(matchesPrincipal);

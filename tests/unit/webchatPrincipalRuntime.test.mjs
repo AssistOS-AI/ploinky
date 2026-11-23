@@ -136,10 +136,11 @@ function makeAppState() {
     return { runtimes: new Map(), sessions: new Map() };
 }
 
-function openStream({ appState, effectiveConfig, user, agentQuery = 'agent=dpuAgent', tabId, sid }) {
+function openStream({ appState, effectiveConfig, user, agentQuery = 'agent=dpuAgent', tabId, sid, binding }) {
     if (!appState.sessions.has(sid)) appState.sessions.set(sid, { tabs: new Map() });
     const req = new EventEmitter();
     req.method = 'GET';
+    if (binding) req.edgeAuthContext = { webchatBinding: binding };
     req.headers = { cookie: `webchat_sid=${sid}` };
     if (user) {
         req.user = user;
@@ -162,9 +163,10 @@ function openStream({ appState, effectiveConfig, user, agentQuery = 'agent=dpuAg
     return { req, res };
 }
 
-async function postInput({ appState, effectiveConfig, user, agentQuery = 'agent=dpuAgent', tabId, text }) {
+async function postInput({ appState, effectiveConfig, user, agentQuery = 'agent=dpuAgent', tabId, text, binding }) {
     const req = new EventEmitter();
     req.method = 'POST';
+    if (binding) req.edgeAuthContext = { webchatBinding: binding };
     req.headers = { host: 'localhost' };
     if (user) {
         req.user = user;
@@ -542,4 +544,86 @@ test('signed WebChat arguments carry runtimeScope only for principal-scoped runt
         tabId: 'tab-A', pageInstanceId: 'page-A', envelope,
     }));
     assert.equal(decodeJwtPayload(sharedPayload.invocation.token).rch, rch(baseArgs), 'shared scope signs the unchanged arguments');
+});
+
+test('WebChat input signs for the active launch and refuses a stale request or pooled TTY', async t => {
+    const { deriveAgentRequestSecret } = await import('../../cli/utils/security/masterKey.js');
+    const { verifyRouterRequestFromHeaders } = await import('../../Agent/lib/invocationAuth.mjs');
+    const { createMemoryReplayCache } = await import('../../Agent/lib/jwtVerify.mjs');
+    const container = 'dpu-agent-container';
+    const recordsFile = path.join(ploinkyDir, 'agents.json');
+    function publish(launchId) {
+        const records = JSON.parse(fs.readFileSync(recordsFile, 'utf8'));
+        records[container].launchId = launchId;
+        fs.writeFileSync(recordsFile, JSON.stringify(records));
+        const { selector } = applyEdgeRoutingGeneration({ workspaceRoot: tempDir, reason: 'webchat-launch' });
+        return { target: 'dpuAgent', generation: selector.generation, targetRoute: { routeKey: 'dpuAgent', container } };
+    }
+    const factory = createFakeFactory();
+    const appState = makeAppState();
+    t.after(() => cleanup(appState));
+    const args = {
+        effectiveConfig: { ...makeConfig(factory, 'principal'), forwardEnvelope: true },
+        appState, tabId: 'tab-A', sid: 'sid-A', user: USER_A, text: 'list my resources',
+    };
+    const binding = publish('initial');
+    assert.equal(openStream({ ...args, binding }).res.statusCode, 200);
+    assert.equal((await postInput({ ...args, binding })).statusCode, 204);
+
+    const replacement = publish('replacement');
+    const log = t.mock.method(console, 'error', () => {});
+    for (const selection of [binding, replacement]) {
+        const refused = await postInput({ ...args, binding: selection });
+        assert.equal(refused.statusCode, 503);
+        assert.match(refused.body, /Unable to authorize/);
+    }
+    assert.equal(log.mock.callCount(), 2);
+    assert.equal(factory.created[0].writes.length, 1);
+    assert.equal(openStream({ ...args, binding: replacement }).res.statusCode, 200);
+    assert.equal(factory.created[0].disposed, true);
+    assert.equal((await postInput({ ...args, binding: replacement })).statusCode, 204);
+    const message = JSON.parse(factory.created[1].writes[0]);
+    const agentId = 'agent:AssistOSExplorer/dpuAgent';
+    const surface = { method: 'POST', path: '/mcp', tool: '__webchat_message__' };
+    const verified = verifyRouterRequestFromHeaders({ authorization: `Bearer ${message.invocation.token}` }, {
+        ...surface,
+        env: { PLOINKY_AGENT_ID: agentId, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId), PLOINKY_LAUNCH_ID: 'replacement' },
+        replayCache: createMemoryReplayCache(),
+        rch: computeRchTool({ ...surface, arguments: {
+            surface: 'webchat', tabId: args.tabId, pageInstanceId: 'page-tab-A', text: args.text,
+            attachments: [], references: [], presentation: { visible: true }, runtimeScope: 'principal',
+        } }),
+    });
+    assert.equal(verified.ok, true, verified.reason);
+});
+
+test('a legacy WebChat TTY without a container is reused only in its opening generation', async t => {
+    const routeKey = 'sharedAgent';
+    const routingFile = path.join(ploinkyDir, 'routing.json');
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    delete routing.routes[routeKey].container;
+    function publish() {
+        fs.writeFileSync(routingFile, JSON.stringify(routing));
+        const { selector } = applyEdgeRoutingGeneration({ workspaceRoot: tempDir, reason: 'legacy-webchat' });
+        return { target: routeKey, generation: selector.generation, targetRoute: { routeKey, container: '' } };
+    }
+    const factory = createFakeFactory();
+    const appState = makeAppState();
+    t.after(() => cleanup(appState));
+    const args = {
+        effectiveConfig: { agentName: routeKey, ttyFactory: factory, forwardEnvelope: true },
+        appState, agentQuery: 'agent=sharedAgent', tabId: 'tab', sid: 'sid', user: USER_A, text: 'hello',
+    };
+    const first = publish();
+    assert.equal(openStream({ ...args, binding: first }).res.statusCode, 200);
+    assert.equal((await postInput({ ...args, binding: first })).statusCode, 204);
+    routing.routes[routeKey].hostPort += 1;
+    const replacement = publish();
+    assert.notEqual(replacement.generation, first.generation);
+    assert.equal((await postInput({ ...args, binding: replacement })).statusCode, 503);
+    assert.equal(factory.created[0].writes.length, 1);
+    assert.equal(openStream({ ...args, binding: replacement }).res.statusCode, 200);
+    assert.equal(factory.created[0].disposed, true);
+    assert.equal((await postInput({ ...args, binding: replacement })).statusCode, 204);
+    assert.ok(JSON.parse(factory.created[1].writes[0]).invocation.token);
 });

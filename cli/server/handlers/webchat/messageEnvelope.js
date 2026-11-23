@@ -1,4 +1,6 @@
 import { buildInvocationContextForProviderCall } from '../../mcp-proxy/index.js';
+import { resolveRouteTargetRecord } from '../../mcp-proxy/invocationMinter.js';
+import { loadActiveRoutingState } from '../../routingState.js';
 
 export function normalizeWebchatPresentation(raw) {
     return { visible: raw?.visible !== false };
@@ -87,20 +89,31 @@ export function buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanc
     return args;
 }
 
-function buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope }) {
+export function resolveWebchatInvocationTarget(req, effectiveConfig) {
+    const binding = req?.edgeAuthContext?.webchatBinding;
+    if (!binding) return undefined;
+    const { target, targetRoute, generation } = binding;
+    const { snapshot } = loadActiveRoutingState();
+    if (target !== effectiveConfig.agentName || targetRoute?.routeKey !== target
+        || generation !== snapshot.generation) {
+        throw new Error('WebChat target binding changed');
+    }
+    const targetRecord = resolveRouteTargetRecord({ routeKey: target, route: targetRoute, generation, snapshot });
+    return { snapshot, targetRecord, container: targetRoute.container };
+}
+
+function buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope, target }) {
     const agentName = String(effectiveConfig?.agentName || '').trim();
     if (!agentName) return '';
-    try {
-        const invocation = buildInvocationContextForProviderCall({
-            req,
-            agentName,
-            toolName: '__webchat_message__',
-            toolArgs: buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanceId, envelope })
-        });
-        return invocation?.token || '';
-    } catch (_) {
-        return '';
-    }
+    const invocation = buildInvocationContextForProviderCall({
+        req,
+        agentName,
+        snapshot: target?.snapshot,
+        targetRecord: target?.targetRecord,
+        toolName: '__webchat_message__',
+        toolArgs: buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanceId, envelope })
+    });
+    return invocation?.token || '';
 }
 
 function firstHeaderValue(value) {
@@ -124,7 +137,10 @@ export function resolveRequestPublicOrigin(req) {
     }
 }
 
-export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, pageInstanceId = '', envelope, fallbackText = '' }) {
+export function serializeWebchatEnvelopeForAgent({
+    req, effectiveConfig, tabId, pageInstanceId = '', envelope, fallbackText = '',
+    target = resolveWebchatInvocationTarget(req, effectiveConfig),
+}) {
     const sanitizedReferences = sanitizeWebchatReferencesForEnvelope(envelope?.references);
     const publicBaseUrl = resolveRequestPublicOrigin(req);
     const payload = {
@@ -138,7 +154,7 @@ export function serializeWebchatEnvelopeForAgent({ req, effectiveConfig, tabId, 
     };
     if (publicBaseUrl) payload.origin = { publicBaseUrl };
     if (sanitizedReferences.length) payload.references = sanitizedReferences;
-    const token = buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope: payload });
+    const token = buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope: payload, target });
     if (token) payload.invocation = { token };
     return JSON.stringify(payload);
 }

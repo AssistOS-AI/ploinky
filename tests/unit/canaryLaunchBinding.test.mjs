@@ -32,11 +32,12 @@ test.after(() => {
     fs.rmSync(workspace, { recursive: true, force: true });
 });
 
-const { buildRouterRequest } = await import('../../cli/server/mcp-proxy/invocationMinter.js');
+const { buildRouterRequest, resolveRouteTargetRecord } = await import('../../cli/server/mcp-proxy/invocationMinter.js');
 const { buildInvocationContextForProviderCall } = await import('../../cli/server/mcp-proxy/index.js');
+const { serializeWebchatEnvelopeForAgent } = await import('../../cli/server/handlers/webchat/messageEnvelope.js');
 const { verifyAndMintAgentOpenAiCall } = await import('../../cli/server/agentOpenAiDelegation.js');
 const { HttpShareAuthorizer } = await import('../../cli/server/policy/HttpShareAuthorizer.js');
-const { applyEdgeRoutingGeneration } = await import('../../cli/sandbox/edgeGeneration.js');
+const { applyEdgeRoutingGeneration, captureEdgeRoutingLease, __testables: generationCache } = await import('../../cli/sandbox/edgeGeneration.js');
 const { loadActiveRoutingState } = await import('../../cli/server/routingState.js');
 const { buildHttpRouteAuthInfoHeader } = await import('../../cli/server/routerHandlers.js');
 const { buildAgentLaunchEnv, stripReservedAgentEnv, verifyRegisteredLaunchId } = await import('../../cli/utils/security/agentIdentityEnv.js');
@@ -171,19 +172,69 @@ test('both MCP invocation branches bind their token to the routed container', ()
         assert.equal(result.payload.sub, req.user ? 'user:reader' : callerId);
         assert.match(verify(token, 'alternate').reason, /launch ID mismatch/);
     }
-    const binding = {
-        target: 'service', generation: loadActiveRoutingState().generation, targetRoute: { container: route.container },
-    };
-    const mintBoundInput = () => buildInvocationContextForProviderCall({
-        req: { user, edgeAuthContext: { webchatBinding: binding } },
-        agentName: 'service', toolName: surface.tool, toolArgs: {},
-    });
-    // The request binding says nothing about the launch of an existing TTY.
-    assert.throws(mintBoundInput, /selected target record required/);
     activateRoute(7400, 'replacement');
     assert.throws(() => mint({ user }), /selected route generation changed/);
-    binding.generation = loadActiveRoutingState().generation;
-    assert.throws(mintBoundInput, /selected target record required/);
+});
+
+test('a route lease still signs for its container after the generation cache is cleared', () => {
+    activateRoute(7400);
+    const lease = captureEdgeRoutingLease();
+    const route = lease.snapshot.routing.routes.service;
+    generationCache.resetActiveGenerationCache();
+    const reloaded = loadActiveRoutingState();
+    assert.equal(reloaded.generation, lease.id);
+    assert.notEqual(reloaded.routing.routes.service, route);
+    const mint = () => buildInvocationContextForProviderCall({
+        req: { user }, agentName: 'service', toolName: surface.tool, toolArgs: {},
+        targetRecord: resolveRouteTargetRecord({
+            routeKey: 'service', route, generation: lease.id, snapshot: reloaded.snapshot,
+        }),
+    });
+    const { token } = mint();
+    assert.equal(verify(token, 'selected').ok, true);
+    assert.match(verify(token, 'alternate').reason, /launch ID mismatch/);
+    const replacement = activateRoute(7400, 'replacement');
+    assert.equal(replacement.container, route.container);
+    assert.notEqual(loadActiveRoutingState().generation, lease.id);
+    assert.throws(mint, /selected route generation changed/);
+});
+
+test('WebChat signs an envelope for the authorized container among copies sharing its principal', () => {
+    const route = activateRoute(7400);
+    const binding = {
+        target: 'service', generation: loadActiveRoutingState().generation,
+        targetRoute: { routeKey: 'service', container: route.container },
+    };
+    const serialize = webchatBinding => serializeWebchatEnvelopeForAgent({
+        req: { user, edgeAuthContext: { webchatBinding } },
+        effectiveConfig: { agentName: 'service' }, tabId: 'tab', pageInstanceId: 'page',
+        envelope: { text: 'hello' },
+    });
+    const { invocation } = JSON.parse(serialize(binding));
+    assert.ok(invocation?.token, 'WebChat must forward the signed invocation');
+    const operation = { method: 'POST', path: '/mcp', tool: '__webchat_message__' };
+    const rch = computeRchTool({ ...operation, arguments: {
+        surface: 'webchat', tabId: 'tab', pageInstanceId: 'page', text: 'hello',
+        attachments: [], references: [], presentation: { visible: true },
+    } });
+    const receive = launchId => verifyRouterRequestFromHeaders({ authorization: `Bearer ${invocation.token}` }, {
+        ...operation, rch, env: { ...receiver, PLOINKY_LAUNCH_ID: launchId }, replayCache: createMemoryReplayCache(),
+    });
+    const accepted = receive('selected');
+    assert.equal(accepted.ok, true, accepted.reason);
+    assert.equal(accepted.payload.launchId, 'selected');
+    assert.equal(accepted.payload.sub, 'user:reader');
+    assert.match(receive('alternate').reason, /launch ID mismatch/);
+    for (const targetRoute of [
+        { routeKey: 'other', container: route.container },
+        { routeKey: 'service', container: 'alternate' },
+        { routeKey: 'service' },
+    ]) {
+        assert.throws(() => serialize({ ...binding, targetRoute }), /binding changed|selected route generation changed/);
+    }
+    activateRoute(7400, 'replacement');
+    assert.match(receive('replacement').reason, /launch ID mismatch/);
+    assert.throws(() => serialize(binding), /binding changed|selected route generation changed/);
 });
 
 test('delegated OpenAI signs for the current route and refuses a superseded route', () => {

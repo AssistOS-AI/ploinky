@@ -66,8 +66,8 @@ test('canary queue startup, enqueue and recovery leave the old pending task unto
     assert.deepEqual(recovered.map(task => [task.id, task.status]), [[id, 'failed']]);
 });
 
-test('ordinary and partially configured queues keep their existing filename and task IDs', () => {
-    for (const env of [{}, { PLOINKY_CANARY: '1' }, { PLOINKY_CANARY_ROLLOUT: 'r1' }]) {
+test('ordinary queues keep their existing filename and task IDs', () => {
+    for (const env of [{}, { PLOINKY_CANARY_ROLLOUT: 'r1' }]) {
         const queue = TaskQueue.forAgent(options, { HOME: '/agent/home', ...env });
         assert.equal(queue.storagePath, '/agent/home/.tasksQueue');
         const id = queue.generateId();
@@ -76,12 +76,24 @@ test('ordinary and partially configured queues keep their existing filename and 
     }
 });
 
-test('rejects malformed markers and rollout IDs that cannot be used as a filename component', () => {
+test('canary queue requires a valid rollout ID before startup', () => {
+    for (const rolloutId of [undefined, '', ' ', '../other', '.r1', '-r1', '_r1', 'r1\n', 'a'.repeat(129)]) {
+        const env = { PLOINKY_CANARY: '1', PLOINKY_CANARY_ROLLOUT: rolloutId };
+        assert.throws(() => TaskQueue.forAgent(options, env), /Invalid PLOINKY_CANARY_ROLLOUT/);
+    }
+    for (const rolloutId of ['1', 'A.b_c-9'.padEnd(128, 'x')]) {
+        const queue = TaskQueue.forAgent(options, {
+            HOME: '/agent/home', PLOINKY_CANARY: '1', PLOINKY_CANARY_ROLLOUT: rolloutId,
+        });
+        assert.equal(queue.storagePath, `/agent/home/.tasksQueue.canary.${rolloutId}`);
+        assert.equal(parseCanaryTaskId(queue.generateId()), rolloutId);
+    }
+});
+
+test('rejects malformed canary task ID markers', () => {
     for (const id of [null, 'canary..1111222233334444', 'canary.r1.short',
-        'canary.r1.1111222233334444.extra', 'canary.a/b.1111222233334444']) {
+        'canary.r1.1111222233334444.extra', 'canary.a/b.1111222233334444',
+        'canary.-r1.1111222233334444', `canary.${'a'.repeat(129)}.1111222233334444`]) {
         assert.equal(parseCanaryTaskId(id), null);
     }
-    assert.throws(() => TaskQueue.forAgent(options, {
-        PLOINKY_CANARY: '1', PLOINKY_CANARY_ROLLOUT: '../other',
-    }), /Invalid PLOINKY_CANARY_ROLLOUT/);
 });
