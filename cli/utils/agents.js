@@ -1,3 +1,4 @@
+import { reconcileCanaries } from '../sandbox/canary/teardown.mjs';
 import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 import path from 'path';
@@ -1665,16 +1666,76 @@ export async function disableAgent(agentRef, dependencies = {}) {
     ));
 }
 
-function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, dependencies) {
+function resolveDisableMatches(map, { input, hasNamespace, targetRepo, targetAgent }) {
+    const directRecord = (map && map[input] && map[input].type === 'agent' && !isCanaryRecord(map[input])) ? map[input] : null;
+    const entries = Object.entries(map || {})
+        .filter(([key, value]) => key !== '_config' && value && typeof value === 'object')
+        .filter(([, value]) => value.type === 'agent' && !isCanaryRecord(value));
+
+    const aliasEntry = (!directRecord)
+        ? entries.find(([, value]) => {
+            if (!value || !value.alias) return false;
+            if (value.alias === input) return true;
+            if (hasNamespace) {
+                return value.repoName === targetRepo && value.alias === targetAgent;
+            }
+            return false;
+        })
+        : null;
+
+    let matches;
+    if (directRecord) {
+        matches = [[input, directRecord]];
+    } else if (aliasEntry) {
+        matches = [[aliasEntry[0], aliasEntry[1]]];
+    } else {
+        matches = entries.filter(([, value]) => {
+            const repoName = String(value.repoName || '').trim();
+            const agentName = String(value.agentName || '').trim();
+            if (!agentName) return false;
+            if (hasNamespace) {
+                return agentName === targetAgent && repoName === targetRepo;
+            }
+            return agentName === targetAgent;
+        });
+    }
+
+    return { matches, directRecord };
+}
+
+async function reconcileDisableTargets(map, targets, dependencies) {
+    const reconcile = dependencies.reconcileCanariesImpl || reconcileCanaries;
+    let changed = false;
+    for (const primaryContainer of targets) {
+        const record = map[primaryContainer];
+        if (record?.type !== 'agent' || isCanaryRecord(record)) continue;
+        const ended = await reconcile({
+            reason: 'disable',
+            workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+            routeKey: routeKeyForEnabledRecord(record),
+            primaryContainer,
+        });
+        if (ended.length) changed = true;
+    }
+    // Teardown published a registry without the secondaries. Stage disable
+    // from that publication, or its write would restore their old records.
+    return changed ? (dependencies.loadAgentsImpl || loadAgents)() : map;
+}
+
+async function disableAgentLocked(selection, dependencies) {
+    const { input, hasNamespace, targetRepo, targetAgent } = selection;
     const loadAgentsImpl = dependencies.loadAgentsImpl || loadAgents;
     const applyGeneration = dependencies.applyGeneration || applyEdgeRoutingGeneration;
     const inactivateGeneration = dependencies.inactivateGeneration || inactivateEdgeRoutingGeneration;
     const abortPreparation = dependencies.abortPreparation || abortEdgeRoutingPreparation;
     const snapshotSources = dependencies.snapshotSourcesImpl || snapshotDisableSources;
-    const map = loadAgentsImpl();
+    const initial = loadAgentsImpl();
+    let { matches, directRecord } = resolveDisableMatches(initial, selection);
+    const targets = matches.length === 1 ? [matches[0][0]] : [];
+    const map = await reconcileDisableTargets(initial, targets, dependencies);
+    if (map !== initial) ({ matches, directRecord } = resolveDisableMatches(map, selection));
     const config = (map && typeof map._config === 'object') ? map._config : null;
     const staticRegistration = configuredStaticRegistration(map, config, dependencies.readRoutingImpl);
-    const directRecord = (map && map[input] && map[input].type === 'agent' && !isCanaryRecord(map[input])) ? map[input] : null;
 
     const clearStaticConfig = ({ repoName, shortName, containerName, rawInput }) => {
         if (!config || !config.static) return false;
@@ -1705,38 +1766,6 @@ function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, de
         }
         return true;
     };
-
-    const entries = Object.entries(map || {})
-        .filter(([key, value]) => key !== '_config' && value && typeof value === 'object')
-        .filter(([, value]) => value.type === 'agent' && !isCanaryRecord(value));
-
-    const aliasEntry = (!directRecord)
-        ? entries.find(([, value]) => {
-            if (!value || !value.alias) return false;
-            if (value.alias === input) return true;
-            if (hasNamespace) {
-                return value.alias === targetAgent;
-            }
-            return false;
-        })
-        : null;
-
-    let matches;
-    if (directRecord) {
-        matches = [[input, directRecord]];
-    } else if (aliasEntry) {
-        matches = [[aliasEntry[0], aliasEntry[1]]];
-    } else {
-        matches = entries.filter(([, value]) => {
-            const repoName = String(value.repoName || '').trim();
-            const agentName = String(value.agentName || '').trim();
-            if (!agentName) return false;
-            if (hasNamespace) {
-                return agentName === targetAgent && repoName === targetRepo;
-            }
-            return agentName === targetAgent;
-        });
-    }
 
     if (!matches.length) {
         const staticContainer = String(config?.static?.container || '').trim();
@@ -1900,12 +1929,12 @@ export async function disableAgentContainers(containerNames = [], dependencies =
     ));
 }
 
-function disableAgentContainersLocked(targets, dependencies) {
+async function disableAgentContainersLocked(targets, dependencies) {
     const loadAgentsImpl = dependencies.loadAgentsImpl || loadAgents;
     const applyGeneration = dependencies.applyGeneration || applyEdgeRoutingGeneration;
     const inactivateGeneration = dependencies.inactivateGeneration || inactivateEdgeRoutingGeneration;
     const abortPreparation = dependencies.abortPreparation || abortEdgeRoutingPreparation;
-    const map = loadAgentsImpl();
+    const map = await reconcileDisableTargets(loadAgentsImpl(), targets, dependencies);
     const config = (map && typeof map._config === 'object') ? map._config : null;
     const staticRegistration = configuredStaticRegistration(map, config, dependencies.readRoutingImpl);
     const disabled = [];

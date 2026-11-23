@@ -48,7 +48,7 @@ import { acquireSettledWorkspaceMutationLease, inspectLiveNoWaitWorkers } from '
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
-import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile, setActiveProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
@@ -2935,6 +2935,8 @@ export function printStartResultSummary(result, { log = console.log } = {}) {
 async function startWorkspace(staticAgentArg, portArg, {
   killRouterIfRunning,
   branchPolicy,
+  profile,
+  withCanariesReconciled,
 } = {}) {
   // Acquire every declared dependency source before resolving the complete
   // graph. A fresh workspace cannot admit repositories that do not exist yet.
@@ -2948,18 +2950,26 @@ async function startWorkspace(staticAgentArg, portArg, {
   if (!requestedStaticAgent) {
     throw new Error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
   }
-  try {
-    prepareDefaultBootRepositories({
-      branchPolicy,
-      staticAgent: requestedStaticAgent,
-    });
-    await prepareManifestRepositories(requestedStaticAgent, {
-      branchPolicy,
-      profile: getActiveProfile(),
-    });
-  } catch (err) {
-    throw new Error(`Failed to prepare manifest repositories for '${requestedStaticAgent}': ${err?.message || err}`);
-  }
+  const prepareSources = async () => {
+    if (profile) {
+      const result = setActiveProfile(profile);
+      if (!result.success) throw new Error(result.message);
+    }
+    try {
+      prepareDefaultBootRepositories({
+        branchPolicy,
+        staticAgent: requestedStaticAgent,
+      });
+      await prepareManifestRepositories(requestedStaticAgent, {
+        branchPolicy,
+        profile: getActiveProfile(),
+      });
+    } catch (err) {
+      throw new Error(`Failed to prepare manifest repositories for '${requestedStaticAgent}': ${err?.message || err}`);
+    }
+  };
+  if (withCanariesReconciled) await withCanariesReconciled(prepareSources);
+  else await prepareSources();
   const admittedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
   // The workspace mutation lease covers source initialization, candidate
   // writes, both inactive prelaunch preparations, and every subsequent start.
@@ -2980,6 +2990,8 @@ async function startWorkspace(staticAgentArg, portArg, {
   // network-lock grace, never a live owner.
   return await runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
+  // A rollout may have started while this start waited for no-wait workers.
+  await withCanariesReconciled?.();
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
   // No earlier no-wait worker still alive here can change anything while this
   // start holds the workspace lease and network lock, and none has published.
