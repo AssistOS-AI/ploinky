@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../../sandbox/canaryRecord.mjs';
 import { execFile as execFileDefault, spawn as spawnDefault } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
@@ -87,7 +88,7 @@ export function normalizeAgentExecRequest(input, limits = AGENT_EXEC_LIMITS) {
 export function selectAgentExecTarget(snapshot, target, caller) {
     const [repoName, agentName] = target.split('/');
     const matches = Object.entries(snapshot?.agents || {})
-        .filter(([, record]) => record?.type === 'agent' && record.repoName === repoName && record.agentName === agentName && !record.alias);
+        .filter(([, record]) => record?.type === 'agent' && !isCanaryRecord(record) && record.repoName === repoName && record.agentName === agentName && !record.alias);
     if (matches.length !== 1) throw agentExecError(404, 'AGENT_EXEC_TARGET_UNKNOWN', `agent ${target} is not enabled`);
     const [containerName, record] = matches[0];
     if (record.runMode !== 'global') {

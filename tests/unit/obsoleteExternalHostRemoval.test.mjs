@@ -33,11 +33,11 @@ const REMOVED_FILES = [
 
 const SEARCH_ROOTS = ['cli', 'ploinky-box', 'tests/unit', 'README.md'];
 
-// sha256 at 7ff252cb, except the reviewed authentication event wiring below.
+// SHA-256 at 7ff252cb, with the reviewed authentication changes below.
 const BASE_FILES = {
-    // 8c0eec56 adds only the authenticated-request event import and publication;
-    // the removed admission logic has not returned. Keep the exact-file guard.
-    'cli/server/authHandlers/authContext.js': '3304ae9c746b1cec40c3525e9c69b877db4b62fef262496f6182406241877850',
+    // Includes the authenticated-request event wiring and the S1 primary-only
+    // auth-owner lookup. Keep the exact-file guard for the reviewed source.
+    'cli/server/authHandlers/authContext.js': '06c39cb62b87eb43d5f9eacfc604a3fd23cc8e673ccd6b6dd18f2ee1c1c5bb9e',
     'ploinky-box/cloudflared/runtime.mjs': 'bb50780910dfe09c237f1930eb034947752adc1bb701d6fd5126a5945f886a2a',
     'ploinky-box/cloudflared/status.mjs': '34e5055dddf9073890e5643ada17176295014225b5a9d183439f4cb94636b2a0',
     'ploinky-box/cloudflared/journal.mjs': '4969c853c230668265cc05f7276d95e3ee677ae2e77de969881295de7622799a',

@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 import { publishAuthenticatedRequestDecision } from '../auth/authenticatedRequestEvents.mjs';
 import path from 'path';
@@ -70,7 +71,7 @@ function resolveEnabledAgentRecordFromSnapshot(agentRef, snapshot) {
     const repoName = namespaced ? parts[0] : String(route?.repo || '').trim();
     const agentName = namespaced ? parts[1] : String(route?.agent || input).trim();
     const matches = Object.entries(agents).filter(([, record]) => (
-        record?.type === 'agent'
+        !isCanaryRecord(record) && record?.type === 'agent'
         && (
             String(record.alias || '') === input
             || (repoName && agentName

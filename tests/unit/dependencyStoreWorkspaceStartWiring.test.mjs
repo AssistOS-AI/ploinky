@@ -10,6 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
+import { isCanaryRecord } from '../../cli/sandbox/canaryRecord.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -42,7 +43,7 @@ import {
 // An identifier the test does not supply is undefined in the sandbox and
 // fails the run with a ReferenceError, so no collaborator is silently skipped.
 function sandbox(collaborators) {
-    return vm.runInNewContext(`(${startWorkspace.toString()})`, { ...collaborators });
+    return vm.runInNewContext(`(${startWorkspace.toString()})`, { isCanaryRecord, ...collaborators });
 }
 
 function startFixture(t) {

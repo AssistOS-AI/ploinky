@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import {
   TARGETED_DRAIN_ACKNOWLEDGEMENT,
   cleanupExactAgentRuntimeCandidate,
@@ -56,6 +57,7 @@ export function parseTargetedRestartArguments(options = []) {
 }
 
 function exactRuntimeIdentity(record) {
+  if (isCanaryRecord(record)) throw new Error('A canary runtime cannot be targeted for restart.');
   const instanceId = text(record?.instanceId);
   const enableGeneration = text(record?.enableGeneration);
   if (record?.type !== 'agent' || !instanceId || !enableGeneration) {
@@ -65,7 +67,7 @@ function exactRuntimeIdentity(record) {
 }
 
 function sameRuntimeIdentity(record, expected) {
-  return record?.type === 'agent'
+  return record?.type === 'agent' && !isCanaryRecord(record)
     && text(record.instanceId) === expected.instanceId
     && text(record.enableGeneration) === expected.enableGeneration;
 }

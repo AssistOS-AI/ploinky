@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { isCanaryRecord } from '../canaryRecord.mjs';
 import { spawnSync } from 'node:child_process';
 import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
 import { resolveManifestRuntimeProfile } from '../../utils/runtime/profileService.js';
@@ -13,6 +14,7 @@ import { readAppliedObservation } from './runtimeState.mjs';
 import {
     assertKnownMpsClients, inspectMpsClient, inspectMpsClientPresence, resolveMpsClientAlias,
     createdMpsCandidates, settleCreatedMpsCandidate, mpsCandidateRecord, sameMpsTuple, mpsOwnerState, releaseMpsLaunchOwner,
+    assertMpsJournalExcludesCanaries,
 } from './mpsInventory.mjs';
 import { createMpsStateStore, createMpsDaemonBackend, isMpsClientAlias, sameMpsServerDefault } from './mps.mjs';
 import { retireExactAgentRuntimePredecessor } from '../docker/agentServiceManager.js';
@@ -49,6 +51,7 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     const members = new Map(nodes.map((entry) => [entry.key, entry]));
     let saved;
     try { saved = store.read(); } catch (_) { throw new MpsError('The private MPS state cannot be read safely', 'mps_backend_unavailable'); }
+    assertMpsJournalExcludesCanaries(saved, registry);
     const networkOf = (key, ref) => {
         const member = members.get(key);
         return member ? resolveManifestRuntimeProfile(member.node.manifest, { agentName: ref, profileName: registry[key]?.profile || undefined }).network : null;
@@ -71,7 +74,7 @@ async function prepareMpsGraphImpl({ nodes, networkLifecycleCapability, deadline
     });
     const clients = new Map((saved?.oldClients || []).map((client) => [tuple(client), client]));
     for (const [key, record] of Object.entries(registry)) {
-        if (record?.type !== 'agent' || !record.containerId) continue;
+        if (record?.type !== 'agent' || isCanaryRecord(record) || !record.containerId) continue;
         const applied = readApplied(key, record.containerId);
         if (!applied?.mpsGeneration || applied.instanceId !== record.instanceId || applied.enableGeneration !== record.enableGeneration) continue;
         const client = { key, alias: record.alias || '', ref: `${record.repoName}/${record.agentName}`, instanceId: record.instanceId,
@@ -206,6 +209,7 @@ export async function prepareMpsGraph(input, dependencies = {}) {
         const refusals = [];
         for (const { key, node } of input.nodes) {
             const record = registry[key];
+            if (isCanaryRecord(record)) continue;
             const ref = record ? `${record.repoName}/${record.agentName}` : node.agentRef;
             const configured = context.overrides?.get(ref)?.gpu;
             const applied = record?.containerId ? readApplied(key, record.containerId) : null;

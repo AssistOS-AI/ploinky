@@ -1,3 +1,4 @@
+import { isCanaryRecord } from './canaryRecord.mjs';
 import { getBwrapPid, isBwrapProcessRunning, registeredRuntimeTuple } from './bwrap/bwrapFleet.js';
 import { collectLiveAgentContainers, collectLiveAgentContainersAsync, getAgentsRegistry } from './docker/containerRegistry.js';
 import { loadActiveEdgeRoutingGeneration } from './edgeGeneration.js';
@@ -140,6 +141,10 @@ function collectAgentRuntimeStates(options = {}) {
     const states = [];
 
     for (const [containerName, record] of Object.entries(registry)) {
+        if (isCanaryRecord(record)) {
+            matchedContainers.add(containerName);
+            continue;
+        }
         if (!record || record.type !== 'agent') continue;
         const liveEntry = containersByName.get(containerName) || null;
         const runtime = normalizeRuntime(record);

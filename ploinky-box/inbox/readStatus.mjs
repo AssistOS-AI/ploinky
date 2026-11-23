@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isCanaryRecord } from '../../cli/sandbox/canaryRecord.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -88,7 +89,7 @@ export function readInboxStatus({
     const agents = readJson(path.join(ploinkyRoot, 'agents.json'), fsApi, warnings) || {};
     const cloudflarePublication = readCloudflarePublicationStatus(ploinkyRoot, fsApi, warnings);
     const tracked = Object.entries(agents).filter(([, record]) => (
-        record && ['agent', 'agentCore'].includes(record.type)
+        record && !isCanaryRecord(record) && ['agent', 'agentCore'].includes(record.type)
     ));
     let runningAgents = 0;
     for (const [recordedName, record] of tracked) {

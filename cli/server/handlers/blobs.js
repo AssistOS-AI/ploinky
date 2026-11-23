@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -77,7 +78,7 @@ function selectAgentRecord(agentSegment, { agentMap } = {}) {
     const entries = Object.entries(map)
         .filter(([key]) => key !== '_config')
         .map(([, rec]) => rec)
-        .filter(rec => rec && rec.type === 'agent' && rec.agentName && rec.projectPath);
+        .filter(rec => rec && rec.type === 'agent' && !isCanaryRecord(rec) && rec.agentName && rec.projectPath);
 
     const matches = entries.filter(rec => {
         if (repoFilter && String(rec.repoName || '') !== repoFilter) return false;

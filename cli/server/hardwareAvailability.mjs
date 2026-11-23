@@ -143,6 +143,11 @@ export function routeHardwareAvailability(snapshot, routeKey) {
 // A caller identity (private relay, agent-to-agent) is unavailable when any
 // compiled entry names its exact instance or generation, or its route key.
 export function identityHardwareUnavailable(snapshot, identity) {
+    const route = snapshot?.routing?.routes?.[identity?.routeKey];
+    if (route?.canary && identity.containerName) {
+        if (identity.containerName === route.canary.container) return canaryRecordHardwareAvailability(snapshot, identity.containerName);
+        return routeHardwareAvailability(snapshot, identity.routeKey);
+    }
     const compiled = snapshot?.compiled?.hardwareAvailability;
     if (!compiled || typeof compiled !== 'object' || !identity) return null;
     if (identity.routeKey && Object.prototype.hasOwnProperty.call(compiled, identity.routeKey)) {
@@ -158,12 +163,24 @@ export function identityHardwareUnavailable(snapshot, identity) {
     return null;
 }
 
+function isCanaryOwner(snapshot, routeKey, containerName) {
+    return Boolean(containerName) && snapshot?.routing?.routes?.[routeKey]?.canary?.container === containerName;
+}
+
+function canaryRecordHardwareAvailability(snapshot, containerName) {
+    const projection = snapshot.agents[containerName].hardwareAvailability;
+    return projection ? compileAvailabilityProjection(projection) : null;
+}
+
 // The effective denial of a route for a captured lease: the compiled parent
 // projection first, else the durable store's denial for that route (M-NW-01).
 // The store contributes only validated `active` evidence and gated committed
 // entries, and only for a target-less route, so a route with a target never
 // carries one.
-export function leaseRouteHardwareAvailability(lease, routeKey) {
+export function leaseRouteHardwareAvailability(lease, routeKey, containerName) {
+    if (isCanaryOwner(lease?.snapshot, routeKey, containerName)) {
+        return canaryRecordHardwareAvailability(lease.snapshot, containerName);
+    }
     const parent = routeHardwareAvailability(lease?.snapshot, routeKey);
     if (parent) return parent;
     const denials = lease?.effective?.denials;
@@ -174,6 +191,9 @@ export function leaseRouteHardwareAvailability(lease, routeKey) {
 // A caller identity is also unavailable when a store-derived denial names its
 // exact instance or generation, or its route key.
 export function identityLeaseHardwareUnavailable(lease, identity) {
+    if (identity?.containerName && lease?.snapshot?.routing?.routes?.[identity.routeKey]?.canary) {
+        return leaseRouteHardwareAvailability(lease, identity.routeKey, identity.containerName);
+    }
     const parent = identityHardwareUnavailable(lease?.snapshot, identity);
     if (parent) return parent;
     const denials = lease?.effective?.denials;

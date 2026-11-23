@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 import path from 'path';
 import { PLOINKY_DIR } from './config.js';
@@ -62,7 +63,7 @@ export function saveAgents(map, {
 }
 
 export function listAgents() {
-    return Object.values(loadAgents());
+    return Object.values(loadAgents()).filter((record) => !isCanaryRecord(record));
 }
 
 export function getAgentRecord(containerName) {

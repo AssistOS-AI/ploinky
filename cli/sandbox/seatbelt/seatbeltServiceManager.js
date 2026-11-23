@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../canaryRecord.mjs';
 import { manifestHomeDirectory } from '../docker/agentHomeLayout.js';
 import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
 import { spawn, spawnSync } from 'child_process';
@@ -321,7 +322,7 @@ function liveSeatbeltSourceConsumers(linkPath, { excludeContainer = '', loadAgen
     const sourceDir = path.dirname(linkPath);
     const live = [];
     for (const [name, record] of Object.entries(loadAgents() || {})) {
-        if (name === excludeContainer || record?.runtime !== 'seatbelt') continue;
+        if (name === excludeContainer || isCanaryRecord(record) || record?.runtime !== 'seatbelt') continue;
         const usesSource = (record.config?.binds || []).some((bind) => path.resolve(String(bind?.source || '/')) === sourceDir);
         if (!usesSource) continue;
         if (isRunning(name, { instanceId: record.instanceId, enableGeneration: record.enableGeneration })) live.push(name);

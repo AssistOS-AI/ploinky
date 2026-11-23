@@ -1,5 +1,6 @@
 // Update-only Git resolution. This module reads effective install inputs and
 // updates pin metadata; it never probes an image, prepares an object or runs npm.
+import { isCanaryRecord } from '../../../sandbox/canaryRecord.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -96,7 +97,7 @@ export async function refreshUpdateGitPins({
         const names = repositoryNames === null ? null : new Set(repositoryNames.map(String));
         const selected = [];
         for (const [registration, record] of Object.entries(registry || {})) {
-            if (registration === '_config' || record?.type !== 'agent') continue;
+            if (registration === '_config' || isCanaryRecord(record) || record?.type !== 'agent') continue;
             if (!record.repoName || !record.agentName) {
                 records.push(recordFor(registration, 'uncertain', 'git-pin-registration-invalid', 'enabled registration has no exact repository/agent identity'));
                 continue;

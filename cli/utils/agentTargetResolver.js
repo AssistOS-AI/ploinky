@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import { parseQualifiedAgentReference, resolveEnabledAgentRecordFromMap } from './agentRegistryResolver.js';
 
 /**
@@ -74,7 +75,7 @@ function resolveQualified(agentRef, { repoName, agentName }, routes, agents) {
         const [routeKey, route] = candidates.find(([key]) => key === agentName) || candidates[0];
         return makeTarget(repoName, agentName, routeKey, route.hostPath);
     }
-    const enabled = Object.values(agents).some((record) => isObject(record)
+    const enabled = Object.values(agents).some((record) => isObject(record) && !isCanaryRecord(record)
         && record.type === 'agent'
         && text(record.repoName) === repoName
         && text(record.agentName) === agentName);

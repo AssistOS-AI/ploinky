@@ -679,7 +679,7 @@ function destroyAllPloinky({ fast = false } = {}) {
     return stopAndRemoveMany(names, { fast }).length;
 }
 
-function destroyWorkspaceContainers({ fast = false } = {}) {
+function destroyWorkspaceContainers({ fast = false } = {}, { removeMany = stopAndRemoveMany } = {}) {
     const agents = loadAgentsMap();
     const names = [];
     for (const [name, rec] of Object.entries(agents || {})) {
@@ -689,7 +689,7 @@ function destroyWorkspaceContainers({ fast = false } = {}) {
         }
     }
     // stopAndRemoveMany now handles bwrap agents internally
-    return stopAndRemoveMany(names, { fast });
+    return removeMany(names, { fast });
 }
 
 const SESSION = new Set();

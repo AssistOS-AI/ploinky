@@ -17,6 +17,7 @@
 // wired only with a marker that says the grant is stale, so the rest of the
 // workspace keeps running and only GPU-requesting agents fail admission.
 
+import { isCanaryRecord } from '../cli/sandbox/canaryRecord.mjs';
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -758,7 +759,7 @@ export function enabledCdiRequestingAgents(workspaceRoot, {
     const routes = routing?.routes && typeof routing.routes === 'object' ? Object.values(routing.routes) : [];
     const requesting = new Set();
     for (const record of Object.values(registry)) {
-        if (record?.type !== 'agent') continue;
+        if (record?.type !== 'agent' || isCanaryRecord(record)) continue;
         const repo = String(record.repoName || '');
         const agent = String(record.agentName || '');
         if (!WORKSPACE_NAME.test(repo) || !WORKSPACE_NAME.test(agent)) continue;

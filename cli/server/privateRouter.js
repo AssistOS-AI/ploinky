@@ -10,12 +10,12 @@ import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.m
 import { parseRouterOriginList } from '../../Agent/lib/routerOrigins.mjs';
 import {
     PRIVATE_ROUTER_AUDIENCE,
-    currentEnabledAgentIdentity,
+    agentExecConsumersOf,
+    resolvePrivateCallerIdentity,
 } from '../sandbox/edgeGeneration.js';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { derivePrivateAgentRequestSecret } from '../utils/security/masterKey.js';
 import { commitRoutePlan } from './edgeRoutePlan.js';
-import { agentExecConsumersOf } from '../sandbox/edgeGeneration.js';
 import { identityHardwareUnavailable, identityLeaseHardwareUnavailable } from './hardwareAvailability.mjs';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
@@ -193,7 +193,11 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
     const token = Array.isArray(header) ? header[0] : String(header || '').trim();
     const untrusted = parseUntrustedPayload(token);
     const agentId = String(untrusted?.iss || '');
-    const current = currentEnabledAgentIdentity(plan.snapshot, agentId);
+    const current = resolvePrivateCallerIdentity(plan.snapshot, {
+        agentId,
+        instanceId: untrusted?.instanceId,
+        enableGeneration: untrusted?.enableGeneration,
+    });
     if (!current || !current.enableGeneration) throw unauthorized('private assertion caller is not currently enabled');
     // A refused or blocked caller keeps no relay authority (plan §9.4).
     // A lease that carries no effective availability cannot prove the caller available: deny. The
@@ -205,10 +209,6 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
         ? identityLeaseHardwareUnavailable(plan.lease, current)
         : identityHardwareUnavailable(plan.snapshot, current)) {
         throw forbidden('private assertion caller is unavailable under hardware limits', 'PRIVATE_CALLER_HARDWARE_UNAVAILABLE');
-    }
-    if (String(untrusted?.instanceId || '') !== current.instanceId
-        || String(untrusted?.enableGeneration || '') !== current.enableGeneration) {
-        throw unauthorized('private assertion instance or generation is stale');
     }
     if (!acl.anyCurrentCaller && !(acl.callers || []).some((entry) => exactCaller(entry, current))) {
         throw forbidden('private assertion caller is not in the exact ACL');

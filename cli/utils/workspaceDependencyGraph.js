@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 import path from 'path';
 import { manifestEnableEntries, parseEnableDirective, qualifyEnableSpecForRepo } from './runtime/bootstrapManifest.js';
@@ -69,7 +70,7 @@ function readManifest(manifestPath) {
 }
 
 function findRegistryRecord(registry, { repoName, shortAgentName, alias = '' }) {
-    const entries = Object.values(registry || {});
+    const entries = Object.values(registry || {}).filter((record) => !isCanaryRecord(record));
     if (alias) {
         return entries.find((record) => (
             record && record.type === 'agent'

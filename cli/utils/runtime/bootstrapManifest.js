@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 import { listAgentRepositoryNames, resolveAgentRepositoryPath } from '../agentRepositorySource.mjs';
 import path from 'path';
@@ -302,7 +303,7 @@ export function findEnabledDirectiveRecord(parsedDirective) {
         : '';
     const agents = loadAgents();
     for (const [key, record] of Object.entries(agents || {})) {
-        if (key === '_config' || !record || record.type !== 'agent') continue;
+        if (key === '_config' || isCanaryRecord(record) || !record || record.type !== 'agent') continue;
         if (record.repoName !== resolved.repo || record.agentName !== resolved.shortAgentName) continue;
         if (alias) {
             if (record.alias === alias) {

@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import { assertWorkspaceMutationLease } from './runtime/maintenanceLocks.js';
 import * as reposSvc from './repos.js';
 import * as agentsSvc from './agents.js';
@@ -25,7 +26,7 @@ export async function uninstallRepositoryUnderLease(target, {
         const repoName = reposSvc.resolveInstalledRepoTarget(target);
         assertWorkspaceMutationLease(lease);
         const containerNames = Object.entries(workspaceSvc.loadAgents() || {})
-            .filter(([, record]) => record && record.type === 'agent' && record.repoName === repoName && record.agentName)
+            .filter(([, record]) => record && record.type === 'agent' && !isCanaryRecord(record) && record.repoName === repoName && record.agentName)
             .map(([containerName]) => containerName);
         const disabledAgents = await agentsSvc.disableAgentContainers(containerNames, {
             ...agentDisableDependencies,

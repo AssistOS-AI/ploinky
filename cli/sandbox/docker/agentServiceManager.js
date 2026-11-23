@@ -1,4 +1,5 @@
 import { ensureRepositoryLink } from '../../utils/repositoryInstall.mjs';
+import { isCanaryRecord } from '../canaryRecord.mjs';
 import { prepareLinkedRepositories } from '../../utils/linkInstall.mjs';
 import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
 import { execSync, spawnSync } from 'child_process';
@@ -907,6 +908,7 @@ function appendEnvFlagsFromMap(envFlags, envMap) {
 
 function removeContainerForRecreate(runtime, containerName, label, record = null) {
     let exactRecord = record || loadAgentsMap()[containerName];
+    if (isCanaryRecord(exactRecord)) throw new Error('An automatic recreation cannot remove a canary runtime.');
     try {
         // A prepared replacement rotated this record's tuple before launch and
         // first made the predecessor's own tuple durable in a receipt keyed by
@@ -928,6 +930,7 @@ function removeContainerForRecreate(runtime, containerName, label, record = null
             }
             exactRecord = { ...exactRecord, ...pending.registryRecord };
         }
+        if (isCanaryRecord(exactRecord)) throw new Error('A predecessor receipt identifies a canary runtime.');
         const result = removeExactRegisteredContainer(containerName, exactRecord, { runtime, recoverIncompleteIdentity: true });
         if (result?.removed !== true && result?.state !== 'absent') {
             throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
@@ -1546,12 +1549,8 @@ export function selectLaunchImages({ resolvedImage, launch = null } = {}) {
 }
 
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
-    // Host Podman launches create the host state skeleton first and fail if
-    // they cannot; in-Box (nested) launches skip it.
-    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
     const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
-    const managedControlEnv = buildManagedControlEnv(manifest);
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
     const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
@@ -1559,6 +1558,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         options,
         { ownerRef: `${repoName}/${agentName}` },
     );
+    // Host Podman launches create the host state skeleton first and fail if
+    // they cannot; in-Box (nested) launches skip it.
+    ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
+    const managedControlEnv = buildManagedControlEnv(manifest);
     const launchRecord = preservePreparedRegistryRecord
         ? (options.preparedRegistryRecord || existingRecord)
         : existingRecord;
@@ -2994,6 +2997,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     agents[containerName] = {
         agentName,
         repoName,
+        ...(launchRecord.canaryOf !== undefined ? { canaryOf: launchRecord.canaryOf } : {}),
         containerImage: image,
         ...(manifestImage && manifestImage !== image ? { manifestImage } : {}),
         ...(llmStartup.enabled ? {
@@ -3220,9 +3224,20 @@ function assertHostPortContract(networkMode, portMappings) {
     }
 }
 
+function assertCanaryLaunch(existingRecord, options) {
+    if (!isCanaryRecord(existingRecord) && !isCanaryRecord(options.preparedRegistryRecord)) return;
+    if (options.canaryLaunch !== true) {
+        throw new Error('Only a canary launch may start a registered canary runtime.');
+    }
+    if (options.hardwareInstanceKey && options.hardwareInstanceKey !== options.containerName) {
+        throw new Error('A canary launch requires its own exact hardware instance key.');
+    }
+}
+
 export function assertPreparedRegistryRecordPreservation(existingRecord, options = {}, {
     ownerRef = 'agent',
 } = {}) {
+    assertCanaryLaunch(existingRecord, options);
     if (options.preservePreparedRegistryRecord !== true) return false;
     const stagedInstanceId = String(existingRecord?.instanceId || '');
     const stagedEnableGeneration = String(existingRecord?.enableGeneration || '');
@@ -3369,6 +3384,7 @@ export function coordinateReplacementRuntimeIdentity({
     uuid = randomUUID,
 } = {}) {
     const exactContainerName = String(containerName || '').trim();
+    if (isCanaryRecord(existingRecord)) throw new Error('Ordinary replacement cannot rotate a canary runtime.');
     if (!exactContainerName) {
         throw new Error('coordinated runtime replacement requires an exact container name');
     }
@@ -3424,7 +3440,7 @@ export function coordinateReplacementRuntimeIdentity({
         }
         const agents = loadRegistry();
         const current = agents?.[exactContainerName];
-        if (!current || current.type !== 'agent') {
+        if (!current || current.type !== 'agent' || isCanaryRecord(current)) {
             throw new Error(`runtime replacement for '${exactContainerName}' requires one exact registered agent record`);
         }
         if (String(current.instanceId || '') !== String(existingRecord?.instanceId || '')
@@ -3706,6 +3722,9 @@ export function serviceLlmReuseReason({
  */
 export function admitAgentServicePreflight(agentName, manifest, agentPath, options = {}, admissionContext = {}) {
     const preflightRepoName = resolveAgentRepositoryName(agentPath);
+    const preflightContainerName = options.containerName || getAgentContainerName(agentName, preflightRepoName);
+    const mutablePreflightRecord = loadAgentsMap()[preflightContainerName] || {};
+    assertCanaryLaunch(mutablePreflightRecord, options);
     const preflightManifestPath = path.join(agentPath, 'manifest.json');
     const preflightManifestBytes = fs.existsSync(preflightManifestPath)
         ? fs.readFileSync(preflightManifestPath)
@@ -3717,9 +3736,6 @@ export function admitAgentServicePreflight(agentName, manifest, agentPath, optio
         error.status = 409;
         throw error;
     }
-    const preflightContainerName = options.containerName
-        || getAgentContainerName(agentName, preflightRepoName);
-    const mutablePreflightRecord = loadAgentsMap()[preflightContainerName] || {};
     // An additive candidate is intentionally absent from mutable agents.json
     // until atomic activation. Carry its exact prepared record through the
     // read-only profile/admission preflight; the preparation lease validates
@@ -4682,6 +4698,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             beforeHardwareMutation: options.beforeHardwareMutation,
             mpsLaunch: options.mpsLaunch,
             preparedRegistryRecord: launchRecord,
+            canaryLaunch: options.canaryLaunch,
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
             adoptManagedRuntimeOnly,
@@ -4764,6 +4781,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         agentName,
         repoName,
         containerImage: startedRecord.containerImage || image,
+        ...(launchRecord.canaryOf !== undefined ? { canaryOf: launchRecord.canaryOf } : {}),
         ...(startedRecord.manifestImage ? { manifestImage: startedRecord.manifestImage } : {}),
         ...(startedRecord.llmRuntime ? { llmRuntime: startedRecord.llmRuntime } : {}),
         createdAt: launchRecord.createdAt || new Date().toISOString(),

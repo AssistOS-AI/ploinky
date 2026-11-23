@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
@@ -461,7 +462,7 @@ export function registeredEnableContainerName(map, { canonicalName, alias = '', 
     if (alias) return canonicalName;
     const staged = Object.keys(map || {}).find((key) => {
         const value = map[key];
-        return value?.type === 'agent' && !value.alias && value.agentName === shortAgentName && value.repoName === repoName
+        return value?.type === 'agent' && !isCanaryRecord(value) && !value.alias && value.agentName === shortAgentName && value.repoName === repoName
             && key !== canonicalName && key.replace(/__candidate_[a-f0-9]{12}$/i, '') === canonicalName;
     });
     return staged || canonicalName;
@@ -493,7 +494,7 @@ function planAgentEnable({
     if (alias) {
         const aliasExists = Object.entries(map || {}).some(([key, value]) => {
             if (key === alias) return true;
-            return value && value.type === 'agent' && value.alias === alias;
+            return value && value.type === 'agent' && !isCanaryRecord(value) && value.alias === alias;
         });
         if (aliasExists) {
             throw new Error('alias already exists');
@@ -617,7 +618,7 @@ function planAgentEnable({
         if (!map[key] || typeof map[key] !== 'object') continue;
         if (alias && key === containerName) continue;
         const r = map[key];
-        if (!r || r.type !== 'agent') continue;
+        if (!r || r.type !== 'agent' || isCanaryRecord(r)) continue;
         const sameAgent = r.agentName === shortAgentName && r.repoName === repoName;
         if (!sameAgent) continue;
         if (alias || r.alias) continue;
@@ -1561,7 +1562,7 @@ function configuredStaticRegistration(map, config, readRoutingImpl = loadRouting
     // A configured bare/qualified primary can acquire additional aliases later.
     // Without an exact routed alias, they do not replace the primary selection.
     const primaryRecords = Object.fromEntries(Object.entries(map || {}).filter(([, record]) =>
-        record?.type === 'agent' && !String(record.alias || '').trim()));
+        record?.type === 'agent' && !isCanaryRecord(record) && !String(record.alias || '').trim()));
     try {
         const primary = resolveEnabledAgentRecordFromMap(reference, primaryRecords);
         if (primary) return primary.containerName;
@@ -1580,7 +1581,7 @@ function configuredRoutedStaticAlias(map, reference, readRoutingImpl) {
     const routedContainer = String(routing?.static?.container || '').trim();
     const routedSource = parseQualifiedAgentReference(String(routing?.static?.agent || '').trim());
     const record = map?.[routedContainer];
-    if (!record || record.type !== 'agent' || !record.alias
+    if (!record || record.type !== 'agent' || isCanaryRecord(record) || !record.alias
         || record.repoName !== source.repoName || record.agentName !== source.agentName
         || routedSource.malformed || routedSource.repoName !== source.repoName
         || routedSource.agentName !== source.agentName) return null;
@@ -1618,7 +1619,7 @@ function sameSourceDirectory(left, right) {
 function removeUnusedAgentSourceLinks(record, remaining) {
     if (!record?.repoName || !record.agentName) return;
     const survivors = Object.values(remaining || {}).filter(candidate =>
-        candidate?.type === 'agent' && candidate.agentName === record.agentName);
+        candidate?.type === 'agent' && !isCanaryRecord(candidate) && candidate.agentName === record.agentName);
     if (survivors.some(candidate => candidate.repoName === record.repoName)) return;
     let retired;
     try { retired = agentSourceDirectories(record); } catch (_) { return; }
@@ -1673,7 +1674,7 @@ function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, de
     const map = loadAgentsImpl();
     const config = (map && typeof map._config === 'object') ? map._config : null;
     const staticRegistration = configuredStaticRegistration(map, config, dependencies.readRoutingImpl);
-    const directRecord = (map && map[input] && map[input].type === 'agent') ? map[input] : null;
+    const directRecord = (map && map[input] && map[input].type === 'agent' && !isCanaryRecord(map[input])) ? map[input] : null;
 
     const clearStaticConfig = ({ repoName, shortName, containerName, rawInput }) => {
         if (!config || !config.static) return false;
@@ -1707,7 +1708,7 @@ function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, de
 
     const entries = Object.entries(map || {})
         .filter(([key, value]) => key !== '_config' && value && typeof value === 'object')
-        .filter(([, value]) => value.type === 'agent');
+        .filter(([, value]) => value.type === 'agent' && !isCanaryRecord(value));
 
     const aliasEntry = (!directRecord)
         ? entries.find(([, value]) => {
@@ -1940,7 +1941,7 @@ function disableAgentContainersLocked(targets, dependencies) {
 
     for (const containerName of targets) {
         const record = map?.[containerName];
-        if (!record || record.type !== 'agent') {
+        if (!record || record.type !== 'agent' || isCanaryRecord(record)) {
             disabled.push({
                 status: 'not-found',
                 containerName
@@ -2019,8 +2020,12 @@ function disableAgentContainersLocked(targets, dependencies) {
 // Loading wrapper around the one pure resolver. Every precedence, ambiguity,
 // and malformed-reference rule lives in `agentRegistryResolver.js` so the
 // read-only log command and the loading command handlers cannot drift apart.
-export function resolveEnabledAgentRecord(agentRef) {
+export function resolveEnabledAgentRecord(agentRef, { forRestart = false } = {}) {
     const input = typeof agentRef === 'string' ? agentRef.trim() : '';
     if (!input) return null;
-    return resolveEnabledAgentRecordFromMap(input, loadAgents());
+    const registry = loadAgents();
+    if (forRestart && isCanaryRecord(registry[input])) {
+        throw new Error('A canary runtime cannot be targeted for restart.');
+    }
+    return resolveEnabledAgentRecordFromMap(input, registry);
 }

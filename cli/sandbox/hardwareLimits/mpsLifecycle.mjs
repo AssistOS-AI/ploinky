@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { isCanaryRecord } from '../canaryRecord.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
@@ -20,7 +21,7 @@ import { buildAvailabilityProjection, markRouteHardwareUnavailable } from '../..
 import { readBoxHardwareContext } from './context.mjs';
 import { readAppliedObservation } from './runtimeState.mjs';
 import {
-    assertKnownMpsClients, inspectMpsClient, inspectMpsClientPresence, resolveMpsClientAlias,
+    assertKnownMpsClients, assertMpsJournalExcludesCanaries, inspectMpsClient, inspectMpsClientPresence, resolveMpsClientAlias,
     createdMpsCandidates, settleCreatedMpsCandidate, dropSettledMpsCandidate, mpsCandidateRecord,
     sameMpsTuple, mpsOwnerState, mpsLaunchOwner, releaseMpsLaunchOwner, inspectRecordedMpsClient, stopRecordedMpsClient,
 } from './mpsInventory.mjs';
@@ -111,6 +112,9 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         };
         check();
         const registry = loadRegistry();
+        if (options.canaryLaunch !== true && (isCanaryRecord(registry[target.key]) || isCanaryRecord(target.record))) {
+            throw new MpsError('GPU reconciliation cannot target a canary runtime.', 'hardware_limits_transition');
+        }
         // A created candidate whose readiness failed (or whose process died)
         // is settled through its own exact tuple and immutable ID before any
         // planning; the registry still names its predecessor. A candidate
@@ -118,7 +122,9 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         // no-wait child waits for readiness outside the locks): it is never
         // removed, and its journal entry is kept.
         const inFlight = [];
-        for (const candidate of createdMpsCandidates(store.read(), registry)) {
+        const journal = store.read();
+        assertMpsJournalExcludesCanaries(journal, registry);
+        for (const candidate of createdMpsCandidates(journal, registry)) {
             check();
             let plan = null;
             try { plan = loadPlan(candidate.ref, registry[candidate.key] || { alias: candidate.alias }); } catch (_) {}
@@ -132,7 +138,7 @@ async function coordinateMpsLifecycleImpl({ target, options = {}, launchTarget }
         const desiredClients = [];
         const plans = new Map();
         const images = new Map();
-        const recordFor = new Map(Object.entries(registry).filter(([, record]) => record?.type === 'agent'));
+        const recordFor = new Map(Object.entries(registry).filter(([, record]) => record?.type === 'agent' && !isCanaryRecord(record)));
         recordFor.set(target.key, target.record);
         for (const [key, record] of recordFor) {
             const ref = `${record.repoName}/${record.agentName}`;
@@ -341,7 +347,11 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
     check();
     const repoName = resolveAgentRepositoryName(agentPath);
     const key = options.hardwareInstanceKey || options.containerName || getAgentContainerName(agentName, repoName);
-    const record = options.preparedRegistryRecord || loadRegistry()[key];
+    const registry = loadRegistry();
+    const record = options.preparedRegistryRecord || registry[key];
+    if (options.canaryLaunch !== true && (isCanaryRecord(record) || isCanaryRecord(registry[key]))) {
+        throw new MpsError('GPU graph launch cannot target a canary runtime.', 'hardware_limits_transition');
+    }
     if (!record?.instanceId || !record?.enableGeneration) throw new MpsError('Prepared GPU target has no exact graph identity');
     const ref = `${repoName}/${agentName}`;
     const policy = context.overrides?.get(ref)?.gpu;
@@ -355,6 +365,7 @@ export async function ensureMpsGraphAgentService(agentName, manifest, agentPath,
         });
     }
     let state = store.read();
+    assertMpsJournalExcludesCanaries(state, loadRegistry());
     inApplyStep('client-inventory', () => observeClients({ runtime: plan.runtime, registry: loadRegistry(), state }));
     const configured = [...context.overrides || []].filter(([, value]) => value.gpu).flatMap(([agentRef, value]) => {
         try { return [{ share: resolveShare(value.gpu, context.gpu, agentRef) }]; } catch (error) { if (agentRef === ref) throw error; return []; }
@@ -500,6 +511,9 @@ export async function finalizeMpsGraph({ networkLifecycleCapability } = {}, {
 /** Prepare an enable transaction before it captures its additive route lease.
  * The target remains a journaled intent until that caller creates and readies it. */
 export async function prepareMpsClientLaunch(target, options = {}) {
+    if (isCanaryRecord(target.record) && options.canaryLaunch !== true) {
+        throw new MpsError('GPU launch preparation cannot target a canary runtime.', 'hardware_limits_transition');
+    }
     const context = readBoxHardwareContext();
     const ref = `${target.record.repoName}/${target.record.agentName}`;
     const applied = target.record.containerId ? readAppliedObservation(target.key, target.record.containerId) : null;

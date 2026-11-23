@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { isCanaryRecord } from '../canaryRecord.mjs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -45,6 +46,7 @@ export function captureExactHardwareInstances(registry, keys) {
     return [...new Set(keys)].map((key) => {
         if (typeof key !== 'string' || !key || Buffer.byteLength(key) > 1024) throw failure('invalid_limits', 'Apply requires a representable exact registry key.', 400);
         const record = Object.hasOwn(registry, key) ? registry[key] : null;
+        if (isCanaryRecord(record)) throw failure('canary_not_applicable', `Hardware Apply cannot target canary runtime ${key}.`);
         if (record?.type !== 'agent') throw failure('unknown_container', `No registered agent has exact key ${key}.`, 404);
         assertRepresentableIdentity({ key, ref: `${record.repoName}/${record.agentName}`, alias: record.alias || null });
         if (!record.instanceId || !record.enableGeneration) throw failure('identity_changed', `The runtime identity for ${key} is incomplete.`);
@@ -54,7 +56,7 @@ export function captureExactHardwareInstances(registry, keys) {
 
 export function assertExactHardwareInstance(captured, registry) {
     const current = Object.hasOwn(registry, captured.key) ? registry[captured.key] : null;
-    if (current?.type !== 'agent' || !isDeepStrictEqual(current, captured.record)) throw failure('identity_changed', `The exact registry identity for ${captured.key} changed before Apply.`);
+    if (current?.type !== 'agent' || isCanaryRecord(current) || !isDeepStrictEqual(current, captured.record)) throw failure('identity_changed', `The exact registry identity for ${captured.key} changed before Apply.`);
     return current;
 }
 
@@ -66,7 +68,7 @@ export function expandHardwareRecoveryKeys(keys, registry, routing) {
         for (const route of Object.values(routing.routes || {})) {
             const value = route?.hardwareAvailability;
             const record = registry[value?.key];
-            if (value?.state !== 'blocked' || record?.type !== 'agent' || value.instanceId !== record.instanceId || value.enableGeneration !== record.enableGeneration) continue;
+            if (value?.state !== 'blocked' || record?.type !== 'agent' || isCanaryRecord(record) || value.instanceId !== record.instanceId || value.enableGeneration !== record.enableGeneration) continue;
             const cause = value.problem;
             if (expanded.has(cause?.rootCause?.key) || expanded.has(cause?.blockedBy?.key)) {
                 if (!expanded.has(value.key)) { expanded.add(value.key); changed = true; }
@@ -325,7 +327,7 @@ export async function reconcileExactHardwareInstance(captured, {
             if (problem && problem.key === captured.key) {
                 checkPolicy();
                 const current = loadRegistry()[captured.key];
-                if (current?.instanceId && current?.enableGeneration) {
+                if (!isCanaryRecord(current) && current?.instanceId && current?.enableGeneration) {
                     const projection = buildAvailabilityProjection({ outcome: problem, instanceId: current.instanceId, enableGeneration: current.enableGeneration });
                     let withdrawn = false;
                     try { withdrawn = (await withdrawUnavailable({ containerName: captured.key, projection }))?.selector?.state === 'active'; } catch (_) {}
@@ -365,7 +367,8 @@ export async function applyHardwareLimits({ expectedToken, containers }, {
     return lease({ operation: 'hardware-apply', waitTimeoutMs: Math.min(operationTimeoutMs, 60_000) }, async () => {
         check();
         const registry = loadRegistry();
-        const requested = containers.length ? containers : Object.entries(registry).filter(([, record]) => record?.type === 'agent').map(([key]) => key);
+        const requested = containers.length ? containers : Object.entries(registry)
+            .filter(([, record]) => record?.type === 'agent' && !isCanaryRecord(record)).map(([key]) => key);
         captureExactHardwareInstances(registry, requested);
         const keys = expandHardwareRecoveryKeys(requested, registry, loadRouting());
         const captured = captureExactHardwareInstances(registry, keys);

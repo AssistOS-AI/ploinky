@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../../cli/sandbox/canaryRecord.mjs';
 import { sanitizeAuthorityDiagnostic } from '../../cli/sandbox/authorityCommandDiagnostics.mjs';
 import { boxWorkspaceExecOptions, boxWorkspacePath } from '../contract/workspace-root.mjs';
 
@@ -11,6 +12,7 @@ const STATUS_PATH = '/opt/ploinky/ploinky-box/inbox/readStatus.mjs';
 // complete agent records, configuration, environment variables, or credentials.
 // The workspace root arrives as the script's only argument, never as code.
 export const CURRENT_REGISTRY_SCRIPT = `
+const isCanaryRecord = ${isCanaryRecord};
 const fs = require('node:fs');
 const path = require('node:path');
 let fd;
@@ -32,7 +34,7 @@ try {
     if (size > 1048576) throw Error('Registry exceeds 1 MiB');
     const registry = JSON.parse(bytes.subarray(0, size).toString('utf8'));
     if (!registry || typeof registry !== 'object' || Array.isArray(registry)) throw Error('Registry is not an object');
-    const records = Object.entries(registry).filter(([name, record]) => record && ['agent', 'agentCore'].includes(record.type)
+    const records = Object.entries(registry).filter(([name, record]) => record && !isCanaryRecord(record) && ['agent', 'agentCore'].includes(record.type)
         && record.runtime === 'podman' && /^[a-f0-9]{64}$/.test(record.containerId)
         && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$/.test(name))
         .map(([name, record]) => ({ name, containerId: record.containerId }));

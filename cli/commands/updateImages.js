@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 
 import { readAgentRegistrySnapshot } from '../utils/agentRegistrySnapshot.js';
@@ -75,7 +76,7 @@ export function isTagReference(reference) {
 export function collectTaggedAgentImages(registry, resolveImages, { repoName = null, warn = () => {} } = {}) {
     const entries = new Map();
     for (const [key, record] of Object.entries(registry || {})) {
-        if (key === '_config' || !record || typeof record !== 'object' || record.type !== 'agent') continue;
+        if (key === '_config' || isCanaryRecord(record) || !record || typeof record !== 'object' || record.type !== 'agent') continue;
         if (!record.repoName || !record.agentName) continue;
         if (repoName && record.repoName !== repoName) continue;
         const agentRef = `${record.repoName}/${record.agentName}${record.alias ? ` (${record.alias})` : ''}`;

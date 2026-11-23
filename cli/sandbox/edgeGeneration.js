@@ -6,6 +6,7 @@ import { domainToASCII } from 'node:url';
 import { assertWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import { assertNetworkLifecycleCapability } from './networkLifecycle.js';
 import { recordOwnedEdgeSelection } from './edgeSelectionMutations.mjs';
+import { isCanaryRecord, validateCanaryField, validateCanaryLinks } from './canaryRecord.mjs';
 
 import {
     AGENTS_FILE,
@@ -669,7 +670,7 @@ function collectRouterAccessConsumers(routing, manifests, agents, field) {
         if (value !== true) {
             throw edgeError(`manifest(${routeKey}).routerAccess.${field} must be a boolean`);
         }
-        consumers.push(resolveEnabledIdentity({
+        consumers.push(...resolvePrivateRouteMembers({
             routeKey,
             route,
             agent: `${String(route.repo || '').trim()}/${String(route.agent || '').trim()}`,
@@ -683,7 +684,7 @@ function routeDefaultDecision(routing, agents, manifests, routeKey, seen = new S
     if (!key || seen.has(key)) return { access: 'guest', routeKey: key, source: 'routeDefault' };
     seen.add(key);
     const route = routing.routes?.[key];
-    const record = Object.values(agents || {}).find((entry) => entry && entry.type === 'agent' && (
+    const record = route?.canary ? agents[route.container] : Object.values(agents || {}).find((entry) => entry && entry.type === 'agent' && !isCanaryRecord(entry) && (
         String(entry.alias || '') === key
         || (String(entry.repoName || '') === String(route?.repo || '')
             && String(entry.agentName || '') === String(route?.agent || ''))
@@ -900,6 +901,7 @@ function validateRoutingShape(routing, manifests) {
     for (const [routeKey, route] of Object.entries(routes)) {
         if (!routeKey || RESERVED_OBJECT_KEYS.has(routeKey)) throw edgeError(`routing route key '${routeKey}' is invalid`);
         assertObject(route, `routing route '${routeKey}'`);
+        if (Object.hasOwn(route, 'canary')) validateCanaryField(route.canary, `routing.routes.${routeKey}.canary`);
         if (route.hostPort !== undefined) normalizeServicePort(route.hostPort, `routing.routes.${routeKey}.hostPort`);
         if (route.hardwareAvailability !== undefined) {
             try {
@@ -1013,7 +1015,7 @@ function resolveRootApplicationRoute(rootApplication, ownerRouteKey, routing, ho
 function resolveEnabledIdentity(routeSelection, agents) {
     const exactContainer = String(routeSelection.route?.container || '').trim();
     const records = Object.entries(agents || {}).filter(([containerName, record]) => {
-        if (!isPlainObject(record) || record.type !== 'agent') return false;
+        if (!isPlainObject(record) || record.type !== 'agent' || isCanaryRecord(record)) return false;
         if (exactContainer && containerName === exactContainer) return true;
         return String(record.alias || '') === routeSelection.routeKey
             || (String(record.repoName || '') === String(routeSelection.route?.repo || '')
@@ -1036,6 +1038,23 @@ function resolveEnabledIdentity(routeSelection, agents) {
         routeKey: routeSelection.routeKey,
         containerName,
     };
+}
+
+// Route and registry sources are validated together before compiling any ACL.
+// Host-network admission is a separate physical capability and uses only the
+// primary identity until a launch explicitly prepares its own capability.
+function resolvePrivateRouteMembers(selection, agents) {
+    const primary = resolveEnabledIdentity(selection, agents);
+    if (!selection.route.canary) return [primary];
+    const containerName = selection.route.canary.container;
+    const record = agents[containerName];
+    return [primary, {
+        agentId: primary.agentId,
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+        routeKey: selection.routeKey,
+        containerName,
+    }];
 }
 
 function publicationDisposition(desired) {
@@ -1119,10 +1138,11 @@ function manifestEnableReference(entry) {
 
 function routeAgentRecord(route, agents) {
     const direct = route?.container ? agents?.[route.container] : null;
-    if (direct && direct.type === 'agent') return direct;
+    if (direct && direct.type === 'agent' && !isCanaryRecord(direct)) return direct;
     const matches = Object.values(agents || {}).filter((record) => (
         record
         && record.type === 'agent'
+        && !isCanaryRecord(record)
         && record.repoName === route?.repo
         && record.agentName === route?.agent
     ));
@@ -1323,15 +1343,16 @@ export function edgeHostServiceRoutes(generation, host) {
     return frozen;
 }
 
-function compileGeneration({ routing, policy, desired, agents, manifests }) {
+function compileGeneration({ routing, policy, desired, agents, manifests }, workspaceRoot) {
     validatePolicy(policy);
     validateRoutingShape(routing, manifests);
     assertObject(agents, 'agents registry');
+    validateCanaryLinks(routing, agents, workspaceRoot);
     const normalizedDesired = normalizeDesired(desired);
     const hostNetworkCapabilities = collectManifestHostNetworkCapabilities(routing, manifests, agents);
     const workspaceLogConsumers = collectWorkspaceLogConsumers(routing, manifests, agents);
-    const turnCredentialConsumers = (normalizedDesired.turn?.credentialConsumers || []).map((agentRef) => (
-        resolveEnabledIdentity(resolveAgentRoute(agentRef, routing), agents)
+    const turnCredentialConsumers = (normalizedDesired.turn?.credentialConsumers || []).flatMap((agentRef) => (
+        resolvePrivateRouteMembers(resolveAgentRoute(agentRef, routing), agents)
     ));
 
     const routeDefaults = {};
@@ -1494,7 +1515,7 @@ function collectCapturedSources(paths) {
         manifestBytes[routeKey] = bytes;
         manifests[routeKey] = parseJsonBytes(bytes, `manifest(${routeKey})`);
     }
-    const semantic = compileGeneration({ routing, policy, desired, agents, manifests });
+    const semantic = compileGeneration({ routing, policy, desired, agents, manifests }, paths.root);
     const parts = [
         ['routing.json', routingBytes],
         ['policy-state.json', policyBytes],
@@ -1582,7 +1603,7 @@ function collectCandidateSources(paths, {
         desired: parsedDesired,
         agents: parsedAgents,
         manifests,
-    });
+    }, paths.root);
     const parts = [
         ['routing.json', routingBytes],
         ['policy-state.json', policyBytes],
@@ -1983,6 +2004,9 @@ export function inactivateEdgeRoutingGeneration(reason = 'candidate-change', opt
     const paths = resolveEdgeGenerationPaths(options);
     const { release } = acquireApplyLockCapability(paths, options);
     try {
+        // A caller-supplied predicate, evaluated under this same lock, may
+        // decline the inactivation (a primary whose canary serves everyone).
+        if (typeof options.abortIf === 'function' && options.abortIf() === true) return null;
         const previous = readSelector(paths);
         // An exact-selector inactivation withdraws only the named active
         // activation. Any other selector already reflects a newer decision
@@ -4602,20 +4626,44 @@ export function assertHostModeGenerationCapability({
     return active.selector.generation;
 }
 
-export function currentEnabledAgentIdentity(snapshot, agentId) {
-    const wanted = String(agentId || '').trim();
+function pairedRouteForPrincipal(snapshot, agentId) {
+    return Object.entries(snapshot?.routing?.routes || {}).find(([, route]) => (
+        route?.canary && `agent:${route.repo}/${route.agent}` === agentId
+    ));
+}
+
+function registeredPrimaryIdentity(snapshot, agentId, pair) {
     for (const [containerName, record] of Object.entries(snapshot?.agents || {})) {
-        if (!record || record.type !== 'agent') continue;
+        if (!record || record.type !== 'agent' || isCanaryRecord(record)) continue;
+        if (pair && containerName !== pair[1].container) continue;
         const principal = `agent:${String(record.repoName || '').trim()}/${String(record.agentName || '').trim()}`;
-        if (principal !== wanted) continue;
+        if (principal !== agentId) continue;
         return {
             agentId: principal,
             instanceId: String(record.instanceId || containerName),
             enableGeneration: String(record.enableGeneration || ''),
-            routeKey: String(record.alias || record.agentName || ''),
+            routeKey: pair?.[0] ?? String(record.alias || record.agentName || ''),
         };
     }
     return null;
+}
+
+export function currentEnabledAgentIdentity(snapshot, agentId) {
+    const wanted = String(agentId || '').trim();
+    return registeredPrimaryIdentity(snapshot, wanted, pairedRouteForPrincipal(snapshot, wanted));
+}
+
+export function resolvePrivateCallerIdentity(snapshot, { agentId, instanceId, enableGeneration }) {
+    const matches = (identity) => identity?.instanceId === instanceId && identity?.enableGeneration === enableGeneration;
+    const pair = pairedRouteForPrincipal(snapshot, agentId);
+    if (pair) {
+        const [routeKey, route] = pair;
+        if (route.disabled) return null;
+        const members = resolvePrivateRouteMembers({ routeKey, route, agent: `${route.repo}/${route.agent}` }, snapshot.agents);
+        return members.find(matches) || null;
+    }
+    const primary = registeredPrimaryIdentity(snapshot, agentId);
+    return primary && matches(primary) ? primary : null;
 }
 
 export function defaultEdgeDesiredStateBytes() {

@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 // One deterministic enabled-agent resolver shared by every operator surface.
 //
 // This module is pure: it takes an already-loaded registry map and never
@@ -66,6 +67,7 @@ function enabledAgentEntries(registry) {
         && record
         && typeof record === 'object'
         && record.type === 'agent'
+        && !isCanaryRecord(record)
     ));
 }
 

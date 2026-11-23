@@ -8,6 +8,7 @@
 // typed `store_unreadable` refusal here and is never reported ready. An inactive
 // or unloadable selector yields none; the Router denies on that basis itself.
 
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import crypto from 'node:crypto';
 
 import { loadActiveEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
@@ -29,6 +30,7 @@ const STORE_UNREADABLE_PARTS = Object.freeze({
 function storeUnreadableProjections(generation) {
     const projections = new Map();
     for (const [key, record] of Object.entries(generation?.agents || {})) {
+        if (isCanaryRecord(record)) continue;
         const instanceId = String(record?.instanceId || '');
         const enableGeneration = String(record?.enableGeneration || '');
         const ref = record?.repoName && record?.agentName ? `${record.repoName}/${record.agentName}` : null;

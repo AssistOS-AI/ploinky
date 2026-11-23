@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../../sandbox/canaryRecord.mjs';
 import fs from 'node:fs';
 import { resolveAgentManifestLocation } from '../../utils/agentRegistry.js';
 import { readAgentsSnapshot } from '../../utils/workspace.js';
@@ -35,7 +36,7 @@ export function createProviderConfigReader(providerAgentRef, readExplicitValue, 
     const manifest = inputs
         ? structuredClone(inputs.readJson(resolved.manifestPath))
         : JSON.parse(fs.readFileSync(resolved.manifestPath, 'utf8'));
-    const record = Object.values(readAgentsSnapshot()).find((entry) => entry?.type === 'agent'
+    const record = Object.values(readAgentsSnapshot()).find((entry) => entry?.type === 'agent' && !isCanaryRecord(entry)
         && entry.repoName === resolved.repo && entry.agentName === resolved.shortAgentName && !entry.alias);
     const { profileConfig } = resolveManifestRuntimeProfile(manifest, {
         agentName: `${resolved.repo}/${resolved.shortAgentName}`,

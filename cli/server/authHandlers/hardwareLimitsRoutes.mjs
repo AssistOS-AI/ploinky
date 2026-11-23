@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../../sandbox/canaryRecord.mjs';
 import fs from 'node:fs';
 import { readMpsStatus, inspectMpsTargetEligibility, inspectPreparedMpsImage } from '../../sandbox/hardwareLimits/mpsStatus.mjs';
 import { resolveManifestImage } from '../../utils/security/secretVars.js';
@@ -118,7 +119,7 @@ export function refuseUnenforceableProposal({ agentRef, agents, context, getInst
     if (!agent) return;
     const proposed = { ...context, overrides: agents };
     const proposalRequest = storedRequestedLimits(agents.get(agentRef));
-    const records = Object.entries(getRegistry()).filter(([, record]) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === agentRef).map(([key, record]) => ({ ...record, key }));
+    const records = Object.entries(getRegistry()).filter(([, record]) => record?.type === 'agent' && !isCanaryRecord(record) && `${record.repoName}/${record.agentName}` === agentRef).map(([key, record]) => ({ ...record, key }));
     for (const record of [{}, ...records]) {
         let admission;
         try { admission = admit(agent, record, proposed); } catch (_) { continue; }
@@ -150,7 +151,7 @@ export function buildHardwareLimitsState({ context, installed, registry, routing
         }
         const containers = [];
         for (const [key, record] of Object.entries(registry)) {
-            if (record?.type !== 'agent' || `${record.repoName}/${record.agentName}` !== agent.ref) continue;
+            if (record?.type !== 'agent' || isCanaryRecord(record) || `${record.repoName}/${record.agentName}` !== agent.ref) continue;
             const route = Object.values(routing.routes || {}).find((value) => value?.container === key);
             let projection = route?.hardwareAvailability;
             if (!projection && storeProjections) {
@@ -311,12 +312,12 @@ export async function handleHardwareLimitsRoutes(req, res, parsedUrl, {
             send(result?.status || 200, { ok: result?.ok !== false, ...result, ...(statusFresh === null ? {} : { statusFresh, statusWaitMs, ...(statusFresh ? {} : { statusNote: 'The workspace metrics snapshot may lag this Apply by a few seconds.' }) }) });
         } else {
             const gpu = body.action === 'set_agent_limits' && body.limits?.gpu
-                ? qualifyGpu(installed.find((agent) => agent.ref === body.agentRef), Object.values(registry).filter((record) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === body.agentRef), context, body.limits) : context.gpu;
+                ? qualifyGpu(installed.find((agent) => agent.ref === body.agentRef), Object.values(registry).filter((record) => record?.type === 'agent' && !isCanaryRecord(record) && `${record.repoName}/${record.agentName}` === body.agentRef), context, body.limits) : context.gpu;
             const capabilities = { gate: context.gate, controllers: context.backendReady ? context.controllers : [], gpu };
             const result = body.action === 'set_agent_limits'
                 ? set({ paths: context.paths, identity: context.identity, expectedToken: body.expectedToken, agentRef: body.agentRef, limits: body.limits, installedRefs: new Set(installed.map((agent) => agent.ref)), capabilities, envelope: context.envelope, actor, beforeCommit: authorize, admitProposed: ({ agentRef, agents }) => refuseUnenforceableProposal({ agentRef, agents, context, getInstalled, getRegistry, admit }) })
                 : clear({ paths: context.paths, identity: context.identity, expectedToken: body.expectedToken, agentRef: body.agentRef, actor, beforeCommit: authorize });
-            send(200, { ...state(), token: result.token, committed: result.committed, affectedInstances: Object.entries(registry).filter(([, record]) => record?.type === 'agent' && `${record.repoName}/${record.agentName}` === body.agentRef).map(([key]) => key) });
+            send(200, { ...state(), token: result.token, committed: result.committed, affectedInstances: Object.entries(registry).filter(([, record]) => record?.type === 'agent' && !isCanaryRecord(record) && `${record.repoName}/${record.agentName}` === body.agentRef).map(([key]) => key) });
         }
     } catch (error) {
         const response = hardwareHttpError(error);

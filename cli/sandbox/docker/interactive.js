@@ -1,5 +1,6 @@
 import { PLOINKY_SKILL_SCOPE_ENV, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import fs from 'fs';
+import { isCanaryRecord } from '../canaryRecord.mjs';
 import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
 import { execSync, spawnSync } from 'child_process';
 import path from 'path';
@@ -208,10 +209,10 @@ export function assertInteractiveHardwareLimitsAbsent(manifest, {
 
 function runCommandInContainer(agentName, repoName, manifest, command, interactive = false) {
     const containerName = getAgentContainerName(agentName, repoName);
+    const agents = loadInteractiveAgents(containerName);
     assertInteractiveHardwareLimitsAbsent(manifest, { agentName, repoName, containerName,
         profileConfig: resolveInteractiveProfileConfig(manifest, { agentName, repoName }) });
     const runtime = getRuntime();
-    let agents = loadAgentsMap();
     const projectDir = getConfiguredProjectPath(agentName, repoName);
     const homeDir = manifestHomeDirectory({ ...manifest.volumes, ...resolveInteractiveProfileConfig(manifest, { agentName, repoName })?.volumes }, getAgentWorkDir(agentName));
     const homeLayout = resolveAgentHomeLayout({
@@ -414,9 +415,16 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
     }
 }
 
+function loadInteractiveAgents(containerName) {
+    const agents = loadAgentsMap();
+    if (isCanaryRecord(agents[containerName])) throw new Error('Interactive commands cannot adopt a canary runtime.');
+    return agents;
+}
+
 function ensureAgentContainer(agentName, repoName, manifest) {
-    const runtime = getRuntime();
     const containerName = getAgentContainerName(agentName, repoName);
+    const agents = loadInteractiveAgents(containerName);
+    const runtime = getRuntime();
     const projectDir = getConfiguredProjectPath(agentName, repoName);
     const homeDir = manifestHomeDirectory({ ...manifest.volumes, ...resolveInteractiveProfileConfig(manifest, { agentName, repoName })?.volumes }, getAgentWorkDir(agentName));
     const homeLayout = resolveAgentHomeLayout({
@@ -427,7 +435,6 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     const absAgentPath = path.resolve(agentPath);
     const sharedDir = ensureSharedHostDir();
     ensureAgentDataDirectory(homeDir);
-    let agents = loadAgentsMap();
 
     // Resolve profile config for env hash computation
     const activeProfile = getActiveProfile();

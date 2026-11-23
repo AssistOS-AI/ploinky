@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 import path from 'path';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -182,7 +183,7 @@ export function readUpdateGraph({
     const pending = [];
     const visited = new Set();
     for (const [key, record] of Object.entries(registry || {})) {
-        if (key === '_config' || !record || typeof record !== 'object' || record.type !== 'agent') continue;
+        if (key === '_config' || isCanaryRecord(record) || !record || typeof record !== 'object' || record.type !== 'agent') continue;
         if (!record.repoName || !record.agentName) {
             unknown(`agents registry entry ${key} has no repository or agent name`);
             continue;

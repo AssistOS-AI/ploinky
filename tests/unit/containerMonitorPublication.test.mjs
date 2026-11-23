@@ -876,7 +876,10 @@ test('semantic ownership probes recur, inactivate on failure, and force an exact
     );
     assert.match(source, /CONTINUOUS_PROBE_INTERVAL_MS/);
     assert.match(source, /now - target\.probeLastSuccessAt >= continuousProbeIntervalMs/);
-    assert.match(source, /inactivate\(`continuous-runtime-probe-failed:\$\{target\.containerName\}`\)/);
+    // The fallback takes its own lock (no preparation-lease check); the canary
+    // hold is a predicate evaluated inside that lock.
+    assert.match(source, /inactivate\(`continuous-runtime-probe-failed:\$\{target\.containerName\}`, \{\s*abortIf:/);
+    assert.doesNotMatch(source, /inactivate\(`continuous-runtime-probe-failed:\$\{target\.containerName\}`, \{ applyLockCapability \}\)/);
     assert.match(source, /scheduleContainerRestart\(monitor, target, 'semantic_probe_failed'\)/);
     assert.match(source, /forceRecreate: reason === 'semantic_probe_failed'/);
 });

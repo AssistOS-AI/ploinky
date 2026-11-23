@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import {
     getActiveProfile,
     setActiveProfile,
@@ -132,7 +133,7 @@ function handleListProfiles(args) {
         // Show agents and their profile support
         const agents = loadAgents();
         const agentEntries = Object.entries(agents || {})
-            .filter(([key, value]) => key !== '_config' && value && value.type === 'agent');
+            .filter(([key, value]) => key !== '_config' && value && value.type === 'agent' && !isCanaryRecord(value));
 
         if (agentEntries.length > 0) {
             console.log('');
@@ -194,7 +195,7 @@ function handleValidateProfile(args) {
         // Validate all enabled agents
         const agents = loadAgents();
         const agentEntries = Object.entries(agents || {})
-            .filter(([key, value]) => key !== '_config' && value && value.type === 'agent');
+            .filter(([key, value]) => key !== '_config' && value && value.type === 'agent' && !isCanaryRecord(value));
 
         if (agentEntries.length > 0) {
             console.log('');

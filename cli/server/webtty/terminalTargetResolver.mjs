@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../../sandbox/canaryRecord.mjs';
 import { execFile as execFileDefault } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -329,7 +330,7 @@ export function exactCandidate(containerName, record, supportedRuntimes) {
     const enableGeneration = exactText(record?.enableGeneration);
     const repoName = exactText(record?.repoName);
     const agentName = exactText(record?.agentName);
-    if (record?.type !== 'agent' || !supportedRuntimes.has(runtime)
+    if (record?.type !== 'agent' || isCanaryRecord(record) || !supportedRuntimes.has(runtime)
         || !IMMUTABLE_CONTAINER_ID.test(containerId) || !exactText(containerName)
         || !instanceId || !enableGeneration || !repoName || !agentName) return null;
     if (record.containerName !== undefined && record.containerName !== containerName) return null;

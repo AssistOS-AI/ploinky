@@ -4,11 +4,21 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { isMainThread } from 'node:worker_threads';
+import { isCanaryRecord } from '../canaryRecord.mjs';
 import { createNetworkLifecycleAdapter } from '../networkLifecycle.js';
 import { networkContractHash } from '../networkContract.js';
 import { effectiveInstanceKey } from '../../utils/workspaceDependencyGraph.js';
 import { MpsError } from './mpsEligibility.mjs';
 import { isMpsClientAlias, MPS_GENERATION_LABEL } from './mps.mjs';
+
+// A pending transition can reintroduce clients independently of the registry
+// enumeration. Its receipts must stay intact until the canary is retired.
+export function assertMpsJournalExcludesCanaries(state, registry) {
+    const clients = [...(state?.oldClients || []), ...(state?.pendingClients || []), ...(state?.desiredClients || [])];
+    if (clients.some((client) => isCanaryRecord(registry[client.key]))) {
+        throw new MpsError('A canary owns a GPU share client in this transition journal.', 'hardware_limits_transition');
+    }
+}
 
 /** A daemon transition must not discard an unjournaled CUDA client's server. */
 export function assertKnownMpsClients({ runtime, registry = {}, state = null, query = spawnSync } = {}) {
@@ -20,8 +30,15 @@ export function assertKnownMpsClients({ runtime, registry = {}, state = null, qu
     if (reply.status !== 0 || reply.error || reply.signal || Buffer.byteLength(text) > 64 * 1024) throw new MpsError('The complete MPS client inventory is unavailable');
     const ids = text ? text.split(/\r?\n/) : [];
     if (ids.length > 512 || ids.some((id) => !/^[a-f0-9]{64}$/.test(id)) || new Set(ids).size !== ids.length) throw new MpsError('MPS client inventory has ambiguous identities');
-    const known = new Set([...Object.values(registry).map((record) => record?.containerId),
-        ...(state?.oldClients || []).map((client) => client.containerId), ...(state?.pendingClients || []).map((client) => client.containerId)]);
+    const known = new Set([...(state?.oldClients || []).map((client) => client.containerId), ...(state?.pendingClients || []).map((client) => client.containerId)]);
+    const liveIds = new Set(ids);
+    for (const record of Object.values(registry)) {
+        if (isCanaryRecord(record)) {
+            if (liveIds.has(record.containerId)) throw new MpsError('A canary GPU share client still owns this daemon.', 'hardware_limits_transition');
+            continue;
+        }
+        known.add(record?.containerId);
+    }
     if (ids.some((id) => !known.has(id))) throw new MpsError('An MPS client is outside the exact registry and transition journal. Recover this Box on the host before changing its daemon.');
     return ids;
 }

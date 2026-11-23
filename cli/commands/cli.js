@@ -461,7 +461,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 const agentName = target;
                 let registryRecord = null;
                 try {
-                    registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
+                    registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName, { forRestart: true });
                 } catch (err) {
                     throw new Error(err?.message || String(err));
                 }

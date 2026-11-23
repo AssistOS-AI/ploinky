@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import { resolveAgentRepositoryName, resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import fs from 'fs';
 import { CLI_OUTPUT_BOUNDARY } from '../server/webchat/startupOutput.js';
@@ -802,7 +803,7 @@ function deduplicateAgentRegistry(reg, getAgentContainerName) {
       dedup[key] = rec;
       continue;
     }
-    if (rec.type !== 'agent') {
+    if (rec.type !== 'agent' || isCanaryRecord(rec)) {
       dedup[key] = rec;
       continue;
     }
@@ -845,7 +846,7 @@ function findRegistryEntryForGraphNode(reg, node, getAgentContainerName) {
   const expectedKey = getAgentContainerName(node.alias || node.shortAgentName, node.repoName);
   const expectedRecord = reg[expectedKey];
   if (
-    expectedRecord && expectedRecord.type === 'agent' &&
+    expectedRecord && !isCanaryRecord(expectedRecord) && expectedRecord.type === 'agent' &&
     expectedRecord.repoName === node.repoName &&
     expectedRecord.agentName === node.shortAgentName &&
     (node.alias ? expectedRecord.alias === node.alias : !expectedRecord.alias)
@@ -854,7 +855,7 @@ function findRegistryEntryForGraphNode(reg, node, getAgentContainerName) {
   }
 
   for (const [key, rec] of Object.entries(reg || {})) {
-    if (key === '_config' || !rec || rec.type !== 'agent') continue;
+    if (key === '_config' || !rec || rec.type !== 'agent' || isCanaryRecord(rec)) continue;
     if (rec.repoName !== node.repoName || rec.agentName !== node.shortAgentName) continue;
     if (node.alias) {
       if (rec.alias === node.alias) {
@@ -868,7 +869,7 @@ function findRegistryEntryForGraphNode(reg, node, getAgentContainerName) {
   }
   if (!node.alias) {
     for (const [key, rec] of Object.entries(reg || {})) {
-      if (key === '_config' || !rec || rec.type !== 'agent') continue;
+      if (key === '_config' || !rec || rec.type !== 'agent' || isCanaryRecord(rec)) continue;
       if (rec.repoName === node.repoName && rec.agentName === node.shortAgentName) {
         return { key, rec };
       }
@@ -1493,6 +1494,7 @@ function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = doc
     .filter(([containerName, record]) => (
       containerName !== '_config'
       && record?.type === 'agent'
+      && !isCanaryRecord(record)
       && !graphRegistryNames.has(containerName)
     ))
     .sort(([left], [right]) => left.localeCompare(right))
@@ -3270,7 +3272,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     let cfg = readRoutingConfig();
     cfg.routes = cfg.routes || {};
 
-    const allNames = Object.keys(reg || {}).filter((name) => name !== '_config');
+    const allNames = Object.keys(reg || {}).filter((name) => name !== '_config' && !isCanaryRecord(reg[name]));
     const graphWaves = topologicallyGroupDependencyGraph(dependencyGraph);
     const { noWait: noWaitNodeIds } = waitClassification;
     const graphRegistryNames = new Set();
@@ -3985,7 +3987,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
       // Resolve the current exact target only after that wait, before mutation.
       const refreshedAgents = loadAgentsMapImpl() || {};
       const matchesIdentity = (record) => (
-        record?.type === 'agent'
+        record?.type === 'agent' && !isCanaryRecord(record)
         && String(record.repoName || '') === repoName
         && String(record.agentName || '') === shortAgentName
         && String(record.alias || '') === expectedAlias

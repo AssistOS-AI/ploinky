@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import { readMpsStatus } from '../sandbox/hardwareLimits/mpsStatus.mjs';
 import { releaseMpsRuntimeOwner } from '../sandbox/hardwareLimits/mpsLifecycle.mjs';
 import { readAppliedObservation } from '../sandbox/hardwareLimits/runtimeState.mjs';
@@ -11,6 +12,7 @@ import { fileURLToPath } from 'url';
 import * as workspaceSvc from '../utils/workspace.js';
 import { REPOS_DIR, RUNNING_DIR } from '../utils/config.js';
 import { mergeRoutingConfig, mergeRuntimeRoute, readRoutingConfig } from './routingFile.js';
+import { loadRoutingConfig as loadActiveRoutingConfig } from './routingState.js';
 import {
     createWorkspaceMutationLease,
     inspectMaintenanceLock,
@@ -458,6 +460,13 @@ function activeProbeWorkerCount(monitor) {
     return count;
 }
 
+function primaryHasAllModeCanary(monitor, target) {
+    const routing = (monitor.loadActiveRoutingConfig || loadActiveRoutingConfig)();
+    return Object.values(routing.routes || {}).some((route) => (
+        route?.container === target.containerName && route.canary?.mode === 'all'
+    ));
+}
+
 // Withdraw only the failing runtime's routes from the active generation (D6).
 // Its drain owner admits the restart scheduled next; its identity stays valid
 // until that replacement commits. Contention defers the drain to a later tick
@@ -465,6 +474,18 @@ function activeProbeWorkerCount(monitor) {
 // other routes stay up. Only a withdrawal that cannot be proven falls back to
 // global inactivation (D7).
 function withdrawFailedRuntime(monitor, target) {
+    // An all-mode route is serving its canary. Only the promotion transaction
+    // may act on the primary's failed probe. Read the selected routing under
+    // the same lock as each potential withdrawal, including the fallback.
+    const withApplyLock = monitor.withEdgeGenerationApplyLock || withEdgeGenerationApplyLock;
+    const mutate = (callback) => withApplyLock((capability) => {
+        if (primaryHasAllModeCanary(monitor, target)) {
+            target.pendingScopedDrain = null;
+            return 'reported';
+        }
+        callback(capability);
+        return 'mutated';
+    });
     const owner = target.instanceId && target.enableGeneration
         ? Object.freeze({
             containerName: target.containerName,
@@ -475,13 +496,13 @@ function withdrawFailedRuntime(monitor, target) {
         : null;
     if (owner) {
         const commitWithdrawal = monitor.commitWithdrawalEdgeRoutingGeneration || commitWithdrawalEdgeRoutingGeneration;
-        const withApplyLock = monitor.withEdgeGenerationApplyLock || withEdgeGenerationApplyLock;
         try {
-            withApplyLock((applyLockCapability) => commitWithdrawal({
+            const action = mutate((applyLockCapability) => commitWithdrawal({
                 withdraw: [{ containerName: target.containerName, mode: 'drain', drainOwner: owner }],
                 reason: `continuous-runtime-probe-failed:${target.containerName}`,
                 applyLockCapability,
             }));
+            if (action === 'reported') return action;
             target.pendingScopedDrain = null;
             logEvent(monitor, 'warn', 'container_probe_routes_withdrawn', {
                 container: target.containerName,
@@ -522,8 +543,17 @@ function withdrawFailedRuntime(monitor, target) {
     }
     target.pendingScopedDrain = null;
     const inactivate = monitor.inactivateEdgeRoutingGeneration || inactivateEdgeRoutingGeneration;
+    // The fallback keeps its own lock and no preparation-lease check, as it
+    // did before canaries existed. The all-mode check runs inside that lock.
+    let heldForCanary = false;
     try {
-        inactivate(`continuous-runtime-probe-failed:${target.containerName}`);
+        inactivate(`continuous-runtime-probe-failed:${target.containerName}`, {
+            abortIf: () => {
+                heldForCanary = primaryHasAllModeCanary(monitor, target);
+                return heldForCanary;
+            },
+        });
+        if (heldForCanary) return 'reported';
     } catch (error) {
         logEvent(monitor, 'error', 'container_probe_inactivation_failed', {
             container: target.containerName,
@@ -547,7 +577,7 @@ function retryAutomaticDrain(monitor, target, routing) {
         if (pending.instanceId !== String(target.instanceId || '')
             || pending.enableGeneration !== String(target.enableGeneration || '')) {
             target.pendingScopedDrain = null;
-        } else if (withdrawFailedRuntime(monitor, target) === 'deferred') {
+        } else if (['deferred', 'reported'].includes(withdrawFailedRuntime(monitor, target))) {
             return true;
         }
     }
@@ -562,6 +592,15 @@ function retryAutomaticDrain(monitor, target, routing) {
     if (target.drainOwnerRetry?.ownerKey !== ownerKey) {
         target.drainOwnerRetry = { ownerKey, attempts: 0, exhaustedLogged: false };
     }
+    const probeFailure = drained.some((route) => route.drainOwner.reason === 'probe-failure');
+    if (probeFailure && primaryHasAllModeCanary(monitor, target)) {
+        if (!target.drainOwnerRetry.canaryHoldReported) {
+            logEvent(monitor, 'warn', 'container_probe_drain_held_for_canary', { container: target.containerName });
+            target.drainOwnerRetry.canaryHoldReported = true;
+        }
+        return true;
+    }
+    target.drainOwnerRetry.canaryHoldReported = false;
     if (target.drainOwnerRetry.attempts >= DRAIN_OWNER_RETRY_LIMIT) {
         if (!target.drainOwnerRetry.exhaustedLogged) {
             target.drainOwnerRetry.exhaustedLogged = true;
@@ -577,7 +616,7 @@ function retryAutomaticDrain(monitor, target, routing) {
     }
     target.drainOwnerRetry.attempts += 1;
     stopProbeWorker(target);
-    scheduleContainerRestart(monitor, target, 'drain_owner_retry');
+    scheduleContainerRestart(monitor, target, 'drain_owner_retry', { probeFailure });
     return true;
 }
 
@@ -599,8 +638,10 @@ function handleProbeFailure(monitor, target, message, { runtimeHealth = false } 
         failures: target.probeFailures
     });
     if (runtimeHealth) {
-        withdrawFailedRuntime(monitor, target);
-        scheduleContainerRestart(monitor, target, 'semantic_probe_failed');
+        const disposition = withdrawFailedRuntime(monitor, target);
+        if (disposition !== 'reported' && !(disposition === 'deferred' && primaryHasAllModeCanary(monitor, target))) {
+            scheduleContainerRestart(monitor, target, 'semantic_probe_failed');
+        }
     }
 }
 
@@ -1234,9 +1275,8 @@ export function syncManagedContainers(monitor) {
         return;
     }
 
-    const presentRegistryNames = new Set(Object.keys(agentsMap).filter((name) => (
-        name !== '_config' && !name.startsWith('_')
-    )));
+    const managedEntries = Object.entries(agentsMap).filter(([name, record]) => !name.startsWith('_') && !isCanaryRecord(record));
+    const presentRegistryNames = new Set(managedEntries.map(([name]) => name));
     pruneTerminalLedger(monitorRef, presentRegistryNames);
 
     let mpsStatus;
@@ -1266,9 +1306,8 @@ export function syncManagedContainers(monitor) {
     const readRouting = monitorRef.readRoutingConfig || readRoutingConfig;
     const routing = readRouting();
 
-    for (const [containerName, record] of Object.entries(agentsMap)) {
+    for (const [containerName, record] of managedEntries) {
         if (!record || typeof record !== 'object') continue;
-        if (containerName === '_config' || containerName.startsWith('_')) continue;
 
         const type = record.type || 'agent';
         if (type !== 'agent') continue;
@@ -1452,7 +1491,7 @@ export function syncManagedContainers(monitor) {
     }
 }
 
-function scheduleContainerRestart(monitor, target, reason) {
+function scheduleContainerRestart(monitor, target, reason, { probeFailure = reason === 'semantic_probe_failed' } = {}) {
     if (!monitor || !target) return;
     if (monitor.isShuttingDown()) return;
     if (target.circuitBreakerTripped || target.isRestarting || target.pendingRestartTimer) return;
@@ -1498,7 +1537,7 @@ function scheduleContainerRestart(monitor, target, reason) {
     if (attempt) target.attemptEpoch = attempt.epoch;
     target.pendingRestartTimer = setTimeout(() => {
         target.pendingRestartTimer = null;
-        performContainerRestart(monitor, target, reason, attempt).catch((error) => {
+        performContainerRestart(monitor, target, reason, attempt, { probeFailure }).catch((error) => {
             target.lastError = error?.message || error;
             if (!error || typeof error !== 'object' || !LOGGED_RESTART_FAILURES.has(error)) {
                 logEvent(monitor, 'error', 'container_restart_failed', {
@@ -1521,7 +1560,7 @@ function scheduleContainerRestart(monitor, target, reason) {
                 target.circuitBreakerTripped = true;
                 return;
             }
-            scheduleContainerRestart(monitor, target, 'restart_failed');
+            scheduleContainerRestart(monitor, target, 'restart_failed', { probeFailure });
         });
     }, backoff);
 }
@@ -2180,7 +2219,7 @@ async function abortFailedRestartPreparation(monitor, target, result, reason, or
     }
 }
 
-export async function performContainerRestart(monitor, target, reason, attempt = null) {
+export async function performContainerRestart(monitor, target, reason, attempt = null, { probeFailure = reason === 'semantic_probe_failed' } = {}) {
     if (!monitor || !target) return;
     if (!attempt && target.restartInputDigest && target.restartSnapshot) {
         attempt = Object.freeze({
@@ -2250,7 +2289,13 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         const restartRecord = attempt
             ? attempt.snapshot.registryRecord
             : loadAgents()?.[target.containerName];
-        if (shouldDeferForStartPredecessor(monitor, target, restartRecord)) {
+        // A failure queued during split may run after promotion switched to all.
+        if (probeFailure && primaryHasAllModeCanary(monitor, target)) {
+            logEvent(monitor, 'warn', 'container_probe_restart_held_for_canary', { container: target.containerName, reason });
+            target.isRestarting = false;
+            return;
+        }
+        if (isCanaryRecord(restartRecord) || shouldDeferForStartPredecessor(monitor, target, restartRecord)) {
             target.isRestarting = false;
             return;
         }

@@ -1,3 +1,4 @@
+import { isCanaryRecord } from '../../sandbox/canaryRecord.mjs';
 import fs from 'fs';
 import path from 'path';
 import { AsyncResource } from 'node:async_hooks';
@@ -561,7 +562,7 @@ function collectMarketplaceNoWaitStates(registry, {
 } = {}) {
     const states = new Map();
     for (const [containerName, record] of Object.entries(registry || {})) {
-        if (!record || record.type !== 'agent') continue;
+        if (!record || record.type !== 'agent' || isCanaryRecord(record)) continue;
         try {
             const observation = observeRecord(containerName, record, {
                 readRunMarker,
@@ -640,7 +641,7 @@ function readMarketplaceEnableModes(agent) {
 
 function enabledMarketplaceAgents(agentsRegistry) {
     return Object.entries(agentsRegistry)
-        .filter(([, record]) => record && record.type === 'agent')
+        .filter(([, record]) => record && record.type === 'agent' && !isCanaryRecord(record))
         .map(([containerName, record]) => ({
             repoName: String(record.repoName || ''),
             agentName: String(record.agentName || ''),
