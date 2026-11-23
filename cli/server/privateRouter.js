@@ -11,6 +11,7 @@ import { parseRouterOriginList } from '../../Agent/lib/routerOrigins.mjs';
 import {
     PRIVATE_ROUTER_AUDIENCE,
     agentExecConsumersOf,
+    principalHasEnabledIdentity,
     resolvePrivateCallerIdentity,
 } from '../sandbox/edgeGeneration.js';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
@@ -198,7 +199,12 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
         instanceId: untrusted?.instanceId,
         enableGeneration: untrusted?.enableGeneration,
     });
-    if (!current || !current.enableGeneration) throw unauthorized('private assertion caller is not currently enabled');
+    if (!current || !current.enableGeneration) {
+        if (principalHasEnabledIdentity(plan.snapshot, agentId)) {
+            throw unauthorized('private assertion instance or generation is stale');
+        }
+        throw unauthorized('private assertion caller is not currently enabled');
+    }
     // A refused or blocked caller keeps no relay authority (plan §9.4).
     // A lease that carries no effective availability cannot prove the caller available: deny. The
     // snapshot-only check applies only to a plan that has no lease at all.

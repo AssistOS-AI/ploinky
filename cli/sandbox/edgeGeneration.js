@@ -4666,6 +4666,14 @@ export function resolvePrivateCallerIdentity(snapshot, { agentId, instanceId, en
     return primary && matches(primary) ? primary : null;
 }
 
+// Whether the principal has any enabled identity at all, so a caller whose
+// tuple matches none of them is told its assertion is stale, as before.
+export function principalHasEnabledIdentity(snapshot, agentId) {
+    const pair = pairedRouteForPrincipal(snapshot, agentId);
+    if (pair) return !pair[1].disabled;
+    return Boolean(registeredPrimaryIdentity(snapshot, agentId)?.enableGeneration);
+}
+
 export function defaultEdgeDesiredStateBytes() {
     return Buffer.from(EMPTY_DESIRED_BYTES);
 }

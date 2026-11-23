@@ -656,7 +656,9 @@ test('EH.managed-adoption-expectation-equals-the-label-the-graph-and-the-closure
     assert.match(managerSource, /const expectedEnvHash = computeSemanticEnvHash\(payload\);/);
     assert.match(managerSource, /\['ploinky\.envhash'\][^;]*!== expectedEnvHash/);
     assert.match(managerSource, /hasExactManagedEnv\(record, expectedEnv\)/);
-    assert.match(managerSource, /\.\.\.managedControlEnv,\n\s*\}\);\n\s*const expectedMounts/);
+    assert.match(managerSource, /\.\.\.managedControlEnv,\n\s*\.\.\.\(existingRecord\.launchId \? buildAgentLaunchEnv\(existingRecord\.launchId\) : \{\}\),\n\s*\}\);\n\s*const expectedMounts/);
+    // The launch id is verified against the registry, not hashed (canary slice S3a).
+    assert.match(managerSource, /verifyRegisteredLaunchId\(existingRecord\.launchId, record\.Config\.Env, payload\.launchId\);/);
 });
 
 // ---------------------------------------------------------------------------

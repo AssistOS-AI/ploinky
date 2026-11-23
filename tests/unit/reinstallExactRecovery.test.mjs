@@ -14,6 +14,7 @@ const { resolveAgentRepositoryName } = await import('../../cli/utils/agentReposi
 const manager = await import('../../cli/sandbox/docker/agentServiceManager.js');
 const { removeExactRegisteredContainer } = await import('../../cli/sandbox/docker/containerFleet.js');
 const { loadAgentsMap } = await import('../../cli/sandbox/docker/common.js');
+const { isCanaryRecord } = await import('../../cli/sandbox/canaryRecord.mjs');
 const { readRuntimeCandidate, retireRuntimeCandidate } = await import('../../cli/sandbox/runtimeCandidateStore.js');
 const { readRuntimePredecessor, writeRuntimePredecessor, retireRuntimePredecessor } = await import('../../cli/sandbox/runtimePredecessorStore.js');
 const { NETWORK_LABELS, workspaceNetworkIdentity } = await import('../../cli/sandbox/networkIdentity.js');
@@ -72,7 +73,7 @@ function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = f
         HostConfig: { Init: true }, Mounts: [], State: { Running: false, ExitCode: 1 },
     };
     const removalContext = {
-        loadAgentsMap, readRuntimeCandidate, retireRuntimeCandidate,
+        loadAgentsMap, isCanaryRecord, readRuntimeCandidate, retireRuntimeCandidate,
         readRuntimePredecessor, retireRuntimePredecessor, structuredClone,
         getRuntime: () => 'podman',
         clearLivenessState: (name) => calls.push(['clear-liveness', name]),
