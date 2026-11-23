@@ -8,6 +8,7 @@ import {
     containerExists,
     getRuntime,
     isContainerRunning,
+    isPloinkyBoxRuntime,
     isSandboxRuntime,
     loadAgentsMap,
     probeContainerRuntime
@@ -24,6 +25,7 @@ import {
 } from '../networkLifecycle.js';
 import { assertExactContainerOwnership, IMMUTABLE_CONTAINER_ID } from './containerOwnership.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
+import { verifyRegisteredLaunchId } from '../../utils/security/agentIdentityEnv.js';
 import {
     buildGeneratedRouterDescriptorEnv,
     readVerifiedGeneratedRouterDescriptorFile,
@@ -392,6 +394,37 @@ function removeExactRegisteredContainer(name, record, options = {}) {
     return removeExactContainerAndDescriptor(name, record, runtime, {
         ...options,
         remove: true,
+    });
+}
+
+// Podman distinguishes a missing container (including exited containers in its
+// search) from an unavailable engine. Only the former proves retirement.
+export function inspectCanaryContainer(runtime, identifier) {
+    if (!isPloinkyBoxRuntime() || runtime !== 'podman' || getRuntime() !== runtime) {
+        throw new Error('canary teardown requires the recorded Podman runtime');
+    }
+    const result = runContainerControl(runtime, ['container', 'exists', identifier]);
+    if (result.error) throw result.error;
+    if (result.status === 1) return null;
+    if (result.status !== 0) throw new Error('could not determine canary container existence');
+    return inspectExactContainer(runtime, identifier);
+}
+
+export function removeCanaryContainer(name, record, { rolloutId, unpublished = false, onRecoveredIdentity }) {
+    const inspect = (runtime, id) => {
+        const container = inspectCanaryContainer(runtime, id);
+        if (!container) return null;
+        const env = inspectedEnvironment(container);
+        if (env.get('PLOINKY_CANARY') !== '1' || env.get('PLOINKY_CANARY_ROLLOUT') !== rolloutId) {
+            throw new Error('container does not belong to the recorded canary rollout');
+        }
+        const launchId = record.launchId || (unpublished && env.get('PLOINKY_LAUNCH_ID'));
+        if (!launchId) throw new Error('canary container lacks its launch identity');
+        verifyRegisteredLaunchId(launchId, container.Config?.Env);
+        return container;
+    };
+    return removeExactContainerAndDescriptor(name, record, record.runtime, {
+        inspect, recoverIncompleteIdentity: unpublished, onRecoveredIdentity,
     });
 }
 

@@ -6,11 +6,12 @@ import { debugLog, findAgent } from '../utils/utils.js';
 import { isKnownCommand } from './commandRegistry.js';
 import { showHelp } from './help.js';
 import { parseStatusOptions } from '../statusOptions.js';
-import { isDebugMode } from '../utils/config.js';
+import { isDebugMode, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import * as envSvc from '../utils/security/secretVars.js';
 import * as agentsSvc from '../utils/agents.js';
 import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../utils/status.js';
 import { runLogCommand } from './logCommands.js';
+import { hasOpenCanaries, reconcileCanaries } from '../sandbox/canary/teardown.mjs';
 import { runCanaryCommand } from './canaryCommand.js';
 import { activeForegroundSignal } from './foregroundCommand.js';
 import {
@@ -33,7 +34,14 @@ import {
     prepareTargetedAgentRestart,
     refreshRouteAgentPath,
 } from './targetedAgentRestart.js';
-import { withHeldOrAcquiredWorkspaceMutationLease, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
+import {
+    heldWorkspaceMutationLease,
+    inspectWorkspaceStartLock,
+    readWorkspaceOwnerIdentity,
+    withHeldOrAcquiredWorkspaceMutationLease,
+    withMaintenanceLock,
+} from '../utils/runtime/maintenanceLocks.js';
+import { isProcessAlive } from '../sandbox/processIdentity.js';
 import { reconcileExactHardwareInstance } from '../sandbox/hardwareLimits/reconcile.mjs';
 import { wrapPreservingHardwareCause } from '../sandbox/hardwareLimits/errors.mjs';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
@@ -59,6 +67,9 @@ import {
     enableRepo,
     disableRepo,
     uninstallRepo,
+    updateAllRepos,
+    updatePloinkyRepos,
+    updateRepoResult,
     enableAgent,
     findAgentManifest,
 } from './repoAgentCommands.js';
@@ -91,12 +102,16 @@ import {
     getValidProfiles,
     isValidProfile,
     resolveManifestRuntimeProfile,
-    setActiveProfile,
 } from '../utils/runtime/profileService.js';
 import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { runOuterRuntimeShell } from '../sandbox/runtimeShell.js';
 import { createNetworkLifecycleAdapter, withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
-import { inactivateEdgeRoutingGeneration, inactivateEdgeRoutingGenerationForStop } from '../sandbox/edgeGeneration.js';
+import {
+    edgePreparationOwnerStopped,
+    inactivateEdgeRoutingGeneration,
+    inactivateEdgeRoutingGenerationForStop,
+    readEdgeRoutingPreparationOwner,
+} from '../sandbox/edgeGeneration.js';
 
 // Restart acquires the workspace mutation lease before the per-runtime
 // maintenance lock (the same order as reinstall), so dependency preparation
@@ -106,6 +121,43 @@ function withRestartLocks(containerName, lockOptions, fn) {
         { operation: `${lockOptions?.operation || 'restart'}:${containerName}` },
         () => withMaintenanceLock(containerName, lockOptions, fn),
     );
+}
+
+// Stop is also recovery for an incomplete workspace start. A replacement
+// graph preparation fences canary admission while the live start (or the
+// Watchdog restarting an agent of a stopped start) holds the workspace lease.
+function canStopDuringWorkspaceStartRecovery() {
+    if (heldWorkspaceMutationLease()) return false;
+    const state = inspectWorkspaceStartLock();
+    if (!state.active || state.recoveryPending) return false;
+    const operation = state.lock?.operation;
+    if (operation !== 'workspace-start' && !operation?.startsWith('watchdog-restart:')) return false;
+    const identity = readWorkspaceOwnerIdentity(state.lock.ownerPid);
+    if (!isProcessAlive(state.lock.ownerPid) || !identity.scope || identity.scope !== state.lock.ownerIdentity.scope
+        || identity.startIdentity !== state.lock.ownerIdentity.startIdentity) return false;
+    const preparation = readEdgeRoutingPreparationOwner({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+    if (preparation?.mode !== 'replacement' || preparation.reason !== 'workspace-graph-enable-prelaunch') return false;
+    if (operation === 'workspace-start' && preparation.pid !== state.lock.ownerPid) return false;
+    if (operation !== 'workspace-start' && !edgePreparationOwnerStopped(preparation)) return false;
+    if (hasOpenCanaries({ workspaceRoot: PLOINKY_WORKSPACE_ROOT })) return false;
+    const current = inspectWorkspaceStartLock();
+    return current.active && !current.recoveryPending && current.lock?.token === state.lock.token;
+}
+
+function withReconciledWorkspace(reason, mutate) {
+    return withHeldOrAcquiredWorkspaceMutationLease({ operation: `workspace-${reason}` }, async () => {
+        await reconcileCanaries({ reason, workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+        return mutate?.();
+    });
+}
+
+// runUpdateCommand calls the selected handler after parsing and while its
+// workspace lease and structured error/report boundary are active.
+function afterCanaryUpdateReconciliation(handler) {
+    return async (...args) => {
+        await reconcileCanaries({ reason: 'update', workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+        return handler(...args);
+    };
 }
 
 let llmAgentsLoadPromise = null;
@@ -288,6 +340,11 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 return runUpdateCommand(normalizedOptions, {
                     agentLibBranchPolicy: updateBranchPolicy,
                     interactiveSession,
+                    handlers: {
+                        updateAllRepos: afterCanaryUpdateReconciliation(updateAllRepos),
+                        updatePloinkyRepos: afterCanaryUpdateReconciliation(updatePloinkyRepos),
+                        updateRepoResult: afterCanaryUpdateReconciliation(updateRepoResult),
+                    },
                 });
             }
         case 'reinstall': {
@@ -382,12 +439,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         }
         case 'start': {
             const startParsed = parseStartArgs(options);
-            if (startParsed.profile) {
-                const profileResult = setActiveProfile(startParsed.profile);
-                if (!profileResult.success) {
-                    throw new Error(profileResult.message);
-                }
-            }
             // The global --branch is applied to achillesAgentLib by the source
             // selector that runs before this command, which validates the local
             // checkout against it. Nothing here reconfigures an AgentLib dependency.
@@ -395,6 +446,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 enableAgent,
                 killRouterIfRunning,
                 branchPolicy: startParsed.branchPolicy,
+                profile: startParsed.profile,
+                withCanariesReconciled: (mutate) => withReconciledWorkspace('start', mutate),
             });
             break;
         }
@@ -683,34 +736,43 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     throw new Error('restart: start is not configured. Run: start <staticAgent> <port>');
                 }
                 resolvePersistedRouterPort();
+                // The generic settler refuses an abandoned additive lease.
+                // Recover a canary-owned publication before asking it to
+                // settle graph starts, then recheck under the stop lease.
+                await reconcileCanaries({ reason: 'restart', workspaceRoot: PLOINKY_WORKSPACE_ROOT });
                 await settleWorkspaceBeforeRestart();
-                inactivateEdgeRoutingGeneration('cli-workspace-restart');
-                console.log('[restart] Stopping Router and configured agents...');
-                killRouterIfRunning();
-                console.log('[restart] Stopping configured agent containers...');
-                const list = stopConfiguredAgents();
-                if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
-                else { console.log('[restart] No containers to stop.'); }
+                await withReconciledWorkspace('restart', () => {
+                    inactivateEdgeRoutingGeneration('cli-workspace-restart');
+                    console.log('[restart] Stopping Router and configured agents...');
+                    killRouterIfRunning();
+                    console.log('[restart] Stopping configured agent containers...');
+                    const list = stopConfiguredAgents();
+                    if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
+                    else { console.log('[restart] No containers to stop.'); }
+                });
                 console.log('[restart] Starting workspace...');
                 await startWorkspace(undefined, undefined, {
                     enableAgent,
                     killRouterIfRunning,
+                    withCanariesReconciled: (mutate) => withReconciledWorkspace('restart', mutate),
                 });
                 console.log('[restart] Done.');
             }
             break;
         }
         case 'shutdown': {
-            inactivateEdgeRoutingGeneration('cli-workspace-shutdown');
-            console.log('[shutdown] Stopping RoutingServer...');
-            killRouterIfRunning();
-            console.log('[shutdown] Removing workspace containers...');
-            const list = destroyWorkspaceContainers();
-            if (list.length) {
-                console.log('[shutdown] Removed containers:');
-                list.forEach(n => console.log(` - ${n}`));
-            }
-            console.log(`Destroyed ${list.length} containers from this workspace (per .ploinky/agents.json).`);
+            await withReconciledWorkspace('shutdown', () => {
+                inactivateEdgeRoutingGeneration('cli-workspace-shutdown');
+                console.log('[shutdown] Stopping RoutingServer...');
+                killRouterIfRunning();
+                console.log('[shutdown] Removing workspace containers...');
+                const list = destroyWorkspaceContainers();
+                if (list.length) {
+                    console.log('[shutdown] Removed containers:');
+                    list.forEach(n => console.log(` - ${n}`));
+                }
+                console.log(`Destroyed ${list.length} containers from this workspace (per .ploinky/agents.json).`);
+            });
             break;
         }
         case 'stop': {
@@ -721,27 +783,33 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             // Stop is the documented recovery, so this retirement never
             // refuses it; it only runs before the selector rewrite below.
             retireAbandonedStartPreparationBeforeStop();
-            const stopSelection = inactivateEdgeRoutingGenerationForStop('cli-workspace-stop');
-            if (stopSelection.preserved) {
-                console.log(`[stop] Kept the inactive routing selector of stopped workspace start pid ${stopSelection.pid}; the next start retires its preparation.`);
-            }
-            console.log('[stop] Stopping RoutingServer...');
-            killRouterIfRunning();
-            console.log('[stop] Stopping configured agent containers...');
-            const list = stopConfiguredAgents();
-            if (list.length) {
-                console.log('[stop] Stopped containers:');
-                list.forEach(n => console.log(` - ${n}`));
-            }
-            console.log(`Stopped ${list.length} configured agent containers.`);
+            const stop = () => {
+                const stopSelection = inactivateEdgeRoutingGenerationForStop('cli-workspace-stop');
+                if (stopSelection.preserved) {
+                    console.log(`[stop] Kept the inactive routing selector of stopped workspace start pid ${stopSelection.pid}; the next start retires its preparation.`);
+                }
+                console.log('[stop] Stopping RoutingServer...');
+                killRouterIfRunning();
+                console.log('[stop] Stopping configured agent containers...');
+                const list = stopConfiguredAgents();
+                if (list.length) {
+                    console.log('[stop] Stopped containers:');
+                    list.forEach(n => console.log(` - ${n}`));
+                }
+                console.log(`Stopped ${list.length} configured agent containers.`);
+            };
+            if (canStopDuringWorkspaceStartRecovery()) stop();
+            else await withReconciledWorkspace('stop', stop);
             break;
         }
         case 'destroy':
-            inactivateEdgeRoutingGeneration('cli-workspace-destroy');
-            console.log('[destroy] Stopping RoutingServer...');
-            killRouterIfRunning();
-            console.log('[destroy] Removing all workspace containers...');
-            await destroyAll();
+            await withReconciledWorkspace('destroy', async () => {
+                inactivateEdgeRoutingGeneration('cli-workspace-destroy');
+                console.log('[destroy] Stopping RoutingServer...');
+                killRouterIfRunning();
+                console.log('[destroy] Removing all workspace containers...');
+                await destroyAll();
+            });
             break;
         case 'logs':
             // One parser, resolver, and state machine serve the REPL and the
@@ -750,9 +818,11 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         case 'canary':
             return runCanaryCommand(options);
         case 'clean':
-            inactivateEdgeRoutingGeneration('cli-workspace-clean');
-            console.log('[clean] Removing all workspace containers...');
-            await destroyAll();
+            await withReconciledWorkspace('clean', async () => {
+                inactivateEdgeRoutingGeneration('cli-workspace-clean');
+                console.log('[clean] Removing all workspace containers...');
+                await destroyAll();
+            });
             break;
         case 'help':
             showHelp(options);
