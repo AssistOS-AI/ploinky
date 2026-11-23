@@ -252,7 +252,8 @@ try {
     started = true;
     runCli('start', ref, '8080');
     const primaryKey = snapshot().routing.routes[agent].container;
-    const old = snapshot().agents[primaryKey];
+    // A primary's port is kept on its route (routingFile.js); only canary records carry hostPort.
+    const old = { ...snapshot().agents[primaryKey], hostPort: snapshot().routing.routes[agent].hostPort };
     const primary = inspect(old.containerId);
     assert.match(old.launchId, /\S/);
     const home = mount(primary, '/root').Source;
