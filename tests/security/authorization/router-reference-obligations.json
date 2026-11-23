@@ -3705,6 +3705,123 @@
             "anchor": null,
             "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
           }
+        },
+        "57cff3f5d39128dc7f67a9e94eb1ac753bd809d77cfb4d0849f340486f30300b": {
+          "root.get": {
+            "line": 835,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "root-index.get": {
+            "line": 835,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "health.get": {
+            "line": 713,
+            "anchor": null,
+            "statement": "if (pathname === '/health') {"
+          },
+          "agent-card.get": {
+            "line": 802,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-card-slash.get": {
+            "line": 802,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "mcp-browser-client.get": {
+            "line": 535,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 535,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 803,
+            "anchor": null,
+            "statement": "} else if (agentName && isActiveAgentRootPlan(routePlan)) {"
+          },
+          "agent-mcp.post": {
+            "line": 808,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.get": {
+            "line": 808,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.delete": {
+            "line": 808,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-task-status.get": {
+            "line": 671,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-status-alias.get": {
+            "line": 671,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-cancel.post": {
+            "line": 615,
+            "anchor": null,
+            "statement": "} else if (isDelegatedAgentTaskCancelRoute) {"
+          },
+          "agent-openai.post": {
+            "line": 814,
+            "anchor": null,
+            "statement": "if (isDelegatedAgentOpenAi) {"
+          },
+          "agent-root-websocket.get": {
+            "line": 1100,
+            "anchor": null,
+            "statement": "const handled = await handleAgentRootUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 1059,
+            "anchor": null,
+            "statement": "if (routePlan.kind === 'agent-port') {"
+          },
+          "internal-agent-control.*": {
+            "line": 550,
+            "anchor": null,
+            "statement": "if (hasInternalAgentSegment(pathname)) {"
+          },
+          "reserved--metrics.*": {
+            "line": 847,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--health-internal.*": {
+            "line": 847,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin.*": {
+            "line": 847,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin-*.*": {
+            "line": 847,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "unix-health.get": {
+            "line": 1010,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          }
         }
       },
       "candidate": "27fb848deaa7824177c9fb16cc265da2b9bb9cc919021fcaacb18580026596a9"
@@ -4555,6 +4672,38 @@
             "anchor": "async function serveAgentStaticRequest(req, res, {",
             "statement": "async function serveAgentStaticRequest(req, res, {"
           }
+        },
+        "920053539940b52767d7583b2ae83f235409f3370b03ee73e99ab2cc84e12aad": {
+          "web-libs.get": {
+            "line": 837,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "web-libs.head": {
+            "line": 837,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "workspace-file-read.get": {
+            "line": 801,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "workspace-file-read.head": {
+            "line": 801,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "agent-static.get": {
+            "line": 956,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          },
+          "agent-static.head": {
+            "line": 956,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          }
         }
       },
       "candidate": "c347aa275550b2eeb89299fd187f4d739d0bfa6fddc32a4a9062f0cdd263479a"
@@ -5348,6 +5497,73 @@
             "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
             "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
           }
+        },
+        "b1bf14609feb68024b9a78f9288cd21eec49eca8fcbe1fdc926c2cc2aa754d1d": {
+          "webchat-ui.get": {
+            "line": 296,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-ui-no-slash.get": {
+            "line": 296,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-index.get": {
+            "line": 296,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-assets.get": {
+            "line": 232,
+            "anchor": "pathname.startsWith('/assets/')",
+            "statement": "if (pathname.startsWith('/assets/')) {"
+          },
+          "webchat-removed-token-auth.post": {
+            "line": 222,
+            "anchor": "pathname === '/auth'",
+            "statement": "if (pathname === '/auth' && req.method === 'POST') {"
+          },
+          "webchat-logout.post": {
+            "line": 230,
+            "anchor": "pathname === '/logout'",
+            "statement": "if (pathname === '/logout' && req.method === 'POST') return handleLogout(req, res, appState, agentQuery);"
+          },
+          "webchat-suggestions.get": {
+            "line": 263,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-suggestions.head": {
+            "line": 263,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-upload.post": {
+            "line": 267,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-upload.put": {
+            "line": 267,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-directories-list.get": {
+            "line": 280,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-list.head": {
+            "line": 280,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-create.post": {
+            "line": 286,
+            "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
+            "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
+          }
         }
       },
       "candidate": "2874a4e81aec3efb6527338dec777dedd997ec7ec0c4980e6fc118161b6fd45d"
@@ -5614,6 +5830,28 @@
             "anchor": null,
             "statement": "if (pathname === '/interaction' && req.method === 'POST') {"
           }
+        },
+        "ca0c6c79b29f748f4cc6f037c7a9ed462ddebfca854d48e2c4480a79c359db0b": {
+          "webchat-stream.get": {
+            "line": 164,
+            "anchor": null,
+            "statement": "if (pathname === '/stream') {"
+          },
+          "webchat-input.post": {
+            "line": 352,
+            "anchor": null,
+            "statement": "if (pathname === '/input' && req.method === 'POST') {"
+          },
+          "webchat-control.post": {
+            "line": 427,
+            "anchor": null,
+            "statement": "if (pathname === '/control' && req.method === 'POST') {"
+          },
+          "webchat-interaction.post": {
+            "line": 457,
+            "anchor": null,
+            "statement": "if (pathname === '/interaction' && req.method === 'POST') {"
+          }
         }
       },
       "candidate": "894d28dbcd19dc51b2393a7f34b0a06d9c4e40804cb4a81460ff65f5131ed17f"
@@ -5779,6 +6017,33 @@
           },
           "private-turn-credentials.post": {
             "line": 938,
+            "anchor": "pathname === '/api/edge/turn-credentials'",
+            "statement": "if (pathname === '/api/edge/turn-credentials') {"
+          }
+        },
+        "5ad000ecba5e425c38ce2a8df543ec82ab35337ebd9db699e68eea710217831d": {
+          "agent-additional-http.*": {
+            "line": 217,
+            "anchor": "function agentPortPlan({",
+            "statement": "export function agentPortPlan({"
+          },
+          "private-workspace-logs.post": {
+            "line": 888,
+            "anchor": "pathname === '/api/edge/workspace-logs'",
+            "statement": "if (pathname === '/api/edge/workspace-logs') {"
+          },
+          "private-workspace-metrics.get": {
+            "line": 906,
+            "anchor": "pathname === '/api/edge/workspace-metrics'",
+            "statement": "if (pathname === '/api/edge/workspace-metrics') {"
+          },
+          "private-runtime-origins.get": {
+            "line": 924,
+            "anchor": "pathname === '/api/edge/runtime-origins'",
+            "statement": "if (pathname === '/api/edge/runtime-origins') {"
+          },
+          "private-turn-credentials.post": {
+            "line": 945,
             "anchor": "pathname === '/api/edge/turn-credentials'",
             "statement": "if (pathname === '/api/edge/turn-credentials') {"
           }

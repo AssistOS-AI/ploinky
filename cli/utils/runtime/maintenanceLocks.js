@@ -8,7 +8,8 @@ import { execFileSync } from 'child_process';
 import { readProcessStartIdentity } from '../../sandbox/processIdentity.js';
 import { assertHostLaunchLockOrder } from '../../sandbox/hostLaunchExclusionState.js';
 
-import { RUNNING_DIR } from '../config.js';
+import { PLOINKY_WORKSPACE_ROOT, RUNNING_DIR } from '../config.js';
+import { canaryWorkspaceOwner } from '../../sandbox/canary/preparation.mjs';
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -95,10 +96,10 @@ function workspaceOwnerIsActive(lock) {
     return expected.startIdentity === current.startIdentity;
 }
 
-function lockSnapshot(filePath) {
+function lockSnapshot(filePath, { requireOwnerRead = false } = {}) {
     try {
         const stat = fs.lstatSync(filePath);
-        if (!stat.isFile() || stat.isSymbolicLink()) {
+        if (!stat.isFile() || stat.isSymbolicLink() || (requireOwnerRead && !(stat.mode & 0o400))) {
             return {
                 filePath,
                 lock: null,
@@ -122,6 +123,14 @@ function lockSnapshot(filePath) {
         if (error?.code === 'ENOENT') return null;
         throw error;
     }
+}
+
+// Observe without reclaiming or renewing any workspace owner's lease. A
+// canary-start writer does not renew/rewrite its published lock. Before its
+// initial JSON is complete it cannot have passed the check for our reader.
+export function canaryStartMayBeInFlight() {
+    const snapshot = lockSnapshot(WORKSPACE_START_LOCK_PATH, { requireOwnerRead: true });
+    return snapshot?.lock?.operation === 'canary-start' && workspaceOwnerIsActive(snapshot.lock);
 }
 
 function removeSnapshot(snapshot, token = null) {
@@ -198,6 +207,7 @@ function createWorkspaceMutationLease({
     const now = Date.now();
     const lock = {
         operation,
+        ...(operation === 'canary-start' ? { canaryOwner: canaryWorkspaceOwner(PLOINKY_WORKSPACE_ROOT) } : {}),
         ...(requireQuiescenceOnOwnerDeath ? { requireQuiescenceOnOwnerDeath: true } : {}),
         ownerPid: process.pid,
         ownerIdentity: readWorkspaceOwnerIdentity(process.pid),
@@ -216,14 +226,18 @@ function createWorkspaceMutationLease({
         throw error;
     }
     OWNED_WORKSPACE_LEASES.add(lock);
+    // Stopped-Box cleanup may retire an incomplete lock before our initial
+    // write finishes. Only its published, still-selected token can admit us.
+    if (operation === 'canary-start') assertWorkspaceMutationLease(lock);
     return lock;
 }
 
 export function assertWorkspaceMutationLease(lease, { runningDir = RUNNING_DIR } = {}) {
-    const current = lockSnapshot(WORKSPACE_START_LOCK_PATH)?.lock;
+    const current = lockSnapshot(WORKSPACE_START_LOCK_PATH, { requireOwnerRead: lease?.operation === 'canary-start' })?.lock;
     if (!OWNED_WORKSPACE_LEASES.has(lease)
         || path.resolve(runningDir) !== path.resolve(RUNNING_DIR)
-        || current?.token !== lease.token || current?.ownerPid !== process.pid || current?.recoveryRequired) {
+        || current?.token !== lease.token || current?.ownerPid !== process.pid || current?.recoveryRequired
+        || (lease.operation === 'canary-start' && (current.operation !== lease.operation || current.canaryOwner !== lease.canaryOwner))) {
         const error = new Error('workspace mutation requires its exact live workspace lease');
         error.code = 'PLOINKY_WORKSPACE_MUTATION_CAPABILITY_REQUIRED';
         throw error;

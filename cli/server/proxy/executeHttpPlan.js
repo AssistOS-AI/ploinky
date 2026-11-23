@@ -202,22 +202,26 @@ function readBoundedBody(req, limit) {
     };
 }
 
-export function proxyErrorStatus(error) {
+export function isCanaryProxyError(plan, error) {
+    return Boolean(plan?.route?.canary || String(error?.code || '').startsWith('CANARY_'));
+}
+
+export function proxyErrorStatus(error, plan) {
     if (error?.code === 'PROTOCOL_REJECTED') return 400;
     // A guest request refused before any relay is asked for: no usable transport source, or no route scope.
     if (error?.code === 'INVALID_RATE_SOURCE') return error.statusCode === 503 ? 503 : 400;
     if (error?.code === 'METHOD_REJECTED') return 405;
     if (error?.code === 'REQUEST_TOO_LARGE') return 413;
     if (['AUTH_REQUIRED', 'ORIGIN_REJECTED', 'CSRF_REJECTED'].includes(error?.code)) return 403;
-    if (['EDGE_GENERATION_CHANGED', 'RELAY_BUSY', 'ROUTING_UNAVAILABLE', 'CANARY_SELECTION_CHANGED'].includes(error?.code)
-        || error?.status === 503
+    if (['EDGE_GENERATION_CHANGED', 'RELAY_BUSY', 'ROUTING_UNAVAILABLE'].includes(error?.code)
+        || (isCanaryProxyError(plan, error) && (error?.status === 503 || error?.code === 'CANARY_SELECTION_CHANGED'))
         || /lease|concurrenc|routing unavailable/i.test(String(error?.message || ''))) return 503;
     if (error?.code === 'TARGET_TIMEOUT'
         || /timeout|lifetime exceeded/i.test(String(error?.message || ''))) return 504;
     return 502;
 }
 
-function sendError(res, error, { abandonedRequest } = {}) {
+function sendError(res, error, { plan, abandonedRequest } = {}) {
     let closeTimer;
     const closeRequest = () => {
         clearTimeout(closeTimer);
@@ -234,9 +238,9 @@ function sendError(res, error, { abandonedRequest } = {}) {
         closeRequest();
         return;
     }
-    const status = proxyErrorStatus(error);
+    const status = proxyErrorStatus(error, plan);
     const headers = { 'content-type': 'application/json', 'cache-control': 'no-store' };
-    if (status === 503) headers['retry-after'] = '1';
+    if (status === 503 && isCanaryProxyError(plan, error)) headers['retry-after'] = '1';
     if (abandonedRequest && !abandonedRequest.complete && !abandonedRequest.destroyed) {
         headers.connection = 'close';
         res.shouldKeepAlive = false;
@@ -312,7 +316,7 @@ export async function dispatchAgentRootHttp({ req, res, plan, taskId, agentBody,
         return await withSelectedRoot({ plan, req: agentBody === undefined ? req : undefined, taskId }, async (selection, check) => {
             if (agentBody === undefined && !taskId && await serveAgentStaticRequest(req, res, {
                 routeKey: plan.routeKey, hostPath: selection.route.hostPath,
-                confinedExport: selection.copy === 'canary', beforeRead: check,
+                confinedExport: selection.copy === 'canary', beforeRead: check, canaryRoute: Boolean(plan.route?.canary),
                 beforeServe: plan.route?.canary ? check : undefined,
             })) return;
             const headers = headersForSelection(selection);
@@ -358,8 +362,9 @@ export async function dispatchAgentRootHttp({ req, res, plan, taskId, agentBody,
     } catch (error) {
         if (!error.status) throw error;
         res.writeHead(error.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store',
-            ...(error.status === 503 ? { 'Retry-After': '1' } : {}) });
-        res.end(JSON.stringify({ error: error.message }));
+            ...(error.status === 503 && isCanaryProxyError(plan, error) ? { 'Retry-After': '1' } : {}) });
+        res.end(JSON.stringify({ error: error.message,
+            ...(error.code === 'CANARY_TASK_INVOCATION_UNAVAILABLE' && { code: error.code }) }));
     }
 }
 
@@ -699,7 +704,7 @@ export async function executeHttpPlan({
             outcome: 'failure',
             startedAt,
             error,
-            status: proxyErrorStatus(error),
+            status: proxyErrorStatus(error, plan),
             upstreamStatus: responseStatus,
             requestBytes,
             responseBytes,
@@ -711,6 +716,7 @@ export async function executeHttpPlan({
         closeCheckout(channel);
         lease?.release?.();
         sendError(res, error, {
+            plan,
             abandonedRequest: bodyReader?.shouldCloseAfterResponse() ? req : undefined,
         });
         return false;

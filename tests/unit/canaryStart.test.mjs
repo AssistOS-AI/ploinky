@@ -128,6 +128,20 @@ for (const nested of [true, false]) {
     });
 }
 
+for (const directory of ['codeDir', 'skillsDir']) {
+    test('export refuses a tracked file omitted by export-ignore in ' + directory, t => {
+        const f = fixture(t, { change: dirs => {
+            write(path.join(dirs[directory], 'rules/.gitattributes'), 'required export-ignore\n');
+            write(path.join(dirs[directory], 'rules/required'), 'required by the candidate');
+        } });
+        const source = inspectCanarySource(f);
+        try {
+            assert.throws(() => exportCanarySource({ ...f, source }), /archive paths differ/);
+            assert.equal(fs.existsSync(path.join(f.workspaceRoot, '.ploinky/canary/alpha', f.commit)), false);
+        } finally { removeCanaryExport(f); }
+    });
+}
+
 test('source preflight refuses dirty, changed manifest, sibling changes and a non-fast-forward', t => {
     const f = fixture(t);
     write(path.join(f.repoRoot, 'untracked'), 'local work');
@@ -248,8 +262,8 @@ test('network preflight rejects the alias of an existing or stopped member befor
     assert.equal(preflight().alias, alias);
 });
 
-async function activeFixture(t) {
-    const f = fixture(t);
+async function activeFixture(t, { withSibling = false, ...sourceOptions } = {}) {
+    const f = fixture(t, sourceOptions);
     const edge = await import('../../cli/sandbox/edgeGeneration.js');
     const { readReceipt } = await import('../../cli/sandbox/canary/receipt.mjs');
     const old = {
@@ -259,8 +273,15 @@ async function activeFixture(t) {
     };
     const route = { repo: 'fixtures', agent: 'alpha', container: 'primary', hostPath: f.agentPath, hostPort: old.hostPort };
     const data = path.join(f.workspaceRoot, '.ploinky');
-    write(path.join(data, 'routing.json'), JSON.stringify({ port: 8080, routes: { alpha: route } }));
-    write(path.join(data, 'agents.json'), JSON.stringify({ primary: old }));
+    const routes = { alpha: route };
+    const agents = { primary: old };
+    if (withSibling) {
+        routes.beta = { ...route, agent: 'beta', container: 'secondary', hostPath: f.siblingDirs[0], hostPort: 42103 };
+        agents.secondary = { ...old, agentName: 'beta', instanceId: 'beta-instance', enableGeneration: 'beta-enabled',
+            containerId: 'c'.repeat(64), launchId: 'launch-beta', hostPort: 42103 };
+    }
+    write(path.join(data, 'routing.json'), JSON.stringify({ port: 8080, routes }));
+    write(path.join(data, 'agents.json'), JSON.stringify(agents));
     write(path.join(data, 'data/edge-routing/desired.json'), JSON.stringify({
         hosts: { 'app.example.com': { agent: 'fixtures/alpha' } }, cloudflare: { tunnelTokenSecret: 'cloudflare/tunnel-token' },
     }));
@@ -320,6 +341,52 @@ async function activeFixture(t) {
     return { f, deps, receipt, active, old, calls, nextId, nextLaunch,
         args: { workspaceRoot: f.workspaceRoot, agentRef: 'fixtures/alpha', commit: f.commit, share: 0, testAccounts: ['tester'] } };
 }
+
+test('start refuses ineligible launches before opening a receipt', async t => {
+    const { startCanary } = await import('../../cli/sandbox/canary/start.mjs');
+    const cases = [
+        { name: 'no manifest declaration', options: { manifest: {} }, error: /no canary probe/ },
+        { name: 'changed candidate manifest', options: {
+            change: ({ manifestPath }) => write(manifestPath, '{}'),
+        }, error: /manifest differs/ },
+        { name: 'non-fast-forward commit', setup: f => git(f.repoRoot, 'commit', '--allow-empty', '-qm', 'diverged'),
+            error: /fast-forward/ },
+        { name: 'changed deployed sibling', options: { withSibling: true,
+            change: ({ sibling }) => write(path.join(sibling, 'change'), 'new'),
+        }, error: /another deployed agent/ },
+        { name: 'insufficient memory', admission: { availableMemoryBytes: 999 }, error: /headroom/ },
+        { name: 'dirty repository', setup: f => write(path.join(f.repoRoot, 'untracked'), 'local'), error: /uncommitted/ },
+        { name: 'missing inventory row', admission: { inventoryRow: null }, error: /eligible inventory row/ },
+        { name: 'unconfirmed cache', admission: { cacheConfirmation: '' }, error: /cache precondition/ },
+    ];
+    for (const scenario of cases) {
+        await t.test(scenario.name, async t => {
+            const { f, args, deps, active, receipt, calls } = await activeFixture(t, scenario.options);
+            scenario.setup?.(f);
+            if (scenario.admission) deps.admission = () => ({ ...accepted, ...scenario.admission });
+            const predecessor = active();
+            await assert.rejects(startCanary(args, deps), scenario.error);
+            assert.equal(receipt(), null);
+            assert.deepEqual(calls, []);
+            assert.deepEqual(active(), predecessor);
+        });
+    }
+});
+
+test('an active canary on another route refuses start and leaves both receipts untouched', async t => {
+    const { startCanary } = await import('../../cli/sandbox/canary/start.mjs');
+    const { readReceipt } = await import('../../cli/sandbox/canary/receipt.mjs');
+    const { f, args, deps, active, receipt } = await activeFixture(t, { withSibling: true });
+    try {
+        await startCanary(args, deps);
+        const alphaReceipt = receipt();
+        const predecessor = active();
+        await assert.rejects(startCanary({ ...args, agentRef: 'fixtures/beta' }, deps), /already has a canary/);
+        assert.equal(readReceipt('beta', f), null);
+        assert.deepEqual(receipt(), alphaReceipt);
+        assert.deepEqual(active(), predecessor);
+    } finally { removeCanaryExport(f); }
+});
 
 test('start publishes both members only after the exact runtime passes readiness and probe', async t => {
     const { startCanary, changeCanary, abortCanary } = await import('../../cli/sandbox/canary/start.mjs');

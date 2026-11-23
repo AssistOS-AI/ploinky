@@ -131,6 +131,7 @@ function checkTree(repo, tree) {
     if (git(repo, 'cat-file', '-t', tree).toString().trim() !== 'tree') throw new Error('canary source must be a tree');
     const entries = new TextDecoder('utf-8', { fatal: true }).decode(git(repo, 'ls-tree', '-rzt', tree));
     const names = new Set();
+    const paths = new Set();
     for (const line of entries.split('\0').filter(Boolean)) {
         const tab = line.indexOf('\t');
         const name = line.slice(tab + 1);
@@ -140,18 +141,34 @@ function checkTree(repo, tree) {
             throw new Error('unsafe path, collision or unsupported entry in canary archive');
         }
         names.add(key);
+        paths.add(name);
+    }
+    return paths;
+}
+
+// Compare the original ls-tree names, including directories, before adding
+// synthetic mountpoints. git archive can silently omit tracked entries.
+function verifyArchivePaths(target, expected, relative = '') {
+    for (const entry of fs.readdirSync(path.join(target, relative), { withFileTypes: true })) {
+        const name = path.posix.join(relative, entry.name);
+        if (!expected.delete(name)) throw new Error('canary archive paths differ from the Git tree: ' + name);
+        if (entry.isDirectory()) verifyArchivePaths(target, expected, name);
+    }
+    if (!relative && expected.size) {
+        throw new Error('canary archive paths differ from the Git tree: missing ' + expected.values().next().value);
     }
 }
 
 function extractTree(source, relative, target, archive) {
     const tree = git(source.repoRoot, 'rev-parse', '--verify', source.commit + ':' + relative).toString().trim();
-    checkTree(source.repoRoot, tree);
+    const paths = checkTree(source.repoRoot, tree);
     fs.mkdirSync(target, { mode: 0o700 });
     git(source.repoRoot, 'archive', '--format=tar', '--output=' + archive, tree);
     execFileSync('tar', ['-xf', archive, '-C', target], {
         env: { PATH: process.env.PATH, LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     fs.unlinkSync(archive);
+    verifyArchivePaths(target, paths);
 }
 
 // AgentServer searches the shared HOME when /code has no readable config.

@@ -9,7 +9,8 @@ const exec = promisify(execFile);
 // Inspect one immutable ID. Engine output contains the process environment and must never escape in diagnostics.
 export async function inspectWebchatLaunch(target, run = exec) {
     const record = target.targetRecord;
-    if (!record?.launchId || !OCI_LOG_RUNTIMES.includes(record.runtime) || !IMMUTABLE_CONTAINER_ID.test(record.containerId)) {
+    if (!record || (target.selection?.copy !== 'old' && !record.launchId)
+        || !OCI_LOG_RUNTIMES.includes(record.runtime) || !IMMUTABLE_CONTAINER_ID.test(record.containerId)) {
         throw new Error('WebChat requires an exact managed launch');
     }
     try {

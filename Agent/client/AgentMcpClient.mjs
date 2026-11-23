@@ -12,6 +12,7 @@ import https from 'node:https';
 
 import { signAgentAssertion, signAgentHttpAssertion } from '../lib/agentAssertion.mjs';
 import { projectContinuationTools, isContinuationToolAlias } from '../lib/taskContinuationOrigin.mjs';
+import { parseCanaryTaskId } from '../lib/canaryTaskId.mjs';
 import { OPENAI_MODELS_PATH, OPENAI_MODELS_TOOL } from '../lib/invocationAuth.mjs';
 import {
     assertVerifiedGeneratedRouterDescriptor,
@@ -72,6 +73,10 @@ const TASK_POLL_INTERVAL_MS = (() => {
 })();
 
 let taskObserver = null;
+
+function observesCanaryTask(taskId) {
+    return taskObserver && (process.env.PLOINKY_CANARY === '1' || parseCanaryTaskId(taskId));
+}
 
 function normalizeCallTimeout(value) {
     const parsed = Number(value);
@@ -356,7 +361,7 @@ function getTaskStatus(agentName, taskId, descriptor, timeoutMs = DEFAULT_CALL_T
                     return;
                 }
                 const task = json.task || json;
-                resolve(taskObserver ? projectContinuationTools(task) : task);
+                resolve(observesCanaryTask(normalizedTaskId) ? projectContinuationTools(task) : task);
             });
         });
         req.on('error', (error) => {
@@ -456,7 +461,7 @@ function cancelTask(agentName, taskId, descriptor) {
                     reject(new Error(json?.reason || json?.error || `agent task cancel failed (status ${res.statusCode})`));
                     return;
                 }
-                resolve(taskObserver ? projectContinuationTools(json.task) : json.task);
+                resolve(observesCanaryTask(normalizedTaskId) ? projectContinuationTools(json.task) : json.task);
             });
         });
         req.on('error', reject);
@@ -792,7 +797,7 @@ export async function createAgentClient(agentName, options = {}) {
             result,
             agentName,
             taskId,
-            toolName: isContinuationToolAlias(name) ? name : metadata?.toolName || name,
+            toolName: observesCanaryTask(taskId) && isContinuationToolAlias(name) ? name : metadata?.toolName || name,
             toolArgs,
             metadata,
             descriptorProvider: descriptorForRequest,

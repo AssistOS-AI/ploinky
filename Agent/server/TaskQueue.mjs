@@ -2,7 +2,9 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describeShellFailure } from '../lib/toolError.mjs';
+import { ROLLOUT_ID_RE } from '../lib/canaryTaskId.mjs';
 import { createTaskControlStream } from './taskControlStream.mjs';
+export { parseCanaryTaskId } from '../lib/canaryTaskId.mjs';
 
 const DEFAULT_MAX_LOG_TAIL_BYTES = 128 * 1024;
 const DEFAULT_CANCEL_GRACE_MS = 2000;
@@ -14,16 +16,6 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const DEFAULT_PERSIST_DEBOUNCE_MS = 100;
 const DEFAULT_TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_TERMINAL_TASKS = 500;
-const ROLLOUT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-
-/** Return the rollout ID from canary.<rolloutId>.<16 hex digits>, or null for other task IDs. */
-export function parseCanaryTaskId(taskId) {
-    if (typeof taskId !== 'string' || !taskId.startsWith('canary.')) return null;
-    const separator = taskId.lastIndexOf('.');
-    const rolloutId = taskId.slice('canary.'.length, separator);
-    const nonce = taskId.slice(separator + 1);
-    return ROLLOUT_ID_RE.test(rolloutId) && /^[a-f0-9]{16}$/.test(nonce) ? rolloutId : null;
-}
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);

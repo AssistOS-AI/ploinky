@@ -125,3 +125,12 @@ test('client destroyed before the upstream upgrade writes no 101 and destroys th
     assert.deepEqual(uncaught.map(error => error.message), []);
     assert.equal(Buffer.concat(written).toString('utf8').includes('101'), false);
 });
+
+test('an unavailable agent-root WebSocket keeps the no-canary wire response', async () => {
+    const chunks = [];
+    const socket = new Duplex({ read() {}, write(chunk, _, done) { chunks.push(chunk); done(); } });
+    const handled = await handleAgentRootUpgrade({ req: upgradeRequest(), socket, head: Buffer.alloc(0),
+        parsedUrl: new URL('http://localhost/ws'), routePlan: agentRootPlan(0) });
+    assert.equal(handled, true);
+    assert.equal(Buffer.concat(chunks).toString(), 'HTTP/1.1 503 Service Unavailable\r\n\r\n');
+});

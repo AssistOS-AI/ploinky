@@ -85,7 +85,7 @@ import { isRouteMount } from './utils/routeMounts.js';
 // New modular components
 import {
     agentSessionStore,
-    buildInvocationContextForProviderCall,
+    delegatedTaskStatusHeaders,
     handleDelegatedAgentTaskCancel,
     handleAgentMcpRequest,
     readAuthenticatedAgentTask,
@@ -604,6 +604,7 @@ async function processRequest(req, res) {
     });
     if (startupHandled) return;
 
+    let ordinaryTaskHeaders;
     if (routedAggregateAgentCard) {
         // Public aggregate route
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
@@ -633,6 +634,12 @@ async function processRequest(req, res) {
                 taskId,
                 path: statusPath,
             });
+            if (!route.canary) {
+                ordinaryTaskHeaders = delegatedTaskStatusHeaders({
+                    req, agentName, taskId, path: statusPath, snapshot: routePlan.snapshot,
+                    selection: { route, targetRecord: routePlan.snapshot.agents?.[route.container] },
+                });
+            }
         } catch (error) {
             sendJsonResponse(res, 401, {
                 error: 'delegated_task_status_rejected',
@@ -816,12 +823,9 @@ async function processRequest(req, res) {
         return dispatchAgentRootHttp({ req, res, plan: routePlan, taskId, headersForSelection: selection => {
             const headers = { ...buildIdentityHeaders(req), ...buildTrustedForwardingHeaders(routePlan) };
             if (isDelegatedAgentTaskStatusRoute) {
-                const ctx = buildInvocationContextForProviderCall({
-                    req, agentName, route: selection.route, targetRecord: selection.targetRecord, snapshot: routePlan.snapshot,
-                    toolName: '__task_status__', toolArgs: { taskId }, method: 'GET', path: pathOnly(agentProxyPath),
-                });
-                if (!ctx?.token) throw new Error('missing task invocation');
-                headers.authorization = `Bearer ${ctx.token}`;
+                Object.assign(headers, ordinaryTaskHeaders ?? delegatedTaskStatusHeaders({
+                    req, agentName, selection, snapshot: routePlan.snapshot, taskId, path: pathOnly(agentProxyPath),
+                }));
             }
             return headers;
         } });

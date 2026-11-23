@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { PloinkyBoxError } from './errors.mjs';
+import { snapshotBoxCanaryPreparations } from '../cli/sandbox/canary/preparation.mjs';
 
 const HELPER_PATH = fileURLToPath(import.meta.url);
 const MARKER_SUFFIX = '.current.json';
@@ -61,15 +62,46 @@ function inspectStartLock(workspaceRoot) {
     return stat;
 }
 
-function retireStartLock(workspaceRoot, before) {
-    const after = inspectStartLock(workspaceRoot);
+function assertSameStartLock(before, after) {
     if (Boolean(before) !== Boolean(after) || (before && ['dev', 'ino', 'mode', 'uid', 'nlink', 'size', 'mtimeMs', 'ctimeMs']
         .some((key) => before[key] !== after[key]))) {
         throw cleanupError('The destroyed Box workspace mutation lock changed during cleanup');
     }
-    // The exact Box is stopped or absent: its workers are gone. Never probe or signal
-    // a recorded PID in the host namespace, whatever owner record the lease carries.
-    if (after) fs.unlinkSync(path.join(workspaceRoot, '.ploinky', 'running', 'workspace-start.json'));
+}
+
+function canaryWriterBelongsElsewhere(file, stat, identity) {
+    // Canary-start publishes only fixed owner, token and timestamp metadata.
+    // Its capability requires owner-read permission. Keep legacy retirement
+    // independent of file read access when the mode rules out such a writer.
+    if (!(stat.mode & 0o400) || !stat.size || stat.size > 64 * 1024) return false;
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    try {
+        assertSameStartLock(stat, fs.fstatSync(fd));
+        const bytes = Buffer.alloc(stat.size);
+        let offset = 0;
+        while (offset < bytes.length) {
+            const count = fs.readSync(fd, bytes, offset, bytes.length - offset, offset);
+            if (!count) throw cleanupError('The destroyed Box workspace mutation lock changed during cleanup');
+            offset += count;
+        }
+        assertSameStartLock(stat, fs.fstatSync(fd));
+        let record;
+        try { record = JSON.parse(bytes); } catch { return false; }
+        return record?.operation === 'canary-start'
+            && (!identity.pathHash || record.canaryOwner !== 'box-' + identity.pathHash);
+    } finally { fs.closeSync(fd); }
+}
+
+function retireStartLock(identity, before, directories) {
+    const { workspaceRoot, rootFingerprint } = identity;
+    const after = inspectStartLock(workspaceRoot);
+    assertSameStartLock(before, after);
+    if (!after) return;
+    const file = path.join(workspaceRoot, '.ploinky', 'running', 'workspace-start.json');
+    if (canaryWriterBelongsElsewhere(file, after, identity)) return;
+    assertDirectoriesUnchanged(workspaceRoot, rootFingerprint, directories);
+    assertSameStartLock(after, inspectStartLock(workspaceRoot));
+    fs.unlinkSync(file);
 }
 
 // The caller must prove the exact Box is stopped or absent while holding the
@@ -82,9 +114,11 @@ export function retireQuiescentBoxWorkspaceStartLock({ identity, lock }) {
     const snapshots = inspectDirectories(identity.workspaceRoot, identity.rootFingerprint, false);
     if (!snapshots) return;
     const startLock = inspectStartLock(identity.workspaceRoot);
+    const retirePreparations = snapshotBoxCanaryPreparations(identity);
     lock.assertHeld(identity.instance);
     assertDirectoriesUnchanged(identity.workspaceRoot, identity.rootFingerprint, snapshots);
-    retireStartLock(identity.workspaceRoot, startLock);
+    retirePreparations(() => lock.assertHeld(identity.instance));
+    retireStartLock(identity, startLock, snapshots);
 }
 
 // Run only after the host has removed the exact Box or proved it already absent.
@@ -99,6 +133,7 @@ export function retireDestroyedBoxNoWaitMarkers({ identity, lock, spawn = spawnS
     if (!snapshots) return;
     const markerSnapshots = inspectDirectories(identity.workspaceRoot, identity.rootFingerprint);
     const startLock = inspectStartLock(identity.workspaceRoot);
+    const retirePreparations = snapshotBoxCanaryPreparations(identity);
     const result = spawn(process.execPath, [
         HELPER_PATH, identity.workspaceRoot, JSON.stringify(identity.rootFingerprint),
     ], {
@@ -122,7 +157,8 @@ export function retireDestroyedBoxNoWaitMarkers({ identity, lock, spawn = spawnS
     }
     assertDirectoriesUnchanged(identity.workspaceRoot, identity.rootFingerprint, snapshots);
     if (markerSnapshots) assertDirectoriesUnchanged(identity.workspaceRoot, identity.rootFingerprint, markerSnapshots);
-    retireStartLock(identity.workspaceRoot, startLock);
+    retirePreparations(() => lock.assertHeld(identity.instance));
+    retireStartLock(identity, startLock, snapshots);
 }
 
 async function retireMarkersInChild(workspaceRoot, rootFingerprint) {

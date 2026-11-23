@@ -9,8 +9,8 @@ import { authService, parseCookies, SSO_AUTH_COOKIE_NAME } from './authHandlers/
 import { createAgentClient } from './AgentClient.js';
 import { buildInvocationContextForProviderCall, observeMcpResult } from './mcp-proxy/index.js';
 import { sanitizeArgumentsForTool } from './mcp-proxy/toolArguments.js';
-import { assertSelectionCurrent, selectRouteRuntime } from './canary/selection.mjs';
-import { routeAdmitted } from './canary/routeAdmission.mjs';
+import { assertSelectionCurrent } from './canary/selection.mjs';
+import { selectFanoutRuntimes } from './canary/fanout.mjs';
 import { withSdkHeaderTiming } from './canary/proxyOutcomes.js';
 import { buildRouterRequest } from './mcp-proxy/invocationMinter.js';
 import { deriveDelegationKey } from './mcp-proxy/mcpDelegations.js';
@@ -619,8 +619,9 @@ function commitAggregateLease(routePlan) {
     return routePlan?.lease?.commit?.() === true;
 }
 
-export function createAgentRouteEntries(routePlan, { beforeDispatch = null, req, signals } = {}) {
-    const routes = routePlan?.lease?.snapshot?.routing?.routes;
+export function createAgentRouteEntries(routePlan, { beforeDispatch = null, req, signals, batchSelections } = {}) {
+    const snapshot = routePlan?.lease?.snapshot;
+    const routes = snapshot?.routing?.routes;
     if (!routes || typeof routes !== 'object') {
         const error = new Error('active edge routing generation lease is required for aggregate MCP');
         error.code = 'EDGE_GENERATION_REQUIRED';
@@ -628,10 +629,8 @@ export function createAgentRouteEntries(routePlan, { beforeDispatch = null, req,
         throw error;
     }
     const entries = [];
-    for (const [agentName, route] of Object.entries(routes || {})) {
-        const snapshot = routePlan.lease.snapshot;
-        if (!routeAdmitted(route, agentName, snapshot, signals)) continue;
-        const selection = selectRouteRuntime({ routeKey: agentName, route, snapshot, req, signals });
+    for (const selection of batchSelections ?? selectFanoutRuntimes(snapshot, req, signals)) {
+        const agentName = selection.routeKey;
         const port = Number(selection.route.hostPort);
         if (!Number.isFinite(port)) continue;
         const baseUrl = `http://127.0.0.1:${port}/mcp`;
@@ -639,7 +638,7 @@ export function createAgentRouteEntries(routePlan, { beforeDispatch = null, req,
         const checkDispatch = () => {
             beforeDispatch?.();
             if (!beforeConnect()) throw staleLeaseError();
-            assertSelectionCurrent(selection);
+            if (!batchSelections) assertSelectionCurrent(selection);
         };
         entries.push({
             agentName,
@@ -875,10 +874,10 @@ async function readEntryResource(entry, uri, req) {
     }
 }
 
-async function executeRouterCommand(command, payload = {}, req = null, routePlan = null, beforeDispatch = null) {
+async function executeRouterCommand(command, payload = {}, req = null, routePlan = null, beforeDispatch = null, batchSelections) {
     for (let attempt = 0; ; attempt++) {
         try {
-            return await executeRouterCommandOnce(command, payload, req, routePlan, beforeDispatch);
+            return await executeRouterCommandOnce(command, payload, req, routePlan, beforeDispatch, batchSelections);
         } catch (error) {
             if (error?.code !== 'CANARY_SELECTION_CHANGED') throw error;
             if (attempt) return { statusCode: 503, body: { error: 'canary_selection_changed' } };
@@ -886,11 +885,11 @@ async function executeRouterCommand(command, payload = {}, req = null, routePlan
     }
 }
 
-async function executeRouterCommandOnce(command, payload, req, routePlan, beforeDispatch) {
+async function executeRouterCommandOnce(command, payload, req, routePlan, beforeDispatch, batchSelections) {
     const normalized = canonicalCommand(command);
     let entries;
     try {
-        entries = createAgentRouteEntries(routePlan, { beforeDispatch, req });
+        entries = createAgentRouteEntries(routePlan, { beforeDispatch, req, batchSelections });
     } catch (error) {
         return {
             statusCode: error?.statusCode || 503,
@@ -1131,6 +1130,16 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
     let sessionIdForResponse = hasValidSession ? headerSessionId : null;
 
     const responses = [];
+    // Admit the complete batch before its first item can create a session or
+    // run a tool. Each downstream dispatch still checks its lease and session.
+    let batchSelections;
+    if (isBatch) {
+        for (let attempt = 0; ; attempt++) {
+            batchSelections = selectFanoutRuntimes(routePlan?.lease?.snapshot, req);
+            if (batchSelections.every(selection => selection.isCurrent())) break;
+            if (attempt) return sendJson(res, 503, { error: 'canary_selection_changed' });
+        }
+    }
 
     for (const message of messages) {
         if (admission.entry && !getSession(headerSessionId, owner)) {
@@ -1186,20 +1195,21 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
                 throw Object.assign(new Error('Missing or invalid MCP session'), { code: 'MCP_SESSION_INVALID' });
             }
         };
+        const execute = (command, params) => executeRouterCommand(command, params, req, routePlan, beforeDispatch, batchSelections);
 
         try {
             let result;
             let rpcResultPayload = null;
             switch (message.method) {
                 case 'tools/list':
-                    result = await executeRouterCommand('list_tools', {}, req, routePlan, beforeDispatch);
+                    result = await execute('list_tools', {});
                     if (result.statusCode < 400) {
                         const tools = Array.isArray(result.body?.tools) ? result.body.tools : [];
                         rpcResultPayload = { tools };
                     }
                     break;
                 case 'resources/list':
-                    result = await executeRouterCommand('list_resources', {}, req, routePlan, beforeDispatch);
+                    result = await execute('list_resources', {});
                     if (result.statusCode < 400) {
                         const resources = Array.isArray(result.body?.resources) ? result.body.resources : [];
                         rpcResultPayload = { resources };
@@ -1228,7 +1238,7 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
                     if (metaAgent && !commandPayload.agent) {
                         commandPayload.agent = metaAgent;
                     }
-                    result = await executeRouterCommand('tool', commandPayload, req, routePlan, beforeDispatch);
+                    result = await execute('tool', commandPayload);
                     if (result.statusCode < 400) {
                         rpcResultPayload = result.body?.result;
                     }
@@ -1239,7 +1249,7 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
                     if (params._meta && params._meta.router && typeof params._meta.router.agent === 'string' && params.agent === undefined) {
                         params.agent = params._meta.router.agent;
                     }
-                    result = await executeRouterCommand('resources/read', params, req, routePlan, beforeDispatch);
+                    result = await execute('resources/read', params);
                     if (result.statusCode < 400) {
                         rpcResultPayload = result.body?.resource;
                     }
@@ -1250,7 +1260,7 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
                     if (params._meta && params._meta.router && typeof params._meta.router.agent === 'string' && params.agent === undefined) {
                         params.agent = params._meta.router.agent;
                     }
-                    result = await executeRouterCommand('ping', params, req, routePlan, beforeDispatch);
+                    result = await execute('ping', params);
                     if (result.statusCode < 400) {
                         rpcResultPayload = result.body?.result ?? {};
                     }

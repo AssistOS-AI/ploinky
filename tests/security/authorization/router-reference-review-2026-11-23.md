@@ -58,3 +58,15 @@ The merged status branch starts at `RoutingServer.js:467`. It checks the loopbac
 | handlers/blobs.js | 87202bbb → ef019340 | 8 | The upload, create and read dispatches move by one line. Blob namespace resolution excludes canary records before selecting an agent. |
 | handlers/webchat/index.js | 8421568f → c5758bfc | 13 | The UI and helper statements follow the new runtime branch. A canaried stream requires an admitted target, a matching manifest command and an inspected physical launch. |
 | handlers/webchat/runtimeRoutes.js | 90e8d42a → fe90c3ee | 4 | Stream, input, control and interaction begin at 146, 334, 414 and 446. Pooled canary input rechecks the admitted copy and launch before writing to the TTY. |
+
+## Ordinary routes and canary failure handling
+
+The S3 fixes add five source blobs to the registry. Each of the 51 references below still matches its prior dispatch statement and anchor. The local CLI canary-status check remains at RoutingServer line 467.
+
+| Source | Prior → reviewed SHA-256 prefix | References | Change |
+| --- | --- | ---: | --- |
+| RoutingServer.js | 522fc225 → 57cff3f5 | 23 | Ordinary delegated task-status requests mint inside the existing 401 handler. Canary requests mint after copy selection and refuse an unavailable invocation. |
+| edgeRoutePlan.js | 25b27c42 → 5ad000ec | 5 | On a ready public host, a missing or disabled ordinary route reaches the existing 404. A canary route uses copy-aware admission. |
+| static/index.js | 53e924c7 → 92005353 | 6 | A stale static-file read returns the retry header only on a canary route. Both lease checks precede file delivery. |
+| handlers/webchat/index.js | c5758bfc → b1bf1460 | 13 | A split can select a legacy primary. Stream creation inspects its immutable container identity and verifies the registered launch environment. |
+| handlers/webchat/runtimeRoutes.js | fe90c3ee → ca0c6c79 | 4 | Ordinary writable sessions survive republication. Delivery checks the opening launch before giving the TTY a token. Stream input, control and interaction writes on a split check the selected TTY. |

@@ -12,6 +12,7 @@ import * as agentsSvc from '../utils/agents.js';
 import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../utils/status.js';
 import { runLogCommand } from './logCommands.js';
 import { hasOpenCanaries, reconcileCanaries } from '../sandbox/canary/teardown.mjs';
+import { registerCanaryPreparation } from '../sandbox/canary/preparation.mjs';
 import { runCanaryCommand } from './canaryCommand.js';
 import { activeForegroundSignal } from './foregroundCommand.js';
 import {
@@ -35,13 +36,11 @@ import {
     refreshRouteAgentPath,
 } from './targetedAgentRestart.js';
 import {
+    canaryStartMayBeInFlight,
     heldWorkspaceMutationLease,
-    inspectWorkspaceStartLock,
-    readWorkspaceOwnerIdentity,
     withHeldOrAcquiredWorkspaceMutationLease,
     withMaintenanceLock,
 } from '../utils/runtime/maintenanceLocks.js';
-import { isProcessAlive } from '../sandbox/processIdentity.js';
 import { reconcileExactHardwareInstance } from '../sandbox/hardwareLimits/reconcile.mjs';
 import { wrapPreservingHardwareCause } from '../sandbox/hardwareLimits/errors.mjs';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
@@ -102,15 +101,14 @@ import {
     getValidProfiles,
     isValidProfile,
     resolveManifestRuntimeProfile,
+    setActiveProfile,
 } from '../utils/runtime/profileService.js';
 import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { runOuterRuntimeShell } from '../sandbox/runtimeShell.js';
 import { createNetworkLifecycleAdapter, withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import {
-    edgePreparationOwnerStopped,
     inactivateEdgeRoutingGeneration,
     inactivateEdgeRoutingGenerationForStop,
-    readEdgeRoutingPreparationOwner,
 } from '../sandbox/edgeGeneration.js';
 
 // Restart acquires the workspace mutation lease before the per-runtime
@@ -123,32 +121,39 @@ function withRestartLocks(containerName, lockOptions, fn) {
     );
 }
 
-// Stop is also recovery for an incomplete workspace start. A replacement
-// graph preparation fences canary admission while the live start (or the
-// Watchdog restarting an agent of a stopped start) holds the workspace lease.
-function canStopDuringWorkspaceStartRecovery() {
-    if (heldWorkspaceMutationLease()) return false;
-    const state = inspectWorkspaceStartLock();
-    if (!state.active || state.recoveryPending) return false;
-    const operation = state.lock?.operation;
-    if (operation !== 'workspace-start' && !operation?.startsWith('watchdog-restart:')) return false;
-    const identity = readWorkspaceOwnerIdentity(state.lock.ownerPid);
-    if (!isProcessAlive(state.lock.ownerPid) || !identity.scope || identity.scope !== state.lock.ownerIdentity.scope
-        || identity.startIdentity !== state.lock.ownerIdentity.startIdentity) return false;
-    const preparation = readEdgeRoutingPreparationOwner({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
-    if (preparation?.mode !== 'replacement' || preparation.reason !== 'workspace-graph-enable-prelaunch') return false;
-    if (operation === 'workspace-start' && preparation.pid !== state.lock.ownerPid) return false;
-    if (operation !== 'workspace-start' && !edgePreparationOwnerStopped(preparation)) return false;
-    if (hasOpenCanaries({ workspaceRoot: PLOINKY_WORKSPACE_ROOT })) return false;
-    const current = inspectWorkspaceStartLock();
-    return current.active && !current.recoveryPending && current.lock?.token === state.lock.token;
+async function withCanarySafePreparation(reason, mutate) {
+    const workspaceRoot = PLOINKY_WORKSPACE_ROOT;
+    if (!mutate || heldWorkspaceMutationLease()) return withReconciledWorkspace(reason, mutate);
+    const release = registerCanaryPreparation(workspaceRoot);
+    try {
+        // Publish this reader first. A writer which already admitted itself
+        // holds canary-start until it has published its receipt or unwound.
+        if (!canaryStartMayBeInFlight() && !hasOpenCanaries({ workspaceRoot })) return await mutate();
+    } finally {
+        release();
+    }
+    // Do not wait for a writer while holding a marker it must refuse.
+    return withReconciledWorkspace(reason, mutate, true);
 }
 
-function withReconciledWorkspace(reason, mutate) {
-    return withHeldOrAcquiredWorkspaceMutationLease({ operation: `workspace-${reason}` }, async () => {
-        await reconcileCanaries({ reason, workspaceRoot: PLOINKY_WORKSPACE_ROOT });
-        return mutate?.();
-    });
+async function withReconciledWorkspace(reason, mutate, acquire = false) {
+    const workspaceRoot = PLOINKY_WORKSPACE_ROOT;
+    if (!acquire && !hasOpenCanaries({ workspaceRoot })) return mutate?.();
+    let acquired = false;
+    try {
+        return await withHeldOrAcquiredWorkspaceMutationLease({ operation: `workspace-${reason}` }, async () => {
+            acquired = true;
+            await reconcileCanaries({ reason, workspaceRoot });
+            return mutate?.();
+        });
+    } catch (error) {
+        // Only refusal to acquire the lease can defer teardown. Never replay a
+        // failed reconciliation or a lifecycle body that already began.
+        if (acquired || error?.code !== 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED'
+            || !['stop', 'shutdown', 'destroy', 'clean'].includes(reason)) throw error;
+        console.warn(`[${reason}] Workspace recovery is required. Canary reconciliation is deferred until the next start.`);
+        return mutate();
+    }
 }
 
 // runUpdateCommand calls the selected handler after parsing and while its
@@ -439,6 +444,13 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         }
         case 'start': {
             const startParsed = parseStartArgs(options);
+            const withCanariesReconciled = mutate => withCanarySafePreparation('start', mutate);
+            if (startParsed.profile) {
+                await withCanariesReconciled(() => {
+                    const result = setActiveProfile(startParsed.profile);
+                    if (!result.success) throw new Error(result.message);
+                });
+            }
             // The global --branch is applied to achillesAgentLib by the source
             // selector that runs before this command, which validates the local
             // checkout against it. Nothing here reconfigures an AgentLib dependency.
@@ -446,8 +458,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 enableAgent,
                 killRouterIfRunning,
                 branchPolicy: startParsed.branchPolicy,
-                profile: startParsed.profile,
-                withCanariesReconciled: (mutate) => withReconciledWorkspace('start', mutate),
+                withCanariesReconciled,
             });
             break;
         }
@@ -739,9 +750,10 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 // The generic settler refuses an abandoned additive lease.
                 // Recover a canary-owned publication before asking it to
                 // settle graph starts, then recheck under the stop lease.
-                await reconcileCanaries({ reason: 'restart', workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+                const withCanariesReconciled = mutate => withCanarySafePreparation('restart', mutate);
+                await withCanariesReconciled();
                 await settleWorkspaceBeforeRestart();
-                await withReconciledWorkspace('restart', () => {
+                await withCanariesReconciled(() => {
                     inactivateEdgeRoutingGeneration('cli-workspace-restart');
                     console.log('[restart] Stopping Router and configured agents...');
                     killRouterIfRunning();
@@ -754,7 +766,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 await startWorkspace(undefined, undefined, {
                     enableAgent,
                     killRouterIfRunning,
-                    withCanariesReconciled: (mutate) => withReconciledWorkspace('restart', mutate),
+                    withCanariesReconciled,
                 });
                 console.log('[restart] Done.');
             }
@@ -783,7 +795,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             // Stop is the documented recovery, so this retirement never
             // refuses it; it only runs before the selector rewrite below.
             retireAbandonedStartPreparationBeforeStop();
-            const stop = () => {
+            await withReconciledWorkspace('stop', () => {
                 const stopSelection = inactivateEdgeRoutingGenerationForStop('cli-workspace-stop');
                 if (stopSelection.preserved) {
                     console.log(`[stop] Kept the inactive routing selector of stopped workspace start pid ${stopSelection.pid}; the next start retires its preparation.`);
@@ -797,9 +809,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     list.forEach(n => console.log(` - ${n}`));
                 }
                 console.log(`Stopped ${list.length} configured agent containers.`);
-            };
-            if (canStopDuringWorkspaceStartRecovery()) stop();
-            else await withReconciledWorkspace('stop', stop);
+            });
             break;
         }
         case 'destroy':

@@ -94,16 +94,19 @@ export function buildWebchatInvocationArgs({ effectiveConfig, tabId, pageInstanc
     return args;
 }
 
-export function resolveWebchatInvocationTarget(req, effectiveConfig) {
+export function resolveWebchatInvocationTarget(req, effectiveConfig, { reuseOrdinaryTty = false } = {}) {
     const binding = req?.edgeAuthContext?.webchatBinding;
     if (!binding) return undefined;
     const { target, targetRoute, generation } = binding;
     const { snapshot } = loadActiveRoutingState();
+    const route = snapshot.routing.routes[target];
+    if (route?.canary && !binding.exactLaunch) {
+        throw Object.assign(new Error('WebChat target acquired a canary'), { code: 'CANARY_SELECTION_CHANGED' });
+    }
     if (target !== effectiveConfig.agentName || targetRoute?.routeKey !== target
-        || generation !== snapshot.generation) {
+        || (generation !== snapshot.generation && (binding.exactLaunch || !reuseOrdinaryTty))) {
         throw new Error('WebChat target binding changed');
     }
-    const route = snapshot.routing.routes[target];
     if (route?.canary) {
         const admitted = webchatRouteProvenance(snapshot.routing, target);
         if (!routeAdmitted(route, target, snapshot) || !admitted || admitted.container !== targetRoute.container) {
@@ -111,12 +114,15 @@ export function resolveWebchatInvocationTarget(req, effectiveConfig) {
         }
         const selection = selectRouteRuntime({ routeKey: target, route, snapshot, req });
         const container = selection.route.container;
-        if (!selection.targetRecord?.launchId || leaseRouteHardwareAvailability({ snapshot }, target, container)) {
+        if (!selection.targetRecord || (selection.copy === 'canary' && !selection.targetRecord.launchId)
+            || leaseRouteHardwareAvailability({ snapshot }, target, container)) {
             throw new Error('WebChat selected runtime is unavailable');
         }
         return { snapshot, selection, container, targetRecord: selection.targetRecord };
     }
-    const targetRecord = resolveRouteTargetRecord({ routeKey: target, route: targetRoute, generation, snapshot });
+    // The ordinary TTY survives republication. Resolve the same container in
+    // the active snapshot; its opening launch still fences credential delivery.
+    const targetRecord = resolveRouteTargetRecord({ routeKey: target, route: targetRoute, generation: snapshot.generation, snapshot });
     return { snapshot, targetRecord, container: targetRoute.container };
 }
 
@@ -157,7 +163,7 @@ export function resolveRequestPublicOrigin(req) {
 
 export function serializeWebchatEnvelopeForAgent({
     req, effectiveConfig, tabId, pageInstanceId = '', envelope, fallbackText = '',
-    target = resolveWebchatInvocationTarget(req, effectiveConfig),
+    target,
 }) {
     const sanitizedReferences = sanitizeWebchatReferencesForEnvelope(envelope?.references);
     const publicBaseUrl = resolveRequestPublicOrigin(req);
@@ -172,8 +178,18 @@ export function serializeWebchatEnvelopeForAgent({
     };
     if (publicBaseUrl) payload.origin = { publicBaseUrl };
     if (sanitizedReferences.length) payload.references = sanitizedReferences;
-    const token = buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope: payload, target });
-    if (token) payload.invocation = { token };
+    if (!effectiveConfig?.agentName) return JSON.stringify(payload);
+    const selected = target ?? resolveWebchatInvocationTarget(req, effectiveConfig);
+    try {
+        if (selected?.tokenError) throw selected.tokenError;
+        const token = buildWebchatInvocationToken({ req, effectiveConfig, tabId, pageInstanceId, envelope: payload, target: selected });
+        if (!token) throw new Error('WebChat invocation token unavailable');
+        payload.invocation = { token };
+    } catch (error) {
+        if (effectiveConfig?.exactTarget || req?.edgeAuthContext?.webchatBinding?.exactLaunch
+            || error.code === 'CANARY_SELECTION_CHANGED') throw error;
+        console.error('[webchat] Forwarding message without an invocation token:', error.message);
+    }
     return JSON.stringify(payload);
 }
 

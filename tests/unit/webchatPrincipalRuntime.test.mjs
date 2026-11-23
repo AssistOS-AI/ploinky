@@ -546,7 +546,7 @@ test('signed WebChat arguments carry runtimeScope only for principal-scoped runt
     assert.equal(decodeJwtPayload(sharedPayload.invocation.token).rch, rch(baseArgs), 'shared scope signs the unchanged arguments');
 });
 
-test('WebChat input signs for the active launch and refuses a stale request or pooled TTY', async t => {
+test('WebChat without a canary keeps the writable TTY and forwards the envelope when token minting fails', async t => {
     const { deriveAgentRequestSecret } = await import('../../cli/utils/security/masterKey.js');
     const { verifyRouterRequestFromHeaders } = await import('../../Agent/lib/invocationAuth.mjs');
     const { createMemoryReplayCache } = await import('../../Agent/lib/jwtVerify.mjs');
@@ -572,22 +572,25 @@ test('WebChat input signs for the active launch and refuses a stale request or p
 
     const replacement = publish('replacement');
     const log = t.mock.method(console, 'error', () => {});
-    for (const selection of [binding, replacement]) {
-        const refused = await postInput({ ...args, binding: selection });
-        assert.equal(refused.statusCode, 503);
-        assert.match(refused.body, /Unable to authorize/);
-    }
-    assert.equal(log.mock.callCount(), 2);
-    assert.equal(factory.created[0].writes.length, 1);
+    assert.equal((await postInput({ ...args, binding })).statusCode, 204);
+    const unsigned = JSON.stringify({
+        __webchatMessage: 1, version: 1, text: args.text, attachments: [], presentation: { visible: true },
+        sourceTabId: args.tabId, sourcePageInstanceId: 'page-tab-A', origin: { publicBaseUrl: 'http://localhost' },
+    }) + '\n';
+    assert.equal(factory.created[0].writes[1], unsigned);
+    assert.equal(log.mock.callCount(), 1);
     assert.equal(openStream({ ...args, binding: replacement }).res.statusCode, 200);
-    assert.equal(factory.created[0].disposed, true);
+    assert.equal(factory.created.length, 1);
+    assert.equal(factory.created[0].disposed, false);
     assert.equal((await postInput({ ...args, binding: replacement })).statusCode, 204);
-    const message = JSON.parse(factory.created[1].writes[0]);
+    assert.equal(factory.created[0].writes[2], unsigned);
+    assert.equal(log.mock.callCount(), 2);
+    const message = JSON.parse(factory.created[0].writes[0]);
     const agentId = 'agent:AssistOSExplorer/dpuAgent';
     const surface = { method: 'POST', path: '/mcp', tool: '__webchat_message__' };
     const verified = verifyRouterRequestFromHeaders({ authorization: `Bearer ${message.invocation.token}` }, {
         ...surface,
-        env: { PLOINKY_AGENT_ID: agentId, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId), PLOINKY_LAUNCH_ID: 'replacement' },
+        env: { PLOINKY_AGENT_ID: agentId, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId), PLOINKY_LAUNCH_ID: 'initial' },
         replayCache: createMemoryReplayCache(),
         rch: computeRchTool({ ...surface, arguments: {
             surface: 'webchat', tabId: args.tabId, pageInstanceId: 'page-tab-A', text: args.text,
@@ -597,15 +600,16 @@ test('WebChat input signs for the active launch and refuses a stale request or p
     assert.equal(verified.ok, true, verified.reason);
 });
 
-test('a legacy WebChat TTY without a container is reused only in its opening generation', async t => {
+test('a no-canary WebChat TTY with a legacy record survives an unrelated generation change', async t => {
     const routeKey = 'sharedAgent';
     const routingFile = path.join(ploinkyDir, 'routing.json');
     const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
-    delete routing.routes[routeKey].container;
+    const { container } = routing.routes[routeKey];
+    assert.equal(JSON.parse(fs.readFileSync(path.join(ploinkyDir, 'agents.json')))[container].launchId, undefined);
     function publish() {
         fs.writeFileSync(routingFile, JSON.stringify(routing));
         const { selector } = applyEdgeRoutingGeneration({ workspaceRoot: tempDir, reason: 'legacy-webchat' });
-        return { target: routeKey, generation: selector.generation, targetRoute: { routeKey, container: '' } };
+        return { target: routeKey, generation: selector.generation, targetRoute: { routeKey, container } };
     }
     const factory = createFakeFactory();
     const appState = makeAppState();
@@ -617,13 +621,17 @@ test('a legacy WebChat TTY without a container is reused only in its opening gen
     const first = publish();
     assert.equal(openStream({ ...args, binding: first }).res.statusCode, 200);
     assert.equal((await postInput({ ...args, binding: first })).statusCode, 204);
-    routing.routes[routeKey].hostPort += 1;
+    routing.routes.dpuAgent.hostPort += 1;
     const replacement = publish();
     assert.notEqual(replacement.generation, first.generation);
-    assert.equal((await postInput({ ...args, binding: replacement })).statusCode, 503);
-    assert.equal(factory.created[0].writes.length, 1);
+    // A body admitted in the previous generation also mints for this legacy TTY.
+    assert.equal((await postInput({ ...args, binding: first })).statusCode, 204);
+    assert.equal(decodeJwtPayload(JSON.parse(factory.created[0].writes[1]).invocation.token).launchId, undefined);
+    assert.equal((await postInput({ ...args, binding: replacement, text: 'still connected' })).statusCode, 204);
     assert.equal(openStream({ ...args, binding: replacement }).res.statusCode, 200);
-    assert.equal(factory.created[0].disposed, true);
-    assert.equal((await postInput({ ...args, binding: replacement })).statusCode, 204);
-    assert.ok(JSON.parse(factory.created[1].writes[0]).invocation.token);
+    assert.equal(factory.created.length, 1);
+    assert.equal(factory.created[0].disposed, false);
+    const delivered = JSON.parse(factory.created[0].writes[2]);
+    assert.equal(delivered.text, 'still connected');
+    assert.equal(decodeJwtPayload(delivered.invocation.token).launchId, undefined);
 });

@@ -620,6 +620,20 @@ export function verifyDelegatedAgentTaskStatusCall({
     };
 }
 
+export function delegatedTaskStatusHeaders({ req, selection, snapshot, agentName, taskId, path }) {
+    try {
+        const ctx = buildInvocationContextForProviderCall({
+            req, agentName, route: selection.route, targetRecord: selection.targetRecord, snapshot,
+            toolName: TASK_STATUS_TOOL, toolArgs: { taskId }, method: 'GET', path,
+        });
+        if (ctx?.token) return { authorization: `Bearer ${ctx.token}` };
+        if (!selection.route.canary) return {};
+    } catch (error) {
+        if (!selection.route.canary) throw error;
+    }
+    throw Object.assign(new Error('missing task invocation'), { status: 503, code: 'CANARY_TASK_INVOCATION_UNAVAILABLE' });
+}
+
 export function verifyDelegatedAgentTaskCancelCall({
     req,
     agentName,

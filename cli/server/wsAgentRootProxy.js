@@ -9,7 +9,7 @@ import {
     buildTrustedForwardingHeaders, readPublicCanaryUserId,
     stripRouterIdentityHeaders,
 } from './routerHandlers.js';
-import { openRootConnection, withSelectedRoot } from './proxy/executeHttpPlan.js';
+import { isCanaryProxyError, openRootConnection, withSelectedRoot } from './proxy/executeHttpPlan.js';
 import { observeProxyFirstByte, observeProxyOutcome } from './canary/proxyOutcomes.js';
 import { trackCanaryConnection } from './canary/selection.mjs';
 
@@ -116,7 +116,7 @@ export async function handleAgentRootUpgrade({
             }
         });
     } catch (error) {
-        closeSocket(socket, error.status || 502, undefined, error.status === 503 ? { 'Retry-After': '1' } : {});
+        closeSocket(socket, error.status || 502, undefined, error.status === 503 && isCanaryProxyError(plan, error) ? { 'Retry-After': '1' } : {});
         return true;
     }
     let settled = false;

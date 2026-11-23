@@ -157,6 +157,7 @@ test('agent static dispatch refuses a stale generation before opening a file', a
 
     await res.completed;
     assert.equal(handled, true);
+    assert.deepEqual(res.headers, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     assert.equal(res.statusCode, 503);
     assert.match(res.body, /edge_generation_changed/);
 });

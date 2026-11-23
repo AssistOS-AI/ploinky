@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { TaskQueue } from './TaskQueue.mjs';
+import { parseCanaryTaskId, TaskQueue } from './TaskQueue.mjs';
 import { issueContinuationOrigins } from '../lib/taskContinuationOrigin.mjs';
 import { createToolWorkerPools, shutdownToolWorkerPools } from './toolWorkerPool.mjs';
 import { agentServerIdentityInputs, createAgentServerCodeIdentity, formatIdentityMeasures } from './toolCodeIdentity.mjs';
@@ -1086,6 +1086,11 @@ const taskQueue = TaskQueue.forAgent({
     executor: executeShell
 });
 
+function taskForReply(task) {
+    const rolloutId = taskQueue.canaryRolloutId || parseCanaryTaskId(task.id);
+    return rolloutId ? issueContinuationOrigins(task, rolloutId, readAgentSecret()) : task;
+}
+
 // Warm tool workers (opt-in through `toolWorkers` in the MCP config, see
 // toolWorkerPool.mjs). Pools are built once from the startup config, never per
 // MCP session. A pool needs a code identity source: workers are replaced when
@@ -1624,7 +1629,7 @@ async function main() {
                 if (!task) {
                     return sendJson(404, { error: 'task not found' });
                 }
-                return sendJson(200, { task: issueContinuationOrigins(task, taskQueue.canaryRolloutId, readAgentSecret()) });
+                return sendJson(200, { task: taskForReply(task) });
             }
             if (method === 'POST' && u.pathname === TASK_CANCEL_PATH) {
                 const parsedBody = await readJsonBody(req);
@@ -1653,7 +1658,7 @@ async function main() {
                 if (!task) {
                     return sendJson(404, { error: 'task not found' });
                 }
-                return sendJson(200, { task: issueContinuationOrigins(task, taskQueue.canaryRolloutId, readAgentSecret()) });
+                return sendJson(200, { task: taskForReply(task) });
             }
             if ((method === 'GET' || method === 'DELETE') && u.pathname === '/mcp') {
                 const sessionId = req.headers['mcp-session-id'];

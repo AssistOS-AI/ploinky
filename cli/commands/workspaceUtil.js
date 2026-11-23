@@ -49,7 +49,7 @@ import { acquireSettledWorkspaceMutationLease, inspectLiveNoWaitWorkers } from '
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
-import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile, setActiveProfile } from '../utils/runtime/profileService.js';
+import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
@@ -2924,7 +2924,6 @@ export function printStartResultSummary(result, { log = console.log } = {}) {
 async function startWorkspace(staticAgentArg, portArg, {
   killRouterIfRunning,
   branchPolicy,
-  profile,
   withCanariesReconciled,
 } = {}) {
   // Acquire every declared dependency source before resolving the complete
@@ -2940,10 +2939,6 @@ async function startWorkspace(staticAgentArg, portArg, {
     throw new Error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
   }
   const prepareSources = async () => {
-    if (profile) {
-      const result = setActiveProfile(profile);
-      if (!result.success) throw new Error(result.message);
-    }
     try {
       prepareDefaultBootRepositories({
         branchPolicy,

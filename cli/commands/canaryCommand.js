@@ -1,4 +1,5 @@
 import { LocalRouterClient } from '../utils/webttyCliClient.mjs';
+import { assertNoCanaryPreparations } from '../sandbox/canary/preparation.mjs';
 
 async function localAdminClient() {
     const { resolvePersistedRouterPort } = await import('../sandbox/routerPort.js');
@@ -91,7 +92,7 @@ function writeStatus(status, scoped, json, output) {
 export async function runCanaryCommand(args, { client, output = process.stdout } = {}) {
     const request = parse(args);
     const { PLOINKY_WORKSPACE_ROOT: workspaceRoot } = await import('../utils/config.js');
-    const { withHeldOrAcquiredWorkspaceMutationLease: withLease } = await import('../utils/runtime/maintenanceLocks.js');
+    const { withHeldOrAcquiredWorkspaceMutationLease: withLease, assertWorkspaceMutationLease } = await import('../utils/runtime/maintenanceLocks.js');
     const canary = await import('../sandbox/canary/start.mjs');
     const status = async () => {
         const router = client ?? await localAdminClient();
@@ -101,11 +102,17 @@ export async function runCanaryCommand(args, { client, output = process.stdout }
         }
         return result;
     };
-    const run = async () => {
+    const run = async lease => {
+        if (request.action === 'start') {
+            if (lease.operation !== 'canary-start') throw new Error('Canary start requires its own workspace mutation lease');
+            assertNoCanaryPreparations(workspaceRoot);
+            assertWorkspaceMutationLease(lease);
+        }
         await canary.reconcileCanaryCommands(workspaceRoot);
         const inputs = { ...request, workspaceRoot };
         switch (request.action) {
             case 'start': {
+                assertWorkspaceMutationLease(lease);
                 const id = await canary.startCanary(inputs);
                 output.write(id + '\n');
                 return;

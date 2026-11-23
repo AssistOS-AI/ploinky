@@ -25,7 +25,7 @@ const edge = await import('../../cli/sandbox/edgeGeneration.js');
 const routingFile = await import('../../cli/server/routingFile.js');
 const { withNetworkLifecycleLock } = await import('../../cli/sandbox/networkLifecycle.js');
 const { coordinateReplacementRuntimeIdentity } = await import('../../cli/sandbox/docker/agentServiceManager.js');
-const { resolveEdgeRoutePlan } = await import('../../cli/server/edgeRoutePlan.js');
+const { resolveEdgeRoutePlan, planForCapturedLease } = await import('../../cli/server/edgeRoutePlan.js');
 const { dispatchAgentStartupAfterRouterSurfaces } = await import('../../cli/server/agentStartupDispatch.js');
 const { saveAgents } = await import('../../cli/utils/workspace.js');
 const { prepareTargetedAgentRestart, commitTargetedAgentRestart, _test: restartInternals } = await import('../../cli/commands/targetedAgentRestart.js');
@@ -451,4 +451,19 @@ test('W9 a hardware refusal marks only the refused runtime unavailable through a
     await assert.rejects(fallback.run, (error) => error instanceof HardwareLimitsError);
     assert.deepEqual(fallback.events, [['withdraw', 'agentB-container', 'agentB-container'], ['publish'], ['retire']],
         'a withdrawal that cannot be proven falls back to the inactive merge');
+});
+
+test('a ready public host with a missing or disabled ordinary route keeps its base 404', () => {
+    seedWorkspace();
+    const lease = edge.captureEdgeRoutingLease({ workspaceRoot: workspace });
+    for (const disabled of [false, true]) {
+        const snapshot = structuredClone(lease.snapshot);
+        if (disabled) snapshot.routing.routes.agentB.disabled = true;
+        else delete snapshot.routing.routes.agentB;
+        const result = planForCapturedLease({ req: { method: 'GET', url: '/', headers: { host: PUBLIC_HOST } },
+            listener: 'public', transport: 'http', lease: { ...lease, snapshot } });
+        assert.equal(result.status, 404);
+        assert.equal(result.code, 'ROUTE_NOT_FOUND');
+        assert.equal(result.retryAfterSeconds, undefined);
+    }
 });

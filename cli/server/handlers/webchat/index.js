@@ -153,7 +153,7 @@ export async function handleWebChat(req, res, appConfig, appState) {
         if (binding.exactLaunch) {
             try {
                 selected = resolveWebchatInvocationTarget(req, { agentName: binding.target });
-                if (!selected?.targetRecord?.launchId) throw new Error();
+                if (!selected?.selection) throw new Error();
             } catch {
                 return denyJson(res, 503, 'webchat_target_changed');
             }

@@ -572,6 +572,7 @@ async function sendOpenedFile(req, res, filePath, {
     fetchedTemplate = false,
     openFile = null,
     beforeRead,
+    canaryRoute = false,
 } = {}) {
     if (responseGone(res)) return true;
     let handle;
@@ -598,7 +599,7 @@ async function sendOpenedFile(req, res, filePath, {
         // The descriptor is open and fstat has completed. Commit before any
         // validator, headers or bytes from this copy can reach the caller.
         if (beforeRead && beforeRead() !== true) {
-            res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Retry-After': '1' });
+            res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...(canaryRoute && { 'Retry-After': '1' }) });
             res.end(JSON.stringify({ error: 'edge_generation_changed' }));
             return true;
         }
@@ -957,6 +958,7 @@ async function serveAgentStaticRequest(req, res, {
     hostPath = null,
     beforeRead = null,
     beforeServe = null,
+    canaryRoute = false,
     confinedExport = false,
 } = {}) {
     try {
@@ -976,13 +978,13 @@ async function serveAgentStaticRequest(req, res, {
                 if (!target.startsWith(canonicalRoot + path.sep)) return false;
             }
             if (beforeRead && beforeRead() !== true) {
-                res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Retry-After': '1' });
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...(canaryRoute && { 'Retry-After': '1' }) });
                 res.end(JSON.stringify({ error: 'edge_generation_changed' }));
                 return true;
             }
             if (await sendOpenedFile(req, res, target, {
                 openFile: confinedExport ? openClassifiedWorkspaceFile : undefined,
-                beforeRead: beforeServe,
+                beforeRead: beforeServe, canaryRoute,
                 authenticated: true,
                 templateAware: true,
                 fetchedTemplate: isFetchedTemplateRequest(req),

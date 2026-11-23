@@ -76,17 +76,24 @@ if (args.length === 3 && args[0] === 'container' && args[1] === 'inspect') {
         for (const req of streams) req.emit('close');
         for (const [key, tab] of appState.runtimes) disposeTab(tab, key, { runtimes: appState.runtimes });
     });
-    async function request(action, user) {
+    const ordinaryWrites = [];
+    const ordinaryFactory = { create() { return {
+        onOutput() {}, onClose() {}, isAlive: () => true, write(data) { ordinaryWrites.push(data); return true; }, dispose() {},
+    }; } };
+    async function request(action, user, beforeBody) {
         const req = new EventEmitter();
-        Object.assign(req, { url: '/webchat/' + action + '?agent=service&tabId=tab', method: action === 'input' ? 'POST' : 'GET',
+        Object.assign(req, { url: '/webchat/' + action + '?agent=service&tabId=tab', method: action === 'stream' ? 'GET' : 'POST',
             headers: { host: 'localhost', cookie: 'webchat_sid=' + user }, authMode: 'sso', user: { id: user, roles: ['user'] } });
         const plan = resolveEdgeRoutePlan({ req });
         req.edgeAuthContext = resolveAuthContextForRoutePlan(new URL(req.url, 'http://localhost'), plan);
-        assert.equal(req.edgeAuthContext.webchatBinding?.exactLaunch, true);
+        assert.equal(req.edgeAuthContext.webchatBinding?.exactLaunch, route.canary ? true : undefined);
         const res = { writeHead(status) { this.status = status; }, write() { return true; }, end() {} };
-        await handleWebChat(req, res, { getFactoryForCommands() { assert.fail('unexpected logical CLI'); } }, appState);
+        await handleWebChat(req, res, { getFactoryForCommands(commands) {
+            assert.equal(route.canary, undefined, 'a split must use the selected physical TTY');
+            return { ...commands, ttyFactory: ordinaryFactory };
+        } }, appState);
         if (action === 'stream') streams.push(req);
-        else if (!res.status) { req.emit('data', 'hello'); req.emit('end'); }
+        else if (!res.status) { req.emit('data', 'hello'); beforeBody?.(); req.emit('end'); }
         return res.status;
     }
     async function check(user, copy) {
@@ -103,6 +110,8 @@ if (args.length === 3 && args[0] === 'container' && args[1] === 'inspect') {
         tab.tty.write = data => { token = JSON.parse(data).invocation.token; return writeInput(data); };
         try { assert.equal(await request('input', user), 204); } finally { tab.tty.write = writeInput; }
         await received;
+        const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url'));
+        assert.equal(claims.launchId, identities[copy].launchId);
         const agent = 'agent:fixture/service';
         const surface = { method: 'POST', path: '/mcp', tool: '__webchat_message__' };
         const rch = computeRchTool({ ...surface, arguments: { surface: 'webchat', tabId: 'tab', pageInstanceId: '',
@@ -117,6 +126,14 @@ if (args.length === 3 && args[0] === 'container' && args[1] === 'inspect') {
     }
     await check('reader', 'old');
     await check('tester', 'canary');
+    const previousWire = process.env.PLOINKY_SECURE_WIRE;
+    try {
+        process.env.PLOINKY_SECURE_WIRE = 'off';
+        assert.equal(await request('input', 'tester'), 503);
+    } finally {
+        if (previousWire === undefined) delete process.env.PLOINKY_SECURE_WIRE;
+        else process.env.PLOINKY_SECURE_WIRE = previousWire;
+    }
     write(manifestPath, { webchat: manifest.webchat });
     assert.equal(await request('stream', 'tester'), 503);
     for (const [key, tab] of appState.runtimes) disposeTab(tab, key, { runtimes: appState.runtimes });
@@ -148,4 +165,38 @@ if (args.length === 3 && args[0] === 'container' && args[1] === 'inspect') {
     observeCanarySnapshot(snapshot);
     assert.equal(await check('reader', 'canary'), canary);
     assert.ok(old.disposed);
+
+    // An upgraded primary lacks both the registry field and the container env.
+    // Its exact container and principal are still inspected before exec.
+    for (const [key, tab] of appState.runtimes) disposeTab(tab, key, { runtimes: appState.runtimes });
+    const oldInspection = path.join(root, identities.old.containerId + '.json');
+    const [legacy] = JSON.parse(fs.readFileSync(oldInspection));
+    legacy.Config.Env = legacy.Config.Env.filter(entry => !entry.startsWith('PLOINKY_LAUNCH_ID='));
+    write(oldInspection, [legacy]);
+    delete identities.old.launchId;
+    write(path.join(state, 'agents.json'), { primary: identities.old, primary__canary: { ...identities.canary, canaryOf: routeKey } });
+    route.hostPort = identities.old.hostPort;
+    delete route.draining;
+    route.canary.mode = 'split';
+    snapshot = publish();
+    observeCanarySnapshot(snapshot);
+    await check('reader', 'old');
+    route.hostPort = route.hostPort + 1;
+    snapshot = publish();
+    observeCanarySnapshot(snapshot);
+    for (const action of ['input', 'control', 'interaction']) {
+        assert.equal(await request(action, 'reader'), 503, action);
+    }
+
+    const split = route.canary;
+    delete route.canary;
+    write(path.join(state, 'agents.json'), { primary: identities.old });
+    observeCanarySnapshot(publish());
+    assert.equal(await request('stream', 'tester'), 200);
+    assert.equal(await request('input', 'tester', () => {
+        route.canary = split;
+        write(path.join(state, 'agents.json'), { primary: identities.old, primary__canary: { ...identities.canary, canaryOf: routeKey } });
+        observeCanarySnapshot(publish());
+    }), 503);
+    assert.deepEqual(ordinaryWrites, []);
 });

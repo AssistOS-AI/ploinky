@@ -5,7 +5,7 @@ import { finalizePlanAfterAdmission } from './RoutePlan.js';
 import { measureHeaderBytes, sanitizeRequestHeaders } from './sanitizeRequestHeaders.js';
 import { sanitizeResponseHeaders } from './sanitizeResponseHeaders.js';
 import { recordProxyOutcome } from './recordProxyOutcome.js';
-import { createRelayHttpAgent, openSelectedRelay, proxyErrorStatus, RelayDuplex } from './executeHttpPlan.js';
+import { createRelayHttpAgent, openSelectedRelay, isCanaryProxyError, proxyErrorStatus, RelayDuplex } from './executeHttpPlan.js';
 import { selectAgentPortPlan } from '../edgeRoutePlan.js';
 import { observeProxyFirstByte } from '../canary/proxyOutcomes.js';
 import { trackCanaryConnection } from '../canary/selection.mjs';
@@ -89,9 +89,9 @@ export class WebSocketFrameLimitTransform extends Transform {
     }
 }
 
-function rejectSocket(socket, status = 403) {
+function rejectSocket(socket, status, canaryError) {
     const reason = http.STATUS_CODES[status] || 'Request Failed';
-    const retry = status === 503 ? 'Retry-After: 1\r\n' : '';
+    const retry = status === 503 && canaryError ? 'Retry-After: 1\r\n' : '';
     try { socket.end(`HTTP/1.1 ${status} ${reason}\r\n${retry}Connection: close\r\nCache-Control: no-store\r\n\r\n`); } catch (_) {}
 }
 
@@ -322,7 +322,7 @@ export async function executeWebSocketPlan({
             outcome: 'failure',
             startedAt,
             error,
-            status: proxyErrorStatus(error),
+            status: proxyErrorStatus(error, plan),
             upstreamStatus,
             serverError: targetFailed,
             requestBytes: clientFrames?.bytes || 0,
@@ -334,7 +334,7 @@ export async function executeWebSocketPlan({
         });
         channel?.close();
         lease?.release?.();
-        rejectSocket(socket, proxyErrorStatus(error));
+        rejectSocket(socket, proxyErrorStatus(error, plan), isCanaryProxyError(plan, error));
         return false;
     } finally {
         untrack?.();

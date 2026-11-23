@@ -103,7 +103,10 @@ function classifyHost({ host, listener, snapshot }) {
             : null;
     }
     const selectedRoute = snapshot.routing?.routes?.[String(record.routeKey || '')];
-    if (snapshot.publicationState !== 'ready' || !routeAdmitted(selectedRoute, record.routeKey, snapshot)) {
+    const inactive = selectedRoute?.canary
+        ? !routeAdmitted(selectedRoute, record.routeKey, snapshot)
+        : selectedRoute?.draining === true;
+    if (snapshot.publicationState !== 'ready' || inactive) {
         return { kind: 'inactive-public', host, record };
     }
     return { kind: 'agent-root', source: 'public-host', host, record };
@@ -843,8 +846,12 @@ export function resolveEdgeRoutePlan({
     } catch (error) {
         return deny(503, error?.code || 'EDGE_GENERATION_INACTIVE');
     }
+    if (!authorityObservationGeneration) activeSnapshotObserver?.(lease.snapshot);
+    return planForCapturedLease({ req, parsedUrl, listener, transport, lease });
+}
+
+export function planForCapturedLease({ req, parsedUrl, listener, transport, lease }) {
     const snapshot = lease.snapshot;
-    if (!authorityObservationGeneration) activeSnapshotObserver?.(snapshot);
     const host = normalizeExactHost(req?.headers?.host);
     if (!host) return deny(400, 'MALFORMED_HOST', { lease });
     if (listener === 'private' && !isPrivateInterfaceAllowed(req, listener)) {

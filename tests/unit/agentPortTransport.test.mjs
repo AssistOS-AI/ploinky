@@ -8,7 +8,7 @@ import path from 'node:path';
 import net from 'node:net';
 import { Duplex, Readable, Writable } from 'node:stream';
 
-import { executeHttpPlan } from '../../cli/server/proxy/executeHttpPlan.js';
+import { executeHttpPlan, proxyErrorStatus } from '../../cli/server/proxy/executeHttpPlan.js';
 import { executeWebSocketPlan } from '../../cli/server/proxy/executeWebSocketPlan.js';
 import { compileProxyLimits } from '../../cli/server/proxy/limits.js';
 import { createRoutePlan } from '../../cli/server/proxy/RoutePlan.js';
@@ -378,6 +378,7 @@ test('a stale per-OPEN generation lease returns HTTP 503 without upstream constr
     });
     assert.equal(handled, false);
     assert.equal(response.statusCode, 503);
+    assert.deepEqual(response.headers, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     assert.deepEqual(JSON.parse(response.body.toString('utf8')), { error: 'upstream_unavailable' });
     assert.equal(released, true);
 });
@@ -413,7 +414,7 @@ test('a stale per-OPEN generation lease rejects a WebSocket upgrade with 503', a
         authorized: true,
     });
     assert.equal(handled, false);
-    assert.match(socket.body.toString('utf8'), /^HTTP\/1\.1 503 Service Unavailable\r\n/);
+    assert.equal(socket.body.toString('utf8'), 'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n');
     assert.equal(released, true);
 });
 
@@ -1113,4 +1114,11 @@ test('client socket destroyed before the upstream upgrade fails teardown and wri
     const failures = events.filter(event => event.outcome === 'failure');
     assert.equal(failures.length, 1);
     assert.equal(events.filter(event => event.outcome === 'success').length, 0);
+});
+
+test('proxy status maps a plain upstream 503 only for a canary route', () => {
+    const error = Object.assign(new Error('upstream unavailable'), { status: 503 });
+    assert.equal(proxyErrorStatus(error, routePlan()), 502);
+    assert.equal(proxyErrorStatus(error, { route: { canary: {} } }), 503);
+    assert.equal(proxyErrorStatus({ ...error, code: 'CANARY_TARGET_UNAVAILABLE' }, routePlan()), 503);
 });

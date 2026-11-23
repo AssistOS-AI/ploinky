@@ -44,11 +44,11 @@ function runContainerControl(runtime, args) {
     });
 }
 
-function inspectExactContainer(runtime, identifier) {
+function inspectExactContainer(runtime, identifier, { allowMissing = true } = {}) {
     const result = runContainerControl(runtime, ['container', 'inspect', identifier]);
     if (result.error) throw result.error;
     if (result.status !== 0) {
-        if (/no such (?:container|object)|no container with .* (?:found|exists)/i.test(String(result.stderr || ''))) {
+        if (allowMissing && /no such (?:container|object)|no container with .* (?:found|exists)/i.test(String(result.stderr || ''))) {
             return null;
         }
         throw new Error('container inspection failed; check that the recorded container engine is available');
@@ -407,10 +407,13 @@ export function inspectCanaryContainer(runtime, identifier) {
     if (result.error) throw result.error;
     if (result.status === 1) return null;
     if (result.status !== 0) throw new Error('could not determine canary container existence');
-    return inspectExactContainer(runtime, identifier);
+    // A failed inspect never proves absence, even when its stderr mentions a
+    // missing container. A later teardown can independently observe exit 1.
+    return inspectExactContainer(runtime, identifier, { allowMissing: false });
 }
 
 export function removeCanaryContainer(name, record, { rolloutId, unpublished = false, onRecoveredIdentity }) {
+    if (typeof rolloutId !== 'string' || !rolloutId.trim()) throw new Error('canary removal requires a recorded rollout ID');
     const inspect = (runtime, id) => {
         const container = inspectCanaryContainer(runtime, id);
         if (!container) return null;

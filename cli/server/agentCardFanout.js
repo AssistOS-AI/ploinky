@@ -1,4 +1,7 @@
 import http from 'node:http';
+import { observeProxyOutcome } from './canary/proxyOutcomes.js';
+import { assertSelectionCurrent } from './canary/selection.mjs';
+import { selectFanoutRuntimes } from './canary/fanout.mjs';
 
 const SAFE_CALLER_METADATA_HEADERS = new Set(['accept-language', 'user-agent']);
 
@@ -76,19 +79,8 @@ export function requestAgentCard(route, agentName, callerHeaders = {}, { beforeD
 
 export default requestAgentCard;
 
-import { observeProxyOutcome } from './canary/proxyOutcomes.js';
-import { assertSelectionCurrent } from './canary/selection.mjs';
-
-import { routeAdmitted } from './canary/routeAdmission.mjs';
-import { selectRouteRuntime } from './canary/selection.mjs';
-
 export function selectAgentCardCandidates(plan, req) {
-    const snapshot = plan?.lease?.snapshot;
-    const candidates = [];
-    for (const [agentName, route] of Object.entries(snapshot?.routing?.routes || {})) {
-        if (!routeAdmitted(route, agentName, snapshot)) continue;
-        const selection = selectRouteRuntime({ routeKey: agentName, route, snapshot, req });
-        if (selection.route.hostPort) candidates.push({ agentName, selection });
-    }
-    return candidates;
+    return selectFanoutRuntimes(plan?.lease?.snapshot, req)
+        .filter(selection => selection.route.hostPort)
+        .map(selection => ({ agentName: selection.routeKey, selection }));
 }

@@ -408,6 +408,36 @@ test('task observer status callbacks stay pinned to the client router', async (t
     assert.equal(secondRouterRequests, 0);
 });
 
+test('ordinary task observers preserve native tool names even for alias-shaped tool names and origin fields', async t => {
+    const name = 'pcq1_' + 'x'.repeat(22);
+    const native = { toolName: 'resume', originToolName: name, handle: 'abcdefghijklmnop' };
+    const task = { id: '0000111122223333', liveContinuation: native };
+    await withCaptureServer(t, (req, body, res) => {
+        if (req.url.startsWith('/worker/task')) return res.end(JSON.stringify({ task }));
+        assert.equal(JSON.parse(body).params.name, name);
+        res.end(JSON.stringify({ result: { metadata: { taskId: task.id, toolName: 'native-name' } } }));
+    });
+    const client = await createAgentClient('worker');
+    let observed;
+    t.after(setAgentTaskObserver(result => { observed = result; }));
+    const previous = process.env.PLOINKY_CANARY;
+    process.env.PLOINKY_CANARY = '0';
+    t.after(() => {
+        if (previous === undefined) delete process.env.PLOINKY_CANARY;
+        else process.env.PLOINKY_CANARY = previous;
+    });
+    await client.callToolWithoutWait(name, {});
+    assert.equal(observed.toolName, 'native-name');
+    assert.deepEqual(await client.getTaskStatus(task.id), task);
+    assert.deepEqual(await client.cancelTask(task.id), task);
+
+    process.env.PLOINKY_CANARY = '1';
+    await client.callToolWithoutWait(name, {});
+    assert.equal(observed.toolName, name);
+    assert.equal((await client.getTaskStatus(task.id)).liveContinuation.toolName, name);
+    assert.equal((await client.cancelTask(task.id)).liveContinuation.toolName, name);
+});
+
 test('task observer aliases keep native handles and work on a fresh client after pruning', async t => {
     const { issueContinuationOrigins, resolveContinuationTool } = await import('../../Agent/lib/taskContinuationOrigin.mjs');
     const secret = Buffer.alloc(32, 0xbc);
@@ -436,7 +466,8 @@ test('task observer aliases keep native handles and work on a fresh client after
         const origin = resolveContinuationTool(name, handle, secret, tools);
         assert.deepEqual(origin.taskPin, { rolloutId: rollout });
         calls.push(origin.tool);
-        res.end(JSON.stringify({ result: origin.tool === resume ? { metadata: { taskId: 'next-id', toolName: resume } } : { ok: true } }));
+        const nextId = 'canary.' + rollout + '.fedcba9876543210';
+        res.end(JSON.stringify({ result: origin.tool === resume ? { metadata: { taskId: nextId, toolName: resume } } : { ok: true } }));
     });
     const client = await createAgentClient('worker');
     assert.equal((await client.getTaskStatus(id)).liveContinuation.toolName, resume, 'ordinary consumers retain the native fields');

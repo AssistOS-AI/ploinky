@@ -34,11 +34,12 @@ async function freePort() {
     return port;
 }
 
-async function startServer(t, { extraEnv = {} } = {}) {
+async function startServer(t, { extraEnv = {}, queueFile, tasks } = {}) {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-tool-logs-'));
     const secret = crypto.randomBytes(32);
     const audience = 'agent:tool-logs-test';
     const configPath = path.join(tmp, 'mcp-config.json');
+    if (queueFile) await fs.writeFile(path.join(tmp, queueFile), JSON.stringify(tasks));
     await fs.writeFile(configPath, JSON.stringify({ tools: [
         { name: 'okTool', command: process.execPath, args: ['-e', 'console.log("done")'], cwd: tmp },
         { name: 'failTool', command: process.execPath, args: ['-e', 'process.exit(3)'], cwd: tmp },
@@ -112,6 +113,45 @@ async function settle(server, expectedLines) {
         await new Promise((resolve) => setTimeout(resolve, 25));
     }
 }
+
+test('task status and cancel keep ordinary replies byte-identical and issue origins for canary tasks', async t => {
+    const liveContinuation = { version: 1, handle: 'abcdefghijklmnop', toolName: 'resume', messageToolName: 'reply' };
+    const stamp = new Date().toISOString();
+    const nativeTask = id => ({ id, toolName: 'run', status: 'completed', createdAt: stamp, updatedAt: stamp,
+        error: null, result: null, liveContinuation, logTail: '', logSeq: 0, logTruncated: false });
+    const old = nativeTask('0000111122223333');
+    const marked = nativeTask('canary.r1.0000111122223333');
+    const ordinary = await startServer(t, { extraEnv: { PLOINKY_CANARY: '0' }, queueFile: '.tasksQueue', tasks: [old, marked] });
+    const canary = await startServer(t, { extraEnv: { PLOINKY_CANARY: '1', PLOINKY_CANARY_ROLLOUT: 'r1' },
+        queueFile: '.tasksQueue.canary.r1', tasks: [marked, old] });
+    const cases = [[ordinary, old, false], [ordinary, marked, true], [canary, marked, true], [canary, old, true]];
+    for (const [server, task, expectsOrigin] of cases) {
+        for (const [method, pathname, tool] of [['GET', '/task', '__task_status__'], ['POST', '/task/cancel', '__task_cancel__']]) {
+            const args = { taskId: task.id };
+            const iat = Math.floor(Date.now() / 1000);
+            const token = signHmacJwt({ secret: server.secret, payload: {
+                typ: 'router-request', iss: 'ploinky-router', aud: server.audience, sub: 'user:test',
+                actor: { kind: 'user', id: 'user:test', roles: ['user'] }, method, path: pathname, tool,
+                rch: computeRchTool({ method, path: pathname, tool, arguments: args }),
+                jti: crypto.randomUUID(), iat, exp: iat + 30,
+            } });
+            const url = new URL(pathname, 'http://127.0.0.1:' + server.port);
+            if (method === 'GET') url.searchParams.set('taskId', task.id);
+            const res = await fetch(url, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+                ...(method === 'POST' && { body: JSON.stringify(args) }) });
+            const text = await res.text();
+            assert.equal(res.status, 200);
+            if (!expectsOrigin) {
+                assert.equal(text, JSON.stringify({ task }));
+            } else {
+                const continuation = JSON.parse(text).task.liveContinuation;
+                assert.match(continuation.originToolName, /^pcq1_.+r1$/);
+                assert.match(continuation.originMessageToolName, /^pcq1_.+r1$/);
+                assert.equal(continuation.toolName, liveContinuation.toolName);
+            }
+        }
+    }
+});
 
 test('each tool call prints one completion line and no per-call detail lines by default', async (t) => {
     const server = await startServer(t);

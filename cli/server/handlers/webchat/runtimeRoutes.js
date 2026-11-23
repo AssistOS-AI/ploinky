@@ -71,7 +71,7 @@ function runtimeAgentName(effectiveConfig) {
 }
 
 // A launch-bound TTY can survive an unrelated generation change. Legacy
-// routes have no launch proof, so reuse them only within the opening generation.
+// members of a split have no launch proof, so fence them by generation.
 function runtimeTargetId(target) {
     if (!target) return null;
     const { container, targetRecord, snapshot } = target;
@@ -79,12 +79,30 @@ function runtimeTargetId(target) {
 }
 
 function currentTarget(req, config, tty) {
-    const target = resolveWebchatInvocationTarget(req, config);
     const expected = config.exactTarget;
+    let target;
+    try {
+        target = resolveWebchatInvocationTarget(req, config, { reuseOrdinaryTty: Boolean(tty) && !expected });
+    } catch (error) {
+        if (expected || error.code === 'CANARY_SELECTION_CHANGED') throw error;
+        // Ordinary routes can still deliver an unsigned envelope.
+        return { tokenError: error };
+    }
     if (expected && (runtimeTargetId(expected) !== runtimeTargetId(target) || expected.selection?.isCurrent() === false
         || (tty && (tty.verifiedLaunch?.containerId !== target.targetRecord.containerId
             || tty.verifiedLaunch?.launchId !== target.targetRecord.launchId)))) {
         throw new Error('WebChat runtime target changed');
+    }
+    return target;
+}
+
+function targetForWrite(req, config, tab) {
+    const target = currentTarget(req, config, tab.tty);
+    if (config.exactTarget) {
+        if (runtimeTargetId(target) !== tab.targetId) throw new Error('WebChat runtime target changed');
+    } else if (target && !target.tokenError && target.targetRecord?.launchId !== tab.openingLaunchId) {
+        // Keep the writable TTY, but never give it a token for its replacement.
+        return { tokenError: new Error('WebChat runtime launch changed') };
     }
     return target;
 }
@@ -152,14 +170,13 @@ export function handleRuntimeRoute({
         const runtimes = getRuntimeMap(appState);
         const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery, principal);
         let tab = runtimes.get(runtimeKey);
-        let targetId = null;
-        if (effectiveConfig.exactTarget || shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)) {
-            try {
-                targetId = runtimeTargetId(currentTarget(req, effectiveConfig, tab?.tty));
-            } catch (error) {
-                return failWebchatInvocation(res, error);
-            }
+        let target;
+        try {
+            target = currentTarget(req, effectiveConfig, tab?.tty);
+        } catch (error) {
+            return failWebchatInvocation(res, error);
         }
+        const targetId = effectiveConfig.exactTarget ? runtimeTargetId(target) : null;
 
         if (tab && (!isRuntimeWritable(tab) || (targetId !== null && tab.targetId !== targetId))) {
             disposeUnavailableRuntime(tab, runtimeKey, runtimes);
@@ -196,6 +213,7 @@ export function handleRuntimeRoute({
                     ttyClosed: false,
                     runtimeKey,
                     targetId,
+                    openingLaunchId: target?.targetRecord?.launchId,
                     runtimePrincipal: principal,
                     runtimeAgent: runtimeAgentName(effectiveConfig),
                     workspaceDirectory,
@@ -363,18 +381,13 @@ export function handleRuntimeRoute({
             const isVisibleMessage = envelope.presentation?.visible !== false;
             const forwardEnvelope = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig);
             let text = rawMessage;
-            if (forwardEnvelope || effectiveConfig.exactTarget) {
-                try {
-                    const target = currentTarget(req, effectiveConfig, tab.tty);
-                    if (runtimeTargetId(target) !== (tab.targetId ?? null)) {
-                        throw new Error('WebChat runtime target changed');
-                    }
-                    if (forwardEnvelope) text = serializeWebchatEnvelopeForAgent({
-                        req, effectiveConfig, tabId, pageInstanceId, envelope, fallbackText: rawMessage, target
-                    });
-                } catch (error) {
-                    return failWebchatInvocation(res, error);
-                }
+            try {
+                const target = targetForWrite(req, effectiveConfig, tab);
+                if (forwardEnvelope) text = serializeWebchatEnvelopeForAgent({
+                    req, effectiveConfig, tabId, pageInstanceId, envelope, fallbackText: rawMessage, target
+                });
+            } catch (error) {
+                return failWebchatInvocation(res, error);
             }
             if (!writeRuntimeInput(tab, `${text}\n`)) {
                 disposeUnavailableRuntime(tab, runtimeKey, runtimes);
@@ -430,9 +443,7 @@ export function handleRuntimeRoute({
                     sourcePageInstanceId: pageInstanceIdFrom(parsedUrl),
                 })}\n`
                 : body;
-            if (effectiveConfig.exactTarget) {
-                try { currentTarget(req, effectiveConfig, tab.tty); } catch (error) { return failWebchatInvocation(res, error); }
-            }
+            try { targetForWrite(req, effectiveConfig, tab); } catch (error) { return failWebchatInvocation(res, error); }
             if (!writeRuntimeInput(tab, control)) {
                 disposeUnavailableRuntime(tab, runtimeKey, runtimes);
                 res.writeHead(409); res.end();
@@ -471,9 +482,7 @@ export function handleRuntimeRoute({
             }
         });
         req.on('end', () => {
-            if (effectiveConfig.exactTarget) {
-                try { currentTarget(req, effectiveConfig, tab.tty); } catch (error) { return failWebchatInvocation(res, error); }
-            }
+            try { targetForWrite(req, effectiveConfig, tab); } catch (error) { return failWebchatInvocation(res, error); }
             if (tooLarge) {
                 res.writeHead(413); res.end('Interaction response is too large.');
                 return;

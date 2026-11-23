@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { assertCanaryEligibility, inspectCanarySource, exportCanarySource } from './export.mjs';
 import { openReceipt, readReceipt as loadReceipt, receiptPath, updateReceipt } from './receipt.mjs';
 import { probeCanaryContainer } from './probe.mjs';
+import { assertNoCanaryPreparations } from './preparation.mjs';
 import { endCanary } from './teardown.mjs';
 import { isCanaryRecord, validateCanaryField } from '../canaryRecord.mjs';
 import {
@@ -184,6 +185,7 @@ function preparedRecord(primary, routeKey, networkAlias) {
 }
 
 export async function startCanary({ workspaceRoot, agentRef, commit, share = 10, testAccounts = [], admissionEvidence }, deps = {}) {
+    assertNoCanaryPreparations(workspaceRoot);
     const { generation, selector, routeKey, route, primary, manifest } = target(workspaceRoot, agentRef);
     if (Object.values(generation.routing.routes).some(r => r.canary) || Object.values(generation.agents).some(isCanaryRecord)
         || canaryReceipts(workspaceRoot).some(r => !r.terminal)) throw new Error('workspace already has a canary rollout');
