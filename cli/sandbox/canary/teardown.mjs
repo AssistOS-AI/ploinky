@@ -17,10 +17,11 @@ import { IMMUTABLE_CONTAINER_ID } from '../docker/containerOwnership.js';
 import {
     abortEdgeRoutingPreparation, applyEdgeRoutingGeneration, assertActiveEdgeRoutingSourcesCurrent,
     commitAdditiveEdgeRoutingGeneration, loadEdgeRoutingGenerationForEvidence, prepareAdditiveEdgeRoutingGeneration,
-    readEdgeRoutingSelection, resolveEdgeGenerationPaths,
-    retireAbandonedActiveBoundPreparation, withEdgeGenerationApplyLock,
+    readEdgeRoutingPreparationOwner, readEdgeRoutingSelection, resolveEdgeGenerationPaths,
+    retireAbandonedActiveBoundPreparation, retireAbandonedWorkspaceStartPreparation, withEdgeGenerationApplyLock,
 } from '../edgeGeneration.js';
-import { closeReceipt, readReceipt, receiptPath, updateReceipt } from './receipt.mjs';
+import { checkedReceiptPath, closeReceipt, inspectStartReceipt, readReceipt, receiptPath, updateReceipt } from './receipt.mjs';
+import { keepCanaryOnStart, repairStartReceipt } from './startReconciliation.mjs';
 
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const keyPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
@@ -119,7 +120,8 @@ function checkedExport(context, commit, codePath) {
 
 function removeExport(dir) {
     const parent = path.dirname(dir);
-    if (!fs.existsSync(parent)) return;
+    const canaryRoot = path.dirname(parent);
+    if (!fs.existsSync(canaryRoot)) return;
     // S2 freezes the archive directories. Re-enable deletion on directories
     // only; archive symlinks are unlinked without following their targets.
     const thaw = directory => {
@@ -132,7 +134,14 @@ function removeExport(dir) {
         thaw(dir);
         fs.rmSync(dir, { recursive: true });
     }
-    sync(parent);
+    // rmdir checks emptiness atomically. A sibling export belongs to its own rollout.
+    try {
+        fs.rmdirSync(parent);
+    } catch (error) {
+        if (error.code === 'ENOTEMPTY' || error.code === 'EEXIST') return sync(parent);
+        if (error.code !== 'ENOENT') throw error;
+    }
+    sync(canaryRoot);
 }
 
 function checkoutHead(dir) {
@@ -161,8 +170,51 @@ function checkedHome(source, workspaceRoot) {
     return source;
 }
 
+function canaryHome({ routeKey, workspaceRoot }, record, primaryRecord) {
+    const binds = (record.config?.binds || primaryRecord?.config?.binds)?.filter(bind => bind.target === '/root') || [];
+    if (binds.length > 1) throw new Error('ambiguous canary home mount');
+    return binds.length ? checkedHome(binds[0].source, workspaceRoot)
+        : resolveAgentDataPath(record.alias || primaryRecord?.alias || record.agentName || routeKey, { workspaceRoot });
+}
+
+function verifyLegacySharedHome(context, generation) {
+    const { receipt, routeKey } = context;
+    const route = generation.routing.routes[routeKey];
+    const primary = generation.agents[route?.container];
+    const member = receipt.canaryRecord;
+    const matches = (record, id, launch, instance, enable) => record?.type === 'agent' && record.runtime === 'podman'
+        && IMMUTABLE_CONTAINER_ID.test(id) && record.containerId === id && launch && record.launchId === launch
+        && instance && record.instanceId === instance && enable && record.enableGeneration === enable;
+    if (!matches(primary, receipt.oldContainerId, receipt.oldLaunchId, receipt.oldInstanceId, receipt.oldEnableGeneration)
+        || !matches(member, receipt.canaryContainerId, receipt.canaryLaunchId, receipt.canaryInstanceId, receipt.canaryEnableGeneration)
+        || member.containerId === primary.containerId || member.canaryOf !== routeKey || route.container !== receipt.oldContainerName
+        || primary.repoName !== member.repoName || member.repoName !== receipt.repoName
+        || primary.agentName !== member.agentName || member.agentName !== receipt.agentName || primary.alias !== member.alias
+        || canaryHome(context, member, primary) !== receipt.teardown.home
+        || canaryHome(context, primary, primary) !== receipt.teardown.home) {
+        throw new Error('cannot prove the queue home after published canary removal');
+    }
+}
+
+function recoverRemovedPairHome(context) {
+    const { receipt } = context;
+    // Prefer the removed pair, including any canary-only /root bind. A legacy
+    // S2 receipt with just a shared home needs the exact primary as well.
+    const generationId = receipt.teardownPairGeneration || readEdgeRoutingSelection(context).selector.previousGeneration;
+    const generation = generationId ? loadEdgeRoutingGenerationForEvidence(generationId, context)
+        : assertActiveEdgeRoutingSourcesCurrent(context).generation;
+    const observed = pair(context, generation);
+    if (!observed) {
+        if (receipt.teardownPairGeneration) throw new Error('saved generation has no matching removed canary');
+        return verifyLegacySharedHome(context, generation);
+    }
+    assertIdentity(context, observed);
+    const home = canaryHome(context, observed.record, generation.agents[observed.route.container]);
+    if (receipt.teardown.home !== home) save(context, { teardown: { ...receipt.teardown, home } });
+}
+
 function begin(context, observed, primaryRecord) {
-    const { receipt, workspaceRoot, routeKey, reason } = context;
+    const { receipt, routeKey, reason } = context;
     assertIdentity(context, observed);
     const record = observed?.record || unpublishedRecord(receipt);
     const commit = observed?.field.commit || receipt.canaryCommit;
@@ -173,10 +225,7 @@ function begin(context, observed, primaryRecord) {
     }
     const id = record?.containerId || receipt.canaryContainerId;
     if ((observed || id) && !IMMUTABLE_CONTAINER_ID.test(id)) throw new Error('missing immutable canary container ID');
-    const binds = (record.config?.binds || primaryRecord?.config?.binds)?.filter(bind => bind.target === '/root') || [];
-    if (binds.length > 1) throw new Error('ambiguous canary home mount');
-    const home = binds.length ? checkedHome(binds[0].source, workspaceRoot)
-        : resolveAgentDataPath(record.alias || primaryRecord?.alias || record.agentName || routeKey, { workspaceRoot });
+    const home = canaryHome(context, record, primaryRecord);
     const teardown = {
         name, id, commit, home, launchId: record?.launchId || receipt.canaryLaunchId,
         instanceId: record?.instanceId, enableGeneration: record?.enableGeneration,
@@ -354,7 +403,10 @@ function publish(context, effect) {
             journal.before[key] = digest(bytes[key]);
             journal.after[key] = digest(JSON.stringify(sources[key], null, 2));
         }
-        save(context, { teardownPublication: journal });
+        // Keep the exact published pair after removing both mutable records.
+        // It can still prove the mounted queue home on a later start.
+        const pairGeneration = selector.state === 'active' ? selector.generation : selector.previousGeneration;
+        save(context, { teardownPublication: journal, ...(effect === 'remove-pair' && { teardownPairGeneration: pairGeneration }) });
         if (selector.state === 'inactive') {
             for (const key of ['routing', 'agents']) writeSource(paths[key + 'File'], JSON.stringify(sources[key], null, 2));
             applyEdgeRoutingGeneration({ workspaceRoot, applyLockCapability, reason, activate: false });
@@ -412,6 +464,16 @@ async function endLocked(context) {
     }
     if (!observed && !receipt.teardown && receipt.step === 'published') {
         throw new Error('published canary is missing its route and registry pair');
+    }
+    if (context.reason === 'start' && observed && receipt.teardown && (!receipt.teardown.published
+        || receipt.teardown.home !== canaryHome(context, observed.record, agents[primary]))) {
+        await repairStartReceipt(context, inspectStartReceipt(context.routeKey, context));
+        receipt = readReceipt(context.routeKey, context);
+        context.receipt = receipt;
+    }
+    if (context.reason === 'start' && !observed && receipt.teardown
+        && (receipt.teardown.published || receipt.teardownPairGeneration || receipt.step === 'published')) {
+        recoverRemovedPairHome(context);
     }
     if (!receipt.teardown) begin(context, observed, agents[primary]);
     receipt = context.receipt;
@@ -488,7 +550,8 @@ function assertWorkspace(workspaceRoot) {
 function withTeardownLock(context, callback) {
     assertWorkspace(context.workspaceRoot);
     return withHeldOrAcquiredWorkspaceMutationLease({ operation: 'canary-teardown' },
-        () => withNetworkLifecycleLockReclaimingStoppedOwner(callback));
+        workspaceMutationLease => withNetworkLifecycleLockReclaimingStoppedOwner(
+            networkLifecycleCapability => callback({ workspaceMutationLease, networkLifecycleCapability })));
 }
 
 export async function endCanary({ routeKey, reason, workspaceRoot = PLOINKY_WORKSPACE_ROOT, dependencies = {} }) {
@@ -498,14 +561,15 @@ export async function endCanary({ routeKey, reason, workspaceRoot = PLOINKY_WORK
 
 function openRoutes(context) {
     assertWorkspace(context.workspaceRoot);
-    const directory = path.dirname(receiptPath('unused', context));
+    const directory = path.dirname((context.reason === 'start' ? checkedReceiptPath : receiptPath)('unused', context));
     let files = [];
     try { files = fs.readdirSync(directory); } catch (error) {
         if (error.code !== 'ENOENT') throw error;
     }
     const keys = new Set(files.filter(file => file.endsWith('.json'))
         .map(file => file.slice(0, -5))
-        .filter(key => (!context.routeKey || context.routeKey === key) && !readReceipt(key, context)?.terminal));
+        .filter(key => !context.routeKey || context.routeKey === key)
+        .filter(key => !(context.reason === 'start' ? inspectStartReceipt(key, context).value : readReceipt(key, context))?.terminal));
     // A missing or prematurely closed receipt must not let stop/disable fall
     // through to ordinary fleet removal with a published canary still present.
     const paths = resolveEdgeGenerationPaths(context);
@@ -525,17 +589,28 @@ function openRoutes(context) {
     return [...keys];
 }
 
-export function hasOpenCanaries({ workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
-    return openRoutes({ workspaceRoot }).length > 0;
+export function hasOpenCanaries({ workspaceRoot = PLOINKY_WORKSPACE_ROOT, reason } = {}) {
+    return openRoutes({ workspaceRoot, reason }).length > 0;
 }
 
 export async function reconcileCanaries({ reason, workspaceRoot = PLOINKY_WORKSPACE_ROOT, routeKey, primaryContainer, dependencies = {} }) {
     const context = { reason, workspaceRoot, routeKey, primaryContainer, dependencies };
     if (!openRoutes(context).length) return [];
-    return withTeardownLock(context, async () => {
+    return withTeardownLock(context, async locks => {
         const results = [];
-        for (const key of openRoutes(context)) {
-            const { ended, outcome } = await endLocked({ ...context, routeKey: key });
+        const keys = openRoutes(context);
+        // A previous warm start can stop with both its canary and its inactive
+        // graph preparation on disk. Retire that exact owner before any apply.
+        if (reason === 'start' && keys.length) {
+            const owner = readEdgeRoutingPreparationOwner(context);
+            if (owner?.mode === 'replacement' && owner.reason === 'workspace-graph-enable-prelaunch') {
+                retireAbandonedWorkspaceStartPreparation({ workspaceRoot, ...locks });
+            }
+        }
+        for (const key of keys) {
+            const routeContext = { ...context, routeKey: key };
+            if (reason === 'start' && await keepCanaryOnStart(routeContext)) continue;
+            const { ended, outcome } = await endLocked(routeContext);
             if (ended) results.push({ routeKey: key, outcome });
         }
         return results;

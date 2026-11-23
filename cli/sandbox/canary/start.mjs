@@ -5,7 +5,7 @@ import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { assertCanaryEligibility, inspectCanarySource, exportCanarySource } from './export.mjs';
-import { openReceipt, readReceipt as loadReceipt, receiptPath, updateReceipt } from './receipt.mjs';
+import { checkedReceiptPath, openReceipt, readReceipt as loadReceipt, updateReceipt } from './receipt.mjs';
 import { probeCanaryContainer } from './probe.mjs';
 import { assertNoCanaryPreparations } from './preparation.mjs';
 import { endCanary } from './teardown.mjs';
@@ -31,19 +31,6 @@ import { resolveRouterEndpoint } from '../routerPort.js';
 import { readRuntimeCandidate, retireRuntimeCandidate } from '../runtimeCandidateStore.js';
 
 const exactId = /^[a-f0-9]{64}$/;
-
-function checkedReceiptPath(routeKey, options) {
-    const file = receiptPath(routeKey, options);
-    let directory = path.resolve(options.workspaceRoot);
-    for (const part of path.relative(directory, path.dirname(file)).split(path.sep)) {
-        directory = path.join(directory, part);
-        const stat = fs.lstatSync(directory, { throwIfNoEntry: false });
-        if (stat && !stat.isDirectory()) throw new Error('canary receipts require real workspace directories');
-    }
-    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
-    if (stat && !stat.isFile()) throw new Error('canary receipt requires a regular file');
-    return file;
-}
 
 function readReceipt(routeKey, options) {
     checkedReceiptPath(routeKey, options);
@@ -492,6 +479,11 @@ async function reconcileReceipt(receipt, workspaceRoot, end) {
         await end({ routeKey, workspaceRoot, reason: receipt.teardown?.reason || (field ? 'abort' : 'interrupted-start') });
         if (!field && candidate) retireRuntimeCandidate(candidate, { workspaceRoot });
     }
+}
+
+// Called by workspace start only after observing this exact selected pair.
+export function reconcilePublishedCanaryReceipt(receipt, workspaceRoot) {
+    return reconcileReceipt(receipt, workspaceRoot, () => { throw new Error('published canary changed during start'); });
 }
 
 export async function reconcileCanaryCommands(workspaceRoot, { end = endCanary } = {}) {

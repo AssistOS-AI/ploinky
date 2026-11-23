@@ -21,6 +21,45 @@ export function receiptPath(routeKey, { workspaceRoot } = {}) {
     return path.join(receiptDir(workspaceRoot), `${key}.json`);
 }
 
+export function checkedReceiptPath(routeKey, options) {
+    const file = receiptPath(routeKey, options);
+    let directory = path.resolve(options.workspaceRoot);
+    for (const part of path.relative(directory, path.dirname(file)).split(path.sep)) {
+        directory = path.join(directory, part);
+        const stat = fs.lstatSync(directory, { throwIfNoEntry: false });
+        if (stat && !stat.isDirectory()) throw new Error('canary receipts require real workspace directories');
+    }
+    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (stat && !stat.isFile()) throw new Error('canary receipt requires a regular file');
+    return file;
+}
+
+// A readable but undecodable receipt can be recovered from an independently
+// proved publication. A filesystem error provides no such evidence.
+export function inspectStartReceipt(routeKey, options) {
+    let bytes;
+    try { bytes = fs.readFileSync(checkedReceiptPath(routeKey, options), 'utf8'); } catch (error) {
+        if (error.code === 'ENOENT') return { bytes: null, value: null };
+        throw error;
+    }
+    try { return { bytes, value: JSON.parse(bytes) }; }
+    catch { return { bytes, value: null }; }
+}
+
+export function recoverPublishedStartReceipt(routeKey, expectedBytes, fields, options) {
+    const file = checkedReceiptPath(routeKey, options);
+    if (inspectStartReceipt(routeKey, options).bytes !== expectedBytes) throw new Error('canary receipt changed during start');
+    const now = new Date().toISOString();
+    writeAtomic(file, {
+        schemaVersion: 1, routeKey, openedAt: now, updatedAt: now, ...fields,
+        step: 'published', intent: 'withdraw', failurePhase: null, failureReason: null, terminal: null,
+    });
+    for (const entry of [file, path.dirname(file), path.dirname(path.dirname(file))]) {
+        const fd = fs.openSync(entry, 'r');
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    }
+}
+
 export function readReceipt(routeKey, options = {}) {
     const file = receiptPath(routeKey, options);
     let bytes;

@@ -84,7 +84,8 @@ function fixture(canary, { published = canary, manifest = {}, onEffect, prepare 
     applyEdgeRoutingGeneration({ workspaceRoot, reason: 'fixture', publicationState: 'ready' });
     if (canary) openReceipt({ routeKey: 'alpha', rolloutId: 'rollout', fields: {
         oldContainerName: 'primary', canaryContainerName: 'primary__canary', canaryCommit: commit,
-        ...(published && { step: 'published', canaryContainerId: canaryId, canaryLaunchId: 'secondary-launch' }),
+        ...(published && { step: 'published', repoName: 'fixtures', agentName: 'alpha', canaryContainerId: canaryId,
+            canaryLaunchId: 'secondary-launch', canaryInstanceId: 'secondary-instance', canaryEnableGeneration: 'secondary-generation' }),
     } }, { workspaceRoot });
     const effects = [];
     observeEffects(name => {
@@ -336,6 +337,7 @@ test('ordinary start persists an explicit profile before reporting a missing sta
 
 test('start finishes canary teardown before persisting an explicit profile', async t => {
     fixture(true);
+    inactivateEdgeRoutingGeneration('cold-start-fixture', { workspaceRoot });
     const atProfileWrite = [];
     const writeFile = fs.writeFileSync;
     t.mock.method(fs, 'writeFileSync', (file, ...args) => {
@@ -353,6 +355,7 @@ for (const [args, boundaries] of commands) {
     for (const canary of [false, true]) {
         test(`${command} dispatch ${canary ? 'finishes teardown before lifecycle effects' : 'runs the base lifecycle without teardown'}`, async () => {
             const effects = fixture(canary);
+            if (canary && command === 'start') inactivateEdgeRoutingGeneration('cold-start-fixture', { workspaceRoot });
             if (['start', 'restart'].includes(command)) {
                 await assert.rejects(handleCommand(args), /fixture reached start repository preparation/);
             } else if (command === 'update') {

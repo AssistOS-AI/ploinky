@@ -1,12 +1,11 @@
 // Run with local rootless Podman on Linux or a local macOS Podman machine.
-// PLOINKY_BOX_CANDIDATE_DIGEST selects the cached Box. Its pinned Router
-// authority helper doubles as the Node fixture image. Both must be cached locally.
+// PLOINKY_BOX_CANDIDATE_DIGEST selects the cached Box. The normal in-Box
+// launch pulls the pinned Router authority helper, also used as the fixture image.
 // Each command/state gets its own disposable Box, Router and nested store.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
@@ -45,12 +44,11 @@ async function configureRouter() {
     timer.unref();
 }
 
-async function exercise(workspace, command, state, imageId, token) {
+async function exercise(workspace, command, state, token) {
     assert.equal(fs.readFileSync('/etc/ploinky-box', 'utf8'), 'assistos/ploinky-box\n');
     assert.equal(fs.realpathSync(workspace), process.env.PLOINKY_WORKSPACE_ROOT);
     assert.equal(fs.readFileSync(path.join(workspace, 'fixture-owner'), 'utf8'), token);
     assert.ok(commands.includes(command) && states.includes(state));
-    assert.match(imageId, /^sha256:[a-f0-9]{64}$/);
     process.chdir(workspace);
     Object.assign(process.env, {
         GIT_ALLOW_PROTOCOL: 'file', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
@@ -63,10 +61,6 @@ async function exercise(workspace, command, state, imageId, token) {
     const podman = (...args) => run('podman', ['--remote=false', ...args]);
     assert.equal(podman('ps', '-aq'), '', 'fixture must start with an empty nested container store');
     const { ROUTER_AUTHORITY_HELPER_IMAGE } = await import('../../../cli/sandbox/routerAuthorityAttestation.js');
-    podman('load', '-i', path.join(workspace, 'fixture-image.tar'));
-    podman('image', 'exists', ROUTER_AUTHORITY_HELPER_IMAGE);
-    assert.match(podman('image', 'inspect', '--format', '{{.Id}}', imageId), new RegExp(imageId.slice(7) + '$'));
-    fs.unlinkSync(path.join(workspace, 'fixture-image.tar'));
     const git = (dir, ...args) => run('git', [
         '-C', dir, '-c', 'user.name=Canary Fixture', '-c', 'user.email=fixture@example.invalid', ...args,
     ]);
@@ -85,7 +79,7 @@ async function exercise(workspace, command, state, imageId, token) {
         const dir = path.join(origin, agent);
         fs.mkdirSync(dir);
         write(path.join(dir, 'manifest.json'), {
-            container: imageId, start: 'node /code/serve.cjs', readiness: { protocol: 'tcp' },
+            container: ROUTER_AUTHORITY_HELPER_IMAGE, start: 'node /code/serve.cjs', readiness: { protocol: 'tcp' },
             ...(agent === 'gate' ? { enable: ['subject'] } : {}),
             profiles: { default: { openPorts: [`127.0.0.1:${agent === 'gate' ? 19081 : 19082}:7000`] } },
         });
@@ -104,6 +98,9 @@ async function exercise(workspace, command, state, imageId, token) {
     git(origin, 'commit', '-qam', 'Candidate fixture');
     const canaryCommit = git(origin, 'rev-parse', 'HEAD');
     cli('start', 'fixture/gate', '8080');
+    const { normalizeImageId } = await import('../../../cli/sandbox/docker/runtimeImageIdentity.js');
+    const imageId = 'sha256:' + normalizeImageId(podman('image', 'inspect', '--format', '{{.Id}}', ROUTER_AUTHORITY_HELPER_IMAGE));
+    assert.match(imageId, /^sha256:[a-f0-9]{64}$/);
     const registry = path.join(workspace, '.ploinky/agents.json');
     const routingFile = path.join(workspace, '.ploinky/routing.json');
     const routing = json(routingFile);
@@ -201,6 +198,8 @@ async function exercise(workspace, command, state, imageId, token) {
         for (const entry of Object.values(agents).filter(a => a?.runtime === 'podman' && a.containerId)) {
             podman('stop', '--time', '3', entry.containerId);
         }
+        assert.equal(podman('inspect', '--format', '{{.State.Running}}', record.containerId), 'false',
+            'cold start requires the recorded canary to be stopped');
     }
     assert.ok(podman('ps', '-a', '--no-trunc', '--format', '{{.ID}}').split('\n').includes(record.containerId));
     cli(command, ...(command === 'disable' ? ['agent', ref] : command === 'update' ? ['repo', 'fixture'] : []));
@@ -240,47 +239,32 @@ async function main() {
     assert.ok(!process.env.CONTAINER_HOST && !process.env.CONTAINER_CONNECTION, 'requires local Podman');
     const digest = process.env.PLOINKY_BOX_CANDIDATE_DIGEST || '';
     assert.match(digest, /^sha256:[a-f0-9]{64}$/, 'set PLOINKY_BOX_CANDIDATE_DIGEST to the cached Box digest');
-    const { ROUTER_AUTHORITY_HELPER_IMAGE } = await import('../../../cli/sandbox/routerAuthorityAttestation.js');
     const { createPodmanHarness } = await import('../../e2e/ploinkyBox/nativeHelpers.mjs');
     const imageRef = 'docker.io/assistos/ploinky-box@' + digest;
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-workspace-matrix-'));
-    try {
-        const archive = path.join(scratch, 'fixture-image.tar');
-        // On macOS the native runner uses the selected local Podman machine.
-        // Verify the configured endpoint before contacting that engine.
-        if (process.platform === 'darwin') {
-            const connections = JSON.parse(execFileSync('podman', ['system', 'connection', 'list', '--format', 'json'], { encoding: 'utf8' }));
-            const selected = connections.filter(connection => connection.Default);
-            assert.equal(selected.length, 1, 'expected one default Podman machine connection');
-            const endpoint = new URL(selected[0].URI);
-            assert.ok(endpoint.protocol === 'unix:' || (endpoint.protocol === 'ssh:'
-                && ['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname)), 'requires a local Podman machine');
-        }
-        const engineArgs = process.platform === 'linux' ? ['--remote=false'] : [];
-        const { normalizeImageId } = await import('../../../cli/sandbox/docker/runtimeImageIdentity.js');
-        const imageId = 'sha256:' + normalizeImageId(execFileSync('podman',
-            [...engineArgs, 'image', 'inspect', '--format', '{{.Id}}', ROUTER_AUTHORITY_HELPER_IMAGE], { encoding: 'utf8' }));
-        assert.match(imageId, /^sha256:[a-f0-9]{64}$/);
-        execFileSync('podman', [...engineArgs, 'save', '--format', 'oci-archive', '--output', archive, ROUTER_AUTHORITY_HELPER_IMAGE],
-            { timeout: 120_000 });
-        for (const command of commands) for (const state of states) {
-            await test(command + ' from ' + state, async t => {
-                const h = createPodmanHarness(t, imageRef);
-                const token = randomUUID();
-                fs.writeFileSync(path.join(h.workspace, 'fixture-owner'), token, { flag: 'wx' });
-                fs.copyFileSync(archive, path.join(h.workspace, 'fixture-image.tar'));
-                const box = await h.supervisor.prepareBoxForCommand({
-                    imageRef, explicitPort: 19826, explicitMediaPort: 19827,
-                });
-                const result = h.runner.query('podman', [
-                    'exec', '--user', 'podman', '--workdir', h.workspace, box.containerId, 'node',
-                    '/opt/ploinky/' + file, '--case', h.workspace, command, state, imageId, token,
-                ], { timeoutMs: 12 * 60_000 });
-                assert.equal(result.ok, true, result.stderr);
+    // On macOS the native runner uses the selected local Podman machine.
+    // Verify the configured endpoint before contacting that engine.
+    if (process.platform === 'darwin') {
+        const connections = JSON.parse(execFileSync('podman', ['system', 'connection', 'list', '--format', 'json'], { encoding: 'utf8' }));
+        const selected = connections.filter(connection => connection.Default);
+        assert.equal(selected.length, 1, 'expected one default Podman machine connection');
+        const endpoint = new URL(selected[0].URI);
+        assert.ok(endpoint.protocol === 'unix:' || (endpoint.protocol === 'ssh:'
+            && ['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname)), 'requires a local Podman machine');
+    }
+    for (const command of commands) for (const state of states) {
+        await test(command + ' from ' + state, async t => {
+            const h = createPodmanHarness(t, imageRef);
+            const token = randomUUID();
+            fs.writeFileSync(path.join(h.workspace, 'fixture-owner'), token, { flag: 'wx' });
+            const box = await h.supervisor.prepareBoxForCommand({
+                imageRef, explicitPort: 19826, explicitMediaPort: 19827,
             });
-        }
-    } finally {
-        fs.rmSync(scratch, { recursive: true });
+            const result = h.runner.query('podman', [
+                'exec', '--user', 'podman', '--workdir', h.workspace, box.containerId, 'node',
+                '/opt/ploinky/' + file, '--case', h.workspace, command, state, token,
+            ], { timeoutMs: 12 * 60_000 });
+            assert.equal(result.ok, true, result.stderr);
+        });
     }
 }
 

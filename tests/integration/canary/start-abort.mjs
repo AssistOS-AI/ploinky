@@ -155,7 +155,8 @@ fs.renameSync = function(from, to) {
             const hex = selector.generation.replace(/^sha256:/, '');
             const doc = read(path.join(path.dirname(to), 'generations', hex + '.json'));
             const routing = JSON.parse(Buffer.from(doc.sources.routing, 'base64'));
-            stop = routing.routes[${JSON.stringify(agent)}]?.canary?.mode === 'withdrawn';
+            const field = routing.routes[${JSON.stringify(agent)}]?.canary;
+            stop = field?.mode === 'withdrawn' && field.rolloutId === process.env.FIXTURE_ROLLOUT;
         }
     }
     if (stop) {
@@ -165,10 +166,10 @@ fs.renameSync = function(from, to) {
     return result;
 };
 `);
-async function interrupt(args, step, observe) {
+async function interrupt(args, step, observe, rolloutId = '') {
     const marker = path.join(scratch, step);
     const child = spawn(process.execPath, ['--require', preload, cli, ...args], {
-        cwd: root, env: { ...env, FIXTURE_MARK: marker, FIXTURE_STEP: step }, stdio: 'ignore',
+        cwd: root, env: { ...env, FIXTURE_MARK: marker, FIXTURE_STEP: step, FIXTURE_ROLLOUT: rolloutId }, stdio: 'ignore',
     });
     const exited = new Promise((resolve, reject) => {
         child.once('error', reject);
@@ -235,7 +236,7 @@ function mount(row, destination) {
     assert.equal(matches.length, 1, destination);
     return matches[0];
 }
-function absent(receipt, home) {
+function absent(receipt, home, reason) {
     assert(!ids().includes(receipt.canaryContainerId), 'canary still present in podman ps -a');
     const live = snapshot();
     assert(!live.agents[receipt.canaryContainerName] && !live.routing.routes[agent].canary);
@@ -243,7 +244,10 @@ function absent(receipt, home) {
     assert(!json(path.join(state, 'routing.json')).routes[agent].canary);
     assert(!fs.existsSync(path.join(root, receipt.codePath)));
     assert(!fs.existsSync(path.join(home, '.tasksQueue.canary.' + receipt.rolloutId)));
-    assert(json(receiptFile).terminal?.outcome);
+    const closed = json(receiptFile);
+    assert.equal(closed.rolloutId, receipt.rolloutId);
+    assert.equal(closed.terminal?.outcome, 'aborted');
+    assert.equal(closed.terminal.reason, reason);
 }
 
 const start = ['canary', 'start', ref, '--commit', candidate];
@@ -277,7 +281,7 @@ try {
         assert(!snapshot().routing.routes[agent].canary);
     });
     runCli('canary', 'status', '--json');
-    absent(orphan, home);
+    absent(orphan, home, 'interrupted-start');
 
     runCli(...start);
     const receipt = json(receiptFile);
@@ -345,6 +349,11 @@ try {
     assert(stillPending());
     runCli('start', ref);
     const adopted = snapshot();
+    const adoptedRoute = adopted.routing.routes[agent];
+    assert.equal(adoptedRoute.container, primaryKey);
+    assert.equal(adoptedRoute.canary?.rolloutId, receipt.rolloutId, 'warm start must preserve the active rollout');
+    assert.equal(adoptedRoute.canary.mode, 'split');
+    assert.equal(adoptedRoute.canary.container, field.container);
     assert.equal(adopted.agents[primaryKey].containerId, old.containerId);
     assert.equal(adopted.agents[field.container].containerId, record.containerId);
     assert.equal(adopted.agents[primaryKey].launchId, old.launchId);
@@ -353,12 +362,19 @@ try {
     await interrupt(['canary', 'abort', ref], 'withdrawn', () => {
         const gen = snapshot();
         assert.equal(gen.routing.routes[agent].canary.mode, 'withdrawn');
+        assert.equal(gen.routing.routes[agent].canary.rolloutId, receipt.rolloutId);
         assert.equal(gen.agents[field.container].containerId, record.containerId);
         assert(ids().includes(record.containerId));
-    });
+        const interrupted = json(receiptFile);
+        assert.equal(interrupted.rolloutId, receipt.rolloutId);
+        assert.equal(interrupted.terminal, null);
+        assert.equal(interrupted.teardown.reason, 'abort');
+        assert(json(newQueue).some(t => t.id === newId));
+    }, receipt.rolloutId);
     runCli('canary', 'abort', ref);
-    absent(receipt, home);
-    assert(stillPending() && hash(queue) === queueHash);
+    absent(receipt, home, 'abort');
+    assert(stillPending(), 'old task must remain pending after resumed abort');
+    assert.equal(hash(queue), queueHash, 'resumed abort changed the primary queue');
     assert(inspect(old.containerId).State.Running);
 } finally {
     if (started) runCli('stop');

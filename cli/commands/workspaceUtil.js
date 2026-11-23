@@ -299,6 +299,10 @@ export function buildRouterEnv({ managedBox } = {}) {
   );
 }
 
+export function workspaceRouterHealthSocket() {
+  return buildRouterEnv().PLOINKY_ROUTER_HEALTH_SOCKET || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
+}
+
 async function spawnNoWaitWorker({
   node,
   identity,
@@ -3058,8 +3062,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       routes: routingCandidate.routes || {},
     }, { coordinate: false });
     console.log(`Static: agent=${utils.colorize(staticAgent, 'cyan')} port=${utils.colorize(String(staticPort), 'yellow')}`);
-    const routerHealthSocket = buildRouterEnv().PLOINKY_ROUTER_HEALTH_SOCKET
-      || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
+    const routerHealthSocket = workspaceRouterHealthSocket();
     const readyRouter = await ensureRouterGenerationReady({
       waitForListener: (child, timeoutMs) => waitForRouterReady(staticPort, child, timeoutMs),
       readHealth: () => readRouterGenerationHealth({ socketPath: routerHealthSocket }),

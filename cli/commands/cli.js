@@ -128,7 +128,7 @@ async function withCanarySafePreparation(reason, mutate) {
     try {
         // Publish this reader first. A writer which already admitted itself
         // holds canary-start until it has published its receipt or unwound.
-        if (!canaryStartMayBeInFlight() && !hasOpenCanaries({ workspaceRoot })) return await mutate();
+        if (!canaryStartMayBeInFlight() && !hasOpenCanaries({ workspaceRoot, reason })) return await mutate();
     } finally {
         release();
     }
@@ -138,7 +138,7 @@ async function withCanarySafePreparation(reason, mutate) {
 
 async function withReconciledWorkspace(reason, mutate, acquire = false) {
     const workspaceRoot = PLOINKY_WORKSPACE_ROOT;
-    if (!acquire && !hasOpenCanaries({ workspaceRoot })) return mutate?.();
+    if (!acquire && !hasOpenCanaries({ workspaceRoot, reason })) return mutate?.();
     let acquired = false;
     try {
         return await withHeldOrAcquiredWorkspaceMutationLease({ operation: `workspace-${reason}` }, async () => {

@@ -25,6 +25,9 @@ test.after(() => {
 });
 
 const edge = await import('../../cli/sandbox/edgeGeneration.js');
+const { NETWORK_LABELS, workspaceNetworkIdentity } = await import('../../cli/sandbox/networkIdentity.js');
+const { NETWORK_SCHEMA_VERSION } = await import('../../cli/sandbox/networkContract.js');
+const { ROUTER_GENERATION_SOURCE_FORMAT } = await import('../../cli/utils/runtime/routerGenerationReadiness.mjs');
 const { endCanary, reconcileCanaries } = await import('../../cli/sandbox/canary/teardown.mjs');
 const options = { workspaceRoot };
 const routeKey = 'alpha';
@@ -92,6 +95,7 @@ function seed(state = 'split', { inactive = false, receipt = {}, mode } = {}) {
     for (const file of keep) put(file, 'preserve');
     openReceipt({ routeKey, rolloutId, fields: {
         step: 'published', oldCommit, canaryCommit, canaryContainerName: secondary,
+        repoName: repo, agentName: routeKey, canaryInstanceId: 'canary-instance', canaryEnableGeneration: 'canary-generation',
         canaryContainerId: id, canaryLaunchId: launchId, ...receipt,
     } }, options);
     edge.applyEdgeRoutingGeneration({ workspaceRoot, reason: 'fixture', publicationState: 'ready' });
@@ -148,6 +152,259 @@ function seed(state = 'split', { inactive = false, receipt = {}, mode } = {}) {
         assert.equal(readReceipt(routeKey, options).terminal.outcome, outcome);
     }
     return { runtime, dependencies, calls, assertClean };
+}
+
+function publishedStartFixture(seedOptions) {
+    const f = seed('split', { ...seedOptions, receipt: {
+        workspaceIdentity: workspaceNetworkIdentity(workspaceRoot).hash,
+        ...seedOptions?.receipt,
+    } });
+    f.dependencies.readRouterHealth = async () => ({ status: 'healthy', pid: 123, generationSourceFormat: ROUTER_GENERATION_SOURCE_FORMAT });
+    const record = source('agents.json')[secondary];
+    Object.assign(f.runtime.container, {
+        Name: secondary, HostConfig: { Init: true },
+        Config: {
+            Env: ['PLOINKY_CANARY=1', 'PLOINKY_CANARY_ROLLOUT=' + rolloutId, 'PLOINKY_LAUNCH_ID=' + launchId],
+            Labels: {
+                [NETWORK_LABELS.managed]: '1', [NETWORK_LABELS.resource]: 'agent',
+                [NETWORK_LABELS.schema]: NETWORK_SCHEMA_VERSION, [NETWORK_LABELS.workspace]: workspaceNetworkIdentity(workspaceRoot).hash,
+                [NETWORK_LABELS.contract]: 'd'.repeat(64), [NETWORK_LABELS.instanceId]: record.instanceId,
+                [NETWORK_LABELS.enableGeneration]: record.enableGeneration,
+            },
+        },
+    });
+    return f;
+}
+
+test('warm start leaves the published rollout, selector, runtime and receipt untouched', async () => {
+    const f = publishedStartFixture();
+    const files = ['routing.json', 'agents.json', 'data/edge-routing/active.json', 'data/canary/alpha.json'];
+    const capture = () => files.map(file => fs.readFileSync(path.join(metadata, file)));
+    const before = capture();
+    assert.deepEqual(await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies }), []);
+    assert.deepEqual(capture(), before);
+    assert.deepEqual(f.calls, []);
+    assert.ok(f.runtime.container.State.Running && fs.existsSync(exportDir) && fs.existsSync(queue));
+});
+
+test('start cleans up an interrupted unpublished route alongside a healthy published canary', async () => {
+    const f = publishedStartFixture();
+    openReceipt({ routeKey: 'beta', rolloutId: 'orphan', fields: {
+        oldContainerName: 'beta', canaryContainerName: 'beta__canary', canaryCommit: oldCommit,
+    } }, options);
+    const inspect = f.dependencies.inspectContainer;
+    f.dependencies.inspectContainer = (runtime, key) => key === 'beta__canary' ? null : inspect(runtime, key);
+    const before = readReceipt(routeKey, options), selector = selected();
+    assert.deepEqual(await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies }),
+        [{ routeKey: 'beta', outcome: 'aborted' }]);
+    assert.deepEqual(readReceipt(routeKey, options), before);
+    assert.deepEqual(selected(), selector);
+    assert.equal(readReceipt('beta', options).terminal.reason, 'start');
+    assert.ok(f.runtime.container.State.Running && fs.existsSync(exportDir) && fs.existsSync(queue));
+});
+
+for (const cold of ['router stopped', 'secondary stopped', 'inactive generation']) {
+    test('start retires a published rollout with ' + cold, async () => {
+        const f = publishedStartFixture({ inactive: cold === 'inactive generation' });
+        if (cold === 'router stopped') f.dependencies.readRouterHealth = () => { throw Object.assign(new Error(), { code: 'ECONNREFUSED' }); };
+        if (cold === 'secondary stopped') f.runtime.container.State.Running = false;
+        await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies });
+        f.assertClean();
+    });
+}
+
+test('a warm start preserves a running canary during promotion', async () => {
+    const f = publishedStartFixture({ mode: 'all', receipt: { step: 3, lastCompletedStep: 3 } });
+    const before = readReceipt(routeKey, options);
+    assert.deepEqual(await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies }), []);
+    assert.deepEqual(readReceipt(routeKey, options), before);
+    assert.equal(active().routing.routes[routeKey].canary.mode, 'all');
+    assert.deepEqual(f.calls, []);
+});
+
+for (const [label, fields] of [
+    ['missing instance', { canaryInstanceId: undefined }], ['missing generation', { canaryEnableGeneration: undefined }],
+    ['missing agent', { agentName: undefined }], ['missing repo', { repoName: undefined }],
+    ['unknown intent', { intent: { unexpected: true } }], ['invalid step', { step: -1 }],
+    ['damaged journal', { teardown: 'damaged' }],
+]) {
+    test('start retires a split with ' + label + ' in its published receipt', async () => {
+        const f = publishedStartFixture({ receipt: fields });
+        await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies });
+        f.assertClean();
+    });
+}
+
+for (const journal of [{ step: 'created', intent: 'publish' },
+    { step: 'published', intent: 'set', settingsChange: { action: 'set', splitStartedAt: '2026-11-23T00:00:00Z' } }]) {
+    test('warm start finishes the S2 ' + journal.intent + ' receipt of a published rollout', async () => {
+        const f = publishedStartFixture({ receipt: journal });
+        const selector = selected();
+        assert.deepEqual(await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies }), []);
+        assert.deepEqual(selected(), selector);
+        assert.equal(readReceipt(routeKey, options).intent, null);
+        assert.equal(readReceipt(routeKey, options).step, 'published');
+        assert.equal(readReceipt(routeKey, options).terminal, null);
+        assert.deepEqual(f.calls, []);
+        assert.ok(f.runtime.container.State.Running && fs.existsSync(exportDir) && fs.existsSync(queue));
+    });
+}
+
+test('start recovers the published pair without unlinking the queue in a different journal home', async () => {
+    const otherHome = path.join(workspaceRoot, '.data', 'agents', 'beta');
+    const otherQueue = path.join(otherHome, '.tasksQueue.canary.' + rolloutId);
+    put(otherQueue, 'preserve');
+    const f = publishedStartFixture({ receipt: { teardown: {
+        published: true, runtime: 'podman', name: secondary, id, launchId, commit: canaryCommit,
+        instanceId: 'canary-instance', enableGeneration: 'canary-generation',
+        reason: 'start', outcome: 'aborted', home: otherHome,
+    } } });
+    await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies });
+    assert.equal(fs.readFileSync(otherQueue, 'utf8'), '"preserve"');
+    f.assertClean();
+});
+
+for (const inactive of [false, true]) {
+    test('start verifies the removed pair’s custom home against its ' + (inactive ? 'inactive' : 'active') + ' generation', async () => {
+        const f = publishedStartFixture({ inactive });
+        const customHome = path.join(workspaceRoot, 'service-home');
+        const customQueue = path.join(customHome, path.basename(queue));
+        const otherHome = path.join(workspaceRoot, '.data', 'agents', 'beta');
+        const otherQueue = path.join(otherHome, path.basename(queue));
+        put(customQueue, 'owned');
+        put(otherQueue, 'preserve');
+        const agents = source('agents.json');
+        agents[secondary].config = { binds: [{ target: '/root', source: customHome }] };
+        put(path.join(metadata, 'agents.json'), agents);
+        edge.applyEdgeRoutingGeneration({ ...options, reason: 'custom-home' });
+        if (inactive) edge.inactivateEdgeRoutingGeneration('cold-start', options);
+        f.dependencies.afterEffect = effect => {
+            if (effect === 'remove-pair') throw new Error('fixture interrupted after pair removal');
+        };
+        await assert.rejects(reconcileCanaries({ ...options, reason: 'restart', dependencies: f.dependencies }), /fixture interrupted/);
+        assert.equal(source('agents.json')[secondary], undefined);
+        assert.equal(f.runtime.container, null);
+        const receipt = readReceipt(routeKey, options);
+        updateReceipt({ routeKey, rolloutId, fields: { teardown: { ...receipt.teardown, home: otherHome } } }, options);
+        f.dependencies.afterEffect = () => {};
+        const args = { ...options, reason: 'start', dependencies: f.dependencies };
+        if (!inactive) {
+            updateReceipt({ routeKey, rolloutId, fields: { teardownPairGeneration: null } }, options);
+            await assert.rejects(reconcileCanaries(args), /cannot prove the queue home/);
+            assert.ok(fs.existsSync(customQueue) && fs.existsSync(otherQueue));
+            assert.equal(readReceipt(routeKey, options).terminal, null);
+            updateReceipt({ routeKey, rolloutId, fields: { teardownPairGeneration: receipt.teardownPairGeneration } }, options);
+        }
+        await reconcileCanaries(args);
+        assert.equal(fs.readFileSync(otherQueue, 'utf8'), '"preserve"');
+        assert.equal(fs.existsSync(customQueue), false);
+        assert.equal(readReceipt(routeKey, options).terminal.outcome, 'aborted');
+    });
+}
+
+test('uncertain Router health leaves the rollout available for retry', async () => {
+    const f = publishedStartFixture();
+    f.dependencies.readRouterHealth = () => { throw Object.assign(new Error(), { code: 'EACCES' }); };
+    const before = readReceipt(routeKey, options);
+    await assert.rejects(reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies }), { code: 'EACCES' });
+    assert.deepEqual(readReceipt(routeKey, options), before);
+    assert.equal(active().routing.routes[routeKey].canary.mode, 'split');
+    assert.deepEqual(f.calls, []);
+});
+
+test('a legacy removal journal can finish only in the shared home of its exact S2 members', async () => {
+    const f = publishedStartFixture();
+    const agents = source('agents.json');
+    const old = agents[primary];
+    updateReceipt({ routeKey, rolloutId, fields: {
+        canaryRecord: agents[secondary], oldContainerName: primary, oldContainerId: old.containerId,
+        oldLaunchId: old.launchId, oldInstanceId: old.instanceId, oldEnableGeneration: old.enableGeneration,
+    } }, options);
+    f.dependencies.afterEffect = effect => { if (effect === 'remove-pair') throw new Error('fixture interruption'); };
+    await assert.rejects(reconcileCanaries({ ...options, reason: 'stop', dependencies: f.dependencies }), /fixture interruption/);
+    const { teardown } = readReceipt(routeKey, options);
+    const otherHome = path.join(workspaceRoot, '.data', 'agents', 'other');
+    const otherQueue = path.join(otherHome, path.basename(queue));
+    put(otherQueue, 'preserve');
+    updateReceipt({ routeKey, rolloutId, fields: { teardownPairGeneration: null, teardown: { ...teardown, home: otherHome } } }, options);
+    const args = { ...options, reason: 'start', dependencies: { ...f.dependencies, afterEffect() {} } };
+    await assert.rejects(reconcileCanaries(args), /cannot prove the queue home/);
+    assert.ok(fs.existsSync(queue) && fs.existsSync(otherQueue));
+    updateReceipt({ routeKey, rolloutId, fields: { teardown } }, options);
+    await reconcileCanaries(args);
+    f.assertClean();
+    assert.equal(fs.readFileSync(otherQueue, 'utf8'), '"preserve"');
+});
+
+for (const [invalid, inactive] of [['closed', false], ['malformed JSON', false], ['wrong shape', true], ['missing', true]]) {
+    test('start retires the exact published rollout with a ' + invalid + ' receipt', async () => {
+        const f = publishedStartFixture({ inactive });
+        const file = receiptPath(routeKey, options);
+        if (invalid === 'closed') closeReceipt({ routeKey, rolloutId, outcome: 'aborted' }, options);
+        else if (invalid === 'missing') fs.unlinkSync(file);
+        else fs.writeFileSync(file, invalid === 'wrong shape' ? '[]' : '{"');
+        assert.deepEqual(await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies }),
+            [{ routeKey, outcome: 'aborted' }]);
+        f.assertClean();
+    });
+}
+
+test('start resumes from the recovered receipt after interruption before withdrawal', async t => {
+    const f = publishedStartFixture();
+    const file = receiptPath(routeKey, options);
+    fs.writeFileSync(file, '{');
+    const rename = fs.renameSync;
+    const interrupted = t.mock.method(fs, 'renameSync', (from, to) => {
+        rename(from, to);
+        if (to === file) throw new Error('fixture interrupted receipt recovery');
+    });
+    const args = { ...options, reason: 'start', dependencies: f.dependencies };
+    await assert.rejects(reconcileCanaries(args), /fixture interrupted receipt recovery/);
+    interrupted.mock.restore();
+    assert.equal(readReceipt(routeKey, options).intent, 'withdraw');
+    assert.equal(active().routing.routes[routeKey].canary.mode, 'split');
+    await reconcileCanaries(args);
+    f.assertClean();
+});
+
+test('start refuses to reconstruct from uncorroborated inactive routing or a foreign runtime', async () => {
+    for (const invalid of ['sources', 'runtime']) {
+        const f = publishedStartFixture({ inactive: invalid === 'sources' });
+        const file = receiptPath(routeKey, options);
+        fs.writeFileSync(file, '{');
+        if (invalid === 'sources') fs.appendFileSync(path.join(metadata, 'routing.json'), ' ');
+        else f.runtime.container.Config.Labels[NETWORK_LABELS.workspace] = 'foreign';
+        await assert.rejects(reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies }),
+            invalid === 'sources' ? /changed publication sources/ : /ownership/);
+        assert.equal(fs.readFileSync(file, 'utf8'), '{');
+        assert.deepEqual(f.calls, []);
+    }
+});
+
+test('start preserves an ambiguous promotion or a symlinked receipt for diagnosis', async () => {
+    for (const invalid of ['promotion', 'symlink']) {
+        const f = publishedStartFixture({ mode: invalid === 'promotion' ? 'all' : 'split' });
+        const file = receiptPath(routeKey, options);
+        const target = path.join(workspaceRoot, 'saved-receipt');
+        if (invalid === 'symlink') {
+            fs.renameSync(file, target);
+            fs.symlinkSync(target, file);
+        } else fs.writeFileSync(file, '{');
+        const before = fs.readFileSync(file);
+        await assert.rejects(reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies }),
+            invalid === 'promotion' ? /without a published split/ : /regular file/);
+        assert.deepEqual(fs.readFileSync(file), before);
+        assert.deepEqual(f.calls, []);
+    }
+});
+
+for (const [step, outcome] of [[2, 'aborted'], [3, 'reset']]) {
+    test('start retires a closed promoted pair at exact completed step ' + step, async () => {
+        const f = publishedStartFixture({ mode: 'all', receipt: { step, lastCompletedStep: step } });
+        closeReceipt({ routeKey, rolloutId, outcome, reason: 'restart' }, options);
+        await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies });
+        f.assertClean(outcome);
+    });
 }
 
 test('a receipt-bound abort withdraws a verified legacy rollout while new publications stay strict', async () => {
@@ -345,6 +602,49 @@ for (const [target, inactive] of [['routing.json', false], ['data/edge-routing/a
         assert.equal(edge.readEdgeRoutingPreparationOwner(options), null);
     });
 }
+
+test('teardown removes the route directory when it removes its last export', async () => {
+    const f = seed();
+    const routeDir = path.dirname(exportDir);
+    fs.rmSync(path.join(routeDir, oldCommit), { recursive: true });
+    await endCanary({ ...options, routeKey, reason: 'abort', dependencies: f.dependencies });
+    assert.equal(fs.existsSync(routeDir), false);
+    assert.ok(fs.statSync(path.dirname(routeDir)).isDirectory());
+});
+
+test('start retires the graph preparation left by a previous start before ending its cold canary', async () => {
+    const f = publishedStartFixture({ inactive: true });
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+        const { prepareEdgeRoutingGeneration } = await import(process.argv[1]);
+        prepareEdgeRoutingGeneration({ reason: 'workspace-graph-enable-prelaunch' });
+        process.kill(process.pid, 'SIGKILL');
+    `, new URL('../../cli/sandbox/edgeGeneration.js', import.meta.url).href], {
+        cwd: workspaceRoot, encoding: 'utf8', timeout: 15_000,
+    });
+    assert.ifError(child.error);
+    assert.equal(child.signal, 'SIGKILL', child.stderr);
+    assert.equal(edge.readEdgeRoutingPreparationOwner(options).pid, child.pid);
+    await reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies });
+    assert.equal(edge.readEdgeRoutingPreparationOwner(options), null);
+    f.assertClean();
+});
+
+test('start leaves a live graph preparation and its cold canary in place', async () => {
+    const f = publishedStartFixture({ inactive: true });
+    const { preparationLease } = edge.prepareEdgeRoutingGeneration({ ...options, reason: 'workspace-graph-enable-prelaunch' });
+    try {
+        const selector = selected();
+        const receipt = readReceipt(routeKey, options);
+        await assert.rejects(reconcileCanaries({ ...options, reason: 'start', dependencies: f.dependencies }),
+            { code: 'EDGE_PREPARATION_BUSY' });
+        assert.equal(edge.readEdgeRoutingPreparationOwner(options).pid, process.pid);
+        assert.deepEqual(selected(), selector);
+        assert.deepEqual(readReceipt(routeKey, options), receipt);
+        assert.deepEqual(f.calls, []);
+    } finally {
+        edge.abortEdgeRoutingPreparation(preparationLease, options);
+    }
+});
 
 test('a substituted export directory cannot redirect teardown into another directory', async () => {
     const f = seed();

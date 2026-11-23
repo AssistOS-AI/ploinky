@@ -412,18 +412,23 @@ export function inspectCanaryContainer(runtime, identifier) {
     return inspectExactContainer(runtime, identifier, { allowMissing: false });
 }
 
+export function assertCanaryLaunchIdentity(record, container, rolloutId, unpublished = false) {
+    if (typeof rolloutId !== 'string' || !rolloutId.trim()) throw new Error('canary removal requires a recorded rollout ID');
+    const env = inspectedEnvironment(container);
+    if (env.get('PLOINKY_CANARY') !== '1' || env.get('PLOINKY_CANARY_ROLLOUT') !== rolloutId) {
+        throw new Error('container does not belong to the recorded canary rollout');
+    }
+    const launchId = record.launchId || (unpublished && env.get('PLOINKY_LAUNCH_ID'));
+    if (!launchId) throw new Error('canary container lacks its launch identity');
+    verifyRegisteredLaunchId(launchId, container.Config?.Env);
+}
+
 export function removeCanaryContainer(name, record, { rolloutId, unpublished = false, onRecoveredIdentity }) {
     if (typeof rolloutId !== 'string' || !rolloutId.trim()) throw new Error('canary removal requires a recorded rollout ID');
     const inspect = (runtime, id) => {
         const container = inspectCanaryContainer(runtime, id);
         if (!container) return null;
-        const env = inspectedEnvironment(container);
-        if (env.get('PLOINKY_CANARY') !== '1' || env.get('PLOINKY_CANARY_ROLLOUT') !== rolloutId) {
-            throw new Error('container does not belong to the recorded canary rollout');
-        }
-        const launchId = record.launchId || (unpublished && env.get('PLOINKY_LAUNCH_ID'));
-        if (!launchId) throw new Error('canary container lacks its launch identity');
-        verifyRegisteredLaunchId(launchId, container.Config?.Env);
+        assertCanaryLaunchIdentity(record, container, rolloutId, unpublished);
         return container;
     };
     return removeExactContainerAndDescriptor(name, record, record.runtime, {
