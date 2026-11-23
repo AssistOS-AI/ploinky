@@ -280,3 +280,45 @@ test('the operator clear command and the cache button share the same in-flight h
     assert.equal(readLastPurge(host, { dataDir }).by, admin.id);
     assert.equal(calls, 1);
 });
+
+test('an unreadable purge configuration never blocks the switch: set writes first and GET reports no configured host', async t => {
+    const dataDir = fs.mkdtempSync(join(os.tmpdir(), 'cache-routes-unreadable-'));
+    t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+    const content = 'not-json-' + randomUUID();
+    fs.writeFileSync(join(dataDir, 'cache-purge.json'), content);
+    const snapshot = { generation: 'sha256:' + '2'.repeat(64), publicationState: 'ready', compiled: { hosts: { [host]: {} } },
+        routing: { routes: { pages: { repo: 'repo', agent: 'pages' } } },
+        manifests: { pages: { routerAccess: { httpRoutes: [{ path: '/public', access: 'public', cache: 'page' }] } } } };
+    const lease = { id: snapshot.generation, snapshot, activationId: randomUUID(), commit: () => true };
+    const warnings = [];
+    const warn = console.warn;
+    console.warn = (...parts) => warnings.push(parts.join(' '));
+    t.after(() => { console.warn = warn; });
+    const call = async body => {
+        const res = response();
+        await handleCacheRoutes({ user: admin, proof: true, method: body === undefined ? 'GET' : 'POST', body }, res, url, {
+            routePlan: { snapshot, lease }, ensureAdmin, verifyMutation: req => ({ ok: req.proof === true }), readBody: req => req.body,
+            listConfigured: generation => configuredCacheHosts(generation, { dataDir }),
+            readSettings: () => readCacheSettings({ dataDir }), lastPurge: () => null,
+            setApplication: (ref, value, options) => setCacheApplication(ref, value, { ...options, dataDir }),
+            purge: () => assert.fail('an unreadable purge configuration has no host to purge'),
+        });
+        return res;
+    };
+    const on = await call(set);
+    assert.equal(on.status, 200);
+    assert.deepEqual(on.body.purges, []);
+    const off = await call({ ...set, enabled: false });
+    assert.equal(off.status, 200);
+    assert.deepEqual(off.body, { application: { ...mark, routes: [mark.routes[0]], enabled: false, pageSeconds: 120, held: null, hosts: [] },
+        purges: [] });
+    assert.deepEqual(readCacheSettings({ dataDir }).applications[agent], { enabled: false, pageSeconds: 120 });
+    const read = await call();
+    assert.equal(read.status, 200);
+    assert.deepEqual(read.body.applications.map(entry => entry.hosts), [[]]);
+    assert.deepEqual(read.body.hosts, [{ host, purgeConfigured: false, lastPurge: null }]);
+    // A purge request still needs a readable configuration.
+    assert.deepEqual((await call(clear)).body, { error: 'cache_unavailable' });
+    assert.deepEqual(warnings, ['cache_purge_config_unreadable']);
+    assert.ok(!warnings.join('').includes(content));
+});

@@ -52,6 +52,16 @@ for (const cacheControl of ['max-age=10, Private="Set-Cookie"', ['PUBLIC', 'NO-S
     });
 }
 
+test('a whole private or no-store directive name bypasses whatever separator follows it', () => {
+    for (const cacheControl of ['no-store; max-age=0', 'no-store;', 'private;x', 'private="x"', 'max-age=0;no-store']) {
+        assert.equal(decide({ headers: { ...validators, 'Cache-Control': cacheControl } }).cdnCacheControl, 'no-store', cacheControl);
+    }
+    for (const cacheControl of ['x-private', 'no-store-x', 'max-age=10, a=private', 'max-age=10, a="private"',
+        'max-age=10, a="x\\", private"']) {
+        assert.equal(decide({ headers: { ...validators, 'Cache-Control': cacheControl } }).cdnCacheControl, pageCdn, cacheControl);
+    }
+});
+
 for (const name of ['Cookie', 'AUTHORIZATION']) {
     test(`the presence of ${name} bypasses both marks, even when empty`, () => {
         for (const value of ['', 'present']) {

@@ -12,7 +12,8 @@ function privateCacheControl(value) {
         const char = value[index];
         if (char === undefined || (char === ',' && !quoted)) {
             const directive = value.slice(start, index).trim();
-            const name = directive.split('=', 1)[0].trim().toLowerCase();
+            // A name ends at "=", ";" or whitespace, so "public; max-age=60" is still public.
+            const name = directive.split(/[=;\s]/, 1)[0].toLowerCase();
             if (directive && !sharedDirectives.has(name)) retained.push(directive);
             start = index + 1;
         } else if (char === '"') {

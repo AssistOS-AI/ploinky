@@ -36,9 +36,10 @@ export function decideAgentAnswer({
     if (vary.split(',').some(value => value.trim() && value.trim().toLowerCase() !== 'accept-encoding')) return bypass;
     const contentType = combinedHeader(headers, 'content-type') || '';
     if (/(?:^|,)\s*text\/event-stream\s*(?:[;,]|$)/i.test(contentType)) return bypass;
-    // A quoted extension value may contain commas and directive names.
+    // A quoted extension value may contain commas and directive names. Outside
+    // quotes, a whole private or no-store name bypasses whatever separator follows.
     const directives = (cacheControl || '').replace(/"(?:[^"\\]|\\.)*"/g, '""');
-    if (/(?:^|,)\s*(?:private|no-store)\s*(?:[=,]|$)/i.test(directives)) return bypass;
+    if (/(?:^|[,;\s])(?:private|no-store)(?![!#$%&'*+.^_`|~0-9a-z-])/i.test(directives)) return bypass;
 
     if (cacheClass === 'immutable') {
         return {

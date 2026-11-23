@@ -49,6 +49,17 @@ for (const access of ['authenticated', 'guest']) {
     });
 }
 
+test('a shared directive followed by a semicolon or whitespace is still removed from a non-public answer', () => {
+    for (const access of ['authenticated', 'guest']) {
+        for (const value of ['public; max-age=60', 'Public max-age=60', 'max-age=10, s-maxage;x', 'proxy-revalidate ;']) {
+            const headers = sanitize({ 'Cache-Control': value }, access);
+            assert.doesNotMatch(headers['cache-control'], /public|s-maxage|proxy-revalidate/i, value);
+            assert.equal(directives(headers)[0], 'private');
+            assertCdnPolicy(headers, access);
+        }
+    }
+});
+
 test('public responses preserve upstream cache policy and allow headerless responses', () => {
     const headers = { 'cache-control': 'public, s-maxage=300, max-age=60', ...sharedHints };
     assert.deepEqual(sanitize(headers, 'public'), { 'cache-control': headers['cache-control'] });

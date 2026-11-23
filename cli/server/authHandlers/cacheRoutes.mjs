@@ -14,6 +14,22 @@ function validRequest(body) {
         && validCacheApplication(body);
 }
 
+// The off switch must not depend on the purge side: for reads and settings an
+// unreadable purge configuration counts as no configured host, logged once by code.
+let purgeConfigWarned = false;
+function configuredHosts(listConfigured, generation, published, strict) {
+    try {
+        const hosts = listConfigured(generation).filter(host => published.includes(host));
+        purgeConfigWarned = false;
+        return hosts;
+    } catch (error) {
+        if (strict) throw error;
+        if (!purgeConfigWarned) console.warn('cache_purge_config_unreadable');
+        purgeConfigWarned = true;
+        return [];
+    }
+}
+
 function applicationEntry({ agent, routes }, settings, hosts, generation, getCanaryHold) {
     const { enabled, pageSeconds } = settings.applications[agent] || { enabled: false, pageSeconds: 300 };
     const hold = settings.held[agent] || (isApplicationHeld(agent, { generation, settings }) ? getCanaryHold() : null);
@@ -77,9 +93,10 @@ export async function handleCacheRoutes(req, res, parsedUrl, {
             assertCurrent();
         }
         const published = listPublished(generation);
-        const configured = listConfigured(generation).filter(host => published.includes(host));
+        const configuredFor = strict => configuredHosts(listConfigured, generation, published, strict);
         if (method === 'GET') {
             const settings = readSettings();
+            const configured = configuredFor(false);
             const applications = listMarked(generation).map(mark => applicationEntry(mark, settings, configured, generation, getCanaryHold));
             const hosts = published.map(host => {
                 const record = lastPurge(host);
@@ -91,13 +108,14 @@ export async function handleCacheRoutes(req, res, parsedUrl, {
         const by = String(req.user?.id || req.user?.username || 'admin').slice(0, 256);
         const clear = host => purge({ host, by, generation, assertCurrent });
         if (body.op === 'purge') {
-            if (!configured.includes(body.host)) return send(404, { error: 'unknown_host' });
+            if (!configuredFor(true).includes(body.host)) return send(404, { error: 'unknown_host' });
             const { host, outcome, retryAfterSeconds } = await clear(body.host);
             return success({ purge: { host, outcome, ...(outcome === 'cooldown' ? { retryAfterSeconds } : {}) } });
         }
         const app = listMarked(generation).find(({ agent }) => agent === body.agent);
         if (!app) return send(404, { error: 'unknown_application' });
         const { settings, previous } = await setApplication(body.agent, { enabled: body.enabled, pageSeconds: body.pageSeconds }, { assertCurrent });
+        const configured = configuredFor(false);
         const purges = [];
         if (previous.enabled && !body.enabled) {
             for (const host of configured) {
