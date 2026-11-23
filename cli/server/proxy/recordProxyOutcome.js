@@ -1,3 +1,5 @@
+import { observeProxyOutcome } from '../canary/proxyOutcomes.js';
+
 const LATENCY_BUCKETS = Object.freeze([10, 50, 100, 250, 500, 1_000, 5_000, 15_000]);
 
 function latencyBucket(milliseconds) {
@@ -16,6 +18,10 @@ export function recordProxyOutcome({
     leaseOutcome = '',
     relayOutcome = '',
     upstreamOutcome = '',
+    upstreamStatus,
+    serverError,
+    unreachable,
+    ttfbMs,
     sink,
 } = {}) {
     const event = Object.freeze({
@@ -41,6 +47,7 @@ export function recordProxyOutcome({
         latencyBucket: latencyBucket(Date.now() - startedAt),
         ...(error ? { errorCode: String(error.code || 'PROXY_FAILURE') } : {}),
     });
+    observeProxyOutcome({ plan, outcome, status, error, leaseOutcome, upstreamStatus, serverError, unreachable, ttfbMs });
     sink?.(event);
     return event;
 }
