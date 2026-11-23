@@ -9,6 +9,7 @@ import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import {
     NETWORK_SCHEMA_VERSION,
     canonicalizeNetwork,
+    assertRuntimeNetworkAlias,
     deriveNetworkAlias,
     logicalNetworkAttachments,
     networkContractHash,
@@ -850,9 +851,28 @@ export function createNetworkLifecycleAdapter({
         return { name, logicalName, created: true };
     }
 
-    function preflight(network, canonicalAgentId, { instanceKey = canonicalAgentId } = {}) {
+    function assertAliasAvailable(attachments, alias) {
+        for (const bridge of attachments.filter(entry => entry.existed)) {
+            const members = execute(['ps', '-a', '--no-trunc', '--filter', `network=${bridge.name}`, '--format', '{{.ID}}']);
+            if (!members.ok) throw new Error(`cannot inspect aliases on '${bridge.name}': ${failure(members)}`);
+            for (const id of members.stdout.trim().split(/\s+/).filter(Boolean)) {
+                if (!/^[a-f0-9]{64}$/.test(id)) throw new Error(`unknown network member on '${bridge.name}'`);
+                const record = inspectContainer(id);
+                const attachment = record?.NetworkSettings?.Networks?.[bridge.name];
+                if (record?.Id !== id && record?.ID !== id || !Array.isArray(attachment?.Aliases)) {
+                    throw new Error(`cannot prove the aliases of '${id}' on '${bridge.name}'`);
+                }
+                const names = [record.Name?.replace(/^\//, ''), id.slice(0, 12), ...attachment.Aliases, ...(attachment.DNSNames || [])];
+                if (names.some(name => String(name).toLowerCase() === alias)) {
+                    throw new Error(`network alias collision '${alias}' on '${bridge.name}'`);
+                }
+            }
+        }
+    }
+
+    function preflight(network, canonicalAgentId, { instanceKey = canonicalAgentId, networkAlias } = {}) {
         const contract = canonicalizeNetwork(network, { path: 'network' });
-        const alias = deriveNetworkAlias(canonicalAgentId);
+        const alias = networkAlias === undefined ? deriveNetworkAlias(canonicalAgentId) : assertRuntimeNetworkAlias(networkAlias);
         if (contract.mode === 'none') {
             return { mode: 'none', alias, args: ['--network', 'none'], attachments: [] };
         }
@@ -860,10 +880,13 @@ export function createNetworkLifecycleAdapter({
             return { mode: 'host', alias, args: ['--network', 'host'], attachments: [] };
         }
         const runtimeProof = ensureManagedPodman();
+        const attachments = validateExpectedBridges(contract, canonicalAgentId, instanceKey);
+        if (networkAlias !== undefined) assertAliasAvailable(attachments, alias);
         return {
             mode: contract.mode,
             alias,
-            attachments: validateExpectedBridges(contract, canonicalAgentId, instanceKey),
+            ...(networkAlias !== undefined ? { networkAlias } : {}),
+            attachments,
             runtimeProof,
         };
     }
@@ -1060,6 +1083,7 @@ export function createNetworkLifecycleAdapter({
         network,
         canonicalAgentId,
         instanceKey = canonicalAgentId,
+        networkAlias,
         containerName,
         runtimeIdentity,
         createContainer,
@@ -1094,13 +1118,14 @@ export function createNetworkLifecycleAdapter({
             throw new Error('managed container transaction onContainerCreated must be a function');
         }
         return withNetworkLifecycleLock(() => {
-            const checked = preflight(network, canonicalAgentId, { instanceKey });
+            const checked = preflight(network, canonicalAgentId, { instanceKey, networkAlias });
             if (!['default', 'bridge'].includes(checked.mode)) {
                 throw new Error(`managed container transaction cannot run network mode '${checked.mode}'`);
             }
             const ownershipLabels = expectedAgentOwnershipLabels(identity.hash, networkContractHash(network));
             const agentLabels = expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity);
             const previous = inspectContainer(containerName);
+            if (networkAlias !== undefined && previous) throw new Error(`canary container '${containerName}' already exists`);
             let previousId = '';
             if (previous) {
                 assertRequiredLabels(containerName, labelsOf(previous), ownershipLabels);
@@ -1413,6 +1438,7 @@ export function createNetworkLifecycleAdapter({
 
     function inspectContainerContract(containerName, network, canonicalAgentId, {
         instanceKey = canonicalAgentId,
+        networkAlias,
         contractHash,
         instanceId = '',
         enableGeneration = '',
@@ -1473,7 +1499,7 @@ export function createNetworkLifecycleAdapter({
         )) {
             return { state: 'owned-drift', id };
         }
-        const alias = deriveNetworkAlias(canonicalAgentId);
+        const alias = networkAlias === undefined ? deriveNetworkAlias(canonicalAgentId) : assertRuntimeNetworkAlias(networkAlias);
         const aliasesExact = expected.every((entry) => {
             const aliases = [...(attached[entry.name]?.Aliases || [])].map(String).sort();
             return JSON.stringify(aliases) === JSON.stringify(exactRuntimeAliases(record, alias));
@@ -1539,6 +1565,7 @@ export function createNetworkLifecycleAdapter({
     function removeExactContainer(containerName, network, canonicalAgentId, {
         expectedContainerId,
         instanceKey = canonicalAgentId,
+        networkAlias,
         contractHash,
         instanceId,
         enableGeneration,
@@ -1549,6 +1576,7 @@ export function createNetworkLifecycleAdapter({
         }
         const inspection = inspectContainerContract(exactContainerId, network, canonicalAgentId, {
             instanceKey,
+            networkAlias,
             contractHash,
             instanceId,
             enableGeneration,

@@ -157,6 +157,7 @@ import {
     ensureAgentLibCacheLink,
 } from '../../utils/dependencies/agentLibLink.js';
 import {
+    executeContainerHook,
     runPreContainerLifecycle,
     runProfileLifecycle
 } from '../../utils/runtime/lifecycleHooks.js';
@@ -193,6 +194,7 @@ import {
 import {
     assertHostSandboxNetworkCompatibility,
     assertNetworkStartupCompatibility,
+    assertRuntimeNetworkAlias,
     canonicalizeNetwork,
     networkContractHash,
 } from '../networkContract.js';
@@ -803,7 +805,7 @@ function replaceRuntimeRouterEnvFlags(envStrings, routerEnv) {
 }
 
 function stripReservedAndRestoreRuntimeRouterEnvFlags(envStrings, routerEnv) {
-    const reservedPrefixes = RESERVED_AGENT_ENV_NAMES.map((name) => `-e ${name}=`);
+    const reservedPrefixes = [...RESERVED_AGENT_ENV_NAMES, 'PLOINKY_CANARY', 'PLOINKY_CANARY_ROLLOUT'].map((name) => `-e ${name}=`);
     for (let index = envStrings.length - 1; index >= 0; index -= 1) {
         const entry = String(envStrings[index] || '');
         if (reservedPrefixes.some((prefix) => entry.startsWith(prefix))
@@ -1579,6 +1581,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         options,
         { ownerRef: `${repoName}/${agentName}` },
     );
+    if (options.canaryLaunch && (options.preserveRegistryRecord !== true
+        || options.runtimeIdentity?.instanceId !== options.instanceId
+        || options.runtimeIdentity?.enableGeneration !== options.enableGeneration
+        || options.runtimeIdentity?.preparationLease !== options.preparationLease)) {
+        throw new Error('A canary create must preserve and attest its exact prepared registry identity.');
+    }
     // Host Podman launches create the host state skeleton first and fail if
     // they cannot; in-Box (nested) launches skip it.
     ensureHostLaunchSkeleton(PLOINKY_WORKSPACE_ROOT);
@@ -1607,6 +1615,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
     const manifestNetwork = profileResolution.network;
+    const sourcePath = options.canaryInputs?.codePath || agentPath;
+    // A manifest may select a code subtree without containing its own manifest.
+    // Admission always binds the same manifest bytes captured by the preflight.
     const manifestPath = path.join(agentPath, 'manifest.json');
     const exactManifestBytes = fs.existsSync(manifestPath)
         ? fs.readFileSync(manifestPath)
@@ -1632,6 +1643,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         alias: hardwareAlias,
     });
     const runtime = getRuntime();
+    if (options.canaryLaunch && (runtime !== 'podman' || !['default', 'bridge'].includes(manifestNetwork.mode))) {
+        throw new Error('A canary launch requires managed Podman networking.');
+    }
     const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
         runtime,
         manifest,
@@ -1715,7 +1729,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // Ensure workspace structure exists and run preinstall [HOST] before any
     // image-dependent work. Hooks may build local images or seed vars that image
     // resolution and dependency-cache probes consume.
-    const preLifecycle = adoptManagedRuntimeOnly
+    const preLifecycle = adoptManagedRuntimeOnly || options.canaryLaunch
         ? { success: true, errors: [] }
         : runPreContainerLifecycle(agentName, repoName, agentPath, activeProfile);
     if (!preLifecycle.success) {
@@ -1788,10 +1802,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // (runtime-key probe and cache stamp) stays the resolved image reference in every path, so a recreate by ID is not an
     // "installer image changed" for the cache the reference start prepared.
     const { image: launchImage, installerImage } = selectLaunchImages({
-        resolvedImage: image,
+        resolvedImage: options.canaryInputs?.imageId || image,
         launch: runtimeAdmission.descriptor.hardwareGpu ? readMpsLaunch(options.mpsLaunch, hardwareInstanceKey, runtimeAdmission.descriptor.hardwareGpu) : null,
     });
     image = launchImage;
+    if (options.canaryLaunch && launchImage !== options.canaryInputs.imageId) {
+        throw new Error('Canary launch image differs from the exact primary image.');
+    }
 
     // Get profile mount modes (profile overrides default if provided)
     const {
@@ -1803,13 +1820,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     // New workspace structure paths
     const agentWorkDir = homeLayout.binds.find(bind => bind.target === homeLayout.containerHome)?.source || agentHomeDir;
-    const agentCodePathSymlink = getAgentCodePath(agentName);
-    const agentSkillsPathSymlink = getAgentSkillsPath(agentName);
-
-    // Resolve symlinks to get actual paths - ensures container mounts work correctly
-    // The paths might be symlinks like $CWD/code/agent -> .ploinky/repos/repo/agent
-    const agentCodePath = resolveSymlinkPath(agentCodePathSymlink);
-    const agentSkillsPath = resolveSymlinkPath(agentSkillsPathSymlink);
+    const agentCodePath = options.canaryInputs?.codePath || resolveSymlinkPath(getAgentCodePath(agentName));
+    const agentSkillsPath = options.canaryLaunch
+        ? options.canaryInputs.skillsPath : resolveSymlinkPath(getAgentSkillsPath(agentName));
 
     if (adoptManagedRuntimeOnly) {
         requireManagedAdoptionDirectory(agentHomeDir, 'persistent agent home');
@@ -1817,7 +1830,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     } else {
         // Ensure persistent state and MCP config before creating a runtime.
         ensureAgentDataDirectory(agentHomeDir);
-        syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentWorkDir });
+        syncAgentMcpConfig(containerName, sourcePath, instanceName, { workDir: agentWorkDir, canaryLaunch: options.canaryLaunch });
     }
 
     // INSTALL PHASE — runtime containers never run npm install. Dependency
@@ -1906,7 +1919,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     const linkedRepositories = prepareLinkedRepositories(manifest, {
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
-        create: !adoptManagedRuntimeOnly,
+        create: !adoptManagedRuntimeOnly && !options.canaryLaunch,
         writable: !isolatedHome,
     });
     // /code is always a direct bind of the agent source, with dependencies and
@@ -1935,14 +1948,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         manifestVolumeMounts.push({ resolvedHostPath, containerPath, options });
     }
 
-    const skillsPathExists = fs.existsSync(agentSkillsPath);
+    const skillsPathExists = agentSkillsPath && fs.existsSync(agentSkillsPath);
     const skillsPathInsideCode = skillsPathExists && isPathWithin(agentSkillsPath, agentCodePath);
     if (skillsPathExists && !skillsPathInsideCode) {
         codeMountPoints.push({ relPath: 'skills', file: false });
     }
     codeMountPoints.push({ relPath: 'node_modules', file: false });
     for (const mountPoint of codeMountPoints) {
-        ensureCodeMountPoint(agentCodePath, mountPoint.relPath, { file: mountPoint.file, adoptOnly: adoptManagedRuntimeOnly });
+        ensureCodeMountPoint(agentCodePath, mountPoint.relPath, {
+            file: mountPoint.file, adoptOnly: adoptManagedRuntimeOnly || options.canaryLaunch,
+        });
     }
 
     let agentLibMountPath = AGENT_LIB_PATH;
@@ -2001,7 +2016,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             nodeModulesDir: preparedNodeModulesDir,
             linkedRepositories,
             codeReadOnly,
-            writableProjectSource: !isolatedHome && isPathWithin(agentCodePath, cwd),
+            writableProjectSource: !options.canaryLaunch && !isolatedHome && isPathWithin(agentCodePath, cwd),
         });
     }
 
@@ -2122,10 +2137,20 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         if (boxHostArgs.length) args.splice(1, 0, ...boxHostArgs);
     }
 
-    const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
+    const { publishArgs: manifestPorts, portMappings } = options.canaryLaunch
+        ? { publishArgs: [], portMappings: [] } : parseManifestPorts(manifest, profileConfig);
     const runtimePorts = (options && Array.isArray(options.publish)) ? options.publish : [];
     const runtimePortMappings = (options && Array.isArray(options.publishMappings)) ? options.publishMappings : [];
     const effectivePortMappings = [...portMappings, ...runtimePortMappings];
+    if (options.canaryLaunch) {
+        const agentServerPort = resolveImplicitAgentServerPort(profileConfig, buildEnvMap(manifest, profileConfig, {
+            agentName, repoName, profileName: activeProfile, forRuntime: true,
+        }));
+        if (!isDeepStrictEqual(runtimePorts, [`127.0.0.1::${agentServerPort}`])
+            || !isDeepStrictEqual(runtimePortMappings, [{ containerPort: agentServerPort, hostPort: 0, hostIp: '127.0.0.1', protocol: 'tcp' }])) {
+            throw new Error('A canary launch requires exactly one ephemeral loopback AgentServer publication.');
+        }
+    }
     assertHostPortContract(runtimeNetworkPlan.mode, effectivePortMappings);
     const pubs = (useHostNetwork || runtimeNetworkPlan.mode === 'none')
         ? []
@@ -2226,6 +2251,17 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // config can redirect the runtime, inject a master key, or override the
     // agent's derived secret.
     stripReservedAndRestoreRuntimeRouterEnvFlags(envStrings, {});
+    const canaryEnv = options.canaryLaunch ? {
+        PLOINKY_CANARY: '1',
+        PLOINKY_CANARY_ROLLOUT: options.canaryInputs.rolloutId,
+        PLOINKY_AGENT_CONFIG: CONTAINER_CONFIG_PATH,
+    } : {};
+    if (options.canaryLaunch) {
+        for (let index = envStrings.length - 1; index >= 0; index--) {
+            if (envStrings[index].startsWith('-e PLOINKY_AGENT_CONFIG=')) envStrings.splice(index, 1);
+        }
+        appendEnvFlagsFromMap(envStrings, canaryEnv);
+    }
     const unmanagedLaunchEnv = runtimeNetworkPlan.requiresManagedNetwork ? {} : buildAgentLaunchEnv();
     appendEnvFlagsFromMap(envStrings, unmanagedLaunchEnv);
     for (const [key, value] of Object.entries(PLOINKY_SKILL_SCOPE_ENV)) envStrings.push(formatEnvFlag(key, value));
@@ -2567,8 +2603,17 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const finalizeGeneratedRouterLaunch = ({ launch, record }) => {
         if (!launch) throw new Error('managed generated-local launch is missing its attested launch state');
         const expectedMounts = expectedBindMountsFromArgs(args, launch.descriptorHostFile);
-        if (!hasExactManagedEnv(record, { ...launch.env, ...managedControlEnv })) {
+        if (!hasExactManagedEnv(record, { ...launch.env, ...managedControlEnv, ...canaryEnv })) {
             throw new Error('managed candidate generated Router env failed exact inspection');
+        }
+        if (options.canaryLaunch) {
+            const publications = Object.entries(record.NetworkSettings?.Ports || {}).filter(([, bindings]) => bindings?.length);
+            const [port, bindings] = publications[0] || [];
+            if (publications.length !== 1 || port !== `${runtimePortMappings[0].containerPort}/tcp`
+                || bindings.length !== 1 || bindings[0].HostIp !== '127.0.0.1'
+                || !/^[1-9]\d*$/.test(bindings[0].HostPort) || Number(bindings[0].HostPort) > 65535) {
+                throw new Error('Cannot prove the exact canary loopback AgentServer publication.');
+            }
         }
         const descriptorMounts = (record?.Mounts || []).filter((mount) => (
             String(mount?.Destination || '') === GENERATED_ROUTER_DESCRIPTOR_CONTAINER_FILE
@@ -2653,6 +2698,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     }
                     launchedContainerId = createdId;
                     recordCreatedId(createdId);
+                    options.canaryInputs?.onCreated({ containerId: createdId, launchId: launch.env.PLOINKY_LAUNCH_ID });
                     recordCreatedIdentity({ containerId: createdId, launch });
                 }
                 return res;
@@ -2786,6 +2832,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     network: manifestNetwork,
                     canonicalAgentId: agentName,
                     instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
+                    networkAlias: launchRecord.networkAlias,
                     containerName,
                     runtimeIdentity,
                     inspectAdoption: inspectGeneratedRouterAdoption,
@@ -2963,6 +3010,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 agentName,
                 {
                     expectedContainerId: launchedContainerId,
+                    networkAlias: launchRecord.networkAlias,
                     instanceKey: effectiveInstanceKey(repoName, agentName, options.alias || ''),
                     contractHash: networkContractHash(manifestNetwork),
                     instanceId: runtimeIdentity.instanceId,
@@ -3025,7 +3073,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     agents[containerName] = {
         agentName,
         repoName,
-        ...(launchRecord.canaryOf !== undefined ? { canaryOf: launchRecord.canaryOf } : {}),
+        ...(options.canaryLaunch ? { canaryOf: launchRecord.canaryOf, networkAlias: launchRecord.networkAlias } : {}),
         containerImage: image,
         ...(manifestImage && manifestImage !== image ? { manifestImage } : {}),
         ...(llmStartup.enabled ? {
@@ -3094,7 +3142,14 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (options.preserveRegistryRecord !== true) saveAgentsMap(agents);
     const registryRecord = structuredClone(agents[containerName]);
     try {
-        if (useProfileLifecycle) {
+        if (options.canaryLaunch) {
+            // The primary owns host preparation. Only run the container's
+            // postinstall, with the exported code and the canary environment.
+            if (profileConfig?.postinstall) {
+                const result = executeContainerHook(launchedContainerId, profileConfig.postinstall);
+                if (!result.success) throw new Error(`[profile] ${agentName}: canary postinstall failed: ${result.message}`);
+            }
+        } else if (useProfileLifecycle) {
             const lifecycleResult = runProfileLifecycle(agentName, activeProfile, {
                     containerName,
                     agentPath,
@@ -3122,7 +3177,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
     }
     try {
-        syncAgentMcpConfig(containerName, path.resolve(agentPath), agentName);
+        syncAgentMcpConfig(containerName, sourcePath, agentName, { canaryLaunch: options.canaryLaunch });
     } catch (error) {
         cleanupExactLaunch(error);
     }
@@ -3254,12 +3309,38 @@ function assertHostPortContract(networkMode, portMappings) {
 }
 
 function assertCanaryLaunch(existingRecord, options) {
-    if (!isCanaryRecord(existingRecord) && !isCanaryRecord(options.preparedRegistryRecord)) return;
+    if (!isCanaryRecord(existingRecord) && !isCanaryRecord(options.preparedRegistryRecord)) {
+        if (options.canaryLaunch || options.canaryInputs) throw new Error('A canary launch requires its own prepared record.');
+        return;
+    }
     if (options.canaryLaunch !== true) {
         throw new Error('Only a canary launch may start a registered canary runtime.');
     }
-    if (options.hardwareInstanceKey && options.hardwareInstanceKey !== options.containerName) {
+    if (!options.hardwareInstanceKey || options.hardwareInstanceKey !== options.containerName) {
         throw new Error('A canary launch requires its own exact hardware instance key.');
+    }
+    const record = options.preparedRegistryRecord;
+    const inputs = options.canaryInputs;
+    if (Object.keys(existingRecord || {}).length || options.preparationLease?.mode !== 'additive'
+        || options.preservePreparedRegistryRecord !== true
+        || !isCanaryRecord(record) || !String(options.containerName).endsWith('__canary')
+        || options.instanceId !== record.instanceId || options.enableGeneration !== record.enableGeneration
+        || !inputs || typeof inputs.onCreated !== 'function' || !/^(?:sha256:)?[a-f0-9]{64}$/.test(inputs.imageId)
+        || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(inputs.rolloutId || '') || record.networkAlias !== inputs.networkAlias) {
+        throw new Error('A canary launch requires an exact additive preparation and isolated launch inputs.');
+    }
+    assertRuntimeNetworkAlias(record.networkAlias);
+    const exportParent = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'canary', record.canaryOf);
+    const releaseDir = path.dirname(inputs.codePath || '');
+    if (path.dirname(releaseDir) !== exportParent || path.basename(inputs.codePath || '') !== 'code'
+        || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(path.basename(releaseDir))) {
+        throw new Error('A canary launch requires the export of its own route and commit.');
+    }
+    for (const source of [inputs.codePath, ...(inputs.skillsPath == null ? [] : [inputs.skillsPath])]) {
+        if (typeof source !== 'string' || !source.startsWith(releaseDir + path.sep)
+            || fs.realpathSync(source) !== source || !fs.statSync(source).isDirectory()) {
+            throw new Error('A canary launch requires physical exported code and skills directories.');
+        }
     }
 }
 
@@ -3801,6 +3882,13 @@ export function admitAgentServicePreflight(agentName, manifest, agentPath, optio
         ...admissionContext,
     });
     const preflightAgentRuntime = getRuntimeForAgent(manifest);
+    if (options.canaryLaunch && (preflightAgentRuntime !== 'podman' || getRuntime() !== 'podman'
+        || !['default', 'bridge'].includes(preflightProfile.network.mode))) {
+        throw new Error('A canary launch requires managed Podman networking.');
+    }
+    if (options.canaryLaunch && (preflightProfile.profileConfig?.hosthook_aftercreation || preflightProfile.profileConfig?.hosthook_postinstall)) {
+        throw new Error('A canary launch cannot run per-container host lifecycle hooks.');
+    }
     const preflightRuntimeKind = isSandboxRuntime(preflightAgentRuntime)
         ? preflightAgentRuntime
         : 'container';
@@ -4255,6 +4343,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // Contract inspection and the launch transaction re-read exact identity,
     // running state, network membership and generated descriptor authority.
     const existingRuntimeAtEntry = containerExists(containerName);
+    if (options.canaryLaunch && existingRuntimeAtEntry) throw new Error(`canary container '${containerName}' already exists`);
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     // LLM-runtime agents get their real image from the hardware-aware catalog in
     // startAgentContainer; tolerate an unresolved manifest container placeholder
@@ -4274,7 +4363,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         agentName, repoName, runtimeNetworkPlan, runtimeRouterEnv,
     });
 
-    const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
+    const { publishArgs: manifestPorts, portMappings } = options.canaryLaunch
+        ? { publishArgs: [], portMappings: [] } : parseManifestPorts(manifest, profileConfig);
     assertHostPortContract(runtimeNetworkPlan.mode, portMappings);
     const resolvedProfileEnv = buildEnvMap(manifest, profileConfig, {
         agentName,
@@ -4286,7 +4376,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const containerPortCandidates = portMappings
         .map((mapping) => mapping?.containerPort)
         .filter((port) => typeof port === 'number' && port > 0);
-    if (shouldCreateImplicitAgentServerPublish(
+    if (options.canaryLaunch || shouldCreateImplicitAgentServerPublish(
         manifest,
         manifestPorts,
         runtimeNetworkPlan.mode,
@@ -4543,7 +4633,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 : (containerPortCandidates.length
                     ? resolveHostPort(containerName, existingRecord, containerPortCandidates)
                     : 0);
-            syncAgentMcpConfig(containerName, agentPath, agentName);
+            syncAgentMcpConfig(containerName, agentPath, agentName, { canaryLaunch: options.canaryLaunch });
             const registryRecord = {
                 ...existingRecord,
                 runtime,
@@ -4571,14 +4661,14 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     let additionalPortMappings = [];
     let allPortMappings = [...portMappings];
 
-    if (shouldCreateImplicitAgentServerPublish(
+    if (options.canaryLaunch || shouldCreateImplicitAgentServerPublish(
         manifest,
         manifestPorts,
         runtimeNetworkPlan.mode,
         portMappings,
         agentServerPort,
     )) {
-        const hostPort = Number(preferredHostPort || 0);
+        const hostPort = options.canaryLaunch ? 0 : Number(preferredHostPort || 0);
         const agentServerMapping = {
             containerPort: agentServerPort,
             hostPort,
@@ -4730,6 +4820,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             mpsLaunch: options.mpsLaunch,
             preparedRegistryRecord: launchRecord,
             canaryLaunch: options.canaryLaunch,
+            canaryInputs: options.canaryInputs,
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
             adoptManagedRuntimeOnly,
@@ -4761,7 +4852,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             }),
         };
     }
-    allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
+    allPortMappings = resolvePublishedPortMappings(options.canaryLaunch ? started.containerId : containerName, allPortMappings);
+    if (options.canaryLaunch && !allPortMappings[0]?.hostPort) throw new Error('Cannot resolve canary AgentServer loopback port.');
     const agentCodePath = getAgentCodePath(agentName);
     const agentSkillsPath = getAgentSkillsPath(agentName);
     const profileEnv = normalizeProfileEnv(profileConfig?.env);
@@ -4812,7 +4904,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         agentName,
         repoName,
         containerImage: startedRecord.containerImage || image,
-        ...(launchRecord.canaryOf !== undefined ? { canaryOf: launchRecord.canaryOf } : {}),
+        ...(options.canaryLaunch ? { canaryOf: launchRecord.canaryOf, networkAlias: launchRecord.networkAlias } : {}),
         ...(startedRecord.manifestImage ? { manifestImage: startedRecord.manifestImage } : {}),
         ...(startedRecord.llmRuntime ? { llmRuntime: startedRecord.llmRuntime } : {}),
         createdAt: launchRecord.createdAt || new Date().toISOString(),
@@ -4849,7 +4941,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
     if (!preserveRuntimeRegistryRecord) saveAgentsMap(agents);
 
-    syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
+    syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir, canaryLaunch: options.canaryLaunch });
     if (!preserveRuntimeRegistryRecord && started?.durableCandidate) {
         retireRuntimeCandidate(started.durableCandidate);
     }
@@ -4879,7 +4971,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 : {}),
         };
     } catch (error) {
-        if (error?.code === 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH'
+        if (!options.canaryLaunch && error?.code === 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH'
             && runtimeNetworkPlan.requiresManagedNetwork
             && (!runtimeIdentity.preparationLease
                 || runtimeIdentity.preparationLease.mode === 'additive')
@@ -4969,6 +5061,7 @@ function removeExactGenerationCandidate({
         record.agentName,
         {
             expectedContainerId: containerId,
+            networkAlias: record.networkAlias,
             instanceKey: effectiveInstanceKey(record.repoName, record.agentName, record.alias || ''),
             contractHash: networkContractHash(network),
             instanceId: record.instanceId,
