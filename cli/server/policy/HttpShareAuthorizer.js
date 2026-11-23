@@ -1,10 +1,8 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import http from 'node:http';
 
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
-import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
-import { buildRouterRequest } from '../mcp-proxy/invocationMinter.js';
+import { loadActiveRoutingState } from '../routingState.js';
+import { buildRouterRequest, resolveRouteTargetRecord } from '../mcp-proxy/invocationMinter.js';
 import { computeRch } from '../../../Agent/lib/requestHash.mjs';
 
 /**
@@ -32,19 +30,15 @@ export class ShareAuthorizer {
     }
 }
 
-function readRoutingRoutes() {
-    try {
-        const file = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'routing.json');
-        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-        return parsed && typeof parsed.routes === 'object' ? parsed.routes : {};
-    } catch {
-        return {};
-    }
-}
-
 function resolveOwningRoute(agentName) {
-    const routes = readRoutingRoutes();
-    const route = routes[agentName];
+    let snapshot;
+    try {
+        ({ snapshot } = loadActiveRoutingState());
+    } catch {
+        return null;
+    }
+    const routes = snapshot.routing?.routes ?? {};
+    const route = Object.hasOwn(routes, agentName) ? routes[agentName] : null;
     if (!route || !route.hostPort) return null;
     const repo = String(route.repo || '').trim();
     const agent = String(route.agent || agentName || '').trim();
@@ -55,7 +49,7 @@ function resolveOwningRoute(agentName) {
     } catch {
         return null;
     }
-    return { hostPort: route.hostPort, principalId, agent };
+    return { route, principalId, snapshot };
 }
 
 function postJson(hostPort, requestPath, headers, bodyObject, timeoutMs = 2000) {
@@ -99,6 +93,7 @@ export class HttpShareAuthorizer extends ShareAuthorizer {
             };
             const built = buildRouterRequest({
                 targetAgentId: owning.principalId,
+                targetRecord: resolveRouteTargetRecord({ routeKey: agentName, route: owning.route, snapshot: owning.snapshot }),
                 sub: user?.id ? `user:${user.id}` : '',
                 actor: { kind: 'user', id: user?.id ? `user:${user.id}` : '', roles: Array.isArray(user?.roles) ? user.roles : [] },
                 method: 'POST',
@@ -106,7 +101,7 @@ export class HttpShareAuthorizer extends ShareAuthorizer {
                 tool: SHARE_TOOL,
                 rch: computeRch(bodyObject),
             });
-            const response = await postJson(owning.hostPort, SHARE_AUTHORIZE_PATH, { authorization: `Bearer ${built.token}` }, bodyObject);
+            const response = await postJson(owning.route.hostPort, SHARE_AUTHORIZE_PATH, { authorization: `Bearer ${built.token}` }, bodyObject);
             if (response.status === 200 && response.json && response.json.allowed === true) {
                 return { allowed: true, reason: 'agent_approved' };
             }

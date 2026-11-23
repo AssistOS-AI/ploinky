@@ -500,7 +500,7 @@ function buildRouteDelegations(req, definition, { routePath = '', parsedUrl = nu
     return Object.keys(out).length ? out : undefined;
 }
 
-export function buildHttpRouteAuthInfoHeader(req, parsedUrl, definition, { bodyHash = '', routePath = '' } = {}) {
+export function buildHttpRouteAuthInfoHeader(req, parsedUrl, definition, { bodyHash = '', routePath = '', targetRecord, snapshot } = {}) {
     if (!definition?.includeAuthInfo || !req.user || typeof req.user !== 'object') {
         return {};
     }
@@ -519,6 +519,9 @@ export function buildHttpRouteAuthInfoHeader(req, parsedUrl, definition, { bodyH
         const sub = authInfo.user?.id ? `user:${authInfo.user.id}` : '';
         const { token } = buildRouterRequest({
             targetAgentId: routePrincipal,
+            targetRecord,
+            routeDefinition: definition,
+            snapshot,
             sub,
             actor: {
                 kind: resolveHttpRouteActorKind(authInfo),
@@ -628,6 +631,8 @@ export function createAgentRouteEntries(routePlan, { beforeDispatch = null } = {
         const beforeConnect = () => commitAggregateLease(routePlan);
         entries.push({
             agentName,
+            route,
+            snapshot: routePlan.lease.snapshot,
             port,
             baseUrl,
             beforeConnect,
@@ -795,10 +800,12 @@ function canonicalCommand(command) {
     }
 }
 
-function buildToolRequestHeaders(req, agentName, toolName, toolArgs) {
+function buildToolRequestHeaders(req, entry, toolName, toolArgs) {
     const invocation = buildInvocationContextForProviderCall({
         req: req || { headers: {} },
-        agentName,
+        agentName: entry.agentName,
+        route: entry.route,
+        snapshot: entry.snapshot,
         toolName,
         toolArgs: toolArgs || {}
     });
@@ -808,7 +815,7 @@ function buildToolRequestHeaders(req, agentName, toolName, toolArgs) {
 
 async function callEntryTool(entry, toolName, args, req) {
     entry.beforeDispatch?.();
-    const requestHeaders = buildToolRequestHeaders(req, entry.agentName, toolName, args);
+    const requestHeaders = buildToolRequestHeaders(req, entry, toolName, args);
     if (!requestHeaders) {
         return await entry.client.callTool(toolName, args);
     }
@@ -826,7 +833,7 @@ async function callEntryTool(entry, toolName, args, req) {
 
 async function readEntryResource(entry, uri, req) {
     entry.beforeDispatch?.();
-    const requestHeaders = buildToolRequestHeaders(req, entry.agentName, 'resources/read', { uri });
+    const requestHeaders = buildToolRequestHeaders(req, entry, 'resources/read', { uri });
     if (!requestHeaders) {
         return await entry.client.readResource(uri);
     }

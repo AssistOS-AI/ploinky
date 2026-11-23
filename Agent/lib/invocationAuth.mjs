@@ -117,6 +117,10 @@ export function verifyRouterRequestFromHeaders(headers = {}, {
             rch,
             replayCache,
         });
+        const launchId = env.PLOINKY_LAUNCH_ID;
+        if (launchId !== undefined && (!launchId || payload.launchId !== launchId)) {
+            return { ok: false, reason: 'router-request launch ID mismatch' };
+        }
         return { ok: true, payload, rawToken };
     } catch (err) {
         return { ok: false, reason: err?.message || String(err), ...(err?.code ? { code: String(err.code) } : {}) };

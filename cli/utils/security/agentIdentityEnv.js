@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { SKILL_SCOPE_ENV_NAMES } from '../../../ploinky-box/skillScope.mjs';
 import { AGENTLIB_RESERVED_ENV_NAMES, BOX_IMAGE_ID_ENV } from '../../../agentlib/contract.mjs';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../publicRouterHosts.mjs';
@@ -45,6 +46,23 @@ function normalizeRuntimeIdentity(instanceId, enableGeneration) {
 function markGenerated(env, names) {
     for (const name of names) env[`PLOINKY_ENV_SOURCE_${name}`] = 'generated';
     return env;
+}
+
+// Created only for a new container. Host sandboxes and lifecycle hooks share
+// the reserved-name filter but do not receive a container launch identity.
+export function buildAgentLaunchEnv(launchId = randomUUID()) {
+    return markGenerated({ PLOINKY_LAUNCH_ID: launchId }, ['PLOINKY_LAUNCH_ID']);
+}
+
+// Legacy managed containers already have a signed descriptor ID, but no
+// invocation binding. Reuse their original environment without opting in.
+export function verifyRegisteredLaunchId(registeredId, containerEnv, descriptorId = registeredId) {
+    const name = 'PLOINKY_LAUNCH_ID';
+    const entries = (containerEnv || []).filter(entry => entry === name || entry.startsWith(`${name}=`));
+    if (registeredId === undefined && entries.length === 0) return;
+    if (!registeredId || registeredId !== descriptorId || entries.length !== 1 || entries[0] !== `${name}=${registeredId}`) {
+        throw new Error('container launch binding disagrees with its registered identity');
+    }
 }
 
 // Non-secret identity fields may be prepared before topology attestation. They
@@ -111,6 +129,7 @@ export const GENERATED_RUNTIME_ENV_NAMES = Object.freeze([
     'PLOINKY_AGENT_PRINCIPAL',
     'PLOINKY_AGENT_INSTANCE_ID',
     'PLOINKY_AGENT_ENABLE_GENERATION',
+    'PLOINKY_LAUNCH_ID',
     'PLOINKY_AGENT_API_PUBLIC_KEY',
     'PLOINKY_AGENT_API_KEY',
 ]);
@@ -171,6 +190,7 @@ export function stripReservedAgentEnv(env) {
 
 export default {
     buildAgentPrincipalEnv,
+    buildAgentLaunchEnv,
     buildAgentCredentialEnv,
     stripReservedAgentEnv,
     GENERATED_RUNTIME_ENV_NAMES,
