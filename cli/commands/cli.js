@@ -269,6 +269,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         case 'vars':
             handleVarsCommand();
             break;
+        case 'cache':
+            return (await import('./cacheCommands.js')).runCacheCommand(options);
         case 'var':
             if (isVarStdinRequest(options)) await handleVarStdinCommand(options[0]);
             else handleVarCommand(options);

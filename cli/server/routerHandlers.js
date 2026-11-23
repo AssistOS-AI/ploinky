@@ -12,6 +12,8 @@ import { deriveDelegationKey } from './mcp-proxy/mcpDelegations.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
 import { policy } from './policy/index.js';
 import { loadRoutingConfig } from './routingState.js';
+import { guardSharedCache } from './proxy/sharedCacheGuard.js';
+import { writeAgentResponseHead } from './proxy/sanitizeResponseHeaders.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { ROUTING_FILE } from '../utils/config.js';
 import { deriveSubkey } from '../utils/security/masterKey.js';
@@ -153,18 +155,21 @@ function handleProxyError(res, error) {
 // before the response ends cancels the upstream work. Root routes keep their
 // previous timing; they add no idle or first-byte deadline, because agents
 // such as streaming chat responders may legitimately pause for minutes.
-function bindUpstreamToDownstream(res, upstream) {
+function bindUpstreamToDownstream(req, res, upstream, access, routePlan) {
     res.once('close', () => {
         if (!res.writableEnded) upstream.destroy();
     });
     if (res.destroyed && !res.writableEnded) upstream.destroy();
     return upstreamRes => {
-        res.writeHead(upstreamRes.statusCode || 200, upstreamRes.headers);
+        writeAgentResponseHead(res, upstreamRes, {
+            headers: guardSharedCache(upstreamRes.headers, access),
+            status: upstreamRes.statusCode || 200, plan: routePlan, method: req.method, access,
+        });
         pipeline(upstreamRes, res, () => {});
     };
 }
 
-export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}, { beforeDial = null } = {}) {
+export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}, { beforeDial = null, access, routePlan } = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const headers = {
         ...stripRouterIdentityHeaders(req.headers, {
@@ -187,7 +192,7 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
     upstream.on('error', err => {
         handleProxyError(res, err);
     });
-    upstream.once('response', bindUpstreamToDownstream(res, upstream));
+    upstream.once('response', bindUpstreamToDownstream(req, res, upstream, access, routePlan));
 
     req.on('aborted', () => {
         upstream.destroy();
@@ -226,7 +231,7 @@ function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
     return headers;
 }
 
-export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}, { beforeDial = null } = {}) {
+export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}, { beforeDial = null, access = 'authenticated', routePlan } = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const upstream = http.request({
         hostname: '127.0.0.1',
@@ -240,7 +245,7 @@ export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHe
     upstream.on('error', err => {
         handleProxyError(res, err);
     });
-    upstream.once('response', bindUpstreamToDownstream(res, upstream));
+    upstream.once('response', bindUpstreamToDownstream(req, res, upstream, access, routePlan));
 
     upstream.end(body);
     return upstream;

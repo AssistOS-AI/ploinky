@@ -7,6 +7,7 @@ import { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import test from 'node:test';
+import { markCdnKeep } from '../../cli/server/cdn/cdnResponseHook.js';
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const source = fs.readFileSync(path.join(sourceRoot, 'cli/server/RoutingServer.js'), 'utf8');
@@ -20,7 +21,7 @@ test.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 function loadHandler(fsApi = fs) {
     return vm.runInNewContext(`(${source.slice(start, end)})`, {
-        fs: fsApi, MCP_BROWSER_CLIENT_PATH: file, appendLog() {},
+        fs: fsApi, MCP_BROWSER_CLIENT_PATH: file, appendLog() {}, markCdnKeep,
     });
 }
 function response(write = (_chunk, _encoding, callback) => callback()) {

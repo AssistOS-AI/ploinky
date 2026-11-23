@@ -1089,6 +1089,19 @@ every caller, administrators included, and a manifest that also declares a
 `routerAccess.httpRoutes` entry on a closed agent port is rejected when the
 edge generation is compiled.
 
+### Cloudflare caching for public routes
+
+A public `routerAccess.httpRoutes` entry may declare `"cache": "page"` for a page or `"cache": "immutable"` for a versioned file. Caching starts disabled for each `repo/agent`. Administrators can enable it and select a page lifetime of 60, 120 or 300 seconds through `GET` and `POST /api/marketplace/cache`. The Router sets `Cloudflare-CDN-Cache-Control` on every answer except successful responses from its own public static handlers, which keep their existing headers. The default is `no-store`. Only an eligible anonymous response on a marked route receives a CDN lifetime. Requests with cookies or authorization and responses that set a cookie receive CDN `no-store`.
+
+| Command | Purpose |
+| --- | --- |
+| `ploinky cache purge-config --host HOST --zone ZONE_ID --secret publication/HANDLE` | Associate a published host with its 32-hex-digit zone ID and an existing purge-token secret handle. |
+| `ploinky cache clear --host HOST` | Ask the Router to purge the host and report whether Cloudflare accepted the request. |
+| `ploinky cache hold --agent REPO/AGENT` | Persist a page-cache hold, purge configured hosts and check a marked page at the origin. Versioned immutable files stay eligible. |
+| `ploinky cache release --agent REPO/AGENT` | Purge configured hosts and clear the hold after acceptance. |
+
+The Router reads switches and holds from `.ploinky/data/cache-settings.json`. Purge configuration and per-host results live alongside it. [Router header contract, admin API and settings files](docs/http-route-access-security-model.md#public-route-caching)
+
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.

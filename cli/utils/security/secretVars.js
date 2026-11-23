@@ -2,13 +2,19 @@ import fs from 'fs';
 import { randomBytes } from 'crypto';
 import { getConfig } from '../workspace.js';
 import { findAgent } from '../utils.js';
-import { loadSecretsFile, loadEnvFile } from './secretInjector.js';
+import { isPublicationHandle, loadSecretsFile, loadEnvFile } from './secretInjector.js';
 import { deleteSecretValue, readSecretsFile, setSecretValue } from './encryptedSecretsFile.js';
 import { deriveAgentSecret, deriveWorkspaceSecret } from './masterKey.js';
 
 export function parseSecrets() {
     return readSecretsFile();
 }
+
+export function hasSecretHandle(name) {
+    return Object.hasOwn(readSecretsFile(), name);
+}
+
+export { isPublicationHandle };
 
 export function setEnvVar(name, value) {
     setSecretValue(name, value);
@@ -22,29 +28,44 @@ export function declareVar(name) {
     return setEnvVar(name, '');
 }
 
-function resolveAlias(value, secrets, seen = new Set()) {
-    if (typeof value !== 'string') return value;
-    if (!value.startsWith('$')) return value;
-    const ref = value.slice(1);
-    if (!ref || seen.has(ref)) return '';
-    seen.add(ref);
-    const next = secrets[ref];
-    if (next === undefined) return '';
-    return resolveAlias(next, secrets, seen);
+// An unresolvable publication handle is distinct from an ordinary empty or
+// dangling alias. In particular, a persistent-secret request must never
+// replace a protected alias with a newly generated value.
+const PUBLICATION_SECRET = Symbol('publication secret');
+
+function resolveStoredVariable(name, secrets) {
+    const seen = new Set();
+    while (name && !seen.has(name)) {
+        if (isPublicationHandle(name)) return PUBLICATION_SECRET;
+        if (!Object.hasOwn(secrets, name)) return '';
+        const value = secrets[name];
+        if (typeof value !== 'string' || !value.startsWith('$')) return value;
+        seen.add(name);
+        name = value.slice(1);
+    }
+    return '';
 }
 
 // `secrets` lets a caller that already holds the current decrypted map (for
 // example a validated memo) resolve against it instead of decrypting again.
 export function resolveVarValue(name, secrets = parseSecrets()) {
-    const raw = secrets[name];
-    if (raw === undefined) return '';
-    return resolveAlias(raw, secrets);
+    const value = resolveStoredVariable(name, secrets);
+    // Callers may fall back to process.env on an empty result.
+    if (value === PUBLICATION_SECRET) {
+        const error = new Error('Publication secrets are reserved for the controller.');
+        error.code = 'PLOINKY_PUBLICATION_SECRET_RESERVED';
+        throw error;
+    }
+    return value;
 }
 
 export function ensurePersistentSecret(name, { allowEnvFile = true, byteLength = 32 } = {}) {
     if (!name) {
         throw new Error('Missing secret name.');
     }
+    if (isPublicationHandle(name)) return '';
+    const stored = resolveStoredVariable(name, parseSecrets());
+    if (stored === PUBLICATION_SECRET) return '';
 
     const processValue = String(process.env[name] || '').trim();
     if (processValue) {
@@ -58,7 +79,7 @@ export function ensurePersistentSecret(name, { allowEnvFile = true, byteLength =
         }
     }
 
-    const existingValue = String(resolveVarValue(name) || '').trim();
+    const existingValue = String(stored || '').trim();
     if (existingValue) {
         return existingValue;
     }
@@ -272,7 +293,7 @@ function expandEnvWildcard(pattern) {
     const matches = [];
 
     for (const name of allNames) {
-        if (!regex.test(name)) {
+        if (isPublicationHandle(name) || !regex.test(name)) {
             continue;
         }
 
@@ -453,15 +474,16 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
 }
 
 function isEmptyValue(value) {
-    if (value === undefined || value === null) return true;
+    if (value === undefined || value === null || value === PUBLICATION_SECRET) return true;
     const str = String(value);
     return str.trim().length === 0;
 }
 
 function resolveExplicitEnvSource(name, secrets, getEnvFile) {
     if (!name) return undefined;
+    if (isPublicationHandle(name)) return PUBLICATION_SECRET;
     if (Object.prototype.hasOwnProperty.call(secrets, name)) {
-        return resolveAlias(secrets[name], secrets);
+        return resolveStoredVariable(name, secrets);
     }
     if (Object.prototype.hasOwnProperty.call(process.env, name)) {
         return process.env[name];
@@ -520,6 +542,11 @@ export function assertManifestEnvProfileCompleteness(manifest, profileConfig, op
 
 function resolveManifestEnv(manifest, secrets, options = {}) {
     const { profileConfig, agentName = '', repoName = '' } = options;
+    // The runtime injects the profile's required secrets separately after
+    // building the manifest environment. Reject protected names before then.
+    for (const name of profileConfig?.secrets || []) {
+        resolveVarValue(name, secrets);
+    }
     if (options.enforceProfileCompleteness) {
         assertManifestEnvProfileCompleteness(manifest, profileConfig, {
             agentName,
@@ -546,10 +573,12 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
         let resolvedValue;
         let usedDefault = false;
         let valueSource;
-        const hasSecret = spec.sourceName
-            && Object.prototype.hasOwnProperty.call(secrets, spec.sourceName);
+        const explicitValue = resolveExplicitEnvSource(spec.sourceName, secrets, getEnvFile);
+        if (isPublicationHandle(spec.insideName) || explicitValue === PUBLICATION_SECRET) {
+            if (spec.required) missing.push(spec);
+            continue;
+        }
         if (spec.generated?.type === 'generated-secret') {
-            const explicitValue = resolveExplicitEnvSource(spec.sourceName, secrets, getEnvFile);
             if (shouldUseExplicitGeneratedOverride(spec, explicitValue, secrets, getEnvFile)) {
                 resolvedValue = explicitValue;
                 valueSource = 'explicit';
@@ -566,20 +595,11 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
                 });
                 valueSource = 'generated';
             }
-        } else if (hasSecret) {
-            resolvedValue = resolveAlias(secrets[spec.sourceName], secrets);
-        } else if (spec.sourceName && Object.prototype.hasOwnProperty.call(process.env, spec.sourceName)) {
-            resolvedValue = process.env[spec.sourceName];
-        } else if (spec.sourceName && Object.prototype.hasOwnProperty.call(getEnvFile(), spec.sourceName)) {
-            resolvedValue = getEnvFile()[spec.sourceName];
-        } else if (Object.prototype.hasOwnProperty.call(spec, 'defaultValue')) {
-            resolvedValue = spec.defaultValue;
-            usedDefault = true;
         } else {
-            resolvedValue = undefined;
+            resolvedValue = explicitValue;
         }
 
-        if (!usedDefault && (resolvedValue === undefined || resolvedValue === null) && Object.prototype.hasOwnProperty.call(spec, 'defaultValue')) {
+        if ((resolvedValue === undefined || resolvedValue === null) && Object.prototype.hasOwnProperty.call(spec, 'defaultValue')) {
             resolvedValue = spec.defaultValue;
             usedDefault = true;
         }
@@ -621,6 +641,7 @@ function resolveManifestEnv(manifest, secrets, options = {}) {
 
 export function getManifestEnvNames(manifest, profileConfig, options = {}) {
     return getManifestEnvSpecs(manifest, profileConfig)
+        .filter(spec => !isPublicationHandle(spec.insideName) && !isPublicationHandle(spec.sourceName))
         .filter(spec => options.forRuntime !== true || spec.runtime !== false)
         .map(spec => spec.insideName);
 }
@@ -647,7 +668,7 @@ export function getExposedNames(manifest, profileConfig, options = {}) {
             if (!runtimeExcludedNames.has(String(n))) names.add(String(n));
         });
     }
-    return Array.from(names);
+    return Array.from(names).filter(name => !isPublicationHandle(name));
 }
 
 function quoteEnvValue(value) {
@@ -687,21 +708,21 @@ export function buildEnvFlags(manifest, profileConfig, options = {}) {
     const exp = manifest?.expose;
     if (Array.isArray(exp)) {
         for (const spec of exp) {
-            if (!spec || !spec.name) continue;
+            if (!spec || !spec.name || isPublicationHandle(spec.name)) continue;
             if (runtimeExcludedNames.has(String(spec.name))) continue;
             if (Object.prototype.hasOwnProperty.call(spec, 'value')) {
                 out.push(formatEnvFlag(spec.name, spec.value));
             } else if (spec.ref) {
-                const v = resolveAlias('$' + spec.ref, secrets);
-                if (v !== undefined) out.push(formatEnvFlag(spec.name, v ?? ''));
+                const v = resolveStoredVariable(String(spec.ref), secrets);
+                if (v !== PUBLICATION_SECRET) out.push(formatEnvFlag(spec.name, v ?? ''));
             }
         }
     } else if (exp && typeof exp === 'object') {
         for (const [name, val] of Object.entries(exp)) {
-            if (runtimeExcludedNames.has(String(name))) continue;
+            if (runtimeExcludedNames.has(String(name)) || isPublicationHandle(name)) continue;
             if (typeof val === 'string' && val.startsWith('$')) {
-                const v = resolveAlias(val, secrets);
-                if (v !== undefined) out.push(formatEnvFlag(name, v ?? ''));
+                const v = resolveStoredVariable(val.slice(1), secrets);
+                if (v !== PUBLICATION_SECRET) out.push(formatEnvFlag(name, v ?? ''));
             } else if (val !== undefined) {
                 out.push(formatEnvFlag(name, val));
             }
@@ -737,19 +758,21 @@ export function buildEnvMap(manifest, profileConfig, options = {}) {
     const exp = manifest?.expose;
     if (Array.isArray(exp)) {
         for (const spec of exp) {
-            if (!spec || !spec.name) continue;
+            if (!spec || !spec.name || isPublicationHandle(spec.name)) continue;
             if (runtimeExcludedNames.has(String(spec.name))) continue;
             if (Object.prototype.hasOwnProperty.call(spec, 'value')) {
                 out[spec.name] = String(spec.value);
             } else if (spec.ref) {
-                out[spec.name] = resolveAlias('$' + spec.ref, secrets) ?? '';
+                const value = resolveStoredVariable(String(spec.ref), secrets);
+                if (value !== PUBLICATION_SECRET) out[spec.name] = value ?? '';
             }
         }
     } else if (exp && typeof exp === 'object') {
         for (const [name, val] of Object.entries(exp)) {
-            if (runtimeExcludedNames.has(String(name))) continue;
+            if (runtimeExcludedNames.has(String(name)) || isPublicationHandle(name)) continue;
             if (typeof val === 'string' && val.startsWith('$')) {
-                out[name] = resolveAlias(val, secrets) ?? '';
+                const value = resolveStoredVariable(val.slice(1), secrets);
+                if (value !== PUBLICATION_SECRET) out[name] = value ?? '';
             } else {
                 out[name] = val !== undefined ? String(val) : '';
             }
@@ -831,7 +854,7 @@ export function echoVar(nameOrAlias) {
     if (!nameOrAlias) return '';
     const isAlias = String(nameOrAlias).startsWith('$');
     const varName = isAlias ? String(nameOrAlias).slice(1) : String(nameOrAlias);
-    if (!varName) return '';
+    if (!varName || isPublicationHandle(varName)) return '';
     try {
         if (isAlias) {
             return resolveVarValue(varName) ?? '';

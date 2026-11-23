@@ -5,7 +5,7 @@ import { pipeline } from 'node:stream/promises';
 import { sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
 import { finalizePlanAfterAdmission } from './RoutePlan.js';
 import { measureHeaderBytes, sanitizeRequestHeaders } from './sanitizeRequestHeaders.js';
-import { sanitizeResponseHeaders } from './sanitizeResponseHeaders.js';
+import { sanitizeResponseHeaders, writeAgentResponseHead } from './sanitizeResponseHeaders.js';
 import { recordProxyOutcome } from './recordProxyOutcome.js';
 
 const READ_ONLY = new Set(['GET', 'HEAD', 'OPTIONS']);
@@ -439,8 +439,12 @@ export async function executeHttpPlan({
                     return;
                 }
                 clearHeaderDeadline();
-                res.writeHead(upstreamRes.statusCode || 502, sanitizeResponseHeaders(upstreamRes.headers, finalized));
                 responseStatus = upstreamRes.statusCode || 502;
+                writeAgentResponseHead(res, upstreamRes, {
+                    headers: sanitizeResponseHeaders(upstreamRes.headers, finalized),
+                    status: responseStatus, plan: finalized,
+                    method: finalized.method, access: finalized.responsePolicy?.access,
+                });
                 const contentType = String(upstreamRes.headers['content-type'] || '').toLowerCase();
                 const longLived = finalized.transport === 'sse' || contentType.startsWith('text/event-stream');
                 if (longLived) {

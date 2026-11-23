@@ -59,7 +59,7 @@ import {
 import {
   sanitizeManagedMasterKeyEnvironment,
 } from '../utils/security/masterKey.js';
-import { getExposedNames, getManifestEnvNames } from '../utils/security/secretVars.js';
+import { getExposedNames, getManifestEnvNames, isPublicationHandle } from '../utils/security/secretVars.js';
 import {
   isLlmRuntimeManifest,
   prepareLlmStartup,
@@ -278,7 +278,13 @@ function createAppendLogStdio(logFile) {
 // cycles without depending on the operator having `export`'d each one. Managed
 // Boxes then remove PLOINKY_MASTER_KEY because core reads its owned key file.
 export function sanitizeRouterEnvironment(environment, { managedBox } = {}) {
-  return sanitizeManagedMasterKeyEnvironment(environment, { managedBox });
+  const routerEnv = sanitizeManagedMasterKeyEnvironment(environment, { managedBox });
+  // Publication controllers read their handles from the encrypted store.
+  // Watchdog children and Router-loaded modules share the Router environment.
+  for (const name of Object.keys(routerEnv)) {
+    if (isPublicationHandle(name)) delete routerEnv[name];
+  }
+  return routerEnv;
 }
 
 export function buildRouterEnv({ managedBox } = {}) {

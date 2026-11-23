@@ -25,6 +25,7 @@ const rawCommands = {
     settings: [],
     client: ['methods', 'status', 'list', 'task', 'task-status'],
     logs: ['tail', 'last'],
+    cache: ['purge-config', 'clear', 'hold', 'release'],
     expose: [],
     var: [],
     vars: [],

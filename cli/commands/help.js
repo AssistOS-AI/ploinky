@@ -51,6 +51,7 @@ function mainHelpText(surface) {
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
   network status [--json]        Show managed network topology (status schema 3)
   network prune                  Remove unused workspace-owned managed networks
+  cache purge-config|clear|hold|release  Configure host purges or operate the running Router cache
   vars                           List all variable names (no values)
   var <VAR> <value>              Set a variable value
   echo <VAR|$VAR>                Print the resolved value of a variable
@@ -134,6 +135,11 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             description: 'Alias for uninstall.',
             examples: [ 'remove myrepo', 'remove repo myrepo' ],
             notes: 'The optional `repo` token is accepted but not required.'
+        },
+        'cache': {
+            description: 'Configure host purges, clear a published host or hold and release application page caching.',
+            syntax: 'cache purge-config --host <host> --zone <id> --secret <publication/handle> | cache clear --host <host> | cache hold|release --agent <repo/agent>',
+            notes: 'Store the purge token with var <publication/handle> --stdin. Give purge-config its handle. Clear, hold and release require the active Router.'
         },
         'var': {
             description: 'Set a workspace variable (stored encrypted in .ploinky/data/.secrets)',

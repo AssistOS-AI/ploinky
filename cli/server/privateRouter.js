@@ -17,6 +17,7 @@ import { derivePrivateAgentRequestSecret } from '../utils/security/masterKey.js'
 import { commitRoutePlan } from './edgeRoutePlan.js';
 import { agentExecConsumersOf } from '../sandbox/edgeGeneration.js';
 import { identityHardwareUnavailable, identityLeaseHardwareUnavailable } from './hardwareAvailability.mjs';
+import { CACHE_OPERATOR_HEADER, CACHE_OPERATOR_PATH, verifyCacheOperatorRequest } from '../commands/cacheOperatorAssertion.js';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
 const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;
@@ -378,6 +379,56 @@ export function sendPrivateError(res, error) {
         'Cache-Control': 'no-store',
     });
     res.end(body);
+}
+
+export async function handlePrivateCacheRequest({
+    req, res, plan, publicPort,
+    purge = async options => (await import('./cdn/cachePurge.js')).purgeCacheHost(options),
+    changeHold = async options => (await import('./cdn/cacheHold.js')).changeCacheHold(options),
+}) {
+    if (!plan?.ok || plan.listener !== 'private' || plan.kind !== 'private-operation' || plan.operation !== 'cache'
+        || req.ploinkyListenerClass !== 'private' || req.method !== 'POST'
+        || plan.pathname !== CACHE_OPERATOR_PATH || req.url !== CACHE_OPERATOR_PATH
+        || !['127.0.0.1', '::ffff:127.0.0.1', '::1'].includes(req.socket?.remoteAddress)) {
+        return sendPrivateError(res, forbidden('Cache operations require the private loopback listener.'));
+    }
+    const assertCurrent = () => {
+        if (!plan.snapshot || plan.lease?.snapshot !== plan.snapshot || !commitRoutePlan(plan)) {
+            throw Object.assign(new Error('Cache operation lease expired.'), { status: 503, code: 'edge_generation_changed' });
+        }
+        return true;
+    };
+    try {
+        assertCurrent();
+        const body = await readPrivateRequestBody(req, { maxBytes: 2048 });
+        let by;
+        try {
+            by = verifyCacheOperatorRequest(req.headers[CACHE_OPERATOR_HEADER], body, plan.lease);
+        } catch (error) {
+            return sendPrivateError(res, { status: replayRefusalStatus(error) || 401, code: 'cache_operator_denied' });
+        } finally {
+            delete req.headers[CACHE_OPERATOR_HEADER];
+        }
+        let input;
+        try { input = JSON.parse(body.toString('utf8')); } catch { }
+        const target = input?.op === 'clear' ? 'host' : 'agent';
+        if (!['clear', 'hold', 'release'].includes(input?.op) || Object.keys(input).length !== 2
+            || typeof input[target] !== 'string' || !input[target]) {
+            return sendPrivateError(res, { status: 400, code: 'invalid_request' });
+        }
+        assertCurrent();
+        const context = { by, generation: plan.snapshot, assertCurrent };
+        const result = input.op === 'clear'
+            ? { purge: await purge({ ...context, host: input.host }) }
+            : await changeHold({ ...context, op: input.op, agent: input.agent, publicPort });
+        assertCurrent();
+        const payload = Buffer.from(JSON.stringify(result));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': payload.length, 'Cache-Control': 'no-store' });
+        res.end(payload);
+    } catch (error) {
+        const status = [400, 404, 413, 503].includes(error?.status) ? error.status : 503;
+        sendPrivateError(res, { status, code: 'cache_operation_refused' });
+    }
 }
 
 function runtimeOriginsError(status, code, message) {

@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
+import { markCdnKeep } from '../cdn/cdnResponseHook.js';
 import {
     getWorkspaceRoot,
     isPathWithinRoots,
@@ -832,6 +833,7 @@ async function serveWebLibRequest(req, res) {
             return false;
         }
 
+        markCdnKeep(res);
         const rel = pathname.replace(/^\/web-libs\/?/, '');
         if (!rel) {
             res.writeHead(404, { 'Content-Type': 'text/plain' });

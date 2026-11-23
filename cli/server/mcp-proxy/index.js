@@ -20,6 +20,7 @@ import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
 import { policy } from '../policy/index.js';
+import { guardSharedCache } from '../proxy/sharedCacheGuard.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
 import { MCP_SESSION_INVALID_ERROR } from './sessionErrors.js';
@@ -622,7 +623,7 @@ export async function handleDelegatedAgentTaskCancel({
                 authorization: `Bearer ${context.token}`,
             },
         }, (response) => {
-            res.writeHead(response.statusCode || 502, response.headers);
+            res.writeHead(response.statusCode || 502, guardSharedCache(response.headers, 'authenticated'));
             response.pipe(res);
         });
         upstream.on('error', () => sendJson(res, 502, { error: 'task_cancel_upstream_failed' }));
