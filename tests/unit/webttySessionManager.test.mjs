@@ -4877,8 +4877,11 @@ test('D6/R1: a periodic validate whose revalidation straddles close start never 
     const provider = { type: 'agent', repoName: 'fixtures', agentName: 'provider', containerId: 'c'.repeat(64),
         instanceId: 'provider-instance', enableGeneration: 'provider-generation' };
     const snapshot = Object.freeze({
-        routing: { routes: { provider: { repo: 'fixtures', agent: 'provider', container: 'provider-container' } } },
-        agents: { 'provider-container': provider },
+        routing: { routes: { provider: { repo: 'fixtures', agent: 'provider', container: 'old-provider',
+            canary: { container: 'provider-container', mode: 'split', rolloutId: 'profile-rollout', share: 0,
+                testAccounts: [LEASE.userId], codePath: '.ploinky/canary/provider/export' } } } },
+        agents: { 'old-provider': { ...provider, containerId: 'd'.repeat(64) },
+            'provider-container': { ...provider, canaryOf: 'provider' } },
         manifests: { provider: { webtty: { homeProfiles: { version: 2, resolve } } } },
     });
     const providerBinding = { routeKey: 'provider', containerName: 'provider-container', agentName: 'provider',

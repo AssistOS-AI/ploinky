@@ -895,13 +895,13 @@ function normalizeDrainOwner(value, label = 'drain owner') {
     };
 }
 
-function validateRoutingShape(routing, manifests) {
+function validateRoutingShape(routing, manifests, options) {
     assertObject(routing, 'routing state');
     const routes = routing.routes === undefined ? {} : assertObject(routing.routes, 'routing.routes');
     for (const [routeKey, route] of Object.entries(routes)) {
         if (!routeKey || RESERVED_OBJECT_KEYS.has(routeKey)) throw edgeError(`routing route key '${routeKey}' is invalid`);
         assertObject(route, `routing route '${routeKey}'`);
-        if (Object.hasOwn(route, 'canary')) validateCanaryField(route.canary, `routing.routes.${routeKey}.canary`);
+        if (Object.hasOwn(route, 'canary')) validateCanaryField(route.canary, `routing.routes.${routeKey}.canary`, options);
         if (route.hostPort !== undefined) normalizeServicePort(route.hostPort, `routing.routes.${routeKey}.hostPort`);
         if (route.hardwareAvailability !== undefined) {
             try {
@@ -1343,9 +1343,9 @@ export function edgeHostServiceRoutes(generation, host) {
     return frozen;
 }
 
-function compileGeneration({ routing, policy, desired, agents, manifests }, workspaceRoot) {
+function compileGeneration({ routing, policy, desired, agents, manifests }, workspaceRoot, options) {
     validatePolicy(policy);
-    validateRoutingShape(routing, manifests);
+    validateRoutingShape(routing, manifests, options);
     assertObject(agents, 'agents registry');
     validateCanaryLinks(routing, agents, workspaceRoot);
     const normalizedDesired = normalizeDesired(desired);
@@ -1488,7 +1488,7 @@ function captureRuntimeBindingSources() {
     };
 }
 
-function collectCapturedSources(paths) {
+function collectCapturedSources(paths, verifiedPredecessor) {
     const routingBytes = readExact(paths.routingFile, { label: 'routing.json' });
     const policyBytes = readExact(paths.policyFile, { label: 'policy-state.json' });
     const desiredBytes = readExact(paths.desiredFile, { label: 'edge desired state' });
@@ -1515,7 +1515,6 @@ function collectCapturedSources(paths) {
         manifestBytes[routeKey] = bytes;
         manifests[routeKey] = parseJsonBytes(bytes, `manifest(${routeKey})`);
     }
-    const semantic = compileGeneration({ routing, policy, desired, agents, manifests }, paths.root);
     const parts = [
         ['routing.json', routingBytes],
         ['policy-state.json', policyBytes],
@@ -1526,8 +1525,12 @@ function collectCapturedSources(paths) {
         ['router-public-hosts', routerPublicHostsBytes],
         ...Object.entries(manifestBytes).sort(([left], [right]) => left.localeCompare(right)).map(([routeKey, bytes]) => [`manifest:${routeKey}`, bytes]),
     ];
+    const generation = digestParts(parts);
+    const semantic = compileGeneration({ routing, policy, desired, agents, manifests }, paths.root, {
+        allowHistoricalThresholds: generation === verifiedPredecessor,
+    });
     return {
-        generation: digestParts(parts),
+        generation,
         parts,
         routing,
         policy,
@@ -2675,7 +2678,7 @@ function reconstructGeneration(document, selector) {
             agents,
             manifests,
             routerHostPort,
-        });
+        }, undefined, { allowHistoricalThresholds: true });
     } catch (error) {
         throw edgeError(`active edge routing generation semantics are invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
     }
@@ -3169,7 +3172,7 @@ export function prepareAdditiveEdgeRoutingGeneration(options = {}) {
         && active.selector.generation !== String(options.expectedActiveGeneration || '')) {
         throw edgeError('active predecessor changed before additive preparation', 'EDGE_GENERATION_RACE');
     }
-    const mutable = collectCapturedSources(paths);
+    const mutable = collectCapturedSources(paths, active.selector.generation);
     if (mutable.generation !== active.selector.generation) {
         throw edgeError(
             'mutable edge sources no longer match the active predecessor',
@@ -3272,7 +3275,7 @@ function assertAdditiveCommitSources(paths, lease, options, fromMutableSources) 
         );
     }
     if (!fromMutableSources) {
-        const predecessorSources = collectCapturedSources(paths);
+        const predecessorSources = collectCapturedSources(paths, lease.predecessorGeneration);
         if (predecessorSources.generation !== lease.predecessorGeneration) {
             throw edgeError(
                 'mutable edge sources changed while the additive predecessor remained active',
@@ -4018,6 +4021,14 @@ function routerPublicHostsMatchRuntime(generation) {
 // against a freshly read selector.
 const ACTIVE_GENERATION_CACHE_LIMIT = 4;
 const activeGenerationCache = new Map();
+// Provenance stays with a caller's immutable route even after cache eviction.
+// Keep it outside the serialized generation and release it with the route.
+const verifiedRouteOrigins = new WeakMap();
+
+export function verifiedRouteOrigin(route) {
+    return verifiedRouteOrigins.get(route);
+}
+
 const activeGenerationCacheCounters = { hits: 0, misses: 0, reconstructs: 0 };
 
 function generationFileStamp(stat) {
@@ -4080,6 +4091,9 @@ function loadVerifiedActiveGeneration(paths, selector) {
     if (cached) activeGenerationCache.delete(key);
     activeGenerationCacheCounters.misses += 1;
     const generation = deepFreeze(readVerifiedGenerationDocument(file, selector));
+    for (const [routeKey, route] of Object.entries(generation.routing.routes ?? {})) {
+        verifiedRouteOrigins.set(route, Object.freeze({ generation: selector.generation, routeKey }));
+    }
     if (stamp !== null) {
         activeGenerationCache.set(key, { stamp, generation });
         while (activeGenerationCache.size > ACTIVE_GENERATION_CACHE_LIMIT) {
@@ -4127,7 +4141,7 @@ export function loadActiveEdgeRoutingGeneration(options = {}) {
  */
 export function assertActiveEdgeRoutingSourcesCurrent(options = {}) {
     const active = loadActiveEdgeRoutingGeneration(options);
-    const captured = collectCapturedSources(active.paths);
+    const captured = collectCapturedSources(active.paths, active.selector.generation);
     if (captured.generation !== active.selector.generation) {
         throw edgeError(
             'edge routing sources changed since the active generation was selected',

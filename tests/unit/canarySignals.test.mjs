@@ -61,6 +61,8 @@ test('old-copy failures never trip, stale canary outcomes cannot contribute, and
     f.canary({ status: 499 }, 6);
     f.canary({ status: 500, rolloutId: 'previous' }, 8);
     f.canary({ status: 500, rolloutId: undefined }, 8);
+    f.old({ status: 500, rolloutId: 'previous' }, 8);
+    f.old({ status: 500, rolloutId: undefined }, 8);
     f.probe({ ok: false });
     const { state, counts } = f.status();
     assert.equal(state, 'split');
@@ -254,6 +256,8 @@ test('recorded WebSocket uses handshake timing even after a ten-minute connectio
         startedAt: Date.now() - tenMinutes, ttfbMs: 15,
     });
     assert.equal(event.latencyBucket, 'over-15000ms');
+    assert.equal(event.copy, 'canary');
+    assert.equal(event.rolloutId, rolloutId);
     const counts = f.status().counts.canary.window;
     assert.equal(counts.timedResponses, 1);
     assert.equal(counts.slowResponses, 0);

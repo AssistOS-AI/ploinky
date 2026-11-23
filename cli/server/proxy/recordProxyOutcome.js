@@ -1,6 +1,5 @@
-import { observeProxyOutcome } from '../canary/proxyOutcomes.js';
-
-const LATENCY_BUCKETS = Object.freeze([10, 50, 100, 250, 500, 1_000, 5_000, 15_000]);
+import { observeProxyOutcome, proxyOutcomeIdentity } from '../canary/proxyOutcomes.js';
+import { LATENCY_BUCKETS } from '../canary/counters.js';
 
 function latencyBucket(milliseconds) {
     const value = Math.max(0, Number(milliseconds) || 0);
@@ -32,6 +31,7 @@ export function recordProxyOutcome({
         surfaceKind: String(plan?.surfaceKind || ''),
         ownerInstanceId: String(plan?.owner?.effectiveInstanceId || ''),
         routeKey: String(plan?.routeKey || ''),
+        ...proxyOutcomeIdentity(plan),
         port: Number(plan?.port || 0),
         method: String(plan?.method || ''),
         transport: String(plan?.transport || ''),

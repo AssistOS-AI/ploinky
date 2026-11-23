@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { ROUTING_FILE } from '../../utils/config.js';
+import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import { DIRECT_CLI_PATH } from '../../utils/directCli.js';
+import { getCliCmd } from '../../utils/manifestCli.mjs';
 
 function trimCommand(value) {
     if (!value) return '';
@@ -272,9 +273,13 @@ const WEBCHAT_PROVENANCE_FIELDS = ['routeKey', 'hostPath', 'container', 'alias',
 function webchatRouteProvenance(routing, routeKey) {
     const key = trimCommand(routeKey);
     const routes = routing?.routes && typeof routing.routes === 'object' ? routing.routes : {};
-    const route = key && Object.hasOwn(routes, key) ? routes[key] : null;
+    const logical = key && Object.hasOwn(routes, key) ? routes[key] : null;
     // A drained route admits no new traffic until its runtime is replaced.
-    if (!route || typeof route !== 'object' || route.disabled || route.draining === true) return null;
+    if (!routeAdmitted(logical, key)) return null;
+    const field = logical.canary;
+    const onCanary = field && effectiveCanaryMode(field, routingSignals()?.routingState(key, field.rolloutId)) === 'all';
+    const route = onCanary ? { ...logical, container: field.container,
+        hostPath: path.resolve(process.env.PLOINKY_WORKSPACE_ROOT || PLOINKY_WORKSPACE_ROOT, field.codePath) } : logical;
     const staticAgent = trimCommand(routing?.static?.agent);
     const shortStatic = staticAgent.includes('/') ? staticAgent.split('/').pop() : staticAgent;
     const isStatic = Boolean(staticAgent) && (
@@ -289,7 +294,7 @@ function webchatRouteProvenance(routing, routeKey) {
         alias: trimCommand(route.alias),
         repo: trimCommand(route.repo),
         agent: trimCommand(route.agent),
-        cliTarget: resolveCliTarget(route, key),
+        cliTarget: onCanary ? field.container : resolveCliTarget(route, key),
     };
 }
 
@@ -322,21 +327,36 @@ async function resolveWebchatCommandsForBindingAsync(binding, options = {}) {
     if (!actual || WEBCHAT_PROVENANCE_FIELDS.some((field) => actual[field] !== expected[field])) {
         return { changed: true };
     }
-    const manifest = await readManifestAsync(path.join(actual.hostPath, 'manifest.json'));
+    const selected = options.selectedTarget;
+    if (routing.routes?.[routeKey]?.canary && !selected?.selection) return { changed: true };
+    // Start requires identical manifests on both commits. The exported /code mount can be
+    // a subdirectory without a manifest, so bind both copies to the published agent manifest.
+    const hostPath = selected ? selected.selection.sourceRoute.hostPath : actual.hostPath;
+    if (selected && hostPath !== routing.routes[routeKey].hostPath) return { changed: true };
+    const manifest = await readManifestAsync(path.join(hostPath, 'manifest.json'));
     if (!manifest || manifestWebchatDeclaration(manifest) !== String(binding.declaration || '')) {
         return { changed: true };
+    }
+    const webchatOptions = extractManifestWebchatOptions(manifest);
+    const selectedCli = manifest.cli || manifest.commands?.cli;
+    if (selected) {
+        const published = selected.snapshot.manifests?.[routeKey];
+        if (!published || manifest.cli !== published.cli || manifest.commands?.cli !== published.commands?.cli
+            || JSON.stringify(webchatOptions) !== JSON.stringify(extractManifestWebchatOptions(published))) return { changed: true };
+        if ((manifest.cli !== undefined || manifest.commands?.cli !== undefined)
+            && (typeof selectedCli !== 'string' || !selectedCli.trim())) return { changed: true };
     }
     const cliArgs = normalizeCliArgs(options.cliArgs);
     const cacheSuffix = cliArgs.join('\u0000');
     return {
-        host: buildHostCliCommand(actual.cliTarget, { cliArgs }),
-        container: extractManifestCli(manifest),
+        host: selected ? '' : buildHostCliCommand(actual.cliTarget, { cliArgs }),
+        container: selected ? getCliCmd(manifest) : extractManifestCli(manifest),
         source: 'manifest',
         agentName: routeKey,
         cliTarget: actual.cliTarget,
         cliArgs,
         provenance: { ...actual, generation: String(binding.generation || '') },
-        ...extractManifestWebchatOptions(manifest),
+        ...webchatOptions,
         cacheKey: cacheSuffix ? `webchat:${routeKey}:${cacheSuffix}` : `webchat:${routeKey}`
     };
 }
@@ -353,3 +373,5 @@ export {
     extractManifestWebchatOptions,
     trimCommand
 };
+
+import { effectiveCanaryMode, routeAdmitted, routingSignals } from '../canary/routeAdmission.mjs';

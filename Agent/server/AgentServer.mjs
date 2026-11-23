@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { TaskQueue } from './TaskQueue.mjs';
+import { issueContinuationOrigins } from '../lib/taskContinuationOrigin.mjs';
 import { createToolWorkerPools, shutdownToolWorkerPools } from './toolWorkerPool.mjs';
 import { agentServerIdentityInputs, createAgentServerCodeIdentity, formatIdentityMeasures } from './toolCodeIdentity.mjs';
 import { createAgentServerCodeIdentityThread } from './toolCodeIdentityThread.mjs';
@@ -13,6 +14,7 @@ import { getConfiguredToolInputSchema } from './toolInputSchemaCache.mjs';
 import { createBoundedReplayCache, legacyMinRetentionMs } from '../lib/replayCache.mjs';
 import {
     hasInvocationTokenHeader,
+    readAgentSecret,
     verifyRouterRequestFromHeaders,
     verifyOpenAiServiceAuthInfoFromHeaders,
     verifyOpenAiModelsAuthInfoFromHeaders
@@ -1622,7 +1624,7 @@ async function main() {
                 if (!task) {
                     return sendJson(404, { error: 'task not found' });
                 }
-                return sendJson(200, { task });
+                return sendJson(200, { task: issueContinuationOrigins(task, taskQueue.canaryRolloutId, readAgentSecret()) });
             }
             if (method === 'POST' && u.pathname === TASK_CANCEL_PATH) {
                 const parsedBody = await readJsonBody(req);
@@ -1651,7 +1653,7 @@ async function main() {
                 if (!task) {
                     return sendJson(404, { error: 'task not found' });
                 }
-                return sendJson(200, { task });
+                return sendJson(200, { task: issueContinuationOrigins(task, taskQueue.canaryRolloutId, readAgentSecret()) });
             }
             if ((method === 'GET' || method === 'DELETE') && u.pathname === '/mcp') {
                 const sessionId = req.headers['mcp-session-id'];

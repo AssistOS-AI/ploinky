@@ -23,6 +23,12 @@ import { normalizeManifestHttpRouteAccess } from './policy/HttpRouteProviders.js
 import { compileProxyLimits } from './proxy/limits.js';
 import { createRoutePlan } from './proxy/RoutePlan.js';
 import { leaseRouteHardwareAvailability } from './hardwareAvailability.mjs';
+import { routeAdmitted } from './canary/routeAdmission.mjs';
+import { assertSelectionCurrent, selectRouteRuntime } from './canary/selection.mjs';
+let activeSnapshotObserver;
+export function setActiveSnapshotObserver(observer) {
+    activeSnapshotObserver = observer;
+}
 
 // Starts the activation clock on any request that captures the active generation (memory only; never throws).
 const observedActiveLease = (lease) => { try { observeEdgeActivation(lease); } catch (_) {} return lease; };
@@ -70,10 +76,10 @@ export function normalizeExactHost(hostHeader) {
     return normalizedHostName(hostHeader);
 }
 
-function exactRoute(routes, routeKey) {
+function exactRoute(routes, routeKey, snapshot) {
     const key = String(routeKey || '');
     const route = routes?.[key];
-    return route && !route.disabled && !route.draining ? { routeKey: key, route } : null;
+    return routeAdmitted(route, key, snapshot) ? { routeKey: key, route } : null;
 }
 
 function classifyHost({ host, listener, snapshot }) {
@@ -97,7 +103,7 @@ function classifyHost({ host, listener, snapshot }) {
             : null;
     }
     const selectedRoute = snapshot.routing?.routes?.[String(record.routeKey || '')];
-    if (snapshot.publicationState !== 'ready' || selectedRoute?.draining === true) {
+    if (snapshot.publicationState !== 'ready' || !routeAdmitted(selectedRoute, record.routeKey, snapshot)) {
         return { kind: 'inactive-public', host, record };
     }
     return { kind: 'agent-root', source: 'public-host', host, record };
@@ -120,8 +126,7 @@ function snapshotPolicy(snapshot) {
     });
 }
 
-function exactAgentRuntime(snapshot, routeKey, route) {
-    const containerName = String(route?.container || '').trim();
+function exactAgentRuntime(snapshot, routeKey, route, containerName = route?.container) {
     const record = snapshot.agents?.[containerName];
     if (!containerName || !record || record.type !== 'agent') return null;
     if (String(record.repoName || '') !== String(route.repo || '')
@@ -170,6 +175,19 @@ function manifestRouteSpecs(manifest = {}) {
         ));
     }
     return [];
+}
+
+function relayForRuntime(runtime) {
+    return {
+        kind: 'container-control-socket',
+        runtime: runtime.runtime,
+        containerId: runtime.containerId,
+        containerName: runtime.containerName,
+        targetAgentId: runtime.targetAgentId,
+        effectiveInstanceId: runtime.effectiveInstanceId,
+        enableGeneration: runtime.enableGeneration,
+        networkMode: runtime.networkMode === 'host' ? 'host' : '',
+    };
 }
 
 function conventionAuthDefinition({ snapshot, routeKey, route, selector, decision }) {
@@ -221,7 +239,7 @@ export function agentPortPlan({
         throw error;
     }
     if (!selector) return null;
-    const selected = exactRoute(routes, selector.agent);
+    const selected = exactRoute(routes, selector.agent, snapshot);
     if (!selected) {
         return deny(404, 'AGENT_OWNER_INACTIVE', {
             matched: true,
@@ -233,7 +251,7 @@ export function agentPortPlan({
     // A refused or blocked instance is unavailable on every transport,
     // including the private relay target path (plan §9.4).
     const hardwareAvailability = leaseRouteHardwareAvailability(lease, selected.routeKey);
-    if (hardwareAvailability) {
+    if (hardwareAvailability && !selected.route.canary) {
         return deny(503, 'AGENT_HARDWARE_UNAVAILABLE', {
             matched: true,
             listener,
@@ -242,7 +260,10 @@ export function agentPortPlan({
             hardwareAvailability,
         });
     }
-    const runtime = exactAgentRuntime(snapshot, selected.routeKey, selected.route);
+    const primary = exactAgentRuntime(snapshot, selected.routeKey, selected.route);
+    const secondary = selected.route.canary
+        ? exactAgentRuntime(snapshot, selected.routeKey, selected.route, selected.route.canary.container) : null;
+    const runtime = primary || secondary;
     if (!runtime) {
         return deny(503, 'AGENT_RUNTIME_INACTIVE', {
             matched: true,
@@ -251,7 +272,7 @@ export function agentPortPlan({
             hostSelection,
         });
     }
-    const deniedPorts = runtime.networkMode === 'host' ? [8080, 8081] : [];
+    const deniedPorts = [primary, secondary].some(member => member?.networkMode === 'host') ? [8080, 8081] : [];
     try {
         selector = parseAgentPortSelector(requestTarget, { deniedPorts });
     } catch (error) {
@@ -356,6 +377,7 @@ export function agentPortPlan({
         parsedUrl,
         routeKey: selected.routeKey,
         route: selected.route,
+        ...(selected.route.canary ? { runtimes: { old: primary, canary: secondary } } : {}),
         forwarding,
         lease,
         snapshot,
@@ -371,16 +393,7 @@ export function agentPortPlan({
         convention: selector.convention,
         forwardedPrefix: rootMount ? '' : `/${selector.convention}/${selector.rawAgent}/${selector.canonicalPort}`,
         unmatchedSuffix: selector.suffix,
-        relay: {
-            kind: 'container-control-socket',
-            runtime: runtime.runtime,
-            containerId: runtime.containerId,
-            containerName: runtime.containerName,
-            targetAgentId: runtime.targetAgentId,
-            effectiveInstanceId: runtime.effectiveInstanceId,
-            enableGeneration: runtime.enableGeneration,
-            networkMode: runtime.networkMode === 'host' ? 'host' : '',
-        },
+        relay: relayForRuntime(runtime),
         deniedPorts,
         allowedRouterCapabilities: [],
         access: decision,
@@ -413,6 +426,42 @@ export function agentPortPlan({
     });
 }
 
+// Authorization uses the logical route above. Only this post-admission step
+// binds the physical relay, owner and request-token signing record together.
+export function selectAgentPortPlan(plan, req) {
+    if (!plan.route?.canary) return plan;
+    const selection = selectRouteRuntime({ route: plan.route, routeKey: plan.routeKey, snapshot: plan.snapshot, req });
+    const runtime = plan.runtimes?.[selection.copy];
+    if (!runtime || runtime.containerName !== selection.route.container
+        || leaseRouteHardwareAvailability(plan.lease, plan.routeKey, runtime.containerName)) {
+        throw Object.assign(new Error('Selected relay is unavailable'), { code: 'ROUTING_UNAVAILABLE', status: 503 });
+    }
+    const { effectiveInstanceId, enableGeneration } = runtime;
+    return createRoutePlan({
+        ...plan,
+        selection,
+        targetRecord: selection.targetRecord,
+        copy: selection.copy,
+        rolloutId: selection.rolloutId,
+        relay: relayForRuntime(runtime),
+        owner: { effectiveInstanceId, enableGeneration },
+    });
+}
+
+// RuntimeRelayManager commits this lease inside OPEN, after minting the
+// session-bound proof. Throw only for an exposure change so a stale
+// authorization generation is never eligible for a retry.
+export function leaseForSelectedPlan(lease, selection) {
+    return !selection ? lease : {
+        ...lease,
+        commit() {
+            if (lease.commit() !== true) return false;
+            assertSelectionCurrent(selection);
+            return true;
+        },
+    };
+}
+
 function canonicalForwardingMetadata({ snapshot, host, listener, hostSelection }) {
     const publicHostname = hostSelection?.source === 'public-host';
     let authority = host;
@@ -432,9 +481,9 @@ function canonicalForwardingMetadata({ snapshot, host, listener, hostSelection }
     });
 }
 
-function resolveAgentPath(pathname, routes, selectedRoot = null) {
+function resolveAgentPath(pathname, routes, selectedRoot, snapshot) {
     if (selectedRoot) {
-        const route = exactRoute(routes, selectedRoot.routeKey);
+        const route = exactRoute(routes, selectedRoot.routeKey, snapshot);
         if (!route) return null;
         const segments = String(pathname || '').split('/').filter(Boolean);
         let explicitlySelectedRoot = false;
@@ -463,7 +512,7 @@ function resolveAgentPath(pathname, routes, selectedRoot = null) {
     if (!segments.length) return null;
     let routeKey = '';
     try { routeKey = decodeURIComponent(segments[0]); } catch (_) { return null; }
-    const selected = exactRoute(routes, routeKey);
+    const selected = exactRoute(routes, routeKey, snapshot);
     if (!selected) return null;
     const firstSlash = pathname.indexOf('/', 1);
     return {
@@ -528,8 +577,8 @@ function selectedAgentMcpRoute(pathname, routeKeys) {
     return isRouteMount(pathname, prefix) ? routeKey : '';
 }
 
-function selectedDependencyHttpRoute(pathname, routes, selectedRootRouteKey, routeSpecs) {
-    const candidate = resolveAgentPath(pathname, routes, null);
+function selectedDependencyHttpRoute(pathname, routes, selectedRootRouteKey, routeSpecs, snapshot) {
+    const candidate = resolveAgentPath(pathname, routes, null, snapshot);
     if (!candidate || candidate.routeKey === String(selectedRootRouteKey || '')) return '';
     const admitted = (routeSpecs || []).some((entry) => (
         entry
@@ -666,7 +715,7 @@ function agentRootPlan({
     lease,
     transport = 'http',
 }) {
-    const agent = resolveAgentPath(pathname, routes, selectedRoot) || (selectedRoot ? null : resolveDrainingAgentPath(pathname, routes));
+    const agent = resolveAgentPath(pathname, routes, selectedRoot, snapshot) || (selectedRoot ? null : resolveDrainingAgentPath(pathname, routes));
     if (!agent) return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
     const policy = snapshotPolicy(snapshot);
     if (!policy) return deny(503, 'POLICY_GENERATION_INVALID', {
@@ -703,7 +752,32 @@ function agentRootPlan({
         snapshot,
         transport,
     };
-    const hardwareAvailability = leaseRouteHardwareAvailability(lease, agent.routeKey);
+    // Admission can survive the primary's removal during promotion. Inspect
+    // the physical member serving user-less traffic for startup diagnostics.
+    let admissionRoute = agent.route;
+    if (agent.route.canary?.mode === 'all' && routeAdmitted(agent.route, agent.routeKey, snapshot)) {
+        try {
+            admissionRoute = selectRouteRuntime({ ...agent, snapshot }).route;
+        } catch {
+            return deny(503, 'TARGET_INACTIVE', { matched: true, lease, hostSelection, decision });
+        }
+    }
+    const hardwareAvailability = leaseRouteHardwareAvailability(lease, agent.routeKey, admissionRoute.container);
+    const draining = !routeAdmitted(agent.route, agent.routeKey, snapshot);
+    const hostPort = draining ? 0 : Number(admissionRoute.hostPort || 0);
+    const activePort = Number.isInteger(hostPort) && hostPort >= 1 && hostPort <= 65535;
+    // In split, the actor or task owner is still unknown. A temporarily
+    // unavailable primary must not hide its healthy peer. In retiring that
+    // peer may still own a task. A targetless active plan can only dispatch
+    // through post-auth selection. Startup probes retain their normal owner.
+    if (!draining && (!activePort || hardwareAvailability) && ['split', 'retiring'].includes(agent.route.canary?.mode)) {
+        const canary = snapshot.agents?.[agent.route.canary.container];
+        const candidate = { ...common, kind: 'agent-root', target: null };
+        if (canary?.canaryOf === agent.routeKey && canary.containerId
+            && Number.isInteger(canary.hostPort) && canary.hostPort > 0 && canary.hostPort <= 65535
+            && !leaseRouteHardwareAvailability(lease, agent.routeKey, agent.route.canary.container)
+            && classifyAgentStartupRequest(req, { routePlan: candidate }) !== 'probe') return candidate;
+    }
     if (hardwareAvailability) {
         // The logical route stays resolvable; only a terminal unavailable
         // answer is possible. Non-HTTP transports are denied outright.
@@ -727,9 +801,7 @@ function agentRootPlan({
     // A draining route is resolved only to answer it after authorization with a
     // retryable unavailable state. It never yields its predecessor's target,
     // even when an operator drain kept the predecessor's port.
-    const draining = agent.route?.draining === true;
-    const hostPort = draining ? 0 : Number(agent.route?.hostPort || 0);
-    if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+    if (!activePort) {
         const pendingCode = draining ? 'AGENT_ROUTE_DRAINING' : 'TARGET_INACTIVE';
         if (transport !== 'http') {
             return deny(503, pendingCode, { matched: true, lease, hostSelection, decision });
@@ -772,6 +844,7 @@ export function resolveEdgeRoutePlan({
         return deny(503, error?.code || 'EDGE_GENERATION_INACTIVE');
     }
     const snapshot = lease.snapshot;
+    if (!authorityObservationGeneration) activeSnapshotObserver?.(snapshot);
     const host = normalizeExactHost(req?.headers?.host);
     if (!host) return deny(400, 'MALFORMED_HOST', { lease });
     if (listener === 'private' && !isPrivateInterfaceAllowed(req, listener)) {
@@ -951,6 +1024,7 @@ export function resolveEdgeRoutePlan({
             routes,
             hostSelection.record?.routeKey,
             edgeHostServiceRoutes(snapshot, host).dependencyHttpRoutes,
+            snapshot,
         );
         if (dependencyHttpRoute) {
             return agentRootPlan({

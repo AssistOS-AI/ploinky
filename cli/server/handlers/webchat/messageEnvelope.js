@@ -2,6 +2,11 @@ import { buildInvocationContextForProviderCall } from '../../mcp-proxy/index.js'
 import { resolveRouteTargetRecord } from '../../mcp-proxy/invocationMinter.js';
 import { loadActiveRoutingState } from '../../routingState.js';
 
+import { selectRouteRuntime } from '../../canary/selection.mjs';
+import { routeAdmitted } from '../../canary/routeAdmission.mjs';
+import { leaseRouteHardwareAvailability } from '../../hardwareAvailability.mjs';
+import { webchatRouteProvenance } from '../../webchat/commandResolver.js';
+
 export function normalizeWebchatPresentation(raw) {
     return { visible: raw?.visible !== false };
 }
@@ -97,6 +102,19 @@ export function resolveWebchatInvocationTarget(req, effectiveConfig) {
     if (target !== effectiveConfig.agentName || targetRoute?.routeKey !== target
         || generation !== snapshot.generation) {
         throw new Error('WebChat target binding changed');
+    }
+    const route = snapshot.routing.routes[target];
+    if (route?.canary) {
+        const admitted = webchatRouteProvenance(snapshot.routing, target);
+        if (!routeAdmitted(route, target, snapshot) || !admitted || admitted.container !== targetRoute.container) {
+            throw new Error('WebChat target binding changed');
+        }
+        const selection = selectRouteRuntime({ routeKey: target, route, snapshot, req });
+        const container = selection.route.container;
+        if (!selection.targetRecord?.launchId || leaseRouteHardwareAvailability({ snapshot }, target, container)) {
+            throw new Error('WebChat selected runtime is unavailable');
+        }
+        return { snapshot, selection, container, targetRecord: selection.targetRecord };
     }
     const targetRecord = resolveRouteTargetRecord({ routeKey: target, route: targetRoute, generation, snapshot });
     return { snapshot, targetRecord, container: targetRoute.container };

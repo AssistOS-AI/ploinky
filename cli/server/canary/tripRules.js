@@ -1,3 +1,5 @@
+import { LATENCY_BUCKETS } from './counters.js';
+
 export const DEFAULT_THRESHOLDS = Object.freeze({
     minFailures: 5,
     errorMultiple: 2,
@@ -22,6 +24,7 @@ export function rolloutThresholds(overrides = {}) {
     for (const key of Reflect.ownKeys(overrides)) {
         const value = overrides[key];
         if (!Object.hasOwn(DEFAULT_THRESHOLDS, key) || !Number.isFinite(value) || value < 0
+            || (key === 'slowMs' && !LATENCY_BUCKETS.includes(value))
             || (countThresholds.has(key) && (!Number.isSafeInteger(value) || value < 1))
             || (percentThresholds.has(key) && value > 100)) {
             throw new RangeError(`invalid canary threshold: ${String(key)}`);

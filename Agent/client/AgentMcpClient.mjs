@@ -11,6 +11,7 @@ import http from 'node:http';
 import https from 'node:https';
 
 import { signAgentAssertion, signAgentHttpAssertion } from '../lib/agentAssertion.mjs';
+import { projectContinuationTools, isContinuationToolAlias } from '../lib/taskContinuationOrigin.mjs';
 import { OPENAI_MODELS_PATH, OPENAI_MODELS_TOOL } from '../lib/invocationAuth.mjs';
 import {
     assertVerifiedGeneratedRouterDescriptor,
@@ -354,7 +355,8 @@ function getTaskStatus(agentName, taskId, descriptor, timeoutMs = DEFAULT_CALL_T
                     reject(new Error(json.error.reason || json.error.detail || json.error.message || json.error));
                     return;
                 }
-                resolve(json.task || json);
+                const task = json.task || json;
+                resolve(taskObserver ? projectContinuationTools(task) : task);
             });
         });
         req.on('error', (error) => {
@@ -454,7 +456,7 @@ function cancelTask(agentName, taskId, descriptor) {
                     reject(new Error(json?.reason || json?.error || `agent task cancel failed (status ${res.statusCode})`));
                     return;
                 }
-                resolve(json.task);
+                resolve(taskObserver ? projectContinuationTools(json.task) : json.task);
             });
         });
         req.on('error', reject);
@@ -790,7 +792,7 @@ export async function createAgentClient(agentName, options = {}) {
             result,
             agentName,
             taskId,
-            toolName: metadata?.toolName || name,
+            toolName: isContinuationToolAlias(name) ? name : metadata?.toolName || name,
             toolArgs,
             metadata,
             descriptorProvider: descriptorForRequest,

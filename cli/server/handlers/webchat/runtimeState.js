@@ -778,6 +778,8 @@ export function resolveRuntimePrincipal(req) {
 
 export function buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery = '', principal = '') {
     const agent = String(effectiveConfig?.agentName || effectiveConfig?.displayName || 'webchat').trim();
+    const launch = effectiveConfig?.exactTarget?.targetRecord;
+    if (launch) agentQuery = JSON.stringify([agentQuery, launch.containerId, launch.launchId]);
     const launchSignature = crypto.createHash('sha256').update(String(agentQuery || '')).digest('hex').slice(0, 16);
     const sharedKey = `${workspaceDirectory}\0${agent}\0${launchSignature}`;
     return principal ? `${sharedKey}\0${principal}` : sharedKey;
@@ -1055,6 +1057,7 @@ export function disposeTab(tab, tabId, session) {
         return;
     }
     tab.disposed = true;
+    tab.releaseSelection?.();
 
     tab.taskProtocolBuffer = '';
 

@@ -74,19 +74,20 @@ export function inspectNoWaitAgentPublication(plan, {
         }
         const routeKey = exactText(plan.routeKey);
         const snapshot = plan.snapshot;
-        const route = plan.route;
+        const logicalRoute = plan.route;
         if (!routeKey || !snapshot || typeof snapshot !== 'object'
-            || !route || typeof route !== 'object' || Array.isArray(route)) {
+            || !logicalRoute || typeof logicalRoute !== 'object' || Array.isArray(logicalRoute)) {
             return INVALID_PUBLICATION;
         }
 
         // The plan must retain the actual route selected from its immutable
         // snapshot, not a lookalike assembled from request-controlled fields.
         const snapshotRoute = snapshot.routing?.routes?.[routeKey];
-        if (!snapshotRoute || snapshotRoute !== route
-            || route.disabled === true || route.draining === true) {
+        if (!snapshotRoute || snapshotRoute !== logicalRoute
+            || !routeAdmitted(logicalRoute, routeKey, snapshot)) {
             return INVALID_PUBLICATION;
         }
+        const { route } = selectRouteRuntime({ routeKey, route: logicalRoute, snapshot });
         const publishedPort = Number(route.hostPort || 0);
         if (Number.isSafeInteger(publishedPort) && publishedPort > 0 && publishedPort <= 65535) {
             return INVALID_PUBLICATION;
@@ -316,3 +317,6 @@ export const __testables = Object.freeze({
     immutableRecordMatches,
     strictStaleFence,
 });
+
+import { routeAdmitted } from './canary/routeAdmission.mjs';
+import { selectRouteRuntime } from './canary/selection.mjs';

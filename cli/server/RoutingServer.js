@@ -6,7 +6,8 @@ import { execFileSync } from 'node:child_process';
 
 import { handleWebChat } from './handlers/webchat/index.js';
 import { handleStatus, streamWorkspaceMetrics } from './handlers/status.js';
-import { canaryStatus } from './canary/routerSignals.js';
+import { canaryStatus, observeCanarySnapshot } from './canary/routerSignals.js';
+import { readPublicCanaryUserId } from './routerHandlers.js';
 import { workspaceMetricsMonitor } from './workspaceMetrics.js';
 import { hardwareAvailabilityLatcher } from './hardwareAvailabilityLatcher.mjs';
 import { executeWorkspaceLogOperation } from './workspaceLogFiles.js';
@@ -32,12 +33,12 @@ import {
     buildTrustedForwardingHeaders,
     loadApiRoutes,
     handleRouterMcp,
-    proxyHttpPassthrough
 } from './routerHandlers.js';
 import { createCapturingRes, handleAgentRootUpgrade } from './wsAgentRootProxy.js';
 import {
     commitRouteGeneration,
     commitRoutePlan,
+    setActiveSnapshotObserver,
     httpAccessForEdgeRoutePlan,
     isActiveAgentRootPlan,
     isAgentRootPlan,
@@ -69,7 +70,7 @@ import {
     recordRouterAuthorityObservation,
 } from './routerAuthorityAttestationRegistry.js';
 import { verifyBrowserMutationRequest } from './browserMutationSecurity.js';
-import { executeHttpPlan } from './proxy/executeHttpPlan.js';
+import { dispatchAgentRootHttp, dispatchCanaryAgentOpenAi, executeHttpPlan } from './proxy/executeHttpPlan.js';
 import { executeWebSocketPlan } from './proxy/executeWebSocketPlan.js';
 import { RuntimeRelayManager } from './runtimeRelay/RuntimeRelayManager.js';
 import { RelayRequestMinter } from './runtimeRelay/relayRequestMinter.js';
@@ -110,7 +111,7 @@ import {
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import { deriveAgentRequestSecret } from '../utils/security/masterKey.js';
 import { createCloudflaredRouterIntegration } from '../../ploinky-box/cloudflared/index.mjs';
-import { requestAgentCard } from './agentCardFanout.js';
+import { requestAgentCard, selectAgentCardCandidates } from './agentCardFanout.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { WebttySessionManager } from './webtty/sessionManager.mjs';
 import { WebttyHomeProfileProvider } from './webtty/homeProfileProvider.mjs';
@@ -127,6 +128,7 @@ const __dirname = path.dirname(__filename);
 const MCP_BROWSER_CLIENT_PATH = path.resolve(__dirname, '../../Agent/client/MCPBrowserClient.js');
 const port = 8080;
 const privatePort = 8081;
+setActiveSnapshotObserver(observeCanarySnapshot);
 const runtimeRelayManager = new RuntimeRelayManager({
     minter: new RelayRequestMinter({ resolveAgentSecret: deriveAgentRequestSecret }),
 });
@@ -369,21 +371,27 @@ async function handleRoutedAggregateAgentCard(req, res, routePlan) {
         sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
         return;
     }
-    const apiRoutes = routePlan.lease.snapshot?.routing?.routes || {};
-    const candidates = Object.entries(apiRoutes || {})
-        .filter(([, route]) => route && !route.disabled && !route.draining && route.hostPort);
-    const results = await Promise.all(candidates.map(([agentName, route]) =>
-        requestAgentCard(route, agentName, req.headers, {
-            beforeDial: () => routePlan?.lease?.commit?.() === true,
-        })
-            .catch(error => ({
-                ok: false,
-                error: {
-                    name: agentName,
-                    error: error?.message || String(error)
-                }
-            }))
-    ));
+    const candidates = selectAgentCardCandidates(routePlan, req);
+    const results = await Promise.all(candidates.map(async ({ agentName, selection }) => {
+        try {
+            for (let attempt = 0; ; attempt++) {
+                let changed = false;
+                const result = await requestAgentCard(selection.route, agentName, req.headers, {
+                    selection,
+                    beforeDial: () => {
+                        if (!routePlan.lease.commit()) return false;
+                        changed = !selection.isCurrent();
+                        return !changed;
+                    },
+                });
+                if (!changed || attempt) return result;
+                selection = selectAgentCardCandidates(routePlan, req).find(candidate => candidate.agentName === agentName)?.selection;
+                if (!selection) return result;
+            }
+        } catch (error) {
+            return { ok: false, error: { name: agentName, error: error.message } };
+        }
+    }));
     const agents = [];
     const errors = [];
     if (results.some((result) => result?.generationChanged)) {
@@ -521,7 +529,6 @@ async function processRequest(req, res) {
         && isAgentTaskCancelProxyPath(agentProxyPath)
         && hasDelegatedAgentAssertion(req)
     );
-    let agentProxyExtraHeaders = {};
     appendLog('http_request', { method: req.method, path: pathname });
 
     // MCP Browser Client
@@ -574,7 +581,7 @@ async function processRequest(req, res) {
     // Assertion itself, not a browser session: a session is neither sufficient
     // nor required.
     if (pathname === OPENAI_AGENT_DISCOVERY_PATH) {
-        const handled = handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl);
+        const handled = handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl, { snapshot: routePlan.lease?.snapshot });
         if (handled) return;
     }
 
@@ -610,6 +617,7 @@ async function processRequest(req, res) {
             res,
             route,
             agentName,
+            routePlan,
             beforeDial: () => commitRoutePlan(routePlan),
         });
         return;
@@ -625,17 +633,6 @@ async function processRequest(req, res) {
                 taskId,
                 path: statusPath,
             });
-            const ctx = buildInvocationContextForProviderCall({
-                req,
-                agentName,
-                toolName: '__task_status__',
-                toolArgs: { taskId },
-                method: 'GET',
-                path: statusPath,
-            });
-            if (ctx?.token) {
-                agentProxyExtraHeaders = { authorization: `Bearer ${ctx.token}` };
-            }
         } catch (error) {
             sendJsonResponse(res, 401, {
                 error: 'delegated_task_status_rejected',
@@ -655,6 +652,7 @@ async function processRequest(req, res) {
         // One authorization path for transparent agent routes and agent-port relays.
         const accessResult = await ensureHttpRouteAccess(req, res, parsedUrl, httpRouteAccess, { routePlan });
         if (!accessResult.ok) return;
+        if (routePlan.route?.canary && httpRouteAccess.access === 'public') req.canaryPublicUserId = readPublicCanaryUserId(req);
     } else {
         const authResult = await ensureAuthenticated(req, res, parsedUrl, { routePlan });
         if (!authResult.ok) return;
@@ -687,6 +685,8 @@ async function processRequest(req, res) {
                 route,
                 agentName,
                 taskId,
+                routePlan,
+                beforeDial: () => commitRoutePlan(routePlan),
             });
             sendJsonResponse(res, 200, { task }, { 'Cache-Control': 'no-store' });
         } catch (error) {
@@ -753,7 +753,7 @@ async function processRequest(req, res) {
             lease: routePlan.lease,
             relayManager: runtimeRelayManager,
             authorized: true,
-            trustedHeadersFactory: ({ bodyHash }) => ({
+            trustedHeadersFactory: ({ bodyHash, plan }) => ({
                 ...(req.user?.id ? { userId: req.user.id } : {}),
                 authInfo: buildHttpRouteAuthInfoHeader(
                     req,
@@ -762,6 +762,8 @@ async function processRequest(req, res) {
                     {
                         bodyHash,
                         routePath: routePlan.unmatchedSuffix,
+                        targetRecord: plan.targetRecord,
+                        snapshot: plan.snapshot,
                     },
                 )['x-ploinky-auth-info'],
                 applicationHeaders: buildHttpRouteRateSourceHeader(req, routePlan),
@@ -796,10 +798,6 @@ async function processRequest(req, res) {
             sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
             return;
         }
-        if (!route.hostPort) {
-            sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
-            return;
-        }
         if (isAgentMcpRoute) {
             return handleAgentMcpRequest(req, res, route, agentName, {
                 beforeDial: () => commitRoutePlan(routePlan),
@@ -807,26 +805,26 @@ async function processRequest(req, res) {
             });
         }
         if (isDelegatedAgentOpenAi) {
+            if (route.canary) return dispatchCanaryAgentOpenAi({ req, res, plan: routePlan });
             return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath, {
                 beforeDial: () => commitRoutePlan(routePlan),
             });
         }
         // `__agent` control-plane paths are already refused at the top of the
         // dispatch, so anything that reaches here is a normal agent request.
-        if (await staticSrv.serveAgentStaticRequest(req, res, {
-            routeKey: agentName,
-            hostPath: route.hostPath,
-            beforeRead: () => commitRoutePlan(routePlan),
-        })) {
-            return;
-        }
-        return proxyHttpPassthrough(req, res, route.hostPort, agentProxyPath, {
-            ...buildIdentityHeaders(req),
-            ...agentProxyExtraHeaders,
-            ...buildTrustedForwardingHeaders(routePlan),
-        }, {
-            beforeDial: () => commitRoutePlan(routePlan),
-        });
+        const taskId = isDelegatedAgentTaskStatusRoute ? parsedUrl.searchParams.get('taskId') : undefined;
+        return dispatchAgentRootHttp({ req, res, plan: routePlan, taskId, headersForSelection: selection => {
+            const headers = { ...buildIdentityHeaders(req), ...buildTrustedForwardingHeaders(routePlan) };
+            if (isDelegatedAgentTaskStatusRoute) {
+                const ctx = buildInvocationContextForProviderCall({
+                    req, agentName, route: selection.route, targetRecord: selection.targetRecord, snapshot: routePlan.snapshot,
+                    toolName: '__task_status__', toolArgs: { taskId }, method: 'GET', path: pathOnly(agentProxyPath),
+                });
+                if (!ctx?.token) throw new Error('missing task invocation');
+                headers.authorization = `Bearer ${ctx.token}`;
+            }
+            return headers;
+        } });
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res, routePlan);
     } else {
@@ -1068,6 +1066,7 @@ server.on('upgrade', async (req, socket, head) => {
                 socket.destroy();
                 return;
             }
+            if (routePlan.route.canary && routePlan.access.access === 'public') req.canaryPublicUserId = readPublicCanaryUserId(req);
             await executeWebSocketPlan({
                 req,
                 socket,
@@ -1076,7 +1075,7 @@ server.on('upgrade', async (req, socket, head) => {
                 lease: routePlan.lease,
                 relayManager: runtimeRelayManager,
                 authorized: true,
-                trustedHeaders: {
+                trustedHeadersFactory: ({ plan }) => ({
                     ...(req.user?.id ? { userId: req.user.id } : {}),
                     authInfo: buildHttpRouteAuthInfoHeader(
                         req,
@@ -1084,10 +1083,12 @@ server.on('upgrade', async (req, socket, head) => {
                         routePlan.authDefinition,
                         {
                             routePath: routePlan.unmatchedSuffix,
+                            targetRecord: plan.targetRecord,
+                            snapshot: plan.snapshot,
                         },
                     )['x-ploinky-auth-info'],
                     applicationHeaders: buildHttpRouteRateSourceHeader(req, routePlan),
-                },
+                }),
                 auditSink: event => appendLog(event.event, event),
             });
             return;

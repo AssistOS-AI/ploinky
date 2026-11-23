@@ -15,6 +15,7 @@ export class CanarySignals {
     #rollouts = new Map();
     #baselines = new Map();
     #probe;
+    #oldConnections = new Map();
 
     constructor({ now = Date.now, log = () => {}, probe } = {}) {
         this.now = now;
@@ -51,6 +52,13 @@ export class CanarySignals {
         if (r.state === state) return;
         r.state = state;
         this.#log(r, 'canary_state_change', reason);
+        const copy = state === 'all' ? 'old' : ['removed', 'withdrawn', 'tripped', 'paused', 'prepare-rejected'].includes(state) ? 'canary' : null;
+        if (copy) {
+            for (const close of r.connections[copy]) {
+                r.connections[copy].delete(close);
+                try { close(); } catch { /* Keep closing the other streams. */ }
+            }
+        }
     }
 
     #trip(r, reason) {
@@ -102,7 +110,9 @@ export class CanarySignals {
         const epoch = randomUUID();
         const r = {
             routeKey, rolloutId, commit, share, thresholds, old, canary: new SignalCounts(thresholds.slowMs),
-            target: Object.freeze({ routeKey, rolloutId, container, containerId, probe: probe && Object.freeze({ ...probe }) }),
+            connections: { old: this.#oldConnections.get(routeKey) || new Set(), canary: new Set() },
+            target: Object.freeze({ routeKey, rolloutId, container, containerId, runtime: config.runtime,
+                ...(config.registryRecord && { registryRecord: config.registryRecord }), probe: probe && Object.freeze({ ...probe }) }),
             containerId, startedAt, running: undefined,
             splitStartedAt, lastIncidentAt: now, lastTripReason: null, firing: new Set(),
             consecutiveConnections: 0, consecutiveProbes: 0, seal: null,
@@ -137,11 +147,54 @@ export class CanarySignals {
         }
     }
 
+    routingState(routeKey, rolloutId) {
+        const r = this.#match(routeKey, rolloutId);
+        if (!r) return null;
+        this.#advanceWindow(r, this.now());
+        return { state: r.state, exposureVersion: r.exposureVersion, running: r.running };
+    }
+
+    trackConnection(routeKey, rolloutId, copy, close, selectedVersionIsCurrent = true) {
+        const r = this.#match(routeKey, rolloutId);
+        const current = this.#rollouts.get(routeKey);
+        if ((copy === 'canary' && (!r || r.state === 'withdrawn'
+            || (!selectedVersionIsCurrent && ['paused', 'tripped'].includes(r.state))))
+            || (copy === 'old' && current?.state === 'all')) {
+            close();
+            return () => {};
+        }
+        const connections = copy === 'old'
+            ? current?.connections.old || this.#oldConnections.get(routeKey) || new Set() : r.connections.canary;
+        if (copy === 'old') this.#oldConnections.set(routeKey, connections);
+        connections.add(close);
+        return () => {
+            connections.delete(close);
+            if (connections.size === 0 && this.#oldConnections.get(routeKey) === connections) this.#oldConnections.delete(routeKey);
+        };
+    }
+
+    replaceProbeTarget(routeKey, rolloutId, { runtime, containerId, registryRecord, startedAt }) {
+        const r = this.#match(routeKey, rolloutId);
+        if (!r || r.target.containerId === containerId) return;
+        this.recordProbe(routeKey, rolloutId, { ok: false, containerId, startedAt });
+        // A new container without a published start time establishes its own
+        // baseline at the first inspection.
+        r.startedAt = startedAt;
+        r.target = Object.freeze({ ...r.target, runtime, containerId, registryRecord });
+        this.#attachProbe(r);
+    }
+
+    publishedMode(routeKey, rolloutId, mode) {
+        const r = this.#match(routeKey, rolloutId);
+        if (r) this.#state(r, mode, 'published-mode');
+    }
+
     removeRollout(routeKey, rolloutId) {
         const r = this.#match(routeKey, rolloutId);
         if (!r) return false;
         r.stopProbe?.();
         this.#state(r, 'removed', 'rollout-removed');
+        if (!r.connections.old.size) this.#oldConnections.delete(routeKey);
         this.#rollouts.delete(routeKey);
         return true;
     }
@@ -155,6 +208,22 @@ export class CanarySignals {
             this.settingsChanged(routeKey, rolloutId);
         }
         return true;
+    }
+
+    setThresholds(routeKey, rolloutId, thresholds) {
+        const r = this.#match(routeKey, rolloutId);
+        if (!r) return;
+        const next = rolloutThresholds(thresholds);
+        if (Object.keys(next).every(key => next[key] === r.thresholds[key])) return;
+        const now = this.now();
+        this.#advanceWindow(r, now);
+        r.old = r.old.withSlowMs(next.slowMs, now);
+        r.canary = r.canary.withSlowMs(next.slowMs, now);
+        r.thresholds = next;
+        this.settingsChanged(routeKey, rolloutId);
+        this.#rule(r, 'unreachable', r.consecutiveConnections >= next.consecutiveConnections);
+        this.#rule(r, 'probe-failures', r.consecutiveProbes >= next.consecutiveProbes);
+        this.#evaluateWindow(r, now);
     }
 
     settingsChanged(routeKey, rolloutId) {
@@ -180,12 +249,12 @@ export class CanarySignals {
     }
 
     recordOutcome({ routeKey, copy = 'old', rolloutId, status = 0, serverError = false,
-        unreachable = false, callerError = false, ttfbMs }) {
+        unreachable = false, callerError = false, timingOnly = false, ttfbMs }) {
         if (!routeKey || (copy !== 'old' && copy !== 'canary')) return;
         const r = this.#rollouts.get(routeKey);
-        if ((copy === 'canary' || rolloutId != null) && (!r || r.rolloutId !== rolloutId)) return;
+        if ((rolloutId ?? null) !== (r?.rolloutId ?? null) || (copy === 'canary' && !r)) return;
         const now = this.now();
-        const fields = callerError ? ['callerErrors'] : outcomeFields({ status, serverError, unreachable });
+        const fields = timingOnly ? [] : callerError ? ['callerErrors'] : outcomeFields({ status, serverError, unreachable });
         const timing = !callerError && Number.isFinite(ttfbMs) && ttfbMs >= 0 ? ttfbMs : undefined;
         if (copy === 'old') this.#baseline(routeKey).record(now, fields, timing);
         if (!r) return;
@@ -198,8 +267,10 @@ export class CanarySignals {
                 if (fields.includes('backendFailures')) r.firing.delete('server-errors');
                 if (timing > r.thresholds.slowMs) r.firing.delete('slow');
             }
-            r.consecutiveConnections = unreachable ? r.consecutiveConnections + 1 : 0;
-            this.#rule(r, 'unreachable', r.consecutiveConnections >= r.thresholds.consecutiveConnections);
+            if (!timingOnly) {
+                r.consecutiveConnections = unreachable ? r.consecutiveConnections + 1 : 0;
+                this.#rule(r, 'unreachable', r.consecutiveConnections >= r.thresholds.consecutiveConnections);
+            }
         }
         this.#evaluateWindow(r, now);
     }

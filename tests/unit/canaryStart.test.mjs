@@ -43,6 +43,28 @@ function scratch(t) {
     return workspace;
 }
 
+test('the CLI refuses canary start in an uninitialized workspace before repository bootstrap', t => {
+    const workspace = scratch(t);
+    const bin = path.join(workspace, 'bin');
+    const gitMarker = path.join(workspace, 'git-called');
+    write(path.join(bin, 'git'), '#!/bin/sh\ntouch "$CANARY_GIT_MARKER"\nexit 1\n');
+    fs.chmodSync(path.join(bin, 'git'), 0o755);
+    const main = new URL('../../cli/main.js', import.meta.url);
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+        import { runCoreCli } from ${JSON.stringify(main.href)};
+        await runCoreCli(['canary', 'start', 'fixture/alpha', '--commit', 'a'.repeat(40)]);
+    `], {
+        cwd: workspace, encoding: 'utf8', timeout: 10_000,
+        env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH,
+            PLOINKY_WORKSPACE_ROOT: workspace, CANARY_GIT_MARKER: gitMarker },
+    });
+    assert.ifError(child.error);
+    assert.equal(child.status, 1, child.stderr);
+    assert.match(child.stderr, /edge routing generation is inactive/);
+    assert.equal(fs.existsSync(gitMarker), false);
+    assert.equal(fs.existsSync(path.join(workspace, '.ploinky/repos')), false);
+});
+
 function fixture(t, { manifest = { canary: { probe } }, change, nested = false } = {}) {
     const workspaceRoot = scratch(t);
     const repoRoot = path.join(workspaceRoot, 'fixtures');

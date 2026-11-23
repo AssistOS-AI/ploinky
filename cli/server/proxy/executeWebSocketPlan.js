@@ -5,7 +5,10 @@ import { finalizePlanAfterAdmission } from './RoutePlan.js';
 import { measureHeaderBytes, sanitizeRequestHeaders } from './sanitizeRequestHeaders.js';
 import { sanitizeResponseHeaders } from './sanitizeResponseHeaders.js';
 import { recordProxyOutcome } from './recordProxyOutcome.js';
-import { createRelayHttpAgent, proxyErrorStatus, RelayDuplex } from './executeHttpPlan.js';
+import { createRelayHttpAgent, openSelectedRelay, proxyErrorStatus, RelayDuplex } from './executeHttpPlan.js';
+import { selectAgentPortPlan } from '../edgeRoutePlan.js';
+import { observeProxyFirstByte } from '../canary/proxyOutcomes.js';
+import { trackCanaryConnection } from '../canary/selection.mjs';
 
 export class WebSocketFrameLimitTransform extends Transform {
     constructor({ frameBytes, messageBytes } = {}) {
@@ -88,7 +91,8 @@ export class WebSocketFrameLimitTransform extends Transform {
 
 function rejectSocket(socket, status = 403) {
     const reason = http.STATUS_CODES[status] || 'Request Failed';
-    try { socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n`); } catch (_) {}
+    const retry = status === 503 ? 'Retry-After: 1\r\n' : '';
+    try { socket.end(`HTTP/1.1 ${status} ${reason}\r\n${retry}Connection: close\r\nCache-Control: no-store\r\n\r\n`); } catch (_) {}
 }
 
 function assertWebSocketOrigin(req, plan) {
@@ -125,6 +129,7 @@ export async function executeWebSocketPlan({
     relayManager,
     authorized = false,
     trustedHeaders = {},
+    trustedHeadersFactory,
     auditSink,
 } = {}) {
     const startedAt = Date.now();
@@ -133,6 +138,11 @@ export async function executeWebSocketPlan({
     let clientFrames;
     let targetFrames;
     let leaseOutcome = 'uncommitted';
+    let finalized;
+    let untrack;
+    let dialStarted;
+    let upstreamStatus;
+    let targetFailed = false;
     // Node leaves an upgraded socket flowing with no 'error' listener, so a
     // client reset during any await below would be uncaught. This listener
     // only absorbs the event; teardown is owned by the paths below.
@@ -143,22 +153,31 @@ export async function executeWebSocketPlan({
         }
         assertWebSocketHandshake(req);
         assertWebSocketOrigin(req, plan);
-        const finalized = finalizePlanAfterAdmission(plan);
-        const headers = sanitizeRequestHeaders(req.headers, finalized, trustedHeaders);
-        delete headers['sec-websocket-extensions'];
-        headers.connection = 'Upgrade';
-        headers.upgrade = 'websocket';
-        if (measureHeaderBytes(headers) > finalized.limits.requestHeaderBytes) {
-            throw Object.assign(new Error('proxy: request header limit exceeded'), { code: 'REQUEST_TOO_LARGE' });
-        }
-        channel = await relayManager.checkout({ plan: finalized, lease, authorized: true });
-        leaseOutcome = 'committed';
-        const relayStream = await channel.openRequest({
-            plan: { ...finalized, transport: 'websocket' },
-            bodyMode: 'stream',
-            bodyHash: '',
-            headers,
-        });
+        finalized = finalizePlanAfterAdmission(selectAgentPortPlan(plan, req));
+        let headers;
+        const relayStream = await openSelectedRelay({ plan, req, lease, initial: finalized, open: async (selected, checkedLease) => {
+            finalized = selected;
+            const trusted = trustedHeadersFactory ? await trustedHeadersFactory({ plan: selected }) : trustedHeaders;
+            headers = sanitizeRequestHeaders(req.headers, selected, trusted);
+            delete headers['sec-websocket-extensions'];
+            headers.connection = 'Upgrade';
+            headers.upgrade = 'websocket';
+            if (measureHeaderBytes(headers) > selected.limits.requestHeaderBytes) {
+                throw Object.assign(new Error('proxy: request header limit exceeded'), { code: 'REQUEST_TOO_LARGE' });
+            }
+            dialStarted = performance.now();
+            channel = await relayManager.checkout({ plan: selected, lease: checkedLease, authorized: true });
+            leaseOutcome = 'committed';
+            try {
+                return await channel.openRequest({
+                    plan: { ...selected, transport: 'websocket' }, bodyMode: 'stream', bodyHash: '', headers,
+                });
+            } catch (error) {
+                channel.close();
+                channel = undefined;
+                throw error;
+            }
+        } });
         const connection = new RelayDuplex(relayStream);
         relayAgent = createRelayHttpAgent(connection);
         await new Promise((resolve, reject) => {
@@ -213,6 +232,12 @@ export async function executeWebSocketPlan({
             upstream.once('upgrade', (response, selectedUpstreamSocket, upstreamHead) => {
                 clearTimeout(headerTimer);
                 upstreamSocket = selectedUpstreamSocket;
+                untrack = trackCanaryConnection(finalized.selection || finalized, () => {
+                    socket.destroy();
+                    upstreamSocket.destroy();
+                });
+                upstreamStatus = response.statusCode;
+                observeProxyFirstByte({ plan: finalized, ttfbMs: performance.now() - dialStarted });
                 if (socket.destroyed || !socket.writable) {
                     fail(new Error('proxy: client socket closed before WebSocket upgrade'));
                     return;
@@ -237,11 +262,15 @@ export async function executeWebSocketPlan({
                     messageBytes: finalized.limits.webSocketMessageBytes,
                 });
                 clientFrames.once('error', fail);
-                targetFrames.once('error', fail);
+                const failTarget = error => {
+                    targetFailed = !socket.destroyed;
+                    fail(error);
+                };
+                targetFrames.once('error', failTarget);
                 // The relay duplex is piped as a destination; without its own
                 // listener a write rejected by a terminal relay stream
                 // (END, failure or abandon) escapes as an uncaught exception.
-                upstreamSocket.once('error', fail);
+                upstreamSocket.once('error', failTarget);
                 // The upgraded client socket is also a pipe destination and has
                 // no other 'error' listener once the HTTP server hands it over.
                 socket.once('error', fail);
@@ -261,6 +290,8 @@ export async function executeWebSocketPlan({
                 upstreamSocket.once('close', finish);
             });
             upstream.once('response', response => {
+                upstreamStatus = response.statusCode;
+                observeProxyFirstByte({ plan: finalized, ttfbMs: performance.now() - dialStarted });
                 response.resume();
                 fail(new Error(`proxy: target refused WebSocket (${response.statusCode})`));
             });
@@ -287,11 +318,13 @@ export async function executeWebSocketPlan({
     } catch (error) {
         relayAgent?.destroy();
         recordProxyOutcome({
-            plan,
+            plan: finalized || plan,
             outcome: 'failure',
             startedAt,
             error,
             status: proxyErrorStatus(error),
+            upstreamStatus,
+            serverError: targetFailed,
             requestBytes: clientFrames?.bytes || 0,
             responseBytes: targetFrames?.bytes || 0,
             leaseOutcome,
@@ -303,6 +336,8 @@ export async function executeWebSocketPlan({
         lease?.release?.();
         rejectSocket(socket, proxyErrorStatus(error));
         return false;
+    } finally {
+        untrack?.();
     }
 }
 

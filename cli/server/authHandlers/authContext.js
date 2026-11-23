@@ -409,6 +409,7 @@ function resolveRouterSurfaceAuthContext(parsedUrl, routePlan, options = {}) {
             ownerRouteKey: owner.ownerRouteKey,
             generation: boundGenerationFor(routePlan, snapshot),
             targetRoute: webchatRouteProvenance(routing, target),
+            ...(routing.routes?.[target]?.canary && { exactLaunch: true }),
         },
     };
 }

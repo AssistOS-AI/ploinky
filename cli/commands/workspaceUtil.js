@@ -1,3 +1,4 @@
+import { getCliCmd } from '../utils/manifestCli.mjs';
 import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
 import { resolveAgentRepositoryName, resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import fs from 'fs';
@@ -732,18 +733,6 @@ function runWithSuspendedInput(callback) {
   if (typeof result?.then === 'function') return Promise.resolve(result).finally(restoreInput);
   restoreInput();
   return result;
-}
-
-function getCliCmd(manifest) {
-  const explicitCli =
-    (manifest.cli && String(manifest.cli)) ||
-    (manifest.commands && manifest.commands.cli);
-
-  if (explicitCli) {
-    return explicitCli;
-  }
-
-  return '/Agent/default_cli.sh';
 }
 
 function shellQuote(str) {

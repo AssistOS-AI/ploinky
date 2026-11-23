@@ -30,7 +30,22 @@ function identityPart(value) {
     return exactString(value) && !value.includes('/');
 }
 
-export function validateCanaryField(field, label) {
+// Earlier writers accepted these two forms. Validate their original bounds
+// during replay or receipt-bound teardown. The snapshot retains its exact
+// thresholds so the Router detects unsupported overrides and pauses the route.
+function replayThresholds(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+    if (Object.keys(value).length === 2 && Number.isFinite(value.errorRate)
+        && value.errorRate >= 0 && value.errorRate <= 1
+        && Number.isSafeInteger(value.windowSeconds) && value.windowSeconds >= 1) return {};
+    if (Number.isFinite(value.slowMs) && value.slowMs >= 0) {
+        const { slowMs, ...rest } = value;
+        return rest;
+    }
+    return value;
+}
+
+export function validateCanaryField(field, label, { allowHistoricalThresholds = false } = {}) {
     exactFields(field, [
         'rolloutId', 'container', 'commit', 'codeDigest', 'codePath', 'share',
         'testAccounts', 'salt', 'splitStartedAt', 'mode', 'probe', 'thresholds',
@@ -66,7 +81,7 @@ export function validateCanaryField(field, label) {
     if (!Number.isInteger(probe.status) || probe.status < 100 || probe.status > 599) invalid(`${label}.probe.status is invalid`);
     if (thresholds === undefined) invalid(`${label}.thresholds must be an object`);
     try {
-        rolloutThresholds(thresholds);
+        rolloutThresholds(allowHistoricalThresholds ? replayThresholds(thresholds) : thresholds);
     } catch (error) {
         invalid(`${label}.thresholds: ${error.message}`);
     }

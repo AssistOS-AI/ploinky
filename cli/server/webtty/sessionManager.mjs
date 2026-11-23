@@ -1102,6 +1102,11 @@ export class WebttySessionManager {
             // This session field is in memory only. Agent startup evidence
             // does persist translatedHome and the profile for exact recovery.
             profile: target.profile || null,
+            // The periodic provider check uses the same admitted account as
+            // discovery. Retain only the identity fields used for selection.
+            profileActor: target.profile?.mode === 'live-agent'
+                ? { authMode: lease.mode, user: { id: lease.userId, roles: [...(req.user?.roles || [])] } }
+                : null,
             // Close policy, views and a pending stop are in memory only.
             closePolicy,
             views: new Map(),
@@ -2279,7 +2284,7 @@ export class WebttySessionManager {
                     });
                     if (session.profile?.mode === 'live-agent') {
                         const expected = session.target.home.providerBinding;
-                        const provider = findHomeProfileProvider(plan.snapshot, session.profile.provider);
+                        const provider = findHomeProfileProvider(plan.snapshot, session.profile.provider, session.profileActor);
                         if (!expected || !provider || !['routeKey', 'containerName', 'agentName', 'repoName',
                             'containerId', 'instanceId', 'enableGeneration'].every((key) => provider[key] === expected[key])
                             || provider.declaration.version !== expected.declaration.version

@@ -4,6 +4,7 @@ import { describeAgent } from '../../utils/agentRegistry.js';
 import { parseQualifiedAgentReference } from '../../utils/agentRegistryResolver.js';
 import { AGENT_TARGET_AMBIGUOUS, resolveAgentTargetFromSnapshot } from '../../utils/agentTargetResolver.js';
 import { loadActiveRoutingState } from '../routingState.js';
+import { verifiedRouteOrigin } from '../../sandbox/edgeGeneration.js';
 import {
     AgentAssertionService,
     RouterRequestTokenService,
@@ -101,7 +102,11 @@ function routeInSnapshot(snapshot, routeKey) {
 // A generation digest survives cache reconstruction. The route key and
 // container select the dial target within that immutable generation.
 export function resolveRouteTargetRecord({ routeKey, route, generation, snapshot } = {}) {
-    const expectedGeneration = generation ?? snapshot?.generation;
+    const origin = verifiedRouteOrigin(route);
+    const expectedGeneration = generation ?? snapshot?.generation ?? origin?.generation;
+    if (origin && (origin.generation !== expectedGeneration || origin.routeKey !== routeKey)) {
+        throw new Error('invocationMinter: selected route generation changed');
+    }
     // A host-port-only dial supplies no container selection. The issuer
     // still requires a selected record if this principal has a launch ID.
     if (route && !route.container && expectedGeneration === undefined) return undefined;
@@ -111,9 +116,8 @@ export function resolveRouteTargetRecord({ routeKey, route, generation, snapshot
         || (snapshot && snapshot.generation !== expectedGeneration))) {
         throw new Error('invocationMinter: selected route generation changed');
     }
-    // A raw route has no digest. When the caller omits its generation, the
-    // route must belong to the selection snapshot (or the current snapshot).
-    if (route && ((generation === undefined && route !== routeInSnapshot(snapshot ?? active, routeKey))
+    // Unverified route objects still need a selection snapshot or explicit generation.
+    if (route && ((!origin && generation === undefined && route !== routeInSnapshot(snapshot ?? active, routeKey))
         || (route.routeKey !== undefined && route.routeKey !== routeKey)
         || !currentRoute || (currentRoute.container ?? '') !== (route.container ?? ''))) {
         throw new Error('invocationMinter: selected route generation changed');

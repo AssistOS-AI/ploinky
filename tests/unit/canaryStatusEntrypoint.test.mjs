@@ -129,6 +129,7 @@ test('canary status on an unavailable Box only inspects it and reports the state
         assert.equal(inspections, 1);
         assert.equal(code, 1);
         assert.ok(diagnostic.includes(state), diagnostic);
+        assert.match(diagnostic, /^ploinky canary status:/);
     }
 });
 

@@ -589,18 +589,17 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
         return 0;
     }
 
-    // Logs are inspect-only at this boundary. The route reads Box status once
-    // and forwards only into an already owned, running, initialized Box; it
-    // never prepares, reconciles, installs dependencies, or takes a mutation
-    // lock, so asking for logs can never create or repair a Box.
+    // Both logs and canary status inspect the Box before forwarding.
     if (route.kind === 'logs') {
         const status = selectedSupervisor.inspectBoxStatus();
         const container = status.ownership?.handles?.container;
         const engine = status.ownership?.engine;
         if (status.state !== 'running-initialized' || !container?.id || !engine?.name) {
+            const command = parsed.command === 'canary' ? 'canary status' : 'logs';
             errorOutput.write(
-                `ploinky logs: the outer Box is not running and initialized (state: ${status.state}).\n`
-                + 'Logs never create or repair a Box; start the workspace first with `ploinky start AGENT`.\n',
+                `ploinky ${command}: the outer Box is not running and initialized (state: ${status.state}).\n`
+                + (command === 'logs' ? 'Logs never create or repair a Box; start' : 'Start')
+                + ' the workspace first with `ploinky start AGENT`.\n',
             );
             return 1;
         }

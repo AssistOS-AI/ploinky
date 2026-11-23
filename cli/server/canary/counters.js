@@ -10,7 +10,8 @@ const countFields = [...fields, 'timedResponses', 'slowResponses'];
 const zeroCounts = Object.freeze(Object.fromEntries(countFields.map(field => [field, 0])));
 
 // As in proxy/recordProxyOutcome.js, the upper edges are inclusive.
-const latencyLimits = [10, 50, 100, 250, 500, 1_000, 5_000, 15_000, Infinity];
+export const LATENCY_BUCKETS = Object.freeze([10, 50, 100, 250, 500, 1_000, 5_000, 15_000]);
+const latencyLimits = [...LATENCY_BUCKETS, Infinity];
 const MAX_DISTINCT_PER_BIN = 8;
 
 export function outcomeFields({ status, serverError, unreachable }) {
@@ -126,6 +127,7 @@ export class SignalCounts {
     #size = 0;
     #window = { ...zeroCounts };
     #sinceStart = { ...zeroCounts };
+    #timingTotals = Array(latencyLimits.length).fill(0);
 
     constructor(slowMs) {
         this.slowMs = slowMs;
@@ -175,6 +177,18 @@ export class SignalCounts {
         recordCell(page, at - page.start, mask, ttfbMs, this.slowMs);
         applyObservation(this.#window, mask, ttfbMs, this.slowMs, 1);
         applyObservation(this.#sinceStart, mask, ttfbMs, this.slowMs, 1);
+        if (ttfbMs >= 0) this.#timingTotals[latencyLimits.findIndex(limit => ttfbMs <= limit)]++;
+    }
+
+    withSlowMs(slowMs, now) {
+        if (this.slowMs === slowMs) return this;
+        const next = new SignalCounts(slowMs);
+        next.seedWindow(this, now);
+        next.#timingTotals = [...this.#timingTotals];
+        const slowResponses = this.#timingTotals.reduce((sum, count, i) =>
+            sum + (latencyLimits[i] > slowMs ? count : 0), 0);
+        next.#sinceStart = { ...this.#sinceStart, slowResponses };
+        return next;
     }
 
     // Compare against recent old-copy samples even when the new rollout

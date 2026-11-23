@@ -91,19 +91,21 @@ export function homeProfileDeclaration(manifest, routeKey) {
     return Object.freeze({ version: declaration.version, resolve });
 }
 
-function activeRoute(routes, routeKey) {
+function activeRoute(routes, routeKey, snapshot, req) {
     const route = routes?.[routeKey];
-    return route && !route.disabled && !route.draining ? route : null;
+    return routeAdmitted(route, routeKey, snapshot)
+        ? selectRouteRuntime({ routeKey, route, snapshot, req }).route : null;
 }
 
 // Exactly one enabled agent with this name and a valid declaration may serve
 // the provider name. Any ambiguity is a refusal, never a choice.
-export function findHomeProfileProvider(snapshot, providerName) {
+export function findHomeProfileProvider(snapshot, providerName, req) {
     const routes = snapshot?.routing?.routes || {};
     const candidates = [];
     for (const routeKey of Object.keys(routes)) {
-        const route = activeRoute(routes, routeKey);
-        if (!route || String(route.agent || '') !== providerName) continue;
+        if (routes[routeKey]?.agent !== providerName) continue;
+        const route = activeRoute(routes, routeKey, snapshot, req);
+        if (!route) continue;
         const containerName = String(route.container || '');
         const record = snapshot.agents?.[containerName];
         if (!containerName || record?.type !== 'agent' || record.agentName !== providerName
@@ -254,14 +256,23 @@ export class WebttyHomeProfileProvider {
         }
         const snapshot = currentSnapshot(routePlan);
         if (!snapshot) throw profileError('generation');
-        const provider = findHomeProfileProvider(snapshot, requested.provider);
-        if (!provider) throw profileError('provider');
-        if (requested.mode === 'live-agent' && provider.declaration.version !== 2) throw profileError('provider');
-        const answer = await this.callProvider({ req, routePlan, snapshot, provider, id: requested.id, mode: requested.mode });
+        let provider;
+        let answer;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            provider = findHomeProfileProvider(snapshot, requested.provider, req);
+            if (!provider) throw profileError('provider');
+            if (requested.mode === 'live-agent' && provider.declaration.version !== 2) throw profileError('provider');
+            try {
+                answer = await this.callProvider({ req, routePlan, snapshot, provider, id: requested.id, mode: requested.mode });
+                break;
+            } catch (error) {
+                if (error.code !== 'CANARY_SELECTION_CHANGED' || attempt) throw error;
+            }
+        }
         // The generation, and with it the provider's exact runtime record,
         // must still be the one that answered.
         const after = currentSnapshot(routePlan);
-        if (after !== snapshot || !sameProvider(findHomeProfileProvider(after, requested.provider), provider)) {
+        if (after !== snapshot || !sameProvider(findHomeProfileProvider(after, requested.provider, req), provider)) {
             throw profileError('generation');
         }
         let home = typeof answer.home !== 'string'
@@ -299,7 +310,7 @@ export class WebttyHomeProfileProvider {
             if (this.fsApi.realpathSync(current) !== current || this.fsApi.realpathSync(robotsRoot) !== robotsRoot) {
                 throw new Error('noncanonical robots path');
             }
-            const candidate = exactCandidate(provider.containerName, snapshot.agents?.[provider.containerName], new Set(['podman']));
+            const candidate = exactProfileMountOwner(provider, snapshot);
             const hash = this.workspaceIdentity()?.hash;
             if (!candidate || !hash) throw new Error('provider identity');
             const inspected = assertOwnedInspection(candidate,
@@ -371,6 +382,9 @@ export class WebttyHomeProfileProvider {
         } catch (_) {
             throw profileError('route');
         }
+        if (plan?.ok && snapshot.routing?.routes?.[provider.routeKey]?.canary) {
+            plan = selectAgentPortPlan(plan, req);
+        }
         // A route-policy deny or relay opt-out is a refusal, never a fallback.
         if (!plan?.ok || plan.kind !== 'agent-port' || plan.routeKey !== provider.routeKey
             || plan.relay?.containerName !== provider.containerName
@@ -396,7 +410,7 @@ export class WebttyHomeProfileProvider {
                 { method: 'POST', user: req.user, sessionId: '' },
                 plan.parsedUrl,
                 plan.authDefinition,
-                { bodyHash, routePath: plan.unmatchedSuffix },
+                { bodyHash, routePath: plan.unmatchedSuffix, targetRecord: plan.targetRecord, snapshot },
             )?.['x-ploinky-auth-info'];
             const parsed = JSON.parse(String(authInfo || ''));
             if (typeof parsed?.invocationToken !== 'string' || !parsed.invocationToken) throw new Error('unsigned');
@@ -409,7 +423,8 @@ export class WebttyHomeProfileProvider {
         } catch (_) {
             throw profileError('signature');
         }
-        const response = await this.exchange({ plan: finalized, lease: routePlan.lease, headers, body, bodyHash });
+        const lease = leaseForSelectedPlan(routePlan.lease, plan.selection);
+        const response = await this.exchange({ plan: finalized, lease, headers, body, bodyHash });
         const answer = validateHomeProfileResponse(response.statusCode, response.body, id, mode);
         if (!answer) throw profileError('response');
         return answer;
@@ -449,6 +464,8 @@ export class WebttyHomeProfileProvider {
                     return;
                 }
                 checkout = opened;
+                assertSelectionCurrent(plan.selection);
+                const start = performance.now();
                 const stream = await checkout.openRequest({ plan, bodyMode: 'buffered', bodyHash, headers });
                 if (settled) {
                     try { stream?.cancel?.(); } catch (_) { }
@@ -462,6 +479,8 @@ export class WebttyHomeProfileProvider {
                     agent: relayAgent,
                     maxHeaderSize: limits.responseBytes,
                 }, (response) => {
+                    observeProxyOutcome({ plan, outcome: 'success', upstreamStatus: response.statusCode,
+                        ttfbMs: performance.now() - start });
                     const declared = Number(response.headers['content-length']);
                     if (Number.isFinite(declared) && declared > limits.responseBytes) {
                         finish(profileError('oversize'));
@@ -486,9 +505,33 @@ export class WebttyHomeProfileProvider {
                 });
                 request.on('error', () => finish(profileError('transport')));
                 request.end(body);
-            })().catch((error) => finish(error?.code === 'WEBTTY_PROFILE_UNAVAILABLE' ? error : profileError('transport')));
+            })().catch((error) => {
+                observeProxyOutcome({ plan, outcome: 'failure', error, leaseOutcome: 'committed' });
+                finish(['WEBTTY_PROFILE_UNAVAILABLE', 'CANARY_SELECTION_CHANGED'].includes(error?.code) ? error : profileError('transport'));
+            });
         });
     }
 }
 
 export default WebttyHomeProfileProvider;
+
+import { routeAdmitted } from '../canary/routeAdmission.mjs';
+import { selectRouteRuntime, assertSelectionCurrent } from '../canary/selection.mjs';
+import { leaseForSelectedPlan, selectAgentPortPlan } from '../edgeRoutePlan.js';
+import { observeProxyOutcome } from '../canary/proxyOutcomes.js';
+
+// A canary may vouch for its own declared mount as the selected profile
+// provider. This inspection grants no terminal attachment to that container.
+function exactProfileMountOwner(provider, snapshot) {
+    const name = provider.containerName;
+    const record = snapshot.agents?.[name];
+    if (!record?.canaryOf) return exactCandidate(name, record, new Set(['podman']));
+    if (record.canaryOf !== provider.routeKey || snapshot.routing?.routes?.[provider.routeKey]?.canary?.container !== name
+        || record.runtime !== 'podman' || !/^[a-f0-9]{64}$/.test(record.containerId)
+        || (record.containerName !== undefined && record.containerName !== name)
+        || !record.instanceId || !record.enableGeneration
+        || record.instanceId !== provider.instanceId || record.enableGeneration !== provider.enableGeneration
+        || record.containerId !== provider.containerId || record.repoName !== provider.repoName
+        || record.agentName !== provider.agentName) return null;
+    return { ...provider, runtime: record.runtime, record };
+}

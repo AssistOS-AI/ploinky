@@ -1,8 +1,11 @@
 import http from 'node:http';
 
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
-import { loadActiveRoutingState } from '../routingState.js';
-import { buildRouterRequest, resolveRouteTargetRecord } from '../mcp-proxy/invocationMinter.js';
+import { captureEdgeRoutingLease } from '../../sandbox/edgeGeneration.js';
+import { routeAdmitted } from '../canary/routeAdmission.mjs';
+import { selectRouteRuntime } from '../canary/selection.mjs';
+import { leaseRouteHardwareAvailability } from '../hardwareAvailability.mjs';
+import { buildRouterRequest } from '../mcp-proxy/invocationMinter.js';
 import { computeRch } from '../../../Agent/lib/requestHash.mjs';
 
 /**
@@ -30,16 +33,14 @@ export class ShareAuthorizer {
     }
 }
 
-function resolveOwningRoute(agentName) {
-    let snapshot;
-    try {
-        ({ snapshot } = loadActiveRoutingState());
-    } catch {
-        return null;
-    }
+function resolveOwningRoute(agentName, user) {
+    const lease = captureEdgeRoutingLease();
+    const { snapshot } = lease;
     const routes = snapshot.routing?.routes ?? {};
     const route = Object.hasOwn(routes, agentName) ? routes[agentName] : null;
-    if (!route || !route.hostPort) return null;
+    if (!routeAdmitted(route, agentName, snapshot)) return null;
+    const selection = selectRouteRuntime({ routeKey: agentName, route, snapshot, req: { user } });
+    if (!selection.route.hostPort || leaseRouteHardwareAvailability(lease, agentName, selection.route.container)) return null;
     const repo = String(route.repo || '').trim();
     const agent = String(route.agent || agentName || '').trim();
     if (!repo || !agent) return null;
@@ -49,7 +50,7 @@ function resolveOwningRoute(agentName) {
     } catch {
         return null;
     }
-    return { route, principalId, snapshot };
+    return { selection, principalId, snapshot, lease };
 }
 
 function postJson(hostPort, requestPath, headers, bodyObject, timeoutMs = 2000) {
@@ -80,10 +81,6 @@ function postJson(hostPort, requestPath, headers, bodyObject, timeoutMs = 2000) 
 
 export class HttpShareAuthorizer extends ShareAuthorizer {
     async authorize({ agentName, normalizedPath, access = '', verb = '', user }) {
-        const owning = resolveOwningRoute(agentName);
-        if (!owning) {
-            return { allowed: false, reason: 'no_authorizer' };
-        }
         try {
             const bodyObject = {
                 path: normalizedPath,
@@ -91,21 +88,29 @@ export class HttpShareAuthorizer extends ShareAuthorizer {
                 verb: String(verb || ''),
                 user: { id: String(user?.id || ''), username: String(user?.username || '') },
             };
-            const built = buildRouterRequest({
-                targetAgentId: owning.principalId,
-                targetRecord: resolveRouteTargetRecord({ routeKey: agentName, route: owning.route, snapshot: owning.snapshot }),
-                sub: user?.id ? `user:${user.id}` : '',
-                actor: { kind: 'user', id: user?.id ? `user:${user.id}` : '', roles: Array.isArray(user?.roles) ? user.roles : [] },
-                method: 'POST',
-                path: SHARE_AUTHORIZE_PATH,
-                tool: SHARE_TOOL,
-                rch: computeRch(bodyObject),
-            });
-            const response = await postJson(owning.route.hostPort, SHARE_AUTHORIZE_PATH, { authorization: `Bearer ${built.token}` }, bodyObject);
-            if (response.status === 200 && response.json && response.json.allowed === true) {
-                return { allowed: true, reason: 'agent_approved' };
+            for (let attempt = 0; attempt < 2; attempt++) {
+                const owning = resolveOwningRoute(agentName, user);
+                if (!owning) return { allowed: false, reason: 'no_authorizer' };
+                const { selection, lease } = owning;
+                const built = buildRouterRequest({
+                    targetAgentId: owning.principalId,
+                    targetRecord: selection.targetRecord,
+                    snapshot: owning.snapshot,
+                    sub: user?.id ? `user:${user.id}` : '',
+                    actor: { kind: 'user', id: user?.id ? `user:${user.id}` : '', roles: Array.isArray(user?.roles) ? user.roles : [] },
+                    method: 'POST',
+                    path: SHARE_AUTHORIZE_PATH,
+                    tool: SHARE_TOOL,
+                    rch: computeRch(bodyObject),
+                });
+                if (!lease.commit() || !selection.isCurrent()) continue;
+                const response = await postJson(selection.route.hostPort, SHARE_AUTHORIZE_PATH, { authorization: `Bearer ${built.token}` }, bodyObject);
+                if (response.status === 200 && response.json?.allowed === true && lease.isCurrent() && selection.isCurrent()) {
+                    return { allowed: true, reason: 'agent_approved' };
+                }
+                return { allowed: false, reason: 'agent_denied' };
             }
-            return { allowed: false, reason: 'agent_denied' };
+            return { allowed: false, reason: 'authorizer_changed' };
         } catch {
             return { allowed: false, reason: 'authorizer_error' };
         }

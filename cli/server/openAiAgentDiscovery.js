@@ -117,13 +117,14 @@ function buildAgentRow(routeKey, route, manifest) {
  * it defaults to the exported readEnabledAgentManifest (hostPath + enabled-agent
  * fallback, never route.manifestPath).
  */
-export function buildOpenAiAgentDiscovery({ routes = {}, readManifest = readEnabledAgentManifest } = {}) {
+export function buildOpenAiAgentDiscovery({ routes = {}, snapshot, readManifest = readEnabledAgentManifest } = {}) {
     const agents = [];
     let complete = true;
 
     for (const [routeKey, route] of Object.entries(routes || {})) {
-        if (!route || route.disabled || route.draining) continue;
-        if (!isActiveHostPort(route.hostPort)) continue;
+        if (!routeAdmitted(route, routeKey, snapshot)) continue;
+        const selected = selectRouteRuntime({ routeKey, route, snapshot });
+        if (!isActiveHostPort(selected.route.hostPort)) continue;
         let manifest = null;
         try {
             manifest = readManifest(routeKey, routes);
@@ -171,7 +172,8 @@ function sendJson(res, statusCode, body) {
  * as failed and preserves its existing rows.
  */
 export function handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl, {
-    routing = loadRoutingConfig(),
+    snapshot,
+    routing = snapshot?.routing || loadRoutingConfig(),
     replayCache = discoveryReplayCache,
 } = {}) {
     const pathname = parsedUrl?.pathname || '';
@@ -219,7 +221,7 @@ export function handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl, {
     }
 
     const routes = routing?.routes && typeof routing.routes === 'object' ? routing.routes : {};
-    const result = buildOpenAiAgentDiscovery({ routes });
+    const result = buildOpenAiAgentDiscovery({ routes, snapshot });
     sendJson(res, 200, result);
     return true;
 }
@@ -231,3 +233,6 @@ export default {
     buildOpenAiAgentDiscovery,
     handleOpenAiAgentDiscoveryRoute,
 };
+
+import { routeAdmitted } from './canary/routeAdmission.mjs';
+import { selectRouteRuntime } from './canary/selection.mjs';

@@ -150,6 +150,31 @@ function seed(state = 'split', { inactive = false, receipt = {}, mode } = {}) {
     return { runtime, dependencies, calls, assertClean };
 }
 
+test('a receipt-bound abort withdraws a verified legacy rollout while new publications stay strict', async () => {
+    const { digestGenerationParts, generationDocumentFile, generationSourceParts, readGenerationDocument,
+        selectActiveGeneration, sha256 } = await import('../helpers/routerOriginsWorkspace.mjs');
+    const edgeDir = path.join(metadata, 'data/edge-routing');
+    for (const thresholds of [{ errorRate: 0.05, windowSeconds: 300 }, { slowMs: 515 }]) {
+        const fixture = seed();
+        const routing = source('routing.json');
+        routing.routes.alpha.canary.thresholds = thresholds;
+        const bytes = Buffer.from(JSON.stringify(routing));
+        fs.writeFileSync(path.join(metadata, 'routing.json'), bytes);
+        const document = readGenerationDocument(edgeDir, selected().generation);
+        document.sources.routing = bytes.toString('base64');
+        document.sourceDigests.routing = sha256(bytes);
+        document.generation = digestGenerationParts(generationSourceParts(document));
+        put(generationDocumentFile(edgeDir, document.generation), document);
+        selectActiveGeneration(edgeDir, document.generation);
+        assert.deepEqual(active().routing.routes.alpha.canary.thresholds, thresholds);
+        assert.throws(() => edge.withEdgeGenerationApplyLock(applyLockCapability =>
+            edge.prepareAdditiveEdgeRoutingGeneration({ workspaceRoot, routing, applyLockCapability }), options),
+        { code: 'EDGE_GENERATION_INVALID' });
+        await endCanary({ workspaceRoot, routeKey, reason: 'abort', dependencies: fixture.dependencies });
+        fixture.assertClean();
+    }
+});
+
 for (const reason of ['stop', 'restart', 'shutdown', 'destroy', 'clean', 'update', 'disable', 'start']) {
     for (const state of ['split', 'tripped', 'paused', 'withdrawn']) {
         test(`${reason} reconciles a ${state} canary`, async () => {

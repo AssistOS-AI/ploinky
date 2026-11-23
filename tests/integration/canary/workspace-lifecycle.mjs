@@ -162,7 +162,7 @@ async function exercise(workspace, command, state, imageId, token) {
         codeDigest: 'sha256:' + createHash('sha256').update(tree).digest('hex'),
         share: 10, testAccounts: [], salt: randomUUID(), splitStartedAt: new Date().toISOString(),
         mode: state === 'withdrawn' ? state : 'split', probe: { port: 7000, path: '/', status: 200 },
-        thresholds: { errorRate: 0.05, windowSeconds: 300 },
+        thresholds: {},
     };
     const { openReceipt, readReceipt } = await import('../../../cli/sandbox/canary/receipt.mjs');
     openReceipt({ routeKey, rolloutId, fields: {

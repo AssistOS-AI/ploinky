@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { trackCanaryConnection } from '../../canary/selection.mjs';
 
 import { getSession } from './browserSession.js';
 import {
@@ -77,6 +78,17 @@ function runtimeTargetId(target) {
     return JSON.stringify([container, targetRecord?.containerId, targetRecord?.launchId, targetRecord?.launchId ? null : snapshot.generation]);
 }
 
+function currentTarget(req, config, tty) {
+    const target = resolveWebchatInvocationTarget(req, config);
+    const expected = config.exactTarget;
+    if (expected && (runtimeTargetId(expected) !== runtimeTargetId(target) || expected.selection?.isCurrent() === false
+        || (tty && (tty.verifiedLaunch?.containerId !== target.targetRecord.containerId
+            || tty.verifiedLaunch?.launchId !== target.targetRecord.launchId)))) {
+        throw new Error('WebChat runtime target changed');
+    }
+    return target;
+}
+
 function failWebchatInvocation(res, error) {
     console.error('[webchat] Failed to authorize message for the agent:', error.message);
     res.writeHead(503, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
@@ -141,9 +153,9 @@ export function handleRuntimeRoute({
         const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery, principal);
         let tab = runtimes.get(runtimeKey);
         let targetId = null;
-        if (shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)) {
+        if (effectiveConfig.exactTarget || shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)) {
             try {
-                targetId = runtimeTargetId(resolveWebchatInvocationTarget(req, effectiveConfig));
+                targetId = runtimeTargetId(currentTarget(req, effectiveConfig, tab?.tty));
             } catch (error) {
                 return failWebchatInvocation(res, error);
             }
@@ -195,6 +207,10 @@ export function handleRuntimeRoute({
                     taskProtocolBuffer: ''
                 };
                 runtimes.set(runtimeKey, tab);
+                const selection = effectiveConfig.exactTarget?.selection;
+                const routeKey = req.edgeAuthContext?.webchatBinding?.target;
+                if (routeKey) tab.releaseSelection = trackCanaryConnection(selection || { routeKey },
+                    () => disposeTab(tab, runtimeKey, { runtimes }));
 
                 tty.onOutput((data) => {
                     routeWorkspaceRuntimeOutput(appState, tab, data);
@@ -347,13 +363,13 @@ export function handleRuntimeRoute({
             const isVisibleMessage = envelope.presentation?.visible !== false;
             const forwardEnvelope = shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig);
             let text = rawMessage;
-            if (forwardEnvelope) {
+            if (forwardEnvelope || effectiveConfig.exactTarget) {
                 try {
-                    const target = resolveWebchatInvocationTarget(req, effectiveConfig);
+                    const target = currentTarget(req, effectiveConfig, tab.tty);
                     if (runtimeTargetId(target) !== (tab.targetId ?? null)) {
                         throw new Error('WebChat runtime target changed');
                     }
-                    text = serializeWebchatEnvelopeForAgent({
+                    if (forwardEnvelope) text = serializeWebchatEnvelopeForAgent({
                         req, effectiveConfig, tabId, pageInstanceId, envelope, fallbackText: rawMessage, target
                     });
                 } catch (error) {
@@ -414,6 +430,9 @@ export function handleRuntimeRoute({
                     sourcePageInstanceId: pageInstanceIdFrom(parsedUrl),
                 })}\n`
                 : body;
+            if (effectiveConfig.exactTarget) {
+                try { currentTarget(req, effectiveConfig, tab.tty); } catch (error) { return failWebchatInvocation(res, error); }
+            }
             if (!writeRuntimeInput(tab, control)) {
                 disposeUnavailableRuntime(tab, runtimeKey, runtimes);
                 res.writeHead(409); res.end();
@@ -452,6 +471,9 @@ export function handleRuntimeRoute({
             }
         });
         req.on('end', () => {
+            if (effectiveConfig.exactTarget) {
+                try { currentTarget(req, effectiveConfig, tab.tty); } catch (error) { return failWebchatInvocation(res, error); }
+            }
             if (tooLarge) {
                 res.writeHead(413); res.end('Interaction response is too large.');
                 return;

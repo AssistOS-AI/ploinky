@@ -28,6 +28,10 @@ import {
     handleLogout,
     redirectToRouterLogin
 } from './browserSession.js';
+import { resolveWebchatInvocationTarget } from './messageEnvelope.js';
+import { inspectWebchatLaunch } from '../../webchat/selectedTty.mjs';
+import { createTTYFactory } from '../../webchat/tty.js';
+import { resolveContainerWorkdir } from '../../../sandbox/docker/interactive.js';
 import { handleRuntimeRoute } from './runtimeRoutes.js';
 import { handleTaskRoute } from './taskRoutes.js';
 import { renderModulePreloadLinks } from './modulePreload.js';
@@ -145,8 +149,17 @@ export async function handleWebChat(req, res, appConfig, appState) {
     if (pathClass === 'runtime') {
         // Explicit and omitted selectors both launch the bound target. As
         // before, only an explicit selector launch carries query launch flags.
+        let selected;
+        if (binding.exactLaunch) {
+            try {
+                selected = resolveWebchatInvocationTarget(req, { agentName: binding.target });
+                if (!selected?.targetRecord?.launchId) throw new Error();
+            } catch {
+                return denyJson(res, 503, 'webchat_target_changed');
+            }
+        }
         const boundCommands = await resolveWebchatCommandsForBindingAsync(binding, {
-            cliArgs: agentOverride ? launchOptions.cliArgs : []
+            selectedTarget: selected, cliArgs: agentOverride ? launchOptions.cliArgs : []
         });
         if (req.destroyed || res.destroyed) return;
         if (!boundCommands || boundCommands.changed) return denyJson(res, 503, 'webchat_target_changed');
@@ -155,8 +168,25 @@ export async function handleWebChat(req, res, appConfig, appState) {
             res.end('Dynamic agent selection unavailable.');
             return;
         }
-        const boundConfig = appConfig.getFactoryForCommands(boundCommands);
-        if (!boundConfig || !boundConfig.ttyFactory) {
+        let boundConfig;
+        if (selected) {
+            let factory;
+            if (pathname === '/stream') {
+                try {
+                    const launch = await inspectWebchatLaunch(selected);
+                    if (req.destroyed || res.destroyed) return;
+                    const workdir = resolveContainerWorkdir(selected.container, workspaceBase.root, selected.snapshot.agents);
+                    factory = createTTYFactory({ runtime: launch.runtime, containerName: launch.containerId, workdir,
+                        entry: boundCommands.container, cliArgs: boundCommands.cliArgs, verifiedLaunch: launch });
+                } catch {
+                    return denyJson(res, 503, 'webchat_target_changed');
+                }
+            }
+            boundConfig = { ...boundCommands, ttyFactory: factory, exactTarget: selected };
+        } else {
+            boundConfig = appConfig.getFactoryForCommands(boundCommands);
+        }
+        if (!boundConfig || (!boundConfig.ttyFactory && !selected)) {
             res.writeHead(503, { 'Content-Type': 'text/plain' });
             res.end('Unable to start agent session.');
             return;

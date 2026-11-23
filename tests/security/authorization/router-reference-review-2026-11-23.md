@@ -33,3 +33,28 @@ The WebTTY overlay pins the current handler and moves its close-intent and close
 The status handler at `RoutingServer.js:459` now allows the four exact loopback control names classified in `edgeRoutePlan.js`. A configured public control alias receives 403 even with a signed local CLI administrator session. The handler sets `Cache-Control: no-store` before invoking authentication so it also applies to the anonymous response.
 
 Relative to `270dc5ba`, this block moves all 23 RoutingServer references by four lines. The source registry adds blob `a1619ac4` alongside `acee67c7`. Each candidate statement and anchor was checked against the corresponding prior statement. The 128-row historical contracts and the 134 current obligations retain their identifiers and principal expectations.
+
+## Per-user canary routing
+
+The S3 inventory adds three source blobs to the historical reference map. It also pins the local CLI administrator status check to the updated Router source.
+
+| File | S3 SHA-256 prefix | Reviewed references |
+| --- | --- | --- |
+| RoutingServer.js | 39e999f1 | 23. The root, health, cards, MCP, tasks, WebSockets, reserved paths and Unix health references retain their dispatch statements. The OpenAI row identifies the shared delegated branch that selects either the single-copy or canary dispatcher. Both verify the source assertion against the buffered request. |
+| edgeRoutePlan.js | 25b27c42 | 5. The agent-port planner resolves physical members of a published pair. A caller acquires the concrete target after admission. The four private operations retain their listener checks. |
+| static/index.js | 53e924c7 | 6. Web library and workspace file dispatch retain their existing references. Agent GET and HEAD can open the selected export under its confined root and recheck the selection before serving its bytes. |
+
+The S3 review also recorded 18 outstanding references in the hardware limits, marketplace and blob handlers. The integrated review below covers those S1 changes.
+
+## Integrated canary routing
+
+The merged status branch starts at `RoutingServer.js:467`. It checks the loopback control host before authentication and retains the local CLI administrator, GET, current lease and no-store checks. The following additions to the historical registry map each previously reviewed statement and anchor through the source diff. The existing S3 references for `edgeRoutePlan.js` and `static/index.js` still match their registered bytes.
+
+| Source | Reviewed → integrated SHA-256 prefix | Rows | Dispatch review |
+| --- | --- | ---: | --- |
+| RoutingServer.js | 39e999f1 → 522fc225 | 23 | The loopback restriction moves all 23 S3 references by four lines. Task status matches the forwarding branch at 664 and the additional WebSocket matches the upgrade branch at 1055. |
+| authHandlers/hardwareLimitsRoutes.mjs | 126e6e8e → 5e7d9679 | 4 | The GET and administrative mutation branches move by one line. Registry reads exclude canary records from ordinary limit proposals, reported instances and GPU qualification. |
+| authHandlers/marketplaceRoutes.js | c21698e4 → 68c76924 | 6 | The read and mutation dispatches move by one line. Marketplace enumeration omits secondary canary records. |
+| handlers/blobs.js | 87202bbb → ef019340 | 8 | The upload, create and read dispatches move by one line. Blob namespace resolution excludes canary records before selecting an agent. |
+| handlers/webchat/index.js | 8421568f → c5758bfc | 13 | The UI and helper statements follow the new runtime branch. A canaried stream requires an admitted target, a matching manifest command and an inspected physical launch. |
+| handlers/webchat/runtimeRoutes.js | 90e8d42a → fe90c3ee | 4 | Stream, input, control and interaction begin at 146, 334, 414 and 446. Pooled canary input rechecks the admitted copy and launch before writing to the TTY. |

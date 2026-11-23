@@ -247,6 +247,9 @@ test('delegated OpenAI signs for the current route and refuses a superseded rout
             env: { PLOINKY_AGENT_ID: callerId, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(callerId) },
         }),
     });
+    generationCache.resetActiveGenerationCache();
+    assert.notEqual(loadActiveRoutingState().routing.routes.service, route);
+    assert.throws(() => resolveRouteTargetRecord({ route, routeKey: 'other' }), /selected route generation changed/);
     const minted = mint();
     assert.equal(minted.ok, true, minted.error);
     const receive = launchId => verifyOpenAiServiceAuthInfoFromHeaders(minted.authInfoHeader, {

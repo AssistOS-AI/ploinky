@@ -106,12 +106,14 @@ test('registry and rollout thresholds accept the same fields and bounds', async 
     const { DEFAULT_THRESHOLDS } = await import('../../cli/server/canary/tripRules.js');
     const field = reset().routing.routes.alpha.canary;
     const validate = thresholds => validateCanaryField({ ...field, thresholds }, 'canary');
-    for (const overrides of [{}, DEFAULT_THRESHOLDS, { slowMs: 0.5, errorMultiple: 0 }, { slowDeltaPoints: 100 }]) {
+    for (const overrides of [{}, DEFAULT_THRESHOLDS, { errorMultiple: 0 }, { slowDeltaPoints: 100 },
+        ...[10, 50, 100, 250, 500, 1000, 5000, 15000].map(slowMs => ({ slowMs }))]) {
         assert.doesNotThrow(() => validate(overrides));
     }
     for (const overrides of [null, undefined, [], 3, { windowSeconds: 600 }, { errorRate: 0.05 }, { [Symbol('x')]: 1 },
         { minFailures: 0 }, { minResponses: 1.5 }, { consecutiveProbes: 2 ** 53 },
         { consecutiveConnections: -1 }, { slowWithoutBaselinePercent: 100.1 },
+        { slowMs: 0.5 }, { slowMs: 30 }, { slowMs: 0 }, { slowMs: 5001 },
         { slowMs: Infinity }, { errorMultiple: NaN }, { errorDeltaPoints: -0.1 }]) {
         assert.throws(() => validate(overrides), { code: 'EDGE_GENERATION_INVALID' });
     }
@@ -148,20 +150,125 @@ test('Router startup isolates invalid overrides and honors the compiled threshol
 });
 
 test('a committed generation retires only missing route baselines, including their lifetime counts', async () => {
-    const { canarySignals, canaryStatus } = await import('../../cli/server/canary/routerSignals.js');
-    const first = reset().routing.routes;
-    canaryStatus(first);
-    for (const routeKey of ['alpha', 'beta']) canarySignals.recordOutcome({ routeKey, status: 503 });
-    const onlyAlpha = reset(({ routing }) => { delete routing.routes.beta; }).routing.routes;
-    assert.deepEqual(canaryStatus(onlyAlpha).baselines.map(row => row.routeKey), ['alpha']);
+    const { canarySignals, canaryStatus, observeCanarySnapshot } = await import('../../cli/server/canary/routerSignals.js');
+    const { observeProxyOutcome, observeProxyFirstByte } = await import('../../cli/server/canary/proxyOutcomes.js');
+    const { selectRouteRuntime } = await import('../../cli/server/canary/selection.mjs');
+    const { resolveEdgeRoutePlan } = await import('../../cli/server/edgeRoutePlan.js');
+    const { finalizePlanAfterAdmission } = await import('../../cli/server/proxy/RoutePlan.js');
+    const portPlan = () => {
+        const plan = resolveEdgeRoutePlan({ req: { method: 'GET', headers: { host: 'localhost' },
+            url: '/base-agent-additional-server/beta/8787/health' } });
+        assert.equal(plan.ok, true, plan.code);
+        return plan;
+    };
+    const first = reset(({ agents }) => Object.assign(agents[bystander], { runtime: 'podman', containerId: 'b'.repeat(64) }));
+    const { selector, paths } = active();
+    observeCanarySnapshot(first);
+    const response = (snapshot, routeKey, status) => ({
+        plan: selectRouteRuntime({ routeKey, route: snapshot.routing.routes[routeKey], snapshot }), status, outcome: 'success',
+    });
+    const retired = response(first, 'beta', 503);
+    const retiredPort = portPlan();
+    for (const routeKey of ['alpha', 'beta']) observeProxyOutcome(response(first, routeKey, 503));
+    const routesWithoutBeta = { ...first.routing.routes };
+    delete routesWithoutBeta.beta;
+    write(path.join(ploinky, 'routing.json'), { ...first.routing, routes: routesWithoutBeta });
+    edge.applyEdgeRoutingGeneration({ workspaceRoot, publicationState: 'ready' });
+    const onlyAlpha = active().generation;
+    observeCanarySnapshot(onlyAlpha);
+    assert.deepEqual(canaryStatus(onlyAlpha.routing.routes).baselines.map(row => row.routeKey), ['alpha']);
     canarySignals.recordOutcome({ routeKey: 'beta', status: 503 });
     assert.deepEqual(canarySignals.status().baselines.map(row => row.routeKey), ['alpha']);
-    const restored = reset().routing.routes;
-    canarySignals.recordOutcome({ routeKey: 'beta', status: 200 });
-    const { baselines } = canaryStatus(restored);
+    // Reselect the original immutable file, as rollback can do. The cache
+    // returns the very same objects that the first request admitted.
+    write(paths.activeSelectorFile, selector);
+    const restored = active().generation;
+    assert.equal(restored, first);
+    observeCanarySnapshot(restored);
+    observeProxyOutcome(response(restored, 'beta', 200));
+    observeProxyOutcome(retired);
+    observeProxyFirstByte({ plan: retired.plan, ttfbMs: 60_000 });
+    observeProxyOutcome({ plan: finalizePlanAfterAdmission(retiredPort), outcome: 'success', status: 503 });
+    observeProxyFirstByte({ plan: retiredPort, ttfbMs: 60_000 });
+    observeProxyOutcome({ plan: finalizePlanAfterAdmission(portPlan()), outcome: 'success', status: 200 });
+    const { baselines } = canaryStatus(restored.routing.routes);
     assert.deepEqual(baselines.map(row => [row.routeKey, row.sinceStart.requests, row.sinceStart.backendFailures]),
-        [['alpha', 1, 1], ['beta', 1, 0]]);
+        [['alpha', 1, 1], ['beta', 2, 0]]);
+    assert.equal(baselines.find(row => row.routeKey === 'beta').sinceStart.timedResponses, 0);
     assert.deepEqual(canaryStatus(undefined).baselines, []);
+});
+
+test('snapshot reconciliation isolates a legacy route from a new rollout and a prepared receipt', async () => {
+    const { canarySignals, observeCanarySnapshot } = await import('../../cli/server/canary/routerSignals.js');
+    const { openReceipt } = await import('../../cli/sandbox/canary/receipt.mjs');
+    const snapshot = reset();
+    const { alpha } = snapshot.routing.routes;
+    const bad = { ...alpha, canary: { ...alpha.canary, mode: 'all', thresholds: { slowMs: 30 } } };
+    openReceipt({ routeKey: 'legacy', rolloutId: bad.canary.rolloutId, fields: { lastCompletedStep: 1 } }, { workspaceRoot });
+    const publish = routes => observeCanarySnapshot({ ...snapshot, routing: { routes } });
+    const state = key => canarySignals.routingState(key, alpha.canary.rolloutId)?.state;
+    publish({});
+    publish({ legacy: bad, alpha });
+    assert.equal(state('legacy'), 'paused');
+    assert.equal(state('alpha'), 'split');
+    const count = (copy, ttfbMs) => canarySignals.recordOutcome({ routeKey: 'alpha', rolloutId: alpha.canary.rolloutId,
+        copy, status: 200, ttfbMs });
+    count('old', 30);
+    count('canary', 120);
+    const changed = { ...alpha, canary: { ...alpha.canary, thresholds: { minResponses: 1, slowMs: 50 } } };
+    publish({ legacy: bad, alpha: changed });
+    assert.equal(state('legacy'), 'paused');
+    assert.equal(state('alpha'), 'tripped');
+    const { counts } = canarySignals.status().rollouts.find(row => row.routeKey === 'alpha');
+    assert.equal(counts.old.sinceStart.slowResponses, 0);
+    assert.equal(counts.canary.sinceStart.slowResponses, 1);
+    publish({ alpha: { ...changed, canary: { ...changed.canary, mode: 'all', thresholds: { slowMs: 51 } } } });
+    assert.equal(state('alpha'), 'paused');
+    assert.equal(state('legacy'), undefined);
+    publish({});
+});
+
+test('the Router schedules and cancels the exact probe when its published container or rollout changes', async t => {
+    const { canarySignals, observeCanarySnapshot, exactContainerProbe } = await import('../../cli/server/canary/routerSignals.js');
+    const snapshot = reset();
+    const { alpha } = snapshot.routing.routes;
+    const publish = (route, record) => observeCanarySnapshot({
+        routing: { routes: route ? { alpha: route } : {} }, agents: { [secondary]: record },
+    });
+    const probes = [];
+    publish();
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    canarySignals.setProbe((target, { signal }) => new Promise(resolve => probes.push({ target, signal, resolve })));
+    t.after(() => { publish(); canarySignals.setProbe(exactContainerProbe()); });
+    const first = { ...snapshot.agents[secondary], startedAt: '2026-11-23T10:00:00Z' };
+    const counts = () => canarySignals.status().rollouts[0].counts.canary.sinceStart;
+    publish(alpha, first);
+    t.mock.timers.tick(30_000);
+    assert.equal(probes.length, 1);
+    assert.equal(probes[0].target.registryRecord, first);
+    probes[0].resolve({ ok: true, running: true, containerId: first.containerId, startedAt: '2026-11-23T10:00:20Z' });
+    await Promise.resolve();
+    assert.equal(canarySignals.status().rollouts[0].lastTripReason, 'container-restart');
+    assert.equal(counts().restarts, 1);
+    t.mock.timers.tick(30_000);
+    const replacement = { ...first, containerId: 'replacement-id', startedAt: '2026-11-23T10:01:00Z' };
+    publish(alpha, replacement);
+    assert.equal(probes[1].signal.aborted, true);
+    probes[1].resolve({ ok: true, running: true, containerId: first.containerId });
+    await Promise.resolve();
+    assert.equal(counts().probes, 2);
+    assert.equal(counts().restarts, 2);
+    t.mock.timers.tick(30_000);
+    assert.equal(probes[2].target.containerId, replacement.containerId);
+    probes[2].resolve({ ok: true, running: true, containerId: replacement.containerId, startedAt: replacement.startedAt });
+    await Promise.resolve();
+    assert.equal(counts().restarts, 2);
+    t.mock.timers.tick(30_000);
+    publish();
+    assert.equal(probes[3].signal.aborted, true);
+    t.mock.timers.tick(60_000);
+    assert.equal(probes.length, 4);
+    assert.deepEqual(canarySignals.status().rollouts, []);
 });
 
 test('withdrawn compiles with both records; canary-first name resolution selects the primary', () => {

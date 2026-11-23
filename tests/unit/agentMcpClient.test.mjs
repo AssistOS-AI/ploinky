@@ -408,6 +408,68 @@ test('task observer status callbacks stay pinned to the client router', async (t
     assert.equal(secondRouterRequests, 0);
 });
 
+test('task observer aliases keep native handles and work on a fresh client after pruning', async t => {
+    const { issueContinuationOrigins, resolveContinuationTool } = await import('../../Agent/lib/taskContinuationOrigin.mjs');
+    const secret = Buffer.alloc(32, 0xbc);
+    const rollout = ('r._-' + 'a'.repeat(16)).repeat(7).slice(0, 128);
+    const handle = 'h'.repeat(200);
+    const resume = 'r'.repeat(160);
+    const reply = 'm'.repeat(160);
+    const native = { version: 1, toolName: resume, messageToolName: reply, handle };
+    const id = 'canary.' + rollout + '.0123456789abcdef';
+    const tools = [resume, reply];
+    let statusReads = 0;
+    let terminal = false;
+    let pruned = false;
+    const calls = [];
+    await withCaptureServer(t, (req, body, res) => {
+        if (req.method === 'GET') {
+            statusReads++;
+            if (pruned) return res.writeHead(404).end('{}');
+            const task = terminal ? { id, result: { metadata: { continuation: native } } } : { id, liveContinuation: native };
+            return res.end(JSON.stringify({ task: issueContinuationOrigins(task, rollout, secret) }));
+        }
+        const { name, arguments: args } = JSON.parse(body).params;
+        const claims = JSON.parse(Buffer.from(req.headers.authorization.split('.')[1], 'base64url'));
+        assert.equal(claims.tool, name);
+        assert.equal(args.handle, handle);
+        const origin = resolveContinuationTool(name, handle, secret, tools);
+        assert.deepEqual(origin.taskPin, { rolloutId: rollout });
+        calls.push(origin.tool);
+        res.end(JSON.stringify({ result: origin.tool === resume ? { metadata: { taskId: 'next-id', toolName: resume } } : { ok: true } }));
+    });
+    const client = await createAgentClient('worker');
+    assert.equal((await client.getTaskStatus(id)).liveContinuation.toolName, resume, 'ordinary consumers retain the native fields');
+    let observed;
+    const remove = setAgentTaskObserver(async task => { observed = task; return { detached: true, id: 'local-next' }; });
+    t.after(remove);
+    const live = (await client.getTaskStatus(id)).liveContinuation;
+    terminal = true;
+    const done = (await client.getTaskStatus(id)).result.metadata.continuation;
+    pruned = true;
+    for (const value of [live, done]) {
+        assert.equal(value.handle, handle);
+        assert.match(value.toolName, /^[A-Za-z0-9._-]{1,160}$/);
+        assert.match(value.messageToolName, /^[A-Za-z0-9._-]{1,160}$/);
+        assert.notEqual(value.toolName, resume);
+        assert.notEqual(value.messageToolName, reply);
+    }
+    const fresh = await createAgentClient('worker');
+    await fresh.callTool(live.messageToolName, { handle });
+    const result = await fresh.callToolWithoutWait(done.toolName, { handle });
+    assert.equal(result.metadata.backgroundTask.id, 'local-next');
+    assert.equal(observed.toolName, done.toolName);
+    assert.equal(observed.arguments.handle, handle);
+    assert.equal(statusReads, 3);
+    assert.deepEqual(calls, [reply, resume]);
+    assert.throws(() => resolveContinuationTool(done.toolName, 'another_native_handle', secret, tools));
+    assert.throws(() => resolveContinuationTool(done.toolName, handle, Buffer.alloc(32, 1), tools));
+    assert.throws(() => resolveContinuationTool(done.toolName, handle, secret, [reply]));
+    assert.throws(() => resolveContinuationTool(done.toolName.slice(0, -1) + 'X', handle, secret, tools));
+    assert.deepEqual(resolveContinuationTool(done.toolName, 'another_native_handle', secret, [...tools, done.toolName]),
+        { tool: done.toolName }, 'an explicit literal name never acquires a queue pin');
+});
+
 test('cancelTask sends a request-bound agent assertion through the router', async (t) => {
     let captured = null;
     await withCaptureServer(t, (req, body, res) => {

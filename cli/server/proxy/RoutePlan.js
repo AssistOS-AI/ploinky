@@ -1,3 +1,5 @@
+import { routingSignals } from '../canary/routeAdmission.mjs';
+
 function deepFreeze(value, seen = new Set()) {
     if (!value || typeof value !== 'object' || seen.has(value)) return value;
     seen.add(value);
@@ -39,7 +41,9 @@ export function createRoutePlan(input = {}) {
     if (input.relay.host || input.relay.port || input.relay[['host', 'Port'].join('')]) {
         throw new Error('RoutePlan: relay must not contain a host TCP target');
     }
-    return deepFreeze({ ...input });
+    // A generation cache hit after rollback may reuse this very route
+    // object. Keep the epoch from initial admission through finalization.
+    return deepFreeze({ outcomeEpoch: routingSignals()?.routeEpoch?.(input.route), ...input });
 }
 
 export function finalizeRoutePlan(plan, { targetPath, query = plan.query || '' } = {}) {

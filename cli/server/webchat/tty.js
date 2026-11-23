@@ -85,7 +85,7 @@ function buildSsoCliArgs(ssoUser) {
     return ssoCliArgs;
 }
 
-function createTTYFactory({ runtime, containerName, workdir, entry }) {
+function createTTYFactory({ runtime, containerName, workdir, entry, cliArgs = [], verifiedLaunch }) {
     const DEBUG = process.env.WEBCHAT_TTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty]', ...args); };
     const factory = (ssoUser) => {
@@ -99,7 +99,11 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
             ? entry
             : "(command -v /bin/bash >/dev/null 2>&1 && exec /bin/bash) || exec /bin/sh";
 
-        if (ssoCliArgs.length > 0 && shouldAppendIdentityArgs(shellCmd)) {
+        if (verifiedLaunch) {
+            // Exec option values and manifest CLI arguments remain inside the selected container.
+            const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
+            shellCmd += cliArgs.map(arg => ' ' + quote(arg)).join('');
+        } else if (ssoCliArgs.length > 0 && shouldAppendIdentityArgs(shellCmd)) {
             shellCmd = `${shellCmd} ${ssoCliArgs.join(' ')}`;
         }
 
@@ -108,6 +112,12 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
         // Use interactive mode but NO TTY allocation - this ensures stdin EOF propagates
         // to the container process when the host connection closes
         const execArgs = buildExecArgs(containerName, wd, shellCmd, true, false, { env });
+        if (verifiedLaunch) {
+            const identity = { SSO_USER: ssoUser?.username || 'guest', SSO_USER_ID: ssoUser?.id || 'guest',
+                SSO_ROLES: ssoUser?.roles?.join(',') || 'guest', ...(ssoUser?.email && { SSO_EMAIL: ssoUser.email }) };
+            const envArgs = Object.entries(identity).flatMap(([key, value]) => ['-e', key + '=' + value]);
+            execArgs.splice(1, 0, ...envArgs);
+        }
         let ptyProc = null;
         let closed = false;
         const outputHandlers = new Set();
@@ -156,6 +166,7 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
         }
 
         return {
+            verifiedLaunch,
             get pid() { return ptyProc?.pid; },
             onOutput(handler) {
                 if (handler) outputHandlers.add(handler);

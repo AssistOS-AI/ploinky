@@ -12,6 +12,7 @@ import { readRuntimeCandidate, retireRuntimeCandidate } from '../runtimeCandidat
 import { withNetworkLifecycleLockReclaimingStoppedOwner } from '../networkLifecycle.js';
 import { inspectCanaryContainer, removeCanaryContainer } from '../docker/containerFleet.js';
 import { validateCanaryField, validateCanaryLinks } from '../canaryRecord.mjs';
+import { rolloutThresholds } from '../../server/canary/tripRules.js';
 import { IMMUTABLE_CONTAINER_ID } from '../docker/containerOwnership.js';
 import {
     abortEdgeRoutingPreparation, applyEdgeRoutingGeneration, assertActiveEdgeRoutingSourcesCurrent,
@@ -70,7 +71,7 @@ function pair({ routeKey, receipt, workspaceRoot }, { routing, agents }) {
         || !field.container.endsWith('__canary') || field.container === route.container) {
         throw new Error('canary receipt, route and registry must identify the same rollout');
     }
-    validateCanaryField(field, 'canary');
+    validateCanaryField(field, 'canary', { allowHistoricalThresholds: true });
     validateCanaryLinks(routing, agents, workspaceRoot);
     return { route, field, record: agents[field.container] };
 }
@@ -320,8 +321,13 @@ function recoverPublication(context) {
 
 function mutateSources(context, { routing, agents }, effect) {
     const route = routing.routes[context.routeKey];
-    if (effect === 'withdraw') route.canary.mode = 'withdrawn';
-    else {
+    if (effect === 'withdraw') {
+        route.canary.mode = 'withdrawn';
+        // Withdrawals carry no traffic. Clear obsolete trip rules before
+        // publishing the receipt's exact pair under the current schema.
+        try { rolloutThresholds(route.canary.thresholds); }
+        catch { route.canary.thresholds = {}; }
+    } else {
         delete route.canary;
         delete agents[context.receipt.teardown.name];
     }
