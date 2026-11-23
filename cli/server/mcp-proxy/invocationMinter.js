@@ -24,7 +24,15 @@ import {
  * does not hold that agent's secret.
  */
 
-const routerRequestTokenService = new RouterRequestTokenService({
+class LaunchBoundRouterRequestTokenService extends RouterRequestTokenService {
+    _payload(input) {
+        const result = super._payload(input);
+        if (input.launchId) result.payload.launchId = input.launchId;
+        return result;
+    }
+}
+
+const routerRequestTokenService = new LaunchBoundRouterRequestTokenService({
     resolveAgentSecret: (targetAgentId) => deriveAgentRequestSecret(targetAgentId, { encoding: 'buffer' }),
 });
 
@@ -33,10 +41,11 @@ const agentAssertionService = new AgentAssertionService({
 });
 
 // The active generation's snapshot, or null when no generation is active.
-function tryLoadActiveSnapshot() {
+function tryLoadActiveSnapshot({ forMint = false } = {}) {
     try {
         return loadActiveRoutingState().snapshot || null;
-    } catch (_) {
+    } catch (error) {
+        if (forMint && error?.code !== 'EDGE_GENERATION_INACTIVE') throw error;
         return null;
     }
 }
@@ -84,6 +93,51 @@ export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal, 
     throw unresolvedProvider(providerAgentRef);
 }
 
+// Select by the route used for the dial. A route handed in by a caller
+// must still belong to that snapshot, even if a replacement reused its name.
+export function resolveRouteTargetRecord({ routeKey, route, snapshot = tryLoadActiveSnapshot({ forMint: true }) } = {}) {
+    const routes = snapshot?.routing?.routes;
+    const currentRoute = routes && Object.hasOwn(routes, routeKey) ? routes[routeKey] : undefined;
+    const selected = route ?? currentRoute;
+    if (!selected?.container) return undefined;
+    if (currentRoute !== selected) throw new Error('invocationMinter: selected route generation changed');
+    const agents = snapshot.agents;
+    if (!agents || !Object.hasOwn(agents, selected.container) || !agents[selected.container]) {
+        throw new Error('invocationMinter: selected target container missing');
+    }
+    return agents[selected.container];
+}
+
+// The audience identifies the agent principal. Aliases and a canary can share
+// it. Prefer the record chosen for the dial; principal-only callers may use a
+// unique record from the snapshot they used to select the target. Loading a
+// newer generation by principal could sign for a same-name replacement.
+function requestLaunchId(targetAgentId, { targetRecord, routeDefinition, snapshot }) {
+    const matchesPrincipal = record => record?.type === 'agent'
+        && `agent:${record.repoName}/${record.agentName}` === targetAgentId;
+    let record = targetRecord;
+    if (record === undefined) {
+        const generation = snapshot ?? tryLoadActiveSnapshot({ forMint: true });
+        if (routeDefinition?.route?.container) {
+            record = resolveRouteTargetRecord({ routeKey: routeDefinition.routeKey, route: routeDefinition.route, snapshot: generation });
+        } else {
+            const agents = generation?.agents;
+            if (!agents) return undefined;
+            const matches = Object.values(agents).filter(matchesPrincipal);
+            if (!matches.some(candidate => candidate.launchId !== undefined)) return undefined;
+            if (!snapshot || matches.length !== 1) {
+                throw new Error('invocationMinter: selected target record required for launch-bound agent');
+            }
+            [record] = matches;
+        }
+    }
+    if (!matchesPrincipal(record)) throw new Error('invocationMinter: target record principal mismatch');
+    if (record.launchId !== undefined && (typeof record.launchId !== 'string' || !record.launchId)) {
+        throw new Error('invocationMinter: invalid launchId in target record');
+    }
+    return record.launchId;
+}
+
 /**
  * Mint a Router Request JWT (router -> target agent), signed with the target
  * agent's own secret. The caller computes `rch` over the exact request surface
@@ -91,6 +145,9 @@ export function resolveProviderPrincipal({ providerAgentRef, providerPrincipal, 
  */
 export function buildRouterRequest({
     targetAgentId,
+    targetRecord,
+    routeDefinition,
+    snapshot,
     sub,
     actor,
     caller,
@@ -106,6 +163,7 @@ export function buildRouterRequest({
 }) {
     return routerRequestTokenService.mintWithPayloadSync({
         targetAgentId,
+        launchId: requestLaunchId(targetAgentId, { targetRecord, routeDefinition, snapshot }),
         sub,
         actor,
         caller,

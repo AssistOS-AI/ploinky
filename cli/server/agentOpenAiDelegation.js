@@ -1,6 +1,6 @@
 import { resolveEnabledAgentRecord } from '../utils/agents.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
-import { verifyAgentAssertion, buildRouterRequest } from './mcp-proxy/invocationMinter.js';
+import { verifyAgentAssertion, buildRouterRequest, resolveRouteTargetRecord } from './mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from './security/tokens/JwsCodec.js';
 import { replayRefusalStatus } from '../../Agent/lib/replayCache.mjs';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
@@ -147,6 +147,7 @@ export function verifyAndMintAgentOpenAiCall({
     token,
     routeKey,
     route,
+    targetRecord,
     body = Buffer.alloc(0),
     method = 'POST',
     path = OPENAI_CHAT_COMPLETIONS_PATH,
@@ -208,6 +209,7 @@ export function verifyAndMintAgentOpenAiCall({
     try {
         const minted = buildRouterRequest({
             targetAgentId: targetPrincipal,
+            targetRecord: targetRecord === undefined ? resolveRouteTargetRecord({ routeKey, route }) : targetRecord,
             sub,
             actor,
             caller,

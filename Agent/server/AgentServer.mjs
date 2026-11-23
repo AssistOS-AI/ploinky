@@ -33,14 +33,6 @@ const { isOptOutModel, runOpenAiAgenticResponse } = await importAgentLibFile(
 
 const DEFAULT_MAX_CONCURRENT_TASKS = 10;
 const DEFAULT_TASK_LOG_TAIL_BYTES = 128 * 1024;
-// The agent code directory is read-only in production. Every supported
-// runtime supplies a dedicated writable HOME for this exact agent, so durable
-// restart state belongs there rather than beside the staged code.
-const taskQueueHome = String(process.env.HOME || '').trim();
-const TASK_QUEUE_FILE = path.join(
-    taskQueueHome && path.isAbsolute(taskQueueHome) ? taskQueueHome : process.cwd(),
-    '.tasksQueue',
-);
 const invocationReplayCache = createBoundedReplayCache({
     maxSize: 32768,
     legacyMinRetentionMs: legacyMinRetentionMs({ maxTtlSeconds: 60 }),
@@ -1086,10 +1078,9 @@ function sanitizePayloadForLog(payload = {}) {
 
 const initialConfigResult = getConfigResult();
 const initialConfig = initialConfigResult ? initialConfigResult.config : {};
-const taskQueue = new TaskQueue({
+const taskQueue = TaskQueue.forAgent({
     maxConcurrent: resolveMaxConcurrent(initialConfig),
     maxLogTailBytes: resolveTaskLogTailBytes(initialConfig),
-    storagePath: TASK_QUEUE_FILE,
     executor: executeShell
 });
 

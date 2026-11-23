@@ -13,6 +13,7 @@ import {
 import {
     buildRouterRequest,
     resolveProviderPrincipal,
+    resolveRouteTargetRecord,
     verifyAgentAssertion
 } from './invocationMinter.js';
 import { buildMcpDelegationsForUserCall } from './mcpDelegations.js';
@@ -270,6 +271,7 @@ export async function invokeAuthenticatedAgentTool({
         const args = await canonicalizeToolArguments(agentName, agentClient, toolName, rawArguments);
         const context = buildInvocationContextForProviderCall({
             req,
+            route,
             agentName,
             toolName,
             toolArgs: args,
@@ -302,6 +304,7 @@ export async function readAuthenticatedAgentTask({ req, route, agentName, taskId
     const normalizedTaskId = String(taskId || '').trim();
     const context = buildInvocationContextForProviderCall({
         req,
+        route,
         agentName,
         toolName: TASK_STATUS_TOOL,
         toolArgs: { taskId: normalizedTaskId },
@@ -359,6 +362,7 @@ export async function cancelAuthenticatedAgentTask({ req, route, agentName, task
     const args = { taskId: normalizedTaskId };
     const context = buildInvocationContextForProviderCall({
         req,
+        route,
         agentName,
         toolName: TASK_CANCEL_TOOL,
         toolArgs: args,
@@ -401,12 +405,14 @@ export async function cancelAuthenticatedAgentTask({ req, route, agentName, task
 // one; the route key (`agentName`) is resolved to its provider principal.
 export function buildInvocationContextForProviderCall({
     req,
+    route,
     agentName,
     toolName,
     toolArgs,
     method = 'POST',
     path = '/mcp',
     snapshot = undefined,
+    targetRecord,
 }) {
     if (!isSecureWireEnabled()) return null;
     const canonicalArgs = toolArgs && typeof toolArgs === 'object' && !Array.isArray(toolArgs) ? toolArgs : {};
@@ -422,16 +428,24 @@ export function buildInvocationContextForProviderCall({
     const delegated = req?.delegatedAgentVerified && typeof req.delegatedAgentVerified === 'object'
         ? req.delegatedAgentVerified
         : null;
+    const targetAgentId = String(delegated?.userDelegation?.delegation?.targetAgentId || '').trim()
+        || resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
+    // A pooled WebChat TTY can outlive the route that created it. A bare
+    // user route key cannot select that TTY's launch. Delegated task polling
+    // commits its route lease before dialing; other routed callers pass it in.
+    let selectedRecord = targetRecord;
+    if (selectedRecord === undefined && (route || snapshot || delegated)) {
+        selectedRecord = resolveRouteTargetRecord({ routeKey: agentName, route, snapshot });
+    }
     if (delegated) {
         const caller = String(delegated.callerPrincipal || '');
-        const targetAgentId = String(delegated.userDelegation?.delegation?.targetAgentId || '').trim()
-            || resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
         sub = caller;
         actor = { kind: 'agent', id: caller, roles: [] };
         const callerInfo = { kind: 'agent', id: caller, roles: ['agent'] };
         const verifiedDelegation = delegated.userDelegation;
         const { token, payload } = buildRouterRequest({
             targetAgentId,
+            targetRecord: selectedRecord,
             sub,
             actor,
             caller: callerInfo,
@@ -444,7 +458,6 @@ export function buildInvocationContextForProviderCall({
         });
         return { token, payload, rch };
     } else {
-        const targetAgentId = resolveProviderPrincipal({ providerAgentRef: agentName, snapshot });
         const user = extractDelegatedUser(req);
         sub = user?.id ? `user:${user.id}` : '';
         actor = {
@@ -463,6 +476,7 @@ export function buildInvocationContextForProviderCall({
         const delegations = buildMcpDelegationsForUserCall({ req, routeKey: agentName, toolName });
         const { token, payload } = buildRouterRequest({
             targetAgentId,
+            targetRecord: selectedRecord,
             sub,
             actor,
             scope: resolveGuestInvocationScope(req),
@@ -599,6 +613,7 @@ export async function handleDelegatedAgentTaskCancel({
         }
         const context = buildInvocationContextForProviderCall({
             req,
+            route,
             agentName,
             toolName: TASK_CANCEL_TOOL,
             toolArgs: { taskId },
@@ -722,6 +737,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
     function buildRequestHeadersForToolCall(toolName, toolArgs) {
         const ctx = buildInvocationContextForProviderCall({
             req,
+            route,
             agentName,
             toolName,
             toolArgs: toolArgs || {},

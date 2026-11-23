@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import { describeShellFailure } from '../lib/toolError.mjs';
 import { createTaskControlStream } from './taskControlStream.mjs';
 
@@ -13,6 +14,16 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const DEFAULT_PERSIST_DEBOUNCE_MS = 100;
 const DEFAULT_TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_TERMINAL_TASKS = 500;
+const ROLLOUT_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+/** Return the rollout ID from canary.<rolloutId>.<16 hex digits>, or null for other task IDs. */
+export function parseCanaryTaskId(taskId) {
+    if (typeof taskId !== 'string' || !taskId.startsWith('canary.')) return null;
+    const separator = taskId.lastIndexOf('.');
+    const rolloutId = taskId.slice('canary.'.length, separator);
+    const nonce = taskId.slice(separator + 1);
+    return ROLLOUT_ID_RE.test(rolloutId) && /^[a-f0-9]{16}$/.test(nonce) ? rolloutId : null;
+}
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
@@ -99,9 +110,25 @@ function commandResult(stdout) {
 }
 
 export class TaskQueue {
+    static forAgent(options, env = process.env) {
+        // Agent code is read-only in production. Both copies share the writable HOME.
+        const home = String(env.HOME || '').trim();
+        const rolloutId = env.PLOINKY_CANARY === '1' ? env.PLOINKY_CANARY_ROLLOUT || '' : '';
+        if (rolloutId && !ROLLOUT_ID_RE.test(rolloutId)) {
+            throw new Error('Invalid PLOINKY_CANARY_ROLLOUT for task queue');
+        }
+        const fileName = rolloutId ? `.tasksQueue.canary.${rolloutId}` : '.tasksQueue';
+        return new TaskQueue({
+            ...options,
+            canaryRolloutId: rolloutId,
+            storagePath: path.join(path.isAbsolute(home) ? home : process.cwd(), fileName),
+        });
+    }
+
     constructor({
         maxConcurrent = 10,
         storagePath,
+        canaryRolloutId = '',
         executor,
         maxLogTailBytes = DEFAULT_MAX_LOG_TAIL_BYTES,
         cancelGraceMs = DEFAULT_CANCEL_GRACE_MS,
@@ -114,6 +141,7 @@ export class TaskQueue {
         }
         this.maxConcurrent = maxConcurrent;
         this.storagePath = storagePath;
+        this.canaryRolloutId = canaryRolloutId;
         this.executor = executor;
         this.maxLogTailBytes = parsePositiveInt(maxLogTailBytes, DEFAULT_MAX_LOG_TAIL_BYTES);
         this.cancelGraceMs = parsePositiveInt(cancelGraceMs, DEFAULT_CANCEL_GRACE_MS);
@@ -323,7 +351,8 @@ export class TaskQueue {
     }
 
     generateId() {
-        return randomBytes(8).toString('hex');
+        const nonce = randomBytes(8).toString('hex');
+        return this.canaryRolloutId ? `canary.${this.canaryRolloutId}.${nonce}` : nonce;
     }
 
     createTaskLogState() {

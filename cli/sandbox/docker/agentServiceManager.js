@@ -21,7 +21,9 @@ import {
 } from '../../utils/security/secretVars.js';
 import {
     buildAgentCredentialEnv,
+    buildAgentLaunchEnv,
     buildAgentPrincipalEnv,
+    verifyRegisteredLaunchId,
     RESERVED_AGENT_ENV_NAMES,
 } from '../../utils/security/agentIdentityEnv.js';
 import {
@@ -1223,7 +1225,7 @@ function computeAgentEnvHash(manifest, profileConfig, {
     generatedRouter = null,
 }, computeEnvHashImpl = computeEnvHash) {
     const payload = generatedRouter?.payload;
-    return computeEnvHashImpl(manifest, profileConfig, {
+    const hashEnv = {
         ...(generatedRouter ? {} : runtimeRouterEnv),
         ...runtimeNetworkPlan.hashEnv,
         ...buildManagedControlEnv(manifest),
@@ -1236,7 +1238,26 @@ function computeAgentEnvHash(manifest, profileConfig, {
             PLOINKY_AGENT_INSTANCE_ID: generatedRouter.instanceId,
             PLOINKY_AGENT_ENABLE_GENERATION: generatedRouter.enableGeneration,
         } : {}),
-    }, { agentName, repoName });
+    };
+    delete hashEnv.PLOINKY_LAUNCH_ID;
+    delete hashEnv.PLOINKY_ENV_SOURCE_PLOINKY_LAUNCH_ID;
+    // computeEnvHash merges configured values underneath this overlay. Mask
+    // launch fields there only when the manifest or profile declares them.
+    if (manifest?.env || profileConfig?.env || manifest?.expose) {
+        let configured;
+        try {
+            configured = getExposedNames(manifest, profileConfig);
+        } catch {
+            return ''; // Same invalid-config result as computeEnvHash.
+        }
+        if (configured.includes('PLOINKY_LAUNCH_ID')) {
+            hashEnv.PLOINKY_LAUNCH_ID = undefined;
+            hashEnv.PLOINKY_ENV_SOURCE_PLOINKY_LAUNCH_ID = undefined;
+        } else if (configured.includes('PLOINKY_ENV_SOURCE_PLOINKY_LAUNCH_ID')) {
+            hashEnv.PLOINKY_ENV_SOURCE_PLOINKY_LAUNCH_ID = undefined;
+        }
+    }
+    return computeEnvHashImpl(manifest, profileConfig, hashEnv, { agentName, repoName });
 }
 
 function inspectImageEntrypoint(runtime, image, spawn = spawnSync) {
@@ -2202,6 +2223,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // config can redirect the runtime, inject a master key, or override the
     // agent's derived secret.
     stripReservedAndRestoreRuntimeRouterEnvFlags(envStrings, {});
+    const unmanagedLaunchEnv = runtimeNetworkPlan.requiresManagedNetwork ? {} : buildAgentLaunchEnv();
+    appendEnvFlagsFromMap(envStrings, unmanagedLaunchEnv);
     for (const [key, value] of Object.entries(PLOINKY_SKILL_SCOPE_ENV)) envStrings.push(formatEnvFlag(key, value));
     // Only non-secret principal fields exist before topology attestation.
     for (const [key, value] of Object.entries(buildAgentPrincipalEnv(
@@ -2402,6 +2425,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         };
         try {
             const launchEnv = Object.freeze({
+                ...buildAgentLaunchEnv(launchId),
                 ...buildGeneratedRouterDescriptorEnv(payload),
                 ...buildAgentCredentialEnv(principalId, runtimeIdentity),
             });
@@ -2456,10 +2480,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
             const descriptorEnv = buildGeneratedRouterDescriptorEnv(payload);
             const credentialEnv = buildAgentCredentialEnv(principalId, runtimeIdentity);
+            verifyRegisteredLaunchId(existingRecord.launchId, record.Config.Env, payload.launchId);
             const expectedEnv = Object.freeze({
                 ...descriptorEnv,
                 ...credentialEnv,
                 ...managedControlEnv,
+                ...(existingRecord.launchId ? buildAgentLaunchEnv(existingRecord.launchId) : {}),
             });
             const expectedMounts = expectedBindMountsFromArgs(args, descriptorHostFile);
             const expectedEnvHash = computeSemanticEnvHash(payload);
@@ -2688,6 +2714,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         createdRegistryRecord = {
             ...launchRecord,
             type: 'agent', agentName, repoName, runtime, containerId,
+            launchId: launch?.env.PLOINKY_LAUNCH_ID || unmanagedLaunchEnv.PLOINKY_LAUNCH_ID,
             ...(options.alias ? { alias: options.alias } : {}),
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
@@ -2991,6 +3018,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         ? ['HF_HOME', 'PLOINKY_MODELS_DIR', 'PLOINKY_DERIVED_DIR', 'PLOINKY_RUNTIME_DIR', 'PLOINKY_LAUNCHERS_DIR', 'PLOINKY_MCP_PORT', 'PLOINKY_LLM_PUBLIC_PORT', 'PLOINKY_LLM_MCP_PORT', 'PLOINKY_LLM_CONTROL_PORT', 'PLOINKY_INFERENCE_PORT']
         : [];
     const persistedRecord = agents[containerName] || launchRecord;
+    const launchId = generatedLaunch?.env.PLOINKY_LAUNCH_ID || unmanagedLaunchEnv.PLOINKY_LAUNCH_ID;
     agents[containerName] = {
         agentName,
         repoName,
@@ -3015,6 +3043,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         type: 'agent',
         runtime,
         containerId: launchedContainerId,
+        ...(launchId ? { launchId } : {}),
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         agentLib: agentLibRuntimeRecord(containerAgentLibGrant),
@@ -4473,6 +4502,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 recreateReason ||= 'dependencyMountDrifted';
             }
             if (!canReuseExisting) debugLog(`[ensureAgentService] ${agentName}: host/none reuse rejected (${recreateReason})`);
+            // A reused registry record must keep the launch ID of this exact container.
+            if (canReuseExisting) verifyRegisteredLaunchId(existingRecord.launchId, inspectedRecords[0].Config?.Env);
         }
         if (canReuseExisting) {
             verifyReusableHardwareRuntime(serviceAdmission, {
@@ -4774,6 +4805,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         type: 'agent',
         runtime,
         containerId: started.containerId,
+        ...(startedRecord.launchId ? { launchId: startedRecord.launchId } : {}),
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         agentLib: structuredClone(startedRecord.agentLib),
