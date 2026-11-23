@@ -38,7 +38,7 @@ function write(file, value) {
 }
 
 function scratch(t) {
-    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-start-'));
+    const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'canary-start-')));
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
     return workspace;
 }
