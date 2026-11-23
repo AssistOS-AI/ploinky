@@ -17,6 +17,7 @@ const rawCommands = {
     restart: [],
     clean: [],
     status: [],
+    canary: ['status'],
     shutdown: [],
     stop: [],
     destroy: [],

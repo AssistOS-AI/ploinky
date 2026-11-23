@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 
 import { handleWebChat } from './handlers/webchat/index.js';
 import { handleStatus, streamWorkspaceMetrics } from './handlers/status.js';
+import { canaryStatus } from './canary/routerSignals.js';
 import { workspaceMetricsMonitor } from './workspaceMetrics.js';
 import { hardwareAvailabilityLatcher } from './hardwareAvailabilityLatcher.mjs';
 import { executeWorkspaceLogOperation } from './workspaceLogFiles.js';
@@ -453,6 +454,25 @@ async function processRequest(req, res) {
             { error: routePlan.code || 'route_denied' },
             { 'Cache-Control': 'no-store', ...proofHeaders, ...(routePlan.retryAfterSeconds ? { 'Retry-After': String(routePlan.retryAfterSeconds) } : {}) },
         );
+        return;
+    }
+    if (requestedUrl.pathname === '/api/router/canary/status' && routePlan.hostSelection?.kind === 'control') {
+        const headers = { 'Cache-Control': 'no-store' };
+        const auth = await ensureAuthenticated(req, res, requestedUrl, { routePlan });
+        if (!auth.ok || !requireAdminControlRequest(req, res)) return;
+        if (req.authMode !== 'local' || req.authChannel !== 'cli') {
+            sendJsonResponse(res, 403, { error: 'local_cli_session_required' }, headers);
+            return;
+        }
+        if (req.method !== 'GET') {
+            sendJsonResponse(res, 405, { error: 'method_not_allowed' }, { ...headers, Allow: 'GET' });
+            return;
+        }
+        if (!commitRouteGeneration(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, headers);
+            return;
+        }
+        sendJsonResponse(res, 200, canaryStatus(routePlan.lease.snapshot.routing.routes), headers);
         return;
     }
     if (routePlan.kind === 'mount-redirect') {

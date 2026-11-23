@@ -37,6 +37,12 @@ export function coverageRows(report = { requests: [], checks: [] }) {
     });
 }
 
+function adminExpectation(row) {
+    const expected = row.expected;
+    if (!expected?.localCliAdmin) return expected?.admin;
+    return `browser: ${expected.admin}, local CLI: ${expected.localCliAdmin}`;
+}
+
 export async function writeCoverage(outputRoot, report = { requests: [], checks: [], gaps: [] }) {
     const source = await fs.realpath(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
     const output = await artifactDestination(source, outputRoot);
@@ -51,7 +57,7 @@ export async function writeCoverage(outputRoot, report = { requests: [], checks:
         `Router rows: ${summary.routerRows}. Agent rows: ${summary.agentRows}. Manifest agents: ${summary.agents} (${summary.enabledAgents} recorded enabled). Declared MCP tools: ${summary.declaredTools}. Rows with request contact: ${summary.contactedRows}. Unexercised rows: ${summary.unexercisedRows}.`, '',
         '| ID / tool | Method | Router path | Source | Anonymous | selfRegistered | Ordinary user | Admin | Coverage / tests |',
         '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
-        ...rows.map(row => `| ${[row.tool || row.id, row.method, row.path, row.source, row.expected?.anonymous, row.expected?.selfRegistered, row.expected?.user, row.expected?.admin, `${row.coverage}; ${row.tests.join(', ') || row.gap || row.notes || 'No assertion executed'}`].map(escape).join(' | ')} |`),
+        ...rows.map(row => `| ${[row.tool || row.id, row.method, row.path, row.source, row.expected?.anonymous, row.expected?.selfRegistered, row.expected?.user, adminExpectation(row), `${row.coverage}; ${row.tests.join(', ') || row.gap || row.notes || 'No assertion executed'}`].map(escape).join(' | ')} |`),
         '', '## Explicit run gaps', '', ...(report.gaps || []).map(gap => `- ${escape(gap.id)}: ${escape(gap.reason)}`), '',
     ];
     await fs.writeFile(path.join(output, 'endpoint-coverage.md'), lines.join('\n'), { flag: 'wx', mode: 0o600 });

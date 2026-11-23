@@ -11,6 +11,7 @@ import * as envSvc from '../utils/security/secretVars.js';
 import * as agentsSvc from '../utils/agents.js';
 import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../utils/status.js';
 import { runLogCommand } from './logCommands.js';
+import { runCanaryCommand } from './canaryCommand.js';
 import { activeForegroundSignal } from './foregroundCommand.js';
 import {
     startWorkspace,
@@ -746,6 +747,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             // One parser, resolver, and state machine serve the REPL and the
             // lightweight one-shot entry point in cli/index.js.
             return runLogCommand(['logs', ...options], { signal: activeForegroundSignal() });
+        case 'canary':
+            return runCanaryCommand(options);
         case 'clean':
             inactivateEdgeRoutingGeneration('cli-workspace-clean');
             console.log('[clean] Removing all workspace containers...');

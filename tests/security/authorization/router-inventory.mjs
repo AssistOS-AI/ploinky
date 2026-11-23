@@ -4,6 +4,8 @@
  * A row is an inventory obligation, not a claim that a live test passed.
  */
 import fs from 'node:fs';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { collectRouterSourceDrift, hasRouterSourceReference, normalizeRouterInventory, resolveRouterSourceReference } from './router-source-references.mjs';
 import { buildLiveSessionsRouterInventory } from './router-live-sessions-inventory.mjs';
 
@@ -150,12 +152,34 @@ export const routerInventoryHistorical = Object.freeze(routerInventoryBaseline.m
     return row;
   }
 }));
+// The four inventory principals use browser sessions. Only the separately
+// authenticated local CLI administrator can read this control-host endpoint.
+function currentRouterInventory(historical, readSource) {
+  const current = buildLiveSessionsRouterInventory(historical, readSource('cli/server/handlers/webtty.js'));
+  const file = 'cli/server/RoutingServer.js';
+  const bytes = readSource(file);
+  const sourceBlobSha256 = 'acee67c7fd42d103b8ff66b8f63a557f8c8de14be393b285ca29928b13aa70b0';
+  const line = 459;
+  const path = '/api/router/canary/status';
+  const anchor = `if (requestedUrl.pathname === '${path}' && routePlan.hostSelection?.kind === 'control') {`;
+  assert.equal(createHash('sha256').update(bytes).digest('hex'), sourceBlobSha256, 'UNREVIEWED_CANARY_STATUS_SOURCE');
+  assert.equal(bytes.toString().split('\n')[line - 1]?.trim(), anchor, 'CANARY_STATUS_STATEMENT_MISMATCH');
+  const row = Object.freeze({
+    id: 'canary-status.get', method: 'GET', path, source: `${file}:${line}`, sourceBlobSha256, anchor,
+    expected: { ...access.private, localCliAdmin: 'allow' },
+    notes: 'Control host only. Requires an authenticated local CLI administrator and a current routing generation. Browser administrators are denied.',
+    coverage: 'inventoried; live evidence required',
+  });
+  assert.ok(current.every(existing => existing.id !== row.id), 'DUPLICATE_ROUTER_OBLIGATION');
+  return Object.freeze([...current, row]);
+}
+
 // Keep source-independent checks loadable when either historical references or
 // the Live Sessions overlay drift. The mandatory check below reports failure;
 // overlay tests also reject this historical-only fallback.
 export const routerInventory = (() => {
   try {
-    return buildLiveSessionsRouterInventory(routerInventoryHistorical, readRouterSource('cli/server/handlers/webtty.js'));
+    return currentRouterInventory(routerInventoryHistorical, readRouterSource);
   } catch {
     return routerInventoryHistorical;
   }
@@ -172,9 +196,11 @@ export function routerSourceDrift({ readSource = readRouterSource } = {}) {
   if (!drift.length) {
     try {
       const historical = routerInventoryBaseline.map(row => resolveRouterSourceReference(row, readSource(row.source.split(':')[0])));
-      buildLiveSessionsRouterInventory(historical, readSource('cli/server/handlers/webtty.js'));
+      currentRouterInventory(historical, readSource);
     } catch (error) {
-      drift.push(`LIVE_SESSIONS_SOURCE_DRIFT: ${String(error?.message ?? error).split('\n')[0]}`);
+      const reason = String(error?.message ?? error).split('\n')[0];
+      const surface = reason.includes('CANARY_STATUS') ? 'CANARY_STATUS' : 'LIVE_SESSIONS';
+      drift.push(`${surface}_SOURCE_DRIFT: ${reason}`);
     }
   }
   return drift;
