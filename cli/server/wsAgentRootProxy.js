@@ -2,15 +2,16 @@ import http from 'node:http';
 
 import { buildIdentityHeaders, ensureHttpRouteAccess } from './authHandlers/authContext.js';
 import {
-    commitRoutePlan,
     httpAccessForEdgeRoutePlan,
     resolveEdgeRoutePlan,
 } from './edgeRoutePlan.js';
 import {
-    buildTrustedForwardingHeaders,
-    createLeaseCommittedAgent,
+    buildTrustedForwardingHeaders, readPublicCanaryUserId,
     stripRouterIdentityHeaders,
 } from './routerHandlers.js';
+import { openRootConnection, withSelectedRoot } from './proxy/executeHttpPlan.js';
+import { observeProxyFirstByte, observeProxyOutcome } from './canary/proxyOutcomes.js';
+import { trackCanaryConnection } from './canary/selection.mjs';
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 
@@ -95,25 +96,33 @@ export async function handleAgentRootUpgrade({
         ...buildIdentityHeaders(req),
         ...buildTrustedForwardingHeaders(plan),
     };
-    const targetPort = Number(plan.target?.hostPort || 0);
-    if (!Number.isSafeInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
-        closeSocket(socket, 503);
+    if (plan.route?.canary && plan.decision?.access === 'public') req.canaryPublicUserId = readPublicCanaryUserId(req);
+    let selection;
+    let upstream;
+    const startedAt = Date.now();
+    try {
+        await withSelectedRoot({ req, plan }, (selected, check) => {
+            selection = selected;
+            const targetPort = selected.route.hostPort;
+            headers.host = `127.0.0.1:${targetPort}`;
+            const connection = openRootConnection(selected, check);
+            try {
+                upstream = http.request({ hostname: '127.0.0.1', port: targetPort, method: 'GET',
+                    path: plan.upstreamPath, headers, agent: connection.agent });
+            } catch (error) {
+                connection.socket.destroy();
+                throw error;
+            }
+        });
+    } catch (error) {
+        closeSocket(socket, error.status || 502, undefined, error.status === 503 ? { 'Retry-After': '1' } : {});
         return true;
     }
-    headers.host = `127.0.0.1:${targetPort}`;
-
-    const upstream = http.request({
-        hostname: '127.0.0.1',
-        port: targetPort,
-        method: 'GET',
-        path: plan.upstreamPath,
-        headers,
-        agent: createLeaseCommittedAgent(() => commitRoutePlan(plan)),
-    });
     let settled = false;
     const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        observeProxyOutcome({ plan: selection, outcome: 'failure', unreachable: true });
         try { upstream.destroy(); } catch (_) {}
         closeSocket(socket, 504);
     }, HANDSHAKE_TIMEOUT_MS);
@@ -126,6 +135,13 @@ export async function handleAgentRootUpgrade({
         }
         settled = true;
         clearTimeout(timer);
+        observeProxyFirstByte({ plan: selection, ttfbMs: Date.now() - startedAt });
+        let targetFailed = false;
+        upstreamSocket.once('error', () => { targetFailed = !socket.destroyed; });
+        upstreamSocket.once('close', () => observeProxyOutcome({ plan: selection,
+            outcome: targetFailed ? 'failure' : 'success', upstreamStatus: upstreamResponse.statusCode, serverError: targetFailed }));
+        const untrack = trackCanaryConnection(selection, () => { upstreamSocket.destroy(); socket.destroy(); });
+        upstreamSocket.once('close', untrack);
         if (socket.destroyed || !socket.writable) {
             try { upstreamSocket.destroy(); } catch (_) {}
             try { upstream.destroy(); } catch (_) {}
@@ -162,12 +178,16 @@ export async function handleAgentRootUpgrade({
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        observeProxyOutcome({ plan: selection, outcome: 'success', upstreamStatus: response.statusCode, ttfbMs: Date.now() - startedAt });
+        response.resume();
         closeSocket(socket, response.statusCode || 502, response.statusMessage);
     });
     upstream.once('error', (error) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (!socket.destroyed) observeProxyOutcome({ plan: selection, outcome: 'failure', error,
+            serverError: true, unreachable: ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH'].includes(error.code) });
         closeSocket(socket, error?.code === 'EDGE_GENERATION_CHANGED' ? 503 : 502);
     });
     upstream.end();

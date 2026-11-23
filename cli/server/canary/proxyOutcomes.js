@@ -86,3 +86,65 @@ export function observeProxyOutcome({
         // Observation must never interrupt proxy completion or audit delivery.
     }
 }
+
+// Headers can arrive hours before an SSE/WS closes. A timing observation
+// updates the latency distribution without declaring the stream successful.
+export function observeProxyFirstByte({ plan, ttfbMs }) {
+    if (!registration || !plan?.routeKey || !Number.isFinite(ttfbMs) || ttfbMs < 0) return;
+    try {
+        registration.sink({ routeKey: plan.routeKey, copy: plan.copy || 'old', rolloutId: plan.rolloutId,
+            timingOnly: true, ttfbMs });
+    } catch { /* Observation cannot interrupt forwarding. */ }
+}
+
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { channel } from 'node:diagnostics_channel';
+
+const sdkTiming = new AsyncLocalStorage();
+const sdkRequests = new WeakMap();
+const requestCreated = channel('undici:request:create');
+const responseHeaders = channel('undici:request:headers');
+let activeSdkCalls = 0;
+
+function sdkRequestCreated({ request }) {
+    const scope = sdkTiming.getStore();
+    if (!scope?.active || request.method !== 'POST' || request.path !== '/mcp'
+        || String(request.origin) !== scope.origin) return;
+    // A cold SDK client initializes and acknowledges a session before issuing
+    // the actual RPC. Each new POST replaces the previous provisional sample.
+    const attempt = { scope, started: performance.now() };
+    scope.latest = attempt;
+    scope.ttfbMs = undefined;
+    sdkRequests.set(request, attempt);
+}
+
+function sdkResponseHeaders({ request, response }) {
+    const attempt = sdkRequests.get(request);
+    if (!attempt || response.statusCode < 200) return;
+    sdkRequests.delete(request);
+    if (attempt.scope.active && attempt.scope.latest === attempt) {
+        attempt.scope.ttfbMs = performance.now() - attempt.started;
+    }
+}
+
+// Keep subscriptions alive only while a measured SDK operation is in flight.
+// Fetch responses may arrive in a pooled socket's async context, so correlate
+// the header event by its Undici request object, never by socket or port alone.
+export async function withSdkHeaderTiming(baseUrl, run, reportTiming) {
+    if (!registration || !/^http:\/\/127\.0\.0\.1:\d+\/mcp$/.test(baseUrl)) return run();
+    const scope = { origin: baseUrl.slice(0, -'/mcp'.length), active: true };
+    if (activeSdkCalls++ === 0) {
+        requestCreated.subscribe(sdkRequestCreated);
+        responseHeaders.subscribe(sdkResponseHeaders);
+    }
+    try {
+        return await sdkTiming.run(scope, run);
+    } finally {
+        scope.active = false;
+        if (--activeSdkCalls === 0) {
+            requestCreated.unsubscribe(sdkRequestCreated);
+            responseHeaders.unsubscribe(sdkResponseHeaders);
+        }
+        reportTiming(scope.ttfbMs);
+    }
+}

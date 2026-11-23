@@ -3354,6 +3354,123 @@
             "anchor": null,
             "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
           }
+        },
+        "39e999f17a371d3badcf10d63a27b74ef25e46b725e275105aafb69a18365015": {
+          "root.get": {
+            "line": 827,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "root-index.get": {
+            "line": 827,
+            "anchor": null,
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "health.get": {
+            "line": 702,
+            "anchor": null,
+            "statement": "if (pathname === '/health') {"
+          },
+          "agent-card.get": {
+            "line": 791,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "agent-card-slash.get": {
+            "line": 791,
+            "anchor": null,
+            "statement": "return handleRoutedAggregateAgentCard(req, res, routePlan);"
+          },
+          "mcp-browser-client.get": {
+            "line": 531,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "mcp-browser-client.head": {
+            "line": 531,
+            "anchor": "pathname === '/MCPBrowserClient.js'",
+            "statement": "if (pathname === '/MCPBrowserClient.js') {"
+          },
+          "agent-root-proxy.*": {
+            "line": 792,
+            "anchor": null,
+            "statement": "} else if (agentName && isActiveAgentRootPlan(routePlan)) {"
+          },
+          "agent-mcp.post": {
+            "line": 797,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.get": {
+            "line": 797,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-mcp.delete": {
+            "line": 797,
+            "anchor": null,
+            "statement": "if (isAgentMcpRoute) {"
+          },
+          "agent-task-status.get": {
+            "line": 660,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-status-alias.get": {
+            "line": 660,
+            "anchor": null,
+            "statement": "&& isAgentTaskStatusProxyPath(agentProxyPath)"
+          },
+          "agent-task-cancel.post": {
+            "line": 610,
+            "anchor": null,
+            "statement": "} else if (isDelegatedAgentTaskCancelRoute) {"
+          },
+          "agent-openai.post": {
+            "line": 803,
+            "anchor": null,
+            "statement": "if (isDelegatedAgentOpenAi) {"
+          },
+          "agent-root-websocket.get": {
+            "line": 1092,
+            "anchor": null,
+            "statement": "const handled = await handleAgentRootUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });"
+          },
+          "agent-additional-websocket.get": {
+            "line": 1051,
+            "anchor": null,
+            "statement": "if (routePlan.kind === 'agent-port') {"
+          },
+          "internal-agent-control.*": {
+            "line": 546,
+            "anchor": null,
+            "statement": "if (hasInternalAgentSegment(pathname)) {"
+          },
+          "reserved--metrics.*": {
+            "line": 839,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--health-internal.*": {
+            "line": 839,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin.*": {
+            "line": 839,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "reserved--admin-*.*": {
+            "line": 839,
+            "anchor": null,
+            "statement": "return res.end('Not Found');"
+          },
+          "unix-health.get": {
+            "line": 1002,
+            "anchor": null,
+            "statement": "sendJsonResponse(res, 200, detailedHealthData(), { 'Cache-Control': 'no-store' });"
+          }
         }
       },
       "candidate": "27fb848deaa7824177c9fb16cc265da2b9bb9cc919021fcaacb18580026596a9"
@@ -4115,6 +4232,38 @@
           },
           "agent-static.head": {
             "line": 946,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          }
+        },
+        "53e924c733b646c897a541c5281c43e114209bb9e796571274d4cfcb36538035": {
+          "web-libs.get": {
+            "line": 836,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "web-libs.head": {
+            "line": 836,
+            "anchor": "async function serveWebLibRequest(req, res) {",
+            "statement": "async function serveWebLibRequest(req, res) {"
+          },
+          "workspace-file-read.get": {
+            "line": 800,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "workspace-file-read.head": {
+            "line": 800,
+            "anchor": "async function serveWorkspaceFileRequest(req, res) {",
+            "statement": "async function serveWorkspaceFileRequest(req, res) {"
+          },
+          "agent-static.get": {
+            "line": 955,
+            "anchor": "async function serveAgentStaticRequest(req, res, {",
+            "statement": "async function serveAgentStaticRequest(req, res, {"
+          },
+          "agent-static.head": {
+            "line": 955,
             "anchor": "async function serveAgentStaticRequest(req, res, {",
             "statement": "async function serveAgentStaticRequest(req, res, {"
           }
@@ -5184,6 +5333,33 @@
           },
           "private-turn-credentials.post": {
             "line": 865,
+            "anchor": "pathname === '/api/edge/turn-credentials'",
+            "statement": "if (pathname === '/api/edge/turn-credentials') {"
+          }
+        },
+        "25b27c42cbe452a61ed7aa7c433878b586e24b749632b8c40118e76bafb7cbd0": {
+          "agent-additional-http.*": {
+            "line": 214,
+            "anchor": "function agentPortPlan({",
+            "statement": "export function agentPortPlan({"
+          },
+          "private-workspace-logs.post": {
+            "line": 881,
+            "anchor": "pathname === '/api/edge/workspace-logs'",
+            "statement": "if (pathname === '/api/edge/workspace-logs') {"
+          },
+          "private-workspace-metrics.get": {
+            "line": 899,
+            "anchor": "pathname === '/api/edge/workspace-metrics'",
+            "statement": "if (pathname === '/api/edge/workspace-metrics') {"
+          },
+          "private-runtime-origins.get": {
+            "line": 917,
+            "anchor": "pathname === '/api/edge/runtime-origins'",
+            "statement": "if (pathname === '/api/edge/runtime-origins') {"
+          },
+          "private-turn-credentials.post": {
+            "line": 938,
             "anchor": "pathname === '/api/edge/turn-credentials'",
             "statement": "if (pathname === '/api/edge/turn-credentials') {"
           }

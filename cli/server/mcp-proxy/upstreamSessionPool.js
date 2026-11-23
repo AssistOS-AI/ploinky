@@ -94,13 +94,19 @@ export function poolKeyForRoutePlan(routePlan) {
     if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) return null;
     // The proxy dials route.hostPort; refuse a plan whose route disagrees.
     if (routePlan.route?.hostPort !== undefined && Number(routePlan.route.hostPort) !== hostPort) return null;
-    return JSON.stringify([routeKey, leaseId, hostPort, containerId, instanceId, enableGeneration]);
+    const key = [routeKey, leaseId, hostPort, containerId, instanceId, enableGeneration];
+    if (record.launchId || routePlan.copy === 'canary') {
+        key.push(text(record.launchId), routePlan.copy === 'canary' ? 'canary' : 'old');
+    }
+    return JSON.stringify(key);
 }
 
 function slotForKey(key) {
     try {
         const parsed = JSON.parse(key);
-        if (Array.isArray(parsed) && typeof parsed[0] === 'string' && parsed[0]) return parsed[0];
+        if (Array.isArray(parsed) && typeof parsed[0] === 'string' && parsed[0]) {
+            return JSON.stringify([parsed[0], parsed[7] === 'canary' ? 'canary' : 'old']);
+        }
     } catch (_) { }
     return key;
 }
@@ -439,7 +445,7 @@ export function createUpstreamSessionPool({
         }
     }
 
-    function post(entry, body, { sessionId = '', authorization = '', timeoutMs }) {
+    function post(entry, body, { sessionId = '', authorization = '', timeoutMs, onHeaders }) {
         assertOpen();
         return new Promise((resolve, reject) => {
             const payload = Buffer.from(JSON.stringify(body), 'utf8');
@@ -462,6 +468,7 @@ export function createUpstreamSessionPool({
                 if (timer) clearTimeout(timer);
                 fn(value);
             };
+            const started = performance.now();
             const request = httpImpl.request({
                 host: '127.0.0.1',
                 port: entry.hostPort,
@@ -493,6 +500,7 @@ export function createUpstreamSessionPool({
             request.on('timeout', timedOut);
             request.on('response', (response) => {
                 responded = true;
+                onHeaders?.(performance.now() - started);
                 const chunks = [];
                 response.on('data', (chunk) => chunks.push(chunk));
                 response.on('error', fail);
@@ -629,7 +637,7 @@ export function createUpstreamSessionPool({
         throw poolError(UPSTREAM_SESSION_LOST, 'upstream MCP session could not be established', { retryable: false });
     }
 
-    async function attempt({ key, hostPort, method, params, headers, beforeDial, beforeDispatch, refusal, timeoutMs }) {
+    async function attempt({ key, hostPort, method, params, headers, beforeDial, beforeDispatch, refusal, timeoutMs, onHeaders }) {
         const deadline = Date.now() + timeoutMs;
         const entry = await acquire(key, hostPort, beforeDial, Math.min(timeoutMs, DEFAULT_REQUEST_TIMEOUT_MS));
         assertOpen();
@@ -667,6 +675,7 @@ export function createUpstreamSessionPool({
             const response = await post(entry, { jsonrpc: '2.0', id, method, params: params ?? {} }, {
                 sessionId: entry.sessionId,
                 authorization,
+                onHeaders,
                 timeoutMs: Math.max(1, deadline - Date.now()),
             });
             const message = interpretRpcResponse(response, id, { dispatched: true });
@@ -705,6 +714,8 @@ export function createUpstreamSessionPool({
         beforeDispatch = null,
         timeoutMs,
         ensureReady = null,
+        onHeaders = null,
+        onRetryError = null,
     } = {}) {
         assertOpen();
         if (typeof key !== 'string' || !key) throw new TypeError('upstream pool request requires a key');
@@ -732,17 +743,20 @@ export function createUpstreamSessionPool({
                     beforeDispatch: beforeDispatch || null,
                     refusal,
                     timeoutMs: effectiveTimeoutMs,
+                    onHeaders,
                 });
             } catch (error) {
                 if (refusal.byCaller) throw error;
                 assertOpen();
                 if (!error?.retryable || attemptIndex >= 1) throw error;
                 counters.retries += 1;
+                onRetryError?.(error);
                 if (typeof ensureReady === 'function') {
                     let ready = false;
                     try {
                         ready = (await ensureReady()) === true;
-                    } catch (_) {
+                    } catch (error) {
+                        if (error?.code === 'CANARY_SELECTION_CHANGED') throw error;
                         ready = false;
                     }
                     assertOpen();

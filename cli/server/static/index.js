@@ -571,6 +571,7 @@ async function sendOpenedFile(req, res, filePath, {
     templateAware = false,
     fetchedTemplate = false,
     openFile = null,
+    beforeRead,
 } = {}) {
     if (responseGone(res)) return true;
     let handle;
@@ -594,6 +595,13 @@ async function sendOpenedFile(req, res, filePath, {
         // Last await is behind us: a gone client is handled here, and the
         // finally block closes the handle because no stream was started.
         if (responseGone(res)) return true;
+        // The descriptor is open and fstat has completed. Commit before any
+        // validator, headers or bytes from this copy can reach the caller.
+        if (beforeRead && beforeRead() !== true) {
+            res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Retry-After': '1' });
+            res.end(JSON.stringify({ error: 'edge_generation_changed' }));
+            return true;
+        }
         const size = Number(stat.size);
         const etag = `W/"${stat.size}-${stat.mtimeNs}-${stat.ino}"`;
         const mtimeMs = Number(stat.mtimeNs / 1000000n);
@@ -663,7 +671,8 @@ async function sendOpenedFile(req, res, filePath, {
         }
         stream.pipe(res);
         return true;
-    } catch (_) {
+    } catch (error) {
+        if (error?.status) throw error;
         return false;
     } finally {
         if (!streamStarted) await handle.close().catch(() => { });
@@ -917,7 +926,7 @@ async function resolveAgentStaticFile(agentName, agentRelPath, options = {}) {
         ? await normalizeAgentHostPath(options.hostPath)
         : await getAgentHostPath(agentName);
     if (!root) return null;
-    const allowedRoots = await getAgentAllowedRoots(agentName, capturedHostPath ? { hostPath: root } : {});
+    const allowedRoots = options.confinedExport ? [root] : await getAgentAllowedRoots(agentName, capturedHostPath ? { hostPath: root } : {});
     const candidate = safeJoin(root, agentRelPath);
     if (!candidate) return null;
     try {
@@ -947,6 +956,8 @@ async function serveAgentStaticRequest(req, res, {
     routeKey = null,
     hostPath = null,
     beforeRead = null,
+    beforeServe = null,
+    confinedExport = false,
 } = {}) {
     try {
         const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -956,24 +967,30 @@ async function serveAgentStaticRequest(req, res, {
         const agent = parts[0];
         if (routeKey !== null && agent !== routeKey) return false;
         const rest = parts.slice(1).join('/');
-        const target = await resolveAgentStaticFile(agent, rest, routeKey !== null ? { hostPath } : {});
+        let target = await resolveAgentStaticFile(agent, rest, routeKey !== null ? { hostPath, confinedExport } : {});
         if (target) {
-            if (typeof beforeRead === 'function' && beforeRead() !== true) {
-                res.writeHead(503, {
-                    'Content-Type': 'application/json',
-                    'Cache-Control': 'no-store',
-                });
+            if (confinedExport) {
+                const workspace = getWorkspaceRoot();
+                const canonicalRoot = path.resolve(await fs.promises.realpath(workspace), path.relative(workspace, hostPath));
+                target = await fs.promises.realpath(target);
+                if (!target.startsWith(canonicalRoot + path.sep)) return false;
+            }
+            if (beforeRead && beforeRead() !== true) {
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Retry-After': '1' });
                 res.end(JSON.stringify({ error: 'edge_generation_changed' }));
                 return true;
             }
-            if (await sendFile(res, target, {
-                req,
+            if (await sendOpenedFile(req, res, target, {
+                openFile: confinedExport ? openClassifiedWorkspaceFile : undefined,
+                beforeRead: beforeServe,
                 authenticated: true,
                 templateAware: true,
                 fetchedTemplate: isFetchedTemplateRequest(req),
             })) return true;
         }
-    } catch (_) { }
+    } catch (error) {
+        if (error?.status) throw error;
+    }
     return false;
 }
 

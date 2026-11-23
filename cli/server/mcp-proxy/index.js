@@ -21,6 +21,9 @@ import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
 import { policy } from '../policy/index.js';
+import { leaseRouteHardwareAvailability } from '../hardwareAvailability.mjs';
+import { assertSelectionCurrent, selectRouteRuntime } from '../canary/selection.mjs';
+import { observeProxyOutcome, withSdkHeaderTiming } from '../canary/proxyOutcomes.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
 import { MCP_SESSION_INVALID_ERROR } from './sessionErrors.js';
@@ -117,15 +120,96 @@ function resolveGuestInvocationScope(req) {
 
 // `upstream` is an agent client or the pooled caller from
 // createUpstreamMcpCaller; both expose listTools().
-async function getToolSchemasForAgent(agentName, upstream) {
+function cacheToolSchemas(runtimeKey, tools) {
+    // A long-lived Router sees many generations. Bound retired schemas as
+    // well as their lifetime, including for unpooled SDK callers.
+    agentToolSchemaCache.delete(runtimeKey);
+    agentToolSchemaCache.set(runtimeKey, { loadedAt: Date.now(), tools });
+    if (agentToolSchemaCache.size > 256) agentToolSchemaCache.delete(agentToolSchemaCache.keys().next().value);
+}
+
+function schemaKey(selection, agentName, route) {
+    const record = selection?.targetRecord;
+    // A legacy container has no launch claim. Its immutable container id
+    // identifies the same schemas even when the loopback forwarder changes.
+    if (!route.canary && record?.containerId && !record.launchId) {
+        return JSON.stringify([agentName, record.containerId, record.instanceId, record.enableGeneration]);
+    }
+    return selection?.runtimeKey ?? JSON.stringify([agentName, route.container, route.hostPort]);
+}
+
+async function getToolSchemasForAgent(runtimeKey, upstream) {
     const now = Date.now();
-    const cached = agentToolSchemaCache.get(agentName);
+    const cached = agentToolSchemaCache.get(runtimeKey);
     if (cached && now - cached.loadedAt < TOOL_SCHEMA_CACHE_TTL_MS) {
         return cached.tools;
     }
     const tools = await upstream.listTools();
-    agentToolSchemaCache.set(agentName, { loadedAt: now, tools });
+    cacheToolSchemas(runtimeKey, tools);
     return tools;
+}
+
+// Retry only a refusal raised synchronously by a selection guard before the
+// backend dispatch. In particular, a failed tool invocation is never replayed.
+async function runSelectedMcp({ req, route, agentName, routePlan, taskId, signals, beforeDial }, run) {
+    const snapshot = routePlan?.lease?.snapshot;
+    for (let attempt = 0; ; attempt++) {
+        const selection = selectRouteRuntime({ req, route, routeKey: agentName, snapshot, taskId, signals });
+        const requireAvailable = () => {
+            if (route?.canary && leaseRouteHardwareAvailability(routePlan?.lease, agentName, selection.route.container)) {
+                throw Object.assign(new Error('hardware_unavailable'), { status: 503, code: 'AGENT_HARDWARE_UNAVAILABLE' });
+            }
+        };
+        const check = () => {
+            if (beforeDial && beforeDial() !== true) return false;
+            assertSelectionCurrent(selection);
+            requireAvailable();
+            return true;
+        };
+        try {
+            requireAvailable();
+            return await run(selection, check, snapshot);
+        } catch (error) {
+            if (attempt || error?.code !== 'CANARY_SELECTION_CHANGED') throw error;
+        }
+    }
+}
+
+function requireCurrent(check) {
+    if (check() !== true) {
+        throw Object.assign(new Error('edge_generation_changed'), { code: 'EDGE_GENERATION_CHANGED', status: 503 });
+    }
+}
+
+// SDK RPC errors and transport errors are classified before the Router
+// converts them into HTTP 200 JSON-RPC replies. Local policy/mint/lease
+// failures have no observed backend status and produce no backend sample.
+export function observeMcpResult(selection, { result, error, ttfbMs } = {}) {
+    const plan = selection;
+    if (!error) {
+        observeProxyOutcome({ plan, outcome: 'success', status: 200, serverError: result?.isError === true, ttfbMs });
+        return;
+    }
+    if (error.notReady || error.queued) return;
+    const code = error?.cause?.cause?.code ?? error?.cause?.code ?? error?.code;
+    const rpcCode = error.rpcCode ?? (Number.isInteger(error.code) && error.code < 0 ? error.code : null);
+    if ([-32700, -32600, -32601, -32602, -32003].includes(rpcCode)) {
+        observeProxyOutcome({ plan, outcome: 'failure', status: 400 });
+        return;
+    }
+    const transport = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH'].includes(code)
+        || (error.timedOut && !error.queued) || rpcCode === -32001;
+    // StreamableHTTPClientTransport 1.x reports an HTTP refusal as a plain
+    // Error. Its stable prefix carries the status before any backend text.
+    const sdkStatus = /^Error POSTing to endpoint \(HTTP ([1-5]\d\d)\):/.exec(error.message || '');
+    const status = sdkStatus ? Number(sdkStatus[1])
+        : error.code === 'UPSTREAM_TRANSPORT' || error.code === 'UPSTREAM_SESSION_LOST' ? error.status : undefined;
+    const protocolFailure = error.code === 'UPSTREAM_TRANSPORT' && !error.queued;
+    if (transport || protocolFailure || rpcCode != null || Number.isInteger(status)) {
+        observeProxyOutcome({ plan, outcome: 'failure', upstreamStatus: rpcCode != null && !transport ? 200 : status,
+            unreachable: transport, serverError: transport || rpcCode != null || status >= 500
+                || (protocolFailure && (status == null || status < 400)), ttfbMs });
+    }
 }
 
 function resolveUpstreamPoolKey({ pool, routePlan, route, beforeDial }) {
@@ -149,12 +233,15 @@ function upstreamRpcError(error) {
  * key exists, otherwise (or after a pool mismatch) today's per-call SDK client.
  * `mintHeaders` is called once per attempt so every attempt carries a new token.
  */
-function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, beforeDispatch = null, pool, poolKey, ensureReady }) {
+function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, beforeDispatch = null, pool, poolKey, ensureReady, selection }) {
     let sharedClient = null;
     const sdkClientOptions = (headers) => ({
         ...(headers ? { requestHeaders: headers } : {}),
         ...(beforeDial ? { beforeConnect: beforeDial } : {}),
-        ...(beforeDispatch ? { beforeDispatch } : {}),
+        beforeDispatch: () => {
+            if (beforeDial) requireCurrent(beforeDial);
+            beforeDispatch?.();
+        },
     });
     const shared = () => {
         if (!sharedClient) sharedClient = createAgentClient(baseUrl, sdkClientOptions(null));
@@ -163,6 +250,17 @@ function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, beforeDispatch
     const usePool = () => Boolean(pool && poolKey && !pool.usesFallback(poolKey));
 
     async function withPool(method, params, headers, sdkPath) {
+        let ttfbMs;
+        try {
+            const reply = await dispatch(method, params, headers, sdkPath, ms => { ttfbMs = ms; });
+            observeMcpResult(selection, { result: reply.result, ttfbMs });
+            return reply;
+        } catch (error) {
+            observeMcpResult(selection, { error, ttfbMs });
+            throw error;
+        }
+    }
+    async function dispatch(method, params, headers, sdkPath, onHeaders) {
         if (usePool()) {
             try {
                 const message = await pool.request({
@@ -178,6 +276,11 @@ function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, beforeDispatch
                     beforeDispatch,
                     timeoutMs: upstreamTimeoutForMethod(method),
                     ensureReady,
+                    onHeaders,
+                    onRetryError: error => {
+                        observeMcpResult(selection, { error });
+                        onHeaders(undefined);
+                    },
                 });
                 if (message.error) throw upstreamRpcError(message.error);
                 return { pooled: true, result: message.result };
@@ -187,7 +290,7 @@ function createUpstreamMcpCaller({ baseUrl, hostPort, beforeDial, beforeDispatch
                 if (!(error?.poolMismatch && replayable)) throw error;
             }
         }
-        return { pooled: false, result: await sdkPath() };
+        return { pooled: false, result: await withSdkHeaderTiming(baseUrl, sdkPath, onHeaders) };
     }
 
     async function withToolClient(mintHeaders, run) {
@@ -232,7 +335,8 @@ async function canonicalizeToolArguments(agentName, agentClient, toolName, args)
     try {
         const tools = await getToolSchemasForAgent(agentName, agentClient);
         return sanitizeArgumentsForTool(args, tools, toolName);
-    } catch (_) {
+    } catch (error) {
+        if (error?.code === 'CANARY_SELECTION_CHANGED' || error?.code === 'EDGE_GENERATION_CHANGED') throw error;
         return args && typeof args === 'object' && !Array.isArray(args) ? args : {};
     }
 }
@@ -243,6 +347,7 @@ export async function invokeAuthenticatedAgentTool({
     agentName,
     toolName,
     arguments: rawArguments = {},
+    routePlan, beforeDial, signals, taskId,
 }) {
     const caller = policy.resolveCaller(req);
     if (caller?.kind !== 'user') {
@@ -260,145 +365,97 @@ export async function invokeAuthenticatedAgentTool({
         error.status = decision.status || 403;
         throw error;
     }
-    if (!route?.hostPort) {
-        const error = new Error('continuation_agent_unavailable');
-        error.status = 409;
-        throw error;
-    }
-    const baseUrl = `http://127.0.0.1:${route.hostPort}/mcp`;
-    const agentClient = createAgentClient(baseUrl);
-    try {
-        const args = await canonicalizeToolArguments(agentName, agentClient, toolName, rawArguments);
-        const context = buildInvocationContextForProviderCall({
-            req,
-            route,
-            agentName,
-            toolName,
-            toolArgs: args,
+    return runSelectedMcp({ req, route, agentName, taskId, routePlan, beforeDial, signals }, async (selection, check, snapshot) => {
+        if (!selection.route?.hostPort) throw Object.assign(new Error('continuation_agent_unavailable'), { status: 409 });
+        const upstream = createUpstreamMcpCaller({
+            baseUrl: `http://127.0.0.1:${selection.route.hostPort}/mcp`,
+            beforeDial: check,
+            beforeDispatch: () => requireCurrent(check),
+            selection,
         });
-        const toolClient = createAgentClient(baseUrl, context?.token
-            ? { requestHeaders: { authorization: `Bearer ${context.token}` } }
-            : undefined);
         try {
-            return await toolClient.callTool(toolName, args);
+            const args = await canonicalizeToolArguments(schemaKey(selection, agentName, route), upstream, toolName, rawArguments);
+            return await upstream.callTool(toolName, args, () => {
+                const invocation = buildInvocationContextForProviderCall({ req, route: selection.route, agentName,
+                    toolName, toolArgs: args, snapshot, targetRecord: selection.targetRecord });
+                return invocation?.token ? { authorization: `Bearer ${invocation.token}` } : null;
+            });
         } finally {
-            await toolClient.close().catch(() => {});
+            await upstream.close();
         }
-    } finally {
-        await agentClient.close().catch(() => {});
-    }
-}
-
-export async function readAuthenticatedAgentTask({ req, route, agentName, taskId }) {
-    const caller = policy.resolveCaller(req);
-    if (caller?.kind !== 'user') {
-        const error = new Error('authenticated_user_required');
-        error.status = 401;
-        throw error;
-    }
-    if (!route?.hostPort) {
-        const error = new Error('continuation_agent_unavailable');
-        error.status = 409;
-        throw error;
-    }
-    const normalizedTaskId = String(taskId || '').trim();
-    const context = buildInvocationContextForProviderCall({
-        req,
-        route,
-        agentName,
-        toolName: TASK_STATUS_TOOL,
-        toolArgs: { taskId: normalizedTaskId },
-        method: 'GET',
-        path: '/task',
-    });
-    const url = new URL(`http://127.0.0.1:${route.hostPort}/task`);
-    url.searchParams.set('taskId', normalizedTaskId);
-    return await new Promise((resolve, reject) => {
-        const request = http.request(url, {
-            method: 'GET',
-            headers: {
-                accept: 'application/json',
-                ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
-            },
-        }, (response) => {
-            const chunks = [];
-            response.on('data', (chunk) => chunks.push(chunk));
-            response.on('end', () => {
-                const text = Buffer.concat(chunks).toString('utf8');
-                let payload = null;
-                try { payload = JSON.parse(text); } catch (_) { }
-                if ((response.statusCode || 500) >= 400 || !payload?.task) {
-                    const error = new Error(payload?.reason || payload?.error || `task_status_${response.statusCode}`);
-                    error.status = response.statusCode || 502;
-                    reject(error);
-                    return;
-                }
-                resolve(payload.task);
-            });
-        });
-        request.on('error', reject);
-        request.end();
     });
 }
 
-export async function cancelAuthenticatedAgentTask({ req, route, agentName, taskId }) {
-    const caller = policy.resolveCaller(req);
-    if (caller?.kind !== 'user') {
-        const error = new Error('authenticated_user_required');
-        error.status = 401;
-        throw error;
-    }
-    if (!route?.hostPort) {
-        const error = new Error('task_agent_unavailable');
-        error.status = 409;
-        throw error;
-    }
-    const normalizedTaskId = String(taskId || '').trim();
-    if (!normalizedTaskId) {
-        const error = new Error('invalid_remote_task_id');
-        error.status = 400;
-        throw error;
-    }
-    const args = { taskId: normalizedTaskId };
-    const context = buildInvocationContextForProviderCall({
-        req,
-        route,
-        agentName,
-        toolName: TASK_CANCEL_TOOL,
-        toolArgs: args,
-        method: 'POST',
-        path: TASK_CANCEL_PATH,
-    });
-    const payload = Buffer.from(JSON.stringify(args), 'utf8');
-    const url = new URL(`http://127.0.0.1:${route.hostPort}${TASK_CANCEL_PATH}`);
-    return await new Promise((resolve, reject) => {
-        const request = http.request(url, {
-            method: 'POST',
-            headers: {
-                accept: 'application/json',
-                'content-type': 'application/json',
-                'content-length': payload.length,
-                ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
-            },
-        }, (response) => {
-            const chunks = [];
-            response.on('data', (chunk) => chunks.push(chunk));
-            response.on('end', () => {
-                const text = Buffer.concat(chunks).toString('utf8');
-                let body = null;
-                try { body = JSON.parse(text); } catch (_) { }
-                if ((response.statusCode || 500) >= 400 || !body?.task) {
-                    const error = new Error(body?.reason || body?.error || `task_cancel_${response.statusCode}`);
-                    error.status = response.statusCode || 502;
-                    reject(error);
-                    return;
-                }
-                resolve(body.task);
-            });
+function requestTask(options, cancel) {
+    const { req, agentName, taskId } = options;
+    const method = cancel ? 'POST' : 'GET';
+    const path = cancel ? TASK_CANCEL_PATH : '/task';
+    const toolArgs = { taskId };
+    const payload = cancel ? Buffer.from(JSON.stringify(toolArgs)) : undefined;
+    return runSelectedMcp(options, (selection, check, snapshot) => {
+        if (!selection.route?.hostPort) {
+            throw Object.assign(new Error(cancel ? 'task_agent_unavailable' : 'continuation_agent_unavailable'), { status: 409 });
+        }
+        const context = buildInvocationContextForProviderCall({
+            req, agentName, route: selection.route, snapshot, targetRecord: selection.targetRecord,
+            toolName: cancel ? TASK_CANCEL_TOOL : TASK_STATUS_TOOL, toolArgs, method, path,
         });
-        request.on('error', reject);
-        request.end(payload);
+        if (req.delegatedAgentVerified && !context?.token) {
+            throw Object.assign(new Error('delegated_task_cancel_rejected'), { status: 401 });
+        }
+        const url = new URL(`http://127.0.0.1:${selection.route.hostPort}${path}`);
+        if (!cancel) url.searchParams.set('taskId', taskId);
+        return new Promise((resolve, reject) => {
+            const started = performance.now();
+            // A private, single-request Agent allocates the socket synchronously.
+            // Nothing has been sent when the version guard refuses this attempt.
+            requireCurrent(check);
+            const request = http.request(url, {
+                method,
+                agent: false,
+                headers: {
+                    accept: 'application/json',
+                    ...(payload ? { 'content-type': 'application/json', 'content-length': payload.length } : {}),
+                    ...(context?.token ? { authorization: `Bearer ${context.token}` } : {}),
+                },
+            }, response => {
+                observeProxyOutcome({ plan: selection, outcome: 'success', upstreamStatus: response.statusCode,
+                    ttfbMs: performance.now() - started });
+                resolve(response);
+            });
+            request.on('error', error => {
+                observeMcpResult(selection, { error });
+                reject(error);
+            });
+            request.end(payload);
+        });
     });
+}
+
+async function authenticatedTask(options, cancel) {
+    if (policy.resolveCaller(options.req)?.kind !== 'user') {
+        throw Object.assign(new Error('authenticated_user_required'), { status: 401 });
+    }
+    const taskId = String(options.taskId || '').trim();
+    if (cancel && !taskId) throw Object.assign(new Error('invalid_remote_task_id'), { status: 400 });
+    const response = await requestTask({ ...options, taskId }, cancel);
+    const chunks = [];
+    for await (const chunk of response) chunks.push(chunk);
+    let body;
+    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (_) {}
+    if ((response.statusCode || 500) >= 400 || !body?.task) {
+        throw Object.assign(new Error(body?.reason || body?.error || `task_${cancel ? 'cancel' : 'status'}_${response.statusCode}`),
+            { status: response.statusCode || 502 });
+    }
+    return body.task;
+}
+
+export function readAuthenticatedAgentTask(options) {
+    return authenticatedTask(options, false);
+}
+
+export function cancelAuthenticatedAgentTask(options) {
+    return authenticatedTask(options, true);
 }
 
 // `snapshot` is the request's edge-routing lease snapshot, when the caller has
@@ -586,6 +643,7 @@ export async function handleDelegatedAgentTaskCancel({
     route,
     agentName,
     beforeDial = null,
+    routePlan, signals,
 }) {
     const chunks = [];
     let size = 0;
@@ -607,45 +665,17 @@ export async function handleDelegatedAgentTaskCancel({
     const taskId = typeof body?.taskId === 'string' ? body.taskId.trim() : '';
     try {
         req.delegatedAgentVerified = verifyDelegatedAgentTaskCancelCall({ req, agentName, taskId });
-        if (!route?.hostPort) {
-            sendJson(res, 409, { error: 'task_agent_unavailable' });
-            return;
-        }
-        const context = buildInvocationContextForProviderCall({
-            req,
-            route,
-            agentName,
-            toolName: TASK_CANCEL_TOOL,
-            toolArgs: { taskId },
-            method: 'POST',
-            path: TASK_CANCEL_PATH,
-        });
-        if (beforeDial && await Promise.resolve(beforeDial()) !== true) {
-            sendJson(res, 503, { error: 'edge_generation_changed' });
-            return;
-        }
-        const payload = Buffer.from(JSON.stringify({ taskId }), 'utf8');
-        const upstream = http.request({
-            hostname: '127.0.0.1',
-            port: route.hostPort,
-            path: TASK_CANCEL_PATH,
-            method: 'POST',
-            headers: {
-                accept: 'application/json',
-                'content-type': 'application/json',
-                'content-length': payload.length,
-                authorization: `Bearer ${context.token}`,
-            },
-        }, (response) => {
-            res.writeHead(response.statusCode || 502, response.headers);
-            response.pipe(res);
-        });
-        upstream.on('error', () => sendJson(res, 502, { error: 'task_cancel_upstream_failed' }));
-        upstream.end(payload);
     } catch (error) {
-        sendJson(res, 401, {
-            error: 'delegated_task_cancel_rejected',
-            reason: error?.message || 'delegated task cancel verification failed',
+        sendJson(res, 401, { error: 'delegated_task_cancel_rejected', reason: error.message });
+        return;
+    }
+    try {
+        const response = await requestTask({ req, agentName, route, taskId, routePlan, beforeDial, signals }, true);
+        res.writeHead(response.statusCode || 502, response.headers);
+        response.pipe(res);
+    } catch (error) {
+        sendJson(res, error.status ?? error.statusCode ?? 502, {
+            error: error.status || error.statusCode ? error.message : 'task_cancel_upstream_failed',
         });
     }
 }
@@ -659,6 +689,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
     poolKey = null,
     ensureReady = null,
     snapshot = undefined,
+    selection = null,
 } = {}) {
     const isBatch = Array.isArray(payload);
     const messages = isBatch ? payload : [payload];
@@ -670,6 +701,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
 
     const message = messages[0];
     const baseUrl = `http://127.0.0.1:${route.hostPort}/mcp`;
+    const runtimeKey = schemaKey(selection, agentName, route);
 
     const owner = createMcpSessionOwner(req, 'agent', agentName);
     const admission = inspectMcpSession(agentSessionStore, req, owner);
@@ -742,6 +774,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
             toolName,
             toolArgs: toolArgs || {},
             snapshot,
+            targetRecord: selection?.targetRecord,
         });
         if (ctx?.token) {
             return { authorization: `Bearer ${ctx.token}` };
@@ -753,9 +786,11 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
         baseUrl,
         hostPort: route.hostPort,
         beforeDial,
-        beforeDispatch: stateless ? null : () => {
-            if (!isOwned()) throw Object.assign(new Error(MCP_SESSION_INVALID_ERROR.message), { code: 'MCP_SESSION_INVALID' });
+        beforeDispatch: () => {
+            if (!stateless && !isOwned()) throw Object.assign(new Error(MCP_SESSION_INVALID_ERROR.message), { code: 'MCP_SESSION_INVALID' });
+            if (selection) assertSelectionCurrent(selection);
         },
+        selection,
         pool,
         poolKey,
         ensureReady,
@@ -766,7 +801,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
                 const tools = await upstream.listTools();
                 // Cache the full schema set for argument canonicalization, but only
                 // advertise the tools this caller is permitted to invoke.
-                agentToolSchemaCache.set(agentName, { loadedAt: Date.now(), tools });
+                cacheToolSchemas(runtimeKey, tools);
                 const visibleTools = policy.mcpToolPolicy.filterTools(agentName, tools, policy.resolveCaller(req));
                 sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, result: { tools: visibleTools } }, sessionIdHeader);
                 break;
@@ -797,7 +832,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
                 const args = argPayload && typeof argPayload === 'object' && !Array.isArray(argPayload)
                     ? { ...argPayload }
                     : {};
-                const canonicalArgs = await canonicalizeToolArguments(agentName, upstream, name, args);
+                const canonicalArgs = await canonicalizeToolArguments(runtimeKey, upstream, name, args);
                 if (!stateless && !isOwned()) {
                     sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } }, null);
                     break;
@@ -837,6 +872,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
                 sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32601, message: `Method not found: ${message.method}` } }, sessionIdHeader);
         }
     } catch (err) {
+        if (err?.code === 'CANARY_SELECTION_CHANGED') throw err;
         const messageText = err?.notReady
             ? `Agent '${agentName}' is still starting. Try again in a moment.`
             : (err && err.message ? err.message : String(err || 'unknown error'));
@@ -874,6 +910,7 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
     routePlan = null,
     pool = agentUpstreamSessionPool,
     waitForAgentReady: waitForReady = waitForAgentReady,
+    signals,
 } = {}) {
     const method = (req.method || 'GET').toUpperCase();
     const isDelegatedAgentRequest = Boolean(readAuthorizationBearer(req));
@@ -1048,45 +1085,54 @@ async function handleAgentMcpRequest(req, res, route, agentName, {
             res.end(JSON.stringify({ error: 'agent_mcp_unavailable', detail }));
             return;
         }
-        const poolKey = resolveUpstreamPoolKey({ pool, routePlan, route, beforeDial });
-        // 'tcp' is an explicit statement that the port is the readiness signal;
-        // the request is still forwarded upstream afterwards.
-        const probeReadiness = () => waitForReady(route, {
-            timeoutMs: 5000,
-            intervalMs: 125,
-            probeTimeoutMs: 250,
-            beforeProbe: beforeDial,
-            ...(declaredProtocol === 'tcp' ? { protocol: 'tcp' } : {}),
-        });
-        const isReady = Boolean(poolKey && pool.isReady(poolKey)) || await probeReadiness();
-        if (admission.entry && agentSessionStore.get(admission.id) !== admission.entry) {
-            if (isJsonRpc && Object.hasOwn(message || {}, 'id')) {
-                sendJson(res, 200, { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } });
-            } else sendJson(res, 403, { error: MCP_SESSION_INVALID_ERROR.message });
-            return;
-        }
-        if (!isReady) {
-            sendAgentNotReady(res, { isJsonRpc, message, agentName });
-            return;
-        }
+        async function forward(selection, check, snapshot) {
+            const selectedRoute = selection.route;
+            const plan = selection.copy === 'canary' && routePlan
+                ? { ...routePlan, route: selectedRoute, copy: selection.copy, snapshot,
+                    target: { ...routePlan.target, hostPort: selectedRoute.hostPort } }
+                : routePlan;
+            const poolKey = resolveUpstreamPoolKey({ pool, routePlan: plan, route: selectedRoute, beforeDial });
+            // 'tcp' is an explicit statement that the port is the readiness signal;
+            // the request is still forwarded upstream afterwards.
+            const probeReadiness = () => waitForReady(selectedRoute, {
+                timeoutMs: 5000,
+                intervalMs: 125,
+                probeTimeoutMs: 250,
+                beforeProbe: check,
+                ...(declaredProtocol === 'tcp' ? { protocol: 'tcp' } : {}),
+            });
+            const isReady = Boolean(poolKey && pool.isReady(poolKey)) || await probeReadiness();
+            if (admission.entry && agentSessionStore.get(admission.id) !== admission.entry) {
+                if (isJsonRpc && Object.hasOwn(message || {}, 'id')) {
+                    sendJson(res, 200, { jsonrpc: '2.0', id: message.id ?? null, error: { ...MCP_SESSION_INVALID_ERROR } });
+                } else sendJson(res, 403, { error: MCP_SESSION_INVALID_ERROR.message });
+                return;
+            }
+            if (!isReady) {
+                sendAgentNotReady(res, { isJsonRpc, message, agentName });
+                return;
+            }
 
-        try {
             if (isJsonRpc) {
-                await handleAgentJsonRpc(req, res, route, agentName, payload, {
-                    beforeDial,
+                await handleAgentJsonRpc(req, res, selectedRoute, agentName, payload, {
+                    beforeDial: check,
                     pool: poolKey ? pool : null,
                     poolKey,
                     ensureReady: probeReadiness,
-                    snapshot: routePlan?.lease?.snapshot,
+                    snapshot,
+                    selection,
                 });
                 return;
             }
 
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'unsupported request for agent MCP proxy' }));
+        }
+        try {
+            await runSelectedMcp({ req, route, agentName, routePlan, signals, beforeDial }, forward);
         } catch (err) {
             const message = err && err.message ? err.message : String(err || 'unknown error');
-            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.writeHead(err.status ?? err.statusCode ?? 500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: message }));
         }
     });

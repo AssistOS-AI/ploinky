@@ -5,8 +5,13 @@ import { pipeline } from 'node:stream';
 import { createHmac, randomUUID } from 'node:crypto';
 
 import { sendJson } from './authHandlers/index.js';
+import { authService, parseCookies, SSO_AUTH_COOKIE_NAME } from './authHandlers/shared.js';
 import { createAgentClient } from './AgentClient.js';
-import { buildInvocationContextForProviderCall } from './mcp-proxy/index.js';
+import { buildInvocationContextForProviderCall, observeMcpResult } from './mcp-proxy/index.js';
+import { sanitizeArgumentsForTool } from './mcp-proxy/toolArguments.js';
+import { assertSelectionCurrent, selectRouteRuntime } from './canary/selection.mjs';
+import { routeAdmitted } from './canary/routeAdmission.mjs';
+import { withSdkHeaderTiming } from './canary/proxyOutcomes.js';
 import { buildRouterRequest } from './mcp-proxy/invocationMinter.js';
 import { deriveDelegationKey } from './mcp-proxy/mcpDelegations.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
@@ -164,7 +169,7 @@ function bindUpstreamToDownstream(res, upstream) {
     };
 }
 
-export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}, { beforeDial = null } = {}) {
+export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeaders = {}, { beforeDial = null, agent } = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const headers = {
         ...stripRouterIdentityHeaders(req.headers, {
@@ -181,7 +186,7 @@ export function proxyHttpPassthrough(req, res, targetPort, agentPath, extraHeade
         path: pathWithLeadingSlash,
         method: req.method,
         headers,
-        agent: createLeaseCommittedAgent(beforeDial),
+        agent: agent ?? createLeaseCommittedAgent(beforeDial),
     });
 
     upstream.on('error', err => {
@@ -210,9 +215,9 @@ function pathOnly(pathWithQuery = '') {
     return index >= 0 ? value.slice(0, index) : value;
 }
 
-function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
+function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}, credentialPolicy) {
     const headers = {
-        ...stripRouterIdentityHeaders(req.headers),
+        ...stripRouterIdentityHeaders(req.headers, credentialPolicy),
         host: `127.0.0.1:${targetPort}`,
         ...extraHeaders,
     };
@@ -226,15 +231,15 @@ function buildBufferedProxyHeaders(req, targetPort, body, extraHeaders = {}) {
     return headers;
 }
 
-export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}, { beforeDial = null } = {}) {
+export function proxyHttpBuffered(req, res, targetPort, agentPath, body, extraHeaders = {}, { beforeDial = null, agent, credentialPolicy } = {}) {
     const pathWithLeadingSlash = agentPath.startsWith('/') ? agentPath : `/${agentPath}`;
     const upstream = http.request({
         hostname: '127.0.0.1',
         port: targetPort,
         path: pathWithLeadingSlash,
         method: req.method,
-        headers: buildBufferedProxyHeaders(req, targetPort, body, extraHeaders),
-        agent: createLeaseCommittedAgent(beforeDial),
+        headers: buildBufferedProxyHeaders(req, targetPort, body, extraHeaders, credentialPolicy),
+        agent: agent ?? createLeaseCommittedAgent(beforeDial),
     });
 
     upstream.on('error', err => {
@@ -614,7 +619,7 @@ function commitAggregateLease(routePlan) {
     return routePlan?.lease?.commit?.() === true;
 }
 
-export function createAgentRouteEntries(routePlan, { beforeDispatch = null } = {}) {
+export function createAgentRouteEntries(routePlan, { beforeDispatch = null, req, signals } = {}) {
     const routes = routePlan?.lease?.snapshot?.routing?.routes;
     if (!routes || typeof routes !== 'object') {
         const error = new Error('active edge routing generation lease is required for aggregate MCP');
@@ -624,23 +629,43 @@ export function createAgentRouteEntries(routePlan, { beforeDispatch = null } = {
     }
     const entries = [];
     for (const [agentName, route] of Object.entries(routes || {})) {
-        if (!route || route.disabled || route.draining) continue;
-        const port = Number(route.hostPort);
+        const snapshot = routePlan.lease.snapshot;
+        if (!routeAdmitted(route, agentName, snapshot, signals)) continue;
+        const selection = selectRouteRuntime({ routeKey: agentName, route, snapshot, req, signals });
+        const port = Number(selection.route.hostPort);
         if (!Number.isFinite(port)) continue;
         const baseUrl = `http://127.0.0.1:${port}/mcp`;
         const beforeConnect = () => commitAggregateLease(routePlan);
+        const checkDispatch = () => {
+            beforeDispatch?.();
+            if (!beforeConnect()) throw staleLeaseError();
+            assertSelectionCurrent(selection);
+        };
         entries.push({
             agentName,
-            route,
-            snapshot: routePlan.lease.snapshot,
+            route: selection.route,
+            selection,
+            snapshot,
             port,
             baseUrl,
             beforeConnect,
-            beforeDispatch,
-            client: createAgentClient(baseUrl, { beforeConnect, beforeDispatch }),
+            beforeDispatch: checkDispatch,
+            client: createAgentClient(baseUrl, { beforeConnect, beforeDispatch: checkDispatch }),
         });
     }
     return entries;
+}
+
+async function observeEntry(entry, run) {
+    let ttfbMs;
+    try {
+        const result = await withSdkHeaderTiming(entry.baseUrl, run, ms => { ttfbMs = ms; });
+        observeMcpResult(entry.selection, { result, ttfbMs });
+        return result;
+    } catch (error) {
+        observeMcpResult(entry.selection, { error, ttfbMs });
+        throw error;
+    }
 }
 
 function annotateTool(tool, agentName) {
@@ -711,7 +736,7 @@ async function collectTools(entries) {
 
     await Promise.all(entries.map(async (entry) => {
         try {
-            const tools = await entry.client.listTools();
+            const tools = await observeEntry(entry, () => entry.client.listTools());
             toolsByAgent.set(entry.agentName, tools || []);
             for (const tool of tools || []) {
                 const name = tool && tool.name ? String(tool.name) : null;
@@ -722,7 +747,7 @@ async function collectTools(entries) {
                 toolIndex.get(name).push({ entry, tool });
             }
         } catch (err) {
-            if (err?.code === 'EDGE_GENERATION_CHANGED') throw err;
+            if (err?.code === 'EDGE_GENERATION_CHANGED' || err?.code === 'CANARY_SELECTION_CHANGED') throw err;
             const message = summarizeMcpError(err, 'listTools');
             errors.push({ agent: entry.agentName, error: message });
             failures.set(entry.agentName, message);
@@ -739,10 +764,10 @@ async function collectResources(entries) {
 
     await Promise.all(entries.map(async (entry) => {
         try {
-            const resources = await entry.client.listResources();
+            const resources = await observeEntry(entry, () => entry.client.listResources());
             resourcesByAgent.set(entry.agentName, resources || []);
         } catch (err) {
-            if (err?.code === 'EDGE_GENERATION_CHANGED') throw err;
+            if (err?.code === 'EDGE_GENERATION_CHANGED' || err?.code === 'CANARY_SELECTION_CHANGED') throw err;
             const message = summarizeMcpError(err, 'listResources');
             errors.push({ agent: entry.agentName, error: message });
             failures.set(entry.agentName, message);
@@ -805,6 +830,7 @@ function buildToolRequestHeaders(req, entry, toolName, toolArgs) {
         req: req || { headers: {} },
         agentName: entry.agentName,
         route: entry.route,
+        targetRecord: entry.selection.targetRecord,
         snapshot: entry.snapshot,
         toolName,
         toolArgs: toolArgs || {}
@@ -850,10 +876,21 @@ async function readEntryResource(entry, uri, req) {
 }
 
 async function executeRouterCommand(command, payload = {}, req = null, routePlan = null, beforeDispatch = null) {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await executeRouterCommandOnce(command, payload, req, routePlan, beforeDispatch);
+        } catch (error) {
+            if (error?.code !== 'CANARY_SELECTION_CHANGED') throw error;
+            if (attempt) return { statusCode: 503, body: { error: 'canary_selection_changed' } };
+        }
+    }
+}
+
+async function executeRouterCommandOnce(command, payload, req, routePlan, beforeDispatch) {
     const normalized = canonicalCommand(command);
     let entries;
     try {
-        entries = createAgentRouteEntries(routePlan, { beforeDispatch });
+        entries = createAgentRouteEntries(routePlan, { beforeDispatch, req });
     } catch (error) {
         return {
             statusCode: error?.statusCode || 503,
@@ -971,7 +1008,8 @@ async function executeRouterCommand(command, payload = {}, req = null, routePlan
                 if (!aggDecision.allow) {
                     return { statusCode: aggDecision.status || 403, body: { error: 'access_denied', code: aggDecision.code } };
                 }
-                const response = await callEntryTool(resolved.entry, toolName, args, req);
+                const canonicalArgs = resolved.entry.route.canary ? sanitizeArgumentsForTool(args, [resolved.tool], toolName) : args;
+                const response = await observeEntry(resolved.entry, () => callEntryTool(resolved.entry, toolName, canonicalArgs, req));
                 return {
                     statusCode: 200,
                     body: {
@@ -1018,9 +1056,10 @@ async function executeRouterCommand(command, payload = {}, req = null, routePlan
                     return { statusCode: 404, body: { error: `resource '${uri}' was not found`, errors } };
                 }
                 try {
-                    const resource = await readEntryResource(resolvedEntry, uri, req);
+                    const resource = await observeEntry(resolvedEntry, () => readEntryResource(resolvedEntry, uri, req));
                     return { statusCode: 200, body: { resource, agent: resolvedEntry.agentName, errors } };
                 } catch (err) {
+                    if (err?.code === 'CANARY_SELECTION_CHANGED') throw err;
                     if (err?.code === 'EDGE_GENERATION_CHANGED') {
                         return { statusCode: 503, body: { error: 'edge_generation_changed' } };
                     }
@@ -1038,9 +1077,10 @@ async function executeRouterCommand(command, payload = {}, req = null, routePlan
                     return { statusCode: 404, body: { error: `agent '${requestedAgent}' is not registered` } };
                 }
                 try {
-                    const result = await entry.client.ping();
+                    const result = await observeEntry(entry, () => entry.client.ping());
                     return { statusCode: 200, body: { result: result ?? {}, agent: entry.agentName } };
                 } catch (err) {
+                    if (err?.code === 'CANARY_SELECTION_CHANGED') throw err;
                     if (err?.code === 'EDGE_GENERATION_CHANGED') {
                         return { statusCode: 503, body: { error: 'edge_generation_changed' } };
                     }
@@ -1055,6 +1095,7 @@ async function executeRouterCommand(command, payload = {}, req = null, routePlan
                 return { statusCode: 400, body: { error: `unknown command '${command}'` } };
         }
     } catch (err) {
+        if (err?.code === 'CANARY_SELECTION_CHANGED') throw err;
         const message = err && err.message ? err.message : String(err || 'unknown error');
         return {
             statusCode: err?.code === 'EDGE_GENERATION_CHANGED' ? 503 : 500,
@@ -1224,6 +1265,9 @@ async function handleRouterJsonRpc(req, res, payload, routePlan) {
                 sessionIdForResponse = null;
                 responses.push({ jsonrpc: '2.0', id: message.id ?? null,
                     error: { code: -32000, message: 'Missing or invalid MCP session' } });
+            } else if (result.statusCode === 503 && result.body?.error === 'canary_selection_changed') {
+                sendJson(res, 503, result.body);
+                return;
             } else if (result.statusCode >= 400) {
                 const messageText = result.body?.error || 'Router error';
                 responses.push({ jsonrpc: '2.0', id: message.id ?? null, error: { code: -32000, message: messageText } });
@@ -1322,3 +1366,16 @@ export async function handleRouterMcp(req, res, routePlan) {
 }
 
 export { ROUTING_FILE };
+
+// Optional public routing affinity. An opaque SSO cookie can identify a
+// locally live session for this choice without admitting a browser principal.
+export function readPublicCanaryUserId(req, service = authService) {
+    try {
+        const cookie = parseCookies(req).get(SSO_AUTH_COOKIE_NAME);
+        const user = cookie && service.getSession(cookie)?.user;
+        return typeof user?.id === 'string' && user.id
+            && !user.roles?.some?.(role => String(role).trim().toLowerCase() === 'guest') ? user.id : null;
+    } catch {
+        return null;
+    }
+}

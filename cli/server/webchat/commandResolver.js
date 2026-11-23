@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { ROUTING_FILE } from '../../utils/config.js';
+import { ROUTING_FILE, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import { DIRECT_CLI_PATH } from '../../utils/directCli.js';
 
 function trimCommand(value) {
@@ -272,9 +272,13 @@ const WEBCHAT_PROVENANCE_FIELDS = ['routeKey', 'hostPath', 'container', 'alias',
 function webchatRouteProvenance(routing, routeKey) {
     const key = trimCommand(routeKey);
     const routes = routing?.routes && typeof routing.routes === 'object' ? routing.routes : {};
-    const route = key && Object.hasOwn(routes, key) ? routes[key] : null;
+    const logical = key && Object.hasOwn(routes, key) ? routes[key] : null;
     // A drained route admits no new traffic until its runtime is replaced.
-    if (!route || typeof route !== 'object' || route.disabled || route.draining === true) return null;
+    if (!routeAdmitted(logical, key)) return null;
+    const field = logical.canary;
+    const onCanary = field && effectiveCanaryMode(field, routingSignals()?.routingState(key, field.rolloutId)) === 'all';
+    const route = onCanary ? { ...logical, container: field.container,
+        hostPath: path.resolve(process.env.PLOINKY_WORKSPACE_ROOT || PLOINKY_WORKSPACE_ROOT, field.codePath) } : logical;
     const staticAgent = trimCommand(routing?.static?.agent);
     const shortStatic = staticAgent.includes('/') ? staticAgent.split('/').pop() : staticAgent;
     const isStatic = Boolean(staticAgent) && (
@@ -289,7 +293,7 @@ function webchatRouteProvenance(routing, routeKey) {
         alias: trimCommand(route.alias),
         repo: trimCommand(route.repo),
         agent: trimCommand(route.agent),
-        cliTarget: resolveCliTarget(route, key),
+        cliTarget: onCanary ? field.container : resolveCliTarget(route, key),
     };
 }
 
@@ -322,6 +326,9 @@ async function resolveWebchatCommandsForBindingAsync(binding, options = {}) {
     if (!actual || WEBCHAT_PROVENANCE_FIELDS.some((field) => actual[field] !== expected[field])) {
         return { changed: true };
     }
+    // The general-purpose CLI resolves logical agent names and can auto-enable
+    // a missing target. Never give it the physical name of a canary TTY.
+    if (routing.routes?.[routeKey]?.canary?.container === actual.container) return { changed: true };
     const manifest = await readManifestAsync(path.join(actual.hostPath, 'manifest.json'));
     if (!manifest || manifestWebchatDeclaration(manifest) !== String(binding.declaration || '')) {
         return { changed: true };
@@ -353,3 +360,5 @@ export {
     extractManifestWebchatOptions,
     trimCommand
 };
+
+import { effectiveCanaryMode, routeAdmitted, routingSignals } from '../canary/routeAdmission.mjs';
