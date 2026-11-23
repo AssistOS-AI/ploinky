@@ -105,6 +105,20 @@ export function deriveNetworkAlias(canonicalAgentId, { path = 'agent id' } = {})
     return alias;
 }
 
+export function deriveCanaryNetworkAlias(canonicalAgentId, rolloutId) {
+    if (typeof rolloutId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(rolloutId)) {
+        fail('canary rollout', 'requires an exact rollout id');
+    }
+    const base = deriveNetworkAlias(canonicalAgentId);
+    const suffix = '-canary-' + crypto.createHash('sha256').update(rolloutId).digest('hex').slice(0, 12);
+    return base.slice(0, 63 - suffix.length).replace(/-+$/, '') + suffix;
+}
+
+export function assertRuntimeNetworkAlias(alias) {
+    if (typeof alias !== 'string' || !DNS_LABEL.test(alias)) fail('network alias', 'requires an exact DNS label');
+    return alias;
+}
+
 export function logicalNetworkAttachments(network, canonicalAgentId, { instanceKey = canonicalAgentId } = {}) {
     const contract = canonicalizeNetwork(network, { path: 'network' });
     if (contract.mode === 'none' || contract.mode === 'host') return [];

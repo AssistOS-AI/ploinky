@@ -551,6 +551,7 @@ function proveAuthorityHelperIdentity(inspected, {
     expectedNonce,
     expectedImageId,
     expectedNetworks = null,
+    expectedAlias = '',
     expectedPrimaryNetwork = '',
     expectedHostMapping = '',
     failureCode = 'PLOINKY_ROUTER_ATTESTATION_HELPER',
@@ -572,6 +573,11 @@ function proveAuthorityHelperIdentity(inspected, {
         : null;
     const exactNetworkPlan = !expectedNetworkList
         || (JSON.stringify(inspectedNetworks) === JSON.stringify(expectedNetworkList)
+            && (!expectedAlias || !inspected.running || inspectedNetworks.every(network => {
+                const aliases = inspected.networks[network]?.Aliases;
+                return Array.isArray(aliases) && aliases.includes(expectedAlias)
+                    && aliases.every(alias => [expectedAlias, id.slice(0, 12), name].includes(alias));
+            }))
             && ['bridge', expectedPrimaryNetwork].includes(String(inspected?.networkMode || ''))
             && extraHosts.length === 1
             && extraHosts[0] === expectedHostMapping);
@@ -767,6 +773,13 @@ export function runContainerAuthorityProbe({
     if (expectedNetworks.length < 1 || !plan?.alias || !Array.isArray(plan?.args)) {
         fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper requires the exact prepared managed-network plan');
     }
+    if (plan.networkAlias !== undefined) {
+        const aliasFlags = plan.args.filter(arg => arg === '--network-alias');
+        if (plan.networkAlias !== plan.alias || aliasFlags.length !== 1
+            || plan.args[plan.args.indexOf('--network-alias') + 1] !== plan.alias) {
+            fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'authority helper requires the exact prepared canary alias');
+        }
+    }
     const primaryNetwork = String((plan.attachments || []).find((entry) => entry.primary)?.name || expectedNetworks[0]);
     const additionalNetworkArgs = (plan.attachments || [])
         .filter((entry) => String(entry?.name || '') !== primaryNetwork)
@@ -781,6 +794,7 @@ export function runContainerAuthorityProbe({
         expectedNonce: nonce,
         expectedImageId: helperImageId,
         expectedNetworks,
+        expectedAlias: plan.networkAlias,
         expectedPrimaryNetwork: primaryNetwork,
         expectedHostMapping,
     });

@@ -485,6 +485,7 @@ function getAgentMcpConfigPath(agentPath) {
 }
 
 function syncAgentMcpConfig(_containerName, agentPath, agentName, options = {}) {
+    if (options.canaryLaunch === true) return false;
     try {
         const source = getAgentMcpConfigPath(agentPath);
         if (!source) return false;
