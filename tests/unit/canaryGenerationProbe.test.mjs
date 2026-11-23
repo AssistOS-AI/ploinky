@@ -79,7 +79,7 @@ function canaryField(overrides = {}) {
         splitStartedAt: '2026-11-23T00:00:00.000Z',
         mode: 'split',
         probe: { port: 8787, path: '/healthz', status: 200 },
-        thresholds: { errorRate: 0.05, windowSeconds: 300 },
+        thresholds: { minFailures: 5, slowMs: 5000 },
         ...overrides,
     };
 }

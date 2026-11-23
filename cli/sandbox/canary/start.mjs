@@ -220,7 +220,7 @@ export async function startCanary({ workspaceRoot, agentRef, commit, share = 10,
     const record = preparedRecord(primary, routeKey, deriveCanaryNetworkAlias(route.agent, rolloutId));
     const field = {
         container: containerName, rolloutId, commit, codePath: codePath + '/code', share, testAccounts, mode: 'split',
-        salt: randomUUID(), probe: source.probe, thresholds: { errorRate: 0.02, windowSeconds: 600 },
+        salt: randomUUID(), probe: source.probe, thresholds: {},
         splitStartedAt: new Date().toISOString(), codeDigest: 'sha256:' + '0'.repeat(64),
     };
     validateCanaryField(field, 'canary');

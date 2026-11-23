@@ -67,7 +67,7 @@ function seed(state = 'split', { inactive = false, receipt = {}, mode } = {}) {
         rolloutId, container: secondary, commit: canaryCommit, codePath, codeDigest: 'sha256:' + '1'.repeat(64),
         share: 10, testAccounts: [], salt: 'test-salt', splitStartedAt: '2026-11-23T00:00:00Z',
         mode: mode || (state === 'withdrawn' ? 'withdrawn' : 'split'),
-        probe: { port: 8787, path: '/health', status: 200 }, thresholds: { errorRate: 0.05, windowSeconds: 300 },
+        probe: { port: 8787, path: '/health', status: 200 }, thresholds: { minFailures: 5 },
     };
     const repo = 'fixtures';
     const hostPath = path.join(workspaceRoot, repo, routeKey);
