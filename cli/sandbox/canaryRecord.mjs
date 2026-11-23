@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { validateAvailabilityProjection } from '../server/hardwareAvailability.mjs';
+import { rolloutThresholds } from '../server/canary/tripRules.js';
 
 // Even an invalid link is a canary marker. Lifecycle readers must never
 // prepare it as an ordinary agent while generation compilation rejects it.
@@ -63,9 +64,12 @@ export function validateCanaryField(field, label) {
         invalid(`${label}.probe.path must be a local HTTP request path`);
     }
     if (!Number.isInteger(probe.status) || probe.status < 100 || probe.status > 599) invalid(`${label}.probe.status is invalid`);
-    exactFields(thresholds, ['errorRate', 'windowSeconds'], `${label}.thresholds`);
-    if (!Number.isFinite(thresholds.errorRate) || thresholds.errorRate < 0 || thresholds.errorRate > 1
-        || !Number.isSafeInteger(thresholds.windowSeconds) || thresholds.windowSeconds < 1) invalid(`${label}.thresholds is invalid`);
+    if (thresholds === undefined) invalid(`${label}.thresholds must be an object`);
+    try {
+        rolloutThresholds(thresholds);
+    } catch (error) {
+        invalid(`${label}.thresholds: ${error.message}`);
+    }
 }
 
 // The capture may precede materialization of the export. Check every existing

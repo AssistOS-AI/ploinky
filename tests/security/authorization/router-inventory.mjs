@@ -153,12 +153,12 @@ export const routerInventoryHistorical = Object.freeze(routerInventoryBaseline.m
   }
 }));
 // The four inventory principals use browser sessions. Only the separately
-// authenticated local CLI administrator can read this control-host endpoint.
+// authenticated local CLI administrator can read this endpoint on a loopback control host.
 function currentRouterInventory(historical, readSource) {
   const current = buildLiveSessionsRouterInventory(historical, readSource('cli/server/handlers/webtty.js'));
   const file = 'cli/server/RoutingServer.js';
   const bytes = readSource(file);
-  const sourceBlobSha256 = 'acee67c7fd42d103b8ff66b8f63a557f8c8de14be393b285ca29928b13aa70b0';
+  const sourceBlobSha256 = 'a1619ac4e28e91a56f7952b69452991e22b4f3442cd9472d72f84d6708c913fc';
   const line = 459;
   const path = '/api/router/canary/status';
   const anchor = `if (requestedUrl.pathname === '${path}' && routePlan.hostSelection?.kind === 'control') {`;
@@ -167,7 +167,7 @@ function currentRouterInventory(historical, readSource) {
   const row = Object.freeze({
     id: 'canary-status.get', method: 'GET', path, source: `${file}:${line}`, sourceBlobSha256, anchor,
     expected: { ...access.private, localCliAdmin: 'allow' },
-    notes: 'Control host only. Requires an authenticated local CLI administrator and a current routing generation. Browser administrators are denied.',
+    notes: 'Requires a loopback control host, an authenticated local CLI administrator and a current routing generation. Browser administrators and configured public control aliases are denied.',
     coverage: 'inventoried; live evidence required',
   });
   assert.ok(current.every(existing => existing.id !== row.id), 'DUPLICATE_ROUTER_OBLIGATION');

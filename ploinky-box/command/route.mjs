@@ -283,10 +283,9 @@ export function routeOuterCommand(parsed, options = {}) {
     if (parsed.command === 'cli') {
         return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'agent-cli', coreArgv: parsed.forwardingArgv });
     }
-    // Logs are observational, so they get their own route instead of the
-    // generic one: generic forwarding prepares the Box, which can create,
-    // reconcile, or repair it before the command runs.
-    if (parsed.command === 'logs') {
+    // Observational commands share the inspect-only forwarding path. Generic
+    // forwarding can create, reconcile, or repair the Box before dispatch.
+    if (parsed.command === 'logs' || (parsed.command === 'canary' && parsed.commandArgs[0] === 'status')) {
         return Object.freeze({
             kind: parsed.dryRun ? 'dry-run' : 'logs',
             coreArgv: parsed.forwardingArgv,
