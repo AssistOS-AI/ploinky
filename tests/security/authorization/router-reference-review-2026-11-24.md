@@ -79,6 +79,18 @@ The private listener sends a `private-operation` plan with operation `cache` to 
 
 Agent-port and agent-root plans gain response-policy fields: the route access, the manifest cache class and whether the request carried a credential, which is read on ingress. They decide only the cache header. The private listener resolves the cache operation plan described under RoutingServer.js before its other private routes.
 
+## Merge of master b1c9e62f
+
+The branch merged `origin/master` at `b1c9e62f` (commit `fbc051dc`). Master commit `b1c9e62f` ("add validated browser entry routing and guard logout submission", 2026-11-24) changed one registered file without registering it.
+
+| File | Last reviewed | Registered now | Rows moved |
+| --- | --- | --- | --- |
+| RoutingServer.js | b46fb2c3 | 8a4be1c5 | all 23, by 1 or 8 lines |
+
+### RoutingServer.js (blob 8a4be1c5)
+
+The root redirect (`root.get`, `root-index.get`, now line 815) sends a static root agent to `resolveBrowserEntryPath` (`cli/server/browserEntryPath.js`) instead of the fixed `/<route>/index.html`. Without `routerAccess.entryPath` the location is unchanged. With it, the path must be an exact router-relative route path without `?`, `#` or `%`, owned by the agent and matched by one of its enabled HTTP routes; otherwise the Router answers 503 `browser_entry_invalid` with `no-store`. The generation loader (`cli/sandbox/edgeGeneration.js`) refuses an invalid entry path. The redirect is still 302 with `Cache-Control: no-store`, and the cache hook adds CDN `no-store` to both answers. No gate moved or changed order.
+
 ## Surfaces without an inventory row
 
 | Surface | Source | Expected access |
