@@ -87,32 +87,15 @@ remove [repo] &lt;repoName|url&gt;</code></pre>
 
                         <h3>update</h3>
                         <pre><code>update [folderPath]</code></pre>
-                        <p>Runs the full update workflow from the current directory or an explicit folder path. It updates the Ploinky checkout, the runtime <code>node_modules/achillesAgentLib</code> checkout, managed repositories under <code>.ploinky/repos/</code>, and recursively discovered project repositories. Missing or unreachable project remotes are logged and skipped.</p>
+                        <p>Runs the full update workflow from the current directory or an explicit folder path. It updates the Ploinky checkout, the selected <code>achillesAgentLib</code> source, managed repositories under <code>.ploinky/repos/</code>, and recursively discovered project repositories. Missing or unreachable project remotes are logged and skipped.</p>
                         <pre><code>update all [folderPath]</code></pre>
-                        <p>Runs the same full workflow as <code>update</code> with an explicit all-repository scope. Inside a Ploinky box, the read-only <code>/opt/ploinky</code> self-pull is skipped while writable runtime dependencies, managed repositories, workspace repositories, and skills continue to update.</p>
+                        <p>Runs the same full workflow as <code>update</code> with an explicit all-repository scope. Inside a Ploinky box, the read-only <code>/opt/ploinky</code> self-pull is skipped while writable runtime dependencies, managed repositories, workspace repositories continue to update.</p>
                         <pre><code>update repos</code></pre>
                         <p>Updates the installed repositories under <code>.ploinky/repos/</code>, refreshes the runtime Achilles checkout, and refreshes managed-repository <code>achillesAgentLib</code> dependencies.</p>
                         <pre><code>update repo &lt;name&gt;</code></pre>
-                        <p>Updates one named repository, repairs it by recloning when its direct git metadata is missing but its source URL is known, refreshes its <code>achillesAgentLib</code> dependencies, and applies the default skills to that repository.</p>
-                        <p>All update commands refresh <code>AchillesCopilotBasicSkills</code>, <code>DocumentationSkills</code>, and <code>PloinkySkills</code> in each eligible installed <code>.ploinky/repos/</code> entry through the <code>default-skills</code> behavior. Each source repository is skipped when it is itself the target, as are skills-only repositories; refreshed project repositories also receive the managed <code>.gitignore</code> block.</p>
-                        <table class="command-table">
-                            <tr>
-                                <th>Default skills repository</th>
-                                <th>Purpose</th>
-                            </tr>
-                            <tr>
-                                <td><a href="https://github.com/AssistOS-AI/AchillesCopilotBasicSkills.git"><code>AchillesCopilotBasicSkills</code></a></td>
-                                <td>Skills maintained for <code>achillesAgentLib</code>.</td>
-                            </tr>
-                            <tr>
-                                <td><a href="https://github.com/AssistOS-AI/DocumentationSkills.git"><code>DocumentationSkills</code></a></td>
-                                <td>Skills for software documentation.</td>
-                            </tr>
-                            <tr>
-                                <td><a href="https://github.com/AssistOS-AI/PloinkySkills.git"><code>PloinkySkills</code></a></td>
-                                <td>Skills for developing the Ploinky application.</td>
-                            </tr>
-                        </table>
+                        <p>Updates one named repository, repairs it by recloning when its direct git metadata is missing but its source URL is known, and refreshes its Git dependency pins.</p>
+                        <p>Update does not install, export, prune or validate skills, read skills manifests, or modify their Git exclusions. Use the explicit skills commands to manage skills. Only valid Git checkouts are included in workspace repository discovery.</p>
+                        <p>A full update from the host terminal restarts an already running workspace after its required repositories have been verified. If a required repository has uncommitted changes, it is preserved and the restart is skipped with the repository name and reason. Targeted updates do not restart the whole workspace.</p>
                     </div>
 
                     <div class="doc-section" id="agent">
@@ -257,10 +240,15 @@ ploinky cli codexAgent</code></pre>
                             Any extra arguments after <code>cli &lt;agentName&gt;</code> are appended directly to the manifest CLI command. For coding agents such as <code>codexAgent</code>, this lets you use the coding CLI inside the agent's containerized runtime instead of running it directly on the host.
                         </div>
 
-                        <h3>cs (alias: coding-sessions)</h3>
+                        <h3>cs and coding aliases</h3>
                         <p>Open a menu of the coding sessions that an enabled agent provides in the current folder. The provider declares one API base under <code>webtty.codingSessions</code> in its manifest; RoboWork does for robot coding agents. Choose a robot (the default robot is preselected), one of its coding agents, then a session: a running terminal to attach, an earlier conversation to resume, or a new one. Only the conversations a person started with that agent in this folder are listed.</p>
-                        <pre><code>cs
-coding-sessions</code></pre>
+                        <pre><code>ploinky cs
+ploinky code
+ploinky coding
+ploinky coding agents
+ploinky coding sessions
+ploinky coding-sessions</code></pre>
+                        <p>All these commands open the same coding sessions menu.</p>
                         <table class="command-table"><thead><tr><th>Key</th><th>Effect</th></tr></thead><tbody>
                             <tr><td>Arrows, Enter</td><td>Select and open; Enter on a running session attaches to it, on an earlier conversation resumes it.</td></tr>
                             <tr><td><code>n</code>, <code>k</code>, <code>r</code></td><td>Start a new session, kill the selected running session after confirmation, refresh the list.</td></tr>

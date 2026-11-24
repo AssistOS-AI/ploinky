@@ -305,14 +305,14 @@ function classifyWorkingState(preflight) {
         return {
             outcome: 'skipped',
             code: 'dirty-index',
-            reason: `staged changes are present (${sample(status.staged).join(', ')}); commit or unstage them before updating`,
+            reason: 'staged changes are present; commit or stash them before updating',
         };
     }
     if (status.unstaged.length) {
         return {
             outcome: 'skipped',
             code: 'dirty-worktree',
-            reason: `uncommitted changes are present (${sample(status.unstaged).join(', ')}); commit or discard them before updating`,
+            reason: 'uncommitted changes are present; commit or stash them before updating',
         };
     }
     return null;

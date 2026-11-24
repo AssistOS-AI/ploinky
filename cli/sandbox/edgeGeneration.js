@@ -13,6 +13,7 @@ import {
     ROUTING_FILE,
 } from '../utils/config.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
+import { isRouteCacheClass, manifestHttpRouteSpecs } from '../server/policy/routeCacheMarks.js';
 import { normalizeRequiredCapability } from '../server/authHandlers/requiredCapability.js';
 import { AGENT_PORT_ROUTE, parseAgentPortSelector } from '../server/agentPortConvention/parseSelector.js';
 import { HttpRouteAccessPath } from '../server/policy/HttpRouteAccessPath.js';
@@ -607,15 +608,10 @@ function asManifestHttpRouteSpecs(manifest, routeKey) {
     const routerAccess = assertObject(manifest.routerAccess, `manifest(${routeKey}).routerAccess`);
     const raw = routerAccess.httpRoutes;
     if (raw === undefined || raw === null) return [];
-    if (Array.isArray(raw)) return raw;
-    if (isPlainObject(raw)) {
-        return Object.entries(raw).map(([pathValue, value]) => (
-            isPlainObject(value)
-                ? { path: pathValue, ...value }
-                : { path: pathValue, access: String(value || '') }
-        ));
+    if (!Array.isArray(raw) && !isPlainObject(raw)) {
+        throw edgeError(`manifest(${routeKey}).routerAccess.httpRoutes must be an array or object`);
     }
-    throw edgeError(`manifest(${routeKey}).routerAccess.httpRoutes must be an array or object`);
+    return manifestHttpRouteSpecs(raw);
 }
 
 function collectStrictManifestPolicyEntries(routing, manifests) {
@@ -623,6 +619,7 @@ function collectStrictManifestPolicyEntries(routing, manifests) {
     for (const [routeKey, route] of Object.entries(routing.routes || {})) {
         if (!route || route.disabled) continue;
         const manifest = manifests[routeKey] || {};
+        const publicCacheByPath = new Map();
         for (const [index, spec] of asManifestHttpRouteSpecs(manifest, routeKey).entries()) {
             assertObject(spec, `manifest(${routeKey}).routerAccess.httpRoutes[${index}]`);
             if (spec.enabled !== undefined && typeof spec.enabled !== 'boolean') {
@@ -634,7 +631,17 @@ function collectStrictManifestPolicyEntries(routing, manifests) {
                     `manifest(${routeKey}).routerAccess.httpRoutes[${index}] is invalid: ${normalized.error || normalized.code}`,
                 );
             }
+            if (Object.hasOwn(spec, 'cache') && (!isRouteCacheClass(spec.cache) || normalized.access !== 'public')) {
+                throw edgeError(`manifest(${routeKey}).routerAccess.httpRoutes[${index}].cache must be page or immutable on a public entry`);
+            }
             if (spec.enabled === false) continue;
+            if (normalized.access === 'public') {
+                const mark = spec.cache ?? null;
+                if (publicCacheByPath.has(normalized.path) && publicCacheByPath.get(normalized.path) !== mark) {
+                    throw edgeError(`manifest(${routeKey}).routerAccess.httpRoutes has conflicting cache marks for ${normalized.path}`);
+                }
+                publicCacheByPath.set(normalized.path, mark);
+            }
             entries.push({
                 path: normalized.path,
                 access: normalized.access,

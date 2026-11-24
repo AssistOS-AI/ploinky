@@ -143,8 +143,6 @@
                 <p>The <a href="wiki.html">Ploinky Wiki</a> is the canonical reference for project-specific terminology used throughout these guides.</p>
             </div>
 
-            <section class="documentation-map-section"><h2>Documentation Map</h2><div class="documentation-map"><table><thead><tr><th scope="col">Workspace Runtime Ploinky Documentation</th><th scope="col">Guides</th><th scope="col">Reference</th></tr></thead><tbody><tr><td><a href="index.html">Overview</a><span>Workspace purpose and command entry points.</span></td><td><a href="cli-reference.html">CLI Reference</a><span>Commands for repositories, agents and workspace configuration.</span></td><td><a href="specsLoader.html?spec=matrix.md">Specifications</a><span>Design contracts indexed by filename.</span></td></tr><tr><td><a href="worker.html">Ploinky Worker</a><span>Worker responsibilities and workflow execution.</span></td><td><a href="architecture.html">Architecture</a><span>Box, Router and agent ownership boundaries.</span></td><td><a href="spec-agent.html">Agent Spec</a><span>Manifest fields and agent authoring requirements.</span></td></tr><tr><td></td><td><a href="runtime.html">Runtime</a><span>Agent execution, mounts and dependency preparation.</span></td><td><a href="wiki.html">Wiki</a><span>Canonical runtime terminology.</span></td></tr><tr><td></td><td><a href="interfaces.html">Interfaces</a><span>Public routes and integration contracts.</span></td><td></td></tr><tr><td></td><td><a href="operations.html">Workspace Lifecycle</a><span>Workspace initialization and bounded lifecycle operations.</span></td><td></td></tr><tr><td></td><td><a href="webchat.html">WebChat</a><span>Browser conversations and native agent task controls.</span></td><td></td></tr></tbody></table></div><p>Start with Overview in Workspace Runtime Ploinky Documentation. Use Guides for CLI Reference and Workspace Lifecycle, then Architecture and Runtime for execution details. Reference contains Specifications, Agent Spec and Wiki.</p></section>
-
             <div class="demo-container" style="margin-top: 0;">
                 <h2 style="text-align: center; margin-bottom: 1rem; margin-top: 0;">Quick Start Demos</h2>
                 
@@ -203,6 +201,14 @@
             </div>
 
             <div class="content-wrapper">
+                <section class="doc-section documentation-map-section" aria-labelledby="documentation-map-title">
+                    <h2 id="documentation-map-title">Documentation Map</h2>
+                    <div class="documentation-map">
+                        <div><h3>Overview</h3><p><a href="index.html">Ploinky</a> · <a href="worker.html">Ploinky Worker</a></p></div>
+                        <div><h3>Guides</h3><p><a href="cli-reference.html">CLI Reference</a> · <a href="architecture.html">Architecture</a> · <a href="runtime.html">Runtime</a> · <a href="interfaces.html">Interfaces</a> · <a href="operations.html">Workspace Lifecycle</a> · <a href="webchat.html">WebChat</a></p></div>
+                        <div><h3>Reference</h3><p><a href="specsLoader.html?spec=matrix.md">Specifications</a> · <a href="spec-agent.html">Agent Spec</a> · <a href="wiki.html">Wiki</a></p></div>
+                    </div>
+                </section>
                 <div class="doc-section">
                     <h2>Getting Started</h2>
 
@@ -297,6 +303,13 @@ ploinky start explorer</code></pre>
                         <li>Run <code>ploinky</code> to initialize your workspace</li>
                         <li>Start explorer agent: <code>start explorer</code></li>
                     </ol>
+
+                    <h3>Coding sessions</h3>
+                    <p>Run the following in an interactive terminal from your workspace or a project folder inside it:</p>
+                    <pre><code>ploinky cs</code></pre>
+                    <p>Your workspace needs a running coding sessions provider, such as RoboWork. Select a robot, then a coding agent. Open a running terminal, resume a saved conversation, or press <code>n</code> to start a new session. Saved conversations are listed for the selected robot, coding agent, and current folder.</p>
+                    <p>Use the arrow keys and Enter to select. Press <kbd>Ctrl+]</kbd> inside a session to return to the menu while the agent keeps running; exiting the coding agent ends its terminal. Press <code>q</code> in the menu to quit. The same running terminals appear in Explorer’s Live Sessions.</p>
+                    <p><code>ploinky code</code>, <code>ploinky coding</code>, <code>ploinky coding agents</code>, <code>ploinky coding sessions</code>, and <code>ploinky coding-sessions</code> open the same menu. See the <a href="cli-reference.html">CLI Reference</a> for all session controls.</p>
 
                     <h3>Globally from any directory</h3>
                     <p>To use <code>ploinky</code> from anywhere, you need to add its location to your shell's configuration file (e.g., <code>.bashrc</code>, <code>.zshrc</code>).</p>

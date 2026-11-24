@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { guardSharedCache } from './proxy/sharedCacheGuard.js';
 
 import { buildIdentityHeaders, ensureHttpRouteAccess } from './authHandlers/authContext.js';
 import {
@@ -48,7 +49,8 @@ function statusLine(statusCode, statusMessage, headers = {}) {
     return `${lines.join('\r\n')}\r\n\r\n`;
 }
 
-function closeSocket(socket, status, message = http.STATUS_CODES[status] || 'Request Failed', headers = {}) {
+function closeSocket(socket, status, message = http.STATUS_CODES[status] || 'Request Failed') {
+    const headers = { 'Cloudflare-CDN-Cache-Control': 'no-store' };
     try { socket.write(statusLine(status, message, headers)); } catch (_) {}
     try { socket.destroy(); } catch (_) {}
 }
@@ -135,7 +137,7 @@ export async function handleAgentRootUpgrade({
             upstreamResponse.statusCode || 101,
             upstreamResponse.statusMessage || 'Switching Protocols',
             {
-                ...upstreamResponse.headers,
+                ...guardSharedCache(upstreamResponse.headers, plan.decision?.access),
                 ...(captured.getHeader('set-cookie')
                     ? { 'set-cookie': captured.getHeader('set-cookie') }
                     : {}),

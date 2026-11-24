@@ -1,5 +1,9 @@
 import { publicProtocolCorsAllowHeaders } from '../policy/PublicProtocolPolicy.js';
+import { getApplicationCacheState } from '../cdn/cacheSettings.js';
+import { decideAgentAnswer } from '../cdn/cdnCachePolicy.js';
+import { markCdnDecision } from '../cdn/cdnResponseHook.js';
 import { HOP_BY_HOP, isRouterCookie, ROUTER_HEADERS } from './sanitizeRequestHeaders.js';
+import { guardSharedCache } from './sharedCacheGuard.js';
 
 function isPrivateIpv4(host) {
     const octets = host.split('.').map(Number);
@@ -96,7 +100,7 @@ function protocolCorsHeaders(headers, policy) {
 export function sanitizeResponseHeaders(headers, plan) {
     const policy = plan?.responsePolicy || {};
     const result = {};
-    for (const [rawName, value] of Object.entries(headers || {})) {
+    for (const [rawName, value] of Object.entries(guardSharedCache(headers, policy.access))) {
         const name = String(rawName).toLowerCase();
         if (!name || HOP_BY_HOP.has(name) || name === 'proxy-connection') continue;
         if (ROUTER_HEADERS.has(name) || name.startsWith('x-ploinky-')) continue;
@@ -128,6 +132,41 @@ export function sanitizeResponseHeaders(headers, plan) {
     }
     if (policy.allowCaching !== true) result['cache-control'] = 'no-store';
     return result;
+}
+
+// Both HTTP relay paths commit here. The WebSocket upgrade writer only uses
+// the sanitizer above, since a 101 is a protocol switch.
+export function writeAgentResponseHead(res, upstreamRes, { headers, status, plan, method, access }) {
+    if (access === 'public') {
+        const policy = plan?.responsePolicy;
+        const route = plan?.route;
+        // A plan admitted before a generation change can finish serving the
+        // client, but it cannot populate a shared cache for its successor.
+        const application = policy?.cacheClass && route?.repo && route?.agent && plan.lease?.isCurrent?.() === true
+            ? getApplicationCacheState(`${route.repo}/${route.agent}`, plan.snapshot)
+            : undefined;
+        const decision = decideAgentAnswer({
+            access, cacheClass: policy?.cacheClass, application, method,
+            requestHasCredential: policy?.requestHasCredential,
+            status: upstreamRes.statusCode,
+            // Include discarded upstream cookies and the final Vary for CORS.
+            headers: { ...res.getHeaders?.(), ...upstreamRes.headers, ...headers },
+            routerQueuedSetCookie: res.hasHeader?.('set-cookie'),
+            isStream: plan?.transport === 'sse',
+        });
+        if (decision.removeValidators) {
+            for (const key of Object.keys(headers)) {
+                if (['cache-control', 'etag', 'last-modified'].includes(key.toLowerCase())) delete headers[key];
+            }
+            res.removeHeader('etag');
+            res.removeHeader('last-modified');
+            headers['cache-control'] = decision.cacheControl;
+        }
+        markCdnDecision(res, decision.cdnCacheControl);
+    } else {
+        markCdnDecision(res, 'no-store');
+    }
+    res.writeHead(status, headers);
 }
 
 export default sanitizeResponseHeaders;

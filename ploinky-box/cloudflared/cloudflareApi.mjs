@@ -248,6 +248,33 @@ export class CloudflarePublicationApiClient {
         return normalizeIngress(result).length ? normalizeIngress(result) : ingress;
     }
 
+    async purgeHosts({ apiToken, zoneId, hosts, signal } = {}) {
+        // The common request helper deliberately omits the HTTP status from
+        // publication errors. Capture it per call, before the body is redacted.
+        let status;
+        const client = new CloudflarePublicationApiClient({
+            baseUrl: this.baseUrl,
+            timeoutMs: this.timeoutMs,
+            fetchImpl: async (...args) => {
+                const response = await this.fetchImpl(...args);
+                status = response.status;
+                return response;
+            },
+        });
+        try {
+            const result = await client.request(apiToken, 'POST', `/zones/${encode(zoneId)}/purge_cache`, {
+                body: { hosts }, operation: 'purge-hosts', signal,
+            });
+            if (!result?.id) throw new Error('missing_purge_acknowledgment');
+            return result;
+        } catch {
+            throw new CloudflarePublicationError('Cloudflare did not acknowledge the purge', {
+                code: status === 429 ? 'CLOUDFLARE_PURGE_RATE_LIMITED' : 'CLOUDFLARE_PURGE_FAILED',
+                operation: 'purge-hosts',
+            });
+        }
+    }
+
     readZone({ apiToken, zoneId, signal } = {}) {
         return this.request(apiToken, 'GET', `/zones/${encode(zoneId)}`, {
             operation: 'read-zone',

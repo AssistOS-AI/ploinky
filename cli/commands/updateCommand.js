@@ -132,6 +132,7 @@ async function runUpdate(normalizedOptions, {
         try {
             const boxRun = boxRunFromReportContext(reportRequest?.context, { insideBox });
             const options = { interactiveSession, agentLibBranchPolicy, command, cancellation, boxRun,
+                hostManagedSelfUpdate: insideBox && Boolean(reportRequest),
                 delegatedWorkspacePloinkyPath: reportRequest?.context?.source?.workspacePloinky?.delegatedBoxRepoPath || null };
             // Git pin refresh inside the update reuses this lease.
             result = await runWithWorkspaceMutationLease(lease, () => withUpdateSkillScopes(

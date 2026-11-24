@@ -20,6 +20,8 @@ import { normalizeHttpRouteAuthDefinition } from './httpRouteAuth.js';
 import { HttpRouteAccessPolicy } from './policy/HttpRouteAccessPolicy.js';
 import { HttpRouteAccessPath } from './policy/HttpRouteAccessPath.js';
 import { normalizeManifestHttpRouteAccess } from './policy/HttpRouteProviders.js';
+import { resolveRouteCacheClass } from './policy/routeCacheMarks.js';
+import { requestHasCredential } from './cdn/cdnCachePolicy.js';
 import { compileProxyLimits } from './proxy/limits.js';
 import { createRoutePlan } from './proxy/RoutePlan.js';
 import { leaseRouteHardwareAvailability } from './hardwareAvailability.mjs';
@@ -192,6 +194,15 @@ function conventionAuthDefinition({ snapshot, routeKey, route, selector, decisio
             ? { delegations: declaration.delegations }
             : {}),
     });
+}
+
+function cacheResponsePolicy(req, snapshot, routeKey, requestPath, access) {
+    return {
+        access,
+        cacheClass: resolveRouteCacheClass({ manifest: snapshot.manifests?.[routeKey], routeKey, requestPath, access }),
+        // Capture header presence on ingress, before authentication and forwarding.
+        requestHasCredential: req?.headers ? requestHasCredential(req) : undefined,
+    };
 }
 
 export function agentPortPlan({
@@ -398,6 +409,7 @@ export function agentPortPlan({
             allowApplicationCookies: true,
         },
         responsePolicy: {
+            ...cacheResponsePolicy(req, snapshot, selected.routeKey, selector.policyPath, decision.access),
             allowApplicationCookies: true,
             allowRedirects: true,
             allowCaching: true,
@@ -745,6 +757,7 @@ function agentRootPlan({
     return {
         ...common,
         kind: 'agent-root',
+        responsePolicy: cacheResponsePolicy(req, snapshot, agent.routeKey, agent.canonicalPath, decision.access),
         target: { hostname: '127.0.0.1', hostPort },
     };
 }
@@ -806,6 +819,21 @@ export function resolveEdgeRoutePlan({
     if (conventionPlan) return conventionPlan;
 
     if (listener === 'private') {
+        if (transport === 'http' && req.method === 'POST' && req.url === '/api/edge/cache' && pathname === req.url) {
+            return {
+                matched: true,
+                ok: true,
+                kind: 'private-operation',
+                operation: 'cache',
+                listener,
+                host,
+                hostSelection,
+                pathname,
+                parsedUrl: url,
+                lease,
+                snapshot,
+            };
+        }
         if (pathname === '/api/edge/workspace-logs') {
             if (req.method !== 'POST' || url.search) {
                 return deny(400, 'WORKSPACE_LOGS_REQUEST_INVALID', { lease, hostSelection });

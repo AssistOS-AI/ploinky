@@ -88,7 +88,7 @@ export class WebSocketFrameLimitTransform extends Transform {
 
 function rejectSocket(socket, status = 403) {
     const reason = http.STATUS_CODES[status] || 'Request Failed';
-    try { socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n`); } catch (_) {}
+    try { socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nCache-Control: no-store\r\nCloudflare-CDN-Cache-Control: no-store\r\n\r\n`); } catch (_) {}
 }
 
 function assertWebSocketOrigin(req, plan) {

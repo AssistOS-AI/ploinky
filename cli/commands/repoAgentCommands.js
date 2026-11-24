@@ -1,3 +1,4 @@
+import { formatDiagnostic, diagnosticLevel } from '../utils/diagnostics.js';
 import fs from 'fs';
 import path from 'path';
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
@@ -25,7 +26,6 @@ import {
     isErrorRecord,
     isReportedSkip,
     recordDisplayName,
-    skillsManifestRecord,
 } from './updateRecords.js';
 import { UpdateRequestError, resolveUpdateFolderScope } from './updateRequest.js';
 import { refreshUpdateGitPins } from '../utils/dependencies/store/updatePins.mjs';
@@ -178,15 +178,6 @@ function refreshDefaultSkillsInPloinkyRepos(repoNames = getGitRepoNames(), {
     };
 }
 
-// Folders (core spelling) whose private exclusions a container run could not
-// publish. The host refreshes them with skillsSvc.refreshExportExclusions.
-const DEFERRED_EXCLUSION_CODE = 'exclusions-executor-view-unverified';
-function deferredExclusionFolders(results) {
-    return [...new Set(results
-        .filter(result => result?.exclusions?.code === DEFERRED_EXCLUSION_CODE)
-        .map(result => path.resolve(result.destRoot || result.repoPath)))];
-}
-
 function logRepoUpdateSuccess(repoName, result, indent = '') {
     if (result?.recloned) {
         console.log(`${indent}✓ ${repoName} (cloned into its empty managed directory)`);
@@ -285,11 +276,12 @@ function executeGitOperation(operation, records, indent = '  ', checkoutOptions 
     let result = null;
     try {
         if (operation.kind === 'registered') {
-            record = reposSvc.updateRegisteredRepository(operation.name, { checkoutOptions });
+            record = reposSvc.updateRegisteredRepository(operation.name, { checkoutOptions, assessGeneratedState: null });
         } else {
             record = reposSvc.updateWorkspaceRepository(operation.path, {
                 id: operation.path,
                 aliases: operation.aliases.map(String),
+                assessGeneratedState: null,
                 checkoutOptions,
             });
         }
@@ -313,11 +305,10 @@ function executeGitOperation(operation, records, indent = '  ', checkoutOptions 
     const label = recordLabel(operation);
     if (record.outcome === 'changed' || record.outcome === 'unchanged') {
         logRepoUpdateSuccess(operation.name, result, indent);
-        if (operation.aliases.length) console.log(`${indent}  (same checkout as ${operation.aliases.join(', ')})`);
     } else if (record.outcome === 'skipped' || record.outcome === 'deferred') {
-        console.warn(`${indent}- ${label}: skipped update (${record.code}): ${record.reason}`);
+        console.warn(formatDiagnostic(`${indent}${label}: skipped update (${record.code}): ${record.reason}`));
     } else {
-        console.error(`${indent}✗ ${label}: ${record.reason}`);
+        console.error(formatDiagnostic(`${indent}${label}: ${record.reason}`, 'error'));
     }
     return record;
 }
@@ -325,7 +316,7 @@ function executeGitOperation(operation, records, indent = '  ', checkoutOptions 
 function logSkippedSummary(records) {
     const skipped = records.filter(isReportedSkip);
     if (!skipped.length) return;
-    console.log(`Update skipped: ${skipped.map(record => `${recordDisplayName(record)} (${record.code || 'skipped'})`).join(', ')}`);
+    console.log(formatDiagnostic(`Update skipped: ${skipped.map(record => `${recordDisplayName(record)} (${record.code || 'skipped'})`).join(', ')}`));
 }
 
 // The running Ploinky checkout is reported but is not one of the graph's
@@ -447,7 +438,7 @@ async function refreshAgentLibSourceForUpdate({
         };
     } catch (err) {
         const message = err?.message || String(err);
-        console.error(`  ✗ achillesAgentLib: ${message}`);
+        console.error(formatDiagnostic(`achillesAgentLib: ${message}`, 'error'));
         return {
             result: null,
             record: createOperationRecord({
@@ -459,30 +450,15 @@ async function refreshAgentLibSourceForUpdate({
     }
 }
 
-function logDefaultSkillSummary(summary, indent = '') {
-    const refreshedCount = summary?.refreshed?.length || 0;
-    const skippedCount = summary?.skipped?.length || 0;
-    const failedCount = summary?.failed?.length || 0;
-    if (!refreshedCount && !failedCount) return;
-
-    console.log(`${indent}Default skills summary: ${refreshedCount}/${summary.total} repo(s) refreshed.`);
-    if (skippedCount) {
-        console.log(`${indent}Default skills skipped: ${skippedCount} repo(s).`);
-    }
-    if (failedCount) {
-        console.log(`${indent}Default skills failed: ${failedCount} repo(s).`);
-    }
-}
-
 function logUpdateFailures(records) {
     const failed = records.filter(isErrorRecord);
     if (!failed.length) return;
-    console.error(`Update completed with ${failed.length} error(s):`);
+    console.error(formatDiagnostic(`Update completed with ${failed.length} error(s):`, 'error'));
     for (const record of failed) {
         const sourceName = record.phase === 'default-skills' ? record.details?.source : null;
         const manifestPath = record.phase === 'skills-manifest' ? record.details?.manifestPath : null;
         const source = sourceName ? ` (source: ${sourceName})` : '';
-        console.error(sanitizeGitDiagnostic(`  ✗ ${recordDisplayName(record)}${source}: ${record.reason}`));
+        console.error(formatDiagnostic(sanitizeGitDiagnostic(`  ✗ ${recordDisplayName(record)}${source}: ${record.reason}`), 'error'));
         if (manifestPath) console.error(`    Manifest: ${manifestPath}`);
     }
 }
@@ -585,7 +561,7 @@ async function uninstallRepo(target, { workspaceLeaseWaitMs, agentDisableDepende
 // before any mutation; the proposed graph after every Git phase.
 function readGraphSafely() {
     try {
-        return readUpdateGraph();
+        return readUpdateGraph({ includeSkills: false });
     } catch (error) {
         return { determinable: false, errors: [String(error?.message || error)], repositories: new Set(),
             repositoryPaths: new Set(), linkInstallNames: new Set(), linkInstallPaths: new Set() };
@@ -595,7 +571,9 @@ function readGraphSafely() {
 function finishUpdateResult({ command, records, prior, agentLib = null, extra = {} }) {
     const proposed = readGraphSafely();
     const closed = applyGraphRequirements(records, { prior, proposed });
-    return buildCoreUpdateResult({ command, records: closed, agentLib, extra });
+    return buildCoreUpdateResult({ command, records: closed, agentLib, extra: {
+        ...extra, graphErrors: [...new Set([...(prior?.errors || []), ...(proposed?.errors || [])])],
+    } });
 }
 
 /**
@@ -609,7 +587,7 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
     let record;
     await checkpoint(`repository ${repoName}`);
     try {
-        record = reposSvc.updateRegisteredRepository(repoName, { checkoutOptions: checkoutOptionsFor(boxRun) });
+        record = reposSvc.updateRegisteredRepository(repoName, { checkoutOptions: checkoutOptionsFor(boxRun), assessGeneratedState: null });
     } catch (err) {
         record = err?.record || createOperationRecord({
             phase: 'registered-repository', id: String(repoName), outcome: 'failed',
@@ -617,7 +595,7 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
         });
     }
     if (record.outcome !== 'changed' && record.outcome !== 'unchanged') {
-        console.error(`✗ Repo '${repoName}': ${record.reason}`);
+        console.error(formatDiagnostic(`Repo '${repoName}': ${record.reason}`, diagnosticLevel(record)));
     } else if (record.details?.recloned === true) {
         console.log(`✓ Repo '${repoName}' cloned into its empty managed directory.`);
     } else if (record.outcome === 'unchanged') {
@@ -628,66 +606,7 @@ async function updateRepoResult(repoName, { command = ['update', 'repo', repoNam
     records.push(record);
     await checkpoint('the dependency pin refresh');
     records.push(...(await refreshUpdateGitPins({ repositoryNames: [repoName], sourceOutcomes: records })).records);
-    const sourceOutcomes = [record];
-    let defaultSkills = null;
-    if (record.outcome === 'changed' || record.outcome === 'unchanged') {
-        await checkpoint('the default skills refresh');
-        // achillesAgentLib is not a per-repository npm package any more: it is
-        // the one workspace-selected source, advanced by `ploinky update`.
-        defaultSkills = refreshDefaultSkillsInPloinkyRepos([repoName], { sourceOutcomes, boxRun });
-        logDefaultSkillSummary(defaultSkills, '  ');
-        records.push(...defaultSkills.records);
-    }
-    // Targeted refresh of the manifest consumers of this source, each with its
-    // complete owner set. Nothing is pulled; a skipped/failed source is used as
-    // it is without pruning and an uncertain one retains every output.
-    let skillConsumers = null;
-    const checkout = record.details?.checkout?.path;
-    if (checkout) {
-        await checkpoint('the skills manifest refresh');
-        skillConsumers = skillsSvc.refreshSkillConsumersForSource({
-            folders: skillsSvc.findWorkspaceFoldersWithSkillsManifest(PLOINKY_WORKSPACE_ROOT),
-            sourcePath: checkout,
-            sourceOutcomes,
-            boxRun,
-        });
-        for (const result of skillConsumers.refreshed) {
-            const consumerRecord = skillsManifestRecord({
-                folder: result.destRoot, manifestPath: result.manifestPath,
-                label: path.relative(PLOINKY_WORKSPACE_ROOT, result.destRoot) || path.basename(result.destRoot), result,
-            });
-            records.push(consumerRecord);
-            // The line is derived from the record: a failed or uncertain
-            // source or export is never printed as an installation.
-            if (isErrorRecord(consumerRecord)) {
-                console.error(sanitizeGitDiagnostic(`  ✗ skills consumer ${result.destRoot}: ${consumerRecord.reason}`));
-            } else {
-                console.log(`  ✓ skills consumer ${result.destRoot}: ${result.skills.length} skill(s)`);
-            }
-        }
-        for (const failure of skillConsumers.failed) {
-            records.push(skillsManifestRecord({
-                folder: failure.folder, manifestPath: failure.manifestPath,
-                label: path.relative(PLOINKY_WORKSPACE_ROOT, failure.folder) || path.basename(failure.folder),
-                error: failure.error,
-            }));
-            console.error(`  ✗ skills consumer ${failure.folder}: ${failure.message}`);
-        }
-    }
-    return finishUpdateResult({
-        command,
-        records,
-        prior,
-        extra: {
-            defaultSkills,
-            record,
-            skillConsumers,
-            deferredExclusionFolders: deferredExclusionFolders([
-                ...(defaultSkills?.refreshed || []),
-                ...(skillConsumers?.refreshed || []),
-            ]),
-        },
-    });
+    return finishUpdateResult({ command, records, prior, extra: { record } });
 }
 
 async function updatePloinkyRepos(options = {}) {
@@ -717,18 +636,11 @@ async function updatePloinkyRepos(options = {}) {
     await checkpoint('the dependency pin refresh');
     records.push(...(await refreshUpdateGitPins({ repositoryNames: ploinkyRepos, sourceOutcomes: records })).records);
 
-    // The skills phase consumes the operation records; it never pulls again.
-    await checkpoint('the default skills refresh');
-    const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos, { sourceOutcomes: [...records], boxRun: options.boxRun });
-    logDefaultSkillSummary(defaultSkills);
-    records.push(...defaultSkills.records);
-
     const result = finishUpdateResult({
         command: options.command || ['update', 'repos'],
         records,
         prior,
         agentLib: agentLib.result,
-        extra: { defaultSkills, deferredExclusionFolders: deferredExclusionFolders(defaultSkills.refreshed) },
     });
     const repositoryRecords = result.records.filter(record => record.phase === 'registered-repository');
     const verified = repositoryRecords.filter(record => record.outcome === 'changed' || record.outcome === 'unchanged').length;
@@ -763,21 +675,10 @@ async function updateAllRepos(folderPath, options = {}) {
         discoveredWorkspaceRepos.push({ name: path.basename(delegatedWorkspacePloinky), path: delegatedWorkspacePloinky });
     }
     const baseExclusions = [ploinkyRoot, hostUpdatedWorkspaceCheckout, runtimeAgentLibSource].filter(Boolean);
-    const workspaceManifestFolders = skillsSvc.findWorkspaceFoldersWithSkillsManifest(projectsRoot)
-        .filter(folderPath => !pathsReferToSameLocation(folderPath, ploinkyRoot))
-        .filter(folderPath => {
-            const hasManifest = skillsSvc.findSkillsManifestPath(folderPath);
-            return Boolean(hasManifest);
-        });
     const ploinkyRepos = getGitRepoNames();
     const registeredOperations = buildRegisteredOperations(ploinkyRepos);
-    // Declared manifest sources join the one operation set; a checkout already
-    // covered by a registered or discovered operation is not added twice.
-    const declaredSources = skillsSvc.listDeclaredSkillSources(workspaceManifestFolders)
-        .filter(source => source.exists && !source.error)
-        .map(source => ({ name: source.name, path: source.checkoutPath }));
     let workspaceOperations = buildWorkspaceOperations(
-        [...discoveredWorkspaceRepos, ...declaredSources], registeredOperations, baseExclusions,
+        discoveredWorkspaceRepos, registeredOperations, baseExclusions,
     );
     if (delegatedWorkspacePloinky) {
         for (const operation of [...registeredOperations, ...workspaceOperations]) {
@@ -787,31 +688,36 @@ async function updateAllRepos(folderPath, options = {}) {
     const records = [];
     const checkpoint = stage => options.cancellation?.checkpoint(stage, records);
 
-    await checkpoint('the Ploinky self-update');
-    console.log('Updating Ploinky...');
+    // The host already owns the self-update, including any skip or failure.
+    // Do not attempt it again against the internal /opt/ploinky copy.
     let selfUpdate = null;
-    try {
-        selfUpdate = await (options.updateSelf || updatePloinkySelf)({
-            repoPath: ploinkyRoot,
-            updateScopePath: projectsRoot,
-            interactiveSession: options.interactiveSession === true,
-        });
-        const record = selfUpdateRecord(selfUpdate, ploinkyRoot);
-        if (record) records.push(record);
-        if (selfUpdate.deferred) {
-            console.log('  - Ploinky self-update deferred; continuing repository and skills update.');
-        } else if (selfUpdate.skipped) {
-            console.log(`  - skipped (${selfUpdate.reason || 'not available'})`);
-        } else if (selfUpdate.updated) {
-            console.log('  ✓ Ploinky updated.');
-        } else {
-            console.log('  ✓ Ploinky already up to date.');
+    if (!options.hostManagedSelfUpdate) {
+        await checkpoint('the Ploinky self-update');
+        console.log('Updating Ploinky...');
+        try {
+            selfUpdate = await (options.updateSelf || updatePloinkySelf)({
+                repoPath: ploinkyRoot,
+                updateScopePath: projectsRoot,
+                interactiveSession: options.interactiveSession === true,
+            });
+            const record = selfUpdateRecord(selfUpdate, ploinkyRoot);
+            if (record) records.push(record);
+            if (selfUpdate.deferred) {
+                console.log('  - Ploinky self-update deferred; continuing repository update.');
+            } else if (selfUpdate.skipped) {
+                console.log(`  - skipped (${selfUpdate.reason || 'not available'})`);
+            } else if (selfUpdate.updated) {
+                console.log('  ✓ Ploinky updated.');
+            } else {
+                console.log('  ✓ Ploinky already up to date.');
+            }
+        } catch (err) {
+            const message = err?.message || String(err);
+            const base = err?.record || { phase: 'host-ploinky', id: ploinkyRoot, outcome: 'failed', code: 'self-update-error', reason: message };
+            records.push(createOperationRecord({ ...base, attempted: base.attempted ?? true, required: false, details: { ...(base.details || {}), requirementFixed: true } }));
+            console.error(formatDiagnostic(`Ploinky: ${message}`, 'error'));
         }
-    } catch (err) {
-        const message = err?.message || String(err);
-        const base = err?.record || { phase: 'host-ploinky', id: ploinkyRoot, outcome: 'failed', code: 'self-update-error', reason: message };
-        records.push(createOperationRecord({ ...base, attempted: base.attempted ?? true, required: false, details: { ...(base.details || {}), requirementFixed: true } }));
-        console.error(`  ✗ Ploinky: ${message}`);
+
     }
 
     await checkpoint('the achillesAgentLib refresh');
@@ -850,69 +756,6 @@ async function updateAllRepos(folderPath, options = {}) {
     await checkpoint('the dependency pin refresh');
     records.push(...(await refreshUpdateGitPins({ repositoryNames: ploinkyRepos, sourceOutcomes: records })).records);
 
-    // The skills phases consume the operation records; they never pull again.
-    await checkpoint('the default skills refresh');
-    const sourceOutcomes = [...records];
-    const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos, { sourceOutcomes, boxRun: options.boxRun });
-    logDefaultSkillSummary(defaultSkills);
-    records.push(...defaultSkills.records);
-    const manifestResults = [];
-
-    if (workspaceManifestFolders.length) {
-        console.log('Installing skills from folders containing ploinky-skills-manifest.json...');
-        console.log(`  Found ${workspaceManifestFolders.length} skills manifest folder(s) under ${projectsRoot}.`);
-        for (const manifestFolder of workspaceManifestFolders) {
-            const manifestPath = skillsSvc.findSkillsManifestPath(manifestFolder);
-            const folderLabel = path.relative(projectsRoot, manifestFolder) || path.basename(manifestFolder);
-            await checkpoint(`the skills manifest in ${folderLabel}`);
-            try {
-                const result = skillsSvc.installSkillsFromManifest(manifestPath, {
-                    targetRoot: manifestFolder,
-                    pruneMissing: true,
-                    sourceOutcomes,
-                    boxRun: options.boxRun,
-                });
-                manifestResults.push(result);
-                const manifestRecord = skillsManifestRecord({ folder: manifestFolder, manifestPath, label: folderLabel, result });
-                records.push(manifestRecord);
-                // Both summaries are derived from the record: a failed or
-                // uncertain source or export is never printed as an installation.
-                // Present exactly when the export transaction settled, whatever
-                // the outcome of a source: the manifest rewrite did happen.
-                for (const entry of manifestRecord.details?.prunedSkills || []) {
-                    console.log(sanitizeGitDiagnostic(`    Removed missing skill '${entry.skill}' from '${entry.repository}' in the manifest.`));
-                }
-                const prunedListed = manifestRecord.details?.prunedSkills?.length || 0;
-                const prunedTotal = manifestRecord.details?.prunedSkillCount || prunedListed;
-                if (prunedTotal > prunedListed) {
-                    console.log(`    … and ${prunedTotal - prunedListed} more skill(s) removed from the manifest.`);
-                }
-                if (isErrorRecord(manifestRecord)) {
-                    console.error(sanitizeGitDiagnostic(`  ✗ ${folderLabel} skills: ${manifestRecord.reason}`));
-                    continue;
-                }
-                const reposLabel = result.repoCount ? ` from ${result.repoCount} repos` : '';
-                const skillNames = result.skills.join(', ');
-                console.log(`  ✓ ${folderLabel}: ${result.skills.length} skill(s)${reposLabel} (${skillNames})`);
-                if (result.duplicateSkills?.length) {
-                    const duplicates = result.duplicateSkills
-                        .map((entry) => `  - ${entry.skill}: ${entry.previousSource} -> ${entry.chosenSource}`)
-                        .join('\n');
-                    console.log(`    duplicate skills resolved by manifest order:\n${duplicates}`);
-                }
-                if (result.gitignoreUpdated) {
-                    console.log(`    .gitignore updated`);
-                }
-            } catch (err) {
-                const message = err?.message || String(err);
-                records.push(skillsManifestRecord({ folder: manifestFolder, manifestPath, label: folderLabel, error: err }));
-                console.error(`  ✗ ${folderLabel} skills: ${message}`);
-            }
-        }
-    } else {
-        console.log(`No ploinky-skills-manifest.json files found under ${projectsRoot}.`);
-    }
-
     const result = finishUpdateResult({
         command: options.command || ['update', ...(folderPath ? ['all', projectsRoot] : [])],
         records,
@@ -920,8 +763,6 @@ async function updateAllRepos(folderPath, options = {}) {
         agentLib: agentLib.result,
         extra: {
             selfUpdate,
-            defaultSkills,
-            deferredExclusionFolders: deferredExclusionFolders([...defaultSkills.refreshed, ...manifestResults]),
         },
     });
     // A skipped or deferred self-update was never attempted, so it is neither a

@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+import { formatWorkspaceRestartBlockers, isExpectedUpdateDelegation } from '../../cli/commands/updateSummary.js';
 import fs from 'node:fs';
+import { formatDiagnostic, diagnosticLevel, updateDiagnosticLevel } from '../../cli/utils/diagnostics.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -116,7 +118,8 @@ Commands:
                                   process list; removes one trailing newline
   ploinky cli                     Open Bash in the Box
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
-  ploinky cs | coding-sessions    Attach, resume or start robot coding sessions in the
+  ploinky cs | code | coding [agents|sessions] | coding-sessions
+                                  Attach, resume or start robot coding sessions in the
                                   current folder; they are also listed in Live Sessions
   ploinky logs tail [TARGET]      Follow Router or agent logs; inspect-only
   ploinky logs last [N] [TARGET]  Show the last N lines; inspect-only
@@ -664,13 +667,12 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
 }
 
 const UPDATE_ACTIVATION_WORDING = Object.freeze({
-    restarted: 'Activation: the workspace graph was restarted and the Router health check passed.',
-    'not-required': 'Activation not required; no configured running workspace required a restart.',
-    deferred: 'Activation deferred; the running workspace graph was not restarted. Updated sources may require '
-        + 'activation: run `ploinky restart` to activate them.',
-    restored: 'Activation blocked; reconstruction of the previous Box and graph configuration was attempted and '
+    restarted: 'Workspace restarted; the Router health check passed.',
+    'not-required': 'Workspace not restarted: no configured workspace was running.',
+    deferred: 'Workspace not restarted. Run `ploinky restart` to use the updated sources.',
+    restored: 'The updated workspace could not be started; restoring the previous runtime configuration was attempted and '
         + 'passed its checks. It runs from the current checkouts: sources that were already pulled are not rolled back.',
-    'recovery-required': 'Activation blocked and the previous workspace graph could not be fully reconstructed; '
+    'recovery-required': 'Workspace restart failed and the previous runtime could not be fully restored; '
         + 'recover it from this workspace with `ploinky stop`, then `ploinky start`.',
 });
 
@@ -694,16 +696,18 @@ function describeRecord(record) {
 // The final status line names every phase that was not verified.
 export function formatUpdateStatusLine(result) {
     const unverified = result.records.filter(record => !['changed', 'unchanged'].includes(record.outcome)
-        && !(record.phase === 'activation' && record.id === 'workspace-graph'));
+        && !(record.phase === 'activation' && record.id === 'workspace-graph')
+        && !isExpectedUpdateDelegation(record));
     const errors = unverified.filter(record => ['failed', 'uncertain'].includes(record.outcome));
     const skipped = unverified.filter(record => !['failed', 'uncertain'].includes(record.outcome));
     const list = records => records.map(describeRecord).join('; ');
     if (result.status === 'complete') return 'Update complete.';
-    if (result.status === 'complete-with-skips') return `Update complete with skips: ${list(skipped)}.`;
+    if (result.status === 'complete-with-skips') return skipped.length
+        ? `Update complete with skips: ${list(skipped)}.` : 'Update complete.';
     const parts = [];
     if (errors.length) parts.push(`failed or uncertain: ${list(errors)}`);
     if (skipped.length) parts.push(`not verified: ${list(skipped)}`);
-    const label = result.status === 'partial' ? 'Update partially failed' : 'Update failed';
+    const label = !errors.length ? 'Update incomplete' : result.status === 'partial' ? 'Update partially failed' : 'Update failed';
     return `${label} (exit status ${result.exitCode}): ${parts.join('; ') || 'no verified result'}.`;
 }
 
@@ -878,10 +882,11 @@ async function runHostUpdate({
                 record: hostUpdate.record,
                 repoPath: hostUpdate.repoPath || repositoryRoot,
             };
-            output.write(
+            output.write(formatDiagnostic(
                 `Host Ploinky checkout at ${hostUpdate.repoPath || repositoryRoot} was not updated `
                 + `(${hostUpdate.record.outcome}${hostUpdate.record.code ? `: ${hostUpdate.record.code}` : ''}): `
-                + `${hostUpdate.record.reason || hostUpdate.reason || 'no reason recorded'}.\n`,
+                + `${hostUpdate.record.reason || hostUpdate.reason || 'no reason recorded'}.`,
+                diagnosticLevel(hostUpdate.record), { stream: output, env }) + '\n',
             );
         } else if (hostUpdate.updated) {
             const handoff = createRelaunchHandoff({
@@ -924,10 +929,9 @@ async function runHostUpdate({
             // Already named from the writer's operation record.
         } else if (hostUpdate.skipped) {
             summary.host = { outcome: 'skipped', reason: hostUpdate.reason || '', repoPath: hostUpdate.repoPath || repositoryRoot };
-            output.write(
+            output.write(formatDiagnostic(
                 `Host Ploinky checkout at ${hostUpdate.repoPath || repositoryRoot} was not updated: `
-                + `${hostUpdate.reason}.\n`,
-            );
+                + `${hostUpdate.reason}.`, 'warning', { stream: output, env }) + '\n');
         } else {
             summary.host = { outcome: 'unchanged', repoPath: hostUpdate.repoPath || repositoryRoot };
             output.write('Host Ploinky checkout is already up to date.\n');
@@ -957,7 +961,7 @@ async function runHostUpdate({
                 code: String(error?.code || 'update-failed'), reason: String(error?.message || error),
             })],
         });
-        output.write(`${formatUpdateStatusLine(failed)}\n`);
+        output.write(`${formatDiagnostic(formatUpdateStatusLine(failed), 'error', { stream: output, env })}\n`);
         output.write(`${UPDATE_FAILURE_WORDING[outcome]
             || 'Update failed; the activation outcome could not be determined.'}\n`);
         summary.activation = error?.activation || null;
@@ -997,12 +1001,16 @@ async function runHostUpdate({
     };
     const outcome = result?.activation?.outcome;
     summary.activation = result?.activation || null;
-    output.write(`${formatUpdateStatusLine(final)}\n`);
-    output.write(`${UPDATE_ACTIVATION_WORDING[outcome] || 'The activation outcome was not reported.'}\n`);
-    if (outcome === 'deferred' && result?.activation?.blockedBy?.length) {
-        output.write(`Activation was blocked by: ${result.activation.blockedBy
-            .map(entry => `${entry.phase} ${entry.id} (${entry.code || entry.outcome})`).join('; ')}.\n`);
+    const level = updateDiagnosticLevel(final);
+    const finalText = formatUpdateStatusLine(final);
+    output.write(`${level && finalText !== 'Update complete.' ? formatDiagnostic(finalText, level, { stream: output, env }) : finalText}\n`);
+    const restartBlockers = formatWorkspaceRestartBlockers(final);
+    if (outcome !== 'deferred' || restartBlockers.length === 0) {
+        const message = UPDATE_ACTIVATION_WORDING[outcome] || 'The workspace restart result was not reported.';
+        const severity = outcome === 'recovery-required' ? 'error' : ['deferred', 'restored'].includes(outcome) ? 'warning' : null;
+        output.write(`${severity ? formatDiagnostic(message, severity, { stream: output, env }) : message}\n`);
     }
+    if (restartBlockers.length) output.write(`${formatDiagnostic(restartBlockers.join('\n'), 'warning', { stream: output, env })}\n`);
     onUpdateResult?.({ ...summary, failed: final.exitCode !== 0, result: final });
     dispatch.reported = true;
     return final.exitCode;
@@ -1013,7 +1021,7 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
     try {
         process.exitCode = await runOuterCli(process.argv.slice(2));
     } catch (error) {
-        process.stderr.write(`ploinky: ${error.message}\n`);
+        process.stderr.write(`${formatDiagnostic(`ploinky: ${error.message}`, 'error')}\n`);
         process.exitCode = 1;
     }
 }

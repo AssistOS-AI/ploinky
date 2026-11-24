@@ -269,6 +269,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         case 'vars':
             handleVarsCommand();
             break;
+        case 'cache':
+            return (await import('./cacheCommands.js')).runCacheCommand(options);
         case 'var':
             if (isVarStdinRequest(options)) await handleVarStdinCommand(options[0]);
             else handleVarCommand(options);
@@ -450,6 +452,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 resolvePersistedRouterPort();
                 killRouterIfRunning();
                 await startWorkspace(undefined, undefined, {
+                    announce: false,
                     enableAgent,
                     killRouterIfRunning: () => { },
                 });
@@ -690,8 +693,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 const list = stopConfiguredAgents();
                 if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
                 else { console.log('[restart] No containers to stop.'); }
-                console.log('[restart] Starting workspace...');
                 await startWorkspace(undefined, undefined, {
+                    restarting: true,
                     enableAgent,
                     killRouterIfRunning,
                 });
@@ -774,7 +777,12 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             break;
         }
         case 'cs':
+        case 'code':
+        case 'coding':
         case 'coding-sessions': {
+            if (command === 'coding' && (options.length > 1 || (options.length === 1 && !['agents', 'sessions'].includes(options[0])))) {
+                throw new Error('Usage: ploinky coding [agents|sessions]');
+            }
             if (inputState.getInterface()) {
                 throw new Error('Coding sessions open from your shell: leave the Ploinky prompt and run `ploinky cs`.');
             }

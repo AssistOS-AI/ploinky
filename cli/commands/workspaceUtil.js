@@ -59,7 +59,7 @@ import {
 import {
   sanitizeManagedMasterKeyEnvironment,
 } from '../utils/security/masterKey.js';
-import { getExposedNames, getManifestEnvNames } from '../utils/security/secretVars.js';
+import { getExposedNames, getManifestEnvNames, isPublicationHandle } from '../utils/security/secretVars.js';
 import {
   isLlmRuntimeManifest,
   prepareLlmStartup,
@@ -278,7 +278,13 @@ function createAppendLogStdio(logFile) {
 // cycles without depending on the operator having `export`'d each one. Managed
 // Boxes then remove PLOINKY_MASTER_KEY because core reads its owned key file.
 export function sanitizeRouterEnvironment(environment, { managedBox } = {}) {
-  return sanitizeManagedMasterKeyEnvironment(environment, { managedBox });
+  const routerEnv = sanitizeManagedMasterKeyEnvironment(environment, { managedBox });
+  // Publication controllers read their handles from the encrypted store.
+  // Watchdog children and Router-loaded modules share the Router environment.
+  for (const name of Object.keys(routerEnv)) {
+    if (isPublicationHandle(name)) delete routerEnv[name];
+  }
+  return routerEnv;
 }
 
 export function buildRouterEnv({ managedBox } = {}) {
@@ -2933,6 +2939,8 @@ export function printStartResultSummary(result, { log = console.log } = {}) {
 async function startWorkspace(staticAgentArg, portArg, {
   killRouterIfRunning,
   branchPolicy,
+  restarting = false,
+  announce = true,
 } = {}) {
   // Acquire every declared dependency source before resolving the complete
   // graph. A fresh workspace cannot admit repositories that do not exist yet.
@@ -2946,6 +2954,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   if (!requestedStaticAgent) {
     throw new Error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
   }
+  if (announce) console.log(`${restarting ? 'Restarting' : 'Starting'} workspace with static agent ${requestedStaticAgent}...`);
   try {
     prepareDefaultBootRepositories({
       branchPolicy,
@@ -3633,7 +3642,7 @@ async function startWorkspace(staticAgentArg, portArg, {
             statusFile: entry.statusFile,
             waitForStatuses: entry.waitForStatuses,
           });
-          console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait wave ${entry.waveIndex + 1}/${noWaitSchedule.length} launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
+          console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: starting in background.`);
           asynchronousAgentKeys.push(registryName);
         } catch (spawnErr) {
           // Publishing the terminal status is best-effort here. Letting it

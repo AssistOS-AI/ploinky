@@ -1,7 +1,8 @@
 export function showHelp(args = [], { surface = 'core' } = {}) {
     // Parse help arguments
-    const topic = args[0];
-    const subtopic = args[1];
+    const codingAlias = ['cs', 'code', 'coding', 'coding-sessions'].includes(args[0]);
+    const topic = codingAlias ? 'cs' : args[0];
+    const subtopic = codingAlias && ['agents', 'sessions'].includes(args[1]) ? undefined : args[1];
     const subsubtopic = args[2];
     
     // Detailed help for specific commands
@@ -41,7 +42,7 @@ function mainHelpText(surface) {
   add <url|repoName> [name] [branch]     Alias for install
   uninstall <name|url>           Uninstall repository and its enabled agents
   remove <name|url>              Alias for uninstall
-  update [folderPath]            Verified fast-forward update of Ploinky, AgentLib, repos, projects, and skills
+  update [folderPath]            Verified fast-forward update of Ploinky, AgentLib, repos and projects
   start <agent> [port] [--profile <name>]
                                  Start agents from .ploinky/agents.json and launch Router
   shell <agentName>              Open interactive shell in container (attached TTY)
@@ -51,6 +52,7 @@ function mainHelpText(surface) {
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
   network status [--json]        Show managed network topology (status schema 3)
   network prune                  Remove unused workspace-owned managed networks
+  cache purge-config|clear|hold|release  Configure host purges or operate the running Router cache
   vars                           List all variable names (no values)
   var <VAR> <value>              Set a variable value
   echo <VAR|$VAR>                Print the resolved value of a variable
@@ -59,7 +61,8 @@ function mainHelpText(surface) {
   list agents | repos | routes   List agents, predefined repos, or router routes
   /settings | settings           Open the interactive model/settings menu
   profile [name|list|show]       Inspect or change the active profile
-  cs | coding-sessions           Attach, resume or start robot coding sessions in this folder
+  cs | code | coding [agents|sessions] | coding-sessions
+                                 Attach, resume or start robot coding sessions in this folder
 
 
 ▶ CLIENT OPERATIONS
@@ -135,6 +138,11 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             examples: [ 'remove myrepo', 'remove repo myrepo' ],
             notes: 'The optional `repo` token is accepted but not required.'
         },
+        'cache': {
+            description: 'Configure host purges, clear a published host or hold and release application page caching.',
+            syntax: 'cache purge-config --host <host> --zone <id> --secret <publication/handle> | cache clear --host <host> | cache hold|release --agent <repo/agent>',
+            notes: 'Store the purge token with var <publication/handle> --stdin. Give purge-config its handle. Clear, hold and release require the active Router.'
+        },
         'var': {
             description: 'Set a workspace variable (stored encrypted in .ploinky/data/.secrets)',
             syntax: 'var <VAR> <value> | var <VAR> --stdin',
@@ -154,7 +162,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             description: 'Update Ploinky itself, its Achilles runtime checkout, workspace repositories, Achilles dependencies, and project repositories',
             syntax: 'update [folderPath] | update all [folderPath] | update repos | update repo <name>',
             examples: [ 'update', 'update /work/projects', 'update all /work/projects', 'update repos', 'update repo basic' ],
-            notes: '`update` is the same full workflow as `update all`. The current directory is the selected update folder unless folderPath is supplied; folderPath must be inside the workspace. A Ploinky checkout is updated only when it is inside that folder or the command is launched from inside the checkout; an out-of-scope Ploinky checkout is skipped. Every checkout is fetched once and fast-forwarded only when it is clean, on its configured branch and upstream, and not diverged. Dirty, conflicted, diverged, detached, operation-in-progress and upstream-mismatch checkouts are preserved untouched and reported with a named reason; Ploinky never stashes, rebases, resets or aborts user Git state. A changed or untracked .gitignore containing a Ploinky managed block without matching write provenance is preserved and may skip the checkout with `unverified-ignore-block-preserved`; inspect the reported edit before resolving it. An unchanged committed block remains repository policy and does not by itself block an update. The workflow advances the selected achillesAgentLib source (a local <workspace>/achillesAgentLib checkout is revalidated but never pulled; inside a Ploinky box the outer host owns it), updates .ploinky/repos, git repositories discovered recursively from folderPath and declared skills sources, then refreshes default skills and ploinky-skills-manifest.json selections without pulling again. Generated skill links are excluded through private per-worktree Git configuration, never through a tracked .gitignore or the shared info/exclude; when a live external excludes policy would be shadowed the exclusion is deferred and reported (set PLOINKY_SKILL_EXCLUDES_COMPOSE=1 to authorize composing it). Each phase produces a record: the command exits nonzero when any record failed or when a required input of the configured graph was not verified, and the workspace is restarted only when every required input verified. `update repos` and `update repo <name>` run under the same workspace transaction but record activation as pending instead of restarting the whole graph; run `ploinky restart` to activate. Dependency caches are never prepared by update. In an interactive Ploinky session, a detected Ploinky self-update is deferred: close the session, run `ploinky update`, then restart Ploinky so the new changes are visible.'
+            notes: '`update` is the same full workflow as `update all`. The current directory is the selected update folder unless folderPath is supplied; folderPath must be inside the workspace. A Ploinky checkout is updated only when it is inside that folder or the command is launched from inside the checkout; an out-of-scope Ploinky checkout is skipped. Checkouts are fast-forwarded only when they are clean, on their configured branch and upstream, and not diverged. Local changes are preserved; update never stashes, rebases or resets them. The workflow refreshes the selected achillesAgentLib source, registered repositories and valid Git checkouts discovered recursively in the selected folder. Update does not install, export, prune or validate skills, read skills manifests, or modify their Git exclusions. Use the explicit skills commands for those operations. A full update from the host restarts an already running workspace when its required dependencies have been verified. Required repositories with local changes are listed and the restart is skipped. Targeted forms (`update repos` and `update repo <name>`) do not restart the whole workspace. Dependency caches are not prepared by update. For self-update and automatic workspace restart, leave the interactive Ploinky console and run ploinky update in the host terminal.'
         },
         
         
@@ -183,13 +191,13 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             }
         },
         'cs': {
-            description: 'Open a menu of the coding sessions an enabled agent provides in the current folder (alias: coding-sessions)',
+            description: 'Open a menu of the coding sessions an enabled agent provides in the current folder (aliases: code, coding, coding agents, coding sessions, coding-sessions)',
             subcommands: {
                 'default': {
-                    syntax: 'cs | coding-sessions',
+                    syntax: 'cs | code | coding | coding agents | coding sessions | coding-sessions',
                     description: 'Choose a robot (the default robot is preselected), one of its coding agents, then a session: attach a running one, resume an earlier conversation, or start a new one.',
                     params: {},
-                    examples: [ 'cs', 'coding-sessions' ],
+                    examples: [ 'cs', 'code', 'coding', 'coding agents', 'coding sessions', 'coding-sessions' ],
                     notes: 'In the menu: arrows select, Enter opens, n starts a new session, k kills a running session, r refreshes, Backspace goes back to the coding agents and then to the robots, q quits. Only the conversations a person started in this folder are listed. In a session, Ctrl+] detaches back to the menu; closing the terminal or losing the connection also detaches, and the session keeps running. Exiting the coding agent ends the session; k in the menu or Kill in Live Sessions kills a running one. The window used most recently sets the terminal size: attaching, typing or clicking in a window takes it, and every other window renders at that size. Run it from a project folder inside the workspace.'
                 }
             }

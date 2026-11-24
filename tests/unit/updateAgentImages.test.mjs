@@ -130,6 +130,8 @@ test('each image is pulled once; a changed ID is recorded, a failed pull keeps t
     assert.equal(images.ids.get('podman:broken:1'), ID_B, 'the existing local image is kept');
     assert.match(warnings.join('\n'), /broken:1: refresh failed .*keeping local image bbbbbbbbbbbb/);
     assert.match(logs.join('\n'), /absent:1 is not present locally/);
+    assert.ok(logs.includes('[images] same:1: already up to date.'));
+    assert.ok(logs.includes('[images] changed:1: updated; used on restart.'));
 
     const decision = decideUpdateStatus(records);
     assert.deepEqual([decision.status, decision.exitCode, decision.activationAllowed], ['complete-with-skips', 0, true],
@@ -245,4 +247,19 @@ test('runUpdateCommand appends the image records after the source phase, scoped 
     } finally {
         fs.rmSync(scratch, { recursive: true, force: true });
     }
+});
+
+
+test('quiet pulls suppress progress but retain runtime failure diagnostics', async t => {
+    const { pullImage } = await import('../../cli/sandbox/docker/common.js');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-quiet-pull-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const runtime = path.join(root, 'runtime');
+    fs.writeFileSync(runtime, '#!/bin/sh\n[ "$1" = pull ] && [ "$2" = --quiet ] || exit 99\necho "layer progress"\nif [ "$3" = broken ]; then echo "registry authentication failed" >&2; exit 125; fi\n');
+    fs.chmodSync(runtime, 0o755);
+    const logs = [];
+    pullImage('healthy', { runtime, quiet: true, log: message => logs.push(message) });
+    assert.deepEqual(logs, []);
+    assert.throws(() => pullImage('broken', { runtime, quiet: true, log: message => logs.push(message) }),
+        /code 125.*registry authentication failed/);
 });

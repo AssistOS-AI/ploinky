@@ -5,6 +5,10 @@ import { findEnvFile, loadEnvFile } from './masterKey.js';
 import { debugLog } from '../utils.js';
 import { REPOS_SOURCE_ENV } from '../reposSource.mjs';
 
+export function isPublicationHandle(name) {
+    return String(name).startsWith('publication/');
+}
+
 /**
  * Load secrets from the .ploinky/data/.secrets file.
  * File format is KEY=VALUE, one per line, with # comments.
@@ -26,6 +30,7 @@ export function loadSecretsFile() {
  * @returns {string|undefined} The secret value or undefined
  */
 export function getSecret(secretName) {
+    if (isPublicationHandle(secretName)) return undefined;
     // First check environment
     if (process.env[secretName] !== undefined) {
         return process.env[secretName];
@@ -53,6 +58,7 @@ export function getSecrets(secretNames) {
     const envSecrets = loadEnvFile();
 
     for (const name of secretNames) {
+        if (isPublicationHandle(name)) continue;
         // Environment takes precedence
         if (process.env[name] !== undefined) {
             secrets[name] = process.env[name];
@@ -82,7 +88,9 @@ export function validateSecrets(requiredSecrets) {
     const envSecrets = loadEnvFile();
 
     for (const name of requiredSecrets) {
-        if (process.env[name] !== undefined) {
+        if (isPublicationHandle(name)) {
+            missing.push(name);
+        } else if (process.env[name] !== undefined) {
             source[name] = 'environment';
         } else if (fileSecrets[name] !== undefined) {
             source[name] = '.secrets file';
