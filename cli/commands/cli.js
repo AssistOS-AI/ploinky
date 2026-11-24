@@ -452,6 +452,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 resolvePersistedRouterPort();
                 killRouterIfRunning();
                 await startWorkspace(undefined, undefined, {
+                    announce: false,
                     enableAgent,
                     killRouterIfRunning: () => { },
                 });
@@ -692,8 +693,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 const list = stopConfiguredAgents();
                 if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
                 else { console.log('[restart] No containers to stop.'); }
-                console.log('[restart] Starting workspace...');
                 await startWorkspace(undefined, undefined, {
+                    restarting: true,
                     enableAgent,
                     killRouterIfRunning,
                 });

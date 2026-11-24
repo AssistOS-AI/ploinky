@@ -126,9 +126,9 @@ function runScenario(body) {
     }
 }
 
-test('registered, workspace and Ploinky writers all run the generated-state assessment before dirty classification', () => {
+test('explicit skill writers assess generated state; Ploinky self-update preserves it', () => {
     const result = runScenario();
-    for (const caller of ['registered', 'workspace', 'ploinky']) {
+    for (const caller of ['registered', 'workspace']) {
         const unverified = result[`${caller}-unverified`];
         assert.equal(unverified.outcome, 'skipped', caller);
         assert.equal(unverified.code, 'unverified-ignore-block-preserved', `${caller}: named skip from the assessor, not dirty-worktree`);
@@ -139,6 +139,12 @@ test('registered, workspace and Ploinky writers all run the generated-state asse
         assert.equal(receipt.after.head, receipt.upstream);
         assert.equal(receipt.after.ignore, 'node_modules\n', `${caller}: the committed .gitignore bytes are restored`);
         assert.equal(receipt.after.receipt, false, `${caller}: the consumed receipt is removed`);
+    }
+    for (const label of ['unverified', 'receipt']) {
+        const entry = result[`ploinky-${label}`];
+        assert.equal(entry.outcome, 'skipped');
+        assert.equal(entry.code, 'dirty-worktree');
+        assert.deepEqual(entry.after, entry.before, 'self-update preserves skill ignore state even with a receipt');
     }
     assert.deepEqual(result['registered-receipt'].restored, ['.gitignore']);
 });

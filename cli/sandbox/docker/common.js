@@ -209,9 +209,13 @@ function pullImage(image, options = {}) {
     const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
         ? options.timeoutMs
         : imagePullTimeoutMs();
-    log(`[pull] ${rt} pull ${img} (timeout ${Math.round(timeoutMs / 1000)}s)`);
+    const quiet = options.quiet === true;
+    if (!quiet) log(`[pull] ${rt} pull ${img} (timeout ${Math.round(timeoutMs / 1000)}s)`);
     const startedAt = Date.now();
-    const res = spawnSync(rt, ['pull', img], { stdio: ['ignore', 'inherit', 'inherit'], timeout: timeoutMs });
+    const res = spawnSync(rt, ['pull', ...(quiet ? ['--quiet'] : []), img], {
+        stdio: quiet ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'inherit', 'inherit'],
+        encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: timeoutMs,
+    });
     const elapsedSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     if (res.error) {
         if (res.error.code === 'ETIMEDOUT') {
@@ -221,16 +225,10 @@ function pullImage(image, options = {}) {
         throw new Error(`Image pull for '${img}' failed: ${res.error.message}`);
     }
     if (res.status !== 0) {
-        throw new Error(`Image pull for '${img}' exited with code ${res.status}.`);
+        const detail = quiet ? String(res.stderr || '').trim().slice(-2000) : '';
+        throw new Error(`Image pull for '${img}' exited with code ${res.status}.${detail ? ` ${detail}` : ''}`);
     }
-    const bytes = getImageSizeBytes(img, rt);
-    if (bytes > 0) {
-        const mb = bytes / (1024 * 1024);
-        log(`[pull] ${img} ready — ${(mb / 1024).toFixed(2)} GB unpacked in ${elapsedSec}s `
-            + `(avg ${(mb / elapsedSec).toFixed(1)} MB/s)`);
-    } else {
-        log(`[pull] ${img} ready in ${elapsedSec}s`);
-    }
+    if (!quiet) log(`[pull] ${img} ready in ${elapsedSec}s`);
 }
 
 function resolveLocalImageBuildSource(image, options = {}) {

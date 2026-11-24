@@ -222,7 +222,7 @@ test('a complete verified update exits 0 and activates the AgentLib selection', 
 });
 
 test('Ctrl+C during the last update step blocks activation instead of being dropped', () => {
-    // The default-skills exclusion probe runs after the update's last checkpoint.
+    // Deliver a signal during Git work; no skill phase is needed for cancellation.
     const result = runScenario(String.raw`
         const { required } = await standardWorkspace();
         advance(required.seed);
@@ -231,15 +231,13 @@ test('Ctrl+C during the last update step blocks activation instead of being drop
             reasons: run.result.records.filter(record => record.code === 'cancelled').map(record => record.reason),
             spawned: run.spawned, staged: run.staged,
             signalled: fs.existsSync(path.join(scratch, 'signalled')) });
-    `, { PLOINKY_TEST_SIGNAL_PARENT_ON: 'check-ignore' });
+    `, { PLOINKY_TEST_SIGNAL_PARENT_ON: 'fetch' });
     assert.equal(result.signalled, true, 'the signal was delivered during the update');
     assert.equal(result.thrown, null);
     assert.equal(result.code, 1);
     assert.equal(result.activationAllowed, false);
-    assert.deepEqual(result.records.find(record => record[0] === 'registered-repository' && record[1] === 'RequiredRepo'),
-        ['registered-repository', 'RequiredRepo', 'changed', 'fast-forward', true], 'the steps before the signal completed');
     assert.equal(result.reasons.length, 1);
-    assert.match(result.reasons[0], /^Update cancelled by SIGINT before activation/);
+    assert.match(result.reasons[0], /^Update cancelled by SIGINT before /);
     assert.deepEqual(result.spawned, [], 'activation is never spawned after an operator signal');
     assert.deepEqual(result.staged, []);
 });
@@ -274,7 +272,7 @@ test('a dirty required repository alone blocks activation and exits nonzero with
     assert.deepEqual(result.spawned, [], 'the AgentLib activation child was not spawned');
     assert.deepEqual(result.staged, [], 'no AgentLib transaction was staged');
     assert.match(result.stderr, /achillesAgentLib activation is pending: blocked by registered-repository RequiredRepo \(skipped, dirty-worktree\)/);
-    assert.match(result.stderr, /Update failed: required inputs are not verified/);
+    assert.match(result.stderr, /Update incomplete: the workspace cannot be restarted/);
     assert.ok(result.headKept);
     assert.equal(result.bytes, 'local edit\n');
 });
@@ -289,13 +287,11 @@ test('a required repository failure through CLI dispatch: nonzero exit, records 
     assert.equal(result.code, 1);
     assert.equal(result.status, 'failed');
     assert.deepEqual(result.records.find(record => record[1] === 'RequiredRepo'),
-        ['registered-repository', 'RequiredRepo', 'failed', 'fetch-failed', true]);
-    assert.deepEqual(result.failed, ['RequiredRepo']);
+        ['registered-repository', 'RequiredRepo', 'skipped', 'remote-unreachable', true]);
+    assert.deepEqual(result.failed, []);
     assert.deepEqual(result.spawned, []);
-    assert.match(result.stderr, /Update completed with 1 error\(s\):/);
-    assert.match(result.stderr, /  ✗ RequiredRepo: /);
-    assert.match(result.stderr, /Update failed: required inputs are not verified/);
-    assert.match(result.stderr, /registered-repository RequiredRepo: failed \(fetch-failed, required\)/);
+    assert.match(result.stderr, /Update incomplete: the workspace cannot be restarted/);
+    assert.match(result.stderr, /registered-repository RequiredRepo: skipped \(remote-unreachable, required by the workspace\)/);
     assert.doesNotMatch(result.stderr + result.stdout, /Update complete:/);
 });
 
@@ -320,58 +316,20 @@ test('an optional workspace repository failure exits nonzero but still allows ac
     assert.match(result.stderr, /final update status: partial \(exit 1\)/);
 });
 
-test('a required skills manifest whose source cannot be cloned exits nonzero and never reaches activation', () => {
+test('update ignores missing skill sources and invalid manifests without blocking the workspace', () => {
     const result = runScenario(String.raw`
         await standardWorkspace();
         writeFile(path.join(workspaceRoot, 'ploinky-skills-manifest.json'),
-            JSON.stringify([{ name: 'MissingSource', url: path.join(scratch, 'missing.git'), skills: ['mandatory'] }]) + '\n');
+            JSON.stringify([{ name: 'MissingSource', url: path.join(scratch, 'missing.git'), skills: ['x'] }]));
+        writeFile(path.join(workspaceRoot, 'optional', 'ploinky-skills-manifest.json'), '{invalid');
         const run = await launchUpdate(['update', workspaceRoot]);
-        done({
-            code: run.code, thrown: run.thrown, result: {
-                status: run.result.status, exitCode: run.result.exitCode, activationAllowed: run.result.activationAllowed,
-                blockedBy: run.result.blockedBy, errors: run.result.errors,
-            },
-            manifest: run.result.records.filter(record => record.phase === 'skills-manifest')
-                .map(record => [record.outcome, record.code, record.required, (record.details.failedSources || []).map(source => source.name)]),
-            spawned: run.spawned, staged: run.staged, stdout: run.stdout, stderr: run.stderr,
-        });
+        done({ code: run.code, records: brief(run.result), activationAllowed: run.result.activationAllowed,
+            output: run.stdout + run.stderr });
     `);
-    assert.equal(result.thrown, null);
-    assert.equal(result.code, 1);
-    assert.deepEqual(result.manifest, [['failed', 'skill-source-unavailable', true, ['MissingSource']]]);
-    assert.equal(result.result.exitCode, 1);
-    assert.equal(result.result.activationAllowed, false);
-    assert.equal(result.result.status, 'failed');
-    assert.deepEqual(result.result.blockedBy.filter(entry => entry.phase === 'skills-manifest').map(entry => [entry.outcome, entry.code]),
-        [['failed', 'skill-source-unavailable']]);
-    assert.deepEqual(result.result.errors.map(entry => [entry.phase, entry.outcome]), [['skills-manifest', 'failed']]);
-    assert.deepEqual(result.spawned, [], 'the activation child that restarts the graph was never spawned');
-    assert.deepEqual(result.staged, [], 'no AgentLib transaction was staged');
-    assert.match(result.stderr, /achillesAgentLib activation is pending: blocked by skills-manifest /);
-    assert.match(result.stderr, /Update failed: required inputs are not verified/);
-    assert.match(result.stderr, /✗ workspace skills: .*MissingSource/);
-    assert.doesNotMatch(result.stdout, /✓ workspace: \d+ skill\(s\)/, 'no success line for the failed manifest');
-    assert.doesNotMatch(result.stderr + result.stdout, /Update complete:/);
-});
-
-test('an optional skills manifest with a missing source exits nonzero but still allows activation', () => {
-    const result = runScenario(String.raw`
-        await standardWorkspace();
-        writeFile(path.join(workspaceRoot, 'optional', 'ploinky-skills-manifest.json'),
-            JSON.stringify([{ name: 'MissingSource', url: path.join(scratch, 'missing.git'), skills: ['x'] }]) + '\n');
-        const run = await launchUpdate(['update', workspaceRoot]);
-        done({
-            code: run.code, status: run.result.status, activationAllowed: run.result.activationAllowed,
-            manifest: run.result.records.filter(record => record.phase === 'skills-manifest').map(record => [record.outcome, record.required]),
-            spawned: run.spawned, stderr: run.stderr,
-        });
-    `);
-    assert.equal(result.code, 1);
-    assert.equal(result.status, 'partial');
+    assert.equal(result.code, 0);
     assert.equal(result.activationAllowed, true);
-    assert.deepEqual(result.manifest, [['failed', false]]);
-    assert.deepEqual(result.spawned, [['--agentlib-activate-transaction', 'commit']]);
-    assert.match(result.stderr, /final update status: partial \(exit 1\)/);
+    assert.ok(!result.records.some(record => ['skills-manifest', 'default-skills'].includes(record[0])));
+    assert.doesNotMatch(result.output, /\[skills\]|Installing skills|Default skills summary/);
 });
 
 test('an in-Box update with no host report defers AgentLib, holds the lease and names host activation', async () => {
@@ -465,7 +423,7 @@ test('a host-requested report is published once with the echoed context and keep
         console.log = log;
         console.error = logError;
         process.stdout.write = write;
-        const summaryHead = [...out, ...errors].map(entry => entry.split('\n')[0]).filter(entry => /^(Update (complete|partially failed|failed)|In-Box update phase)/.test(entry));
+        const summaryHead = [...out, ...errors].map(entry => entry.split('\n')[0]).filter(entry => /^(Update (complete|partially failed|incomplete)|In-Box update phase)/.test(entry));
         const report = readUpdateReport(PLOINKY_DIR, process.env.PLOINKY_UPDATE_REPORT_NONCE, { expectedContext: ${JSON.stringify(context)} });
         const reports = fs.readdirSync(path.join(PLOINKY_DIR, 'running', 'update-reports'));
         const reportBytes = fs.readFileSync(path.join(PLOINKY_DIR, 'running', 'update-reports', reports[0]), 'utf8');
@@ -483,8 +441,7 @@ test('a host-requested report is published once with the echoed context and keep
     assert.equal(result.reportActivation, false);
     assert.deepEqual(result.reportContext, context);
     assert.deepEqual(result.reports, [`${nonce}.json`]);
-    assert.deepEqual(result.summaryHead, ['In-Box update phase: required inputs are not verified. The host reports the update result.'],
-        'the host-driven phase names itself and leaves the update result to the host');
+    assert.deepEqual(result.summaryHead, [], 'the internal phase leaves the final summary to the host');
     assert.equal(result.leaked, false, 'the control report never goes to stdout');
     assert.equal(result.userinfo, false, 'the persisted report carries no URL credentials');
     assert.ok(result.reportSize < 512 * 1024, `report size ${result.reportSize} stays far below the 4 MB cap`);
@@ -558,7 +515,7 @@ test('phase records: thrown self-update, skipped self-update count, skipped work
         }]));
         const partial = await quiet(() => commands.updateAllRepos(workspaceRoot));
         const pick = (run, phase) => brief(run.value).filter(record => record[0] === phase);
-        const line = (run, prefix) => run.out.find(entry => entry.startsWith(prefix)) || null;
+        const line = (run, prefix) => run.out.map(entry => entry.replace(/^[⚠✖] /, '')).find(entry => entry.startsWith(prefix)) || null;
         const counts = run => {
             const match = /^Update summary: (\d+)\/(\d+) /.exec(line(run, 'Update summary:') || '');
             return match ? { updated: Number(match[1]), total: Number(match[2]) } : null;
@@ -608,9 +565,9 @@ test('phase records: thrown self-update, skipped self-update count, skipped work
     assert.equal(result.interactive.exitCode, 0);
     assert.deepEqual(result.interactive.blockedBy, []);
 
-    assert.deepEqual(result.partial.manifests, [['aa-bad', 'failed', false], ['zz-good', 'changed', false]]);
-    assert.equal(result.partial.status, 'partial');
-    assert.equal(result.partial.exitCode, 1);
+    assert.deepEqual(result.partial.manifests, []);
+    assert.equal(result.partial.status, 'complete-with-skips');
+    assert.equal(result.partial.exitCode, 0);
     assert.equal(result.partial.activationAllowed, true);
 });
 
@@ -698,9 +655,47 @@ test('the host-driven in-Box phase never prints an update result of its own', as
     for (const status of ['complete', 'complete-with-skips', 'partial', 'failed']) {
         const result = { status, totals: {}, records: [] };
         const phase = formatUpdateSummary(result, { hostPhase: true }).split('\n')[0];
-        assert.match(phase, /^In-Box update phase: .*The host (activates it and )?reports the update result\.$/);
+        assert.equal(phase, '', 'no internal summary or statistics');
         assert.doesNotMatch(phase, /Update (complete|failed|partially failed)/);
-        assert.match(formatUpdateSummary(result).split('\n')[0], /^Update (complete|partially failed|failed)/,
+        assert.match(formatUpdateSummary(result).split('\n')[0], /^Update (complete|partially failed|incomplete)/,
             'a direct run still states its own result');
     }
+});
+
+
+test('host-coordinated update omits internal self-update while standalone update keeps it', () => {
+    const result = runScenario(String.raw`
+        await standardWorkspace();
+        const { runUpdateCommand } = await import(${JSON.stringify(moduleUrl('cli/commands/updateCommand.js'))});
+        const commands = await import(${JSON.stringify(moduleUrl('cli/commands/repoAgentCommands.js'))});
+        const original = { log: console.log, warn: console.warn, error: console.error };
+        const runs = [];
+        try {
+            for (const coordinated of [true, false]) {
+                const output = [];
+                console.log = console.warn = console.error = message => output.push(String(message));
+                let selfCalls = 0;
+                const env = coordinated ? {
+                    PLOINKY_UPDATE_REPORT_NONCE: 'e'.repeat(32),
+                    PLOINKY_UPDATE_REPORT_CONTEXT: '{}',
+                } : {};
+                const value = await runUpdateCommand([], {
+                    insideBox: true, env, interactiveSession: true,
+                    refreshAgentImages: () => [],
+                    log: message => output.push(String(message)), error: message => output.push(String(message)),
+                    handlers: { updateAllRepos: (folder, options) => commands.updateAllRepos(folder, {
+                        ...options,
+                        updateSelf: async () => { selfCalls++; return { updated: false }; },
+                    }) },
+                });
+                runs.push({ coordinated, selfCalls, output, phases: value.records.map(record => record.phase) });
+            }
+        } finally { Object.assign(console, original); }
+        done(runs);
+    `);
+    assert.equal(result[0].selfCalls, 0);
+    assert.ok(!result[0].phases.includes('host-ploinky'));
+    assert.doesNotMatch(result[0].output.join('\n'), /Updating Ploinky|Skipping Ploinky self-update|outside the selected update folder/);
+    assert.equal(result[1].selfCalls, 1);
+    assert.match(result[1].output.join('\n'), /Updating Ploinky/);
 });

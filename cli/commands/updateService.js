@@ -1,3 +1,4 @@
+import { formatDiagnostic } from '../utils/diagnostics.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -9,7 +10,6 @@ import {
     updateCheckoutFastForward,
 } from '../utils/git/verifiedUpdate.js';
 import { acquireSourceLock, createDefaultSourceLockManager, ploinkySourceLockIdentity } from '../utils/git/sourceLock.js';
-import { assessGeneratedCheckoutState } from '../utils/git/generatedState.js';
 import {
     DEFAULT_NETWORK_TIMEOUT_MS,
     describeGitFailure,
@@ -23,7 +23,7 @@ export const INTERACTIVE_PLOINKY_UPDATE_MESSAGE = [
 ].join('\n');
 
 function defaultLogger() {
-    return console;
+    return { warn: message => console.warn(formatDiagnostic(message)) };
 }
 
 export function resolvePloinkyRoot() {
@@ -151,7 +151,7 @@ export async function updatePloinkySelf({
     heldSourceLock = null,
     sourceLockManager = null,
     checkoutOptions = {},
-    assessGeneratedState = assessGeneratedCheckoutState,
+    assessGeneratedState = null,
 } = {}) {
     if (updateScopePath) {
         const scope = resolvePloinkyUpdateEligibility({ repoPath, updateScopePath });

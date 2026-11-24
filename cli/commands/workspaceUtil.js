@@ -2939,6 +2939,8 @@ export function printStartResultSummary(result, { log = console.log } = {}) {
 async function startWorkspace(staticAgentArg, portArg, {
   killRouterIfRunning,
   branchPolicy,
+  restarting = false,
+  announce = true,
 } = {}) {
   // Acquire every declared dependency source before resolving the complete
   // graph. A fresh workspace cannot admit repositories that do not exist yet.
@@ -2952,6 +2954,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   if (!requestedStaticAgent) {
     throw new Error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
   }
+  if (announce) console.log(`${restarting ? 'Restarting' : 'Starting'} workspace with static agent ${requestedStaticAgent}...`);
   try {
     prepareDefaultBootRepositories({
       branchPolicy,
@@ -3639,7 +3642,7 @@ async function startWorkspace(staticAgentArg, portArg, {
             statusFile: entry.statusFile,
             waitForStatuses: entry.waitForStatuses,
           });
-          console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait wave ${entry.waveIndex + 1}/${noWaitSchedule.length} launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
+          console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: starting in background.`);
           asynchronousAgentKeys.push(registryName);
         } catch (spawnErr) {
           // Publishing the terminal status is best-effort here. Letting it
