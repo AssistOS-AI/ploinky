@@ -70,9 +70,10 @@ test('providers are the enabled routes whose manifests declare coding sessions',
 
 test('the host gives the coding sessions command a terminal and keeps other commands generic', () => {
     const route = argv => routeOuterCommand(parseOuterArguments(argv));
-    assert.deepEqual(route(['cs']), { kind: 'coding-sessions', coreArgv: ['cs'] });
-    assert.deepEqual(route(['coding-sessions']), { kind: 'coding-sessions', coreArgv: ['coding-sessions'] });
-    assert.equal(route(['--dry-run', 'cs']).kind, 'dry-run');
+    for (const argv of [['cs'], ['code'], ['coding'], ['coding', 'agents'], ['coding', 'sessions'], ['coding-sessions']]) {
+        assert.deepEqual(route(argv), { kind: 'coding-sessions', coreArgv: argv });
+        assert.equal(route(['--dry-run', ...argv]).kind, 'dry-run');
+    }
     // Coding agents are no longer commands of their own, and --robot is no longer an option.
     assert.equal(route(['codex']).kind, 'generic');
     assert.throws(() => parseOuterArguments(['--robot', 'ana']), /Unknown outer option --robot/);

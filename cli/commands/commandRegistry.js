@@ -12,6 +12,8 @@ const rawCommands = {
     shell: [],
     cli: [],
     cs: [],
+    code: [],
+    coding: ['agents', 'sessions'],
     'coding-sessions': [],
     start: [],
     restart: [],
