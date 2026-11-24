@@ -1526,6 +1526,20 @@ test('invalid manifest capability requirements fail edge compilation', (t) => {
     );
 });
 
+test('browser entry declarations are validated before publishing a generation', (t) => {
+    const entryPath = '/base-agent-additional-server/alpha/7000/';
+    const valid = createFixture(t, { alphaManifest: { routerAccess: {
+        entryPath, httpRoutes: [{ path: entryPath, access: 'public' }],
+    } } });
+    assert.doesNotThrow(() => applyEdgeRoutingGeneration({ workspaceRoot: valid.workspace, reason: 'browser-entry' }));
+    for (const invalid of ['https://outside.example/', '/base-agent-additional-server/beta/7000/', entryPath + 'missing/']) {
+        const fixture = createFixture(t, { alphaManifest: { routerAccess: {
+            entryPath: invalid, httpRoutes: [{ path: entryPath, access: 'public' }],
+        } } });
+        assert.throws(() => applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'invalid-browser-entry' }), /entryPath/);
+    }
+});
+
 test('durable preparation remains inactive until its exact lease commits', (t) => {
     const fixture = createFixture(t);
     const prepared = prepareEdgeRoutingGeneration({

@@ -77,3 +77,35 @@ test('logout action normalizes external return destinations', () => {
     const action = html.match(/<form method="post" action="([^"]+)"/)[1].replaceAll('&amp;', '&');
     assert.equal(new URL(action, 'https://app.example').searchParams.get('returnTo'), '/');
 });
+
+
+test('logout confirmation permits one submit and resets when restored from browser history', () => {
+    const html = renderLogoutConfirmationHtml({ returnTo: '/application/' });
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+    const handlers = {};
+    const attributes = new Map();
+    const button = { disabled: false, textContent: 'Sign out' };
+    const form = {
+        querySelector: () => button,
+        getAttribute: name => attributes.get(name),
+        setAttribute: (name, value) => attributes.set(name, value),
+        removeAttribute: name => attributes.delete(name),
+        addEventListener: (name, handler) => { handlers[name] = handler; },
+    };
+    vm.runInNewContext(script, {
+        document: { querySelector: () => form },
+        window: { addEventListener: (name, handler) => { handlers[name] = handler; } },
+    });
+    let prevented = 0;
+    const event = { preventDefault: () => { prevented++; } };
+    handlers.submit(event);
+    assert.equal(prevented, 0);
+    assert.equal(button.disabled, true);
+    assert.equal(button.textContent, 'Signing out…');
+    handlers.submit(event);
+    assert.equal(prevented, 1);
+    handlers.pageshow();
+    assert.equal(button.disabled, false);
+    handlers.submit(event);
+    assert.equal(prevented, 1);
+});

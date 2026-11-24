@@ -16,6 +16,7 @@ import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProv
 import { normalizeRequiredCapability } from '../server/authHandlers/requiredCapability.js';
 import { AGENT_PORT_ROUTE, parseAgentPortSelector } from '../server/agentPortConvention/parseSelector.js';
 import { HttpRouteAccessPath } from '../server/policy/HttpRouteAccessPath.js';
+import { resolveBrowserEntryPath } from '../server/browserEntryPath.js';
 import { agentPortRelayDenial, normalizeAgentPortRelayPolicy } from '../server/agentPortConvention/relayPolicy.js';
 import { resolveAgentAuthPolicy } from '../utils/manifestAuth.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
@@ -920,6 +921,10 @@ function validateRoutingShape(routing, manifests) {
         const manifest = manifests[routeKey];
         if (manifest) {
             assertObject(manifest, `manifest(${routeKey})`);
+            if (manifest.routerAccess?.entryPath !== undefined) {
+                try { resolveBrowserEntryPath(routeKey, manifest); }
+                catch (error) { throw edgeError(`manifest(${routeKey}).${error.message}`); }
+            }
             if (Object.prototype.hasOwnProperty.call(manifest, 'httpServices')) {
                 throw edgeError(`manifest(${routeKey}).httpServices is unsupported; use routerAccess.httpRoutes with agent-port convention paths`);
             }
