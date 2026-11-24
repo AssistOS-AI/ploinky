@@ -3691,6 +3691,38 @@
             "anchor": "action === 'disable_agent'",
             "statement": "} else if (action === 'disable_agent') {"
           }
+        },
+        "c21698e4f788c60138d6537a91ae2d47fa2f91562f6bff7776607204d11d3f11": {
+          "marketplace-repos-read.get": {
+            "line": 996,
+            "anchor": "const marketplacePayload = async () =>",
+            "statement": "const marketplacePayload = async () => runPreparedRepositoryRead(res, () => (isRepos ? buildMarketplaceRepositories({ user: req.user, machine: verifiedAgentCaller(req) }) : agentsMarketplace()), { catalog: isRepos });"
+          },
+          "marketplace-agents-read.get": {
+            "line": 966,
+            "anchor": "...buildMarketplaceAgents(req.user, options),",
+            "statement": "...buildMarketplaceAgents(req.user, options),"
+          },
+          "marketplace-install_repo.post": {
+            "line": 1083,
+            "anchor": "action === 'install_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-uninstall_repo.post": {
+            "line": 1083,
+            "anchor": "action === 'uninstall_repo'",
+            "statement": "} else if (action === 'install_repo' || action === 'uninstall_repo') {"
+          },
+          "marketplace-enable_agent.post": {
+            "line": 1109,
+            "anchor": "action === 'enable_agent'",
+            "statement": "} else if (action === 'enable_agent') {"
+          },
+          "marketplace-disable_agent.post": {
+            "line": 1133,
+            "anchor": "action === 'disable_agent'",
+            "statement": "} else if (action === 'disable_agent') {"
+          }
         }
       },
       "candidate": "8c99918602620aa560b8dc0cf08d99c1aa69902c6e2c8a5606dc13a9965480f1"
@@ -4235,6 +4267,58 @@
             "anchor": null,
             "statement": "if (!selected.operation && method === 'DELETE') {"
           }
+        },
+        "08ce71919458aca70f3c3f6e0c3fafa47c7a16589c8931703db21ecf2cd2b9a6": {
+          "webtty-ui.get": {
+            "line": 262,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-ui-slash.get": {
+            "line": 262,
+            "anchor": "pathname === '/webtty'",
+            "statement": "if ((pathname === '/webtty' || pathname === '/webtty/') && method === 'GET') {"
+          },
+          "webtty-assets.get": {
+            "line": 277,
+            "anchor": "pathname.startsWith('/webtty/assets/')",
+            "statement": "if (pathname.startsWith('/webtty/assets/') && method === 'GET') {"
+          },
+          "webtty-discover.post": {
+            "line": 296,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/target-discoveries' && method === 'POST') {"
+          },
+          "webtty-discovery-delete.delete": {
+            "line": 327,
+            "anchor": null,
+            "statement": "if (selectedDiscovery && method === 'DELETE') {"
+          },
+          "webtty-create.post": {
+            "line": 344,
+            "anchor": null,
+            "statement": "if (pathname === '/webtty/sessions' && method === 'POST') {"
+          },
+          "webtty-stream.get": {
+            "line": 382,
+            "anchor": null,
+            "statement": "if (selected.operation === 'stream' && method === 'GET') {"
+          },
+          "webtty-input.post": {
+            "line": 426,
+            "anchor": null,
+            "statement": "if (selected.operation === 'input' && method === 'POST') {"
+          },
+          "webtty-resize.post": {
+            "line": 450,
+            "anchor": null,
+            "statement": "if (selected.operation === 'resize' && method === 'POST') {"
+          },
+          "webtty-delete.delete": {
+            "line": 517,
+            "anchor": null,
+            "statement": "if (!selected.operation && method === 'DELETE') {"
+          }
         }
       },
       "candidate": "0c0d70d80e8113db35b46432e17a50aaf6372fedeadcff9cd19c83ad4d5070f6"
@@ -4576,6 +4660,73 @@
             "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
             "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
           }
+        },
+        "8421568f14ae9889cabe6b4091e26cece163d0ce9a825f7e9f7510ce025fd0ec": {
+          "webchat-ui.get": {
+            "line": 266,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-ui-no-slash.get": {
+            "line": 266,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-index.get": {
+            "line": 266,
+            "anchor": "pathname === '/'",
+            "statement": "if (pathname === '/' || pathname === '/index.html') {"
+          },
+          "webchat-assets.get": {
+            "line": 202,
+            "anchor": "pathname.startsWith('/assets/')",
+            "statement": "if (pathname.startsWith('/assets/')) {"
+          },
+          "webchat-removed-token-auth.post": {
+            "line": 192,
+            "anchor": "pathname === '/auth'",
+            "statement": "if (pathname === '/auth' && req.method === 'POST') {"
+          },
+          "webchat-logout.post": {
+            "line": 200,
+            "anchor": "pathname === '/logout'",
+            "statement": "if (pathname === '/logout' && req.method === 'POST') return handleLogout(req, res, appState, agentQuery);"
+          },
+          "webchat-suggestions.get": {
+            "line": 233,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-suggestions.head": {
+            "line": 233,
+            "anchor": "pathname === '/suggestions/files'",
+            "statement": "if (pathname === '/suggestions/files' && (req.method === 'GET' || req.method === 'HEAD')) {"
+          },
+          "webchat-upload.post": {
+            "line": 237,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-upload.put": {
+            "line": 237,
+            "anchor": "pathname === '/uploads'",
+            "statement": "if (pathname === '/uploads') {"
+          },
+          "webchat-directories-list.get": {
+            "line": 250,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-list.head": {
+            "line": 250,
+            "anchor": "pathname === '/directories'",
+            "statement": "if (pathname === '/directories') {"
+          },
+          "webchat-directories-create.post": {
+            "line": 256,
+            "anchor": "return handleWorkspaceDirectoriesPost(req, res, directoryContext)",
+            "statement": "return handleWorkspaceDirectoriesPost(req, res, directoryContext);"
+          }
         }
       },
       "candidate": "2874a4e81aec3efb6527338dec777dedd997ec7ec0c4980e6fc118161b6fd45d"
@@ -4646,6 +4797,48 @@
           }
         },
         "4fdb5efcb5d77cffb8c28dc94b06bd243e84c58afe32f9ba79271109501d3f62": {
+          "workspace-upload.post": {
+            "line": 437,
+            "anchor": null,
+            "statement": "async function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {}) {"
+          },
+          "workspace-upload.put": {
+            "line": 437,
+            "anchor": null,
+            "statement": "async function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {}) {"
+          },
+          "blob-shared-create.post": {
+            "line": 498,
+            "anchor": null,
+            "statement": "if (req.method === 'POST' && segments.length === 1) {"
+          },
+          "blob-agent-create.post": {
+            "line": 507,
+            "anchor": null,
+            "statement": "if (req.method === 'POST' && segments.length === 2) {"
+          },
+          "blob-shared-read.get": {
+            "line": 522,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 2) {"
+          },
+          "blob-shared-read.head": {
+            "line": 522,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 2) {"
+          },
+          "blob-agent-read.get": {
+            "line": 532,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 3) {"
+          },
+          "blob-agent-read.head": {
+            "line": 532,
+            "anchor": null,
+            "statement": "if ((req.method === 'GET' || req.method === 'HEAD') && segments.length === 3) {"
+          }
+        },
+        "87202bbbac3e49bfb0ecf3f112c03f1d836fb29d1aa41df5a8a11d287767e33f": {
           "workspace-upload.post": {
             "line": 437,
             "anchor": null,
