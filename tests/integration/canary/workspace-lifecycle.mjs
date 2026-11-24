@@ -71,6 +71,20 @@ async function exercise(workspace, command, state, token) {
     fs.mkdirSync(repos, { recursive: true });
     const { getDefaultBootRepos } = await import('../../../cli/utils/repos.js');
     for (const { name } of getDefaultBootRepos()) fs.mkdirSync(path.join(repos, name), { recursive: true });
+    if (command === 'update') {
+        // `update repo` also refreshes the default skills from these sources.
+        // Only file-protocol git is allowed here, so give them local stand-ins,
+        // as the update unit tests do.
+        for (const name of ['AchillesCopilotBasicSkills', 'DocumentationSkills', 'PloinkySkills']) {
+            const seed = path.join(workspace, '.fixture', 'skills', name);
+            fs.mkdirSync(path.join(seed, 'skills', name + '-skill'), { recursive: true });
+            fs.writeFileSync(path.join(seed, 'skills', name + '-skill', 'SKILL.md'), '# ' + name + '\n');
+            git(seed, 'init', '-q', '-b', 'main');
+            git(seed, 'add', '.');
+            git(seed, 'commit', '-qm', 'Default skills stand-in');
+            run('git', ['clone', '-q', seed, path.join(repos, name)]);
+        }
+    }
     // Keep the local origin outside workspace repository discovery.
     const origin = path.join(workspace, '.fixture', 'origin');
     fs.mkdirSync(origin, { recursive: true });
