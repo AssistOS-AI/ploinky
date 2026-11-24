@@ -1,7 +1,8 @@
 export function showHelp(args = [], { surface = 'core' } = {}) {
     // Parse help arguments
-    const topic = args[0];
-    const subtopic = args[1];
+    const codingAlias = ['cs', 'code', 'coding', 'coding-sessions'].includes(args[0]);
+    const topic = codingAlias ? 'cs' : args[0];
+    const subtopic = codingAlias && ['agents', 'sessions'].includes(args[1]) ? undefined : args[1];
     const subsubtopic = args[2];
     
     // Detailed help for specific commands
@@ -51,6 +52,7 @@ function mainHelpText(surface) {
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
   network status [--json]        Show managed network topology (status schema 3)
   network prune                  Remove unused workspace-owned managed networks
+  cache purge-config|clear|hold|release  Configure host purges or operate the running Router cache
   vars                           List all variable names (no values)
   var <VAR> <value>              Set a variable value
   echo <VAR|$VAR>                Print the resolved value of a variable
@@ -59,7 +61,8 @@ function mainHelpText(surface) {
   list agents | repos | routes   List agents, predefined repos, or router routes
   /settings | settings           Open the interactive model/settings menu
   profile [name|list|show]       Inspect or change the active profile
-  cs | coding-sessions           Attach, resume or start robot coding sessions in this folder
+  cs | code | coding [agents|sessions] | coding-sessions
+                                 Attach, resume or start robot coding sessions in this folder
 
 
 ▶ CLIENT OPERATIONS
@@ -135,6 +138,11 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             examples: [ 'remove myrepo', 'remove repo myrepo' ],
             notes: 'The optional `repo` token is accepted but not required.'
         },
+        'cache': {
+            description: 'Configure host purges, clear a published host or hold and release application page caching.',
+            syntax: 'cache purge-config --host <host> --zone <id> --secret <publication/handle> | cache clear --host <host> | cache hold|release --agent <repo/agent>',
+            notes: 'Store the purge token with var <publication/handle> --stdin. Give purge-config its handle. Clear, hold and release require the active Router.'
+        },
         'var': {
             description: 'Set a workspace variable (stored encrypted in .ploinky/data/.secrets)',
             syntax: 'var <VAR> <value> | var <VAR> --stdin',
@@ -183,13 +191,13 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             }
         },
         'cs': {
-            description: 'Open a menu of the coding sessions an enabled agent provides in the current folder (alias: coding-sessions)',
+            description: 'Open a menu of the coding sessions an enabled agent provides in the current folder (aliases: code, coding, coding agents, coding sessions, coding-sessions)',
             subcommands: {
                 'default': {
-                    syntax: 'cs | coding-sessions',
+                    syntax: 'cs | code | coding | coding agents | coding sessions | coding-sessions',
                     description: 'Choose a robot (the default robot is preselected), one of its coding agents, then a session: attach a running one, resume an earlier conversation, or start a new one.',
                     params: {},
-                    examples: [ 'cs', 'coding-sessions' ],
+                    examples: [ 'cs', 'code', 'coding', 'coding agents', 'coding sessions', 'coding-sessions' ],
                     notes: 'In the menu: arrows select, Enter opens, n starts a new session, k kills a running session, r refreshes, Backspace goes back to the coding agents and then to the robots, q quits. Only the conversations a person started in this folder are listed. In a session, Ctrl+] detaches back to the menu; closing the terminal or losing the connection also detaches, and the session keeps running. Exiting the coding agent ends the session; k in the menu or Kill in Live Sessions kills a running one. The window used most recently sets the terminal size: attaching, typing or clicking in a window takes it, and every other window renders at that size. Run it from a project folder inside the workspace.'
                 }
             }

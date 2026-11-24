@@ -57,7 +57,8 @@ function handleVarsCommand() {
         const merged = env.parseSecrets();
         const printOrder = ['APP_NAME'];
         const keys = Array.from(new Set([...printOrder, ...Object.keys(merged).sort()]));
-        keys.forEach(k => console.log(`${k}=${merged[k] ?? ''}`));
+        keys.filter(name => !env.isPublicationHandle(name))
+            .forEach(k => console.log(`${k}=${merged[k] ?? ''}`));
     } catch (e) { console.error('Failed to list variables:', e.message); }
 }
 

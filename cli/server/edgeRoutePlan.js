@@ -20,6 +20,8 @@ import { normalizeHttpRouteAuthDefinition } from './httpRouteAuth.js';
 import { HttpRouteAccessPolicy } from './policy/HttpRouteAccessPolicy.js';
 import { HttpRouteAccessPath } from './policy/HttpRouteAccessPath.js';
 import { normalizeManifestHttpRouteAccess } from './policy/HttpRouteProviders.js';
+import { resolveRouteCacheClass } from './policy/routeCacheMarks.js';
+import { requestHasCredential } from './cdn/cdnCachePolicy.js';
 import { compileProxyLimits } from './proxy/limits.js';
 import { createRoutePlan } from './proxy/RoutePlan.js';
 import { leaseRouteHardwareAvailability } from './hardwareAvailability.mjs';
@@ -212,6 +214,15 @@ function conventionAuthDefinition({ snapshot, routeKey, route, selector, decisio
             ? { delegations: declaration.delegations }
             : {}),
     });
+}
+
+function cacheResponsePolicy(req, snapshot, routeKey, requestPath, access) {
+    return {
+        access,
+        cacheClass: resolveRouteCacheClass({ manifest: snapshot.manifests?.[routeKey], routeKey, requestPath, access }),
+        // Capture header presence on ingress, before authentication and forwarding.
+        requestHasCredential: req?.headers ? requestHasCredential(req) : undefined,
+    };
 }
 
 export function agentPortPlan({
@@ -413,6 +424,7 @@ export function agentPortPlan({
             allowApplicationCookies: true,
         },
         responsePolicy: {
+            ...cacheResponsePolicy(req, snapshot, selected.routeKey, selector.policyPath, decision.access),
             allowApplicationCookies: true,
             allowRedirects: true,
             allowCaching: true,
@@ -755,6 +767,12 @@ function agentRootPlan({
         snapshot,
         transport,
     };
+    const activeRootPlan = target => ({
+        ...common,
+        kind: 'agent-root',
+        responsePolicy: cacheResponsePolicy(req, snapshot, agent.routeKey, agent.canonicalPath, decision.access),
+        target,
+    });
     // Admission can survive the primary's removal during promotion. Inspect
     // the physical member serving user-less traffic for startup diagnostics.
     let admissionRoute = agent.route;
@@ -775,7 +793,7 @@ function agentRootPlan({
     // through post-auth selection. Startup probes retain their normal owner.
     if (!draining && (!activePort || hardwareAvailability) && ['split', 'retiring'].includes(agent.route.canary?.mode)) {
         const canary = snapshot.agents?.[agent.route.canary.container];
-        const candidate = { ...common, kind: 'agent-root', target: null };
+        const candidate = activeRootPlan(null);
         if (canary?.canaryOf === agent.routeKey && canary.containerId
             && Number.isInteger(canary.hostPort) && canary.hostPort > 0 && canary.hostPort <= 65535
             && !leaseRouteHardwareAvailability(lease, agent.routeKey, agent.route.canary.container)
@@ -816,11 +834,7 @@ function agentRootPlan({
             diagnosticCategory: pendingCode,
         };
     }
-    return {
-        ...common,
-        kind: 'agent-root',
-        target: { hostname: '127.0.0.1', hostPort },
-    };
+    return activeRootPlan({ hostname: '127.0.0.1', hostPort });
 }
 
 export function isPrivateInterfaceAllowed(req, listenerClass = 'public') {
@@ -885,6 +899,21 @@ export function planForCapturedLease({ req, parsedUrl, listener, transport, leas
     if (conventionPlan) return conventionPlan;
 
     if (listener === 'private') {
+        if (transport === 'http' && req.method === 'POST' && req.url === '/api/edge/cache' && pathname === req.url) {
+            return {
+                matched: true,
+                ok: true,
+                kind: 'private-operation',
+                operation: 'cache',
+                listener,
+                host,
+                hostSelection,
+                pathname,
+                parsedUrl: url,
+                lease,
+                snapshot,
+            };
+        }
         if (pathname === '/api/edge/workspace-logs') {
             if (req.method !== 'POST' || url.search) {
                 return deny(400, 'WORKSPACE_LOGS_REQUEST_INVALID', { lease, hostSelection });

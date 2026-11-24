@@ -257,10 +257,15 @@ ploinky cli codexAgent</code></pre>
                             Any extra arguments after <code>cli &lt;agentName&gt;</code> are appended directly to the manifest CLI command. For coding agents such as <code>codexAgent</code>, this lets you use the coding CLI inside the agent's containerized runtime instead of running it directly on the host.
                         </div>
 
-                        <h3>cs (alias: coding-sessions)</h3>
+                        <h3>cs and coding aliases</h3>
                         <p>Open a menu of the coding sessions that an enabled agent provides in the current folder. The provider declares one API base under <code>webtty.codingSessions</code> in its manifest; RoboWork does for robot coding agents. Choose a robot (the default robot is preselected), one of its coding agents, then a session: a running terminal to attach, an earlier conversation to resume, or a new one. Only the conversations a person started with that agent in this folder are listed.</p>
-                        <pre><code>cs
-coding-sessions</code></pre>
+                        <pre><code>ploinky cs
+ploinky code
+ploinky coding
+ploinky coding agents
+ploinky coding sessions
+ploinky coding-sessions</code></pre>
+                        <p>All these commands open the same coding sessions menu.</p>
                         <table class="command-table"><thead><tr><th>Key</th><th>Effect</th></tr></thead><tbody>
                             <tr><td>Arrows, Enter</td><td>Select and open; Enter on a running session attaches to it, on an earlier conversation resumes it.</td></tr>
                             <tr><td><code>n</code>, <code>k</code>, <code>r</code></td><td>Start a new session, kill the selected running session after confirmation, refresh the list.</td></tr>

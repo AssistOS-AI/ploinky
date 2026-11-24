@@ -179,6 +179,28 @@ Agents declare route access with `routerAccess.httpRoutes`. Declarations are age
 
 Manifest entries are candidate input. Coordinated apply captures and digests their exact bytes; neither mtime/size changes nor a same-size replacement can authorize a live request. Invalid input prevents the affected generation from installing and leaves its selectors inactive. Omitted manifest-route `access` still defaults to `authenticated`; persisted `httpRoutes` require explicit valid access.
 
+## Public route caching
+
+An entry such as `{ "path": "/articles/*", "access": "public", "cache": "page" }` marks pages for Cloudflare. Use `"cache": "immutable"` for files whose URLs change with their contents. The Router takes the mark from the verified manifest after resolving effective access. An exact public path overrides a wildcard, and a longer wildcard overrides a shorter one. A more specific unmarked entry therefore opts out. Settings use the selected route’s `repo/agent` identity, including when reached through an alias or root application.
+
+| Answer | Browser `Cache-Control` | `Cloudflare-CDN-Cache-Control` |
+| --- | --- | --- |
+| Eligible page | Preserve the upstream policy or supply `no-cache` if absent. Remove `ETag` and `Last-Modified`. | `max-age=<pageSeconds>, stale-if-error=900` |
+| Eligible immutable file | Set `public, max-age=31536000, immutable` and remove both validators. | `max-age=31536000` |
+| Other public agent response | Preserve the upstream browser policy and validators. | `no-store` |
+| Guest or authenticated agent response | Make the policy private and remove shared-cache directives. | `no-store` |
+| Router-generated response | Use the handler’s browser policy. | `no-store`, except successful public static responses under `/web-libs/` and at `/MCPBrowserClient.js`, which retain their existing headers. |
+
+Eligibility requires an enabled application, an anonymous GET or HEAD with neither Cookie nor Authorization, HTTP 200, no upstream or Router-queued `Set-Cookie`, and no `Vary` fields beyond `Accept-Encoding`. Event streams and upstream `private` or `no-store` directives bypass the cache. The Router strips upstream `Cloudflare-CDN-Cache-Control`, `CDN-Cache-Control` and `Surrogate-Control`. An operator hold or a canary on an application route suspends page caching while immutable files remain eligible.
+
+Administrators use `GET /api/marketplace/cache` to list marked applications and routes, switches, page lifetimes, holds, published hosts and their last purge outcomes. POST to the same endpoint with `{"op":"set","agent":"repo/agent","enabled":true,"pageSeconds":120}` or `{"op":"purge","host":"site.example"}`. Allowed page lifetimes are 60, 120 and 300 seconds. Switching off takes effect on the next request and triggers a purge of configured hosts. Mutations require the administrative request proof and current route lease. The operator CLI uses the private, signed `POST /api/edge/cache` for clear, hold and release.
+
+| Workspace file | Contents |
+| --- | --- |
+| `.ploinky/data/cache-settings.json` | Per-application switches, page lifetimes and persisted holds. Missing or unreadable settings disable caching. |
+| `.ploinky/data/cache-purge.json` | Published hostname, zone ID and publication secret handle configured by `ploinky cache purge-config`. |
+| `.ploinky/data/cache-purge-results/<host>.json` | Time, caller and outcome of the last purge. A host has a 15-second purge cooldown. |
+
 ## Additional Agent Servers
 
 An enabled agent can expose an additional private server through `/base-agent-additional-server/<agentName>/<port>/<path>`. Its manifest declares the admitted path and `public`, `guest`, or `authenticated` policy through `routerAccess.httpRoutes`. Ploinky validates the agent owner and canonical port, rejects reserved ports and stale generations, and installs the route target and policy together. This convention never adds a physical-host publication.

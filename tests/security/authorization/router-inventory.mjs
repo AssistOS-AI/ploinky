@@ -158,8 +158,8 @@ function currentRouterInventory(historical, readSource) {
   const current = buildLiveSessionsRouterInventory(historical, readSource('cli/server/handlers/webtty.js'));
   const file = 'cli/server/RoutingServer.js';
   const bytes = readSource(file);
-  const sourceBlobSha256 = '57cff3f5d39128dc7f67a9e94eb1ac753bd809d77cfb4d0849f340486f30300b';
-  const line = 467;
+  const sourceBlobSha256 = 'ea829d41454b1b5e7afa5b786c2b6dd687a0fe97c89548b33656937ca18d2aec';
+  const line = 471;
   const path = '/api/router/canary/status';
   const anchor = `if (requestedUrl.pathname === '${path}' && routePlan.hostSelection?.kind === 'control') {`;
   assert.equal(createHash('sha256').update(bytes).digest('hex'), sourceBlobSha256, 'UNREVIEWED_CANARY_STATUS_SOURCE');

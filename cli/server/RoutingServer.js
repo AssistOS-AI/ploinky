@@ -1,4 +1,5 @@
 import http from 'http';
+import { installCdnResponseHook, markCdnKeep } from './cdn/cdnResponseHook.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -14,6 +15,7 @@ import { executeWorkspaceLogOperation } from './workspaceLogFiles.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
 import { handleWebtty } from './handlers/webtty.js';
 import * as staticSrv from './static/index.js';
+import { resolveBrowserEntryPath } from './browserEntryPath.js';
 
 // Authentication and routing
 import {
@@ -52,6 +54,7 @@ import {
 } from './noWaitAgentStartupState.js';
 import {
     authorizePrivateRoutePlan,
+    handlePrivateCacheRequest,
     mintTurnCredentials,
     readPrivateRequestBody,
     sendPrivateError,
@@ -227,6 +230,7 @@ function serveMcpBrowserClient(req, res) {
     }
 
     appendLog('mcp_client_request', { method: req.method });
+    markCdnKeep(res);
     res.writeHead(200, {
         'Content-Type': 'application/javascript',
         'Content-Length': stats.size,
@@ -820,23 +824,34 @@ async function processRequest(req, res) {
         // `__agent` control-plane paths are already refused at the top of the
         // dispatch, so anything that reaches here is a normal agent request.
         const taskId = isDelegatedAgentTaskStatusRoute ? parsedUrl.searchParams.get('taskId') : undefined;
-        return dispatchAgentRootHttp({ req, res, plan: routePlan, taskId, headersForSelection: selection => {
-            const headers = { ...buildIdentityHeaders(req), ...buildTrustedForwardingHeaders(routePlan) };
-            if (isDelegatedAgentTaskStatusRoute) {
-                Object.assign(headers, ordinaryTaskHeaders ?? delegatedTaskStatusHeaders({
-                    req, agentName, selection, snapshot: routePlan.snapshot, taskId, path: pathOnly(agentProxyPath),
-                }));
-            }
-            return headers;
-        } });
+        return dispatchAgentRootHttp({
+            req, res, plan: routePlan, taskId,
+            access: isDelegatedAgentTaskStatusRoute ? 'authenticated' : httpRouteAccess?.access,
+            headersForSelection: selection => {
+                const headers = { ...buildIdentityHeaders(req), ...buildTrustedForwardingHeaders(routePlan) };
+                if (isDelegatedAgentTaskStatusRoute) {
+                    Object.assign(headers, ordinaryTaskHeaders ?? delegatedTaskStatusHeaders({
+                        req, agentName, selection, snapshot: routePlan.snapshot, taskId, path: pathOnly(agentProxyPath),
+                    }));
+                }
+                return headers;
+            },
+        });
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res, routePlan);
     } else {
         if (pathname === '/' || pathname === '/index.html') {
             const staticRouteName = getStaticRouteName(apiRoutes, routePlan?.lease?.snapshot);
             if (staticRouteName) {
+                let entryPath;
+                try {
+                    entryPath = resolveBrowserEntryPath(staticRouteName, routePlan.lease.snapshot.manifests?.[staticRouteName]);
+                } catch {
+                    sendJsonResponse(res, 503, { error: 'browser_entry_invalid' }, { 'Cache-Control': 'no-store' });
+                    return;
+                }
                 res.writeHead(302, {
-                    Location: `/${encodeURIComponent(staticRouteName)}/index.html`,
+                    Location: entryPath,
                     'Cache-Control': 'no-store'
                 });
                 return res.end();
@@ -853,6 +868,7 @@ async function processRequest(req, res) {
  */
 function handleAsyncRequest(processor, eventName) {
     return (req, res) => {
+        installCdnResponseHook(req, res);
         processor(req, res).catch(err => {
             appendLog(eventName, { error: err?.message || String(err) });
             if (!res.headersSent) {
@@ -887,6 +903,9 @@ async function processPrivateRequest(req, res) {
     if (!routePlan.ok) {
         sendJsonResponse(res, routePlan.status || 404, { error: routePlan.code || 'private_route_denied' }, { 'Cache-Control': 'no-store' });
         return;
+    }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'cache') {
+        return handlePrivateCacheRequest({ req, res, plan: routePlan, publicPort: port });
     }
     let body;
     try {
@@ -1036,7 +1055,7 @@ server.on('upgrade', async (req, socket, head) => {
     try {
         const exactHost = normalizeExactHost(req.headers.host);
         if (!exactHost || !String(req.url || '').startsWith('/')) {
-            socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+            socket.write('HTTP/1.1 400 Bad Request\r\nCloudflare-CDN-Cache-Control: no-store\r\n\r\n');
             socket.destroy();
             return;
         }
@@ -1052,7 +1071,7 @@ server.on('upgrade', async (req, socket, head) => {
             transport: 'websocket',
         });
         if (!routePlan.ok || !['agent-root', 'agent-port'].includes(routePlan.kind)) {
-            socket.write(`HTTP/1.1 ${routePlan.status || 404} Not Found\r\n\r\n`);
+            socket.write(`HTTP/1.1 ${routePlan.status || 404} Not Found\r\nCloudflare-CDN-Cache-Control: no-store\r\n\r\n`);
             socket.destroy();
             return;
         }
@@ -1066,7 +1085,7 @@ server.on('upgrade', async (req, socket, head) => {
                 { routePlan },
             );
             if (!access?.ok) {
-                socket.write(`HTTP/1.1 ${captured.statusCode || 403} Forbidden\r\n\r\n`);
+                socket.write(`HTTP/1.1 ${captured.statusCode || 403} Forbidden\r\nCloudflare-CDN-Cache-Control: no-store\r\n\r\n`);
                 socket.destroy();
                 return;
             }
@@ -1098,7 +1117,7 @@ server.on('upgrade', async (req, socket, head) => {
             return;
         }
         const handled = await handleAgentRootUpgrade({ req, socket, head, parsedUrl: routePlan.parsedUrl, routePlan });
-        if (!handled) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); }
+        if (!handled) { socket.write('HTTP/1.1 404 Not Found\r\nCloudflare-CDN-Cache-Control: no-store\r\n\r\n'); socket.destroy(); }
     } catch (_) {
         try { socket.destroy(); } catch (_) {}
     }
@@ -1124,7 +1143,7 @@ privateServer.on('upgrade', async (req, socket, head) => {
             auditSink: event => appendLog(event.event, event),
         });
     } catch (_) {
-        try { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); } catch (_) {}
+        try { socket.write('HTTP/1.1 403 Forbidden\r\nCloudflare-CDN-Cache-Control: no-store\r\n\r\n'); } catch (_) {}
         try { socket.destroy(); } catch (_) {}
     }
 });

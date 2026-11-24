@@ -255,7 +255,7 @@ class WebSocket extends EventEmitter {
 function acceptWebSocketUpgrade(req, socket, head) {
     const key = req.headers['sec-websocket-key'];
     if (!key) {
-        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        socket.write('HTTP/1.1 400 Bad Request\r\nCloudflare-CDN-Cache-Control: no-store\r\n\r\n');
         socket.destroy();
         return null;
     }

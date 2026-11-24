@@ -7,7 +7,7 @@ import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHas
 import { OPENAI_MODELS_TOOL, OPENAI_CHAT_COMPLETIONS_TOOL } from '../../../Agent/lib/invocationAuth.mjs';
 import { finalizePlanAfterAdmission } from './RoutePlan.js';
 import { measureHeaderBytes, sanitizeRequestHeaders } from './sanitizeRequestHeaders.js';
-import { sanitizeResponseHeaders } from './sanitizeResponseHeaders.js';
+import { sanitizeResponseHeaders, writeAgentResponseHead } from './sanitizeResponseHeaders.js';
 import { recordProxyOutcome } from './recordProxyOutcome.js';
 import { commitRoutePlan, leaseForSelectedPlan, selectAgentPortPlan } from '../edgeRoutePlan.js';
 import { observeProxyFirstByte, observeProxyOutcome } from '../canary/proxyOutcomes.js';
@@ -308,7 +308,7 @@ export function openRootConnection(selection, check) {
     return { agent, socket };
 }
 
-export async function dispatchAgentRootHttp({ req, res, plan, taskId, agentBody, headersForSelection = () => ({}) }) {
+export async function dispatchAgentRootHttp({ req, res, plan, taskId, agentBody, access, headersForSelection = () => ({}) }) {
     // Relay readiness imports this module while policy storage initializes.
     // Load the policy-backed dispatchers only for an admitted root request.
     const { proxyHttpBuffered, proxyHttpPassthrough } = await import('../routerHandlers.js');
@@ -324,9 +324,12 @@ export async function dispatchAgentRootHttp({ req, res, plan, taskId, agentBody,
             const { agent, socket } = openRootConnection(selection, check);
             try {
                 const upstream = agentBody === undefined
-                    ? proxyHttpPassthrough(req, res, selection.route.hostPort, plan.upstreamPath, headers, { agent })
+                    ? proxyHttpPassthrough(req, res, selection.route.hostPort, plan.upstreamPath, headers, {
+                        agent, access, routePlan: plan,
+                    })
                     : proxyHttpBuffered(req, res, selection.route.hostPort, plan.upstreamPath, agentBody, headers, {
-                        agent, credentialPolicy: { preserveAuthorization: false, preserveCookie: false },
+                        agent, access, routePlan: plan,
+                        credentialPolicy: { preserveAuthorization: false, preserveCookie: false },
                     });
                 let received = false;
                 upstream.once('response', response => {
@@ -633,7 +636,11 @@ export async function executeHttpPlan({
                 clearHeaderDeadline();
                 responseStatus = upstreamRes.statusCode || 502;
                 observeProxyFirstByte({ plan: finalized, ttfbMs: performance.now() - dialStarted });
-                res.writeHead(responseStatus, sanitizeResponseHeaders(upstreamRes.headers, finalized));
+                writeAgentResponseHead(res, upstreamRes, {
+                    headers: sanitizeResponseHeaders(upstreamRes.headers, finalized),
+                    status: responseStatus, plan: finalized,
+                    method: finalized.method, access: finalized.responsePolicy?.access,
+                });
                 const contentType = String(upstreamRes.headers['content-type'] || '').toLowerCase();
                 const longLived = finalized.transport === 'sse' || contentType.startsWith('text/event-stream');
                 if (longLived) {

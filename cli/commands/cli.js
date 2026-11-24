@@ -327,6 +327,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         case 'vars':
             handleVarsCommand();
             break;
+        case 'cache':
+            return (await import('./cacheCommands.js')).runCacheCommand(options);
         case 'var':
             if (isVarStdinRequest(options)) await handleVarStdinCommand(options[0]);
             else handleVarCommand(options);
@@ -857,7 +859,12 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             break;
         }
         case 'cs':
+        case 'code':
+        case 'coding':
         case 'coding-sessions': {
+            if (command === 'coding' && (options.length > 1 || (options.length === 1 && !['agents', 'sessions'].includes(options[0])))) {
+                throw new Error('Usage: ploinky coding [agents|sessions]');
+            }
             if (inputState.getInterface()) {
                 throw new Error('Coding sessions open from your shell: leave the Ploinky prompt and run `ploinky cs`.');
             }

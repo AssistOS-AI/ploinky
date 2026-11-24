@@ -293,7 +293,7 @@ export function routeOuterCommand(parsed, options = {}) {
     }
     // The coding sessions menu and the terminals it opens are interactive, so
     // they are forwarded with a TTY like the REPL.
-    if (parsed.command === 'cs' || parsed.command === 'coding-sessions') {
+    if (['cs', 'code', 'coding', 'coding-sessions'].includes(parsed.command)) {
         return Object.freeze({
             kind: parsed.dryRun ? 'dry-run' : 'coding-sessions',
             coreArgv: parsed.forwardingArgv,

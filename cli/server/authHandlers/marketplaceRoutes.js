@@ -51,6 +51,7 @@ import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTok
 import { localSessionAllowedForRoutePlan } from './authContext.js';
 import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
 import { handleHardwareLimitsRoutes } from './hardwareLimitsRoutes.mjs';
+import { handleCacheRoutes } from './cacheRoutes.mjs';
 import { readEdgeRoutingSelection } from '../../sandbox/edgeGeneration.js';
 import { planManifestDependencyEnables } from '../../utils/workspaceDependencyGraph.js';
 
@@ -913,8 +914,8 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
 
     const method = (req.method || 'GET').toUpperCase();
 
-    if (route.resource === 'hardware-limits') {
-        return handleHardwareLimitsRoutes(req, res, parsedUrl, {
+    if (route.resource === 'hardware-limits' || route.resource === 'cache') {
+        const guards = {
             ensureAdmin: (request, response, url) => ensureAdmin(request, response, url, { routePlan }),
             verifyMutation: (request) => {
                 const publicContext = publicMarketplaceAuthContext(routePlan);
@@ -922,7 +923,15 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                     ? verifyBrowserMutationRequest(request, { routePlan, authContext: publicContext, sessionId: request.sessionId })
                     : verifyAdminMutationRequest(request, request.sessionId);
             },
-            verifyLease: () => !routePlan?.lease?.commit || routePlan.lease.commit() === true,
+        };
+        if (route.resource === 'cache') {
+            return handleCacheRoutes(req, res, parsedUrl, {
+                ...guards, routePlan,
+                readBody: async request => (await readMarketplaceBody(request, { maxBytes: 16 * 1024 })).body,
+            });
+        }
+        return handleHardwareLimitsRoutes(req, res, parsedUrl, {
+            ...guards, verifyLease: () => !routePlan?.lease?.commit || routePlan.lease.commit() === true,
             readSelection: readEdgeRoutingSelection,
             runReadScope: build => runPreparedRepositoryRead(res, build),
         });

@@ -263,6 +263,24 @@ function renderLogoutConfirmationHtml({
       <a class="auth-btn secondary" href="${safeCancelTo}">Cancel</a>
     </section>
   </main>
+  <script>
+    const form = document.querySelector('form');
+    const submit = form.querySelector('button[type="submit"]');
+    form.addEventListener('submit', event => {
+      if (form.getAttribute('aria-busy') === 'true') {
+        event.preventDefault();
+        return;
+      }
+      form.setAttribute('aria-busy', 'true');
+      submit.disabled = true;
+      submit.textContent = 'Signing out…';
+    });
+    window.addEventListener('pageshow', () => {
+      form.removeAttribute('aria-busy');
+      submit.disabled = false;
+      submit.textContent = 'Sign out';
+    });
+  </script>
 </body>
 </html>`;
 }

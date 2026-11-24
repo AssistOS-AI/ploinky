@@ -92,7 +92,7 @@ export class WebSocketFrameLimitTransform extends Transform {
 function rejectSocket(socket, status, canaryError) {
     const reason = http.STATUS_CODES[status] || 'Request Failed';
     const retry = status === 503 && canaryError ? 'Retry-After: 1\r\n' : '';
-    try { socket.end(`HTTP/1.1 ${status} ${reason}\r\n${retry}Connection: close\r\nCache-Control: no-store\r\n\r\n`); } catch (_) {}
+    try { socket.end(`HTTP/1.1 ${status} ${reason}\r\n${retry}Connection: close\r\nCache-Control: no-store\r\nCloudflare-CDN-Cache-Control: no-store\r\n\r\n`); } catch (_) {}
 }
 
 function assertWebSocketOrigin(req, plan) {

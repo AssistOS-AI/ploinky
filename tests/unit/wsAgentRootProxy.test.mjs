@@ -126,11 +126,35 @@ test('client destroyed before the upstream upgrade writes no 101 and destroys th
     assert.equal(Buffer.concat(written).toString('utf8').includes('101'), false);
 });
 
-test('an unavailable agent-root WebSocket keeps the no-canary wire response', async () => {
+test('an unavailable agent-root WebSocket forbids CDN caching without a retry header', async () => {
     const chunks = [];
     const socket = new Duplex({ read() {}, write(chunk, _, done) { chunks.push(chunk); done(); } });
     const handled = await handleAgentRootUpgrade({ req: upgradeRequest(), socket, head: Buffer.alloc(0),
         parsedUrl: new URL('http://localhost/ws'), routePlan: agentRootPlan(0) });
     assert.equal(handled, true);
-    assert.equal(Buffer.concat(chunks).toString(), 'HTTP/1.1 503 Service Unavailable\r\n\r\n');
+    assert.equal(Buffer.concat(chunks).toString(),
+        'HTTP/1.1 503 Service Unavailable\r\nCloudflare-CDN-Cache-Control: no-store\r\n\r\n');
+});
+
+test('a stale canary agent-root WebSocket refuses before dial with retry and CDN no-store headers', async t => {
+    const chunks = [];
+    const socket = new Duplex({ read() {}, write(chunk, _, done) { chunks.push(chunk); done(); } });
+    const routePlan = {
+        ...agentRootPlan(43210),
+        routeKey: 'alpha',
+        route: { hostPort: 43210, canary: { mode: 'split', rolloutId: 'fixture' } },
+        lease: { commit: () => false },
+    };
+    const dial = t.mock.method(net, 'createConnection', () => { throw new Error('unexpected upstream dial'); });
+    const handled = await handleAgentRootUpgrade({ req: upgradeRequest(), socket, head: Buffer.alloc(0),
+        parsedUrl: new URL('http://localhost/ws'), routePlan });
+    assert.equal(handled, true);
+    assert.equal(dial.mock.callCount(), 0);
+    assert.equal(Buffer.concat(chunks).toString(), [
+        'HTTP/1.1 503 Service Unavailable',
+        'Retry-After: 1',
+        'Cloudflare-CDN-Cache-Control: no-store',
+        '',
+        '',
+    ].join('\r\n'));
 });

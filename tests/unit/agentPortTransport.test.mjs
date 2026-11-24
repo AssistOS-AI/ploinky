@@ -414,7 +414,14 @@ test('a stale per-OPEN generation lease rejects a WebSocket upgrade with 503', a
         authorized: true,
     });
     assert.equal(handled, false);
-    assert.equal(socket.body.toString('utf8'), 'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n');
+    assert.equal(socket.body.toString('utf8'), [
+        'HTTP/1.1 503 Service Unavailable',
+        'Connection: close',
+        'Cache-Control: no-store',
+        'Cloudflare-CDN-Cache-Control: no-store',
+        '',
+        '',
+    ].join('\r\n'));
     assert.equal(released, true);
 });
 

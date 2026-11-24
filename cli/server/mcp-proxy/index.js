@@ -21,6 +21,7 @@ import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
 import { policy } from '../policy/index.js';
+import { guardSharedCache } from '../proxy/sharedCacheGuard.js';
 import { leaseRouteHardwareAvailability } from '../hardwareAvailability.mjs';
 import { assertSelectionCurrent, selectRouteRuntime } from '../canary/selection.mjs';
 import { observeProxyOutcome, withSdkHeaderTiming } from '../canary/proxyOutcomes.js';
@@ -695,7 +696,7 @@ export async function handleDelegatedAgentTaskCancel({
     }
     try {
         const response = await requestTask({ req, agentName, route, taskId, routePlan, beforeDial, signals }, true);
-        res.writeHead(response.statusCode || 502, response.headers);
+        res.writeHead(response.statusCode || 502, guardSharedCache(response.headers, 'authenticated'));
         response.pipe(res);
     } catch (error) {
         sendJson(res, error.status ?? error.statusCode ?? 502, {
