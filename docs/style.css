@@ -1385,8 +1385,16 @@ body[data-page="cli-reference"] .sidebar {
   }
 }
 
-.documentation-map { overflow-x: auto; }
-.documentation-map table { width: 100%; border-collapse: separate; border-spacing: 0.75rem; }
-.documentation-map th, .documentation-map td { border: 0; text-align: left; vertical-align: top; padding: 0.5rem; }
-.documentation-map td span { display: block; margin-top: 0.4rem; }
+.documentation-map {
+  display: grid;
+  grid-template-columns: 1fr 2fr 1fr;
+  gap: 1rem;
+}
+.documentation-map-section { padding: 1.5rem 2rem; }
+.documentation-map-section h2 { margin-bottom: 0.75rem; }
+.documentation-map h3 { margin: 0 0 0.25rem; font-size: 1rem; }
+.documentation-map p { margin: 0; font-size: 0.9rem; line-height: 1.8; }
 .documentation-map a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+@media (max-width: 768px) {
+  .documentation-map { grid-template-columns: 1fr; gap: 0.75rem; }
+}
