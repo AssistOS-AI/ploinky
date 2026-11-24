@@ -126,6 +126,7 @@ function startFixture(t) {
         readRoutingConfig: () => structuredClone(routing),
         writeRoutingConfig: (next) => { routing = structuredClone(next); },
         buildRouterEnv: () => ({}),
+        workspaceRouterHealthSocket: () => '.ploinky/run/router-health.sock',
         ensureRouterGenerationReady: async () => ({ reused: true }),
         resolveStaticRouterContainerName: () => CONTAINER,
         deduplicateAgentRegistry: (value) => ({ ...value }),
