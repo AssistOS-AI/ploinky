@@ -170,6 +170,59 @@
     terminal.open(terminalElement);
     fitAddon.fit();
 
+    // Clipboard: xterm.js has no copy shortcut of its own (Ctrl+Shift+C would
+    // reach Chrome as "inspect element", Ctrl+C reaches the program as SIGINT)
+    // and ignores OSC 52, which TUI apps (Textual, tmux, nvim) use to copy.
+    function legacyCopy(text) {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute('readonly', '');
+        area.style.position = 'fixed';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.select();
+        try { document.execCommand('copy'); } catch (_) {}
+        area.remove();
+        terminal.focus();
+    }
+
+    function copyText(text) {
+        if (!text) return;
+        if (navigator.clipboard?.writeText && window.isSecureContext) {
+            navigator.clipboard.writeText(text).catch(() => legacyCopy(text));
+        } else {
+            legacyCopy(text);
+        }
+    }
+
+    terminal.attachCustomKeyEventHandler((event) => {
+        if (event.type !== 'keydown' || !event.ctrlKey || event.altKey || event.metaKey) return true;
+        const key = event.key.toLowerCase();
+        if (key === 'c' && event.shiftKey) {
+            // Ctrl+Shift+C copies, like desktop terminals; plain Ctrl+C stays SIGINT.
+            event.preventDefault();
+            copyText(terminal.getSelection());
+            return false;
+        }
+        if (key === 'v' && event.shiftKey) {
+            // Leave Ctrl+Shift+V to the browser, whose paste event xterm handles.
+            return false;
+        }
+        return true;
+    });
+
+    terminal.parser.registerOscHandler(52, (data) => {
+        const separator = data.indexOf(';');
+        if (separator < 0) return true;
+        const payload = data.slice(separator + 1);
+        if (!payload || payload === '?') return true; // never answer clipboard reads
+        try {
+            const bytes = Uint8Array.from(atob(payload), (character) => character.charCodeAt(0));
+            copyText(new TextDecoder().decode(bytes));
+        } catch (_) {}
+        return true;
+    });
+
     function boundedDimensions() {
         return {
             cols: Math.max(2, Math.min(1024, Number.isSafeInteger(terminal.cols) ? terminal.cols : 80)),

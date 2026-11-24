@@ -251,7 +251,7 @@ export async function runCodingSessionsCommand({
             const item = choice.action === 'new' ? items[0] : items[choice.index];
             if (choice.action === 'kill') {
                 if (item.kind !== 'live') { status = 'Only a running session can be killed.'; continue; }
-                if (!await menu.confirm(view, `Kill ${item.label.slice(2)}? Its conversation stays resumable.`)) continue;
+                if (!await menu.confirm({ ...view, selected: choice.index }, `Kill ${item.label.slice(2)}? Its conversation stays resumable.`)) continue;
                 try { await client.json('DELETE', `/webtty/sessions/${encodeURIComponent(item.row.id)}`); status = 'Session killed.'; }
                 catch (error) { status = failure(error); }
                 continue;
