@@ -33,6 +33,7 @@ const AGENT_ROOT_AUTH_SUPPORT_PATHS = new Set([
     '/auth/logged-out',
     '/auth/login',
     '/auth/logout',
+    '/auth/logout-cache',
     '/auth/account',
     '/auth/token',
 ]);

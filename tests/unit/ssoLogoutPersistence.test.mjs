@@ -25,7 +25,7 @@ export function createProvider() {
                 providerSession: { tokens: { accessToken: 'AT' }, expiresAt: Date.now() + 60_000 } };
         },
         async sso_refresh_session({ providerSession }) { return { user: { id: 'u1', username: 'alice' }, providerSession }; },
-        async sso_logout() { return { redirectUrl: 'https://fake.test/logout' }; },
+        async sso_logout({ postLogoutRedirectUri }) { return { redirectUrl: postLogoutRedirectUri }; },
     };
 }
 `);
@@ -86,7 +86,7 @@ function cookieValue(res, name) {
     return cookie ? cookie.split(';')[0].slice(name.length + 1) : '';
 }
 
-test('logout and callback answer 503 while the store is not open, and a non-durable logout is never reported as done', async () => {
+test('logout separates opted-in cache clearing and still requires durable session deletion', async () => {
     const fail = {};
     const failing = (name) => (...args) => {
         if (fail[name]) throw Object.assign(new Error(`injected ${fail[name]}`), { code: fail[name] });
@@ -123,6 +123,42 @@ test('logout and callback answer 503 while the store is not open, and a non-dura
     const sessionId = cookieValue(callback, 'ploinky_sso');
     const csrfToken = cookieValue(callback, BROWSER_CSRF_COOKIE_NAME);
     assert.ok(sessionId && csrfToken);
+
+    const deferredReturn = '/?clearLogoutCache=1';
+    const deferredLogin = await request('/auth/login?returnTo=%2F');
+    const deferredBinding = setCookies(deferredLogin)[0].split(';')[0];
+    const deferredState = deferredBinding.split('=')[0].slice('ploinky_sso_login_'.length);
+    const deferredCallback = await request(`/auth/callback?code=fixture-code&state=${deferredState}`, { cookie: deferredBinding });
+    const deferredId = cookieValue(deferredCallback, 'ploinky_sso');
+    const deferredProof = cookieValue(deferredCallback, BROWSER_CSRF_COOKIE_NAME);
+    const deferredLogout = await request('/auth/logout', {
+        method: 'POST',
+        cookie: `ploinky_sso=${deferredId}; ${BROWSER_CSRF_COOKIE_NAME}=${deferredProof}`,
+        body: { csrfToken: deferredProof, returnTo: deferredReturn },
+        headers: { origin: 'http://localhost' },
+    });
+    assert.equal(deferredLogout.statusCode, 302, deferredLogout.body);
+    assert.equal(deferredLogout.getHeader('location'), 'http://localhost' + deferredReturn);
+    assert.equal(deferredLogout.getHeader('clear-site-data'), undefined);
+    assert.ok(setCookies(deferredLogout).some(value => value.startsWith('ploinky_sso=;') && value.includes('Max-Age=0')));
+    assert.ok(setCookies(deferredLogout).some(value => value.startsWith(`${BROWSER_CSRF_COOKIE_NAME}=;`) && value.includes('Max-Age=0')));
+    assert.equal(authService.getSession(deferredId), null);
+    assert.ok(authService.getSession(sessionId));
+    const cleanupCookie = setCookies(deferredLogout).find(value => value.startsWith('ploinky_logout_cache=1;'));
+    assert.match(cleanupCookie, /Path=\/auth\/logout-cache/);
+    assert.match(cleanupCookie, /HttpOnly/);
+    const cleanupRequest = { method: 'POST', cookie: cleanupCookie.split(';')[0],
+        headers: { origin: 'http://localhost', 'x-ploinky-logout-cache': '1' } };
+    const foreignCleanup = await request('/auth/logout-cache', { ...cleanupRequest,
+        headers: { ...cleanupRequest.headers, origin: 'https://other.test' } });
+    assert.equal(foreignCleanup.statusCode, 403);
+    assert.equal(foreignCleanup.getHeader('clear-site-data'), undefined);
+    const cleanup = await request('/auth/logout-cache', cleanupRequest);
+    assert.equal(cleanup.statusCode, 204);
+    assert.equal(cleanup.getHeader('clear-site-data'), '"cache"');
+    assert.ok(setCookies(cleanup).some(value => value.startsWith('ploinky_logout_cache=;') && value.includes('Max-Age=0')));
+    const repeatedCleanup = await request('/auth/logout-cache', { ...cleanupRequest, cookie: '' });
+    assert.equal(repeatedCleanup.getHeader('clear-site-data'), undefined);
 
     fail.renameSync = 'EROFS';
     fail.unlinkSync = 'EROFS';

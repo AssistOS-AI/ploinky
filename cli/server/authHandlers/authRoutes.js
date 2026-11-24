@@ -41,6 +41,9 @@ import {
 } from './authPages.js';
 import { LOGIN_FAILURE, resolvePublicLoginError } from './loginErrors.js';
 
+const LOGOUT_CACHE_PATH = '/auth/logout-cache';
+const LOGOUT_CACHE_COOKIE = 'ploinky_logout_cache';
+
 // Router-generated configuration messages; provider text is never echoed.
 const SSO_NOT_CONFIGURED_MESSAGES = new Set([
     'SSO is not configured (no provider agent configured)',
@@ -268,6 +271,21 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
         return true;
     }
     try {
+        if (pathname === LOGOUT_CACHE_PATH) {
+            const headers = { 'Cache-Control': 'no-store' };
+            if (method !== 'POST') {
+                res.writeHead(405, { ...headers, Allow: 'POST' });
+            } else if (req.headers.origin !== baseUrl || req.headers['x-ploinky-logout-cache'] !== '1') {
+                res.writeHead(403, headers);
+            } else if (parseCookies(req).get(LOGOUT_CACHE_COOKIE) !== '1') {
+                res.writeHead(204, headers);
+            } else {
+                appendSetCookie(res, buildCookie(LOGOUT_CACHE_COOKIE, '', req, LOGOUT_CACHE_PATH, { maxAge: 0, sameSite: 'Strict' }));
+                res.writeHead(204, { ...headers, 'Clear-Site-Data': '"cache"' });
+            }
+            res.end();
+            return true;
+        }
         if (pathname === '/auth/logged-out') {
             if (method !== 'GET') {
                 res.writeHead(405); res.end(); return true;
@@ -549,10 +567,17 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             const wantsJson = !outcome.redirect
                 && String(req.headers?.accept || '').toLowerCase().includes('application/json');
             if (!wantsJson) {
+                const destination = URL.parse(redirectTarget, baseUrl);
+                const deferCache = destination?.origin === baseUrl
+                    && destination.searchParams.get('clearLogoutCache') === '1';
+                if (deferCache) {
+                    appendSetCookie(res, buildCookie(LOGOUT_CACHE_COOKIE, '1', req, LOGOUT_CACHE_PATH,
+                        { maxAge: 300, sameSite: 'Strict' }));
+                }
                 res.writeHead(302, {
                     Location: redirectTarget || '/',
                     'Cache-Control': 'no-store, no-cache, must-revalidate',
-                    'Clear-Site-Data': '"cache"',
+                    ...(!deferCache ? { 'Clear-Site-Data': '"cache"' } : {}),
                 });
                 res.end('Logged out');
             } else {
