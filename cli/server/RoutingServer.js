@@ -13,6 +13,7 @@ import { executeWorkspaceLogOperation } from './workspaceLogFiles.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
 import { handleWebtty } from './handlers/webtty.js';
 import * as staticSrv from './static/index.js';
+import { resolveBrowserEntryPath } from './browserEntryPath.js';
 
 // Authentication and routing
 import {
@@ -814,8 +815,15 @@ async function processRequest(req, res) {
         if (pathname === '/' || pathname === '/index.html') {
             const staticRouteName = getStaticRouteName(apiRoutes, routePlan?.lease?.snapshot);
             if (staticRouteName) {
+                let entryPath;
+                try {
+                    entryPath = resolveBrowserEntryPath(staticRouteName, routePlan.lease.snapshot.manifests?.[staticRouteName]);
+                } catch {
+                    sendJsonResponse(res, 503, { error: 'browser_entry_invalid' }, { 'Cache-Control': 'no-store' });
+                    return;
+                }
                 res.writeHead(302, {
-                    Location: `/${encodeURIComponent(staticRouteName)}/index.html`,
+                    Location: entryPath,
                     'Cache-Control': 'no-store'
                 });
                 return res.end();
