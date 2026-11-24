@@ -304,3 +304,26 @@ test('a failed or uncertain skills manifest with unknown membership is conservat
         }
     } finally { fs.rmSync(fx.root, { recursive: true, force: true }); }
 });
+
+
+test('update dependency checks can exclude all skill scopes and manifest sources', () => {
+    const fx = fixture();
+    try {
+        fx.manifest('Main', 'app', {});
+        fs.writeFileSync(path.join(fx.workspace, 'ploinky-skills-manifest.json'), '{invalid');
+        const graph = readUpdateGraph({
+            workspaceRoot: fx.workspace,
+            readRegistry: () => ({ a: { type: 'agent', repoName: 'Main', agentName: 'app' } }),
+            repositoryPath: fx.repositoryPath,
+            includeSkills: false,
+            skillScopeContext: { priorRequired: true, prior: null, proposed: null },
+            resolveSkillSource() { assert.fail('skills must not be inspected during update'); },
+        });
+        assert.deepEqual(graph.errors, []);
+        const records = applyGraphRequirements([
+            record('registered-repository', 'Main'),
+            record('workspace-repository', path.join(fx.workspace, 'unrelated'), { outcome: 'skipped', code: 'dirty-worktree' }),
+        ], { prior: graph, proposed: graph });
+        assert.deepEqual(records.map(entry => entry.required), [true, false]);
+    } finally { fs.rmSync(fx.root, { recursive: true, force: true }); }
+});

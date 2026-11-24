@@ -87,32 +87,15 @@ remove [repo] &lt;repoName|url&gt;</code></pre>
 
                         <h3>update</h3>
                         <pre><code>update [folderPath]</code></pre>
-                        <p>Runs the full update workflow from the current directory or an explicit folder path. It updates the Ploinky checkout, the runtime <code>node_modules/achillesAgentLib</code> checkout, managed repositories under <code>.ploinky/repos/</code>, and recursively discovered project repositories. Missing or unreachable project remotes are logged and skipped.</p>
+                        <p>Runs the full update workflow from the current directory or an explicit folder path. It updates the Ploinky checkout, the selected <code>achillesAgentLib</code> source, managed repositories under <code>.ploinky/repos/</code>, and recursively discovered project repositories. Missing or unreachable project remotes are logged and skipped.</p>
                         <pre><code>update all [folderPath]</code></pre>
-                        <p>Runs the same full workflow as <code>update</code> with an explicit all-repository scope. Inside a Ploinky box, the read-only <code>/opt/ploinky</code> self-pull is skipped while writable runtime dependencies, managed repositories, workspace repositories, and skills continue to update.</p>
+                        <p>Runs the same full workflow as <code>update</code> with an explicit all-repository scope. Inside a Ploinky box, the read-only <code>/opt/ploinky</code> self-pull is skipped while writable runtime dependencies, managed repositories, workspace repositories continue to update.</p>
                         <pre><code>update repos</code></pre>
                         <p>Updates the installed repositories under <code>.ploinky/repos/</code>, refreshes the runtime Achilles checkout, and refreshes managed-repository <code>achillesAgentLib</code> dependencies.</p>
                         <pre><code>update repo &lt;name&gt;</code></pre>
-                        <p>Updates one named repository, repairs it by recloning when its direct git metadata is missing but its source URL is known, refreshes its <code>achillesAgentLib</code> dependencies, and applies the default skills to that repository.</p>
-                        <p>All update commands refresh <code>AchillesCopilotBasicSkills</code>, <code>DocumentationSkills</code>, and <code>PloinkySkills</code> in each eligible installed <code>.ploinky/repos/</code> entry through the <code>default-skills</code> behavior. Each source repository is skipped when it is itself the target, as are skills-only repositories; refreshed project repositories also receive the managed <code>.gitignore</code> block.</p>
-                        <table class="command-table">
-                            <tr>
-                                <th>Default skills repository</th>
-                                <th>Purpose</th>
-                            </tr>
-                            <tr>
-                                <td><a href="https://github.com/AssistOS-AI/AchillesCopilotBasicSkills.git"><code>AchillesCopilotBasicSkills</code></a></td>
-                                <td>Skills maintained for <code>achillesAgentLib</code>.</td>
-                            </tr>
-                            <tr>
-                                <td><a href="https://github.com/AssistOS-AI/DocumentationSkills.git"><code>DocumentationSkills</code></a></td>
-                                <td>Skills for software documentation.</td>
-                            </tr>
-                            <tr>
-                                <td><a href="https://github.com/AssistOS-AI/PloinkySkills.git"><code>PloinkySkills</code></a></td>
-                                <td>Skills for developing the Ploinky application.</td>
-                            </tr>
-                        </table>
+                        <p>Updates one named repository, repairs it by recloning when its direct git metadata is missing but its source URL is known, and refreshes its Git dependency pins.</p>
+                        <p>Update does not install, export, prune or validate skills, read skills manifests, or modify their Git exclusions. Use the explicit skills commands to manage skills. Only valid Git checkouts are included in workspace repository discovery.</p>
+                        <p>A full update from the host terminal restarts an already running workspace after its required repositories have been verified. If a required repository has uncommitted changes, it is preserved and the restart is skipped with the repository name and reason. Targeted updates do not restart the whole workspace.</p>
                     </div>
 
                     <div class="doc-section" id="agent">

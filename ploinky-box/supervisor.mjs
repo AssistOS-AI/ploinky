@@ -1,3 +1,4 @@
+import { diagnosticColorEnabled } from '../cli/utils/diagnostics.js';
 import { assertDataLayoutCurrent } from '../cli/utils/workspaceDataLayout.js';
 import { buildHostSkillScope } from './skillScope.mjs';
 import { readGraphSkillScope, validateGraphSkillScope, writeGraphSkillScope } from './graphSkillScope.mjs';
@@ -146,11 +147,6 @@ import {
 import { listUnresolvedAdmissions, runJournaledAdmission } from './update/admission.mjs';
 import { createUpdateHostState } from './update/hostState.mjs';
 import { IN_BOX_NONCE_PROBE_SCRIPT, IN_BOX_OPERATION_WRITERS_PROBE_SCRIPT, runUpdateExec } from './update/coreRunner.mjs';
-import {
-    HOST_EXCLUSIONS_INTENT_KIND,
-    recoverInterruptedHostExclusions,
-    refreshDeferredHostExclusions,
-} from './update/hostExclusions.mjs';
 import {
     UPDATE_REPORT_CONTEXT_ENV,
     UPDATE_REPORT_NONCE_ENV,
@@ -361,8 +357,6 @@ export function createBoxSupervisor({
     runCoreCommand = runBoundedCoreCommand,
     runUpdateCore = runBoundedUpdateCommand,
     runRestartCore = runBoundedRestartCommand,
-    refreshHostExclusions = refreshDeferredHostExclusions,
-    recoverHostExclusions = recoverInterruptedHostExclusions,
     createCancellation = () => createUpdateCancellation(),
     readReport = readUpdateReport,
     removeReport = removeUpdateReport,
@@ -1944,41 +1938,6 @@ export function createBoxSupervisor({
         });
     }
 
-    // Private host record of the folders whose locks a host exclusion refresh
-    // of this workspace may hold.
-    function exclusionsIntent(identity) {
-        return {
-            read: () => updateStore(identity).read(HOST_EXCLUSIONS_INTENT_KIND, identity.instance),
-            write: record => updateStore(identity).write(HOST_EXCLUSIONS_INTENT_KIND, identity.instance, record),
-            remove: () => updateStore(identity).remove(HOST_EXCLUSIONS_INTENT_KIND, identity.instance),
-        };
-    }
-
-    /**
-     * The host refresh holds folder locks that only this host can prove
-     * released, so it owns SIGINT/SIGTERM instead of dying with them: a signal
-     * stops it before its next folder, and the update ends with a `cancelled`
-     * record that blocks activation. A signal after that decision keeps its
-     * default action.
-     */
-    async function refreshExclusionsOwningSignals(identity, folders) {
-        const cancellation = createCancellation();
-        cancellation.arm();
-        let signal = '';
-        try {
-            const records = [...await refreshHostExclusions({
-                folders, identity, env, cancellation, intent: exclusionsIntent(identity),
-            })];
-            signal = await cancellation.signalReceived();
-            if (signal) {
-                records.push(commandErrorRecord(new UpdateCancelledError(signal, 'the host finished this update'), { code: 'cancelled' }));
-            }
-            return records;
-        } finally {
-            await cancellation.dispose({ reported: Boolean(signal) });
-        }
-    }
-
     /**
      * Run the in-Box update with a fresh nonce and expected context, then
      * judge its one structured report. A nonzero exit keeps a complete
@@ -2084,9 +2043,6 @@ export function createBoxSupervisor({
         const records = [];
         if (report.ok) {
             records.push(...report.result.records);
-            // The in-Box core cannot see the host user's Git excludes view;
-            // refresh the exclusions it deferred here, still under the lock.
-            records.push(...await refreshExclusionsOwningSignals(identity, report.result.deferredExclusionFolders));
         } else {
             records.push(uncertainCoreRecord('in-box-update-report', report.code, report.reason));
         }
@@ -2251,26 +2207,15 @@ export function createBoxSupervisor({
             const activity = sampleGraphActivity(identity, ownership);
             const unresolvedAdmissions = listUnresolvedAdmissions(updateStore(identity), identity);
             const context = { identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity, hardwareGate, reposSource };
-            // Locks that an interrupted host exclusion refresh left are
-            // released, when provably its own, before the in-Box step meets them.
-            const exclusionRecovery = recoverHostExclusions({ intent: exclusionsIntent(identity), identity, env });
-            let result;
-            try {
-                result = plan.request.kind === 'all'
-                    ? await runFullUpdate(context)
-                    : await runTargetedUpdate(context);
-            } catch (error) {
-                if (exclusionRecovery.records.length && error && typeof error === 'object') {
-                    error.updateRecords = Object.freeze([...exclusionRecovery.records, ...(error.updateRecords || [])]);
-                }
-                throw error;
-            }
-            const records = Object.freeze([...exclusionRecovery.records, ...result.records]);
+            const result = plan.request.kind === 'all'
+                ? await runFullUpdate(context)
+                : await runTargetedUpdate(context);
+            const records = result.records;
             return Object.freeze({
                 ...result,
                 records,
                 decision: decideUpdateStatus(records),
-                warnings: Object.freeze([...barrierWarnings, ...exclusionRecovery.warnings, ...result.warnings]),
+                warnings: Object.freeze([...barrierWarnings, ...result.warnings]),
                 request: plan.request,
                 coreArgv,
                 unresolvedAdmissions,
@@ -3080,7 +3025,7 @@ export function createBoxSupervisor({
             if (!announced) {
                 stderr?.write?.(
                     `[ploinky] Waiting for ${count} no-wait agent ${count === 1 ? 'launch' : 'launches'} (image pulls) `
-                    + 'to finish before replacing the Box to apply the GPU agents...\n',
+                    + 'to finish before automatically restarting the workspace runtime for GPU access...\n',
                 );
                 announced = true;
             }
@@ -3114,15 +3059,19 @@ export function createBoxSupervisor({
             return untouched;
         }
         if (sameGpuWiring(selected.desired, prepared.gpu)) return untouched;
+        const gpuAgents = selected.desired?.agents ?? [];
+        stderr?.write?.(gpuAgents.length
+            ? `[ploinky] GPU access required for: ${gpuAgents.join(', ')}. An automatic workspace runtime restart is needed to apply it.\n`
+            : '[ploinky] GPU access configuration changed. An automatic workspace runtime restart is needed to apply it.\n');
         const launches = await waitForNoWaitLaunches(identity);
         if (!launches.settled) {
             stderr?.write?.(
-                `[ploinky] The installed manifests change the GPU agents, but ${launches.reason}; the workspace keeps `
+                `[ploinky] Automatic restart for GPU access postponed: ${launches.reason}; the workspace keeps `
                 + 'running without that GPU wiring; run `ploinky start` again once they finish.\n',
             );
             return untouched;
         }
-        stderr?.write?.('[ploinky] The installed manifests change the GPU agents; replacing the Box once to apply them...\n');
+        stderr?.write?.('[ploinky] Restarting the workspace runtime to apply GPU access. Restart logs follow...\n');
         let gpuReapplied;
         try {
             gpuReapplied = await applyGpuGrantChange({
@@ -3269,7 +3218,7 @@ export function createBoxSupervisor({
             revalidateMountedAgentLibSource(selection, { engine, containerId: container.id, runner });
         }
         const previousGpu = observeContainerGpuWiring(container, { identity });
-        stderr?.write?.(
+        if (verb !== 'start') stderr?.write?.(
             `[ploinky] Applying GPU grant ${describeGpuGrant(next)}; `
             + 'the Box and workspace graph restart briefly if the GPU wiring changes...\n',
         );
@@ -4431,6 +4380,7 @@ function boundedCoreEnvironment(
     hostReachableIpv4 = '',
     updateExcludedRepoPath = '',
     skillScopeEnv = {},
+    colorOutput = false,
 ) {
     if (!agentLib) {
         throw supervisorError('Bounded core command requires the selected achillesAgentLib contract');
@@ -4438,6 +4388,7 @@ function boundedCoreEnvironment(
     const agentLibEnvironment = agentLibBoxEnv(normalizeBoxAgentLib(agentLib));
     return [
         'container', 'exec',
+        '--env', `PLOINKY_DIAGNOSTIC_COLOR=${colorOutput ? '1' : '0'}`,
         ...Object.entries(skillScopeEnv).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
         '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
         '--env', `PLOINKY_MEDIA_HOST_PORT=${mediaHostPort}`,
@@ -4484,6 +4435,7 @@ export async function runBoundedCoreCommand(
             normalizedHostReachableIpv4,
             updateExcludedRepoPath,
             skillScopeEnv,
+            diagnosticColorEnabled({ stream: stdout }),
         ),
         '--user', 'podman',
         ...boxWorkspaceExecOptions(workspaceRoot),
@@ -4565,6 +4517,7 @@ export async function runBoundedUpdateCommand(
             String(hostReachableIpv4 || '').trim(),
             updateExcludedRepoPath,
             skillScopeEnv,
+            diagnosticColorEnabled({ stream: stdout }),
         ),
         '--env', `${UPDATE_REPORT_NONCE_ENV}=${reportNonce}`,
         '--env', `${UPDATE_REPORT_CONTEXT_ENV}=${JSON.stringify(reportContext)}`,
@@ -4631,7 +4584,7 @@ export async function runBoundedRestartCommand(
     }
     const marker = `${UPDATE_OPERATION_ENV}=${operationId}`;
     const args = [
-        ...boundedCoreEnvironment(hostPort, mediaHostPort, agentLib, normalizedHostReachableIpv4, '', skillScopeEnv),
+        ...boundedCoreEnvironment(hostPort, mediaHostPort, agentLib, normalizedHostReachableIpv4, '', skillScopeEnv, diagnosticColorEnabled({ stream: stdout })),
         '--env', marker,
         '--user', 'podman',
         ...boxWorkspaceExecOptions(workspaceRoot),

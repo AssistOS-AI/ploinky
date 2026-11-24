@@ -147,6 +147,7 @@ export function readUpdateGraph({
     repositoryPath = resolveAgentRepositoryPath,
     // Same resolver the start path uses for a bare enabled agent name.
     resolveAgent = findAgent,
+    includeSkills = true,
     skillScopeContext = commandSkillScopes.getStore(),
     resolveSkillSource = resolveSkillRepositorySource,
 } = {}) {
@@ -169,7 +170,7 @@ export function readUpdateGraph({
         unknown(`agents registry: ${error?.message || error}`);
         return graph;
     }
-    addSkillScopes(graph, workspaceRoot, registry, skillScopeContext, resolveSkillSource);
+    if (includeSkills) addSkillScopes(graph, workspaceRoot, registry, skillScopeContext, resolveSkillSource);
     const addRepository = name => {
         const repoName = String(name || '').trim();
         if (!repoName || graph.repositories.has(repoName)) return;

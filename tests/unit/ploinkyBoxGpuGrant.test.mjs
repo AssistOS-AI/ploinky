@@ -2452,11 +2452,16 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
         const box = graphBox(t);
         const events = [];
         const seen = [];
+        const output = [];
+        const stdout = { write(text) { output.push(String(text)); } };
+        const stderr = { write(text) { output.push(String(text)); } };
         let scans = 0;
         let current = box.ownership;
         // The start returns while its no-wait launches (image pulls) still run.
         const workers = [2, 1, 0];
         const supervisor = gpuSupervisor(box, events, {
+            stdout,
+            stderr,
             gpuGrantStore: memoryGpuStore(events),
             discover: () => current,
             // Nothing is installed when the host prepares the Box; the in-Box
@@ -2469,7 +2474,14 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
                 current = boxGeneration(box, REPLACEMENT_ID, options.gpu);
                 return { ...prepared(box, 'replaced', options.gpu, events), ownership: current };
             },
-            async startCore() { events.push('start-core'); },
+            async startCore(...args) {
+                events.push('start-core');
+                const streams = args[6];
+                assert.equal(streams.stdout, stdout);
+                assert.equal(streams.stderr, stderr);
+                streams.stdout.write('[start] graph output\n');
+                streams.stderr.write('[start] graph diagnostic\n');
+            },
             async healthCheck() { events.push('health'); },
             selectAgentLib: async () => ({ selection: box.agentLib }),
             commitAgentLibSelection: () => {},
@@ -2486,12 +2498,19 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
         const noWait = events.filter((event) => event.startsWith('no-wait:') || event === 'reconcile');
         if (declaredAfterStart.length) {
             assert.deepEqual(seen[1].agents, [AGENT]);
+            const log = output.join('');
+            assert.ok(log.includes(`GPU access required for: ${AGENT}.`));
+            assert.match(log, /Waiting for 2 no-wait agent launches/);
+            assert.match(log, /Restart logs follow[\s\S]*\[start\] graph output[\s\S]*\[start\] graph diagnostic/);
+            assert.ok(!log.includes('Applying GPU grant none'));
+
             assert.equal(result.gpuReapplied.action, 'replaced');
             assert.equal(result.containerId, REPLACEMENT_ID);
             assert.equal(events.filter((event) => event === 'start-core').length, 2);
             // The Box is replaced only once no no-wait launch is left.
             assert.deepEqual(noWait, ['reconcile', 'no-wait:2', 'no-wait:1', 'no-wait:0', 'reconcile']);
         } else {
+            assert.ok(!output.join('').includes('GPU access required'));
             assert.equal(result.gpuReapplied, undefined);
             assert.equal(result.containerId, OLD_ID);
             assert.equal(events.filter((event) => event === 'start-core').length, 1);

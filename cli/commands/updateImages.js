@@ -1,4 +1,5 @@
 import { isCanaryRecord } from '../sandbox/canaryRecord.mjs';
+import { formatDiagnostic } from '../utils/diagnostics.js';
 import fs from 'fs';
 
 import { readAgentRegistrySnapshot } from '../utils/agentRegistrySnapshot.js';
@@ -119,7 +120,7 @@ export function refreshTaggedImages(entries, {
     inspectImageId = inspectLocalImageId,
     pull = pullImage,
     log = console.log,
-    warn = console.warn,
+    warn = message => console.warn(formatDiagnostic(message)),
     budgetMs = UPDATE_IMAGE_PULL_BUDGET_MS,
     pullTimeoutMs = imagePullTimeoutMs(),
     now = Date.now,
@@ -145,7 +146,7 @@ export function refreshTaggedImages(entries, {
             continue;
         }
         try {
-            pull(entry.reference, { runtime: entry.runtime, log, timeoutMs: Math.min(pullTimeoutMs, remaining) });
+            pull(entry.reference, { runtime: entry.runtime, quiet: true, log, timeoutMs: Math.min(pullTimeoutMs, remaining) });
         } catch (error) {
             const message = String(error?.message || error);
             warn(`[pull] ${entry.reference}: refresh failed (${message}); keeping local image ${shortId(before)}.`);
@@ -173,8 +174,8 @@ export function refreshTaggedImages(entries, {
         }
         const changed = after !== before;
         log(changed
-            ? `[pull] ${entry.reference}: new image ${shortId(after)} (was ${shortId(before)}); agents using it are recreated on restart.`
-            : `[pull] ${entry.reference}: already current (${shortId(after)}).`);
+            ? `[images] ${entry.reference.split('/').pop()}: updated; used on restart.`
+            : `[images] ${entry.reference.split('/').pop()}: already up to date.`);
         records.push(imageRecord(entry, {
             outcome: changed ? 'changed' : 'unchanged',
             attempted: true,
@@ -222,7 +223,7 @@ export function refreshAgentImagesForUpdate({
     readRegistry = readAgentRegistrySnapshot,
     resolveImages = resolveAgentRecordImages,
     log = console.log,
-    warn = console.warn,
+    warn = message => console.warn(formatDiagnostic(message)),
     ...deps
 } = {}) {
     let registry;
@@ -234,6 +235,6 @@ export function refreshAgentImagesForUpdate({
     }
     const entries = collectTaggedAgentImages(registry, resolveImages, { repoName, warn });
     if (!entries.length) return [];
-    log(`Refreshing ${entries.length} tagged agent image(s)...`);
+    log(`Checking ${entries.length} agent image(s) for updates...`);
     return refreshTaggedImages(entries, { log, warn, ...deps });
 }

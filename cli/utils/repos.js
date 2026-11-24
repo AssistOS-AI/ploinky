@@ -648,7 +648,16 @@ export function findWorkspaceGitRepos(workspaceRoot) {
     ]);
 
     function visit(dir) {
+        let validCheckout = false;
         if (fs.existsSync(path.join(dir, '.git'))) {
+            try {
+                const topLevel = execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], {
+                    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000,
+                }).trim();
+                validCheckout = fs.realpathSync(topLevel) === fs.realpathSync(dir);
+            } catch { /* A .git/info directory alone is not a Git checkout. */ }
+        }
+        if (validCheckout) {
             repos.push({ name: path.basename(dir), path: dir });
             if (dir !== root) return;
         }

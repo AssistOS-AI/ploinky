@@ -333,7 +333,7 @@ test('host dispatch: complete verified update exits zero and reports the restart
     assert.equal(code, 0);
     assert.equal(result.status, 'complete');
     assert.match(output, /^Update complete\.$/m);
-    assert.match(output, /workspace graph was restarted and the Router health check passed/);
+    assert.match(output, /Workspace restarted; the Router health check passed/);
     assert.deepEqual(result.records[0].phase, 'host-ploinky');
 });
 
@@ -343,9 +343,9 @@ test('host dispatch: a preserved dirty required repository exits nonzero without
     assert.equal(code, 1);
     assert.equal(result.status, 'failed');
     assert.equal(result.activationAllowed, false);
-    assert.match(output, /Update failed \(exit status 1\): not verified: workspace-repository demo: skipped \[dirty-worktree\]/);
-    assert.match(output, /Activation deferred/);
-    assert.match(output, /Activation was blocked by: workspace-repository demo \(dirty-worktree\)/);
+    assert.match(output, /Update incomplete \(exit status 1\): not verified: workspace-repository demo: skipped \[dirty-worktree\]/);
+    assert.match(output, /Workspace restart skipped/);
+    assert.match(output, /required repositories have uncommitted changes:\n  - demo/);
     assert.doesNotMatch(output, /Update complete|restarted and/);
     assert.deepEqual(coreCalls(fixture.events), [['update']]);
     assert.notEqual(fixture.store.read('update-pending', fixture.identity.instance), null);
@@ -374,7 +374,7 @@ test('host dispatch: a required skill source that could not be acquired exits no
     assert.equal(result.status, 'failed');
     assert.equal(result.activationAllowed, false);
     assert.match(output, /Update failed \(exit status 1\): .*skills-manifest \/workspace\/project: failed \[skill-source-unavailable\]/);
-    assert.match(output, /Activation deferred/);
+    assert.match(output, /Workspace restart skipped/);
     assert.doesNotMatch(output, /Update complete|restarted and/);
     assert.deepEqual(coreCalls(fixture.events), [['update']], 'no restart, so no start-time replacement');
     assert.notEqual(fixture.store.read('update-pending', fixture.identity.instance), null);
@@ -396,7 +396,7 @@ test('host dispatch: an optional failure exits nonzero while the verified graph 
     assert.equal(result.status, 'partial');
     assert.equal(result.activationAllowed, true);
     assert.match(output, /Update partially failed \(exit status 1\): failed or uncertain: default-skills optional-skills: failed \[fetch-failed\]/);
-    assert.match(output, /workspace graph was restarted/);
+    assert.match(output, /Workspace restarted/);
     assert.deepEqual(coreCalls(fixture.events), [['update'], ['restart']]);
 });
 
