@@ -4657,6 +4657,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
         if (drained?.state === 'accepted-failed-drain') {
             console.log(`[restart] ${agentName}: replacing predecessor ${drained.containerId.slice(0, 12)} after its refused drain (exit=${drained.exitCode ?? 'unknown'}${drained.oomKilled ? ', oom-killed' : ''}); the operator accepted possible data loss`);
+        } else if (drained?.sharedCgroupOomFlag) {
+            console.log(`[restart] ${agentName}: the predecessor exited 0; Podman flagged it OOM-killed, but it has no cgroup of its own, so the flag reports an OOM kill somewhere in the Box and does not refuse the drain`);
         }
         clearLivenessState(containerName);
     }

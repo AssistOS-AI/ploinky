@@ -121,25 +121,51 @@ export function normalizeAcceptedFailedDrain(value) {
     return Object.freeze({ containerId });
 }
 
+// Podman records `--cgroups=disabled` as HostConfig.Cgroups "disabled", also
+// after the container exits. The Box's nested Podman sets it for every agent
+// without hardware placement (the base image's containers.conf), so the agent
+// stays in the cgroup of the Podman process that started it, which it shares
+// with the Box's own processes. Conmon derives State.OOMKilled from the OOM
+// counters of the cgroup the container runs in, so for such a container the
+// flag reports an OOM kill of any process in that shared cgroup, not
+// necessarily of this container. Only this exact positive evidence makes the
+// flag unattributable; any other or missing value (an own cgroup, a
+// hardware-placed agent's "enabled", Docker) keeps it as an OOM kill.
+function hasNoCgroupOfItsOwn(inspection) {
+    const hostConfig = inspection?.HostConfig || inspection?.hostConfig || {};
+    return hostConfig.Cgroups === 'disabled';
+}
+
 function terminationOf(inspection) {
     const state = inspection?.State || inspection?.state || {};
     const exitCode = Number(state.ExitCode ?? state.exitCode);
-    const oomKilled = state.OOMKilled === true || state.oomKilled === true;
+    const oomFlag = state.OOMKilled === true || state.oomKilled === true;
+    const sharedCgroupOomFlag = oomFlag && hasNoCgroupOfItsOwn(inspection);
+    const oomKilled = oomFlag && !sharedCgroupOomFlag;
     const stateError = String(state.Error || state.error || '').trim();
     return {
         running: state.Running === true || state.running === true,
         exitCode: Number.isFinite(exitCode) ? exitCode : null,
         oomKilled,
+        sharedCgroupOomFlag,
         stateError,
         // A targeted restart is not an ordinary process stop. Exit zero is the
         // application acknowledgement that its own drain/persistence contract
-        // completed. Signal termination (including 143) is never an acknowledgement.
+        // completed. Signal termination (including 143) is never an
+        // acknowledgement. An OOM kill of the main process still exits 137.
         clean: !oomKilled && !stateError && exitCode === 0,
     };
 }
 
 function describeTermination(termination) {
-    return `exit=${termination.exitCode ?? 'unknown'}${termination.oomKilled ? ', oom-killed' : ''}${termination.stateError ? `, error=${termination.stateError}` : ''}`;
+    const oom = termination.oomKilled
+        ? ', oom-killed'
+        : (termination.sharedCgroupOomFlag ? ', OOM flag from the shared Box cgroup (not attributable to this container)' : '');
+    return `exit=${termination.exitCode ?? 'unknown'}${oom}${termination.stateError ? `, error=${termination.stateError}` : ''}`;
+}
+
+function sharedCgroupOomDetail(termination) {
+    return termination.sharedCgroupOomFlag ? { sharedCgroupOomFlag: true } : {};
 }
 
 function assertCleanTermination(name, inspection) {
@@ -148,10 +174,10 @@ function assertCleanTermination(name, inspection) {
         throw lifecycleError(
             `targeted drain for '${name}' did not exit cleanly (${describeTermination(termination)}); refusing removal or recreate`,
             'TARGETED_DRAIN_FAILED',
-            { exitCode: termination.exitCode, oomKilled: termination.oomKilled },
+            { exitCode: termination.exitCode, oomKilled: termination.oomKilled, ...sharedCgroupOomDetail(termination) },
         );
     }
-    return termination.exitCode;
+    return termination;
 }
 
 function acceptanceRefused(message) {
@@ -176,7 +202,7 @@ function acceptStoppedPredecessor(name, inspection, accepted, selectors) {
         );
     }
     if (termination.clean) {
-        return Object.freeze({ state: 'already-stopped', containerName: name, exitCode: termination.exitCode, affectedSelectors: selectors });
+        return Object.freeze({ state: 'already-stopped', containerName: name, exitCode: termination.exitCode, ...sharedCgroupOomDetail(termination), affectedSelectors: selectors });
     }
     return Object.freeze({
         state: 'accepted-failed-drain',
@@ -184,6 +210,7 @@ function acceptStoppedPredecessor(name, inspection, accepted, selectors) {
         containerId: inspectedId,
         exitCode: termination.exitCode,
         oomKilled: termination.oomKilled,
+        ...sharedCgroupOomDetail(termination),
         ...(termination.stateError ? { stateError: termination.stateError } : {}),
         affectedSelectors: selectors,
     });
@@ -254,8 +281,8 @@ export function drainTargetedContainer(name, {
     if (!isRunning(containerName)) {
         const inspection = inspect(runtime, containerName);
         if (accepted) return acceptStoppedPredecessor(containerName, inspection, accepted, selectors);
-        const exitCode = assertCleanTermination(containerName, inspection);
-        return Object.freeze({ state: 'already-stopped', containerName, exitCode, affectedSelectors: selectors });
+        const termination = assertCleanTermination(containerName, inspection);
+        return Object.freeze({ state: 'already-stopped', containerName, exitCode: termination.exitCode, ...sharedCgroupOomDetail(termination), affectedSelectors: selectors });
     }
     if (accepted) {
         throw acceptanceRefused(
@@ -282,8 +309,8 @@ export function drainTargetedContainer(name, {
         );
     }
 
-    const exitCode = assertCleanTermination(containerName, inspect(runtime, containerName));
-    return Object.freeze({ state: 'drained', containerName, exitCode, affectedSelectors: selectors });
+    const termination = assertCleanTermination(containerName, inspect(runtime, containerName));
+    return Object.freeze({ state: 'drained', containerName, exitCode: termination.exitCode, ...sharedCgroupOomDetail(termination), affectedSelectors: selectors });
 }
 
 export function drainAndRemoveTargetedContainer(name, options = {}) {
