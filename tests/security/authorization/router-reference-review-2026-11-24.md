@@ -49,3 +49,42 @@ Two request surfaces are new. Neither has its own inventory row.
 | `POST /api/marketplace/agents` `enable_agent` with `Prefer: respond-async`, browser callers only | Runs after the unchanged POST gates (administrator, exact Origin and CSRF, then the body, then the lease commit). It answers 202 with an operation id, or 429 when the bounded queue is full, and the background job keeps only the admitted lease, not the request |
 
 The other changes are error messages (a recovery instruction after a timed-out or failed worker) and the repository kind, which now comes from `resolveRepoKind`.
+
+## Cloudflare cache branch
+
+The `cloudflare-cache` branch (`da84e0d0`) changed four registered files. The follow-up commit `1bb1ac73` changed none of them.
+
+| File | Last reviewed | Registered now | Rows moved |
+| --- | --- | --- | --- |
+| RoutingServer.js | 0ed76407 | b46fb2c3 | all 23, by 3 to 9 lines |
+| authHandlers/marketplaceRoutes.js | c21698e4 | caca9686 | all 6, by 9 lines |
+| static/index.js | 4c1d5fc9 | 647fc532 | all 6, by 1 or 2 lines |
+| edgeRoutePlan.js | e1a96459 | 62537426 | all 5: 196 to 207, and the four private routes by 28 lines |
+
+### RoutingServer.js (blob b46fb2c3)
+
+`handleAsyncRequest`, which wraps the public, private and detailed-health servers, installs the CDN response hook before the request is processed. The hook only sets the `Cloudflare-CDN-Cache-Control` response header from the route's access and cache mark. `serveMcpBrowserClient` marks its public asset to keep a cacheable header. The agent-root proxy call passes the route's access (`authenticated` for delegated task status) and the route plan to the proxy, which uses them only for that header. Every WebSocket refusal written to the raw socket carries `Cloudflare-CDN-Cache-Control: no-store`. No gate moved or changed order.
+
+The private listener sends a `private-operation` plan with operation `cache` to `handlePrivateCacheRequest` (`privateRouter.js`). That plan is resolved only for an exact `POST /api/edge/cache` with no query. The handler refuses anything not on the private listener, not a POST to that exact path, or not from a loopback peer. It then requires the current lease and a signed cache-operator request, with replay refusal, before it reads the operation.
+
+### authHandlers/marketplaceRoutes.js (blob caca9686)
+
+`/api/marketplace/cache` is dispatched beside `hardware-limits`, with the same `ensureAdmin` and Origin/CSRF guards. `handleCacheRoutes` refuses any bearer (agent) request with 403 and any method other than GET and POST with 405, then calls `ensureAdmin`. It then requires the current lease, and for POST an unexpired, unrevoked session and Origin/CSRF proof, before it reads the body and again before it answers. `hardware-limits` keeps its own lease check unchanged.
+
+### static/index.js (blob 647fc532)
+
+`serveWebLibRequest` marks the public library asset to keep a cacheable header. No gate changed.
+
+### edgeRoutePlan.js (blob 62537426)
+
+Agent-port and agent-root plans gain response-policy fields: the route access, the manifest cache class and whether the request carried a credential, which is read on ingress. They decide only the cache header. The private listener resolves the cache operation plan described under RoutingServer.js before its other private routes.
+
+## Surfaces without an inventory row
+
+| Surface | Source | Expected access |
+| --- | --- | --- |
+| `GET /api/marketplace/agents?operation=<id>` | master `02d64bde` | administrator |
+| `GET` and `POST /api/marketplace/cache` | `cloudflare-cache` | administrator; POST also needs Origin/CSRF |
+| `POST /api/edge/cache` | `cloudflare-cache` | private listener, loopback, signed cache operator; no user role |
+
+The baseline inventory is frozen at 128 rows and the Live Sessions overlay adds five, so a row for any of these needs its own overlay and a harness review.
