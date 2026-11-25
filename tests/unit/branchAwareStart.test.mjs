@@ -1177,6 +1177,76 @@ test('prepareManifestRepositories: a declared repo clone that fails once is retr
     assert.match(warnings[0], GIT_MISSING_REPOSITORY);
 });
 
+test('prepareManifestRepositories: a clone retry checks again a branch fallback decided while the remote was unreachable', async () => {
+    const remote = path.join(tempDir, 'remotes', 'late', 'lateBranchDep.git');
+    writeAgentManifest('staticLateBranch', 'app', {
+        container: 'node:20',
+        repos: { lateBranchDep: remote },
+    });
+
+    await prepareManifestRepositories('staticLateBranch/app', {
+        cloneRetryDelayMs: 0,
+        branchPolicy: {
+            branch: 'late-feature',
+            repoBranches: {},
+            fallback: 'default',
+            resetRepos: false,
+        },
+        warn: () => {
+            if (!fs.existsSync(remote)) {
+                const created = createBareRepo('lateBranchDepSource', { branches: ['late-feature'] });
+                fs.mkdirSync(path.dirname(remote), { recursive: true });
+                fs.renameSync(created, remote);
+            }
+        },
+    });
+
+    assert.equal(headBranch(path.join(tempDir, '.ploinky', 'repos', 'lateBranchDep')), 'late-feature');
+});
+
+test('prepareManifestRepositories: a clone that fails after creating its checkout still fails preparation', async (t) => {
+    // A required smudge filter that fails makes `git clone` exit non-zero
+    // after it created the directory ("Clone succeeded, but checkout failed").
+    const workPath = path.join(tempDir, 'work', 'failingCheckoutSource');
+    fs.mkdirSync(workPath, { recursive: true });
+    execFileSync('git', ['init', '-q', '-b', 'main', workPath], { stdio: 'ignore' });
+    fs.writeFileSync(path.join(workPath, '.gitattributes'), '* filter=ploinkytestboom\n');
+    fs.writeFileSync(path.join(workPath, 'file.txt'), 'content\n');
+    execFileSync('git', ['-C', workPath, 'add', '.'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', workPath, 'commit', '-q', '-m', 'filtered'], { stdio: 'ignore' });
+    const savedEnv = {};
+    const gitConfig = {
+        GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: 'filter.ploinkytestboom.smudge',
+        GIT_CONFIG_VALUE_0: 'false',
+        GIT_CONFIG_KEY_1: 'filter.ploinkytestboom.required',
+        GIT_CONFIG_VALUE_1: 'true',
+    };
+    for (const [key, value] of Object.entries(gitConfig)) {
+        savedEnv[key] = process.env[key];
+        process.env[key] = value;
+    }
+    t.after(() => {
+        for (const [key, value] of Object.entries(savedEnv)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    });
+    writeAgentManifest('staticFailingCheckout', 'app', {
+        container: 'node:20',
+        repos: { failingCheckoutDep: workPath },
+    });
+
+    await assert.rejects(
+        () => prepareManifestRepositories('staticFailingCheckout/app', { cloneRetryDelayMs: 0, warn: () => {} }),
+        (error) => {
+            assert.match(error.message, /Failed to install repo 'failingCheckoutDep'/);
+            assert.match(error.message, /checkout failed/);
+            return true;
+        },
+    );
+});
+
 // The tolerated preparation failures below keep their current, non-fatal
 // behavior: the dependency graph reports what is still missing when it is
 // resolved.

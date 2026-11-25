@@ -191,9 +191,10 @@ function errorMessage(err) {
 // Start preparation clones each repository at most twice.
 const MANIFEST_CLONE_ATTEMPTS = 2;
 
-// A repository the manifest graph requires is still missing after an install
-// attempt. Unlike the tolerated preparation failures, it fails the whole
-// preparation, however deep in the graph it was declared.
+// A repository the manifest graph requires could not be cloned, or is still
+// missing after an install attempt. Unlike the tolerated preparation
+// failures, it fails the whole preparation, however deep in the graph it was
+// declared.
 class RequiredRepositoryError extends Error {
     constructor(message, repoName) {
         super(message);
@@ -280,7 +281,7 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy, {
             throw new Error(`Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
         }
         const message = `[manifest] Auto-install repo '${repoName}' failed: ${errorMessage(err)}`;
-        if (!repositoryPresent(repoName)) {
+        if (repos.isRepositoryCloneFailure(err) || !repositoryPresent(repoName)) {
             // The dependency cannot resolve without its repository. A no-wait
             // dependency is optional: it is reported, and the dependency graph
             // skips it. Any other dependency fails the preparation.
@@ -426,10 +427,13 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                 }
             } catch (err) {
                 const message = `[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`;
-                // A declared repository must be present before the graph is
-                // resolved. A failure that leaves the checkout in place, such
-                // as a refused branch switch, is tolerated unless strict.
-                if (!repositoryPresent(name)) throw new RequiredRepositoryError(message, name);
+                // A declared repository must be cloned and present before the
+                // graph is resolved. A failure that leaves an existing checkout
+                // in place, such as a refused branch switch, is tolerated
+                // unless strict.
+                if (repos.isRepositoryCloneFailure(err) || !repositoryPresent(name)) {
+                    throw new RequiredRepositoryError(message, name);
+                }
                 if (isStrictBranchPolicy(branchPolicy)) throw new Error(message);
                 logError(message);
             }
@@ -541,8 +545,9 @@ export function prepareExplicitRepositoryBranches(branchPolicy, {
 // Prepares the repositories the static agent's manifest graph needs before
 // `start` resolves that graph. Git's output is not shown (`stdio`), but its
 // error is carried in every reported failure. A repository declared under
-// `repos`, or holding a blocking `enable` dependency, that is still missing
-// after a clone retry rejects, naming the repository and Git's error. The
+// `repos`, or holding a blocking `enable` dependency, that cannot be cloned
+// (after one retry) or is still missing rejects, naming the repository and
+// Git's error. The
 // repositories a no-wait dependency needs, including those its own manifests
 // require, are optional: their failures and each clone retry are reported
 // through `warn`, and a blocking path to the same manifests still fails on

@@ -876,6 +876,14 @@ function sleepSync(ms) {
     if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// Marks the error of a failed clone, including one that left an incomplete
+// checkout behind, so a caller can tell it from other install failures.
+const CLONE_FAILURE = Symbol('ploinky.repositoryCloneFailure');
+
+export function isRepositoryCloneFailure(error) {
+    return Boolean(error && typeof error === 'object' && error[CLONE_FAILURE]);
+}
+
 // `cloneAttempts` above 1 retries a failed clone after `cloneRetryDelayMs`,
 // reporting the failed attempt through `onCloneRetry`. The last attempt's Git
 // error is thrown.
@@ -943,7 +951,10 @@ export function ensureRepoInstalled(name, url, {
         } catch (error) {
             // Git removes the directory of a failed clone; never retry into a
             // directory that is left behind.
-            if (attempt >= attempts || fs.existsSync(repoPath)) throw error;
+            if (attempt >= attempts || fs.existsSync(repoPath)) {
+                if (error && typeof error === 'object') error[CLONE_FAILURE] = true;
+                throw error;
+            }
             onCloneRetry(`[repos] Cloning '${name}' failed (attempt ${attempt} of ${attempts}); retrying in ${retryDelayMs} ms: ${error.message}`);
             sleepSync(retryDelayMs);
             continue;
