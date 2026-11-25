@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -64,7 +65,17 @@ export async function writeCoverage(outputRoot, report = { requests: [], checks:
     return summary;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const invokedPath = path.resolve(process.argv[1]);
+    const modulePath = fileURLToPath(import.meta.url);
+    if (invokedPath === modulePath) return true;
+    try { return realpathSync(invokedPath) === modulePath; } catch { return false; }
+}
+
+if (invokedAsMain()) {
     assert.equal(process.argv[2], '--out', 'Usage: node coverage.mjs --out /absolute/evidence-directory');
     assert.ok(path.isAbsolute(process.argv[3] || ''));
     // The export lists Router rows with their reviewed source references; refuse it while the checkout drifted.

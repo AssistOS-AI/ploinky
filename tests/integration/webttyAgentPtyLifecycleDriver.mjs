@@ -2305,8 +2305,17 @@ async function main() {
     process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
-const invoked = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname);
-if (invoked) {
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const invokedPath = path.resolve(process.argv[1]);
+    if (invokedPath === path.resolve(new URL(import.meta.url).pathname)) return true;
+    // realpathSync decodes the file URL, which .pathname leaves percent-encoded.
+    try { return fs.realpathSync(invokedPath) === fs.realpathSync(new URL(import.meta.url)); } catch { return false; }
+}
+
+if (invokedAsMain()) {
     main().catch((error) => {
         process.stderr.write(`${error.stack || error}\n`);
         process.exitCode = 1;

@@ -26,6 +26,7 @@ import {
 
 const VERIFIER = path.resolve(import.meta.dirname, '../release/verifyExplorerReleaseBundle.mjs');
 const LEGACY_VERIFIER = path.resolve(import.meta.dirname, '../release/verifyCopilot421Bundle.mjs');
+const REPO_ROOT = path.resolve(import.meta.dirname, '../..');
 const DIGEST = `sha256:${'5'.repeat(64)}`;
 const TEMP_ROOT = fs.realpathSync(os.tmpdir());
 const DEPENDENCIES = ['webmeet', 'OnlyOfficeAgent'];
@@ -439,6 +440,46 @@ test('the CLI writes then verifies a manifest, prints only safe identities and f
         '--require-agentlib-sha', '--require-ploinky-sha', '--require-achillescli-sha', '--require-explorer-sha', '--require-box-digest'], { encoding: 'utf8' });
     assert.equal(legacyCli.status, 1);
     assert.match(legacyCli.stderr, /Copilot 421 release bundle rejected/);
+});
+
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed. A release CLI reached through a symlinked checkout must still run its
+// command, never skip it and exit 0 with no output.
+test('the release CLIs run their command when invoked through a symlinked checkout', (t) => {
+    const fixture = createFixture(t);
+    const linkedRoot = path.join(fixture.base, 'ploinky-link');
+    fs.symlinkSync(REPO_ROOT, linkedRoot, 'dir');
+    const linked = (name) => path.join(linkedRoot, 'tests', 'release', name);
+    const linkedVerifier = linked('verifyExplorerReleaseBundle.mjs');
+    assert.notEqual(linkedVerifier, fs.realpathSync(linkedVerifier), 'the invoked path goes through a symlink');
+    const run = (...args) => spawnSync(process.execPath, [linkedVerifier, ...args], { encoding: 'utf8' });
+
+    const outputPath = path.join(fixture.evidence, 'linked-release.json');
+    const written = run('write', '--inventory', fixture.inventoryPath, '--inventory-sha256', fixture.inventorySha256,
+        '--image-digest', DIGEST, '--output', outputPath);
+    assert.equal(written.status, 0, written.stderr);
+    assert.match(written.stdout, new RegExp(`^Wrote .+ \\(mode 0600\\)\\. Explorer release bundle verified \\(${DIGEST}\\)`));
+    assert.ok(fs.existsSync(outputPath), 'write created the manifest');
+    const verified = run('verify', '--manifest', outputPath);
+    assert.equal(verified.status, 0, verified.stderr);
+    assert.match(verified.stdout, new RegExp(`^Explorer release bundle verified \\(${DIGEST}\\); source inventory sha256 ${fixture.inventorySha256}`));
+
+    // Negative control through the same link: a refused manifest fails closed.
+    const legacyPath = fixture.writeManifest({ repositories: {}, images: {} }, 'legacy-linked.json');
+    const legacy = run('verify', '--manifest', legacyPath);
+    assert.equal(legacy.status, 1);
+    assert.match(legacy.stderr, /versionless legacy release manifests are not accepted/);
+
+    // The sibling release CLIs refuse a bare invocation through the link too.
+    for (const [name, expected] of [
+        ['verifyCopilot421Bundle.mjs', /Copilot 421 release bundle rejected/],
+        ['verifyLocalSnapshotBundle.mjs', /Local snapshot bundle rejected: usage/],
+        ['noWaitLoadingEvidence.mjs', /no-wait evidence error: usage/],
+    ]) {
+        const result = spawnSync(process.execPath, [linked(name)], { encoding: 'utf8' });
+        assert.equal(result.status, 1, `${name} exited ${result.status}: ${result.stderr}`);
+        assert.match(result.stderr, expected, name);
+    }
 });
 
 test('validateManifest returns only the exact identities and the module is not tied to the legacy schema', () => {

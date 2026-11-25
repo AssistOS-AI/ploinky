@@ -282,8 +282,17 @@ export function initializeWorkspaceMasterKey({
     return Object.freeze({ created: true, path: target, keyPresent: true });
 }
 
-const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
-if (invokedPath === fileURLToPath(import.meta.url)) {
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const invokedPath = path.resolve(process.argv[1]);
+    const modulePath = fileURLToPath(import.meta.url);
+    if (invokedPath === modulePath) return true;
+    try { return fs.realpathSync(invokedPath) === modulePath; } catch { return false; }
+}
+
+if (invokedAsMain()) {
     try {
         initializeWorkspaceMasterKey({ workspaceRoot: readBoxWorkspaceRoot(process.env) });
     } catch (error) {

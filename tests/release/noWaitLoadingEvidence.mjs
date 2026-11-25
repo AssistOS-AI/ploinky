@@ -588,9 +588,17 @@ async function main(argv) {
     );
 }
 
-const isMain = process.argv[1]
-    && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
-if (isMain) {
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const invokedPath = path.resolve(process.argv[1]);
+    const modulePath = fileURLToPath(import.meta.url);
+    if (invokedPath === modulePath) return true;
+    try { return fs.realpathSync(invokedPath) === modulePath; } catch { return false; }
+}
+
+if (invokedAsMain()) {
     main(process.argv.slice(2)).catch((error) => {
         process.stderr.write(`no-wait evidence error: ${error?.message || String(error)}\n`);
         process.exitCode = 1;
