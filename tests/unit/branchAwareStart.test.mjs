@@ -1107,6 +1107,49 @@ test('prepareManifestRepositories: the repo of an optional no-wait dependency th
     assert.match(skipped[0], GIT_MISSING_REPOSITORY);
 });
 
+test('prepareManifestRepositories: a repo required by the manifest of a no-wait dependency is reported and does not fail preparation', async () => {
+    writeAgentManifest('noWaitChildRepo', 'child', {
+        container: 'node:20',
+        repos: { noWaitNestedDep: missingRemote('noWaitNestedDep') },
+    });
+    writeAgentManifest('staticNoWaitNested', 'app', {
+        container: 'node:20',
+        enable: ['noWaitChildRepo/child no-wait'],
+    });
+    const warnings = [];
+
+    await assert.doesNotReject(() => prepareManifestRepositories('staticNoWaitNested/app', {
+        cloneRetryDelayMs: 0,
+        warn: (message) => warnings.push(message),
+    }));
+    assert.equal(managedRepoExists('noWaitNestedDep'), false);
+    const notFatal = warnings.filter((message) => /'noWaitNestedDep'/.test(message) && /Not fatal/.test(message));
+    assert.equal(notFatal.length, 1, warnings.join('\n'));
+    assert.match(notFatal[0], /no-wait dependency 'noWaitChildRepo\/child'/);
+    assert.match(notFatal[0], GIT_MISSING_REPOSITORY);
+});
+
+test('prepareManifestRepositories: a repo required under both a no-wait and a later blocking dependency still fails preparation', async () => {
+    writeAgentManifest('diamondNoWaitRepo', 'shared', {
+        container: 'node:20',
+        repos: { diamondNestedDep: missingRemote('diamondNestedDep') },
+    });
+    writeAgentManifest('staticDiamondNoWait', 'app', {
+        container: 'node:20',
+        enable: ['diamondNoWaitRepo/shared no-wait', 'diamondNoWaitRepo/shared'],
+    });
+
+    await assert.rejects(
+        () => prepareManifestRepositories('staticDiamondNoWait/app', { cloneRetryDelayMs: 0, warn: () => {} }),
+        (error) => {
+            assert.match(error.message, /Failed to install repo 'diamondNestedDep'/);
+            assert.match(error.message, GIT_MISSING_REPOSITORY);
+            return true;
+        },
+    );
+    assert.equal(managedRepoExists('diamondNestedDep'), false);
+});
+
 test('prepareManifestRepositories: a declared repo clone that fails once is retried once and succeeds', async () => {
     const remote = path.join(tempDir, 'remotes', 'late', 'retriedCloneDep.git');
     writeAgentManifest('staticCloneRetry', 'app', {

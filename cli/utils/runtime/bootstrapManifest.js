@@ -439,6 +439,8 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
     const en = manifestEnableEntries(manifest, profile);
     if (Array.isArray(en)) {
         for (const rawEntry of en) {
+            let noWaitSpec = '';
+            let visitedBeforeChild = null;
             try {
                 const parsed = parseEnableDirective(rawEntry);
                 if (!parsed) continue;
@@ -446,6 +448,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                     ...parsed,
                     spec: qualifyEnableSpecForRepo(parsed.spec, repoName),
                 };
+                if (qualified.noWait === true) noWaitSpec = qualified.spec;
                 ensurePrefixedRepoInstalled(qualified.spec, branchPolicy, {
                     stdio,
                     logError,
@@ -462,6 +465,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                 }
                 const childRef = agentRefFromEnableSpec(qualified.spec);
                 if (childRef) {
+                    visitedBeforeChild = new Set(visited);
                     await applyManifestDirectivesInternal(childRef, {
                         branchPolicy,
                         profile: qualified.profile || profile || '',
@@ -476,8 +480,21 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                 }
             } catch (err) {
                 const message = errorMessage(err);
-                // A child manifest's required repository fails the parent too.
-                if (err instanceof RequiredRepositoryError && !isStrictBranchPolicy(branchPolicy)) throw err;
+                if (err instanceof RequiredRepositoryError && !isStrictBranchPolicy(branchPolicy)) {
+                    // A child manifest's required repository fails the parent
+                    // too, unless the child is an optional no-wait dependency.
+                    if (!noWaitSpec) throw err;
+                    // Forget the manifests visited in the failed subtree, so a
+                    // blocking path to them still installs, or fails on, the
+                    // same repository.
+                    if (visitedBeforeChild) {
+                        for (const key of [...visited]) {
+                            if (!visitedBeforeChild.has(key)) visited.delete(key);
+                        }
+                    }
+                    warn(`${message}\n[manifest] Not fatal: it is required under no-wait dependency '${noWaitSpec}'.`);
+                    continue;
+                }
                 if (isStrictBranchPolicy(branchPolicy)) {
                     throw new Error(`[manifest enable] Failed to enable agent '${rawEntry}': ${message}`);
                 }
@@ -526,8 +543,10 @@ export function prepareExplicitRepositoryBranches(branchPolicy, {
 // error is carried in every reported failure. A repository declared under
 // `repos`, or holding a blocking `enable` dependency, that is still missing
 // after a clone retry rejects, naming the repository and Git's error. The
-// repository of a no-wait dependency is optional: its failure and each clone
-// retry are reported through `warn`. Tolerated failures (an existing checkout
+// repositories a no-wait dependency needs, including those its own manifests
+// require, are optional: their failures and each clone retry are reported
+// through `warn`, and a blocking path to the same manifests still fails on
+// them. Tolerated failures (an existing checkout
 // that refuses a branch switch, a dependency whose repository has no known
 // URL, an agent that cannot be found) stay quiet through `logError`: the
 // dependency graph reports what is still unresolved.

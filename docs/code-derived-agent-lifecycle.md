@@ -325,7 +325,7 @@ flowchart TD
 
 Manifest `repos` and `enable` directives are not applied during `enable agent`; they are applied during `startWorkspace`. Dependency graph construction also reads `enable` arrays recursively.
 
-The repository preparation also clones the repository of a repository-qualified `enable` dependency when its URL is known. If that clone fails, `start` fails for a blocking dependency; for a `no-wait` dependency the failure is printed and the graph skips the dependency. A dependency whose repository has no known URL, or whose agent cannot be found, is left to the graph, which reports it as a skipped dependency.
+The repository preparation also clones the repository of a repository-qualified `enable` dependency when its URL is known. If that clone fails, `start` fails for a blocking dependency; for a `no-wait` dependency the failure is printed and the graph skips the dependency. A repository required by the manifest of a `no-wait` dependency is likewise printed and not fatal, unless a blocking path reaches the same manifest. A dependency whose repository has no known URL, or whose agent cannot be found, is left to the graph, which reports it as a skipped dependency.
 
 Startup config providers are applied after dependency graph construction and before dependency startup. The static/profile manifest supplies `configProviders`; provider manifests supply `providesConfig`. Ploinky resolves provider agents from the graph or installed repositories, runs their provider command with a sanitized host-side environment, validates stdout against the provider manifest allowlist, rejects generated-secret and reserved names, and writes accepted values into `.ploinky/.secrets` before consumer env maps are built.
 
