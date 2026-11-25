@@ -91,7 +91,7 @@ test('unverified source outcomes are not pinned, and unsupported forms are expli
     const w = fixture(t);
     const skipped = await w.refresh({ sourceOutcomes: [{ phase: 'registered-repository', id: 'Repo', outcome: 'skipped' }] });
     assert.equal(skipped.queriesRun, 0);
-    assert.equal(skipped.records.every(record => record.code === 'git-pin-source-not-verified'), true);
+    assert.deepEqual(skipped.records, []);
     assert.equal(fs.existsSync(w.store.paths.pins), false);
     fs.writeFileSync(w.packageFile, JSON.stringify({ dependencies: { markerpkg: `${w.remote.url}#semver:^1` } }));
     const unsupported = await w.refresh();

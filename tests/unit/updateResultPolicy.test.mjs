@@ -267,7 +267,6 @@ test('a dirty required repository alone blocks activation and exits nonzero with
     assert.deepEqual(result.result.errors, [], 'no operation failed');
     assert.deepEqual(result.result.blockedBy, [
         { phase: 'registered-repository', id: 'RequiredRepo', outcome: 'skipped', code: 'dirty-worktree' },
-        { phase: 'git-pin', id: 'ploinky_required_demo', outcome: 'skipped', code: 'git-pin-source-not-verified' },
     ]);
     assert.deepEqual(result.spawned, [], 'the AgentLib activation child was not spawned');
     assert.deepEqual(result.staged, [], 'no AgentLib transaction was staged');
