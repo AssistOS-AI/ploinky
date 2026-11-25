@@ -21,6 +21,7 @@ import { HttpRouteAccessPath } from '../server/policy/HttpRouteAccessPath.js';
 import { resolveBrowserEntryPath } from '../server/browserEntryPath.js';
 import { agentPortRelayDenial, normalizeAgentPortRelayPolicy } from '../server/agentPortConvention/relayPolicy.js';
 import { resolveAgentAuthPolicy } from '../utils/manifestAuth.js';
+import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import {
@@ -1195,6 +1196,22 @@ function resolveEnabledRouteKey(reference, routes, parentRoute) {
         if (sameRepo.length === 1) matches = sameRepo;
     }
     return matches.length === 1 ? matches[0][0] : '';
+}
+
+export function agentDeclaresDependency(snapshot, caller, target) {
+    if (!caller || !target || caller === target) return false;
+    const routes = snapshot?.routing?.routes || {};
+    const callerRoutes = Object.entries(routes).filter(([, route]) => (
+        route && !route.disabled && route.repo && route.agent
+        && deriveAgentPrincipalId(route.repo, route.agent) === caller
+    ));
+    return callerRoutes.length > 0 && callerRoutes.every(([key, route]) => (
+        manifestEnableEntriesForRoute(snapshot.manifests?.[key], route, snapshot.agents).some(entry => {
+            const dependency = routes[resolveEnabledRouteKey(manifestEnableReference(entry), routes, route)];
+            return dependency?.repo && dependency.agent
+                && deriveAgentPrincipalId(dependency.repo, dependency.agent) === target;
+        })
+    ));
 }
 
 function compileAgentMcpRouteClosure(rootRouteKey, routing, manifests, agents) {

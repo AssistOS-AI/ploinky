@@ -110,11 +110,9 @@ export async function refreshUpdateGitPins({
             }
             const outcome = sourceOutcome(record, repoPath, sourceOutcomes || []);
             if (names && !names.has(record.repoName) && !outcome) continue;
-            if (sourceOutcomes !== null && (!outcome || !VERIFIED.has(outcome.outcome))) {
-                records.push(recordFor(registration, 'skipped', 'git-pin-source-not-verified',
-                    `Git pins preserved because repository ${record.repoName} was not verified by this update`, { repository: record.repoName }, false));
-                continue;
-            }
+            // The repository operation already records why this checkout was not
+            // verified. Leave its pins untouched and do not add a record per registration.
+            if (sourceOutcomes !== null && (!outcome || !VERIFIED.has(outcome.outcome))) continue;
             selected.push({ registration, record, repoPath });
         }
         if (!selected.length) return { records, queriesRun: 0, changed: false };

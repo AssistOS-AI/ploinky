@@ -22,7 +22,10 @@ fs.mkdirSync(repoDir, { recursive: true });
 fs.writeFileSync(path.join(repoDir, 'manifest.json'), JSON.stringify({ about: 'dpu agent test fixture' }, null, 2));
 const gitRepoDir = path.join(tempDir, '.ploinky', 'repos', 'AssistOSExplorer', 'gitAgent');
 fs.mkdirSync(gitRepoDir, { recursive: true });
-fs.writeFileSync(path.join(gitRepoDir, 'manifest.json'), JSON.stringify({ about: 'git agent test fixture' }, null, 2));
+fs.writeFileSync(path.join(gitRepoDir, 'manifest.json'), JSON.stringify({
+    about: 'git agent test fixture',
+    enable: [{ agent: 'dpuAgent', profile: 'default' }],
+}, null, 2));
 fs.writeFileSync(path.join(gitRepoDir, 'mcp-config.json'), JSON.stringify({
     tools: [
         {
@@ -455,6 +458,21 @@ test('user call to an unconfigured tool mints no delegations', () => {
         toolArgs: { path: '/tmp/x' },
     });
     assert.equal(ctx.payload.delegations, undefined);
+});
+
+test('MCP grants dependency scope only to undelegated calls targeting a declared dependency', () => {
+    const mint = (callerPrincipal, agentName, userDelegation) => buildInvocationContextForProviderCall({
+        req: { delegatedAgentVerified: { callerPrincipal, userDelegation } },
+        agentName,
+        toolName: 'test_tool',
+        toolArgs: {},
+    });
+    const caller = 'agent:AssistOSExplorer/gitAgent';
+    assert.deepEqual(mint(caller, 'dpuAgent').payload.scope, ['agent-dependency']);
+    assert.equal(mint(caller, 'gitAgent').payload.scope, undefined);
+    assert.equal(mint('agent:AssistOSExplorer/dpuAgent', 'gitAgent').payload.scope, undefined);
+    assert.equal(mint('agent:Other/gitAgent', 'dpuAgent').payload.scope, undefined);
+    assert.equal(mint(caller, 'dpuAgent', { user: { id: 'local:alice' } }).payload.scope, undefined);
 });
 
 test('browser guest MCP invocation carries guest actor kind and no delegations', () => {
