@@ -884,6 +884,21 @@ export function isRepositoryCloneFailure(error) {
     return Boolean(error && typeof error === 'object' && error[CLONE_FAILURE]);
 }
 
+// A failed clone can leave an incomplete checkout behind ("Clone succeeded,
+// but checkout failed"), which a later start would take for a usable one. The
+// directory did not exist before the clone, so it is removed, but only for a
+// plain repository name directly under the repos directory. Returns whether
+// the directory is still there.
+function removeFailedCloneDirectory(reposDir, name, repoPath) {
+    if (!fs.existsSync(repoPath)) return false;
+    const plainName = /^[a-zA-Z0-9_.-]+$/.test(name) && name !== '.' && name !== '..';
+    if (!plainName || path.dirname(repoPath) !== reposDir) return true;
+    try {
+        fs.rmSync(repoPath, { recursive: true, force: true });
+    } catch (_) {}
+    return fs.existsSync(repoPath);
+}
+
 // `cloneAttempts` above 1 retries a failed clone after `cloneRetryDelayMs`,
 // reporting the failed attempt through `onCloneRetry`. The last attempt's Git
 // error is thrown.
@@ -949,9 +964,9 @@ export function ensureRepoInstalled(name, url, {
         try {
             runGitCommand(args, { stdio });
         } catch (error) {
-            // Git removes the directory of a failed clone; never retry into a
-            // directory that is left behind.
-            if (attempt >= attempts || fs.existsSync(repoPath)) {
+            // Never retry into a directory that could not be removed.
+            const leftBehind = removeFailedCloneDirectory(reposDir, name, repoPath);
+            if (attempt >= attempts || leftBehind) {
                 if (error && typeof error === 'object') error[CLONE_FAILURE] = true;
                 throw error;
             }

@@ -1237,14 +1237,19 @@ test('prepareManifestRepositories: a clone that fails after creating its checkou
         repos: { failingCheckoutDep: workPath },
     });
 
-    await assert.rejects(
-        () => prepareManifestRepositories('staticFailingCheckout/app', { cloneRetryDelayMs: 0, warn: () => {} }),
-        (error) => {
-            assert.match(error.message, /Failed to install repo 'failingCheckoutDep'/);
-            assert.match(error.message, /checkout failed/);
-            return true;
-        },
-    );
+    // A second start must fail the same way, not accept a leftover checkout.
+    for (let run = 1; run <= 2; run += 1) {
+        await assert.rejects(
+            () => prepareManifestRepositories('staticFailingCheckout/app', { cloneRetryDelayMs: 0, warn: () => {} }),
+            (error) => {
+                assert.match(error.message, /Failed to install repo 'failingCheckoutDep'/);
+                assert.match(error.message, /checkout failed/);
+                return true;
+            },
+            `prepare run ${run}`,
+        );
+        assert.equal(managedRepoExists('failingCheckoutDep'), false, `prepare run ${run}`);
+    }
 });
 
 // The tolerated preparation failures below keep their current, non-fatal
