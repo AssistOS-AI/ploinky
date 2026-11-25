@@ -868,7 +868,48 @@ function currentBranch(repoPath) {
     }
 }
 
-export function ensureRepoInstalled(name, url, { branchPolicy, branch, stdio = 'inherit' } = {}) {
+// The pause before a clone retry, long enough for a brief network
+// interruption to clear.
+const DEFAULT_CLONE_RETRY_DELAY_MS = 3000;
+
+function sleepSync(ms) {
+    if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Marks the error of a failed clone, including one that left an incomplete
+// checkout behind, so a caller can tell it from other install failures.
+const CLONE_FAILURE = Symbol('ploinky.repositoryCloneFailure');
+
+export function isRepositoryCloneFailure(error) {
+    return Boolean(error && typeof error === 'object' && error[CLONE_FAILURE]);
+}
+
+// A failed clone can leave an incomplete checkout behind ("Clone succeeded,
+// but checkout failed"), which a later start would take for a usable one. The
+// directory did not exist before the clone, so it is removed, but only for a
+// plain repository name directly under the repos directory. Returns whether
+// the directory is still there.
+function removeFailedCloneDirectory(reposDir, name, repoPath) {
+    if (!fs.existsSync(repoPath)) return false;
+    const plainName = /^[a-zA-Z0-9_.-]+$/.test(name) && name !== '.' && name !== '..';
+    if (!plainName || path.dirname(repoPath) !== reposDir) return true;
+    try {
+        fs.rmSync(repoPath, { recursive: true, force: true });
+    } catch (_) {}
+    return fs.existsSync(repoPath);
+}
+
+// `cloneAttempts` above 1 retries a failed clone after `cloneRetryDelayMs`,
+// reporting the failed attempt through `onCloneRetry`. The last attempt's Git
+// error is thrown.
+export function ensureRepoInstalled(name, url, {
+    branchPolicy,
+    branch,
+    stdio = 'inherit',
+    cloneAttempts = 1,
+    cloneRetryDelayMs = DEFAULT_CLONE_RETRY_DELAY_MS,
+    onCloneRetry = (message) => console.error(message),
+} = {}) {
     // Workspace checkouts belong to the developer; never clone, reset or
     // switch their branch as a side effect of starting an agent.
     const localPath = workspaceAgentRepositoryPath(name, { url });
@@ -899,21 +940,43 @@ export function ensureRepoInstalled(name, url, { branchPolicy, branch, stdio = '
 
     if (!actualUrl) throw new Error(`Missing repository URL for '${name}'.`);
 
-    let cloneBranch = resolvedBranch;
-    if (cloneBranch && !remoteBranchExists(actualUrl, cloneBranch)) {
-        if (branchPolicy?.fallback === 'fail') {
-            throw new Error(`Branch '${cloneBranch}' does not exist on remote for repo '${name}'. Aborting (--branch-fallback fail).`);
+    const attempts = Math.max(1, Math.trunc(Number(cloneAttempts)) || 1);
+    const retryDelayMs = Math.max(0, Number(cloneRetryDelayMs) || 0);
+    let branchConfirmed = false;
+    for (let attempt = 1; ; attempt += 1) {
+        let cloneBranch = resolvedBranch;
+        // An unreachable remote also reads as a missing branch, so a fallback
+        // decided before a failed clone is checked again on the retry.
+        if (cloneBranch && !branchConfirmed) {
+            branchConfirmed = remoteBranchExists(actualUrl, cloneBranch);
+            if (!branchConfirmed) {
+                if (branchPolicy?.fallback === 'fail') {
+                    throw new Error(`Branch '${cloneBranch}' does not exist on remote for repo '${name}'. Aborting (--branch-fallback fail).`);
+                }
+                console.log(`[repos] Branch '${cloneBranch}' not found on remote for '${name}'; falling back to default branch.`);
+                cloneBranch = null;
+            }
         }
-        console.log(`[repos] Branch '${cloneBranch}' not found on remote for '${name}'; falling back to default branch.`);
-        cloneBranch = null;
-    }
 
-    const args = ['clone'];
-    if (cloneBranch) args.push('--branch', cloneBranch);
-    args.push(actualUrl, repoPath);
-    runGitCommand(args, { stdio });
-    recordRepoSource(name, actualUrl, cloneBranch);
-    return { status: 'cloned', path: repoPath, branch: cloneBranch || 'default' };
+        const args = ['clone'];
+        if (cloneBranch) args.push('--branch', cloneBranch);
+        args.push(actualUrl, repoPath);
+        try {
+            runGitCommand(args, { stdio });
+        } catch (error) {
+            // Never retry into a directory that could not be removed.
+            const leftBehind = removeFailedCloneDirectory(reposDir, name, repoPath);
+            if (attempt >= attempts || leftBehind) {
+                if (error && typeof error === 'object') error[CLONE_FAILURE] = true;
+                throw error;
+            }
+            onCloneRetry(`[repos] Cloning '${name}' failed (attempt ${attempt} of ${attempts}); retrying in ${retryDelayMs} ms: ${error.message}`);
+            sleepSync(retryDelayMs);
+            continue;
+        }
+        recordRepoSource(name, actualUrl, cloneBranch);
+        return { status: 'cloned', path: repoPath, branch: cloneBranch || 'default' };
+    }
 }
 
 export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback = 'default', stdio = 'inherit', fetchRequestedBranch = false } = {}) {

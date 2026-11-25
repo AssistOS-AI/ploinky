@@ -8,7 +8,7 @@ import test from 'node:test';
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const expectedRepos = ['AchillesIDE', 'copilot-agents'];
 
-function fixture(t, { branches = {} } = {}) {
+function fixture(t, { branches = {}, explorerManifest = {} } = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-fresh-boot-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
@@ -38,6 +38,7 @@ function fixture(t, { branches = {} } = {}) {
                 // Stop the real start path at graph resolution, before any
                 // runtime/network mutation, after repository preparation.
                 enable: ['fixtureMissingService'],
+                ...explorerManifest,
             }));
             git(['add', '.']);
         }
@@ -120,6 +121,23 @@ test('fresh start explorer prepares its sources without installing or registerin
     assert.match(`${result.stdout}\n${result.stderr}`, /fixtureMissingService/);
     assertDefaultRepos(f);
     assert.equal(fs.existsSync(path.join(f.workspace, '.ploinky', 'agents.json')), false);
+});
+
+test('fresh start explorer stops at repository preparation when a declared manifest repo cannot be cloned', (t) => {
+    // The fixture maps https://github.com/AssistOS-AI/ to local paths, and no
+    // fixture exists for this repository, so `git clone` fails.
+    const f = fixture(t, {
+        explorerManifest: { repos: { missingManifestDep: 'https://github.com/AssistOS-AI/missingManifestDep.git' } },
+    });
+    const result = run(f, [path.join(repoRoot, 'cli/index.js'), 'start', 'explorer']);
+    const output = `${result.stdout}\n${result.stderr}`;
+    assert.notEqual(result.status, 0, output);
+    assert.match(output, /Failed to prepare manifest repositories for 'explorer'/);
+    assert.match(output, /Failed to install repo 'missingManifestDep'/);
+    assert.match(output, /fatal: '[^']*missingManifestDep\.git' does not appear to be a git repository/);
+    // The graph is never resolved: its own missing dependency is not reached.
+    assert.doesNotMatch(output, /fixtureMissingService/);
+    assert.equal(fs.existsSync(path.join(f.workspace, '.ploinky', 'repos', 'missingManifestDep')), false);
 });
 
 function checkoutBranch(f, repoName) {
