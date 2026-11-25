@@ -252,7 +252,7 @@ test('root host dispatch follows the C3 precedence table', (t) => {
     // 2 encoded Router surface spelling.
     expectPlan('/%61uth/login', { ok: false, status: 400, code: 'NONCANONICAL_ROUTER_PATH' });
     // 3 browser auth, owner context.
-    for (const url of ['/auth/login', '/auth/callback', '/auth/logout', '/auth/token']) {
+    for (const url of ['/auth/login', '/auth/callback', '/auth/logout', '/auth/logout-cache', '/auth/token']) {
         expectPlan(url, { kind: 'router-surface', surface: 'browser-auth' });
     }
     // 4 owner user administration only.
