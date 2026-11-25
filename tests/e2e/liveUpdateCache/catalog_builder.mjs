@@ -96,7 +96,17 @@ export async function buildCatalogMain(argv, { io = fs, registerHooks = module.r
     return { modules: catalog.modules.length, edges: catalog.edges.length, builtins: catalog.builtins.length };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const invokedPath = path.resolve(process.argv[1]);
+    const modulePath = fileURLToPath(import.meta.url);
+    if (invokedPath === modulePath) return true;
+    try { return fs.realpathSync(invokedPath) === modulePath; } catch { return false; }
+}
+
+if (invokedAsMain()) {
     try { process.stdout.write(JSON.stringify(await buildCatalogMain(process.argv.slice(2))) + '\n'); }
     catch (error) { process.stderr.write(JSON.stringify({ status: 'FAILED', reason: error instanceof AcceptanceError ? error.code : 'catalog-failed' }) + '\n'); process.exitCode = 1; }
 }

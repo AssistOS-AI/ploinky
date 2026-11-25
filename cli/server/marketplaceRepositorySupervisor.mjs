@@ -1,4 +1,5 @@
 import { Worker } from 'node:worker_threads';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { retainWorkspaceMutationLeaseForRecovery } from '../utils/runtime/maintenanceLocks.js';
@@ -328,4 +329,13 @@ export function startRepositorySupervisor({
     return { cancel, state: () => state };
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url) && process.send) startRepositorySupervisor();
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const modulePath = fileURLToPath(import.meta.url);
+    if (process.argv[1] === modulePath) return true;
+    try { return fs.realpathSync(process.argv[1]) === modulePath; } catch { return false; }
+}
+
+if (invokedAsMain() && process.send) startRepositorySupervisor();

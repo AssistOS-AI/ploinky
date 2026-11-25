@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -29,9 +30,13 @@ export async function writeBoxEdgeDesired({
     });
 }
 
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
 function isDirectExecution() {
     if (!process.argv[1]) return false;
-    return import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+    const invokedPath = path.resolve(process.argv[1]);
+    if (import.meta.url === pathToFileURL(invokedPath).href) return true;
+    try { return import.meta.url === pathToFileURL(fs.realpathSync(invokedPath)).href; } catch { return false; }
 }
 
 if (isDirectExecution()) {

@@ -2164,7 +2164,17 @@ async function main() {
     }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const invokedPath = path.resolve(process.argv[1]);
+    const modulePath = fileURLToPath(import.meta.url);
+    if (invokedPath === modulePath) return true;
+    try { return fs.realpathSync(invokedPath) === modulePath; } catch { return false; }
+}
+
+if (invokedAsMain()) {
     withDependencyRefresh('start', () => main()).catch((err) => {
         console.error(sanitizeDiagnosticText(
             `[no-wait] worker crashed: ${sanitizeDiagnosticText(err)}`,

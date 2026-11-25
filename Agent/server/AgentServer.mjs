@@ -1825,6 +1825,15 @@ async function main() {
     });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const invokedPath = path.resolve(process.argv[1]);
+    if (import.meta.url === pathToFileURL(invokedPath).href) return true;
+    try { return import.meta.url === pathToFileURL(fs.realpathSync(invokedPath)).href; } catch { return false; }
+}
+
+if (invokedAsMain()) {
     main().catch(err => { console.error('[AgentServer/MCP] fatal error:', err); process.exit(1); });
 }

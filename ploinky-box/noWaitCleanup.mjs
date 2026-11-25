@@ -144,7 +144,16 @@ async function retireMarkersInChild(workspaceRoot, rootFingerprint) {
     assertDirectoriesUnchanged(workspaceRoot, rootFingerprint, snapshots);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === HELPER_PATH) {
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const invokedPath = path.resolve(process.argv[1]);
+    if (invokedPath === HELPER_PATH) return true;
+    try { return fs.realpathSync(invokedPath) === HELPER_PATH; } catch { return false; }
+}
+
+if (invokedAsMain()) {
     try {
         if (process.argv.length !== 4 || !path.isAbsolute(process.argv[2])) {
             throw cleanupError('Invalid no-wait cleanup invocation');

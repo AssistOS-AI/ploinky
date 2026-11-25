@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { readInstallFrames, writeInstallFrame, installUnitError } from './marketplaceRepositoryInstallUnit.mjs';
 
@@ -56,7 +57,16 @@ export function startRepositoryInstallProcess({ input = process.stdin, output = 
     send({ type: 'ready' });
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+// Node gives import.meta.url the real path, while argv[1] keeps a symlinked path
+// as typed, so a run through a symlinked checkout also compares the real path.
+function invokedAsMain() {
+    if (!process.argv[1]) return false;
+    const modulePath = fileURLToPath(import.meta.url);
+    if (process.argv[1] === modulePath) return true;
+    try { return fs.realpathSync(process.argv[1]) === modulePath; } catch { return false; }
+}
+
+if (invokedAsMain()) {
     // Reserve stdout for the fixed protocol; repository logging is drained by
     // the outer supervisor and never interpreted as a control frame.
     const output = { writable: true, destroyed: false, write: process.stdout.write.bind(process.stdout) };
