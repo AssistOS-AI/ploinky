@@ -20,6 +20,8 @@ import { computeRchTool } from '../../../Agent/lib/requestHash.mjs';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { sanitizeArgumentsForTool } from './toolArguments.js';
 import { policy } from '../policy/index.js';
+import { loadActiveRoutingState } from '../routingState.js';
+import { agentDeclaresDependency } from '../../sandbox/edgeGeneration.js';
 import { guardSharedCache } from '../proxy/sharedCacheGuard.js';
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { verifyUserDelegationGrant } from './userDelegationGrant.js';
@@ -431,6 +433,15 @@ export function buildInvocationContextForProviderCall({
         actor = { kind: 'agent', id: caller, roles: [] };
         const callerInfo = { kind: 'agent', id: caller, roles: ['agent'] };
         const verifiedDelegation = delegated.userDelegation;
+        let scope;
+        if (!verifiedDelegation) {
+            try {
+                const dependencySnapshot = snapshot ?? loadActiveRoutingState().snapshot;
+                if (agentDeclaresDependency(dependencySnapshot, caller, targetAgentId)) scope = ['agent-dependency'];
+            } catch {
+                // Without a verified routing snapshot the dependency scope is absent.
+            }
+        }
         const { token, payload } = buildRouterRequest({
             targetAgentId,
             sub,
@@ -438,6 +449,7 @@ export function buildInvocationContextForProviderCall({
             caller: callerInfo,
             usr: verifiedDelegation?.user || undefined,
             delegation: verifiedDelegation?.delegation || undefined,
+            scope,
             method,
             path,
             tool: toolName,
