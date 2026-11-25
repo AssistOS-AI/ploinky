@@ -188,6 +188,27 @@ function errorMessage(err) {
     return err && err.message ? err.message : String(err);
 }
 
+// Start preparation clones each repository at most twice.
+const MANIFEST_CLONE_ATTEMPTS = 2;
+
+// A repository the manifest graph requires is still missing after an install
+// attempt. Unlike the tolerated preparation failures, it fails the whole
+// preparation, however deep in the graph it was declared.
+class RequiredRepositoryError extends Error {
+    constructor(message, repoName) {
+        super(message);
+        this.name = 'RequiredRepositoryError';
+        this.repoName = repoName;
+    }
+}
+
+function repositoryPresent(repoName) {
+    try {
+        if (fs.existsSync(resolveAgentRepositoryPath(repoName))) return true;
+    } catch (_) {}
+    return fs.existsSync(path.join(PLOINKY_DIR, 'repos', repoName));
+}
+
 export function manifestEnableEntries(manifest, profileOverride = '') {
     const entries = [];
     if (Array.isArray(manifest?.enable)) {
@@ -209,7 +230,10 @@ export function manifestEnableEntries(manifest, profileOverride = '') {
 function ensurePrefixedRepoInstalled(spec, branchPolicy, {
     stdio = 'inherit',
     logError = console.error,
+    warn = console.error,
     activate = true,
+    optional = false,
+    cloneOptions = {},
 } = {}) {
     if (!spec || typeof spec !== 'string') return;
     const slashIdx = spec.indexOf('/');
@@ -242,6 +266,7 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy, {
             branchPolicy,
             branch: source.branch,
             stdio,
+            ...cloneOptions,
         });
         if (activate) {
             repos.enableRepo(repoName, {
@@ -254,7 +279,16 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy, {
         if (isStrictBranchPolicy(branchPolicy)) {
             throw new Error(`Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
         }
-        logError(`[manifest] Auto-install repo '${repoName}' failed: ${errorMessage(err)}`);
+        const message = `[manifest] Auto-install repo '${repoName}' failed: ${errorMessage(err)}`;
+        if (!repositoryPresent(repoName)) {
+            // The dependency cannot resolve without its repository. A no-wait
+            // dependency is optional: it is reported, and the dependency graph
+            // skips it. Any other dependency fails the preparation.
+            if (!optional) throw new RequiredRepositoryError(message, repoName);
+            warn(`${message}\n[manifest] No-wait dependency '${spec}' is skipped.`);
+            return;
+        }
+        logError(message);
     }
 }
 
@@ -343,6 +377,8 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
     enableAgentImpl = enableAgent,
     stdio = 'inherit',
     logError = console.error,
+    warn = console.error,
+    cloneOptions = {},
 } = {}) {
     const { manifest, manifestPath, repoName } = readManifestTarget(agentNameOrPath);
     const visitKey = `${path.resolve(manifestPath)}::${profile || ''}`;
@@ -366,6 +402,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                         branchPolicy,
                         branch: resolvedBranch,
                         stdio,
+                        ...cloneOptions,
                     });
                     if (enableAgents) {
                         repos.enableRepo(name, {
@@ -378,6 +415,7 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                     repos.ensureRepoInstalled(name, value, {
                         branchPolicy,
                         stdio,
+                        ...cloneOptions,
                     });
                     if (enableAgents) {
                         repos.enableRepo(name, {
@@ -387,10 +425,13 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                     }
                 }
             } catch (err) {
-                if (isStrictBranchPolicy(branchPolicy)) {
-                    throw new Error(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
-                }
-                logError(`[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`);
+                const message = `[manifest repos] Failed to install repo '${name}': ${errorMessage(err)}`;
+                // A declared repository must be present before the graph is
+                // resolved. A failure that leaves the checkout in place, such
+                // as a refused branch switch, is tolerated unless strict.
+                if (!repositoryPresent(name)) throw new RequiredRepositoryError(message, name);
+                if (isStrictBranchPolicy(branchPolicy)) throw new Error(message);
+                logError(message);
             }
         }
     }
@@ -408,7 +449,10 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                 ensurePrefixedRepoInstalled(qualified.spec, branchPolicy, {
                     stdio,
                     logError,
+                    warn,
                     activate: enableAgents,
+                    optional: qualified.noWait === true,
+                    cloneOptions,
                 });
                 if (!shouldEnableDirectiveForManifest(qualified, manifest)) {
                     continue;
@@ -426,10 +470,14 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                         enableAgentImpl,
                         stdio,
                         logError,
+                        warn,
+                        cloneOptions,
                     });
                 }
             } catch (err) {
                 const message = errorMessage(err);
+                // A child manifest's required repository fails the parent too.
+                if (err instanceof RequiredRepositoryError && !isStrictBranchPolicy(branchPolicy)) throw err;
                 if (isStrictBranchPolicy(branchPolicy)) {
                     throw new Error(`[manifest enable] Failed to enable agent '${rawEntry}': ${message}`);
                 }
@@ -473,11 +521,23 @@ export function prepareExplicitRepositoryBranches(branchPolicy, {
     return prepared;
 }
 
+// Prepares the repositories the static agent's manifest graph needs before
+// `start` resolves that graph. Git's output is not shown (`stdio`), but its
+// error is carried in every reported failure. A repository declared under
+// `repos`, or holding a blocking `enable` dependency, that is still missing
+// after a clone retry rejects, naming the repository and Git's error. The
+// repository of a no-wait dependency is optional: its failure and each clone
+// retry are reported through `warn`. Tolerated failures (an existing checkout
+// that refuses a branch switch, a dependency whose repository has no known
+// URL, an agent that cannot be found) stay quiet through `logError`: the
+// dependency graph reports what is still unresolved.
 export async function prepareManifestRepositories(agentNameOrPath, {
     branchPolicy,
     profile = '',
     stdio = 'ignore',
     logError = () => {},
+    warn = console.error,
+    cloneRetryDelayMs,
 } = {}) {
     prepareExplicitRepositoryBranches(branchPolicy, { stdio });
     return applyManifestDirectivesInternal(agentNameOrPath, {
@@ -487,5 +547,11 @@ export async function prepareManifestRepositories(agentNameOrPath, {
         enableAgents: false,
         stdio,
         logError,
+        warn,
+        cloneOptions: {
+            cloneAttempts: MANIFEST_CLONE_ATTEMPTS,
+            ...(cloneRetryDelayMs === undefined ? {} : { cloneRetryDelayMs }),
+            onCloneRetry: warn,
+        },
     });
 }

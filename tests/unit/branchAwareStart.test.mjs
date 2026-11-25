@@ -1011,6 +1011,183 @@ test('applyManifestDirectives: duplicate aliased child enables are idempotent un
 });
 
 // ---------------------------------------------------------------------------
+// Manifest repository clone failures during start preparation
+// ---------------------------------------------------------------------------
+
+// A remote path that is never created, so `git clone` fails with
+// "fatal: repository '<path>' does not exist".
+function missingRemote(name) {
+    return path.join(tempDir, 'remotes', 'never-created', `${name}.git`);
+}
+
+const GIT_MISSING_REPOSITORY = /fatal: repository '[^']*' does not exist/;
+
+function managedRepoExists(name) {
+    return fs.existsSync(path.join(tempDir, '.ploinky', 'repos', name));
+}
+
+test('prepareManifestRepositories: a declared repo that cannot be cloned fails with its name and git\'s error', async () => {
+    writeAgentManifest('staticCloneFail', 'app', {
+        container: 'node:20',
+        repos: { requiredCloneDep: missingRemote('requiredCloneDep') },
+    });
+    const warnings = [];
+
+    await assert.rejects(
+        () => prepareManifestRepositories('staticCloneFail/app', {
+            cloneRetryDelayMs: 0,
+            warn: (message) => warnings.push(message),
+        }),
+        (error) => {
+            assert.match(error.message, /Failed to install repo 'requiredCloneDep'/);
+            assert.match(error.message, GIT_MISSING_REPOSITORY);
+            return true;
+        },
+    );
+    assert.equal(managedRepoExists('requiredCloneDep'), false);
+    // The first attempt's git error is reported before the single retry.
+    assert.equal(warnings.filter((message) => /'requiredCloneDep'/.test(message)).length, 1);
+    assert.match(warnings[0], GIT_MISSING_REPOSITORY);
+});
+
+test('prepareManifestRepositories: a child manifest repo clone failure is not swallowed by the parent enable entry', async () => {
+    writeAgentManifest('cloneFailToolRepo', 'tool', {
+        container: 'node:20',
+        repos: { nestedCloneDep: missingRemote('nestedCloneDep') },
+    });
+    writeAgentManifest('staticNestedCloneFail', 'app', {
+        container: 'node:20',
+        enable: ['cloneFailToolRepo/tool global'],
+    });
+
+    await assert.rejects(
+        () => prepareManifestRepositories('staticNestedCloneFail/app', { cloneRetryDelayMs: 0, warn: () => {} }),
+        (error) => {
+            assert.match(error.message, /Failed to install repo 'nestedCloneDep'/);
+            assert.match(error.message, GIT_MISSING_REPOSITORY);
+            return true;
+        },
+    );
+    assert.equal(managedRepoExists('nestedCloneDep'), false);
+});
+
+test('prepareManifestRepositories: the repo of a blocking enable dependency that cannot be cloned fails preparation', async () => {
+    writeRepoSource('blockingCloneRepo', missingRemote('blockingCloneRepo'));
+    writeAgentManifest('staticBlockingCloneFail', 'app', {
+        container: 'node:20',
+        enable: ['blockingCloneRepo/worker'],
+    });
+
+    await assert.rejects(
+        () => prepareManifestRepositories('staticBlockingCloneFail/app', { cloneRetryDelayMs: 0, warn: () => {} }),
+        (error) => {
+            assert.match(error.message, /'blockingCloneRepo'/);
+            assert.match(error.message, GIT_MISSING_REPOSITORY);
+            return true;
+        },
+    );
+    assert.equal(managedRepoExists('blockingCloneRepo'), false);
+});
+
+test('prepareManifestRepositories: the repo of an optional no-wait dependency that cannot be cloned is reported and skipped', async () => {
+    writeRepoSource('optionalCloneRepo', missingRemote('optionalCloneRepo'));
+    writeAgentManifest('staticOptionalCloneFail', 'app', {
+        container: 'node:20',
+        enable: ['optionalCloneRepo/worker no-wait'],
+    });
+    const warnings = [];
+
+    await assert.doesNotReject(() => prepareManifestRepositories('staticOptionalCloneFail/app', {
+        cloneRetryDelayMs: 0,
+        warn: (message) => warnings.push(message),
+    }));
+    assert.equal(managedRepoExists('optionalCloneRepo'), false);
+    const skipped = warnings.filter((message) => /'optionalCloneRepo'/.test(message) && /skipped/.test(message));
+    assert.equal(skipped.length, 1, warnings.join('\n'));
+    assert.match(skipped[0], GIT_MISSING_REPOSITORY);
+});
+
+test('prepareManifestRepositories: a declared repo clone that fails once is retried once and succeeds', async () => {
+    const remote = path.join(tempDir, 'remotes', 'late', 'retriedCloneDep.git');
+    writeAgentManifest('staticCloneRetry', 'app', {
+        container: 'node:20',
+        repos: { retriedCloneDep: remote },
+    });
+    const warnings = [];
+
+    await prepareManifestRepositories('staticCloneRetry/app', {
+        cloneRetryDelayMs: 0,
+        warn: (message) => {
+            warnings.push(message);
+            // The remote becomes reachable between the two attempts.
+            if (!fs.existsSync(remote)) {
+                const created = createBareRepo('retriedCloneDepSource');
+                fs.mkdirSync(path.dirname(remote), { recursive: true });
+                fs.renameSync(created, remote);
+            }
+        },
+    });
+
+    assert.equal(managedRepoExists('retriedCloneDep'), true);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /'retriedCloneDep'/);
+    assert.match(warnings[0], GIT_MISSING_REPOSITORY);
+});
+
+// The tolerated preparation failures below keep their current, non-fatal
+// behavior: the dependency graph reports what is still missing when it is
+// resolved.
+test('prepareManifestRepositories: a prefixed enable without a known repository URL stays non-fatal', async () => {
+    writeAgentManifest('staticNoUrlDep', 'app', {
+        container: 'node:20',
+        enable: ['repoWithoutAnyUrl/worker'],
+    });
+    const warnings = [];
+
+    await assert.doesNotReject(() => prepareManifestRepositories('staticNoUrlDep/app', {
+        cloneRetryDelayMs: 0,
+        warn: (message) => warnings.push(message),
+    }));
+    assert.equal(managedRepoExists('repoWithoutAnyUrl'), false);
+    assert.deepEqual(warnings, []);
+});
+
+test('prepareManifestRepositories: an unresolvable enable entry stays non-fatal', async () => {
+    writeAgentManifest('staticUnknownAgentDep', 'app', {
+        container: 'node:20',
+        enable: ['agentThatExistsNowhere'],
+    });
+
+    await assert.doesNotReject(() => prepareManifestRepositories('staticUnknownAgentDep/app', {
+        cloneRetryDelayMs: 0,
+        warn: () => {},
+    }));
+});
+
+test('prepareManifestRepositories: a declared repo already present but refusing a branch switch stays non-fatal', async () => {
+    const remote = createBareRepo('dirtyDeclaredRemote', { branches: ['dirty-feature'] });
+    writeAgentManifest('staticDirtyDeclared', 'app', {
+        container: 'node:20',
+        repos: { dirtyDeclaredDep: remote },
+    });
+    await prepareManifestRepositories('staticDirtyDeclared/app');
+    const repoPath = path.join(tempDir, '.ploinky', 'repos', 'dirtyDeclaredDep');
+    fs.writeFileSync(path.join(repoPath, 'uncommitted.txt'), 'local change\n');
+
+    await assert.doesNotReject(() => prepareManifestRepositories('staticDirtyDeclared/app', {
+        cloneRetryDelayMs: 0,
+        warn: () => {},
+        branchPolicy: {
+            branch: 'dirty-feature',
+            repoBranches: {},
+            fallback: 'default',
+            resetRepos: false,
+        },
+    }));
+    assert.equal(headBranch(repoPath), 'main');
+});
+
+// ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
 
