@@ -96,7 +96,15 @@ function readExisting(target, fsApi, { normalizeMode = false } = {}) {
         if (!sameFingerprint(fingerprint(before), fingerprint(opened))) {
             throw initializerError(`Workspace master-key target changed while opening: ${target}`);
         }
-        const bytes = fsApi.readFileSync(descriptor);
+        if (opened.size !== 65) throw initializerError(`Existing ${target} must contain exactly one 64-character lowercase hexadecimal key; its content was not changed`);
+        const buffer = Buffer.alloc(66);
+        let count = 0;
+        while (count < buffer.length) {
+            const read = fsApi.readSync(descriptor, buffer, count, buffer.length - count, null);
+            if (read === 0) break;
+            count += read;
+        }
+        const bytes = buffer.subarray(0, count);
         const key = decodeMasterKey(bytes, target);
         if (normalizeMode) fsApi.fchmodSync(descriptor, 0o600);
         else if ((opened.mode & 0o777) !== 0o600) {

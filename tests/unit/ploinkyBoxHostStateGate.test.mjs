@@ -19,8 +19,10 @@ import { resolveBoxDataSources } from '../../ploinky-box/hostState/confinement.m
 import { createMutationLockManager } from '../../ploinky-box/locks.mjs';
 import { nestedPodmanSeccompProfilePath } from '../../ploinky-box/seccomp.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
-import { OUTER_IMAGE_ID_FIXTURE, imageAgentLibFixture } from '../helpers/agentlibFixture.mjs';
+import { OUTER_IMAGE_ID_FIXTURE, imageAgentLibFixture, agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { handleFromCreateArgs } from '../helpers/hostStateFixture.mjs';
+import { initializeWorkspaceMasterKey, readWorkspaceMasterKey } from '../../ploinky-box/entrypoint/initialize-workspace.mjs';
+import { deriveSubkeyFromSeed } from '../../cli/utils/security/masterKey.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const DATA = Object.freeze({ dependencies: 'd'.repeat(64), images: 'f'.repeat(64) });
@@ -43,7 +45,7 @@ function treeDigest(target) {
 
 // A workspace with a stub engine. `old` is an owned Box created with the
 // current contract (or none); data directories are real.
-async function world(t, { old = 'running', dataPaths = false, prepare = () => {} } = {}) {
+async function world(t, { old = 'running', dataPaths = false, localAgentLib = false, prepare = () => {} } = {}) {
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-gate-')));
     t.after(() => fs.rmSync(base, { recursive: true, force: true }));
     const checkout = path.join(base, 'checkout');
@@ -61,7 +63,7 @@ async function world(t, { old = 'running', dataPaths = false, prepare = () => {}
     prepare(identity, workspace);
     const lock = await createMutationLockManager().acquire(identity.instance, { workspaceRoot: workspace });
     t.after(() => { try { lock.release(); } catch (_) {} });
-    const agentLib = imageAgentLibFixture();
+    const agentLib = localAgentLib ? agentLibFixture(identity.workspaceRoot) : imageAgentLibFixture();
     const render = (fingerprints, cidfile, dataSources = undefined) => containerCreateArgs({
         identity, dataFingerprints: fingerprints, dataSources, agentLib, imageId: OUTER_IMAGE_ID_FIXTURE, imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 18080, repositoryRoot: checkout, cidfile,
@@ -404,4 +406,92 @@ test('I4: limits clear keeps its any-ownership authorization and runs as a restr
         assert.equal(result.all, true, state);
         assert.deepEqual(policies, ['under:restrict'], state);
     }
+});
+
+
+function writeRecoveryProd(workspace, value, payload = { version: 1, secrets: { PROD: value } }) {
+    fs.mkdirSync(path.join(workspace, '.ploinky', 'data'), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.join(workspace, '.data', 'dpu-data'), { recursive: true, mode: 0o700 });
+    initializeWorkspaceMasterKey({ workspaceRoot: workspace });
+    const seed = readWorkspaceMasterKey({ workspaceRoot: workspace }).key;
+    const key = deriveSubkeyFromSeed(seed, 'storage/secrets');
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const bytes = Buffer.concat([cipher.update(JSON.stringify(payload)), cipher.final()]);
+    const packed = Buffer.concat([iv, cipher.getAuthTag(), bytes]).toString('base64');
+    key.fill(0);
+    fs.writeFileSync(path.join(workspace, '.ploinky', 'data', '.secrets'), packed, { mode: 0o600 });
+}
+
+for (const recovery of ['data', 'local']) {
+    test(`whole restart passively checks stored PROD before ${recovery} recovery`, async t => {
+        const w = await world(t, { old: 'running', dataPaths: true, localAgentLib: recovery === 'local' });
+        writeRecoveryProd(w.workspace, 'false');
+        const current = w.current();
+        if (recovery === 'data') {
+            fs.renameSync(w.identity.dataPaths.images, `${w.identity.dataPaths.images}-old`);
+        } else {
+            const mount = current.runtime.mounts.find(m => m.destination === '/opt/ploinky-agentlib');
+            fs.writeFileSync(path.join(mount.source, 'changed-file'), 'changed');
+        }
+        const calls = [];
+        const ownership = { state: 'owned', engine: ENGINE, handles: { container: current } };
+        const supervisor = createBoxSupervisor({
+            hostStateGuard: { beforeLock() {}, underLock() { return {}; }, quiescence() { return []; } },
+            resolveIdentity: () => w.identity, launchCwd: w.workspace, repositoryRoot: path.join(w.base, 'checkout'),
+            lockManager: { acquire: async () => ({ ...w.lock, release() {} }) }, discover: () => ownership,
+            runner: { run() { calls.push('mutate'); }, query: () => ({ ok: true, stdout: JSON.stringify({ initialized: true }) }) },
+            validateExistingImage: () => ({ immutableId: OUTER_IMAGE_ID_FIXTURE }),
+            selectAgentLib: async () => { calls.push('selected'); throw new Error('recovery reached'); },
+            stdout: silent, stderr: silent,
+        });
+        await assert.rejects(supervisor.runStartTransaction(['start', 'explorer']), { code: 'PLOINKY_BOX_PROFILE_PREFLIGHT_FAILED' });
+        assert.deepEqual(calls, []);
+        await assert.rejects(supervisor.runRestartTransaction(['restart']), /recovery reached/);
+        assert.deepEqual(calls, ['selected']);
+        writeRecoveryProd(w.workspace, 'true');
+        calls.length = 0;
+        await assert.rejects(supervisor.runRestartTransaction(['restart']), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+        assert.deepEqual(calls, []);
+        if (recovery === 'data') {
+            writeRecoveryProd(w.workspace, 'false');
+            fs.symlinkSync(`${w.identity.dataPaths.images}-old`, w.identity.dataPaths.images);
+            await assert.rejects(supervisor.runRestartTransaction(['restart']), { code: 'PLOINKY_BOX_PROFILE_PREFLIGHT_FAILED' });
+            assert.deepEqual(calls, []);
+        }
+    });
+}
+
+test('passive recovery refuses corrupt, linked and invalid production stores', async t => {
+    const { assertNonProductionRecovery } = await import('../../ploinky-box/profileRecoveryPreflight.mjs');
+    const w = await world(t, { old: 'running' });
+    writeRecoveryProd(w.workspace, 'false');
+    const store = path.join(w.workspace, '.ploinky', 'data', '.secrets');
+    assert.doesNotThrow(() => assertNonProductionRecovery(w.workspace));
+    writeRecoveryProd(w.workspace, 'not-a-boolean');
+    assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+    fs.writeFileSync(store, 'corrupt');
+    assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+    fs.unlinkSync(store);
+    fs.symlinkSync(path.join(w.workspace, '.data', '.layout.json'), store);
+    assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+});
+
+
+test('passive recovery rejects authenticated malformed envelopes and incomplete migration', async t => {
+    const { assertNonProductionRecovery } = await import('../../ploinky-box/profileRecoveryPreflight.mjs');
+    const w = await world(t, { old: 'running' });
+    for (const payload of [{ version: 2, secrets: {} }, { version: 1, secrets: [] }, { version: 1, secrets: { PROD: false } }]) {
+        writeRecoveryProd(w.workspace, undefined, payload);
+        assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+    }
+    const store = path.join(w.workspace, '.ploinky', 'data', '.secrets');
+    fs.unlinkSync(store);
+    fs.unlinkSync(path.join(w.workspace, '.data', 'dpu-data', 'master-key'));
+    fs.writeFileSync(path.join(w.workspace, '.ploinky', 'data', 'master-key'), 'legacy');
+    assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+    fs.unlinkSync(path.join(w.workspace, '.ploinky', 'data', 'master-key'));
+    assert.doesNotThrow(() => assertNonProductionRecovery(w.workspace));
+    fs.writeFileSync(path.join(w.workspace, '.ploinky', '.secrets'), 'retired');
+    assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
 });

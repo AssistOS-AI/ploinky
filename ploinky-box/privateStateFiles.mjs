@@ -70,7 +70,14 @@ export function readPrivateFile(fsApi, target, maxBytes, label, { stateError }) 
         if (uid !== null && before.uid !== uid) throw stateError(`${label} must be owned by the current user: ${target}`);
         if ((before.mode & 0o077) !== 0) throw stateError(`${label} must be private to the current user (mode 0600): ${target}`);
         if (before.size > maxBytes) throw stateError(`${label} exceeds ${maxBytes} bytes: ${target}`);
-        const bytes = fsApi.readFileSync(descriptor);
+        const buffer = Buffer.alloc(before.size + 1);
+        let count = 0;
+        while (count < buffer.length) {
+            const read = fsApi.readSync(descriptor, buffer, count, buffer.length - count, null);
+            if (read === 0) break;
+            count += read;
+        }
+        const bytes = buffer.subarray(0, count);
         const after = fsApi.fstatSync(descriptor);
         if (bytes.length !== before.size || after.size !== before.size
             || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {

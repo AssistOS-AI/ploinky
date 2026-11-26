@@ -5,6 +5,8 @@ import { readGraphSkillScope, validateGraphSkillScope, writeGraphSkillScope } fr
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { isDeepStrictEqual } from 'node:util';
+import { assertNonProductionRecovery } from './profileRecoveryPreflight.mjs';
 
 import {
     BOX_LABELS,
@@ -769,11 +771,13 @@ export function createBoxSupervisor({
     // A live Box must pass the inspect-only preflight before any transition.
     // Discovery supplies ownership, while status validates the runtime before
     // executing in it. Unknown live state is not permission to skip the check.
-    async function assertInBoxProdProfile(identity, ownership, coreArgs) {
+    async function assertInBoxProdProfile(identity, ownership, coreArgs, { allowRecovery = false } = {}) {
         const container = ownership?.handles?.container;
         if (ownership?.state !== 'owned' || !container || !container.runtime?.running) return;
         let status;
         let selection;
+        let sourceChanged = false;
+        let identityVerified = false;
         try {
             status = inspectBoxStatus();
             const observed = status.ownership?.handles?.container;
@@ -784,17 +788,58 @@ export function createBoxSupervisor({
                 || status.ownership.engine.identity !== ownership.engine?.identity) {
                 throw new Error('Box identity changed during inspection');
             }
+            identityVerified = true;
             if (status.state === 'running-uninitialized') return;
             if (status.state !== 'running-initialized') {
                 throw new Error(`Box status is ${status.state}${status.detail ? `: ${status.detail}` : ''}`);
             }
             selection = agentLibContractFromContainer(observed);
-            revalidateMountedAgentLibSource(selection, {
-                engine: status.ownership.engine,
-                containerId: observed.id,
-                runner,
-            });
+            try {
+                revalidateMountedAgentLibSource(selection, {
+                    engine: status.ownership.engine,
+                    containerId: observed.id,
+                    runner,
+                });
+            } catch (error) {
+                sourceChanged = selection.mode === 'local' && error?.code === AGENTLIB_ERROR_CODES.sourceChanged;
+                throw error;
+            }
         } catch (error) {
+            if (allowRecovery && identityVerified && (sourceChanged || status.state === 'incompatible')) {
+                // Validate the admitted immutable container contract, independent
+                // of the current host data path fingerprints.
+                let old;
+                try {
+                    old = observeBoxConfiguration(identity, ownership, repositoryRoot, ownership.engine);
+                    validateExistingImage(ownership.engine.name, container.runtime?.imageId, old.imageRef, runner);
+                } catch (_) {
+                    throw supervisorError('Box profile preflight could not verify the owned Box contract.', 'PLOINKY_BOX_PROFILE_PREFLIGHT_FAILED');
+                }
+                let changedData = false;
+                let dataSafe = true;
+                try {
+                    changedData = !isDeepStrictEqual(inspectBoxData({ identity }).fingerprints, old.dataFingerprints);
+                } catch (_) {
+                    // A missing path is a known restart-recoverable case. Do
+                    // not turn permission errors or symlinked parents into it.
+                    changedData = false;
+                    try {
+                        for (const target of [identity.anchorPath, identity.boxDataRoot, ...Object.values(identity.dataPaths)]) {
+                            try {
+                                const stat = fsPromisesFree.lstatSync(target);
+                                if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('unsafe Box data path');
+                            } catch (pathError) {
+                                if (pathError.code !== 'ENOENT' || target === identity.anchorPath) throw pathError;
+                                changedData = true;
+                            }
+                        }
+                    } catch (_) { dataSafe = false; }
+                }
+                if (dataSafe && (sourceChanged || (status.state === 'incompatible' && changedData))) {
+                    assertNonProductionRecovery(identity.workspaceRoot);
+                    return;
+                }
+            }
             throw supervisorError(`Box profile preflight could not safely inspect the running Box: ${error.message}`, 'PLOINKY_BOX_PROFILE_PREFLIGHT_FAILED');
         }
         const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
@@ -1537,7 +1582,7 @@ export function createBoxSupervisor({
             await assertNoUpdateRecoveryBarrier(identity, ownership);
             const reposSource = requestedReposSource();
             const hardwareGate = selectHardwareGateForOperation(identity, 'restart', lock);
-            await assertInBoxProdProfile(identity, ownership, coreArgs);
+            await assertInBoxProdProfile(identity, ownership, coreArgs, { allowRecovery: true });
             ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'restart');
             const hardware = hardwareWiringFor(identity, hardwareGate.enabled, ownership);
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);

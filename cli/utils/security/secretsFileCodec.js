@@ -65,12 +65,18 @@ function secretsDecryptionError(error) {
 // Decrypts the trimmed, non-empty contents of a .secrets file. `storageKey`
 // defaults to the current storage subkey; a caller that has already resolved
 // the master seed passes the subkey derived from that same seed.
-function decryptSecretsText(raw, storageKey) {
+function decryptSecretsText(raw, storageKey, { strict = false } = {}) {
     let payload;
     try {
         payload = JSON.parse(decryptPacked(raw, storageKey));
     } catch (error) {
         throw secretsDecryptionError(error);
+    }
+    if (strict && (!payload || typeof payload !== 'object' || Array.isArray(payload)
+        || payload.version !== PAYLOAD_VERSION || !payload.secrets || typeof payload.secrets !== 'object'
+        || Array.isArray(payload.secrets)
+        || (Object.hasOwn(payload.secrets, 'PROD') && !['', 'true', 'false'].includes(payload.secrets.PROD)))) {
+        throw new Error('Encrypted variable store has an invalid envelope or PROD value.');
     }
     return normalizeSecretsMap(payload?.secrets);
 }
