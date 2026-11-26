@@ -128,6 +128,8 @@ async function mergeRoutingConfig(mutator, {
     validateActiveGeneration,
     captureExpectedGeneration,
     networkLifecycleCapability,
+    beforeSelectorCommit,
+    afterSelectorCommit,
 } = {}) {
     const mutate = async (applyLockCapability = undefined, liveNetworkLifecycleCapability = undefined) => {
         let validatedActiveGeneration;
@@ -164,6 +166,8 @@ async function mergeRoutingConfig(mutator, {
                     expectedGeneration,
                     applyLockCapability,
                     networkLifecycleCapability: liveNetworkLifecycleCapability,
+                    beforeSelectorCommit,
+                    afterSelectorCommit,
                     ...carry,
                 });
                 return next;

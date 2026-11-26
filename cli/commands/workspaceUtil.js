@@ -55,8 +55,9 @@ import { PROD_ENV } from '../utils/prodMode.mjs';
 import {
   dryCaptureProdGates,
   readCapturedProdGates,
-  writeProdGates,
+  stageProdGates,
 } from '../utils/runtime/mcpProdGates.mjs';
+import { runWithRuntimePolicyEnvironment } from '../utils/runtime/runtimePolicyContext.mjs';
 import { followWorkspaceProfile } from '../utils/runtime/profileFollow.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../utils/publicRouterHosts.mjs';
@@ -1619,16 +1620,16 @@ export function collectProdGateRoutes({
 // otherwise (`restart router`) the value already captured. Only an explicit true
 // makes profile resolution strict.
 export function resolveStartProd(prodCapture) {
-  return prodCapture ? prodCapture.prod === true : readCapturedProdGates().prod === true;
+  return prodCapture ? prodCapture.prod === true : capturedProdOrClosed();
 }
 
-// Completes the dry capture with the routes of the graph the start resolved and
-// writes it. Without a capture (`restart router`) nothing is written and the
-// existing file stays in force.
+// Recapture the graph admitted after repository preparation; publication waits
+// for the ready generation's selector commit.
 export function commitProdCapture(prodCapture, start) {
   if (!prodCapture) return;
-  const routes = collectProdGateRoutes({ registry: start.registry, graph: start.graph, additionalNodes: start.additionalNodes, prod: prodCapture.prod });
-  writeProdGates(dryCaptureProdGates({ prod: prodCapture.prod, routes }));
+  const workspaceProfile = getActiveProfile();
+  const routes = collectProdGateRoutes({ registry: start.registry, graph: start.graph, additionalNodes: start.additionalNodes, prod: prodCapture.prod, workspaceProfile });
+  return dryCaptureProdGates({ prod: prodCapture.prod, routes, workspaceProfile });
 }
 
 function loadRegistryManifest(record) {
@@ -3131,6 +3132,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   // admitted graph under the lease.
   const workspaceStartLock = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' });
   let workspacePreparationLease = null;
+  let workspaceActivated = false;
   const workspaceRuntimeCandidates = [];
   const workspaceMpsRuntimes = [];
   try {
@@ -3138,7 +3140,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   // this lease, and nothing else in the process can. A rollback start can
   // follow a killed start at once: wait out only that dead owner's stale
   // network-lock grace, never a live owner.
-  return await runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
+  return await runWithRuntimePolicyEnvironment({ prod: startProd, workspaceProfile: getActiveProfile() }, () => runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
   // No earlier no-wait worker still alive here can change anything while this
@@ -3163,8 +3165,8 @@ async function startWorkspace(staticAgentArg, portArg, {
   // The graph now exists, including agents the repository preparation just
   // installed or updated. Recapture every admitted route from its final source,
   // including routes whose branch changed during preparation. The result is
-  // written, before the first selector, route, config or Router write.
-  commitProdCapture(prodCapture, lockedStart);
+  // retained for publication with the ready selector.
+  const finalProdCapture = commitProdCapture(prodCapture, lockedStart);
   // `--branch` reaches link-install repositories here, for the whole admitted
   // graph including no-wait agents, before any mutation, wave or worker.
   preflightStartLinkedRepositories(lockedStart, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, branchPolicy });
@@ -3702,6 +3704,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     // remains exact. Persist it once, after all capability-sensitive launches
     // have completed, so one wave cannot invalidate the selector-bound host
     // launch token needed by a later wave.
+    let stagedPolicy;
     await mergeRoutingConfig((current, { applyLockCapability, networkLifecycleCapability: mergeNetworkLifecycleCapability } = {}) => {
       workspaceSvc.saveAgents(reg, { coordinate: false });
       // D2S.13 site S: the blocking runtimes this start verified ready publish their registry tuple here, before
@@ -3718,6 +3721,16 @@ async function startWorkspace(staticAgentArg, portArg, {
     }, {
       reason: 'workspace-runtime-graph-ready',
       preparationLease: workspacePreparationLease,
+      ...(finalProdCapture ? {
+        beforeSelectorCommit() {
+          stagedPolicy = stageProdGates(finalProdCapture);
+          return () => stagedPolicy.rollback();
+        },
+        afterSelectorCommit() {
+          workspaceActivated = true;
+          stagedPolicy.finalize();
+        },
+      } : { afterSelectorCommit() { workspaceActivated = true; } }),
     });
     workspacePreparationLease = null;
     for (const runtimeResult of workspaceMpsRuntimes) {
@@ -3836,6 +3849,9 @@ async function startWorkspace(staticAgentArg, portArg, {
     printStartResultSummary(startResult);
     return startResult;
   } catch (e) {
+    if (workspaceActivated || e.edgeSelectorCommitted) {
+      throw new Error(`start: workspace activated; settlement requires recovery: ${e?.message || e}`, { cause: e });
+    }
     const cleanedCandidateIds = new Set();
     for (const candidate of workspaceRuntimeCandidates.reverse()) {
       const candidateId = String(candidate?.containerId || '');
@@ -3862,7 +3878,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     }
     throw new Error(`start (workspace) failed: ${message}`);
   }
-  }));
+  })));
   } finally {
     releaseWorkspaceStartLock(workspaceStartLock);
   }

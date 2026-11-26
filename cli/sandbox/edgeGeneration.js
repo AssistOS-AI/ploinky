@@ -2912,6 +2912,8 @@ export function applyEdgeRoutingGeneration(options = {}) {
     } = acquireApplyLockCapability(paths, options);
     let applyLockHeld = true;
     let transactionStarted = false;
+    let selectorCommitted = false;
+    let beforeSelectorRollback = null;
     try {
         // A withdrawn lease commits active to active: its predecessor already
         // withdrew the replaced runtime's routes, so no inactive window is
@@ -3113,8 +3115,10 @@ export function applyEdgeRoutingGeneration(options = {}) {
             }
         }
         const topology = writeTopologyForGeneration(paths, generation, publicationState, options);
-        if (typeof options.testHooks?.beforeSelectorCommit === 'function') {
-            options.testHooks.beforeSelectorCommit({ paths, generation, topology, selector });
+        const beforeSelectorCommit = options.beforeSelectorCommit || options.testHooks?.beforeSelectorCommit;
+        if (typeof beforeSelectorCommit === 'function') {
+            beforeSelectorRollback = beforeSelectorCommit({ paths, generation, topology, selector }) || null;
+            if (beforeSelectorRollback && typeof beforeSelectorRollback !== 'function') throw edgeError('invalid pre-selector rollback', 'EDGE_ADDITIVE_CALLBACK_INVALID');
         }
         // The selector is the transaction's sole authorization commit point and
         // must be written last. A crash at any earlier phase therefore leaves the
@@ -3124,9 +3128,13 @@ export function applyEdgeRoutingGeneration(options = {}) {
         }
         if (preparationLease) removePreparationLease(paths, preparationLease);
         writeOwnedEdgeSelector(paths, selector);
+        selectorCommitted = true;
+        options.afterSelectorCommit?.({ paths, generation, topology, selector });
         return { selector: deepFreeze(selector), generation, topology, paths };
     } catch (error) {
-        if (transactionStarted && applyLockHeld) {
+        if (!selectorCommitted && beforeSelectorRollback) beforeSelectorRollback();
+        if (selectorCommitted) error.edgeSelectorCommitted = true;
+        if (!selectorCommitted && transactionStarted && applyLockHeld) {
             inactivateEdgeRoutingGeneration(error?.code || 'apply-failed', {
                 ...options,
                 applyLockCapability,
@@ -3396,9 +3404,11 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
         assertPreparedSelectorStillSelected(paths, lease);
         writeOwnedEdgeSelector(paths, selector);
         selectorCommitted = true;
+        options.afterSelectorCommit?.({ paths, generation, topology, selector });
         removePreparationLease(paths, lease);
         return { selector: deepFreeze(selector), generation, topology, paths };
     } catch (error) {
+        if (selectorCommitted) error.edgeSelectorCommitted = true;
         if (!selectorCommitted) {
             const restoreErrors = [];
             if (beforeSelectorRollback) {

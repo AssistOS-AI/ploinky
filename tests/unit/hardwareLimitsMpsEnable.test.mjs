@@ -73,6 +73,7 @@ function realEnableWithDependencies(f, { failReadiness = false } = {}) {
         // The profile rules and the production-gate merge are outside what this lifecycle test observes.
         assertEnableProfileRules: () => {},
         mergeEnableRouteGates: () => ({ merged: false }),
+        captureEnableRouteGates: () => null,
         registeredRuntimeTuple: () => null,
         withMpsEnablePreparation: (request, stage) => withMpsEnablePreparation(request, stage, f.deps),
         prepareAgentEnableBatch: () => { f.events.push('prepare'); return { plans: [f.plan], preparedGeneration: { preparationLease: lease, generation: { agents: {}, routing: { routes: {} } } } }; },
@@ -82,7 +83,7 @@ function realEnableWithDependencies(f, { failReadiness = false } = {}) {
         waitForEnabledAgentReadiness: async () => { f.events.push('readiness'); if (failReadiness) throw new Error('not ready'); },
         mergeRuntimeRoute: (_old, next) => next,
         withEdgeGenerationApplyLock: (callback) => callback({}),
-        commitAdditiveEdgeRoutingGeneration: () => f.events.push('commit'),
+        commitAdditiveEdgeRoutingGeneration: (_lease, options) => { f.events.push('commit'); options.afterSelectorCommit(); },
         saveAgents: () => assert.fail('additive must not overwrite registry directly'),
         writeRoutingConfig: () => assert.fail('additive must not overwrite routing directly'),
         applyEdgeRoutingGeneration: () => assert.fail('additive has its own commit'),
@@ -108,4 +109,12 @@ test('ME.prepublication MPS verification is awaited and failure cannot commit th
     f.mps.verifyMpsRuntimeReady = async () => { await new Promise((resolve) => setImmediate(resolve)); throw new Error('generation changed'); };
     await assert.rejects(realEnableWithDependencies(f)('demo/a', 'global'), /generation changed/);
     assert.equal(f.events.includes('commit'), false); assert.equal(f.events.includes('ack'), false); assert.equal(f.events.includes('abort'), true);
+});
+
+test('ME.acknowledgement failure after selector publication retains the active runtime', async () => {
+    const f = fixture();
+    f.mps.acknowledgeMpsRuntimeReady = async () => { throw new Error('ack failed'); };
+    await assert.rejects(realEnableWithDependencies(f)('demo/a', 'global'), /activated; settlement requires recovery/);
+    assert.equal(f.events.includes('commit'), true);
+    assert.equal(f.events.includes('abort'), false);
 });

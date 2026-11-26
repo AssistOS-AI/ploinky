@@ -445,8 +445,9 @@ test('collectProdGateRoutes covers the enabled registry (by alias) and the graph
     }));
     const graph = { nodes: new Map([['later', { shortAgentName: 'later', agentPath: path.join(repos, 'later') }]]) };
     const finalGraph = { registry, graph };
-    commitProdCapture(capture, finalGraph);
-    const admitted = JSON.parse(fs.readFileSync(captureFile, 'utf8'));
+    const admitted = commitProdCapture(capture, finalGraph);
+    assert.equal(fs.existsSync(captureFile), false);
+    gates.stageProdGates(admitted).finalize();
     assert.deepEqual(admitted.routes.later.tools, ['l_tool']);
     assert.deepEqual(admitted.routes.enabled.tools, ['new_tool']);
     assert.deepEqual(admitted.routes.shortcut, capture.routes.shortcut);
@@ -458,6 +459,29 @@ test('collectProdGateRoutes covers the enabled registry (by alias) and the graph
     assert.throws(() => commitProdCapture({ ...capture, prod: true }, { ...finalGraph, registry: cleanRegistry }),
         codeIs('PLOINKY_PROD_GATES_DIRTY'));
     assert.deepEqual(JSON.parse(fs.readFileSync(captureFile, 'utf8')), admitted);
+});
+
+test('selector transition preserves predecessor restrictions and exact rollback bytes', () => {
+    reset();
+    const old = { schema: 1, prod: true, workspaceProfile: 'prod', routes: { a: { tools: ['old'], sha256: null } } };
+    const next = { schema: 1, prod: false, workspaceProfile: 'qa', routes: { a: { tools: ['new'], sha256: null } } };
+    gates.writeProdGates(old);
+    const bytes = fs.readFileSync(captureFile);
+    const transition = gates.stageProdGates(next);
+    const staged = gates.readCapturedProdGates();
+    assert.equal(staged.prod, true);
+    assert.deepEqual(staged.routes.a.tools, ['new', 'old']);
+    transition.rollback();
+    assert.deepEqual(fs.readFileSync(captureFile), bytes);
+    const committed = gates.stageProdGates(next);
+    committed.finalize();
+    assert.equal(gates.readCapturedProdGates().workspaceProfile, 'qa');
+    assert.equal(gates.readCapturedProdGates().prod, false);
+    fs.unlinkSync(captureFile);
+    const absent = gates.stageProdGates(next);
+    assert.equal(fs.existsSync(captureFile), false);
+    absent.finalize();
+    assert.equal(gates.readCapturedProdGates().prod, false);
 });
 
 test('a manifest secrets entry named PROD reads as missing in every source, so the stored value never reaches an agent', async () => {

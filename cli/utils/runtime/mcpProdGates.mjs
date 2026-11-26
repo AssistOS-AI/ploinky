@@ -56,7 +56,9 @@ export function parseProdGates(text) {
             sha256: typeof entry.sha256 === 'string' ? entry.sha256 : null,
         });
     }
-    return Object.freeze({ schema: PROD_GATES_SCHEMA, prod: parsed.prod, routes: Object.freeze(routes) });
+    if (parsed.workspaceProfile !== undefined && (typeof parsed.workspaceProfile !== 'string' || !parsed.workspaceProfile)) return unavailable('corrupt');
+    return Object.freeze({ schema: PROD_GATES_SCHEMA, prod: parsed.prod, routes: Object.freeze(routes),
+        ...(parsed.workspaceProfile !== undefined ? { workspaceProfile: parsed.workspaceProfile } : {}) });
 }
 
 const cache = new Map();
@@ -201,7 +203,7 @@ function normalizeRoutes(routes) {
 // graph route as `{ routeKey, agentDir }`. Under PROD it refuses
 // (PLOINKY_PROD_GATES_DIRTY) when any route's mcp-config is not tracked and
 // identical to git HEAD.
-export function dryCaptureProdGates({ prod = readProd(), routes } = {}) {
+export function dryCaptureProdGates({ prod = readProd(), routes, workspaceProfile } = {}) {
     const entries = [];
     const files = [];
     for (const [routeKey, agentDir] of normalizeRoutes(routes)) {
@@ -216,7 +218,43 @@ export function dryCaptureProdGates({ prod = readProd(), routes } = {}) {
         const summary = files.map(({ routeKey, reason }) => `${routeKey} (${reason})`).join('; ');
         throw gateError(PROD_GATES_DIRTY_CODE, `Production policy capture refused: ${summary}`, { files });
     }
-    return { schema: PROD_GATES_SCHEMA, prod: Boolean(prod), routes: Object.fromEntries(entries) };
+    return { schema: PROD_GATES_SCHEMA, prod: Boolean(prod), routes: Object.fromEntries(entries),
+        ...(workspaceProfile ? { workspaceProfile } : {}) };
+}
+
+// Stage a policy no weaker than either generation while the selector changes.
+// An unavailable predecessor stays unavailable until the new selector exists.
+export function stageProdGates(capture, { file = PROD_GATES_FILE } = {}) {
+    let previousBytes;
+    try { previousBytes = fs.readFileSync(file); } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        previousBytes = null;
+    }
+    const previous = previousBytes === null ? unavailable('absent') : parseProdGates(previousBytes.toString('utf8'));
+    let staged = false;
+    if (!previous.unavailable) {
+        const routes = {};
+        for (const key of new Set([...Object.keys(previous.routes), ...Object.keys(capture.routes)])) {
+            const oldEntry = previous.routes[key];
+            const newEntry = capture.routes[key];
+            routes[key] = { tools: [...new Set([...(oldEntry?.tools || []), ...(newEntry?.tools || [])])].sort(),
+                sha256: newEntry?.sha256 || oldEntry?.sha256 || null };
+        }
+        const stagedCapture = { ...capture, prod: previous.prod || capture.prod, routes };
+        if (previous.workspaceProfile) stagedCapture.workspaceProfile = previous.workspaceProfile;
+        else delete stagedCapture.workspaceProfile;
+        writeProdGates(stagedCapture, { file });
+        staged = true;
+    }
+    return {
+        rollback() {
+            if (!staged) return;
+            const temporary = `${file}.${process.pid}.${Date.now()}.restore.tmp`;
+            fs.writeFileSync(temporary, previousBytes, { mode: 0o600 });
+            fs.renameSync(temporary, file);
+        },
+        finalize() { writeProdGates(capture, { file }); },
+    };
 }
 
 // Atomic write into controller-only state. An identical file is left alone so
@@ -253,6 +291,7 @@ export function mergeEnabledRouteGates(routeKey, { agentDir, file = PROD_GATES_F
         .sort(([left], [right]) => left.localeCompare(right))) {
         routes[key] = { tools: [...entry.tools], sha256: entry.sha256 };
     }
-    writeProdGates({ schema: PROD_GATES_SCHEMA, prod: existing.prod, routes }, { file });
+    writeProdGates({ schema: PROD_GATES_SCHEMA, prod: existing.prod, routes,
+        ...(existing.workspaceProfile ? { workspaceProfile: existing.workspaceProfile } : {}) }, { file });
     return { merged: true };
 }
