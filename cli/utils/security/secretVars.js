@@ -6,6 +6,9 @@ import { isPublicationHandle, loadSecretsFile, loadEnvFile } from './secretInjec
 import { deleteSecretValue, readSecretsFile, setSecretValue } from './encryptedSecretsFile.js';
 import { deriveAgentSecret, deriveWorkspaceSecret } from './masterKey.js';
 
+// The production switch is injected by Ploinky from the captured value only.
+const RESERVED_PROD_ENV = 'PROD';
+
 export function parseSecrets() {
     return readSecretsFile();
 }
@@ -293,7 +296,9 @@ function expandEnvWildcard(pattern) {
     const matches = [];
 
     for (const name of allNames) {
-        if (isPublicationHandle(name) || !regex.test(name)) {
+        // PROD is the controller-owned production switch; agents receive only
+        // the captured value, so it is never expanded into a manifest env.
+        if (name === RESERVED_PROD_ENV || isPublicationHandle(name) || !regex.test(name)) {
             continue;
         }
 
@@ -341,6 +346,13 @@ export function getManifestEnvSpecs(manifest, profileConfig) {
      * @param {*} defaultValue - Default value if not found
      */
     function addSpec(insideName, sourceName, required, defaultValue, generated = null, runtime = true) {
+        if (insideName === RESERVED_PROD_ENV) {
+            const error = new Error(
+                `Manifest env '${RESERVED_PROD_ENV}' is reserved: Ploinky injects the captured production switch into every agent.`,
+            );
+            error.code = 'PLOINKY_PROD_ENV_RESERVED';
+            throw error;
+        }
         // Check if this is a wildcard pattern
         if (isWildcardPattern(insideName)) {
             // Expand the wildcard into matching variable names

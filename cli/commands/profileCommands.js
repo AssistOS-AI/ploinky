@@ -9,6 +9,8 @@ import {
 } from '../utils/runtime/profileService.js';
 import { loadAgents } from '../utils/workspace.js';
 import { colorize } from '../utils/utils.js';
+import { assertProdProfileConsistency, readProd } from '../utils/prodMode.mjs';
+import { readCapturedProdGates } from '../utils/runtime/mcpProdGates.mjs';
 
 /**
  * Handle the profile command.
@@ -25,6 +27,10 @@ export async function handleProfileCommand(args) {
         case 'show':
         case 'current':
             return showCurrentProfile();
+        case 'assert':
+            // Hidden: the host runs it inspect-only before it touches a running
+            // Box. It throws, and so exits non-zero, on a PROD/profile mismatch.
+            return handleAssertProfile(args.slice(1));
         case undefined:
         case '':
             return showCurrentProfile();
@@ -76,13 +82,53 @@ function handleSetProfile(profileName) {
 }
 
 /**
+ * Inspect-only consistency assertion for the host: no state is written.
+ * @param {string[]} args - Optional `--profile <name>`
+ */
+function handleAssertProfile(args) {
+    let requestedProfile;
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = String(args[i]);
+        if (arg === '--profile') {
+            requestedProfile = String(args[i + 1] ?? '').trim().toLowerCase();
+            i += 1;
+        } else if (arg.startsWith('--profile=')) {
+            requestedProfile = arg.slice('--profile='.length).trim().toLowerCase();
+        } else {
+            throw new Error('Usage: ploinky profile assert [--profile <name>]');
+        }
+        if (!requestedProfile) throw new Error('--profile needs a value.');
+    }
+    assertProdProfileConsistency({ requestedProfile });
+}
+
+// The stored value (what the next start or whole restart will capture) and the
+// captured value (what the Router and the agents act on now).
+function describeProdState() {
+    let stored;
+    try {
+        stored = String(readProd());
+    } catch (error) {
+        stored = `unreadable (${error?.code || 'error'})`;
+    }
+    const captured = readCapturedProdGates();
+    const active = captured.unavailable
+        ? `true (capture ${captured.reason}; treated as true)`
+        : String(captured.prod);
+    return { stored, active };
+}
+
+/**
  * Show the current profile.
  */
 function showCurrentProfile() {
     const profile = getActiveProfile();
     const mountModes = getDefaultMountModes(profile);
+    const prodState = describeProdState();
 
     console.log(`Current profile: ${colorize(profile, 'cyan')}`);
+    console.log(`PROD: ${prodState.stored}`);
+    console.log(`PROD (active): ${prodState.active}`);
     console.log('');
     console.log('Settings:');
     console.log(`  Environment: ${getProfileEnvironmentLabel(profile)}`);

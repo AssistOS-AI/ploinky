@@ -76,6 +76,7 @@ import {
 import { handleDefaultSkillsCommand } from './skillsCommands.js';
 import { runSettingsMenu } from './settingsMenu.js';
 import { handleProfileCommand } from './profileCommands.js';
+import { assertProdProfileConsistency } from '../utils/prodMode.mjs';
 import {
     cleanupSessionContainers,
     destroyAll,
@@ -383,6 +384,9 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         }
         case 'start': {
             const startParsed = parseStartArgs(options);
+            // Before the first mutation, including the profile write below: a
+            // PROD/profile mismatch must leave the workspace untouched.
+            assertProdProfileConsistency({ requestedProfile: startParsed.profile || undefined });
             if (startParsed.profile) {
                 const profileResult = setActiveProfile(startParsed.profile);
                 if (!profileResult.success) {
@@ -684,6 +688,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
                     throw new Error('restart: start is not configured. Run: start <staticAgent> <port>');
                 }
+                // Before the first mutation: nothing is stopped on a refusal.
+                assertProdProfileConsistency();
                 resolvePersistedRouterPort();
                 await settleWorkspaceBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');

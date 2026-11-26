@@ -50,6 +50,8 @@ import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, res
 import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
+import { PROD_ENV } from '../utils/prodMode.mjs';
+import { capturedProdOrClosed } from '../utils/runtime/mcpProdGates.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../utils/publicRouterHosts.mjs';
 import {
@@ -297,10 +299,18 @@ export function buildRouterEnv({ managedBox } = {}) {
   // Likewise the repository source: only the process (Box) environment selects it.
   const { [PUBLIC_ROUTER_HOSTS_ENV]: _envFileHosts, [REPOS_SOURCE_ENV]: _envFileSource, ...fileEnvironment } = envFile;
   const { [PUBLIC_ROUTER_HOSTS_ENV]: _secretHosts, [REPOS_SOURCE_ENV]: _secretSource, ...secretEnvironment } = secrets;
-  return sanitizeRouterEnvironment(
+  const routerEnvironment = sanitizeRouterEnvironment(
     { ...fileEnvironment, ...secretEnvironment, ...process.env },
     { managedBox },
   );
+  // PROD comes only from the value captured by a start or whole restart. The
+  // workspace .env, the stored var and the caller's environment never select
+  // it for the Router: strip all three sources (the stored value also arrives
+  // through the secrets spread), then set it from the capture. An unavailable
+  // capture is PROD true (fail closed).
+  delete routerEnvironment[PROD_ENV];
+  routerEnvironment[PROD_ENV] = capturedProdOrClosed() ? 'true' : 'false';
+  return routerEnvironment;
 }
 
 async function spawnNoWaitWorker({

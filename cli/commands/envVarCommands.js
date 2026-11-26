@@ -3,6 +3,7 @@ import { showHelp } from './help.js';
 import * as envSvc from '../utils/security/secretVars.js';
 import { findAgent } from '../utils/utils.js';
 import { VAR_STDIN_MAX_BYTES, decodeVarStdinValue } from './varStdinValue.js';
+import { PROD_ENV, assertProdProfileConsistency, parseProd } from '../utils/prodMode.mjs';
 import {
     assertActiveEdgeRoutingSourcesCurrent,
     inactivateEdgeRoutingGeneration,
@@ -42,6 +43,16 @@ function setVarValue(varName, valueOrAlias) {
     if (!varName || typeof valueOrAlias !== 'string' || valueOrAlias.length === 0) {
         showHelp();
         throw new Error('Usage: var <VAR> <value|$OTHER>');
+    }
+    if (varName === PROD_ENV) {
+        // Strict parse (an invalid value leaves the store unchanged), then the
+        // consistency check against the value being set: the stored value is
+        // not read, so `var PROD true|false` repairs a legacy invalid value.
+        const requestedProd = parseProd(valueOrAlias);
+        assertProdProfileConsistency({ requestedProd });
+        envSvc.setEnvVar(varName, valueOrAlias);
+        console.log(`✓ Set variable '${varName}'. It applies at the next start or whole restart.`);
+        return;
     }
     envSvc.setEnvVar(varName, valueOrAlias);
     console.log(`✓ Set variable '${varName}'.`);

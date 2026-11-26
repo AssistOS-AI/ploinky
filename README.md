@@ -261,6 +261,23 @@ hashes none of its files.
 
 Automatic repository bootstrap prepares `AchillesIDE`, `AchillesCLI`, and `copilot-agents`, reusing matching workspace checkouts before cloning missing repositories into `.ploinky/repos`. Explorer's manifest declares its additional repositories and uses `webmeet/liveKitServerAgent` for LiveKit (the WebMeet agents live in the `webmeet` repository; `multimedia`, `soplangAgent`, `tasksAgent` and `webAssist` live in `legacy-agents`; `soul-gateway` and `roboTeamAgent` live in `AchillesIDE`). The `basic` repository is optional: install it explicitly with `ploinky install repo basic` when needed.
 
+### Production switch (`PROD`)
+
+`PROD` is a `ploinky var` (`true` or `false`, default `false`) kept in the controller-only encrypted store (`.ploinky/data/.secrets`), which agents cannot write. It switches production-gated features off for a deployment. It is independent of `PLOINKY_REPOS_SOURCE` and of the workspace profile, with one coupling: `PROD true` requires the workspace profile `prod`.
+
+```sh
+ploinky profile prod
+ploinky var PROD true     # stored now; active after the next start or whole restart
+ploinky restart
+```
+
+- `ploinky var PROD` accepts exactly `true` or `false`. Any other value (`True`, `1`, `'true '`, an empty or oversized value) is refused with `PLOINKY_PROD_INVALID` and the store is unchanged. A value that is already stored but invalid makes `start` and a whole `restart` refuse before anything is stopped; `ploinky var PROD true|false` repairs it.
+- `ploinky var PROD true` with another profile selected, `ploinky profile <name>` or `ploinky start --profile <name>` with `PROD true` stored and a profile other than `prod`, all refuse with `PLOINKY_PROD_PROFILE_MISMATCH` before any mutation. `ploinky var PROD false` first lifts the coupling. Profile `prod` with `PROD false` only warns.
+- The stored value takes effect only when a deploy-path command captures it: `start` and a whole `restart` write the captured value to the controller-only file `.ploinky/data/mcp-prod-gates.json`. The Router, the Marketplace and every agent use only that captured value, so a stored change never takes effect at a Router-only restart (`ploinky restart router`), a watchdog respawn or per call. `ploinky profile show` prints `PROD` (stored) and `PROD (active)` (captured).
+- The workspace `.env`, the caller's `PROD` environment variable and a manifest `env` entry named `PROD` never select it: the first two are ignored (the Router environment drops them) and the manifest entry is a validation error.
+- Agents receive the captured value as a read-only `PROD` environment variable. An unreadable or missing capture is treated as `true` (fail closed).
+- A host `ploinky start` or `ploinky restart` on a running Box first runs the inspect-only in-Box `profile assert`, so a mismatch is refused before the Box is touched.
+
 ### Agent repositories in the workspace
 
 You can keep agent repositories directly inside your [workspace](docs/wiki.html#definition-workspace). Every operation that selects an agent repository's source prefers the matching workspace checkout over `.ploinky/repos/<repository>`. This includes discovery, installed/active lists, Marketplace inventory, manifest and dependency preparation, and source selection for new runtimes.

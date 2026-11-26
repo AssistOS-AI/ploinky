@@ -7,6 +7,8 @@ import { collectManifestEnv, validateManifestEnvProfileCompleteness } from '../s
 import { debugLog, findAgent } from '../utils.js';
 import { effectiveManifestNetwork, validateManifestNetworks } from '../../sandbox/networkContract.js';
 import { mergeProfileHardwareLimits } from '../../sandbox/hardwareLimits/declaredLimits.mjs';
+import { assertProdProfileConsistency, PROD_ENV } from '../prodMode.mjs';
+import { capturedProdOrClosed } from './mcpProdGates.mjs';
 
 // Discover all valid profile names from installed agent manifests.
 // Any profile name declared in a manifest's "profiles" section is valid.
@@ -303,7 +305,7 @@ export function resolveManifestRuntimeProfile(manifest, {
  * @returns {{ success: boolean, message: string }}
  */
 export function setActiveProfile(profileName) {
-    const normalizedProfile = profileName.toLowerCase().trim();
+    const normalizedProfile = String(profileName ?? '').toLowerCase().trim();
 
     if (!isValidProfile(normalizedProfile)) {
         return {
@@ -311,6 +313,11 @@ export function setActiveProfile(profileName) {
             message: `Invalid profile '${profileName}'. Valid profiles are: ${getValidProfiles().join(', ')}`,
         };
     }
+
+    // PROD true requires profile `prod`. A mismatch throws (it keeps
+    // PLOINKY_PROD_PROFILE_MISMATCH) so a caller cannot read it as a soft
+    // refusal; nothing is written.
+    assertProdProfileConsistency({ requestedProfile: normalizedProfile });
 
     try {
         // Ensure .ploinky directory exists
@@ -502,7 +509,7 @@ export function getDefaultMountModes(profile) {
  * @returns {string} Environment identifier
  */
 export function getProfileEnvironment(profile) {
-    if (profile === 'default') return 'development';
+    if (profile === 'default' || profile === 'dev') return 'development';
     return profile;
 }
 
@@ -518,6 +525,9 @@ export function getProfileEnvVars(agentName, repoName, profile, containerInfo = 
     return {
         PLOINKY_PROFILE: profile,
         PLOINKY_PROFILE_ENV: getProfileEnvironment(profile),
+        // Agents get the captured value only, read-only. An unavailable capture
+        // is PROD true (fail closed); a manifest env named PROD is refused.
+        [PROD_ENV]: capturedProdOrClosed() ? 'true' : 'false',
         PLOINKY_AGENT_NAME: agentName,
         PLOINKY_REPO_NAME: repoName,
         PLOINKY_WORKSPACE_ROOT,
