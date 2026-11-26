@@ -13,7 +13,7 @@ import {
 } from '../../cli/utils/supervisedSessions.mjs';
 import { createSupervisionCourier } from '../../cli/utils/supervisionCourier.mjs';
 import {
-    attachRole, createSupervisedPair, findLiveRow, KILL_ITEMS, killRoles, pairItems, pairRoleItems, pairState,
+    attachRole, createSupervisedPair, findLiveRow, killRoles, pairItems, pairRoleItems, pairState,
     relativeAge, rolesToKill, runningTerminals, supervisionTabs,
 } from '../../cli/utils/supervisionFlow.mjs';
 import {
@@ -123,20 +123,22 @@ test('the pair list and its two sessions describe running and ended roles', () =
     ];
     const items = pairItems({ sessions: [record(), record({ id: 'sup-bbbbbbbbbbbbbbbbbbbbbbbb', phase: 'ended',
         supervisor: { ...record().supervisor, terminalId: null }, worker: { ...record().worker, terminalId: null } })], live, now: 121_000 });
-    assert.deepEqual(items.map(item => item.label), ['+ New supervised session', '● project', '○ project']);
+    assert.deepEqual(items.map(item => item.label), ['+ New supervised session', '● project', '  project']);
     assert.match(items[1].detail, /^running · claude → codex · 2m ago$/u);
     assert.match(items[2].detail, /^ended · /u);
     const state = pairState(record(), live);
     assert.deepEqual([state.running, state.worker], [true, null]);
     const roles = pairRoleItems(record(), live, 121_000);
     assert.deepEqual(roles.map(item => [item.role, item.label, item.detail]),
-        [['supervisor', 'Supervisor · claude', 'attached · 1 view · 1m ago'], ['worker', 'Worker · codex', 'ended']]);
+        [['supervisor', '● Supervisor · claude', 'attached · 1 view · 1m ago'], ['worker', '  Worker · codex', 'ended']]);
+    const detached = [{ ...live[0], status: 'detached', viewerCount: 0 }];
+    assert.equal(pairRoleItems(record(), detached)[0].label, '● Supervisor · claude');
+    assert.equal(pairItems({ sessions: [record()], live: detached })[1].label, '● project');
     assert.equal(relativeAge(0, 86_400_000), '1d ago');
     assert.equal(supervisionTabs('supervised').activeTab, 1);
     assert.equal(supervisionTabs('coding').activeTab, 0);
     assert.deepEqual(rolesToKill('both'), ['supervisor', 'worker']);
     assert.deepEqual(rolesToKill('worker'), ['worker']);
-    assert.deepEqual(KILL_ITEMS.map(item => item.role), ['supervisor', 'worker', 'both']);
     assert.equal(findLiveRow(live, 'exited'), null);
 });
 
@@ -338,7 +340,7 @@ function scriptedMenu(choices, confirms = []) {
     };
 }
 
-test('a supervised session is created, switched with Shift+Tab, killed and left with Shift+Tab', async (t) => {
+test('a supervised session is created, switched with Ctrl+\\, killed and left with Shift+Tab', async (t) => {
     const root = agentWorkspace(t);
     const supervisor = 'S'.repeat(32);
     const worker = 'W'.repeat(32);
@@ -378,8 +380,7 @@ test('a supervised session is created, switched with Shift+Tab, killed and left 
         { action: 'enter', index: 0 },      // supervisor agent
         { action: 'enter', index: 0 },      // worker robot
         { action: 'enter', index: 0 },      // worker agent → both terminals start
-        { action: 'kill' },                 // the pair's kill screen
-        { action: 'enter', index: 1 },      // kill the worker
+        { action: 'kill', index: 1 },       // kill the selected worker directly
         { action: 'tab' },                  // pair screen → coding robots
         { action: 'quit', index: 0 },
     ], [true]);
@@ -418,7 +419,7 @@ test('a supervised session is created, switched with Shift+Tab, killed and left 
     assert.equal(couriers[0].started, true);
     assert.equal(couriers[0].options.workerTerminalId, worker);
     assert.equal(couriers[0].options.folder, path.join(root, 'project'));
-    // Shift+Tab switched to the other role and Ctrl+] came back to the pair screen.
+    // Ctrl+\ switched to the other role and Ctrl+] came back to the pair screen.
     assert.deepEqual(relays.map(relay => relay.sessionId), [supervisor, worker]);
     assert.deepEqual(relays.map(relay => relay.keys.switch), [SWITCH_KEY, SWITCH_KEY]);
     // Only this tab asks the view to silence the report modes the agents switch on.
@@ -427,13 +428,13 @@ test('a supervised session is created, switched with Shift+Tab, killed and left 
     assert.deepEqual(selects[1][1].tabs, ['Coding sessions', 'Supervised sessions']);
     assert.equal(selects[1][1].activeTab, 1);
     assert.match(selects[6][1].status, /Detached: the session keeps running/u);
-    assert.deepEqual(selects[6][1].items.map(item => item.label), ['Supervisor · claude', 'Worker · claude']);
+    assert.deepEqual(selects[6][1].items.map(item => item.label), ['● Supervisor · claude', '● Worker · claude']);
     // Killing the worker closed that terminal, and Shift+Tab returned to the coding tab.
     assert.deepEqual(calls.filter(call => call[0] === 'DELETE').map(call => call[1]), [`/webtty/sessions/${worker}`]);
-    assert.match(selects[8][1].status, /Killed Worker/u);
-    assert.equal(selects[8][1].activeTab, 1);
-    assert.equal(selects[9][1].activeTab, 0);
-    assert.match(errors.join(''), /Shift\+Tab switch/u);
+    assert.match(selects[7][1].status, /Killed Worker/u);
+    assert.equal(selects[7][1].activeTab, 1);
+    assert.equal(selects[8][1].activeTab, 0);
+    assert.match(errors.join(''), /Ctrl\+\\ switch/u);
     assert.equal(couriers[0].stopped, true);
     assert.equal(menu.views.at(-1)[0], 'close');
 });

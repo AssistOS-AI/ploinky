@@ -1,5 +1,5 @@
 import {
-    attachRole, createSupervisedPair, findLiveRow, KILL_ITEMS, killRoles, pairItems, pairRoleItems, runningTerminals,
+    attachRole, createSupervisedPair, findLiveRow, killRoles, pairItems, pairRoleItems, runningTerminals,
     RELAY_EXIT_REASONS, relayStatus, supervisionTabs,
 } from '../utils/supervisionFlow.mjs';
 import { SUPERVISION_ROLE_LABELS } from '../utils/supervisionRoles.mjs';
@@ -9,7 +9,7 @@ import {
 import { DETACH_KEY, RELAY_KEY_LABELS, SWITCH_KEY } from '../utils/webttyCliClient.mjs';
 
 // The supervised tab of `ploinky cs`: a list of pairs, one pair's two sessions,
-// the kill screen, and the couriers that carry each new revision to the worker.
+// and the couriers that carry each new revision to the worker.
 // The command owns the event loop; this module owns one screen at a time.
 const MAX_COURIERS = 8;
 const ENTRY_LEVEL = 'pairs';
@@ -74,7 +74,7 @@ export function createSupervisedScreen({
         }
     }
 
-    // Shift+Tab attaches the other role of the same pair; every other way out
+    // Ctrl+\ attaches the other role of the same pair; every other way out
     // returns to the pair menu and leaves both terminals running.
     async function attach(pairId, initialRole) {
         let role = initialRole;
@@ -237,34 +237,6 @@ export function createSupervisedScreen({
         return {};
     }
 
-    async function killScreen(state, { tabs, status }) {
-        const record = findSession(read(), state.supervised);
-        if (!record) { state.level = ENTRY_LEVEL; state.status = 'That session is no longer saved.'; return {}; }
-        const header = { ...tabs, title: [`Supervised sessions — ${folder}`, `${record.label || record.folder} › kill a session`] };
-        const choice = await menu.select({ ...header, items: [...KILL_ITEMS], status,
-            help: '↑/↓ select · Enter kill · Backspace back · Shift+Tab coding · q quit' });
-        state.status = '';
-        if (choice.action === 'tab') return { mode: 'coding' };
-        if (choice.action === 'quit') return { quit: true };
-        if (choice.action === 'back') { state.level = 'pair'; return {}; }
-        const target = KILL_ITEMS[choice.index];
-        if (!target) { state.level = 'pair'; return {}; }
-        if (!await menu.confirm({ ...header, items: [...KILL_ITEMS], selected: choice.index }, `${target.label}?`)) {
-            state.level = 'pair';
-            return {};
-        }
-        let killed;
-        try { killed = await killRoles(client, record, target.role); }
-        catch (error) { state.status = `Kill failed: ${failure(error)}`; state.level = 'pair'; return {}; }
-        if (target.role === 'both') {
-            mutate(store => updateSession(store, record.id, () => ({ phase: 'ended' }), now));
-            sync();
-        }
-        state.status = killed.length ? `Killed ${killed.map(name => labels[name]).join(' and ')}.` : 'Nothing was running.';
-        state.level = 'pair';
-        return {};
-    }
-
     async function pairScreen(state, { tabs, status }) {
         const record = findSession(read(), state.supervised);
         if (!record) { state.level = ENTRY_LEVEL; state.status = 'That session is no longer saved.'; return {}; }
@@ -287,9 +259,22 @@ export function createSupervisedScreen({
         if (choice.action === 'tab') return { mode: 'coding' };
         if (choice.action === 'quit') return { quit: true };
         if (choice.action === 'back') { state.level = ENTRY_LEVEL; return {}; }
-        if (choice.action === 'kill') { state.level = 'kill'; return {}; }
         const item = items[choice.index];
         if (item?.kind !== 'role') { state.status = 'Choose a session to attach.'; return {}; }
+        if (choice.action === 'kill') {
+            if (!item.row) { state.status = 'Only a running session can be killed.'; return {}; }
+            if (!await menu.confirm({ ...view, selected: choice.index },
+                `Kill ${item.label}? Its conversation stays resumable.`)) return {};
+            try {
+                await killRoles(client, record, item.role);
+                if (!items.some(other => other.role !== item.role && other.row)) {
+                    mutate(store => updateSession(store, record.id, () => ({ phase: 'ended' }), now));
+                    sync();
+                }
+                state.status = `Killed ${labels[item.role]}.`;
+            } catch (error) { state.status = `Kill failed: ${failure(error)}`; }
+            return {};
+        }
         let result;
         try {
             result = await menu.busy({ ...view, selected: choice.index, status: `Attaching to the ${labels[item.role].toLowerCase()}…` },
@@ -318,7 +303,6 @@ export function createSupervisedScreen({
         if (state.level === 'supervisor-agent' || state.level === 'worker-agent') {
             return agentScreen(state, state.level === 'supervisor-agent' ? 'supervisor' : 'worker', context);
         }
-        if (state.level === 'kill') return killScreen(state, context);
         return pairScreen(state, context);
     }
 

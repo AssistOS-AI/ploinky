@@ -20,11 +20,11 @@ const INPUT_WINDOW_MS = 10_000;
 const INPUT_WINDOW_BYTES = 384 * 1024;
 const RESIZE_DELAY_MS = 80;
 const SIZE_CLAIM_INTERVAL_MS = 500;
-// Ctrl+] detaches this view and Shift+Tab hands the screen to the other role of a
+// Ctrl+] detaches this view and Ctrl+\ hands the screen to the other role of a
 // supervised session; neither key ever reaches the terminal.
 export const DETACH_KEY = '\x1d';
-export const SWITCH_KEY = '\x1b[Z';
-export const RELAY_KEY_LABELS = Object.freeze({ detach: 'Ctrl+]', switch: 'Shift+Tab' });
+export const SWITCH_KEY = '\x1c';
+export const RELAY_KEY_LABELS = Object.freeze({ detach: 'Ctrl+]', switch: 'Ctrl+\\' });
 const RECONNECT_LIMIT_MS = 60_000;
 
 export class RouterRequestError extends Error {

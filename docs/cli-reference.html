@@ -270,10 +270,10 @@ results.md # written by the worker</code></pre>
                         <table class="command-table"><thead><tr><th>Key</th><th>Effect</th></tr></thead><tbody>
                             <tr><td>Arrows, Enter</td><td>In the pair list, open a pair; in a pair, attach to its supervisor or its worker; in the session, send input.</td></tr>
                             <tr><td><code>n</code>, <code>r</code>, <code>d</code></td><td>Start a pair (robot and agent for each role), refresh the list, forget a saved pair without touching its terminals.</td></tr>
-                            <tr><td><code>k</code></td><td>In a pair, choose Kill Supervisor, Kill Worker or Kill both, each after confirmation.</td></tr>
-                            <tr><td>Shift+Tab in a session</td><td>Attach to the other role of the same pair; the terminal you leave keeps running.</td></tr>
+                            <tr><td><code>k</code></td><td>Kill the selected running Supervisor or Worker after confirmation.</td></tr>
+                            <tr><td>Ctrl+\ in a session</td><td>Attach to the other role of the same pair; the terminal you leave keeps running. Shift+Tab reaches the coding agent unchanged.</td></tr>
                             <tr><td>Ctrl+] in a session</td><td>Return to the pair menu; the session keeps running.</td></tr>
-                            <tr><td>Backspace</td><td>Return from a pair menu or a kill screen to the pair list.</td></tr>
+                            <tr><td>Backspace</td><td>Return from the pair menu to the pair list.</td></tr>
                         </tbody></table>
                         <div class="alert alert-info">
                             A supervised view never lets its terminal enter mouse or focus reporting: those modes are removed from the agent's output — including several modes in one sequence — so dragging keeps selecting text and no ESC[I answers reach your shell. This applies to supervised sessions only; a plain coding session still receives whatever its agent writes. Exiting a coding agent ends that role's terminal and returns you to the pair menu, where the role is listed as ended and entering it resumes its native conversation. The pair list and the delivered revision are stored in <code>.ploinky/supervised-sessions.json</code>, which a terminal sandbox cannot read; role instructions live in <code>.supervised/</code> and <code>tasks.md</code> and <code>results.md</code> live directly in the working folder, which both agents can read. Only one courier runs per pair, for at most eight saved running pairs in this folder, and it stops when this command exits: terminals are unaffected.

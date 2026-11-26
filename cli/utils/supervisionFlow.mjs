@@ -65,7 +65,7 @@ export function pairItems({ sessions = [], live = [], now = Date.now() } = {}) {
                 kind: 'pair',
                 session,
                 ...state,
-                label: `${state.running ? '●' : '○'} ${session.label || session.folder}`,
+                label: `${state.running ? '● ' : '  '}${session.label || session.folder}`,
                 detail: `${state.running ? 'running' : 'ended'} · ${session.supervisor.codingAgent} → ${session.worker.codingAgent} · `
                     + relativeAge(session.updatedAt || session.createdAt, now),
             };
@@ -85,7 +85,7 @@ function roleItem(role, record, row, now) {
         role,
         record,
         row,
-        label: `${SUPERVISION_ROLE_LABELS[role]} · ${record.codingAgent}`,
+        label: `${row ? '● ' : '  '}${SUPERVISION_ROLE_LABELS[role]} · ${record.codingAgent}`,
         detail: roleDetail(row, now),
     };
 }
@@ -98,12 +98,6 @@ export function pairRoleItems(session, live = [], now = Date.now()) {
         roleItem('worker', session.worker, state.worker, now),
     ];
 }
-
-export const KILL_ITEMS = Object.freeze([
-    { kind: 'kill', role: 'supervisor', label: `Kill ${SUPERVISION_ROLE_LABELS.supervisor}` },
-    { kind: 'kill', role: 'worker', label: `Kill ${SUPERVISION_ROLE_LABELS.worker}` },
-    { kind: 'kill', role: 'both', label: 'Kill both' },
-]);
 
 // Opens both terminals in the chosen folder and starts each role with its own
 // instructions. A half-opened pair is closed again, so a failure never leaves a

@@ -24,7 +24,7 @@ test('replay removes terminal queries at every chunk boundary but preserves colo
     }
 });
 
-test('fragmented Shift+Tab switches without delivering escape bytes to the agent', async () => {
+test('Ctrl+backslash switches without delivering the control byte to the agent', async () => {
     const posted = [];
     const input = Object.assign(new EventEmitter(), { pause() {} });
     const relay = new TerminalRelay({ input, output: { write() {} }, signals: new EventEmitter(),
@@ -32,14 +32,33 @@ test('fragmented Shift+Tab switches without delivering escape bytes to the agent
         client: { json: async (...args) => posted.push(args) } });
     relay.onData = () => {}; relay.onEnd = () => {}; relay.onSignal = () => {};
     const result = new Promise(resolve => { relay.resolve = resolve; });
-    relay.queueInput('\x1b');
-    relay.queueInput('[');
-    relay.queueInput('Z');
+    assert.equal(SWITCH_KEY, '\x1c');
+    relay.queueInput('\x1c');
     assert.equal((await result).reason, 'switch');
     assert.equal(posted.some(([, route]) => route.endsWith('/input')), false);
     const parse = createKeyParser();
     assert.deepEqual(parse('\x1b['), []);
     assert.deepEqual(parse('Z'), ['tab']);
+});
+
+test('Shift+Tab and its follow-up reach the coding agent immediately', async () => {
+    for (const followup of [null, 'r', 'x']) {
+        const posted = [];
+        const relay = new TerminalRelay({ sessionId: 'session', viewId: 'view',
+            keys: { switch: SWITCH_KEY }, client: { json: async (...args) => posted.push(args) } });
+        relay.queueInput('\x1b[Z');
+        assert.equal(relay.keyTimer, null);
+        if (followup) relay.queueInput(followup);
+        await relay.flushing;
+        assert.equal(relay.finished, false);
+        assert.equal(posted.map(([, , body]) => body.data).join(''), `\x1b[Z${followup || ''}`);
+        if (!followup) {
+            relay.queueInput('r');
+            await relay.flushing;
+            assert.equal(relay.finished, false, 'r remains ordinary input');
+            assert.equal(posted.at(-1)[2].data, 'r');
+        }
+    }
 });
 
 test('results wake the supervisor once per change and concurrent polling does not duplicate delivery', async () => {

@@ -315,7 +315,7 @@ ploinky start explorer</code></pre>
                     <p>Press <kbd>Shift+Tab</kbd> in the coding sessions menu to let one coding agent supervise another in the same folder. Pick a robot and a coding agent for the supervisor, then a robot and a coding agent for the worker; both terminals start in the current folder and each one is briefed with its own role.</p>
                     <p>The supervisor writes <code>tasks.md</code> and reviews <code>results.md</code>; the worker reads the task file, implements it, and appends its report to the result file. Each new revision reaches the worker automatically, and a worker that goes quiet is reported once.</p>
                     <p>The instructions for both roles travel with the session. For a coding agent that reads its own skills — Claude Code and Mistral Vibe — they are installed in that agent's skill directory, so its first prompt only names the role; for the others the prompt carries the instructions and they are also kept in <code>.supervised/</code>.</p>
-                    <p>Inside a session, <kbd>Shift+Tab</kbd> switches to the other role and <kbd>Ctrl+]</kbd> returns to the pair menu, where <code>k</code> kills one role or both and <code>d</code> forgets a saved pair. The terminals you leave keep running.</p>
+                    <p>Inside a session, <kbd>Ctrl+\</kbd> switches to the other role and <kbd>Ctrl+]</kbd> returns to the pair menu, where <code>k</code> kills the selected running role after confirmation. In the pair list, <code>d</code> forgets a saved pair. The terminals you leave keep running.</p>
                     <p><kbd>Shift+Tab</kbd> or <kbd>←</kbd> <kbd>→</kbd> moves between the two menus.</p>
 
                     <h3>Globally from any directory</h3>
