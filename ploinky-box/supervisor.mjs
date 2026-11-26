@@ -766,33 +766,41 @@ export function createBoxSupervisor({
         return '';
     }
 
-    // PROD true requires workspace profile `prod`. On a running Box, ask the
-    // in-Box core (inspect-only `profile assert`) before this transaction
-    // touches the Box, ahead of `settleHardwareTransitions`. A stopped or absent
-    // Box has nothing to ask, and a Box whose contract cannot be reconstructed is
-    // about to be replaced; the in-Box start and restart repeat the check before
-    // their own first mutation.
+    // PROD true requires workspace profile `prod`. On a running, initialized Box,
+    // ask the in-Box core (inspect-only `profile assert`) before this transaction
+    // touches the Box, ahead of `settleHardwareTransitions`. A Box that is absent,
+    // stopped, uninitialized, not inspectable or about to be replaced has nothing
+    // to ask here; the in-Box start and restart repeat the check before their own
+    // first mutation, so this is the host's early refusal, not the only one.
     async function assertInBoxProdProfile(identity, ownership, coreArgs) {
-        const container = ownership?.handles?.container;
-        const engine = ownership?.engine;
-        if (ownership?.state !== 'owned' || !container?.id || !engine?.name
-            || container.runtime?.running !== true) return;
+        let status;
         let selection;
         let hostPort;
         let mediaHostPort;
         try {
-            selection = agentLibContractFromContainer(container);
-            revalidateMountedAgentLibSource(selection, { engine, containerId: container.id, runner });
-            hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
-            mediaHostPort = Number(container.labels?.[BOX_LABELS.mediaHostPort]);
+            status = inspectBoxStatus();
+            const statusContainer = status.ownership?.handles?.container;
+            if (status.identity?.instance !== identity.instance
+                || status.state !== 'running-initialized'
+                || !statusContainer?.id
+                || !status.ownership?.engine?.name
+                || ownership?.handles?.container?.id !== statusContainer.id) return;
+            selection = agentLibContractFromContainer(statusContainer);
+            revalidateAgentLibSource(selection, {
+                engine: status.ownership.engine,
+                containerId: statusContainer.id,
+                runner,
+            });
+            hostPort = Number(statusContainer.labels?.[BOX_LABELS.routerHostPort]);
+            mediaHostPort = Number(statusContainer.labels?.[BOX_LABELS.mediaHostPort]);
         } catch (_) {
             return;
         }
         const profile = requestedProfileFromCoreArgs(coreArgs);
         const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
         await runCoreCommand(
-            engine,
-            container.id,
+            status.ownership.engine,
+            status.ownership.handles.container.id,
             ['profile', 'assert', ...(profile ? ['--profile', profile] : [])],
             hostPort,
             mediaHostPort,

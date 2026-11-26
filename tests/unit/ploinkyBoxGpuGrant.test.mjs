@@ -2678,7 +2678,9 @@ function reapplySupervisor(t, {
         commitAgentLibSelection: () => {},
         revalidateAgentLibSource: () => {},
         captureCoreStartArgv: () => ['start', 'explorer', '8080'],
-        runCoreCommand: async () => { install('core'); },
+        // The inspect-only `profile assert` the transaction runs on a running initialized Box is not
+        // the graph core: it installs nothing.
+        runCoreCommand: async (_engine, _containerId, argv) => { if (argv?.[0] !== 'profile') install('core'); },
         runRestartCore: fakeRestartCore(async () => { install('restart-core'); }),
         runUpdateCore: fakeUpdateCore({ onCall: () => { install('update-core'); } }),
         validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
