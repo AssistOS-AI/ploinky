@@ -120,6 +120,29 @@ test('A10 a withdrawn lease keeps the base lease document shape, so the base rev
     assert.match(document.predecessorGeneration, /^sha256:[a-f0-9]{64}$/);
 });
 
+test('withdrawn selector rename failure retains conservative policy after publication', () => {
+    seed();
+    const prepared = drainAndPrepare();
+    const routing = structuredClone(prepared.generation.routing);
+    routing.routes.beta.hostPort = 45102;
+    let policy = 'old';
+    assert.throws(() => edge.withEdgeGenerationApplyLock((applyLockCapability) => (
+        edge.commitAdditiveEdgeRoutingGeneration(prepared.preparationLease, {
+            workspaceRoot: workspace,
+            routing,
+            agents: prepared.generation.agents,
+            applyLockCapability,
+            beforeSelectorCommit() { policy = 'conservative'; return () => { policy = 'old'; }; },
+            afterSelectorCommit() { assert.fail('settlement did not finish'); },
+            testHooks: { afterSelectorRename() { throw new Error('directory sync failed'); } },
+        })
+    ), { workspaceRoot: workspace, preparationLease: prepared.preparationLease }), {
+        code: 'EDGE_SELECTOR_COMMITTED_RECOVERY_REQUIRED', edgeSelectorCommitted: true,
+    });
+    assert.equal(policy, 'conservative');
+    assert.equal(edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }).generation.routing.routes.beta.hostPort, 45102);
+});
+
 test('RF-I4 the rollback precondition retires an abandoned withdrawn lease and lifts every automatic drain', async () => {
     seed();
     // An operator drain is not the candidate's to lift.

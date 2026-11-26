@@ -398,7 +398,7 @@ function fsyncDirectory(directory) {
     }
 }
 
-function atomicWrite(file, bytes, { mode } = {}) {
+function atomicWrite(file, bytes, { mode, afterRename } = {}) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
     let fd;
@@ -409,6 +409,7 @@ function atomicWrite(file, bytes, { mode } = {}) {
         fs.closeSync(fd);
         fd = undefined;
         fs.renameSync(tmp, file);
+        afterRename?.();
         fsyncDirectory(path.dirname(file));
     } catch (error) {
         if (fd !== undefined) {
@@ -2019,10 +2020,37 @@ export function prepareHostModeCapabilityForInactiveGeneration(owner, options = 
     return createPreparedHostModeCapability(paths, selector, generation, exact, preparationLease);
 }
 
-function writeOwnedEdgeSelector(paths, selector) {
+function writeOwnedEdgeSelector(paths, selector, options = {}) {
     const before = readSelector(paths);
-    atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), { mode: 0o600 });
+    atomicWrite(paths.activeSelectorFile, Buffer.from(JSON.stringify(selector, null, 2)), {
+        mode: 0o600,
+        afterRename: options.testHooks?.afterSelectorRename
+            ? () => options.testHooks.afterSelectorRename({ paths, selector, before }) : undefined,
+    });
     recordOwnedEdgeSelection({ selectorFile: paths.activeSelectorFile, before, after: selector });
+}
+
+function exactSelector(left, right) {
+    return Boolean(left && right && left.state === right.state
+        && left.generation === right.generation && left.activationId === right.activationId
+        && left.selectorDigest === right.selectorDigest);
+}
+
+// The rename may have succeeded even when its durability or observer failed.
+// Keep the conservative policy for both committed and unknown outcomes.
+function selectorWriteFailure(paths, intended, previous, cause) {
+    const actual = readSelector(paths);
+    if (exactSelector(actual, previous)) return cause;
+    const committed = exactSelector(actual, intended);
+    const error = edgeError(
+        committed ? 'edge selector was published but its settlement requires recovery'
+            : 'edge selector publication is indeterminate and requires recovery',
+        committed ? 'EDGE_SELECTOR_COMMITTED_RECOVERY_REQUIRED' : 'EDGE_SELECTOR_INDETERMINATE',
+    );
+    error.cause = cause;
+    if (committed) error.edgeSelectorCommitted = true;
+    else error.edgeSelectorIndeterminate = true;
+    return error;
 }
 
 function sealSelector(selector) {
@@ -2941,6 +2969,9 @@ export function applyEdgeRoutingGeneration(options = {}) {
     let transactionStarted = false;
     let selectorCommitted = false;
     let beforeSelectorRollback = null;
+    let selectorWriteAttempted = false;
+    let intendedSelector = null;
+    let priorSelector = null;
     try {
         // A withdrawn lease commits active to active: its predecessor already
         // withdrew the replaced runtime's routes, so no inactive window is
@@ -3154,14 +3185,20 @@ export function applyEdgeRoutingGeneration(options = {}) {
             throw edgeError('edge selector changed before authorization commit', 'EDGE_GENERATION_RACE');
         }
         if (preparationLease) removePreparationLease(paths, preparationLease);
-        writeOwnedEdgeSelector(paths, selector);
+        intendedSelector = selector;
+        priorSelector = inactiveSelector;
+        selectorWriteAttempted = true;
+        writeOwnedEdgeSelector(paths, selector, options);
         selectorCommitted = true;
         options.afterSelectorCommit?.({ paths, generation, topology, selector });
         return { selector: deepFreeze(selector), generation, topology, paths };
     } catch (error) {
-        if (!selectorCommitted && beforeSelectorRollback) beforeSelectorRollback();
+        if (selectorWriteAttempted && !selectorCommitted) error = selectorWriteFailure(paths, intendedSelector, priorSelector, error);
+        const indeterminate = error.edgeSelectorIndeterminate === true;
+        selectorCommitted ||= error.edgeSelectorCommitted === true;
+        if (!selectorCommitted && !indeterminate && beforeSelectorRollback) beforeSelectorRollback();
         if (selectorCommitted) error.edgeSelectorCommitted = true;
-        if (!selectorCommitted && transactionStarted && applyLockHeld) {
+        if (!selectorCommitted && !indeterminate && transactionStarted && applyLockHeld) {
             inactivateEdgeRoutingGeneration(error?.code || 'apply-failed', {
                 ...options,
                 applyLockCapability,
@@ -3384,6 +3421,9 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
 
     let selectorCommitted = false;
     let beforeSelectorRollback = null;
+    let selectorWriteAttempted = false;
+    let intendedSelector = null;
+    let priorSelector = null;
     const predecessorTopology = fs.existsSync(paths.topologyCurrentFile)
         ? { exists: true, bytes: fs.readFileSync(paths.topologyCurrentFile) }
         : { exists: false, bytes: null };
@@ -3429,14 +3469,19 @@ export function commitAdditiveEdgeRoutingGeneration(preparationLease, options = 
             options.testHooks.afterBeforeSelectorCommit({ paths, generation, topology, selector });
         }
         assertPreparedSelectorStillSelected(paths, lease);
-        writeOwnedEdgeSelector(paths, selector);
+        priorSelector = readSelector(paths);
+        intendedSelector = selector;
+        selectorWriteAttempted = true;
+        writeOwnedEdgeSelector(paths, selector, options);
         selectorCommitted = true;
         options.afterSelectorCommit?.({ paths, generation, topology, selector });
         removePreparationLease(paths, lease);
         return { selector: deepFreeze(selector), generation, topology, paths };
     } catch (error) {
+        if (selectorWriteAttempted && !selectorCommitted) error = selectorWriteFailure(paths, intendedSelector, priorSelector, error);
+        selectorCommitted ||= error.edgeSelectorCommitted === true;
         if (selectorCommitted) error.edgeSelectorCommitted = true;
-        if (!selectorCommitted) {
+        if (!selectorCommitted && !error.edgeSelectorIndeterminate) {
             const restoreErrors = [];
             if (beforeSelectorRollback) {
                 try { beforeSelectorRollback(); } catch (restoreError) { restoreErrors.push(restoreError); }

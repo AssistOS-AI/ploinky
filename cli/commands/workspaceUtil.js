@@ -3870,8 +3870,11 @@ async function startWorkspace(staticAgentArg, portArg, {
     printStartResultSummary(startResult);
     return startResult;
   } catch (e) {
-    if (workspaceActivated || e.edgeSelectorCommitted) {
-      throw new Error(`start: workspace activated; settlement requires recovery: ${e?.message || e}`, { cause: e });
+    if (workspaceActivated || e.edgeSelectorCommitted || e.edgeSelectorIndeterminate) {
+      const state = e.edgeSelectorIndeterminate ? 'selector publication is indeterminate' : 'workspace activated';
+      const recoveryError = new Error(`start: ${state}; settlement requires recovery: ${e?.message || e}`, { cause: e });
+      if (e.code) recoveryError.code = e.code;
+      throw recoveryError;
     }
     const cleanedCandidateIds = new Set();
     for (const candidate of workspaceRuntimeCandidates.reverse()) {

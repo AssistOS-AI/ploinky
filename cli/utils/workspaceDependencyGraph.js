@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { manifestEnableEntries, parseEnableDirective, qualifyEnableSpecForRepo } from './runtime/bootstrapManifest.js';
 import { findAgent } from './utils.js';
+import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { isSsoProviderManifest } from './agentRegistry.js';
 import { getActiveProfile, mergeProfiles } from './runtime/profileService.js';
 import { isEnvironmentProfile, followWorkspaceProfile } from './runtime/profileFollow.mjs';
@@ -189,7 +190,8 @@ function resolveWorkspaceDependencyGraph({
             resolved = findAgent(agentRef);
         } catch (error) {
             const repo = agentRef.split(/[:/]/)[0];
-            if (!isStatic && deferMissingDeclaredRepos && error.code === 'PLOINKY_AGENT_SOURCE_MISSING' && declaredRepos.has(repo)) {
+            if (!isStatic && deferMissingDeclaredRepos && error.code === 'PLOINKY_AGENT_SOURCE_MISSING'
+                && declaredRepos.has(repo) && !fs.lstatSync(resolveAgentRepositoryPath(repo), { throwIfNoEntry: false })) {
                 return null;
             }
             throw error;

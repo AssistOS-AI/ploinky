@@ -1263,8 +1263,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
         });
     } catch (error) {
-        if (activated || error.edgeSelectorCommitted) {
-            throw wrapLifecycleError(`enable agent: '${shortAgentName}' activated; settlement requires recovery: ${error?.message || error}`, error);
+        if (activated || error.edgeSelectorCommitted || error.edgeSelectorIndeterminate) {
+            const state = error.edgeSelectorIndeterminate ? 'selector publication is indeterminate' : 'activated';
+            throw wrapLifecycleError(`enable agent: '${shortAgentName}' ${state}; settlement requires recovery: ${error?.message || error}`, error);
         }
         const failedCandidate = started || error?.ploinkyRestartCandidate || null;
         if (failedCandidate?.containerName

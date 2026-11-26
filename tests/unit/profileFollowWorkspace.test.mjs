@@ -376,6 +376,9 @@ test('preflight defers a declared new repository until acquisition and still che
     const graph = resolveWorkspaceDependencyGraph({ ...options, deferMissingDeclaredRepos: true });
     assert.deepEqual([...graph.nodes.values()].map(node => node.agentRef).sort(), ['repo/bootstrap', 'repo/dep']);
     assert.throws(() => resolveWorkspaceDependencyGraph(options), /not found/);
+    const installedPartner = path.join(workspace, '.ploinky', 'repos', 'partner');
+    fs.mkdirSync(installedPartner);
+    assert.throws(() => resolveWorkspaceDependencyGraph({ ...options, deferMissingDeclaredRepos: true }), /not found/);
     writeAgent('bootstrap', { profiles: FULL, enable: ['unknown/newAgent'] });
     assert.throws(() => resolveWorkspaceDependencyGraph({ ...options, deferMissingDeclaredRepos: true }), /not found/);
 });
