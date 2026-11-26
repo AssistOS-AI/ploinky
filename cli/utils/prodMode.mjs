@@ -74,3 +74,13 @@ export function assertProdProfileConsistency({
         );
     }
 }
+
+export function assertDeploySettingsCurrent(capture) {
+    const prod = readProd();
+    const workspaceProfile = getActiveProfile();
+    assertProdProfileConsistency({ requestedProd: prod, workspaceProfile });
+    if (prod !== capture.prod || workspaceProfile !== capture.workspaceProfile) {
+        throw prodError('PLOINKY_DEPLOY_SETTINGS_CHANGED',
+            'The requested production mode or workspace profile changed during deployment. Retry with the current settings.');
+    }
+}

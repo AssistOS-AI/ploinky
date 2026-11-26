@@ -26,7 +26,7 @@ process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 process.env.PLOINKY_MASTER_KEY = randomUUID().replaceAll('-', '').padEnd(64, 'a');
 fs.writeFileSync('.env', '');
 
-const { parseProd, readProd, assertProdProfileConsistency } = await import('../../cli/utils/prodMode.mjs');
+const { parseProd, readProd, assertProdProfileConsistency, assertDeploySettingsCurrent } = await import('../../cli/utils/prodMode.mjs');
 const { handleVarCommand, handleVarStdinCommand } = await import('../../cli/commands/envVarCommands.js');
 const { readSecretsFile, writeSecretsFile } = await import('../../cli/utils/security/encryptedSecretsFile.js');
 const { setActiveProfile, getActiveProfile, getProfileEnvVars, validateProfile } = await import('../../cli/utils/runtime/profileService.js');
@@ -182,6 +182,18 @@ test('mode changes respect the workspace lease and normalized variable name', as
     } finally {
         assert.equal(locks.releaseWorkspaceMutationLease(lease), true);
     }
+});
+
+test('a deployment prepared under prod refuses a subsequent valid switch to QA', () => {
+    reset();
+    setProfileFile('prod');
+    quietVar('PROD', 'true');
+    const prepared = { prod: true, workspaceProfile: 'prod' };
+    assert.doesNotThrow(() => assertDeploySettingsCurrent(prepared));
+    quietVar('PROD', 'false');
+    assert.equal(setActiveProfile('qa').success, true);
+    assert.throws(() => assertDeploySettingsCurrent(prepared), codeIs('PLOINKY_DEPLOY_SETTINGS_CHANGED'));
+    assert.doesNotThrow(() => assertDeploySettingsCurrent({ prod: false, workspaceProfile: 'qa' }));
 });
 
 test('production inspection preserves an empty or unreadable store', () => {

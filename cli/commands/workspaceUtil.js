@@ -51,8 +51,9 @@ import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, res
 import { getActiveProfile, getProfileConfig, getRuntimePolicyEnvironment, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
-import { PROD_ENV } from '../utils/prodMode.mjs';
+import { assertDeploySettingsCurrent, PROD_ENV } from '../utils/prodMode.mjs';
 import {
+  capturedProdOrClosed,
   dryCaptureProdGates,
   readCapturedProdGates,
   stageProdGates,
@@ -1598,13 +1599,13 @@ export function collectProdGateRoutes({
     if (staticAgent) {
       try {
         resolvedGraph = resolveWorkspaceDependencyGraph({
-          staticAgentRef: staticAgent, registry, workspaceProfile, prod,
+          staticAgentRef: staticAgent, registry, workspaceProfile, prod, deferMissingDeclaredRepos: true,
           onUnresolvedDependency: () => {},
         });
       } catch (error) {
         // A fresh start prepares its repositories after this inspection. Only
         // missing sources can be deferred; the admitted graph is checked again.
-        const missing = /not found\.|No repos found\./.test(String(error.message));
+        const missing = error.code === 'PLOINKY_AGENT_SOURCE_MISSING';
         if (prod && (retained || !missing)) throw error;
       }
     }
@@ -1627,7 +1628,7 @@ export function resolveStartProd(prodCapture) {
 // for the ready generation's selector commit.
 export function commitProdCapture(prodCapture, start) {
   if (!prodCapture) return;
-  const workspaceProfile = getActiveProfile();
+  const workspaceProfile = prodCapture.workspaceProfile || getActiveProfile();
   const routes = collectProdGateRoutes({ registry: start.registry, graph: start.graph, additionalNodes: start.additionalNodes, prod: prodCapture.prod, workspaceProfile });
   return dryCaptureProdGates({ prod: prodCapture.prod, routes, workspaceProfile });
 }
@@ -3152,7 +3153,8 @@ async function startWorkspace(staticAgentArg, portArg, {
   // this lease, and nothing else in the process can. A rollback start can
   // follow a killed start at once: wait out only that dead owner's stale
   // network-lock grace, never a live owner.
-  return await runWithRuntimePolicyEnvironment({ prod: startProd, workspaceProfile: getActiveProfile() }, () => runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
+  if (prodCapture) assertDeploySettingsCurrent(prodCapture);
+  return await runWithRuntimePolicyEnvironment({ prod: startProd, workspaceProfile: prodCapture?.workspaceProfile || getActiveProfile() }, () => runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
   // No earlier no-wait worker still alive here can change anything while this

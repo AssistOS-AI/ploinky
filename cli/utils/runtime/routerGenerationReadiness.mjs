@@ -4,7 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 // This is a reader/writer capability, not a Box or deployment version. A
 // running Router reports the format its loaded code understands; reading the
 // checkout on disk would incorrectly describe a daemon predating an update.
-export const ROUTER_GENERATION_SOURCE_FORMAT = 'router-public-hosts-v1';
+export const ROUTER_GENERATION_SOURCE_FORMAT = 'router-public-hosts-v1+prod-gates-v1';
 
 const MAX_HEALTH_BYTES = 64 * 1024;
 
