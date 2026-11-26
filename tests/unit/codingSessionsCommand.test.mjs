@@ -398,7 +398,8 @@ test('the relay writes output, forwards keystrokes, takes the size with a redraw
     input.emit('data', Buffer.from('ls\r'));
     const result = await running;
     assert.deepEqual(result, { reason: 'exited', detail: 'terminal_exit' });
-    assert.deepEqual(written, ['hello', ' world']);
+    assert.deepEqual(written.slice(0, 2), ['hello', ' world']);
+    assert.ok(written.at(-1).startsWith(TERMINAL_INPUT_RESET));
     assert.deepEqual(input.raw, [true, false]);
     assert.deepEqual(client.posts.filter(entry => entry[0] === 'STREAM').map(entry => entry[2]), ['', '1']);
     assert.ok(client.posts.some(entry => entry[0] === 'POST' && entry[1] === `${base}/input` && entry[2].data === 'ls\r'));

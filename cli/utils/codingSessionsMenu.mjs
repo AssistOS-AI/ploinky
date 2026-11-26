@@ -6,6 +6,7 @@ const ESC = '\x1b';
 const KEYS = Object.freeze({
     [`${ESC}[A`]: 'up', [`${ESC}OA`]: 'up', [`${ESC}[B`]: 'down', [`${ESC}OB`]: 'down',
     [`${ESC}[5~`]: 'pageUp', [`${ESC}[6~`]: 'pageDown', [`${ESC}[H`]: 'home', [`${ESC}[F`]: 'end',
+    [`${ESC}[Z`]: 'tab', [`${ESC}[C`]: 'right', [`${ESC}OC`]: 'right', [`${ESC}[D`]: 'left', [`${ESC}OD`]: 'left',
     [`${ESC}[3~`]: 'delete', '\r': 'enter', '\n': 'enter', '\x7f': 'back', '\b': 'back', '\x03': 'quit',
 });
 
@@ -13,7 +14,7 @@ const KEYS = Object.freeze({
 // detaches: mouse reporting in every encoding, focus reporting, bracketed
 // paste, the kitty keyboard protocol and application cursor keys. The menu
 // turns them off, so a mouse moving over the terminal never reads as a key.
-export const TERMINAL_INPUT_RESET = `${ESC}[?1000l${ESC}[?1001l${ESC}[?1002l${ESC}[?1003l${ESC}[?1005l${ESC}[?1006l`
+export const TERMINAL_INPUT_RESET = `${ESC}[?9l${ESC}[?1009l${ESC}[?1016l${ESC}[?1000l${ESC}[?1001l${ESC}[?1002l${ESC}[?1003l${ESC}[?1005l${ESC}[?1006l`
     + `${ESC}[?1015l${ESC}[?1004l${ESC}[?2004l${ESC}[<u${ESC}[?1l${ESC}>`;
 
 // Splits a chunk of raw input into keys. Every escape sequence stays whole: a
@@ -37,6 +38,20 @@ export function parseKeys(text) {
     return keys;
 }
 
+// Keep incomplete reports and keys out of the menu across stream reads.
+export function createKeyParser() {
+    let pending = '';
+    return chunk => {
+        let text = pending + chunk.toString('utf8');
+        pending = '';
+        const partial = /\x1b\][^\x07\x1b]*(?:\x1b)?$|\x1b(?:\[[0-?]*[ -/]*|O|\[M[\s\S]{0,2})?$/u.exec(text);
+        if (partial) { pending = partial[0]; text = text.slice(0, partial.index); }
+        // Colour/device reports left in flight by the detached terminal are not menu input.
+        text = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/gu, '');
+        return parseKeys(text);
+    };
+}
+
 // Visible width is approximated by code points; control characters never reach
 // the screen.
 export function fit(text, width) {
@@ -50,11 +65,22 @@ function pad(text, width) {
     return fitted + ' '.repeat(Math.max(0, width - Array.from(fitted).length));
 }
 
-// The rows of one screen: header lines, a window of items around the
-// selection, a status line and the key help.
-export function renderMenu({ title = [], items = [], selected = 0, status = '', help = '', columns = 80, rows = 24 }) {
+// The tab line names the two menus of this command; the active one is inverted.
+function renderTabs(tabs, activeTab, width) {
+    const each = Math.max(6, Math.floor((width - 2 * (tabs.length - 1)) / Math.max(1, tabs.length)));
+    return tabs.map((label, index) => {
+        const text = pad(label, each);
+        return index === activeTab ? `${ESC}[7m${text}${ESC}[0m` : `${ESC}[2m${text}${ESC}[0m`;
+    }).join('  ');
+}
+
+// The rows of one screen: header lines, an optional tab line, a window of items
+// around the selection, a status line and the key help.
+export function renderMenu({ title = [], items = [], selected = 0, status = '', help = '', columns = 80, rows = 24,
+    tabs = [], activeTab = 0 }) {
     const width = Math.max(20, columns);
     const lines = title.map(line => `${ESC}[1m${fit(line, width)}${ESC}[0m`);
+    if (tabs.length) lines.push(renderTabs(tabs, activeTab, width));
     lines.push(`${ESC}[2m${'─'.repeat(width)}${ESC}[0m`);
     const capacity = Math.max(1, rows - lines.length - 3);
     const start = Math.min(Math.max(0, selected - Math.floor(capacity / 2)), Math.max(0, items.length - capacity));
@@ -121,37 +147,69 @@ export class ListMenu {
         return operation();
     }
 
-    // Resolves {action, index}: 'enter', 'back' and 'quit' always, and the
-    // letters or keys of `actions` (for example {k: 'kill', delete: 'kill'}).
-    select(view, { selected = 0, actions = {} } = {}) {
+    // Resolves {action, index}: 'enter', 'back', 'quit' and, on a screen that
+    // shows tabs, 'tab'; plus the letters or keys of `actions` (for example
+    // {k: 'kill', delete: 'kill'}). `refreshMs` with `load` redraws a live
+    // screen in place, so a list of running terminals stays current.
+    select(view, { selected = 0, actions = {}, refreshMs = 0, load = null } = {}) {
         this.open();
-        let index = Math.min(Math.max(0, selected), Math.max(0, view.items.length - 1));
-        let status = view.status || '';
-        this.draw({ ...view, selected: index, status });
+        let current = view;
+        let index = Math.min(Math.max(0, selected), Math.max(0, current.items.length - 1));
+        let status = current.status || '';
+        this.draw({ ...current, selected: index, status });
         return new Promise((resolve) => {
+            let timer = null;
+            let settled = false;
             const finish = (result) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
                 this.input.off('data', onData);
                 this.output.off?.('resize', onResize);
                 resolve(result);
             };
-            const onResize = () => this.draw({ ...view, selected: index, status });
+            const onResize = () => this.draw({ ...current, selected: index, status });
+            const schedule = () => {
+                if (!refreshMs || typeof load !== 'function' || settled) return;
+                timer = setTimeout(async () => {
+                    if (settled) return;
+                    try {
+                        const next = await load();
+                        if (next && !settled) {
+                            current = { ...current, ...next };
+                            index = Math.min(index, Math.max(0, current.items.length - 1));
+                            if (typeof next.status === 'string') status = next.status;
+                            this.draw({ ...current, selected: index, status });
+                        }
+                    } catch (_) { /* the next refresh tries again */ }
+                    schedule();
+                }, refreshMs);
+                timer.unref?.();
+            };
+            const readKeys = createKeyParser();
             const onData = (chunk) => {
-                for (const key of parseKeys(chunk.toString('utf8'))) {
+                for (const key of readKeys(chunk)) {
                     if (key === 'quit' || key === 'q') return finish({ action: 'quit', index });
                     if (key === 'back') return finish({ action: 'back', index });
-                    if (key === 'enter' && view.items.length) return finish({ action: 'enter', index });
+                    // The two menus of this command sit on one line: either Shift+Tab
+                    // or a horizontal arrow moves between them.
+                    if ((key === 'tab' || key === 'left' || key === 'right') && current.tabs) {
+                        return finish({ action: 'tab', index });
+                    }
+                    if (key === 'enter' && current.items.length) return finish({ action: 'enter', index });
                     if (actions[key]) return finish({ action: actions[key], index });
-                    const next = moveSelection(index, key, view.items.length);
+                    const next = moveSelection(index, key, current.items.length);
                     if (next !== index) {
                         index = next;
                         status = '';
-                        this.draw({ ...view, selected: index, status });
+                        this.draw({ ...current, selected: index, status });
                     }
                 }
                 return undefined;
             };
             this.input.on('data', onData);
             this.output.on?.('resize', onResize);
+            schedule();
         });
     }
 

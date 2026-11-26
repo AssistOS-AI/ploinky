@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import { StringDecoder } from 'node:string_decoder';
 
+import { TERMINAL_INPUT_RESET } from './codingSessionsMenu.mjs';
+
 import { WEBTTY_PROTOCOL_LIMITS } from '../../core-services/webtty/worker-protocol.mjs';
 
 // A command-line view of a WebTTY terminal. The Router owns the terminal; this
@@ -18,9 +20,11 @@ const INPUT_WINDOW_MS = 10_000;
 const INPUT_WINDOW_BYTES = 384 * 1024;
 const RESIZE_DELAY_MS = 80;
 const SIZE_CLAIM_INTERVAL_MS = 500;
-// Ctrl+] detaches this view; it never reaches the terminal.
+// Ctrl+] detaches this view and Shift+Tab hands the screen to the other role of a
+// supervised session; neither key ever reaches the terminal.
 export const DETACH_KEY = '\x1d';
-export const RELAY_KEY_LABELS = Object.freeze({ detach: 'Ctrl+]' });
+export const SWITCH_KEY = '\x1b[Z';
+export const RELAY_KEY_LABELS = Object.freeze({ detach: 'Ctrl+]', switch: 'Shift+Tab' });
 const RECONNECT_LIMIT_MS = 60_000;
 
 export class RouterRequestError extends Error {
@@ -148,6 +152,62 @@ export function createSseParser(onEvent) {
     };
 }
 
+// A coding agent may switch its terminal into mouse reporting, which turns every
+// mouse move into an agent event and takes text selection away from the person,
+// and into focus reporting, whose ESC[I and ESC[O answers then reach the shell as
+// text once the command exits. A view created with `stripReports` never delivers
+// either report: those enable sequences are dropped from its output, so the
+// terminal keeps its own selection and produces no focus answers. One sequence may
+// carry several modes (`ESC[?1000;1002;1006h`), so only the silenced modes are
+// removed from it; disable sequences and DECRQM queries pass unchanged, and a
+// sequence split across two chunks is held until it is complete.
+export const MOUSE_REPORT_MODES = Object.freeze([9, 1000, 1001, 1002, 1003, 1005, 1006, 1009, 1015, 1016]);
+export const FOCUS_REPORT_MODES = Object.freeze([1004]);
+const SILENCED_MODES = new Set([...MOUSE_REPORT_MODES, ...FOCUS_REPORT_MODES]);
+const ENABLED_MODES = /^\x1b\[\?([0-9]{1,4}(?:;[0-9]{1,4})*)([hl])/u;
+const PARTIAL_SEQUENCE = /^\x1b(?:\[(?:\?(?:[0-9]{0,4}(?:;[0-9]{0,4})*)?)?)?$/u;
+
+function withoutSilencedModes(parameters, final) {
+    if (final === 'l') return null;
+    const modes = parameters.split(';');
+    const kept = modes.filter(mode => !SILENCED_MODES.has(Number(mode)));
+    if (kept.length === modes.length) return null;
+    return kept.length ? `\x1b[?${kept.join(';')}h` : '';
+}
+
+export function createMouseReportFilter({ holdBack = '' } = {}) {
+    let pending = holdBack;
+    return (text) => {
+        const input = pending + String(text ?? '');
+        pending = '';
+        let output = '';
+        let index = 0;
+        while (index < input.length) {
+            const start = input.indexOf('\x1b', index);
+            if (start < 0) {
+                output += input.slice(index);
+                break;
+            }
+            output += input.slice(index, start);
+            const sequence = input.slice(start).match(ENABLED_MODES);
+            if (!sequence) {
+                const rest = input.slice(start);
+                if (PARTIAL_SEQUENCE.test(rest)) {
+                    pending = rest;
+                    break;
+                }
+                output += input[start];
+                index = start + 1;
+                continue;
+            }
+            const rewritten = withoutSilencedModes(sequence[1], sequence[2]);
+            output += rewritten === null ? sequence[0] : rewritten;
+            index = start + sequence[0].length;
+        }
+        return output;
+    };
+}
+
 export function terminalDimensions(output) {
     const clamp = (value, min, max, fallback) => Math.max(min, Math.min(max, Number.isSafeInteger(value) ? value : fallback));
     return {
@@ -177,15 +237,18 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 // an exit leaves the terminal running.
 export class TerminalRelay {
     constructor({ client, sessionId, viewId, input = process.stdin, output = process.stdout, signals = process,
-        now = () => Date.now(), keys = { detach: DETACH_KEY } }) {
-        Object.assign(this, { client, sessionId, viewId, input, output, signals, now, keys });
+        now = () => Date.now(), keys = { detach: DETACH_KEY }, stripReports = true }) {
+        Object.assign(this, { client, sessionId, viewId, input, output, signals, now, keys, stripReports });
         this.sizeClaimed = false;
         // Whether this view set the terminal's size last; another window may take it.
         this.holdsSize = true;
         this.lastClaimAt = 0;
         this.base = `/webtty/sessions/${encodeURIComponent(sessionId)}`;
         this.decoder = new StringDecoder('utf8');
+        this.outputFilter = stripReports ? createMouseReportFilter() : null;
         this.pending = '';
+        this.keyPending = '';
+        this.keyTimer = null;
         this.flushing = null;
         this.inputWindow = { startedAt: 0, bytes: 0 };
         this.lastEventId = '';
@@ -274,11 +337,12 @@ export class TerminalRelay {
     }
 
     handleEvent(event, settle) {
+        if (this.finished) return;
         let data = {};
         try { data = event.data ? JSON.parse(event.data) : {}; } catch (_) { }
         if (event.event === 'output') {
             if (event.id) this.lastEventId = event.id;
-            if (typeof data.data === 'string') this.output.write(data.data);
+            if (typeof data.data === 'string') this.output.write(this.outputFilter ? this.outputFilter(data.data) : data.data);
         } else if (event.event === 'size') {
             this.holdsSize = !data.view || data.view === this.viewId;
         } else if (event.event === 'resync') {
@@ -293,6 +357,19 @@ export class TerminalRelay {
         // Any other detach (an expired login, a slow reader) reconnects.
     }
 
+    // The first configured control key in a chunk: `detach` leaves the terminal
+    // running, `switch` hands this screen to the pair's other role.
+    controlKey(text) {
+        let found = null;
+        for (const [name, sequence] of Object.entries(this.keys || {})) {
+            if (!sequence) continue;
+            const index = text.indexOf(sequence);
+            if (index < 0) continue;
+            if (!found || index < found.index) found = { index, reason: name === 'switch' ? 'switch' : 'detached' };
+        }
+        return found;
+    }
+
     queueInput(text) {
         if (!text || this.finished) return;
         // Typing here takes the size back from a window that took it meanwhile.
@@ -301,16 +378,32 @@ export class TerminalRelay {
             this.holdsSize = true;
             void this.sendResize({ claim: true });
         }
-        const detach = this.keys?.detach ? text.indexOf(this.keys.detach) : -1;
-        if (detach >= 0) {
+        clearTimeout(this.keyTimer);
+        text = this.keyPending + text;
+        this.keyPending = '';
+        const control = this.controlKey(text);
+        if (control) {
             // Keystrokes typed before the key still reach the terminal.
-            this.pending += text.slice(0, detach);
+            this.pending += text.slice(0, control.index);
             this.input.pause();
             this.startFlush();
-            void Promise.resolve(this.flushing).catch(() => {}).then(() => this.finish({ reason: 'detached' }));
+            void Promise.resolve(this.flushing).catch(() => {}).then(() => this.finish({ reason: control.reason }));
             return;
         }
-        this.pending += text;
+        // Keep a split control key together, but let a standalone Escape through.
+        let held = 0;
+        for (const sequence of Object.values(this.keys || {})) {
+            for (let size = 1; size < sequence.length; size++) {
+                if (text.endsWith(sequence.slice(0, size))) held = Math.max(held, size);
+            }
+        }
+        this.keyPending = held ? text.slice(-held) : '';
+        this.pending += held ? text.slice(0, -held) : text;
+        if (held) this.keyTimer = setTimeout(() => {
+            this.pending += this.keyPending;
+            this.keyPending = '';
+            this.startFlush();
+        }, 100);
         this.startFlush();
     }
 
@@ -374,6 +467,8 @@ export class TerminalRelay {
         if (this.finished) return;
         this.finished = true;
         clearTimeout(this.resizeTimer);
+        clearTimeout(this.keyTimer);
+        this.output.write(`${TERMINAL_INPUT_RESET}\x1b[0m\x1b[?25h\x1b[?1049l`);
         this.input.off('data', this.onData);
         this.input.off('end', this.onEnd);
         this.input.off('error', this.onEnd);
