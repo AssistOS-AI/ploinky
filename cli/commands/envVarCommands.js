@@ -3,7 +3,8 @@ import { showHelp } from './help.js';
 import * as envSvc from '../utils/security/secretVars.js';
 import { findAgent } from '../utils/utils.js';
 import { VAR_STDIN_MAX_BYTES, decodeVarStdinValue } from './varStdinValue.js';
-import { PROD_ENV, assertProdProfileConsistency, parseProd } from '../utils/prodMode.mjs';
+import { PROD_ENV, assertProdProfileConsistency, parseProd, readProd } from '../utils/prodMode.mjs';
+import { capturedProdIfCaptured } from '../utils/runtime/mcpProdGates.mjs';
 import {
     assertActiveEdgeRoutingSourcesCurrent,
     inactivateEdgeRoutingGeneration,
@@ -117,7 +118,22 @@ function handleEchoCommand(options = []) {
     console.log(output);
 }
 
+// `expose` rewrites an agent's manifest.json, which a production deployment
+// never does: its code changes only through the deploy. It refuses under the
+// stored PROD (an unreadable or invalid stored value refuses too, fail closed)
+// and under the captured PROD.
+function assertExposeAllowed() {
+    if (readProd() || capturedProdIfCaptured()) {
+        const error = new Error(
+            `expose is refused while ${PROD_ENV} is true: it edits an agent manifest, and production agent code changes only through the deploy workflow.`,
+        );
+        error.code = 'PLOINKY_PROD_EXPOSE_REFUSED';
+        throw error;
+    }
+}
+
 function handleExposeCommand(options = []) {
+    assertExposeAllowed();
     if (!options[0]) { showHelp(); throw new Error('Usage: expose <EXPOSED_NAME> [<$VAR|value>] [agentName]'); }
     const assignment = parseInlineAssignmentToken(options[0]);
     const normalized = expandInlineAssignment(options).filter(item => item !== undefined);

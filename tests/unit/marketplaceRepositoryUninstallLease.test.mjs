@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
+import { writeProdCapture } from '../helpers/prodCapture.mjs';
 
 const originalCwd = process.cwd();
 const originalEnv = Object.fromEntries(['PLOINKY_WORKSPACE_ROOT', 'PLOINKY_ROUTER_HOST_PORT', 'PLOINKY_MEDIA_HOST_PORT', 'PLOINKY_MASTER_KEY']
@@ -21,6 +22,8 @@ process.env.PLOINKY_ROUTER_HOST_PORT = '18080';
 process.env.PLOINKY_MEDIA_HOST_PORT = '17891';
 process.env.PLOINKY_MASTER_KEY = '5'.repeat(64);
 
+// The handler reads the captured PROD; a workspace without a capture is PROD true.
+writeProdCapture(workspace);
 const routes = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
 const edge = await import('../../cli/sandbox/edgeGeneration.js');
 const locks = await import('../../cli/utils/runtime/maintenanceLocks.js');
@@ -72,6 +75,8 @@ function registryRecord(repoName, agentName) {
 // `others` repository whose agent must survive, under one active generation.
 function fixture({ withAgent = true } = {}) {
     fs.rmSync(paths.ploinkyDir, { recursive: true, force: true });
+    // Resetting the workspace state removes the captured PROD; a started workspace has one.
+    writeProdCapture(workspace);
     const registry = { [SURVIVOR]: registryRecord('others', 'keeper') };
     const routing = { routes: {} };
     for (const [repoName, agentName, container, hostPort] of [

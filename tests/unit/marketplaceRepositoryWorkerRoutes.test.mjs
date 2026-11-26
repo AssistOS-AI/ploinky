@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
+import { writeProdCapture } from '../helpers/prodCapture.mjs';
 
 const previousCwd = process.cwd();
 const previousEnv = Object.fromEntries(['PLOINKY_WORKSPACE_ROOT', 'PLOINKY_MASTER_KEY'].map((key) => [key, process.env[key]]));
@@ -15,6 +16,8 @@ fs.mkdirSync(path.join(workspace, '.ploinky/repos'), { recursive: true });
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 process.env.PLOINKY_MASTER_KEY = '5'.repeat(64);
 process.chdir(invocation);
+// The handler reads the captured PROD; a workspace without a capture is PROD true.
+writeProdCapture(workspace);
 const { handleMarketplaceRoutes } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
 const { mintSessionJwt, getSession } = await import('../../cli/server/auth/localService.js');
 const { mintAdminCsrfToken } = await import('../../cli/server/adminControlSecurity.js');

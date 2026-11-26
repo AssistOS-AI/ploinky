@@ -32,7 +32,7 @@ import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { getActiveProfile, resolveManifestRuntimeProfile } from './runtime/profileService.js';
 import { followWorkspaceProfile, isEnvironmentProfile } from './runtime/profileFollow.mjs';
-import { capturedProdIfCaptured } from './runtime/mcpProdGates.mjs';
+import { capturedProdIfCaptured, mergeEnabledRouteGates } from './runtime/mcpProdGates.mjs';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from './runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
@@ -1078,6 +1078,25 @@ export function assertEnableProfileRules({ agentName, mode, repoNameParam, authO
     }
 }
 
+// An enable captures and merges only its own route into the existing production
+// capture, before anything is prepared. Under the captured PROD that route's
+// mcp-config must be tracked and identical to git HEAD, or the enable refuses;
+// it never changes the captured `prod` value.
+export function mergeEnableRouteGates({ agentName, mode, repoNameParam, aliasParam }, { merge = mergeEnabledRouteGates } = {}) {
+    let routeKey;
+    let agentDir;
+    try {
+        const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
+        const found = findAgent(normalized.agentName);
+        routeKey = normalizeAlias(aliasParam) || found.shortAgentName;
+        agentDir = path.dirname(found.manifestPath);
+    } catch (_) {
+        // The candidate preparation reports an unresolvable agent itself.
+        return { merged: false };
+    }
+    return merge(routeKey, { agentDir });
+}
+
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
     // Enabling mutates the registry and admits a runtime: hold the workspace
     // mutation lease (reusing one this process already holds) for the whole
@@ -1087,6 +1106,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
     const request = { agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions };
     return withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
     assertEnableProfileRules(request);
+    mergeEnableRouteGates(request);
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{

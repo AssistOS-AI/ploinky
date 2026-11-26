@@ -1053,8 +1053,8 @@ export class WebttySessionManager {
                 },
             });
         } catch (error) {
-            if (['WEBTTY_TARGET_STALE', 'WEBTTY_TARGET_DIRECTORY_STALE', 'WEBTTY_TARGET_GENERATION_STALE']
-                .includes(error?.code)) throw errorWithCode('WEBTTY_TARGET_STALE');
+            if (['WEBTTY_TARGET_STALE', 'WEBTTY_TARGET_DIRECTORY_STALE', 'WEBTTY_TARGET_GENERATION_STALE',
+                'WEBTTY_TARGET_PROD_DISABLED'].includes(error?.code)) throw errorWithCode('WEBTTY_TARGET_STALE');
             if (error?.code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') {
                 throw errorWithCode('WEBTTY_TARGET_PROVIDER_UNAVAILABLE');
             }
@@ -2303,7 +2303,8 @@ export class WebttySessionManager {
                 } catch (error) {
                     if (!current()) return;
                     if (error?.code === 'WEBTTY_TARGET_GENERATION_STALE') continue;
-                    if (['WEBTTY_TARGET_IDENTITY_STALE', 'WEBTTY_TARGET_STALE', 'WEBTTY_HOME_PROJECTION_UNPROVEN'].includes(error?.code)) {
+                    if (['WEBTTY_TARGET_IDENTITY_STALE', 'WEBTTY_TARGET_STALE', 'WEBTTY_HOME_PROJECTION_UNPROVEN',
+                        'WEBTTY_TARGET_PROD_DISABLED'].includes(error?.code)) {
                         void this.closeSession(session, 'target_identity_changed').catch(() => {});
                     } else if (error?.code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') {
                         this.disableAgentProvider('target_provider_unavailable');

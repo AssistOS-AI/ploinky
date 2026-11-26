@@ -51,6 +51,8 @@ import { localSessionAllowedForRoutePlan } from './authContext.js';
 import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
 import { handleHardwareLimitsRoutes } from './hardwareLimitsRoutes.mjs';
 import { handleCacheRoutes } from './cacheRoutes.mjs';
+import { isProdAllowedAction, isProdAllowedResource, marketplaceActions } from './marketplaceMutations.mjs';
+import { capturedProdOrClosed } from '../../utils/runtime/mcpProdGates.mjs';
 import { readEdgeRoutingSelection } from '../../sandbox/edgeGeneration.js';
 import { planManifestDependencyEnables } from '../../utils/workspaceDependencyGraph.js';
 
@@ -886,6 +888,18 @@ function createMarketplaceEnableAction(lease) {
     });
 }
 
+// The permission fields a Marketplace client reads. Restart and Reinstall are
+// production-gated: under the captured PROD they are off for everyone, and
+// `production` says why.
+function marketplacePermissions({ canManage, prod }) {
+    return {
+        canManage,
+        canRestart: canManage && !prod,
+        canReinstall: canManage && !prod,
+        production: prod,
+    };
+}
+
 function createMarketplaceActivationJob(action, body) {
     return () => action(body);
 }
@@ -900,6 +914,9 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     uninstallRepositoryAction = (body) => uninstallMarketplaceRepository(body),
     repositoryWorker = runMarketplaceRepositoryWorker,
     repositoryWorkerEligibility = repositoryWorkerEligible,
+    // The production state captured by the start or whole restart that is
+    // running now; unavailable counts as PROD true.
+    readProd = () => capturedProdOrClosed(),
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
@@ -912,6 +929,17 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const method = (req.method || 'GET').toUpperCase();
+    // Read once: the handler top, the action check and the permission fields of
+    // this request all see the same captured value.
+    const prod = readProd() === true;
+    // Under PROD a mutating request to a resource the table does not list is
+    // refused here, by method and resource only. `repos` and `agents` are
+    // listed; their action is checked after the single body parse below, and
+    // `cache` and `hardware-limits` keep their own body handling.
+    if (prod && method !== 'GET' && method !== 'HEAD' && !isProdAllowedResource(route.resource)) {
+        sendJson(res, 403, { ok: false, error: 'disabled_in_production', resource: route.resource });
+        return true;
+    }
 
     if (route.resource === 'hardware-limits' || route.resource === 'cache') {
         const guards = {
@@ -973,10 +1001,11 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         options = { ...options, machine: verifiedAgentCaller(req) };
         return {
             ...buildMarketplaceAgents(req.user, options),
-            permissions: {
+            permissions: marketplacePermissions({
                 canManage: isAdminUser(req.user)
                     && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),
-            },
+                prod,
+            }),
         };
     };
 
@@ -1056,9 +1085,14 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         }
 
         const action = String(body?.action || '').trim();
-        const repoActions = ['install', 'remove', 'install_repo', 'uninstall_repo'];
-        const agentActions = ['enable_agent', 'disable_agent'];
-        const allowedActions = isRepos ? repoActions : agentActions;
+        // Under PROD an action the table does not allow is refused before the
+        // dispatch and before the unknown-action answer, so a Restart or
+        // Reinstall request is 403 rather than 400.
+        if (prod && !isProdAllowedAction(route.resource, action)) {
+            sendJson(res, 403, { ok: false, error: 'disabled_in_production', resource: route.resource, action });
+            return true;
+        }
+        const allowedActions = marketplaceActions(route.resource);
         if (!allowedActions.includes(action)) {
             sendMarketplaceError(res, 400, 'unknown_action', 'Unsupported marketplace action.');
             return true;

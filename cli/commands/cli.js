@@ -13,6 +13,7 @@ import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace }
 import { runLogCommand } from './logCommands.js';
 import { activeForegroundSignal } from './foregroundCommand.js';
 import {
+    collectProdGateRoutes,
     startWorkspace,
     retireAbandonedStartPreparationBeforeStop,
     settleWorkspaceBeforeRestart,
@@ -76,7 +77,8 @@ import {
 import { handleDefaultSkillsCommand } from './skillsCommands.js';
 import { runSettingsMenu } from './settingsMenu.js';
 import { handleProfileCommand } from './profileCommands.js';
-import { assertProdProfileConsistency } from '../utils/prodMode.mjs';
+import { assertProdProfileConsistency, readProd } from '../utils/prodMode.mjs';
+import { dryCaptureProdGates } from '../utils/runtime/mcpProdGates.mjs';
 import {
     cleanupSessionContainers,
     destroyAll,
@@ -387,6 +389,16 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             // Before the first mutation, including the profile write below: a
             // PROD/profile mismatch must leave the workspace untouched.
             assertProdProfileConsistency({ requestedProfile: startParsed.profile || undefined });
+            // The dry capture reads every route's mcp-config and, under PROD,
+            // refuses a dirty, untracked or non-git one, still before any
+            // mutation. startWorkspace writes the result.
+            const prodCapture = dryCaptureProdGates({
+                prod: readProd(),
+                routes: collectProdGateRoutes({
+                    staticAgentArg: startParsed.staticAgent || undefined,
+                    workspaceProfile: startParsed.profile || undefined,
+                }),
+            });
             if (startParsed.profile) {
                 const profileResult = setActiveProfile(startParsed.profile);
                 if (!profileResult.success) {
@@ -400,6 +412,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 enableAgent,
                 killRouterIfRunning,
                 branchPolicy: startParsed.branchPolicy,
+                prodCapture,
             });
             break;
         }
@@ -690,6 +703,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 }
                 // Before the first mutation: nothing is stopped on a refusal.
                 assertProdProfileConsistency();
+                const prodCapture = dryCaptureProdGates({ prod: readProd(), routes: collectProdGateRoutes() });
                 resolvePersistedRouterPort();
                 await settleWorkspaceBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');
@@ -703,6 +717,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     restarting: true,
                     enableAgent,
                     killRouterIfRunning,
+                    prodCapture,
                 });
                 console.log('[restart] Done.');
             }

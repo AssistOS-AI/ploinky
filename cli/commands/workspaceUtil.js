@@ -51,7 +51,12 @@ import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } fro
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
 import { PROD_ENV } from '../utils/prodMode.mjs';
-import { capturedProdOrClosed, readCapturedProdGates } from '../utils/runtime/mcpProdGates.mjs';
+import {
+  capturedProdOrClosed,
+  extendProdCapture,
+  readCapturedProdGates,
+  writeProdGates,
+} from '../utils/runtime/mcpProdGates.mjs';
 import { followWorkspaceProfile } from '../utils/runtime/profileFollow.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../utils/publicRouterHosts.mjs';
@@ -1553,6 +1558,70 @@ function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = doc
   return { nodes, skipped };
 }
 
+// Every route the capture covers (PD7): the enabled registry plus the static
+// agent's dependency graph, as `{ routeKey, agentDir }`. A registry entry whose
+// source is missing is left out (an unknown route is ignored). `graph` is
+// resolved best-effort when it is not given: on a fresh workspace nothing is
+// installed yet, and startWorkspace extends the capture once the repositories
+// are prepared and the graph exists.
+export function collectProdGateRoutes({
+  registry = workspaceSvc.loadAgents(),
+  graph = null,
+  additionalNodes = [],
+  staticAgentArg,
+  workspaceProfile = getActiveProfile(),
+} = {}) {
+  const routes = [];
+  for (const [key, record] of Object.entries(registry || {})) {
+    if (key === '_config' || record?.type !== 'agent') continue;
+    const ref = record.repoName ? `${record.repoName}/${record.agentName}` : String(record.agentName || '');
+    try {
+      routes.push({
+        routeKey: String(record.alias || record.agentName || ''),
+        agentDir: path.dirname(utils.findAgent(ref).manifestPath),
+      });
+    } catch (_) { /* its source is missing: nothing to read or gate */ }
+  }
+  let resolvedGraph = graph;
+  if (!resolvedGraph) {
+    const staticAgent = String(staticAgentArg || workspaceSvc.getConfig()?.static?.agent || '').trim();
+    if (staticAgent) {
+      try {
+        resolvedGraph = resolveWorkspaceDependencyGraph({
+          staticAgentRef: staticAgent,
+          registry,
+          workspaceProfile,
+          onUnresolvedDependency: () => {},
+        });
+      } catch (_) { /* startWorkspace reports it with the full context */ }
+    }
+  }
+  const nodes = [...(resolvedGraph?.nodes?.values?.() || []), ...additionalNodes];
+  for (const node of nodes) {
+    if (node?.agentPath) routes.push({ routeKey: String(node.alias || node.shortAgentName || ''), agentDir: node.agentPath });
+  }
+  return routes;
+}
+
+// The PROD value a start acts on: the capture a start or whole restart carries,
+// otherwise (`restart router`) the value already captured. Only an explicit true
+// makes profile resolution strict.
+export function resolveStartProd(prodCapture) {
+  return prodCapture ? prodCapture.prod === true : readCapturedProdGates().prod === true;
+}
+
+// Completes the dry capture with the routes of the graph the start resolved and
+// writes it. Without a capture (`restart router`) nothing is written and the
+// existing file stays in force.
+export function commitProdCapture(prodCapture, start) {
+  if (!prodCapture) return;
+  writeProdGates(extendProdCapture(prodCapture, collectProdGateRoutes({
+    registry: start.registry,
+    graph: start.graph,
+    additionalNodes: start.additionalNodes,
+  })));
+}
+
 function loadRegistryManifest(record) {
   const manifestRef = `${record.repoName}/${record.agentName}`;
   const manifestPath = findAgentManifest(manifestRef);
@@ -2962,9 +3031,12 @@ async function startWorkspace(staticAgentArg, portArg, {
   branchPolicy,
   restarting = false,
   announce = true,
+  // The dry capture `start` or a whole `restart` computed before its first
+  // mutation. Only a start that carries one writes the captured file;
+  // `restart router` carries none and reuses the existing file.
+  prodCapture = null,
 } = {}) {
-  // Only an explicit captured true makes profile resolution strict.
-  const startProd = readCapturedProdGates().prod === true;
+  const startProd = resolveStartProd(prodCapture);
   // Acquire every declared dependency source before resolving the complete
   // graph. A fresh workspace cannot admit repositories that do not exist yet.
   // Repository preparation remains ahead of authoritative workspace mutation,
@@ -3030,6 +3102,11 @@ async function startWorkspace(staticAgentArg, portArg, {
   for (const unresolved of lockedStart.unresolvedDependencies || []) {
     console.error(`[start] Skipping dependency '${unresolved.rawDependency}' of '${unresolved.parentRef}': ${unresolved.message}`);
   }
+  // The graph now exists, including agents the repository preparation just
+  // installed or updated. Routes the dry capture could not know are added (the
+  // dirty check applies to them under PROD) and the complete capture is
+  // written, before the first selector, route, config or Router write.
+  commitProdCapture(prodCapture, lockedStart);
   // `--branch` reaches link-install repositories here, for the whole admitted
   // graph including no-wait agents, before any mutation, wave or worker.
   preflightStartLinkedRepositories(lockedStart, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, branchPolicy });
