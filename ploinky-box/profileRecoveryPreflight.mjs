@@ -19,7 +19,10 @@ export function assertNonProductionRecovery(workspaceRoot) {
         let currentExists = false;
         try { fs.lstatSync(legacyKey); legacyExists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
         try { fs.lstatSync(currentKey); currentExists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
-        if (legacyExists && !currentExists) throw new Error('incomplete master key migration');
+        if (legacyExists) {
+            if (!currentExists) throw new Error('incomplete master key migration');
+            readWorkspaceMasterKey({ workspaceRoot });
+        }
         const directories = [workspaceRoot, path.join(workspaceRoot, '.ploinky'), path.join(workspaceRoot, '.ploinky', 'data')];
         const snapshots = directories.map(target => {
             const stat = fs.lstatSync(target);
@@ -52,7 +55,7 @@ export function assertNonProductionRecovery(workspaceRoot) {
     } finally {
         key?.fill(0);
     }
-    if (prod === undefined || prod === '' || prod === 'false') return;
+    if (prod === undefined || prod === 'false') return;
     if (prod === 'true') {
         throw new PloinkyBoxError('Production recovery requires a trusted preflight of existing route provenance; it cannot be established with the current Box state. No runtime was changed.', { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
     }

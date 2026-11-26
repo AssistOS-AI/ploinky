@@ -75,10 +75,11 @@ function decryptSecretsText(raw, storageKey, { strict = false } = {}) {
     if (strict && (!payload || typeof payload !== 'object' || Array.isArray(payload)
         || payload.version !== PAYLOAD_VERSION || !payload.secrets || typeof payload.secrets !== 'object'
         || Array.isArray(payload.secrets)
-        || (Object.hasOwn(payload.secrets, 'PROD') && !['', 'true', 'false'].includes(payload.secrets.PROD)))) {
+        || Object.keys(payload.secrets).some(name => name !== 'PROD' && name.trim() === 'PROD')
+        || (Object.hasOwn(payload.secrets, 'PROD') && !['true', 'false'].includes(payload.secrets.PROD)))) {
         throw new Error('Encrypted variable store has an invalid envelope or PROD value.');
     }
-    return normalizeSecretsMap(payload?.secrets);
+    return strict ? { ...payload.secrets } : normalizeSecretsMap(payload?.secrets);
 }
 
 export {

@@ -495,3 +495,46 @@ test('passive recovery rejects authenticated malformed envelopes and incomplete 
     fs.writeFileSync(path.join(w.workspace, '.ploinky', '.secrets'), 'retired');
     assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
 });
+
+test('passive recovery rejects aliased PROD keys and empty stored PROD', async t => {
+    const { assertNonProductionRecovery } = await import('../../ploinky-box/profileRecoveryPreflight.mjs');
+    const w = await world(t, { old: 'running' });
+    for (const secrets of [
+        { PROD: 'true', ' PROD ': 'false' },
+        { ' PROD ': 'false', PROD: 'true' },
+        { ' PROD ': 'false' },
+        { PROD: '' },
+    ]) {
+        writeRecoveryProd(w.workspace, undefined, { version: 1, secrets });
+        assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+    }
+    writeRecoveryProd(w.workspace, 'false');
+    assert.doesNotThrow(() => assertNonProductionRecovery(w.workspace));
+});
+
+test('passive recovery verifies migrated master key before accepting absent store', async t => {
+    const { assertNonProductionRecovery } = await import('../../ploinky-box/profileRecoveryPreflight.mjs');
+    const w = await world(t, { old: 'running' });
+    writeRecoveryProd(w.workspace, 'false');
+    const store = path.join(w.workspace, '.ploinky', 'data', '.secrets');
+    const legacy = path.join(w.workspace, '.ploinky', 'data', 'master-key');
+    const current = path.join(w.workspace, '.data', 'dpu-data', 'master-key');
+    fs.unlinkSync(store);
+    fs.writeFileSync(legacy, 'legacy');
+    const validKey = fs.readFileSync(current);
+    assert.doesNotThrow(() => assertNonProductionRecovery(w.workspace));
+    fs.unlinkSync(current);
+    fs.symlinkSync(path.join(w.workspace, 'missing-key'), current);
+    assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+    fs.unlinkSync(current);
+    fs.mkdirSync(current);
+    assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+    fs.rmdirSync(current);
+    fs.writeFileSync(current, 'invalid', { mode: 0o600 });
+    assert.throws(() => assertNonProductionRecovery(w.workspace), { code: 'PLOINKY_BOX_PROFILE_RECOVERY_REQUIRED' });
+    fs.unlinkSync(current);
+    fs.unlinkSync(legacy);
+    assert.doesNotThrow(() => assertNonProductionRecovery(w.workspace));
+    assert.equal(fs.existsSync(current), false);
+    fs.writeFileSync(current, validKey, { mode: 0o600 });
+});
