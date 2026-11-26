@@ -39,8 +39,9 @@ export async function handleProfileCommand(args) {
             // Box. It throws, and so exits non-zero, on a PROD/profile mismatch.
             return handleAssertProfile(args.slice(1));
         case undefined:
-        case '':
             return showCurrentProfile();
+        case '':
+            throw new Error('Invalid profile: name must not be empty.');
         default:
             // If it's a valid profile name, set it
             if (getValidProfiles().includes(subCommand)) {

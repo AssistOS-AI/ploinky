@@ -334,6 +334,7 @@ test('role-pinned agents receive the workspace environment', () => {
 test('profile command refuses an unknown selection', async () => {
     const { handleProfileCommand } = await import('../../cli/commands/profileCommands.js');
     await assert.rejects(handleProfileCommand(['staging']), /Invalid profile/);
+    await assert.rejects(handleProfileCommand(['']), /Invalid profile/);
 });
 
 
