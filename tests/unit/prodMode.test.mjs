@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -317,4 +318,34 @@ test('profile show prints the stored and the captured PROD', async () => {
     const text = lines.join('\n');
     assert.match(text, /^PROD: true$/m);
     assert.match(text, /^PROD \(active\): false$/m);
+});
+
+
+test('role-pinned agents receive the workspace environment', () => {
+    reset();
+    setProfileFile('prod');
+    const env = getProfileEnvVars('agent', 'repo', 'embedded');
+    assert.equal(env.PLOINKY_PROFILE, 'embedded');
+    assert.equal(env.PLOINKY_PROFILE_ENV, 'prod');
+    setProfileFile('qa');
+    assert.equal(getProfileEnvVars('agent', 'repo', 'embedded').PLOINKY_PROFILE_ENV, 'qa');
+});
+
+test('profile command refuses an unknown selection', async () => {
+    const { handleProfileCommand } = await import('../../cli/commands/profileCommands.js');
+    await assert.rejects(handleProfileCommand(['staging']), /Invalid profile/);
+});
+
+
+test('core profile assert skips workspace initialization and repository bootstrap', () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-profile-assert-'));
+    try {
+        const main = new URL('../../cli/main.js', import.meta.url).href;
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+            `const { runCoreCli } = await import(${JSON.stringify(main)}); await runCoreCli(['profile', 'assert']);`], {
+            cwd: scratch, env: { ...process.env, PLOINKY_WORKSPACE_ROOT: scratch }, encoding: 'utf8',
+        });
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(fs.readdirSync(scratch), []);
+    } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
 });

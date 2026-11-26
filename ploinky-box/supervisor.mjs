@@ -801,7 +801,8 @@ export function createBoxSupervisor({
         await runCoreCommand(
             status.ownership.engine,
             status.ownership.handles.container.id,
-            ['profile', 'assert', ...(profile ? ['--profile', profile] : [])],
+            ['profile', 'assert', ...(profile ? ['--profile', profile] : []),
+                ...(coreArgs[0] === 'start' ? ['--start-args', JSON.stringify(coreArgs.slice(1))] : [])],
             hostPort,
             mediaHostPort,
             runner,

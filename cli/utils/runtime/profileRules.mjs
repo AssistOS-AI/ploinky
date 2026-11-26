@@ -2,7 +2,7 @@
 // standalone checker (`cli/tools/checkManifestProfiles.mjs`). Pure: no
 // workspace, no filesystem.
 
-import { ENVIRONMENT_PROFILES } from './profileFollow.mjs';
+export const ENVIRONMENT_PROFILES = Object.freeze(['default', 'dev', 'qa', 'prod']);
 
 export function parseRequiredProfiles(value) {
     if (value === undefined || value === null) return [...ENVIRONMENT_PROFILES];
@@ -20,13 +20,7 @@ function isPlainObject(value) {
 // Returns the list of issues for one manifest text (empty list = pass). A
 // manifest that does not parse, `profiles` that is not an object, and a
 // required profile that is missing, null or not an object all fail.
-export function checkManifestText(text, required = ENVIRONMENT_PROFILES) {
-    let manifest;
-    try {
-        manifest = JSON.parse(text);
-    } catch (error) {
-        return [`manifest is not valid JSON (${String(error?.message || error).slice(0, 120)})`];
-    }
+export function checkManifestProfiles(manifest, required = ENVIRONMENT_PROFILES) {
     if (!isPlainObject(manifest)) return ['manifest is not a JSON object'];
     if (!isPlainObject(manifest.profiles)) return ["'profiles' is missing or not an object"];
     const issues = [];
@@ -35,4 +29,14 @@ export function checkManifestText(text, required = ENVIRONMENT_PROFILES) {
         else if (!isPlainObject(manifest.profiles[name])) issues.push(`profile '${name}' is not an object`);
     }
     return issues;
+}
+
+export function checkManifestText(text, required = ENVIRONMENT_PROFILES) {
+    let manifest;
+    try {
+        manifest = JSON.parse(text);
+    } catch (error) {
+        return [`manifest is not valid JSON (${String(error?.message || error).slice(0, 120)})`];
+    }
+    return checkManifestProfiles(manifest, required);
 }

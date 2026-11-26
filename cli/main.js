@@ -27,6 +27,7 @@ const PLOINKY_ROOT = process.env.PLOINKY_ROOT || path.resolve(path.dirname(fileU
 function commandOwnsRuntimeAdmission(args) {
     const command = String(args?.[0] || '').trim().toLowerCase();
     if (['start', 'restart', 'reinstall', 'cli', 'shell'].includes(command)) return true;
+    if (command === 'profile' && String(args?.[1] || '').toLowerCase() === 'assert') return true;
     if (command !== 'enable') return false;
     const targetKind = String(args?.[1] || '').trim().toLowerCase();
     return !['repo', 'repository', 'sandbox', 'host-sandbox', 'lite-sandbox'].includes(targetKind);

@@ -343,6 +343,7 @@ async function ensureDirectiveEnabled(parsedDirective, enableAgentImpl = enableA
 async function applyManifestDirectivesInternal(agentNameOrPath, {
     branchPolicy,
     profile = '',
+    workspaceProfile = profile || getActiveProfile(),
     visited,
     enableAgents = true,
     enableAgentImpl = enableAgent,
@@ -425,7 +426,9 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                 if (childRef) {
                     await applyManifestDirectivesInternal(childRef, {
                         branchPolicy,
-                        profile: qualified.profile || profile || '',
+                        profile: qualified.profile && !isEnvironmentProfile(qualified.profile)
+                            ? qualified.profile : workspaceProfile,
+                        workspaceProfile,
                         visited,
                         enableAgents,
                         enableAgentImpl,

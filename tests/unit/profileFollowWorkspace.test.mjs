@@ -129,7 +129,7 @@ test('followWorkspaceProfile: roles stay, environment names follow, legacy stays
     const none = {};
     // Role pins never change.
     assert.equal(followWorkspaceProfile(full, 'embedded', 'qa'), 'embedded');
-    assert.equal(followWorkspaceProfile(full, 'embedded', 'prod', { prod: true }), 'embedded');
+    assert.equal(followWorkspaceProfile({ profiles: { ...FULL, embedded: {} } }, 'embedded', 'prod', { prod: true }), 'embedded');
     // Environment names follow the workspace when declared, else default.
     assert.equal(followWorkspaceProfile(full, 'default', 'qa'), 'qa');
     assert.equal(followWorkspaceProfile(full, 'qa', 'prod'), 'prod');
@@ -354,4 +354,18 @@ test('enable: an operator-supplied per-agent environment that differs from the w
     assert.doesNotThrow(() => agents.assertEnableProfileRules(
         { agentName: 'repo/does-not-exist', authOptions: {} }, { workspaceProfile: 'prod', prod: true },
     ));
+});
+
+
+test('PROD rejects malformed profile shapes and missing explicit roles', () => {
+    for (const profiles of [{ ...FULL, prod: null }, { ...FULL, default: [] }, { ...FULL, embedded: null }, FULL]) {
+        assert.throws(() => followWorkspaceProfile({ profiles }, 'embedded', 'prod', { prod: true }), codeIs('PLOINKY_PROFILE_NOT_FOUND'));
+    }
+});
+
+test('PROD graph rejects malformed dependency declarations even with tolerance', () => {
+    for (const enable of [null, {}, [null], [{ agent: 'repo/dep', profile: 42 }]]) {
+        writeAgent('badgraph', { profiles: FULL, enable });
+        assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'repo/badgraph', workspaceProfile: 'prod', prod: true, onUnresolvedDependency() {} }));
+    }
 });

@@ -4,7 +4,7 @@ import { manifestEnableEntries, parseEnableDirective, qualifyEnableSpecForRepo }
 import { findAgent } from './utils.js';
 import { isSsoProviderManifest } from './agentRegistry.js';
 import { getActiveProfile, mergeProfiles } from './runtime/profileService.js';
-import { isEnvironmentProfile } from './runtime/profileFollow.mjs';
+import { isEnvironmentProfile, followWorkspaceProfile } from './runtime/profileFollow.mjs';
 import {
     assertNetworkStartupCompatibility,
     effectiveManifestNetwork,
@@ -204,6 +204,7 @@ function resolveWorkspaceDependencyGraph({
                 alias
             });
             const selectedProfile = requestedProfile || normalizeProfileOverride(registryRecord?.profile);
+            if (prod) followWorkspaceProfile(manifest, selectedProfile, selectedWorkspaceProfile, { prod, agentRef: `${resolved.repo}/${resolved.shortAgentName}` });
             const profileName = resolveEffectiveProfile(manifest, selectedProfile, `${resolved.repo}/${resolved.shortAgentName}`, {
                 explicit: profileExplicit || (!requestedProfile && Boolean(registryRecord?.profile)),
             });
@@ -292,13 +293,28 @@ function resolveWorkspaceDependencyGraph({
 
         state.set(nodeId, 'visiting');
         const nextStack = [...stack, nodeId];
+        if (prod) {
+            for (const block of [node.manifest, node.manifest.profiles?.[node.profile]]) {
+                if (block && Object.hasOwn(block, 'enable') && !Array.isArray(block.enable)) {
+                    throw new Error(`[manifest enable] ${node.agentRef}: enable must be an array`);
+                }
+            }
+        }
         const enableList = manifestEnableEntries(node.manifest, node.profile);
         for (const rawDependency of enableList) {
             const knownNodeIds = (typeof onUnresolvedNoWait === 'function' || typeof onUnresolvedDependency === 'function')
                 ? new Set(nodes.keys()) : null;
             try {
+                if (prod && (typeof rawDependency !== 'string' && (!rawDependency || typeof rawDependency !== 'object' || Array.isArray(rawDependency))
+                    || (rawDependency && typeof rawDependency === 'object' && (typeof (rawDependency.agent ?? rawDependency.ref ?? rawDependency.spec ?? rawDependency.name) !== 'string'
+                        || (Object.hasOwn(rawDependency, 'profile') && (typeof rawDependency.profile !== 'string' || !rawDependency.profile.trim())))))) {
+                    throw new Error('malformed enable entry');
+                }
                 const parsedDependency = parseEnableDirective(rawDependency);
-                if (!parsedDependency) continue;
+                if (!parsedDependency) {
+                    if (prod) throw new Error('malformed enable entry');
+                    continue;
+                }
 
                 const qualifiedDependency = {
                     ...parsedDependency,
@@ -339,6 +355,7 @@ function resolveWorkspaceDependencyGraph({
                 // Under PROD a node without the `prod` profile stops the graph;
                 // it is never tolerated as a skipped dependency.
                 if (dependencyError?.code === 'PLOINKY_PROFILE_NOT_FOUND') throw dependencyError;
+                if (prod && !message.startsWith('Dependency cycle detected:')) throw dependencyError;
                 // Cycles are an existing intentional truncation case: log and continue so the parent build can still proceed.
                 // All other resolution failures (missing agents, malformed enable specs, manifest parse errors) fail-closed.
                 if (message.startsWith('Dependency cycle detected:')) {

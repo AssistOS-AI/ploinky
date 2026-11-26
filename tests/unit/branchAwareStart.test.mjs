@@ -1029,3 +1029,18 @@ test.after(() => {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
+test('repository preparation follows the workspace environment through nested role pins', async () => {
+    writeAgentManifest('profilePrep', 'root', {
+        profiles: { default: {}, prod: { enable: [{ agent: 'child', profile: 'embedded' }] } },
+    });
+    writeAgentManifest('profilePrep', 'child', {
+        profiles: { default: {}, embedded: { enable: [{ agent: 'grandchild', profile: 'default' }] } },
+    });
+    writeAgentManifest('profilePrep', 'grandchild', {
+        profiles: { default: {}, prod: { enable: ['missing-prod-only'] } },
+    });
+    const errors = [];
+    await prepareManifestRepositories('profilePrep/root', { profile: 'prod', logError: message => errors.push(message) });
+    assert.ok(errors.some(message => message.includes('missing-prod-only')), errors.join('\n'));
+});

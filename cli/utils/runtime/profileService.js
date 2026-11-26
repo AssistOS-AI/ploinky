@@ -515,7 +515,7 @@ export function getProfileEnvironment(profile) {
 export function getProfileEnvVars(agentName, repoName, profile, containerInfo = {}) {
     return {
         PLOINKY_PROFILE: profile,
-        PLOINKY_PROFILE_ENV: getProfileEnvironment(profile),
+        PLOINKY_PROFILE_ENV: getProfileEnvironment(isEnvironmentProfile(profile) ? profile : getActiveProfile()),
         // Agents get the captured value only, read-only. An unavailable capture
         // is PROD true (fail closed); a manifest env named PROD is refused.
         [PROD_ENV]: capturedProdOrClosed() ? 'true' : 'false',

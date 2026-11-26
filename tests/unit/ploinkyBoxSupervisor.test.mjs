@@ -2330,7 +2330,11 @@ for (const [label, invoke, expectedProfile] of [
         const { supervisor, events, coreCalls, ownership } = prodAssertSupervisor(t);
         await assert.rejects(() => invoke(supervisor), /sentinel: past the profile assertion/);
         assert.equal(coreCalls.length, 1, events.join(' | '));
-        assert.deepEqual(coreCalls[0].argv, ['profile', 'assert', ...expectedProfile]);
+        assert.deepEqual(coreCalls[0].argv.slice(0, 2 + expectedProfile.length), ['profile', 'assert', ...expectedProfile]);
+        if (label.startsWith('start')) {
+            assert.equal(coreCalls[0].argv[2 + expectedProfile.length], '--start-args');
+            assert.equal(JSON.parse(coreCalls[0].argv[3 + expectedProfile.length])[0], 'explorer');
+        }
         assert.equal(coreCalls[0].containerId, ownership.handles.container.id);
         assert.equal(coreCalls[0].hostPort, 8080);
         assert.equal(coreCalls[0].mediaHostPort, 7882);

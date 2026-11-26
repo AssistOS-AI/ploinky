@@ -3,7 +3,8 @@
 // follows the workspace profile; a role pin (`embedded`, `explorer`, ...) names
 // a purpose rather than an environment and stays explicit.
 
-export const ENVIRONMENT_PROFILES = Object.freeze(['default', 'dev', 'qa', 'prod']);
+import { checkManifestProfiles, ENVIRONMENT_PROFILES } from './profileRules.mjs';
+export { ENVIRONMENT_PROFILES } from './profileRules.mjs';
 
 function normalizeName(value) {
     return String(value ?? '').trim().toLowerCase();
@@ -44,12 +45,18 @@ function profileNotFound(agentRef, profileName, profiles) {
 //    so a default workspace does not rotate legacy runtimes.
 export function followWorkspaceProfile(manifest, recordProfile, workspaceProfile, { prod = false, agentRef = 'agent' } = {}) {
     const record = normalizeName(recordProfile);
+    const profiles = declaredProfiles(manifest);
+    if (prod) {
+        const required = record && !isEnvironmentProfile(record) ? [...ENVIRONMENT_PROFILES, record] : ENVIRONMENT_PROFILES;
+        const issues = checkManifestProfiles(manifest, required);
+        if (issues.length) {
+            const error = profileNotFound(agentRef, record && !isEnvironmentProfile(record) ? record : 'prod', profiles);
+            error.message += ` (${issues.join('; ')})`;
+            throw error;
+        }
+    }
     if (record && !isEnvironmentProfile(record)) return record;
     if (!record && !prod) return '';
-    const profiles = declaredProfiles(manifest);
-    if (prod && !declaresProfile(profiles, 'prod')) {
-        throw profileNotFound(agentRef, 'prod', profiles);
-    }
     const workspace = normalizeName(workspaceProfile) || 'default';
     return declaresProfile(profiles, workspace) ? workspace : 'default';
 }

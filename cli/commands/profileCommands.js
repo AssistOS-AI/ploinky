@@ -13,7 +13,9 @@ import { colorize, findAgent } from '../utils/utils.js';
 import { resolveWorkspaceDependencyGraph } from '../utils/workspaceDependencyGraph.js';
 import { checkManifestText, parseRequiredProfiles } from '../utils/runtime/profileRules.mjs';
 import { assertProdProfileConsistency, readProd } from '../utils/prodMode.mjs';
-import { readCapturedProdGates } from '../utils/runtime/mcpProdGates.mjs';
+import { readCapturedProdGates, dryCaptureProdGates } from '../utils/runtime/mcpProdGates.mjs';
+import { collectProdGateRoutes } from './workspaceUtil.js';
+import { parseStartArgs } from '../utils/repos.js';
 
 /**
  * Handle the profile command.
@@ -53,7 +55,7 @@ export async function handleProfileCommand(args) {
             console.log('  ploinky profile list [agent]  List available profiles');
             console.log('  ploinky profile validate <profile> [agent]  Validate profile config');
             console.log('  ploinky profile check [--require a,b]  Check that every enabled agent declares the profiles (default: default,dev,qa,prod)');
-            return;
+            throw new Error(`Invalid profile '${args[0]}'`);
     }
 }
 
@@ -83,7 +85,7 @@ function handleSetProfile(profileName) {
             console.log('       Restart running agents to apply the new profile.');
         }
     } else {
-        console.error(colorize(`✗ ${result.message}`, 'red'));
+        throw new Error(result.message);
     }
 }
 
@@ -169,9 +171,14 @@ function handleCheckProfiles(args) {
  */
 function handleAssertProfile(args) {
     let requestedProfile;
+    let startArgs;
     for (let i = 0; i < args.length; i += 1) {
         const arg = String(args[i]);
-        if (arg === '--profile') {
+        if (arg === '--start-args') {
+            startArgs = JSON.parse(args[++i]);
+            if (!Array.isArray(startArgs) || startArgs.some((value) => typeof value !== 'string')) throw new Error('Invalid start arguments.');
+            continue;
+        } else if (arg === '--profile') {
             requestedProfile = String(args[i + 1] ?? '').trim().toLowerCase();
             i += 1;
         } else if (arg.startsWith('--profile=')) {
@@ -181,7 +188,15 @@ function handleAssertProfile(args) {
         }
         if (!requestedProfile) throw new Error('--profile needs a value.');
     }
+    const start = startArgs ? parseStartArgs(startArgs) : {};
+    requestedProfile = start.profile || requestedProfile;
     assertProdProfileConsistency({ requestedProfile });
+    const prod = readProd();
+    dryCaptureProdGates({ prod, routes: collectProdGateRoutes({
+        staticAgentArg: start.staticAgent || undefined,
+        workspaceProfile: requestedProfile || undefined,
+        prod,
+    }) });
 }
 
 // The stored value (what the next start or whole restart will capture) and the
