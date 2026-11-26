@@ -33,7 +33,7 @@ const { InMemoryPolicyStateStore } = await import('../../cli/server/policy/InMem
 const { writeSecretsFile } = await import('../../cli/utils/security/encryptedSecretsFile.js');
 const { readProd } = await import('../../cli/utils/prodMode.mjs');
 const { getProfileEnvVars } = await import('../../cli/utils/runtime/profileService.js');
-const { buildRouterEnv, collectProdGateRoutes } = await import('../../cli/commands/workspaceUtil.js');
+const { buildRouterEnv, collectProdGateRoutes, commitProdCapture } = await import('../../cli/commands/workspaceUtil.js');
 const agentsSvc = await import('../../cli/utils/agents.js');
 
 const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-prod-gates-repos-')));
@@ -132,6 +132,8 @@ test('under PROD a dirty, staged, untracked, non-git or symlinked mcp-config ref
     const cases = {};
     cases.dirty = agentRepo();
     fs.writeFileSync(cases.dirty.file, JSON.stringify({ tools: [{ name: 'git_pull' }] }));
+    cases.deleted = agentRepo();
+    fs.unlinkSync(cases.deleted.file);
     cases.staged = agentRepo();
     fs.writeFileSync(cases.staged.file, JSON.stringify({ tools: [] }));
     git(cases.staged.repo, 'add', '-A');
@@ -359,13 +361,11 @@ test('AC8: start and whole restart run the dry capture before their first mutati
     assert.ok(routerRestart.includes('startWorkspace('));
     assert.equal(routerRestart.includes('prodCapture'), false);
     assert.equal(routerRestart.includes('dryCaptureProdGates'), false);
-    // The file is written only from a carried capture, before the first selector write.
-    const workspaceUtil = fs.readFileSync(path.join(dir, 'workspaceUtil.js'), 'utf8');
-    const writeAt = workspaceUtil.indexOf('writeProdGates(extendProdCapture(');
-    assert.ok(writeAt > 0);
-    assert.ok(workspaceUtil.slice(workspaceUtil.lastIndexOf('if (prodCapture) {', writeAt), writeAt).length < 40);
-    assert.ok(writeAt < workspaceUtil.indexOf("inactivateEdgeRoutingGeneration('workspace-start-prepare'"));
-    assert.equal(workspaceUtil.split('writeProdGates(').length - 1, 1);
+    // A Router-only restart preserves the capture already in force.
+    const existing = { schema: 1, prod: true, routes: {} };
+    gates.writeProdGates(existing);
+    commitProdCapture(undefined, {});
+    assert.deepEqual(JSON.parse(fs.readFileSync(captureFile, 'utf8')), existing);
 });
 
 test('AC8: an enable merges only its own route, never changes prod, and refuses a dirty route under the captured PROD', () => {
@@ -415,7 +415,7 @@ test('an enable with no capture yet merges nothing; an unreadable capture refuse
     assert.deepEqual(calls, []);
 });
 
-test('collectProdGateRoutes covers the enabled registry (by alias) and the graph; extendProdCapture adds the rest', () => {
+test('collectProdGateRoutes covers the enabled registry (by alias) and the graph; publication reads the final admitted sources', () => {
     reset();
     const repos = path.join(workspace, '.ploinky', 'repos', 'r');
     const make = (name, config) => {
@@ -435,18 +435,22 @@ test('collectProdGateRoutes covers the enabled registry (by alias) and the graph
     assert.deepEqual(routes.map((route) => route.routeKey).sort(), ['enabled', 'shortcut']);
     const capture = gates.dryCaptureProdGates({ prod: false, routes });
     assert.deepEqual(capture.routes.shortcut.tools, ['a_tool']);
-    const extended = gates.extendProdCapture(capture, [
-        { routeKey: 'later', agentDir: path.join(repos, 'later') },
-        { routeKey: 'enabled', agentDir: path.join(repos, 'later') }, // already captured: not replaced
-    ]);
-    assert.deepEqual(extended.routes.later.tools, ['l_tool']);
-    assert.deepEqual(extended.routes.enabled, capture.routes.enabled);
-    assert.equal(gates.extendProdCapture(capture, []), capture);
-    // Under PROD the added routes get the dirty check (these are untracked files in no repository).
-    assert.throws(
-        () => gates.extendProdCapture({ ...capture, prod: true }, [{ routeKey: 'later', agentDir: path.join(repos, 'later') }]),
-        codeIs('PLOINKY_PROD_GATES_DIRTY'),
-    );
+    // Repository preparation can replace even a source already seen by the dry
+    // run. The admitted graph controls the routes and bytes finally published.
+    fs.writeFileSync(path.join(repos, 'enabled', 'mcp-config.json'), JSON.stringify({
+        tools: [{ name: 'new_tool', tags: ['prod-disabled'] }],
+    }));
+    const graph = { nodes: new Map([['later', { shortAgentName: 'later', agentPath: path.join(repos, 'later') }]]) };
+    const finalGraph = { registry, graph };
+    commitProdCapture(capture, finalGraph);
+    const admitted = JSON.parse(fs.readFileSync(captureFile, 'utf8'));
+    assert.deepEqual(admitted.routes.later.tools, ['l_tool']);
+    assert.deepEqual(admitted.routes.enabled.tools, ['new_tool']);
+    assert.deepEqual(admitted.routes.shortcut, capture.routes.shortcut);
+    // Production also verifies the final admitted sources. A refusal keeps
+    // the earlier successful capture intact.
+    assert.throws(() => commitProdCapture({ ...capture, prod: true }, finalGraph), codeIs('PLOINKY_PROD_GATES_DIRTY'));
+    assert.deepEqual(JSON.parse(fs.readFileSync(captureFile, 'utf8')), admitted);
 });
 
 test('a manifest secrets entry named PROD reads as missing in every source, so the stored value never reaches an agent', async () => {

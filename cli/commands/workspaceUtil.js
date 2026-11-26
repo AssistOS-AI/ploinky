@@ -53,7 +53,7 @@ import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
 import { PROD_ENV } from '../utils/prodMode.mjs';
 import {
   capturedProdOrClosed,
-  extendProdCapture,
+  dryCaptureProdGates,
   readCapturedProdGates,
   writeProdGates,
 } from '../utils/runtime/mcpProdGates.mjs';
@@ -1615,11 +1615,8 @@ export function resolveStartProd(prodCapture) {
 // existing file stays in force.
 export function commitProdCapture(prodCapture, start) {
   if (!prodCapture) return;
-  writeProdGates(extendProdCapture(prodCapture, collectProdGateRoutes({
-    registry: start.registry,
-    graph: start.graph,
-    additionalNodes: start.additionalNodes,
-  })));
+  const routes = collectProdGateRoutes({ registry: start.registry, graph: start.graph, additionalNodes: start.additionalNodes });
+  writeProdGates(dryCaptureProdGates({ prod: prodCapture.prod, routes }));
 }
 
 function loadRegistryManifest(record) {
@@ -3103,8 +3100,8 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.error(`[start] Skipping dependency '${unresolved.rawDependency}' of '${unresolved.parentRef}': ${unresolved.message}`);
   }
   // The graph now exists, including agents the repository preparation just
-  // installed or updated. Routes the dry capture could not know are added (the
-  // dirty check applies to them under PROD) and the complete capture is
+  // installed or updated. Recapture every admitted route from its final source,
+  // including routes whose branch changed during preparation. The result is
   // written, before the first selector, route, config or Router write.
   commitProdCapture(prodCapture, lockedStart);
   // `--branch` reaches link-install repositories here, for the whole admitted

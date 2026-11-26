@@ -123,90 +123,65 @@ function normalizeTag(tag) {
     return String(tag || '').trim().toLowerCase();
 }
 
-// The tools of one agent directory that carry the `prod-disabled` tag, with the
-// digest of the mcp-config they came from. A missing or unparsable mcp-config
-// gates nothing, exactly as `McpToolPolicy` reads no tools from it.
-function readMcpConfigGate(agentDir) {
-    const file = path.join(agentDir, MCP_CONFIG);
-    let bytes;
-    try {
-        bytes = fs.readFileSync(file);
-    } catch (_) {
-        return { file, present: false, tools: [], sha256: null };
-    }
-    const sha256 = createHash('sha256').update(bytes).digest('hex');
-    let tools = [];
-    try {
-        const parsed = JSON.parse(bytes.toString('utf8'));
-        tools = (Array.isArray(parsed?.tools) ? parsed.tools : [])
-            .filter((tool) => typeof tool?.name === 'string' && tool.name
-                && Array.isArray(tool.tags) && tool.tags.some((tag) => normalizeTag(tag) === PROD_DISABLED_TAG))
-            .map((tool) => tool.name);
-    } catch (_) {
-        tools = [];
-    }
-    return { file, present: true, tools: [...new Set(tools)].sort(), sha256 };
-}
-
-// git with no inherited repository selection, and nothing the repository's
-// own configuration can run.
+// Compare the exact bytes that supply the tool list with the committed blob.
+// Reading HEAD through ls-tree also distinguishes a service without an MCP
+// config from a tracked config that was deleted from the working tree.
 function runGit(directory, args) {
-    const env = { ...process.env };
+    const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' };
     for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_COMMON_DIR']) delete env[name];
     try {
-        const stdout = execFileSync('git', ['-C', directory, '-c', 'core.fsmonitor=false', ...args], {
+        return execFileSync('git', ['-C', directory, '-c', 'core.fsmonitor=false', ...args], {
             env,
-            encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'ignore'],
             timeout: 30_000,
+            maxBuffer: MAX_CAPTURE_BYTES,
         });
-        return { status: 0, stdout };
-    } catch (error) {
-        return { status: typeof error?.status === 'number' ? error.status : -1, stdout: '' };
+    } catch {
+        return null;
     }
 }
 
-// Why an mcp-config cannot be trusted to equal git HEAD, or '' when it is
-// tracked and identical to HEAD.
-function mcpConfigDirtyReason(agentDir, git) {
+function readRouteEntry(agentDir, prod) {
     const file = path.join(agentDir, MCP_CONFIG);
+    let bytes = null;
+    let stat = null;
     try {
-        if (fs.lstatSync(file).isSymbolicLink()) return 'is a symbolic link';
-    } catch (_) {
-        return 'cannot be read';
+        stat = fs.lstatSync(file);
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
     }
-    if (git(agentDir, ['rev-parse', '--is-inside-work-tree']).status !== 0) {
-        return 'is outside a git repository';
+    if (stat) {
+        if (prod && !stat.isFile()) throw new Error('is not a regular file');
+        bytes = fs.readFileSync(file);
     }
-    if (git(agentDir, ['ls-files', '--error-unmatch', '--', MCP_CONFIG]).status !== 0) {
-        return 'is untracked';
+    if (prod) {
+        const tree = runGit(agentDir, ['ls-tree', '-z', 'HEAD', '--', MCP_CONFIG]);
+        if (tree === null) throw new Error('cannot inspect git HEAD');
+        const tracked = tree.toString('utf8');
+        if (tracked || bytes !== null) {
+            const entry = /^(100644|100755) blob ([0-9a-f]{40,64})\tmcp-config\.json\0$/.exec(tracked);
+            if (!entry || bytes === null) throw new Error('must be a present regular file tracked in git HEAD');
+            const [, mode, object] = entry;
+            const index = runGit(agentDir, ['ls-files', '--stage', '-z', '--', MCP_CONFIG]);
+            const original = runGit(agentDir, ['cat-file', 'blob', object]);
+            if (index?.toString() !== `${mode} ${object} 0\t${MCP_CONFIG}\0`
+                || !original?.equals(bytes)) throw new Error('differs from git HEAD');
+        }
     }
-    const diff = git(agentDir, ['diff', '--quiet', 'HEAD', '--', MCP_CONFIG]);
-    if (diff.status === 0) return '';
-    return diff.status === 1 ? 'differs from git HEAD' : 'could not be compared with git HEAD';
-}
-
-function routeEntry(gate) {
-    return { tools: gate.tools, sha256: gate.sha256 };
-}
-
-// Under PROD, every captured route's mcp-config must be tracked and equal to
-// git HEAD, tagged or not: the capture proves the gate set a deploy reviewed.
-function assertCleanUnderProd(gates, git) {
-    const files = [];
-    for (const [routeKey, gate] of gates) {
-        if (!gate.present) continue;
-        const reason = mcpConfigDirtyReason(path.dirname(gate.file), git);
-        if (reason) files.push({ routeKey, file: gate.file, reason });
+    if (bytes === null) return { tools: [], sha256: null };
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    let parsed;
+    try {
+        parsed = JSON.parse(bytes.toString('utf8'));
+    } catch (error) {
+        if (prod) throw new Error('contains invalid JSON');
+        return { tools: [], sha256 };
     }
-    if (files.length) {
-        throw gateError(
-            PROD_GATES_DIRTY_CODE,
-            `PROD true: ${files.length} mcp-config file${files.length === 1 ? '' : 's'} must be tracked and identical to git HEAD before the gates are captured: `
-            + files.map((entry) => `${entry.routeKey} (${entry.file} ${entry.reason})`).join('; '),
-            { files },
-        );
-    }
+    const tools = (Array.isArray(parsed?.tools) ? parsed.tools : [])
+        .filter((tool) => typeof tool?.name === 'string' && tool.name
+            && Array.isArray(tool.tags) && tool.tags.some((tag) => normalizeTag(tag) === PROD_DISABLED_TAG))
+        .map((tool) => tool.name);
+    return { tools: [...new Set(tools)].sort(), sha256 };
 }
 
 function normalizeRoutes(routes) {
@@ -226,33 +201,22 @@ function normalizeRoutes(routes) {
 // graph route as `{ routeKey, agentDir }`. Under PROD it refuses
 // (PLOINKY_PROD_GATES_DIRTY) when any route's mcp-config is not tracked and
 // identical to git HEAD.
-export function dryCaptureProdGates({ prod = readProd(), routes, git = runGit } = {}) {
-    const gates = new Map(normalizeRoutes(routes).map(([routeKey, agentDir]) => [routeKey, readMcpConfigGate(agentDir)]));
-    if (prod) assertCleanUnderProd(gates, git);
-    return {
-        schema: PROD_GATES_SCHEMA,
-        prod: Boolean(prod),
-        routes: Object.fromEntries([...gates].map(([routeKey, gate]) => [routeKey, routeEntry(gate)])),
-    };
-}
-
-// Extend a dry capture with routes that were not known when it ran (a graph
-// resolved after the repositories were prepared). The dirty check applies to
-// the added routes only when the capture's `prod` is true.
-export function extendProdCapture(capture, routes, { git = runGit } = {}) {
-    const added = normalizeRoutes(routes).filter(([routeKey]) => !Object.hasOwn(capture.routes, routeKey));
-    if (!added.length) return capture;
-    const gates = new Map(added.map(([routeKey, agentDir]) => [routeKey, readMcpConfigGate(agentDir)]));
-    if (capture.prod) assertCleanUnderProd(gates, git);
-    return {
-        ...capture,
-        routes: Object.fromEntries(
-            Object.entries({
-                ...capture.routes,
-                ...Object.fromEntries([...gates].map(([routeKey, gate]) => [routeKey, routeEntry(gate)])),
-            }).sort(([left], [right]) => left.localeCompare(right)),
-        ),
-    };
+export function dryCaptureProdGates({ prod = readProd(), routes } = {}) {
+    const entries = [];
+    const files = [];
+    for (const [routeKey, agentDir] of normalizeRoutes(routes)) {
+        try {
+            entries.push([routeKey, readRouteEntry(agentDir, prod)]);
+        } catch (error) {
+            if (!prod) throw error;
+            files.push({ routeKey, file: path.join(agentDir, MCP_CONFIG), reason: error.message });
+        }
+    }
+    if (files.length) {
+        const summary = files.map(({ routeKey, reason }) => `${routeKey} (${reason})`).join('; ');
+        throw gateError(PROD_GATES_DIRTY_CODE, `Production policy capture refused: ${summary}`, { files });
+    }
+    return { schema: PROD_GATES_SCHEMA, prod: Boolean(prod), routes: Object.fromEntries(entries) };
 }
 
 // Atomic write into controller-only state. An identical file is left alone so
@@ -274,7 +238,7 @@ export function writeProdGates(capture, { file = PROD_GATES_FILE } = {}) {
 // for that route; it never changes the captured `prod`. With no capture yet
 // there is nothing to merge into: the next start captures every route. A
 // capture that exists but cannot be read refuses (fail closed).
-export function mergeEnabledRouteGates(routeKey, { agentDir, file = PROD_GATES_FILE, git = runGit } = {}) {
+export function mergeEnabledRouteGates(routeKey, { agentDir, file = PROD_GATES_FILE } = {}) {
     const existing = readCapturedProdGates({ file });
     if (existing.unavailable) {
         if (existing.reason === 'absent') return { merged: false };
@@ -283,10 +247,9 @@ export function mergeEnabledRouteGates(routeKey, { agentDir, file = PROD_GATES_F
             `The captured production gates are ${existing.reason}; run a start or whole restart to capture them again.`,
         );
     }
-    const gate = readMcpConfigGate(agentDir);
-    if (existing.prod) assertCleanUnderProd(new Map([[routeKey, gate]]), git);
+    const capture = dryCaptureProdGates({ prod: existing.prod, routes: [{ routeKey, agentDir }] });
     const routes = {};
-    for (const [key, entry] of Object.entries({ ...existing.routes, [routeKey]: routeEntry(gate) })
+    for (const [key, entry] of Object.entries({ ...existing.routes, ...capture.routes })
         .sort(([left], [right]) => left.localeCompare(right))) {
         routes[key] = { tools: [...entry.tools], sha256: entry.sha256 };
     }
