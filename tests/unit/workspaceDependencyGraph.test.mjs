@@ -1331,7 +1331,7 @@ test('managed runtime hash reconstruction uses the retained signed semantic topo
             PLOINKY_AGENT_INSTANCE_ID: 'retained-instance',
             PLOINKY_AGENT_ENABLE_GENERATION: 'retained-generation',
         },
-        identity: { agentName: 'managed', repoName: 'demo' },
+        identity: { agentName: 'managed', repoName: 'demo', profileName: 'default' },
     });
 });
 

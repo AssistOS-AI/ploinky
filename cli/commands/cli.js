@@ -89,7 +89,7 @@ import {
 import { handleDefaultSkillsCommand } from './skillsCommands.js';
 import { runSettingsMenu } from './settingsMenu.js';
 import { handleProfileCommand } from './profileCommands.js';
-import { assertProdProfileConsistency, readProd } from '../utils/prodMode.mjs';
+import { assertDeploySettingsCurrent, assertProdProfileConsistency, readProd } from '../utils/prodMode.mjs';
 import { dryCaptureProdGates } from '../utils/runtime/mcpProdGates.mjs';
 import {
     cleanupSessionContainers,
@@ -102,6 +102,7 @@ import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './s
 import ClientCommands from './client.js';
 import { runCodingSessionsCommand } from './codingSessionsCommand.js';
 import {
+    getActiveProfile,
     getValidProfiles,
     isValidProfile,
     resolveManifestRuntimeProfile,
@@ -457,12 +458,14 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             // refuses a dirty, untracked or non-git one, still before any
             // mutation. startWorkspace writes the result.
             const prod = readProd();
+            const workspaceProfile = startParsed.profile?.trim().toLowerCase() || getActiveProfile();
+            assertProdProfileConsistency({ requestedProd: prod, workspaceProfile });
             const prodCapture = dryCaptureProdGates({
-                prod,
+                prod, workspaceProfile,
                 routes: collectProdGateRoutes({
                     prod,
                     staticAgentArg: startParsed.staticAgent || undefined,
-                    workspaceProfile: startParsed.profile || undefined,
+                    workspaceProfile,
                 }),
             });
             const withCanariesReconciled = mutate => withCanarySafePreparation('start', mutate);
@@ -764,29 +767,34 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 // Before the first mutation: nothing is stopped on a refusal.
                 assertProdProfileConsistency();
                 const prod = readProd();
-                const prodCapture = dryCaptureProdGates({ prod, routes: collectProdGateRoutes({ prod }) });
+                const workspaceProfile = getActiveProfile();
+                assertProdProfileConsistency({ requestedProd: prod, workspaceProfile });
+                const prodCapture = dryCaptureProdGates({ prod, workspaceProfile, routes: collectProdGateRoutes({ prod, workspaceProfile }) });
                 resolvePersistedRouterPort();
                 // The generic settler refuses an abandoned additive lease.
                 // Recover a canary-owned publication before asking it to
                 // settle graph starts, then recheck under the stop lease.
                 const withCanariesReconciled = mutate => withCanarySafePreparation('restart', mutate);
                 await withCanariesReconciled();
-                await settleWorkspaceBeforeRestart();
-                await withCanariesReconciled(() => {
-                    inactivateEdgeRoutingGeneration('cli-workspace-restart');
-                    console.log('[restart] Stopping Router and configured agents...');
-                    killRouterIfRunning();
-                    console.log('[restart] Stopping configured agent containers...');
-                    const list = stopConfiguredAgents();
-                    if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
-                    else { console.log('[restart] No containers to stop.'); }
-                });
-                await startWorkspace(undefined, undefined, {
-                    restarting: true,
-                    enableAgent,
-                    killRouterIfRunning,
-                    withCanariesReconciled,
-                    prodCapture,
+                await settleWorkspaceBeforeRestart(async (workspaceMutationLease) => {
+                    assertDeploySettingsCurrent(prodCapture);
+                    await withCanariesReconciled(() => {
+                        inactivateEdgeRoutingGeneration('cli-workspace-restart');
+                        console.log('[restart] Stopping Router and configured agents...');
+                        killRouterIfRunning();
+                        console.log('[restart] Stopping configured agent containers...');
+                        const list = stopConfiguredAgents();
+                        if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
+                        else { console.log('[restart] No containers to stop.'); }
+                    });
+                    await startWorkspace(undefined, undefined, {
+                        restarting: true,
+                        enableAgent,
+                        killRouterIfRunning,
+                        withCanariesReconciled,
+                        prodCapture,
+                        workspaceMutationLease,
+                    });
                 });
                 console.log('[restart] Done.');
             }

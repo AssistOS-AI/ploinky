@@ -139,7 +139,7 @@ test('legacy Router replacement is confirmed before an actual generation migrati
             },
             readHealth: async () => {
                 assert.deepEqual(migrationState(fixture), before, 'a health observation must precede generation mutation');
-                if (!spawned) { events.push('legacy-health'); return LEGACY; }
+                if (!spawned) { events.push('legacy-health'); return { ...LEGACY, generationSourceFormat: 'router-public-hosts-v1' }; }
                 events.push('replacement-health');
                 replacementRead.resolve();
                 return releaseHealth.promise;

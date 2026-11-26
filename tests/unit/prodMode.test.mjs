@@ -26,7 +26,7 @@ process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 process.env.PLOINKY_MASTER_KEY = randomUUID().replaceAll('-', '').padEnd(64, 'a');
 fs.writeFileSync('.env', '');
 
-const { parseProd, readProd, assertProdProfileConsistency } = await import('../../cli/utils/prodMode.mjs');
+const { parseProd, readProd, assertProdProfileConsistency, assertDeploySettingsCurrent } = await import('../../cli/utils/prodMode.mjs');
 const { handleVarCommand, handleVarStdinCommand } = await import('../../cli/commands/envVarCommands.js');
 const { readSecretsFile, writeSecretsFile } = await import('../../cli/utils/security/encryptedSecretsFile.js');
 const { setActiveProfile, getActiveProfile, getProfileEnvVars, validateProfile } = await import('../../cli/utils/runtime/profileService.js');
@@ -184,6 +184,18 @@ test('mode changes respect the workspace lease and normalized variable name', as
     }
 });
 
+test('a deployment prepared under prod refuses a subsequent valid switch to QA', () => {
+    reset();
+    setProfileFile('prod');
+    quietVar('PROD', 'true');
+    const prepared = { prod: true, workspaceProfile: 'prod' };
+    assert.doesNotThrow(() => assertDeploySettingsCurrent(prepared));
+    quietVar('PROD', 'false');
+    assert.equal(setActiveProfile('qa').success, true);
+    assert.throws(() => assertDeploySettingsCurrent(prepared), codeIs('PLOINKY_DEPLOY_SETTINGS_CHANGED'));
+    assert.doesNotThrow(() => assertDeploySettingsCurrent({ prod: false, workspaceProfile: 'qa' }));
+});
+
 test('production inspection preserves an empty or unreadable store', () => {
     reset();
     const file = path.join(workspace, '.ploinky', 'data', '.secrets');
@@ -310,7 +322,7 @@ test('start and whole restart run the consistency check before their first mutat
     const restartWhole = source.slice(source.indexOf("restart: start is not configured. Run: start <staticAgent> <port>'"));
     const assertAt = restartWhole.indexOf('assertProdProfileConsistency();');
     assert.ok(assertAt > 0);
-    for (const mutation of ['resolvePersistedRouterPort();', 'settleWorkspaceBeforeRestart()', 'inactivateEdgeRoutingGeneration(', 'killRouterIfRunning();', 'stopConfiguredAgents()']) {
+    for (const mutation of ['resolvePersistedRouterPort();', 'settleWorkspaceBeforeRestart(', 'inactivateEdgeRoutingGeneration(', 'killRouterIfRunning();', 'stopConfiguredAgents()']) {
         assert.ok(assertAt < restartWhole.indexOf(mutation), mutation);
     }
 });

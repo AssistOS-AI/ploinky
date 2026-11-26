@@ -133,14 +133,20 @@ for (const command of ['start', 'restart']) {
                 if (name !== 'prepareDefaultBootRepositories') return;
                 write(path.join(workspaceRoot, 'fixtures/alpha/manifest.json'), probeManifest);
                 applyEdgeRoutingGeneration({ workspaceRoot, reason: 'admit-probe', publicationState: 'ready' });
-                assert.equal(markers().length, 1);
-                attemptNewCanary();
+                if (command === 'restart') {
+                    assert.equal(locks.heldWorkspaceMutationLease()?.operation, 'workspace-restart');
+                    assert.throws(() => locks.createWorkspaceMutationLease({ operation: 'canary-start' }),
+                        error => error.code === 'PLOINKY_WORKSPACE_MUTATION_BUSY');
+                } else {
+                    assert.equal(markers().length, 1);
+                    attemptNewCanary();
+                }
             },
         });
         if (command === 'start') inactivateEdgeRoutingGeneration('cold-start-fixture', { workspaceRoot });
         await assert.rejects(handleCommand([command]), /fixture reached start repository preparation/);
         assert.deepEqual(markers(), []);
-        assert.ok(effects.every(effect => effect.lease === null));
+        assert.ok(effects.every(effect => effect.lease === (command === 'restart' ? 'workspace-restart' : null)));
     });
 }
 
@@ -353,6 +359,28 @@ test('PROD profile refusal leaves a published canary and its runtime untouched',
     }
 });
 
+test('whole restart holds its workspace lease across stop and replacement preparation', async () => {
+    const observations = [];
+    const profileService = new URL('../../cli/utils/runtime/profileService.js', import.meta.url).href;
+    fixture(false, { onEffect(name) {
+        if (!['killRouterIfRunning', 'prepareDefaultBootRepositories'].includes(name)) return;
+        const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
+            import { setActiveProfile } from ${JSON.stringify(profileService)};
+            try { setActiveProfile('qa'); process.exitCode = 2; }
+            catch (error) { process.stdout.write(String(error.code)); }
+        `], { encoding: 'utf8', env: { ...process.env, PLOINKY_WORKSPACE_ROOT: workspaceRoot } });
+        assert.ifError(probe.error);
+        assert.equal(probe.status, 0, probe.stderr);
+        observations.push([name, probe.stdout]);
+    } });
+    await assert.rejects(handleCommand(['restart']), /fixture reached start repository preparation/);
+    assert.deepEqual(observations, [
+        ['killRouterIfRunning', 'PLOINKY_WORKSPACE_MUTATION_BUSY'],
+        ['prepareDefaultBootRepositories', 'PLOINKY_WORKSPACE_MUTATION_BUSY'],
+    ]);
+    assert.equal(locks.heldWorkspaceMutationLease(), null);
+});
+
 test('start finishes canary teardown before persisting an explicit profile', async t => {
     fixture(true);
     inactivateEdgeRoutingGeneration('cold-start-fixture', { workspaceRoot });
@@ -392,7 +420,9 @@ for (const [args, boundaries] of commands) {
                 assert.equal(effect.registered, false);
                 assert.equal(effect.receipt?.reason ?? null, canary ? command : null);
                 assert.equal(effect.receipt?.outcome ?? null, canary ? 'aborted' : null);
-                if (!canary && !['disable', 'update'].includes(command)) assert.equal(effect.lease, null);
+                if (!canary && !['disable', 'update'].includes(command)) {
+                    assert.equal(effect.lease, command === 'restart' ? 'workspace-restart' : null);
+                }
             }
         });
     }

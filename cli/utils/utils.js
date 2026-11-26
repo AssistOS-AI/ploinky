@@ -37,14 +37,14 @@ function findAgent(agentName) {
             debugLog(`Found agent directly with prefixed name: ${manifestPath}`);
             return { manifestPath, repo: repoName, shortAgentName };
         } else {
-            throw new Error(`Agent '${agentName}' not found.`);
+            throw Object.assign(new Error(`Agent '${agentName}' not found.`), { code: 'PLOINKY_AGENT_SOURCE_MISSING' });
         }
     }
 
     const foundAgents = [];
     const installedRepos = listAgentRepositoryNames();
     if (!installedRepos.length) {
-        throw new Error("Ploinky environment not initialized. No repos found.");
+        throw Object.assign(new Error('Ploinky environment not initialized. No repos found.'), { code: 'PLOINKY_AGENT_SOURCE_MISSING' });
     }
     const enabledRepos = reposSvc.loadEnabledRepos();
     const primaryRepos = enabledRepos.length
@@ -80,7 +80,7 @@ function findAgent(agentName) {
     }
 
     if (foundAgents.length === 0) {
-        throw new Error(`Agent '${agentName}' not found.`);
+        throw Object.assign(new Error(`Agent '${agentName}' not found.`), { code: 'PLOINKY_AGENT_SOURCE_MISSING' });
     }
 
     if (foundAgents.length > 1) {

@@ -53,8 +53,9 @@ import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, res
 import { getActiveProfile, getProfileConfig, getRuntimePolicyEnvironment, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
-import { PROD_ENV } from '../utils/prodMode.mjs';
+import { assertDeploySettingsCurrent, PROD_ENV } from '../utils/prodMode.mjs';
 import {
+  capturedProdOrClosed,
   dryCaptureProdGates,
   readCapturedProdGates,
   stageProdGates,
@@ -81,6 +82,7 @@ import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/do
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
 import {
   createWorkspaceMutationLease,
+  heldWorkspaceMutationLease,
   releaseWorkspaceMutationLease,
   releaseWorkspaceStartLock,
   runWithWorkspaceMutationLease,
@@ -1593,13 +1595,13 @@ export function collectProdGateRoutes({
     if (staticAgent) {
       try {
         resolvedGraph = resolveWorkspaceDependencyGraph({
-          staticAgentRef: staticAgent, registry, workspaceProfile, prod,
+          staticAgentRef: staticAgent, registry, workspaceProfile, prod, deferMissingDeclaredRepos: true,
           onUnresolvedDependency: () => {},
         });
       } catch (error) {
         // A fresh start prepares its repositories after this inspection. Only
         // missing sources can be deferred; the admitted graph is checked again.
-        const missing = /not found\.|No repos found\./.test(String(error.message));
+        const missing = error.code === 'PLOINKY_AGENT_SOURCE_MISSING';
         if (prod && (retained || !missing)) throw error;
       }
     }
@@ -1622,7 +1624,7 @@ export function resolveStartProd(prodCapture) {
 // for the ready generation's selector commit.
 export function commitProdCapture(prodCapture, start) {
   if (!prodCapture) return;
-  const workspaceProfile = getActiveProfile();
+  const workspaceProfile = prodCapture.workspaceProfile || getActiveProfile();
   const routes = collectProdGateRoutes({ registry: start.registry, graph: start.graph, additionalNodes: start.additionalNodes, prod: prodCapture.prod, workspaceProfile });
   return dryCaptureProdGates({ prod: prodCapture.prod, routes, workspaceProfile });
 }
@@ -3033,50 +3035,62 @@ export function printStartResultSummary(result, { log = console.log } = {}) {
 
 // Restart only the listener against the already published generation. The
 // active profile must be provable before the old listener is stopped.
-export async function restartRouterOnly({ killRouterIfRunning }) {
-  const lease = await acquireSettledWorkspaceMutationLease({ operation: 'router-restart' });
+export async function restartRouterOnly({ killRouterIfRunning }, {
+  acquireLease = acquireSettledWorkspaceMutationLease,
+  runWithLease = runWithWorkspaceMutationLease,
+  releaseLease = releaseWorkspaceStartLock,
+  readCapture = readCapturedProdGates,
+  loadGeneration = loadActiveEdgeRoutingGeneration,
+  readPort = resolvePersistedRouterPort,
+  waitForListener = waitForRouterReady,
+  ensureReady = ensureRouterGenerationReady,
+  spawnRouter = (port) => {
+    fs.mkdirSync(RUNNING_DIR, { recursive: true });
+    const pidFile = path.join(RUNNING_DIR, 'router.pid');
+    const child = spawnWatchdog(path.resolve(__dirname, '../server/Watchdog.js'), port, pidFile);
+    try { fs.writeFileSync(pidFile, String(child.pid)); } catch (_) {}
+    child.unref();
+    return child;
+  },
+  routerEnvironment = buildRouterEnv,
+  readHealth = readRouterGenerationHealth,
+} = {}) {
+  const lease = await acquireLease({ operation: 'router-restart' });
   try {
-    return await runWithWorkspaceMutationLease(lease, async () => {
-    const capture = readCapturedProdGates();
-    if (capture.unavailable || !['default', 'dev', 'qa', 'prod'].includes(capture.workspaceProfile)) {
-      throw new Error('restart router: active runtime policy identity is unavailable; run a whole restart first.');
-    }
-    const active = loadActiveEdgeRoutingGeneration();
-    const port = parseRouterPort(active.generation.routing.port, { source: 'active Router generation port' });
-    if (resolvePersistedRouterPort() !== port) {
-      throw new Error('restart router: persisted Router port differs from the active generation; run a whole restart first.');
-    }
-    await killRouterIfRunning();
-    const deadline = Date.now() + 15000;
-    let stopped = false;
-    while (Date.now() < deadline) {
-      try { await waitForRouterReady(port, null, 100); }
-      catch (_) { stopped = true; break; }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    if (!stopped) throw new Error('restart router: the previous Router is still listening.');
-    const routerHealthSocket = buildRouterEnv().PLOINKY_ROUTER_HEALTH_SOCKET
-      || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
-    await ensureRouterGenerationReady({
-      waitForListener: (child, timeoutMs) => waitForRouterReady(port, child, timeoutMs),
-      readHealth: () => readRouterGenerationHealth({ socketPath: routerHealthSocket }),
-      spawnRouter: () => {
-        fs.mkdirSync(RUNNING_DIR, { recursive: true });
-        const pidFile = path.join(RUNNING_DIR, 'router.pid');
-        const child = spawnWatchdog(path.resolve(__dirname, '../server/Watchdog.js'), port, pidFile);
-        try { fs.writeFileSync(pidFile, String(child.pid)); } catch (_) {}
-        child.unref();
-        return child;
-      },
-    });
-    const current = loadActiveEdgeRoutingGeneration();
-    if (current.selector.generation !== active.selector.generation
-        || current.selector.activationId !== active.selector.activationId) {
-      throw new Error('restart router: active routing generation changed during restart.');
-    }
+    return await runWithLease(lease, async () => {
+      const capture = readCapture();
+      if (capture.unavailable || !['default', 'dev', 'qa', 'prod'].includes(capture.workspaceProfile)) {
+        throw new Error('restart router: active runtime policy identity is unavailable; run a whole restart first.');
+      }
+      const active = loadGeneration();
+      const port = parseRouterPort(active.generation.routing.port, { source: 'active Router generation port' });
+      if (readPort() !== port) {
+        throw new Error('restart router: persisted Router port differs from the active generation; run a whole restart first.');
+      }
+      await killRouterIfRunning();
+      const deadline = Date.now() + 15000;
+      let stopped = false;
+      while (Date.now() < deadline) {
+        try { await waitForListener(port, null, 100); }
+        catch (_) { stopped = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (!stopped) throw new Error('restart router: the previous Router is still listening.');
+      const routerHealthSocket = routerEnvironment().PLOINKY_ROUTER_HEALTH_SOCKET
+        || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
+      await ensureReady({
+        waitForListener: (child, timeoutMs) => waitForListener(port, child, timeoutMs),
+        readHealth: () => readHealth({ socketPath: routerHealthSocket }),
+        spawnRouter: () => spawnRouter(port),
+      });
+      const current = loadGeneration();
+      if (current.selector.generation !== active.selector.generation
+          || current.selector.activationId !== active.selector.activationId) {
+        throw new Error('restart router: active routing generation changed during restart.');
+      }
     });
   } finally {
-    releaseWorkspaceStartLock(lease);
+    releaseLease(lease);
   }
 }
 
@@ -3084,6 +3098,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   killRouterIfRunning,
   branchPolicy,
   withCanariesReconciled,
+  workspaceMutationLease = null,
   restarting = false,
   announce = true,
   // The dry capture `start` or a whole `restart` computed before its first
@@ -3091,6 +3106,9 @@ async function startWorkspace(staticAgentArg, portArg, {
   // `restart router` carries none and reuses the existing file.
   prodCapture = null,
 } = {}) {
+  if (workspaceMutationLease && heldWorkspaceMutationLease() !== workspaceMutationLease) {
+    throw new Error('start: the supplied workspace lease is not held');
+  }
   const startProd = resolveStartProd(prodCapture);
   // Acquire every declared dependency source before resolving the complete
   // graph. A fresh workspace cannot admit repositories that do not exist yet.
@@ -3130,7 +3148,8 @@ async function startWorkspace(staticAgentArg, portArg, {
   // creating and activating runtimes. Wait until none can still make progress
   // (they need the lease, so the wait holds none), then revalidate the
   // admitted graph under the lease.
-  const workspaceStartLock = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' });
+  const workspaceStartLock = workspaceMutationLease
+    || await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' });
   let workspacePreparationLease = null;
   let workspaceActivated = false;
   const workspaceRuntimeCandidates = [];
@@ -3140,7 +3159,8 @@ async function startWorkspace(staticAgentArg, portArg, {
   // this lease, and nothing else in the process can. A rollback start can
   // follow a killed start at once: wait out only that dead owner's stale
   // network-lock grace, never a live owner.
-  return await runWithRuntimePolicyEnvironment({ prod: startProd, workspaceProfile: getActiveProfile() }, () => runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
+  if (prodCapture) assertDeploySettingsCurrent(prodCapture);
+  return await runWithRuntimePolicyEnvironment({ prod: startProd, workspaceProfile: prodCapture?.workspaceProfile || getActiveProfile() }, () => runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
   // A rollout may have started while this start waited for no-wait workers.
   await withCanariesReconciled?.();
@@ -3881,7 +3901,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   }
   })));
   } finally {
-    releaseWorkspaceStartLock(workspaceStartLock);
+    if (!workspaceMutationLease) releaseWorkspaceStartLock(workspaceStartLock);
   }
 }
 
@@ -3892,13 +3912,13 @@ async function startWorkspace(staticAgentArg, portArg, {
  * settle a stopped start's graph preparation under that same lease, so that
  * either refusal happens while the running graph is still untouched.
  */
-async function settleWorkspaceBeforeRestart() {
+async function settleWorkspaceBeforeRestart(callback) {
   const workspaceMutationLease = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-restart' });
   let callbackError = null;
   try {
     // Bound as this restart's own lease, like every lease owner without a callback.
-    return runWithWorkspaceMutationLease(workspaceMutationLease, () => (
-      withNetworkLifecycleLockReclaimingStoppedOwner((networkLifecycleCapability) => {
+    return await runWithWorkspaceMutationLease(workspaceMutationLease, async () => {
+      const result = await withNetworkLifecycleLockReclaimingStoppedOwner((networkLifecycleCapability) => {
         const result = retireAbandonedWorkspaceStartPreparation({
           workspaceRoot: PLOINKY_WORKSPACE_ROOT,
           workspaceMutationLease,
@@ -3908,8 +3928,9 @@ async function settleWorkspaceBeforeRestart() {
           console.log(`[restart] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
         }
         return result;
-      })
-    ));
+      });
+      return callback ? await callback(workspaceMutationLease) : result;
+    });
   } catch (error) {
     callbackError = error;
     throw error;

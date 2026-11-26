@@ -152,6 +152,7 @@ function resolveWorkspaceDependencyGraph({
     // The captured PROD value: under PROD every node must declare the `prod`
     // profile instead of falling back to `default`.
     prod = false,
+    deferMissingDeclaredRepos = false,
     onCycle = null,
     // Opt-in: called for a no-wait dependency that cannot be resolved. The
     // dependency and everything only it reached leave the graph and the
@@ -169,6 +170,7 @@ function resolveWorkspaceDependencyGraph({
     }
 
     const nodes = new Map();
+    const declaredRepos = new Set();
     const state = new Map();
 
     const selectedWorkspaceProfile = normalizeProfileOverride(workspaceProfile || getActiveProfile());
@@ -182,7 +184,16 @@ function resolveWorkspaceDependencyGraph({
         stack = [],
         selectionPath = [],
     } = {}) {
-        const resolved = findAgent(agentRef);
+        let resolved;
+        try {
+            resolved = findAgent(agentRef);
+        } catch (error) {
+            const repo = agentRef.split(/[:/]/)[0];
+            if (!isStatic && deferMissingDeclaredRepos && error.code === 'PLOINKY_AGENT_SOURCE_MISSING' && declaredRepos.has(repo)) {
+                return null;
+            }
+            throw error;
+        }
         const nodeId = createGraphNodeId(resolved.repo, resolved.shortAgentName, alias);
         const instanceKey = effectiveInstanceKey(resolved.repo, resolved.shortAgentName, alias);
         const requestedProfile = normalizeProfileOverride(profile);
@@ -197,6 +208,7 @@ function resolveWorkspaceDependencyGraph({
         let node = nodes.get(nodeId);
         if (!node) {
             const manifest = readManifest(resolved.manifestPath);
+            for (const repo of Object.keys(manifest.repos || {})) declaredRepos.add(repo);
             validateManifestNetworks(manifest, { path: `manifest(${resolved.repo}/${resolved.shortAgentName})` });
             resolveManifestStartup(manifest);
             const registryRecord = findRegistryRecord(registry, {
@@ -340,6 +352,7 @@ function resolveWorkspaceDependencyGraph({
                     stack: nextStack,
                     selectionPath: [...node.selectionPath, `${node.id} -> ${dependencyRef}${qualifiedDependency.alias ? ` as ${qualifiedDependency.alias}` : ''}`],
                 });
+                if (childId === null) continue;
                 node.dependencies.add(childId);
                 const noWait = Boolean(qualifiedDependency.noWait);
                 const existingEdge = node.dependencyEdges.get(childId);

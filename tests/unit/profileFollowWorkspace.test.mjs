@@ -350,10 +350,9 @@ test('enable: an operator-supplied per-agent environment that differs from the w
         codeIs('PLOINKY_PROFILE_NOT_FOUND'),
     );
     assert.doesNotThrow(() => rules({}, { workspaceProfile: 'prod', prod: true }));
-    // An unresolvable agent is left to the candidate preparation.
-    assert.doesNotThrow(() => agents.assertEnableProfileRules(
+    assert.throws(() => agents.assertEnableProfileRules(
         { agentName: 'repo/does-not-exist', authOptions: {} }, { workspaceProfile: 'prod', prod: true },
-    ));
+    ), codeIs('PLOINKY_AGENT_SOURCE_MISSING'));
 });
 
 
@@ -368,4 +367,15 @@ test('PROD graph rejects malformed dependency declarations even with tolerance',
         writeAgent('badgraph', { profiles: FULL, enable });
         assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'repo/badgraph', workspaceProfile: 'prod', prod: true, onUnresolvedDependency() {} }));
     }
+});
+
+test('preflight defers a declared new repository until acquisition and still checks its installed siblings', () => {
+    writeAgent('bootstrap', { profiles: FULL, repos: { partner: 'https://example.test/partner.git' },
+        enable: ['partner/newAgent', 'repo/dep'] });
+    const options = { staticAgentRef: 'repo/bootstrap', workspaceProfile: 'prod', prod: true };
+    const graph = resolveWorkspaceDependencyGraph({ ...options, deferMissingDeclaredRepos: true });
+    assert.deepEqual([...graph.nodes.values()].map(node => node.agentRef).sort(), ['repo/bootstrap', 'repo/dep']);
+    assert.throws(() => resolveWorkspaceDependencyGraph(options), /not found/);
+    writeAgent('bootstrap', { profiles: FULL, enable: ['unknown/newAgent'] });
+    assert.throws(() => resolveWorkspaceDependencyGraph({ ...options, deferMissingDeclaredRepos: true }), /not found/);
 });

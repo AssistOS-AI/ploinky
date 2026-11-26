@@ -22,11 +22,7 @@ function sliceBetween(source, startLabel, endLabel) {
     return source.slice(start, end);
 }
 
-test('whole-workspace and Router lifecycle commands inactivate edge authorization before stopping processes', () => {
-    assertOrdered(cliSource, [
-        "inactivateEdgeRoutingGeneration('cli-router-restart')",
-        'killRouterIfRunning();',
-    ]);
+test('whole-workspace lifecycle commands inactivate edge authorization before stopping processes', () => {
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-workspace-restart')",
         'killRouterIfRunning();',
@@ -55,14 +51,11 @@ test('restarts settle earlier no-wait workers and a stopped start preparation be
     // The restart inactivation replaces the only selector that binds a stopped
     // start's preparation, and its stop cannot see a no-wait worker's
     // half-created runtime; either refusal must happen before any stop.
-    assertOrdered(sliceBetween(cliSource, "'restart router: start is not configured", "'[restart] RoutingServer restarted.'"), [
-        'await settleWorkspaceBeforeRestart();',
-        "inactivateEdgeRoutingGeneration('cli-router-restart')",
-        'killRouterIfRunning();',
-        'await startWorkspace(',
-    ]);
+    const routerOnly = sliceBetween(workspaceSource, 'export async function restartRouterOnly(', '\n}\n');
+    assertOrdered(routerOnly, ['await acquireLease(', 'readCapture()', 'loadGeneration()', 'await killRouterIfRunning()', 'await ensureReady(']);
+    assert.doesNotMatch(routerOnly, /inactivateEdgeRoutingGeneration|stopConfiguredAgents|startWorkspace\(/);
     assertOrdered(sliceBetween(cliSource, "'restart: start is not configured", "'[restart] Done.'"), [
-        'await settleWorkspaceBeforeRestart();',
+        'await settleWorkspaceBeforeRestart(async (workspaceMutationLease) => {',
         "inactivateEdgeRoutingGeneration('cli-workspace-restart')",
         'killRouterIfRunning();',
         'const list = stopConfiguredAgents();',
