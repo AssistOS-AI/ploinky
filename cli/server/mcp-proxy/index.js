@@ -28,6 +28,13 @@ import { verifyUserDelegationGrant } from './userDelegationGrant.js';
 import { MCP_SESSION_INVALID_ERROR } from './sessionErrors.js';
 import { createMcpSessionOwner, inspectMcpSession, matchesMcpSessionOwner, readMcpSessionHeader } from './sessionOwnership.mjs';
 
+// Existing access policy denials are JSON-RPC errors over HTTP 200.
+function toolDenialHttpStatus(code) {
+    if (code === 'PROD_DISABLED') return 403;
+    if (code === 'PROD_POLICY_UNAVAILABLE') return 503;
+    return 200;
+}
+
 const AGENT_PROXY_PROTOCOL_VERSION = '2025-06-18';
 const AGENT_PROXY_SERVER_INFO = { name: 'ploinky-router-proxy', version: '1.0.0' };
 const TOOL_SCHEMA_CACHE_TTL_MS = 30_000;
@@ -787,7 +794,8 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, {
                 // MCP tool policy (fail-closed) gates the call before any token is minted.
                 const callDecision = policy.mcpToolPolicy.evaluate({ agent: agentName, tool: name, caller: policy.resolveCaller(req) });
                 if (!callDecision.allow) {
-                    sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32003, message: 'Access denied', data: { code: callDecision.code } } }, sessionIdHeader);
+                    sendResponse(toolDenialHttpStatus(callDecision.code), { jsonrpc: '2.0', id: message.id ?? null,
+                        error: { code: -32003, message: 'Access denied', data: { code: callDecision.code } } }, sessionIdHeader);
                     break;
                 }
                 const argPayload = params && typeof params === 'object' ? params['arguments'] : null;

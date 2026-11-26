@@ -50,6 +50,35 @@ test('the agent MCP proxy answers an unknown session with HTTP 200 and exactly t
     }
 });
 
+test('the tool transport distinguishes unavailable and disabled production policy from ordinary ACL denial', async () => {
+    const { handleAgentJsonRpc, agentSessionStore } = await import('../../cli/server/mcp-proxy/index.js');
+    const { writeProdGates, PROD_GATES_FILE } = await import('../../cli/utils/runtime/mcpProdGates.mjs');
+    const req = { method: 'POST', url: '/fixture/mcp', headers: {}, user: { id: 'user', roles: ['user'] },
+        authMode: 'sso', sessionId: 'login', session: { _jwtPayload: { sid: 'login' } } };
+    const route = { hostPort: 1 };
+    const init = new MockResponse();
+    await handleAgentJsonRpc(req, init, route, 'fixture', { jsonrpc: '2.0', id: 1, method: 'initialize' });
+    const session = init.headers['mcp-session-id'];
+    assert.ok(session);
+    req.headers['mcp-session-id'] = session;
+    try {
+        for (const [prod, status, code] of [
+            [true, 403, 'PROD_DISABLED'], [false, 200, 'AGENT_POLICY_DENIED'], [null, 503, 'PROD_POLICY_UNAVAILABLE'],
+        ]) {
+            if (prod === null) fs.rmSync(PROD_GATES_FILE);
+            else writeProdGates({ schema: 1, prod, routes: { fixture: { tools: ['write'], sha256: null } } });
+            const res = new MockResponse();
+            await handleAgentJsonRpc(req, res, route, 'fixture', {
+                jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'write', arguments: {} },
+            });
+            assert.equal(res.statusCode, status);
+            assert.equal(JSON.parse(res.body).error.data.code, code);
+        }
+    } finally {
+        agentSessionStore.delete(session);
+    }
+});
+
 test('the aggregate Router MCP handler sends the same session error text', () => {
     const source = fs.readFileSync(new URL('../../cli/server/routerHandlers.js', import.meta.url), 'utf8');
     assert.ok(source.includes(`error: { code: ${MCP_SESSION_INVALID_ERROR.code}, message: '${MCP_SESSION_INVALID_ERROR.message}' }`),
