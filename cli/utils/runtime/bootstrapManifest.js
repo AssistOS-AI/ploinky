@@ -9,6 +9,7 @@ import { isSsoProviderManifest } from '../agentRegistry.js';
 import { bindSsoProvider } from '../security/sso.js';
 import { PLOINKY_DIR } from '../config.js';
 import { getActiveProfile } from './profileService.js';
+import { isEnvironmentProfile } from './profileFollow.mjs';
 import { resolveManifestAuthMode } from '../manifestAuth.js';
 
 export function parseEnableDirective(entry) {
@@ -318,11 +319,15 @@ export function findEnabledDirectiveRecord(parsedDirective) {
 }
 
 async function ensureDirectiveEnabled(parsedDirective, enableAgentImpl = enableAgent) {
+    // A pin that names an environment follows the workspace profile (PD5): it is
+    // neither written into a record nor passed to the enable. Only a role pin is
+    // an explicit per-agent selection.
+    const pin = typeof parsedDirective?.profile === 'string' && parsedDirective.profile.trim()
+        ? parsedDirective.profile.trim().toLowerCase()
+        : '';
+    const profile = pin && !isEnvironmentProfile(pin) ? pin : '';
     const existing = findEnabledDirectiveRecord(parsedDirective);
     if (existing) {
-        const profile = typeof parsedDirective?.profile === 'string' && parsedDirective.profile.trim()
-            ? parsedDirective.profile.trim().toLowerCase()
-            : '';
         if (profile && existing.record.profile !== profile) {
             existing.record.profile = profile;
             existing.agents[existing.key] = existing.record;
@@ -331,7 +336,7 @@ async function ensureDirectiveEnabled(parsedDirective, enableAgentImpl = enableA
         return;
     }
     await enableAgentImpl(parsedDirective.spec, undefined, undefined, parsedDirective.alias, undefined, {
-        profile: parsedDirective.profile,
+        profile: profile || undefined,
     });
 }
 

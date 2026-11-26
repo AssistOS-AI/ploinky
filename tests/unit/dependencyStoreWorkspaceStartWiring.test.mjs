@@ -104,6 +104,8 @@ function startFixture(t) {
         prepareManifestRepositories: async () => {},
         getActiveProfile: () => 'default',
         getProfileConfig: () => ({}),
+        // The production capture is outside what this wiring observes.
+        readCapturedProdGates: () => ({ prod: false, routes: {} }),
         preflightWorkspaceStartRuntimeCapabilities: () => ({ admissions: ['admitted'], graph, registry, additionalNodes: [] }),
         resetPreinstallRunInProcess: () => {},
         preflightStartLinkedRepositories: (admitted, options) => { calls.push(['linkPreflight', admitted, options]); return []; },

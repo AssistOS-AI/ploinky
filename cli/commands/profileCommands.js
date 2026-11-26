@@ -7,8 +7,11 @@ import {
     getDefaultMountModes,
     getProfileConfig
 } from '../utils/runtime/profileService.js';
-import { loadAgents } from '../utils/workspace.js';
-import { colorize } from '../utils/utils.js';
+import fs from 'fs';
+import { getConfig, loadAgents } from '../utils/workspace.js';
+import { colorize, findAgent } from '../utils/utils.js';
+import { resolveWorkspaceDependencyGraph } from '../utils/workspaceDependencyGraph.js';
+import { checkManifestText, parseRequiredProfiles } from '../utils/runtime/profileRules.mjs';
 import { assertProdProfileConsistency, readProd } from '../utils/prodMode.mjs';
 import { readCapturedProdGates } from '../utils/runtime/mcpProdGates.mjs';
 
@@ -27,6 +30,8 @@ export async function handleProfileCommand(args) {
         case 'show':
         case 'current':
             return showCurrentProfile();
+        case 'check':
+            return handleCheckProfiles(args.slice(1));
         case 'assert':
             // Hidden: the host runs it inspect-only before it touches a running
             // Box. It throws, and so exits non-zero, on a PROD/profile mismatch.
@@ -40,13 +45,14 @@ export async function handleProfileCommand(args) {
                 return handleSetProfile(subCommand);
             }
             // Otherwise, show usage
-            console.log('Usage: ploinky profile [<profileName>|list|validate|show]');
+            console.log('Usage: ploinky profile [<profileName>|list|validate|show|check]');
             console.log('');
             console.log('Commands:');
             console.log('  ploinky profile <name>        Set active profile');
             console.log('  ploinky profile show          Show current profile');
             console.log('  ploinky profile list [agent]  List available profiles');
             console.log('  ploinky profile validate <profile> [agent]  Validate profile config');
+            console.log('  ploinky profile check [--require a,b]  Check that every enabled agent declares the profiles (default: default,dev,qa,prod)');
             return;
     }
 }
@@ -79,6 +85,82 @@ function handleSetProfile(profileName) {
     } else {
         console.error(colorize(`✗ ${result.message}`, 'red'));
     }
+}
+
+// Every manifest in the check scope (PD11): the enabled registry plus the
+// static agent's dependency graph. A source that cannot be resolved is an issue
+// in its own right, never a silent skip.
+function collectCheckScope() {
+    const entries = new Map();
+    const issues = [];
+    const add = (ref, manifestPath) => {
+        if (!entries.has(manifestPath)) entries.set(manifestPath, ref);
+    };
+    const registry = loadAgents() || {};
+    for (const [key, record] of Object.entries(registry)) {
+        if (key === '_config' || !record || record.type !== 'agent') continue;
+        const ref = record.repoName ? `${record.repoName}/${record.agentName}` : String(record.agentName || key);
+        try {
+            add(ref, findAgent(ref).manifestPath);
+        } catch (error) {
+            issues.push(`${ref}: source not found (${String(error?.message || error).slice(0, 160)})`);
+        }
+    }
+    const staticAgent = String(getConfig()?.static?.agent || '').trim();
+    if (staticAgent) {
+        try {
+            const graph = resolveWorkspaceDependencyGraph({
+                staticAgentRef: staticAgent,
+                registry,
+                onUnresolvedDependency: (report) => issues.push(`${report.parentRef}: dependency '${report.rawDependency}' not resolved (${report.message})`),
+            });
+            for (const node of graph.nodes.values()) add(node.agentRef, node.manifestPath);
+        } catch (error) {
+            issues.push(`static agent ${staticAgent}: graph not resolved (${String(error?.message || error).slice(0, 160)})`);
+        }
+    }
+    return { entries, issues };
+}
+
+/**
+ * `ploinky profile check [--require a,b]`: every manifest in the registry and
+ * graph scope declares each required profile as an object. Throws (non-zero
+ * exit) on any failure and when the scope is empty, which is never a pass.
+ * @param {string[]} args
+ */
+function handleCheckProfiles(args) {
+    let requireValue;
+    for (let i = 0; i < args.length; i += 1) {
+        const arg = String(args[i]);
+        if (arg === '--require') {
+            requireValue = args[i + 1];
+            if (requireValue === undefined) throw new Error('--require needs a comma-separated list of profile names.');
+            i += 1;
+        } else if (arg.startsWith('--require=')) {
+            requireValue = arg.slice('--require='.length);
+        } else {
+            throw new Error('Usage: ploinky profile check [--require a,b]');
+        }
+    }
+    const required = parseRequiredProfiles(requireValue);
+    const { entries, issues } = collectCheckScope();
+    const failures = [...issues];
+    for (const [manifestPath, ref] of entries) {
+        let text;
+        try {
+            text = fs.readFileSync(manifestPath, 'utf8');
+        } catch (error) {
+            failures.push(`${ref}: manifest unreadable (${error?.code || 'error'})`);
+            continue;
+        }
+        for (const issue of checkManifestText(text, required)) failures.push(`${ref}: ${issue}`);
+    }
+    if (!entries.size) failures.push('no enabled agent manifests were found; nothing was checked');
+    if (failures.length) {
+        for (const failure of failures) console.error(colorize(`✗ ${failure}`, 'red'));
+        throw new Error(`profile check failed (${failures.length} issue${failures.length === 1 ? '' : 's'}; required: ${required.join(', ')}).`);
+    }
+    console.log(colorize(`✓ ${entries.size} manifest${entries.size === 1 ? '' : 's'} declare ${required.join(', ')}`, 'green'));
 }
 
 /**

@@ -76,9 +76,14 @@ test('profile enable entries are planned and a directive keeps its own mode, ali
     assert.equal(byRef['prof/named'].alias, 'primary');
     assert.equal(byRef['prof/fromProfile'].profile, '');
 
-    writeManifest('prof', 'explicit', { enable: [{ agent: 'named', profile: 'dev' }] });
+    // A pin that names an environment follows the workspace profile: it is not an explicit selection.
+    writeManifest('prof', 'environmentPin', { enable: [{ agent: 'named', profile: 'dev' }] });
+    assert.equal(plan('prof/environmentPin').before[0].profile, '');
+    // A role pin is explicit and travels with the enable.
+    writeManifest('prof', 'named', { profiles: { dev: {}, default: {}, embedded: {} } });
+    writeManifest('prof', 'explicit', { enable: [{ agent: 'named', profile: 'embedded' }] });
     const explicit = plan('prof/explicit');
-    assert.equal(explicit.before[0].profile, 'dev');
+    assert.equal(explicit.before[0].profile, 'embedded');
 });
 
 test('an SSO provider dependency is skipped under a non-SSO parent and kept under an SSO one', () => {

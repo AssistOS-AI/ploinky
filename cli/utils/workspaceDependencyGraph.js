@@ -4,6 +4,7 @@ import { manifestEnableEntries, parseEnableDirective, qualifyEnableSpecForRepo }
 import { findAgent } from './utils.js';
 import { isSsoProviderManifest } from './agentRegistry.js';
 import { getActiveProfile, mergeProfiles } from './runtime/profileService.js';
+import { isEnvironmentProfile } from './runtime/profileFollow.mjs';
 import {
     assertNetworkStartupCompatibility,
     effectiveManifestNetwork,
@@ -130,6 +131,11 @@ function resolveEffectiveProfile(manifest, requestedProfile, agentRef, { explici
     return 'default';
 }
 
+function pinSelectsRole(pin) {
+    const name = normalizeProfileOverride(pin);
+    return Boolean(name) && !isEnvironmentProfile(name);
+}
+
 function effectiveInstanceKey(repoName, shortAgentName, alias = '') {
     return alias
         ? `${repoName}/${shortAgentName}#alias:${alias}`
@@ -142,6 +148,9 @@ function resolveWorkspaceDependencyGraph({
     workspaceProfile = '',
     rootProfile = '',
     rootAlias = '',
+    // The captured PROD value: under PROD every node must declare the `prod`
+    // profile instead of falling back to `default`.
+    prod = false,
     onCycle = null,
     // Opt-in: called for a no-wait dependency that cannot be resolved. The
     // dependency and everything only it reached leave the graph and the
@@ -198,6 +207,14 @@ function resolveWorkspaceDependencyGraph({
             const profileName = resolveEffectiveProfile(manifest, selectedProfile, `${resolved.repo}/${resolved.shortAgentName}`, {
                 explicit: profileExplicit || (!requestedProfile && Boolean(registryRecord?.profile)),
             });
+            if (prod && requestedProfile === 'prod' && profileName !== 'prod') {
+                const available = Object.keys(manifest?.profiles || {}).sort();
+                const error = new Error(
+                    `profile 'prod' is not defined by ${resolved.repo}/${resolved.shortAgentName}; available profiles: ${available.join(', ') || '(none)'}`,
+                );
+                error.code = 'PLOINKY_PROFILE_NOT_FOUND';
+                throw error;
+            }
             const network = effectiveManifestNetwork(manifest, profileName, {
                 path: `manifest(${resolved.repo}/${resolved.shortAgentName})`,
             });
@@ -295,8 +312,14 @@ function resolveWorkspaceDependencyGraph({
                 const childId = visit(dependencyRef, {
                     alias: qualifiedDependency.alias || '',
                     enableSpec: qualifiedDependency.spec || dependencyRef,
-                    profile: qualifiedDependency.profile || selectedWorkspaceProfile,
-                    profileExplicit: Boolean(qualifiedDependency.profile),
+                    // An enable pin that names an environment (`default`, `dev`,
+                    // `qa`, `prod`) follows the workspace profile and is not an
+                    // explicit selection; a role pin (`embedded`, `explorer`)
+                    // stays explicit.
+                    profile: pinSelectsRole(qualifiedDependency.profile)
+                        ? qualifiedDependency.profile
+                        : selectedWorkspaceProfile,
+                    profileExplicit: pinSelectsRole(qualifiedDependency.profile),
                     stack: nextStack,
                     selectionPath: [...node.selectionPath, `${node.id} -> ${dependencyRef}${qualifiedDependency.alias ? ` as ${qualifiedDependency.alias}` : ''}`],
                 });
@@ -313,6 +336,9 @@ function resolveWorkspaceDependencyGraph({
                 nodes.get(childId)?.dependents.add(nodeId);
             } catch (dependencyError) {
                 const message = dependencyError?.message || String(dependencyError);
+                // Under PROD a node without the `prod` profile stops the graph;
+                // it is never tolerated as a skipped dependency.
+                if (dependencyError?.code === 'PLOINKY_PROFILE_NOT_FOUND') throw dependencyError;
                 // Cycles are an existing intentional truncation case: log and continue so the parent build can still proceed.
                 // All other resolution failures (missing agents, malformed enable specs, manifest parse errors) fail-closed.
                 if (message.startsWith('Dependency cycle detected:')) {

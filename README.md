@@ -278,6 +278,17 @@ ploinky restart
 - Agents receive the captured value as a read-only `PROD` environment variable. An unreadable or missing capture is treated as `true` (fail closed).
 - A host `ploinky start` or `ploinky restart` on a running Box first runs the inspect-only in-Box `profile assert`, so a mismatch is refused before the Box is touched.
 
+### Environment profiles
+
+The workspace profile is exactly one of `default`, `dev`, `qa` and `prod`, valid whatever the installed manifests declare (`ploinky profile prod` works before any repository exists). Local work uses `default`; `dev` is for a named shared development deployment. A manifest declares all four under `profiles`; `qa`, `dev` and `prod` are `{}` when they add nothing to `default`. A name that is not one of the four, such as a role name like `embedded`, is refused by `ploinky profile` and by `ploinky start --profile`; a stored role or unknown name in `.ploinky/profile` is read as `default` with one warning.
+
+- Profiles are single-select. An agent record or an `enable` pin that names an environment (`default`, `dev`, `qa`, `prod`) follows the workspace profile: its own name when the manifest declares it, otherwise `default`. At the next `start` or whole `restart` a record whose profile changes gets a new runtime identity and its predecessor is removed, for enabled agents inside and outside the start graph alike. A role pin (`embedded`, `explorer`, ...) names a purpose rather than an environment and stays explicit.
+- Targeted `ploinky restart <agent>`, watchdog recovery and `ploinky update` keep the recorded profile. A profile switch takes effect only through `start`, a whole `restart` or `enable`.
+- `ploinky enable agent` refuses an operator-supplied per-agent environment profile that differs from the workspace profile (`PLOINKY_PROFILE_ENVIRONMENT_SCOPE`).
+- Under the captured `PROD` every agent must declare `prod`: an agent without it refuses at `start`, whole `restart` and `enable` (`PLOINKY_PROFILE_NOT_FOUND`).
+- `PLOINKY_PROFILE` keeps the resolved name; `PLOINKY_PROFILE_ENV` is `development` (for `default` and `dev`), `qa` or `prod`.
+- `ploinky profile check [--require a,b]` checks that every enabled agent and every agent in the static agent's dependency graph declares each required profile (default `default,dev,qa,prod`) as an object; it exits non-zero on any failure and when no agent is enabled. `node cli/tools/checkManifestProfiles.mjs [--require a,b] <repoRoot>...` applies the same rules to repository roots: exit 0 when at least one manifest was found and all pass, 1 when any fails, 2 when no manifest was found (never a pass).
+
 ### Agent repositories in the workspace
 
 You can keep agent repositories directly inside your [workspace](docs/wiki.html#definition-workspace). Every operation that selects an agent repository's source prefers the matching workspace checkout over `.ploinky/repos/<repository>`. This includes discovery, installed/active lists, Marketplace inventory, manifest and dependency preparation, and source selection for new runtimes.

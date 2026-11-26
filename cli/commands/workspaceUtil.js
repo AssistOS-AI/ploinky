@@ -51,7 +51,8 @@ import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } fro
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
 import { PROD_ENV } from '../utils/prodMode.mjs';
-import { capturedProdOrClosed } from '../utils/runtime/mcpProdGates.mjs';
+import { capturedProdOrClosed, readCapturedProdGates } from '../utils/runtime/mcpProdGates.mjs';
+import { followWorkspaceProfile } from '../utils/runtime/profileFollow.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../utils/publicRouterHosts.mjs';
 import {
@@ -1498,7 +1499,10 @@ function admitGraphNodeHardwareDescriptor(node, profileResolution, { runtime, re
   }
 }
 
-function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = dockerSvc.getAgentContainerName) {
+function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = dockerSvc.getAgentContainerName, {
+  workspaceProfile = getActiveProfile(),
+  prod = false,
+} = {}) {
   const graphRegistryNames = new Set();
   for (const node of graph?.nodes?.values?.() || []) {
     const existing = findRegistryEntryForGraphNode(reg, node, getAgentContainerName);
@@ -1536,7 +1540,12 @@ function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = doc
         alias: record.alias || '',
         manifest,
         manifestPath: resolved.manifestPath,
-        profile: record.profile || '',
+        // The single change site for out-of-graph records (PD5): a record that
+        // names an environment follows the workspace profile, and a role pin
+        // stays. The existing profileChanged logic then rotates the identity
+        // and removes the predecessor, so a profile switch reaches these
+        // agents without a second code path.
+        profile: followWorkspaceProfile(manifest, record.profile, workspaceProfile, { prod, agentRef: ref }),
         repoName: resolved.repo,
         shortAgentName: resolved.shortAgentName,
       }];
@@ -2892,7 +2901,7 @@ export function preflightStartLinkedRepositories(admittedStart, {
   return preflight(nodes.map((node) => node.manifest), { ...options, workspaceRoot, branchPolicy });
 }
 
-export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { hardwareContext, boxMarkerOptions } = {}) {
+export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { hardwareContext, boxMarkerOptions, prod = false } = {}) {
   const configured = workspaceSvc.getConfig()?.static?.agent || '';
   let staticAgent = String(staticAgentArg || configured || '').trim();
   if (!staticAgent) {
@@ -2914,12 +2923,14 @@ export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { har
   const graph = resolveWorkspaceDependencyGraph({
     staticAgentRef: staticAgent,
     registry,
+    prod,
     onUnresolvedDependency: (report) => unresolvedDependencies.push(report),
   });
   const { nodes: additionalNodes, skipped: skippedEnabledAgents } = resolveExtraEnabledRuntimeNodes(
     graph,
     registry,
     dockerSvc.getAgentContainerName,
+    { workspaceProfile: getActiveProfile(), prod },
   );
   const admissions = admitWorkspaceGraphRuntimeCapabilities(graph, {
     additionalNodes,
@@ -2952,6 +2963,8 @@ async function startWorkspace(staticAgentArg, portArg, {
   restarting = false,
   announce = true,
 } = {}) {
+  // Only an explicit captured true makes profile resolution strict.
+  const startProd = readCapturedProdGates().prod === true;
   // Acquire every declared dependency source before resolving the complete
   // graph. A fresh workspace cannot admit repositories that do not exist yet.
   // Repository preparation remains ahead of authoritative workspace mutation,
@@ -2977,7 +2990,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   } catch (err) {
     throw new Error(`Failed to prepare manifest repositories for '${requestedStaticAgent}': ${err?.message || err}`);
   }
-  const admittedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  const admittedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { prod: startProd });
   // The workspace mutation lease covers source initialization, candidate
   // writes, both inactive prelaunch preparations, and every subsequent start.
   // Only the final post-provider lease may authorize runtime targets.
@@ -3007,7 +3020,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Superseding ${supersededNoWaitRuns.length} live no-wait worker(s) of an earlier start: ${supersededNoWaitRuns
       .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
   }
-  const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { prod: startProd });
   // A missing source is reported once and skipped; it never stops the restart.
   // The registry record of a skipped enabled agent is kept, so installing its
   // repository brings it back on the next restart.
