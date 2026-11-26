@@ -633,7 +633,7 @@ test('workspace Router generation reader and both inactive graph preparations pr
         source.indexOf('routerReadyForStart = true') > source.indexOf('await ensureRouterGenerationReady({'),
         'a listening daemon must not be marked ready before its loaded reader format is confirmed',
     );
-    assert.match(source, /finally\s*\{\s*releaseWorkspaceStartLock\(workspaceStartLock\)/);
+    assert.match(source, /finally\s*\{\s*if \(!workspaceMutationLease\) releaseWorkspaceStartLock\(workspaceStartLock\)/);
 });
 
 test('prepared runtime records and routes commit together before activation, including no-wait workers', async () => {

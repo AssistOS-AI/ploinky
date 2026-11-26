@@ -353,7 +353,7 @@ test('AC8: start and whole restart run the dry capture before their first mutati
     const whole = cli.slice(cli.indexOf("restart: start is not configured. Run: start <staticAgent> <port>'"));
     const wholeAt = whole.indexOf('dryCaptureProdGates(');
     assert.ok(wholeAt > 0);
-    for (const mutation of ['resolvePersistedRouterPort();', 'settleWorkspaceBeforeRestart()', 'inactivateEdgeRoutingGeneration(', 'killRouterIfRunning();', 'stopConfiguredAgents()']) {
+    for (const mutation of ['resolvePersistedRouterPort();', 'settleWorkspaceBeforeRestart(async (workspaceMutationLease)', 'inactivateEdgeRoutingGeneration(', 'killRouterIfRunning();', 'stopConfiguredAgents()']) {
         assert.ok(wholeAt < whole.indexOf(mutation), mutation);
     }
     // `restart router` passes no capture.
