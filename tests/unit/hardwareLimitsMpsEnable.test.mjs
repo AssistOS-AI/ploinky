@@ -64,7 +64,7 @@ test('ME.actual preview plans on detached registry and routing objects', () => {
     assert.equal(typeof result.plan.instanceId, 'string');
 });
 
-function realEnableWithDependencies(f, { failReadiness = false } = {}) {
+function realEnableWithDependencies(f, { failReadiness = false, indeterminateCommit = false } = {}) {
     const lease = { mode: 'additive' };
     const started = { containerName: 'a', containerId: 'b'.repeat(64), registryRecord: { ...desired, containerId: 'b'.repeat(64) } };
     const bindings = {
@@ -83,7 +83,11 @@ function realEnableWithDependencies(f, { failReadiness = false } = {}) {
         waitForEnabledAgentReadiness: async () => { f.events.push('readiness'); if (failReadiness) throw new Error('not ready'); },
         mergeRuntimeRoute: (_old, next) => next,
         withEdgeGenerationApplyLock: (callback) => callback({}),
-        commitAdditiveEdgeRoutingGeneration: (_lease, options) => { f.events.push('commit'); options.afterSelectorCommit(); },
+        commitAdditiveEdgeRoutingGeneration: (_lease, options) => {
+            f.events.push('commit');
+            if (indeterminateCommit) throw Object.assign(new Error('unknown selector'), { edgeSelectorIndeterminate: true });
+            options.afterSelectorCommit();
+        },
         saveAgents: () => assert.fail('additive must not overwrite registry directly'),
         writeRoutingConfig: () => assert.fail('additive must not overwrite routing directly'),
         applyEdgeRoutingGeneration: () => assert.fail('additive has its own commit'),
@@ -115,6 +119,13 @@ test('ME.acknowledgement failure after selector publication retains the active r
     const f = fixture();
     f.mps.acknowledgeMpsRuntimeReady = async () => { throw new Error('ack failed'); };
     await assert.rejects(realEnableWithDependencies(f)('demo/a', 'global'), /activated; settlement requires recovery/);
+    assert.equal(f.events.includes('commit'), true);
+    assert.equal(f.events.includes('abort'), false);
+});
+
+test('ME.indeterminate selector publication does not abort or clean up the candidate', async () => {
+    const f = fixture();
+    await assert.rejects(realEnableWithDependencies(f, { indeterminateCommit: true })('demo/a', 'global'), /settlement requires recovery/);
     assert.equal(f.events.includes('commit'), true);
     assert.equal(f.events.includes('abort'), false);
 });

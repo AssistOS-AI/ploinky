@@ -286,6 +286,64 @@ test('inactive apply publishes before the final callback and preserves the activ
     assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).selector.state, 'active');
 });
 
+for (const mode of ['inactive', 'additive']) {
+    for (const outcome of ['intended', 'previous', 'different', 'unreadable']) {
+        test(`${mode} selector rename failure distinguishes ${outcome} publication`, (t) => {
+            const fixture = createFixture(t);
+            const predecessor = applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
+            let policy = 'old';
+            let finalized = false;
+            let intended;
+            const options = {
+                workspaceRoot: fixture.workspace,
+                beforeSelectorCommit() { policy = 'conservative'; return () => { policy = 'old'; }; },
+                afterSelectorCommit() { finalized = true; },
+                testHooks: {
+                    afterSelectorRename({ paths, selector, before }) {
+                        intended = selector;
+                        if (outcome === 'previous') fs.writeFileSync(paths.activeSelectorFile, JSON.stringify(before));
+                        if (outcome === 'different') {
+                            const { selectorDigest: _digest, ...body } = before;
+                            body.activationId = crypto.randomUUID();
+                            const selectorDigest = `sha256:${crypto.createHash('sha256').update(JSON.stringify(stableValue(body))).digest('hex')}`;
+                            fs.writeFileSync(paths.activeSelectorFile, JSON.stringify({ ...body, selectorDigest }));
+                        }
+                        if (outcome === 'unreadable') fs.writeFileSync(paths.activeSelectorFile, '{');
+                        throw new Error('selector directory sync failed');
+                    },
+                },
+            };
+            let commit;
+            if (mode === 'inactive') {
+                commit = () => applyEdgeRoutingGeneration(options);
+            } else {
+                const routing = structuredClone(predecessor.generation.routing);
+                routing.routes.alpha.hostPort = 45101;
+                let prepared;
+                withEdgeGenerationApplyLock((applyLockCapability) => {
+                    prepared = prepareAdditiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, routing, applyLockCapability });
+                }, { workspaceRoot: fixture.workspace });
+                commit = () => withEdgeGenerationApplyLock((applyLockCapability) => commitAdditiveEdgeRoutingGeneration(
+                    prepared.preparationLease, { ...options, routing, applyLockCapability },
+                ), { workspaceRoot: fixture.workspace, preparationLease: prepared.preparationLease });
+            }
+            assert.throws(commit, (error) => {
+                if (outcome === 'intended') return error.code === 'EDGE_SELECTOR_COMMITTED_RECOVERY_REQUIRED' && error.edgeSelectorCommitted;
+                if (outcome === 'unreadable' || outcome === 'different') return error.code === 'EDGE_SELECTOR_INDETERMINATE' && error.edgeSelectorIndeterminate;
+                return error.message === 'selector directory sync failed';
+            });
+            assert.equal(policy, outcome === 'previous' ? 'old' : 'conservative');
+            assert.equal(finalized, false);
+            if (outcome === 'intended') {
+                assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).selector.selectorDigest, intended.selectorDigest);
+            }
+            if (mode === 'additive' && outcome === 'previous') {
+                assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).selector.selectorDigest, predecessor.selector.selectorDigest);
+            }
+        });
+    }
+}
+
 test('additive commit rejects manifest byte drift without changing active routing', (t) => {
     const fixture = createFixture(t);
     const predecessor = applyEdgeRoutingGeneration({
