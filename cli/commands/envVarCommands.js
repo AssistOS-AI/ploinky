@@ -4,6 +4,7 @@ import * as envSvc from '../utils/security/secretVars.js';
 import { findAgent } from '../utils/utils.js';
 import { VAR_STDIN_MAX_BYTES, decodeVarStdinValue } from './varStdinValue.js';
 import { PROD_ENV, assertProdProfileConsistency, parseProd, readProd } from '../utils/prodMode.mjs';
+import { withImmediateWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import { capturedProdIfCaptured } from '../utils/runtime/mcpProdGates.mjs';
 import {
     assertActiveEdgeRoutingSourcesCurrent,
@@ -45,13 +46,15 @@ function setVarValue(varName, valueOrAlias) {
         showHelp();
         throw new Error('Usage: var <VAR> <value|$OTHER>');
     }
-    if (varName === PROD_ENV) {
+    if (varName.trim() === PROD_ENV) {
         // Strict parse (an invalid value leaves the store unchanged), then the
         // consistency check against the value being set: the stored value is
         // not read, so `var PROD true|false` repairs a legacy invalid value.
         const requestedProd = parseProd(valueOrAlias);
-        assertProdProfileConsistency({ requestedProd });
-        envSvc.setEnvVar(varName, valueOrAlias);
+        withImmediateWorkspaceMutationLease('set-production-mode', () => {
+            assertProdProfileConsistency({ requestedProd });
+            envSvc.setEnvVar(PROD_ENV, valueOrAlias);
+        });
         console.log(`✓ Set variable '${varName}'. It applies at the next start or whole restart.`);
         return;
     }

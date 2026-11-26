@@ -46,7 +46,7 @@ export function parseProd(value) {
 // The stored value. Absent means false. A stored invalid value and a store
 // read error both throw: neither ever yields false.
 export function readProd({ secrets } = {}) {
-    const map = secrets ?? readSecretsFile();
+    const map = secrets ?? readSecretsFile({ readOnly: true });
     const raw = map && Object.hasOwn(map, PROD_ENV) ? map[PROD_ENV] : undefined;
     return parseProd(raw) ?? false;
 }

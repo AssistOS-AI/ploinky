@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { randomUUID } from 'node:crypto';
 import path from 'path';
 import { PROFILE_FILE, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import { validateSecrets } from '../security/secretInjector.js';
@@ -7,6 +8,7 @@ import { debugLog, findAgent } from '../utils.js';
 import { effectiveManifestNetwork, validateManifestNetworks } from '../../sandbox/networkContract.js';
 import { mergeProfileHardwareLimits } from '../../sandbox/hardwareLimits/declaredLimits.mjs';
 import { assertProdProfileConsistency, PROD_ENV } from '../prodMode.mjs';
+import { withImmediateWorkspaceMutationLease } from './maintenanceLocks.js';
 import { capturedProdOrClosed } from './mcpProdGates.mjs';
 import { ENVIRONMENT_PROFILES, isEnvironmentProfile } from './profileFollow.mjs';
 
@@ -305,28 +307,36 @@ export function setActiveProfile(profileName) {
         };
     }
 
-    // PROD true requires profile `prod`. A mismatch throws (it keeps
-    // PLOINKY_PROD_PROFILE_MISMATCH) so a caller cannot read it as a soft
-    // refusal; nothing is written.
-    assertProdProfileConsistency({ requestedProfile: normalizedProfile });
+    return withImmediateWorkspaceMutationLease('set-workspace-profile', () => {
+        // PROD true requires profile `prod`. A mismatch throws (it keeps
+        // PLOINKY_PROD_PROFILE_MISMATCH) so a caller cannot read it as a soft
+        // refusal; nothing is written.
+        assertProdProfileConsistency({ requestedProfile: normalizedProfile });
 
-    try {
-        // Ensure .ploinky directory exists
-        if (!fs.existsSync(PLOINKY_DIR)) {
-            fs.mkdirSync(PLOINKY_DIR, { recursive: true });
+        try {
+            // Ensure .ploinky directory exists
+            if (!fs.existsSync(PLOINKY_DIR)) {
+                fs.mkdirSync(PLOINKY_DIR, { recursive: true });
+            }
+
+            const temp = `${PROFILE_FILE}.${randomUUID()}.tmp`;
+            fs.writeFileSync(temp, normalizedProfile, { mode: 0o600, flag: 'wx' });
+            try {
+                fs.renameSync(temp, PROFILE_FILE);
+            } finally {
+                fs.rmSync(temp, { force: true });
+            }
+            return {
+                success: true,
+                message: `Profile set to '${normalizedProfile}'`
+            };
+        } catch (err) {
+            return {
+                success: false,
+                message: `Failed to set profile: ${err.message}`
+            };
         }
-
-        fs.writeFileSync(PROFILE_FILE, normalizedProfile);
-        return {
-            success: true,
-            message: `Profile set to '${normalizedProfile}'`
-        };
-    } catch (err) {
-        return {
-            success: false,
-            message: `Failed to set profile: ${err.message}`
-        };
-    }
+    });
 }
 
 /**

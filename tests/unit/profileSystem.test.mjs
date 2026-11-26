@@ -488,7 +488,7 @@ test('createAgentWorkDir creates agent workspace folder', () => {
     const workDir = createAgentWorkDir(agentName);
 
     assert.strictEqual(workDir, getAgentWorkDir(agentName));
-    assert.strictEqual(workDir, path.join(fs.realpathSync(tempDir), '.data', agentName));
+    assert.strictEqual(workDir, path.join(fs.realpathSync(tempDir), '.data', 'agents', agentName));
     assert.ok(fs.statSync(workDir).isDirectory());
 });
 

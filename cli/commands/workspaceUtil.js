@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import * as utils from '../utils/utils.js';
+import { readAgentRegistrySnapshot } from '../utils/agentRegistrySnapshot.js';
 import * as agentsSvc from '../utils/agents.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import * as dockerSvc from '../sandbox/docker/index.js';
@@ -1565,35 +1566,44 @@ function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = doc
 // installed yet, and startWorkspace extends the capture once the repositories
 // are prepared and the graph exists.
 export function collectProdGateRoutes({
-  registry = workspaceSvc.loadAgents(),
+  registry = readAgentRegistrySnapshot(),
   graph = null,
   additionalNodes = [],
   staticAgentArg,
   workspaceProfile = getActiveProfile(),
+  prod = false,
 } = {}) {
   const routes = [];
   for (const [key, record] of Object.entries(registry || {})) {
     if (key === '_config' || record?.type !== 'agent') continue;
     const ref = record.repoName ? `${record.repoName}/${record.agentName}` : String(record.agentName || '');
     try {
-      routes.push({
-        routeKey: String(record.alias || record.agentName || ''),
-        agentDir: path.dirname(utils.findAgent(ref).manifestPath),
-      });
-    } catch (_) { /* its source is missing: nothing to read or gate */ }
+      const { manifestPath } = utils.findAgent(ref);
+      if (prod) {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        followWorkspaceProfile(manifest, record.profile, workspaceProfile, { prod, agentRef: ref });
+      }
+      routes.push({ routeKey: String(record.alias || record.agentName || ''), agentDir: path.dirname(manifestPath) });
+    } catch (error) {
+      if (prod) throw error;
+    }
   }
   let resolvedGraph = graph;
   if (!resolvedGraph) {
-    const staticAgent = String(staticAgentArg || workspaceSvc.getConfig()?.static?.agent || '').trim();
+    const retained = registry?._config?.static?.agent;
+    const staticAgent = String(staticAgentArg || retained || '').trim();
     if (staticAgent) {
       try {
         resolvedGraph = resolveWorkspaceDependencyGraph({
-          staticAgentRef: staticAgent,
-          registry,
-          workspaceProfile,
+          staticAgentRef: staticAgent, registry, workspaceProfile, prod,
           onUnresolvedDependency: () => {},
         });
-      } catch (_) { /* startWorkspace reports it with the full context */ }
+      } catch (error) {
+        // A fresh start prepares its repositories after this inspection. Only
+        // missing sources can be deferred; the admitted graph is checked again.
+        const missing = /not found\.|No repos found\./.test(String(error.message));
+        if (prod && (retained || !missing)) throw error;
+      }
     }
   }
   const nodes = [...(resolvedGraph?.nodes?.values?.() || []), ...additionalNodes];
@@ -1615,7 +1625,7 @@ export function resolveStartProd(prodCapture) {
 // existing file stays in force.
 export function commitProdCapture(prodCapture, start) {
   if (!prodCapture) return;
-  const routes = collectProdGateRoutes({ registry: start.registry, graph: start.graph, additionalNodes: start.additionalNodes });
+  const routes = collectProdGateRoutes({ registry: start.registry, graph: start.graph, additionalNodes: start.additionalNodes, prod: prodCapture.prod });
   writeProdGates(dryCaptureProdGates({ prod: prodCapture.prod, routes }));
 }
 

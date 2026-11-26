@@ -392,9 +392,11 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             // The dry capture reads every route's mcp-config and, under PROD,
             // refuses a dirty, untracked or non-git one, still before any
             // mutation. startWorkspace writes the result.
+            const prod = readProd();
             const prodCapture = dryCaptureProdGates({
-                prod: readProd(),
+                prod,
                 routes: collectProdGateRoutes({
+                    prod,
                     staticAgentArg: startParsed.staticAgent || undefined,
                     workspaceProfile: startParsed.profile || undefined,
                 }),
@@ -703,7 +705,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 }
                 // Before the first mutation: nothing is stopped on a refusal.
                 assertProdProfileConsistency();
-                const prodCapture = dryCaptureProdGates({ prod: readProd(), routes: collectProdGateRoutes() });
+                const prod = readProd();
+                const prodCapture = dryCaptureProdGates({ prod, routes: collectProdGateRoutes({ prod }) });
                 resolvePersistedRouterPort();
                 await settleWorkspaceBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');

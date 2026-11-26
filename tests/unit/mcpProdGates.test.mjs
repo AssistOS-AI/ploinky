@@ -420,7 +420,9 @@ test('collectProdGateRoutes covers the enabled registry (by alias) and the graph
     const repos = path.join(workspace, '.ploinky', 'repos', 'r');
     const make = (name, config) => {
         fs.mkdirSync(path.join(repos, name), { recursive: true });
-        fs.writeFileSync(path.join(repos, name, 'manifest.json'), JSON.stringify({ container: 'node:20-alpine' }));
+        fs.writeFileSync(path.join(repos, name, 'manifest.json'), JSON.stringify({
+            container: 'node:20-alpine', profiles: { default: {}, dev: {}, qa: {}, prod: {} },
+        }));
         if (config) fs.writeFileSync(path.join(repos, name, 'mcp-config.json'), JSON.stringify(config));
     };
     make('enabled', TAGGED);
@@ -449,7 +451,11 @@ test('collectProdGateRoutes covers the enabled registry (by alias) and the graph
     assert.deepEqual(admitted.routes.shortcut, capture.routes.shortcut);
     // Production also verifies the final admitted sources. A refusal keeps
     // the earlier successful capture intact.
-    assert.throws(() => commitProdCapture({ ...capture, prod: true }, finalGraph), codeIs('PLOINKY_PROD_GATES_DIRTY'));
+    assert.throws(() => commitProdCapture({ ...capture, prod: true }, finalGraph), /not found/);
+    const cleanRegistry = { ...registry };
+    delete cleanRegistry.ploinky_gone_x;
+    assert.throws(() => commitProdCapture({ ...capture, prod: true }, { ...finalGraph, registry: cleanRegistry }),
+        codeIs('PLOINKY_PROD_GATES_DIRTY'));
     assert.deepEqual(JSON.parse(fs.readFileSync(captureFile, 'utf8')), admitted);
 });
 

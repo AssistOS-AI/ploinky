@@ -167,6 +167,34 @@ test('AC5: a stored invalid value is repaired by var PROD false and by var PROD 
     assert.equal(storedProd(), 'true');
 });
 
+test('mode changes respect the workspace lease and normalized variable name', async () => {
+    reset();
+    setProfileFile('qa');
+    assert.throws(() => quietVar(' PROD ', 'true'), codeIs('PLOINKY_PROD_PROFILE_MISMATCH'));
+    assert.equal(storedProd(), undefined);
+    const locks = await import('../../cli/utils/runtime/maintenanceLocks.js');
+    const lease = locks.createWorkspaceMutationLease({ operation: 'deployment' });
+    try {
+        assert.throws(() => setActiveProfile('prod'), codeIs('PLOINKY_WORKSPACE_MUTATION_BUSY'));
+        assert.throws(() => quietVar('PROD', 'false'), codeIs('PLOINKY_WORKSPACE_MUTATION_BUSY'));
+        assert.equal(getActiveProfile(), 'qa');
+        assert.equal(storedProd(), undefined);
+    } finally {
+        assert.equal(locks.releaseWorkspaceMutationLease(lease), true);
+    }
+});
+
+test('production inspection preserves an empty or unreadable store', () => {
+    reset();
+    const file = path.join(workspace, '.ploinky', 'data', '.secrets');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    for (const contents of ['', '  ', 'damaged']) {
+        fs.writeFileSync(file, contents);
+        assert.throws(() => readProd());
+        assert.equal(fs.readFileSync(file, 'utf8'), contents);
+    }
+});
+
 test('AC5: consistency compares the requested profile with the requested or stored PROD', () => {
     reset();
     setProfileFile('qa');

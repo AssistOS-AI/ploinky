@@ -23,12 +23,16 @@ function writeSecretsFile(secrets = {}) {
     } catch (_) { }
 }
 
-function readSecretsFile() {
-    if (!fs.existsSync(SECRETS_FILE)) {
-        return {};
+function readSecretsFile({ readOnly = false } = {}) {
+    let raw;
+    try {
+        raw = fs.readFileSync(SECRETS_FILE, 'utf8').trim();
+    } catch (error) {
+        if (error.code === 'ENOENT') return {};
+        throw error;
     }
-    const raw = fs.readFileSync(SECRETS_FILE, 'utf8').trim();
     if (!raw) {
+        if (readOnly) throw new Error('The encrypted variable store is empty.');
         writeSecretsFile({});
         return {};
     }
