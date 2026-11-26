@@ -333,7 +333,7 @@ test('profile assert is inspect-only and exits non-zero on a mismatch', async ()
     writeSecretsFile({ PROD: 'true' });
     const { handleProfileCommand } = await import('../../cli/commands/profileCommands.js');
     const before = fs.readFileSync(path.join(workspace, '.ploinky', 'data', '.secrets'), 'utf8');
-    await assert.rejects(handleProfileCommand(['assert']), codeIs('PLOINKY_PROD_PROFILE_MISMATCH'));
+    await assert.rejects(handleProfileCommand(['assert']), error => error.code === 'PLOINKY_PROD_PROFILE_MISMATCH' && error.message.startsWith('PLOINKY_PROD_PROFILE_MISMATCH:'));
     await assert.rejects(handleProfileCommand(['assert', '--profile', 'qa']), codeIs('PLOINKY_PROD_PROFILE_MISMATCH'));
     await assert.doesNotReject(handleProfileCommand(['assert', '--profile', 'prod']));
     await assert.doesNotReject(handleProfileCommand(['assert', '--profile=PROD']));

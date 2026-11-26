@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../../ploinky-box/constants.mjs';
+import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
 import { writeGraphSkillScope } from '../../ploinky-box/graphSkillScope.mjs';
 import { buildHostSkillScope } from '../../ploinky-box/skillScope.mjs';
@@ -1239,6 +1240,9 @@ test('start selects the AgentLib source and passes the host address into the bou
     let committed = null;
     const supervisor = createBoxSupervisor({
         hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        validateContainer: () => {},
+        runCoreCommand: async (_engine, _id, argv) => { assert.equal(argv[0], 'profile'); },
         env: {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1249,7 +1253,7 @@ test('start selects the AgentLib source and passes the host address into the bou
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
         platform: 'darwin',
-        runner: { run(_command, args) { events.push(args.join(' ')); } },
+        runner: { run(_command, args) { events.push(args.join(' ')); }, query: () => ({ ok: true, stdout: '{\"initialized\":true}' }) },
         reconcile: async () => ({
             action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882,
         }),
@@ -1293,13 +1297,16 @@ test('a source that changes during startup is not committed and is not declared 
     let committed = false;
     const supervisor = createBoxSupervisor({
         hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        validateContainer: () => {},
+        runCoreCommand: async (_engine, _id, argv) => { assert.equal(argv[0], 'profile'); },
         env: {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, []),
         discover: () => ownership,
         platform: 'linux',
-        runner: { run() {} },
+        runner: { run() {}, query: () => ({ ok: true, stdout: '{\"initialized\":true}' }) },
         selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
         reconcile: async () => ({ action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882 }),
         readEdgeDesired: () => null,
@@ -1354,6 +1361,7 @@ test('a failed replacement restores and health-checks the prior Box graph before
     let coreCalls = 0;
     let committed = false;
     const coreCommand = async (_engine, containerId, args, _host, _media, _runner, options) => {
+        if (args[0] === 'profile') return;
         coreCalls += 1;
         events.push(`core:${containerId}:${args.join(' ')}:${options.agentLib.fingerprint}`);
         if (coreCalls === 1) throw new Error('candidate restart failed');
@@ -1363,6 +1371,8 @@ test('a failed replacement restores and health-checks the prior Box graph before
     };
     const supervisor = createBoxSupervisor({
         hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        validateContainer: () => {},
         env: {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1370,6 +1380,7 @@ test('a failed replacement restores and health-checks the prior Box graph before
         discover: () => oldOwnership,
         runner: {
             run(_command, args) { events.push(`run:${args.join(' ')}`); },
+            query: () => ({ ok: true, stdout: '{\"initialized\":true}' }),
         },
         selectAgentLib: async () => ({ selection: candidateAgentLib, mode: 'local' }),
         captureCoreStartArgv: () => Object.freeze(['start', 'explorer', '8080']),
@@ -2228,13 +2239,16 @@ test('restart passes PLOINKY_REPOS_SOURCE to Box reconciliation, keeps the Box s
         const requested = [];
         const supervisor = createBoxSupervisor({
             hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        validateContainer: () => {},
+        runCoreCommand: async (_engine, _id, argv) => { assert.equal(argv[0], 'profile'); },
             ...state.stores,
             env,
             resolveIdentity: () => identity,
             launchCwd: identity.workspaceRoot,
             lockManager: fakeLockManager(fs.mkdtempSync(path.join(state.root, 'locks-')), []),
             discover: () => owned(identity),
-            runner: { run() {} },
+            runner: { run() {}, query: () => ({ ok: true, stdout: '{\"initialized\":true}' }) },
             selectAgentLib: async () => ({ selection: agentLibFixture(identity.workspaceRoot), mode: 'local' }),
             captureCoreStartArgv: () => Object.freeze(['start', 'explorer', '8080']),
             scanGpuAgents: (_root, options) => { requested.push(`scan:${options.includeWorkspace}`); return []; },
@@ -2269,7 +2283,7 @@ for (const running of [true, false]) {
             resolveIdentity: () => identity, launchCwd: identity.workspaceRoot,
             lockManager: fakeLockManager(state.root, events), discover: () => ownership,
             reconcile: () => { throw Error('must not reconcile an old layout'); },
-            runner: { run(_command, args) { events.push(args.join(' ')); } },
+            runner: { run(_command, args) { events.push(args.join(' ')); }, query: () => ({ ok: true, stdout: '{\"initialized\":true}' }) },
         });
         await assert.rejects(supervisor.prepareBoxForCommand(), /Unsupported workspace data layout/);
         assert.equal(fs.readFileSync(layout, 'utf8'), '{"version":2}');
@@ -2282,13 +2296,19 @@ for (const running of [true, false]) {
 // The host asks a running, initialized Box for the inspect-only PROD/profile
 // assertion before it touches the Box (ahead of the hardware transitions); the
 // in-Box start and restart repeat the check before their own first mutation.
-function prodAssertSupervisor(t, { running = true, initialized = true, assertFails = false } = {}) {
+function prodAssertSupervisor(t, { running = true, initialized = true, assertFails = false, imageMode = false, probeFails = false, statusFails = false } = {}) {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
     const ownership = owned(identity, { running });
     ownership.handles.container.labels[BOX_LABELS.routerHostPort] = '8080';
     ownership.handles.container.labels[BOX_LABELS.mediaHostPort] = '7882';
+    if (imageMode) {
+        const image = imageAgentLibFixture();
+        Object.assign(ownership.handles.container.labels, agentLibFixtureLabels(image));
+        ownership.handles.container.runtime.imageId = OUTER_IMAGE_ID_FIXTURE;
+        ownership.handles.container.runtime.mounts = [];
+    }
     const events = [];
     const coreCalls = [];
     const supervisor = createBoxSupervisor({
@@ -2301,12 +2321,14 @@ function prodAssertSupervisor(t, { running = true, initialized = true, assertFai
         discover: () => ownership,
         runner: {
             run(_command, args) { events.push(`run:${args.join(' ')}`); },
-            query: () => ({ ok: true, status: 0, stdout: JSON.stringify({ state: 'running', initialized, routingConfigured: true, trackedAgents: 1, runningAgents: 1, warnings: [] }) }),
+            query: (_command, args) => args[0] === 'exec'
+                ? { ok: !probeFails, status: probeFails ? 1 : 0, stdout: JSON.stringify({ packageName: 'ploinky-agent-lib' }) }
+                : { ok: true, status: 0, stdout: JSON.stringify({ state: 'running', initialized, routingConfigured: true, trackedAgents: 10, runningAgents: 10, warnings: [] }) },
         },
         validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
-        validateContainer: () => {},
+        validateContainer: () => { if (statusFails) throw new Error('status contract unavailable'); },
         inspectBoxData: () => ({ fingerprints: {} }),
-        revalidateAgentLibSource: () => {},
+        ...(imageMode ? {} : { revalidateAgentLibSource: () => {} }),
         resolveHostReachableIpv4: async () => '192.168.1.12',
         captureCoreStartArgv: () => Object.freeze(['start', 'explorer', '8080']),
         runCoreCommand: async (_engine, containerId, argv, hostPort, mediaHostPort) => {
@@ -2360,4 +2382,29 @@ test('a stopped or uninitialized Box is not asked for the profile assertion', as
         await assert.rejects(() => supervisor.runRestartTransaction(['restart']), /sentinel: past the profile assertion/);
         assert.deepEqual(coreCalls, [], JSON.stringify(options));
     }
+});
+
+
+test('image-backed live Box refuses profile mismatch before reconciliation or rollback', async (t) => {
+    const { supervisor, events, coreCalls } = prodAssertSupervisor(t, { imageMode: true, assertFails: true });
+    await assert.rejects(() => runOuterCli(['start', 'explorer', '--profile', 'qa'], {
+        supervisor, detectInsideBox: () => false, env: {}, output: { write() {} }, errorOutput: { write() {} },
+    }), /In-box profile failed/);
+    assert.deepEqual(coreCalls[0].argv.slice(0, 4), ['profile', 'assert', '--profile', 'qa']);
+    assert.equal(events.some(event => event.startsWith('run:') || event === 'select-agentlib'), false, events.join(' | '));
+});
+
+test('a live Box with an uninspectable image AgentLib is refused before mutation', async (t) => {
+    const { supervisor, events, coreCalls } = prodAssertSupervisor(t, { imageMode: true, probeFails: true });
+    await assert.rejects(() => supervisor.runStartTransaction(['start', 'explorer']), /preflight|inspection/i);
+    assert.equal(coreCalls.length, 0);
+    assert.equal(events.some(event => event.startsWith('run:') || event === 'select-agentlib'), false, events.join(' | '));
+});
+
+
+test('a live Box with incompatible status is refused before mutation', async (t) => {
+    const { supervisor, events, coreCalls } = prodAssertSupervisor(t, { statusFails: true });
+    await assert.rejects(() => supervisor.runRestartTransaction(['restart']), { code: 'PLOINKY_BOX_PROFILE_PREFLIGHT_FAILED' });
+    assert.equal(coreCalls.length, 0);
+    assert.equal(events.some(event => event.startsWith('run:') || event === 'select-agentlib'), false, events.join(' | '));
 });

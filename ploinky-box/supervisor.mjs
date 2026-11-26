@@ -766,36 +766,39 @@ export function createBoxSupervisor({
         return '';
     }
 
-    // PROD true requires workspace profile `prod`. On a running, initialized Box,
-    // ask the in-Box core (inspect-only `profile assert`) before this transaction
-    // touches the Box, ahead of `settleHardwareTransitions`. A Box that is absent,
-    // stopped, uninitialized, not inspectable or about to be replaced has nothing
-    // to ask here; the in-Box start and restart repeat the check before their own
-    // first mutation, so this is the host's early refusal, not the only one.
+    // A live Box must pass the inspect-only preflight before any transition.
+    // Discovery supplies ownership, while status validates the runtime before
+    // executing in it. Unknown live state is not permission to skip the check.
     async function assertInBoxProdProfile(identity, ownership, coreArgs) {
+        const container = ownership?.handles?.container;
+        if (ownership?.state !== 'owned' || !container || !container.runtime?.running) return;
         let status;
         let selection;
-        let hostPort;
-        let mediaHostPort;
         try {
             status = inspectBoxStatus();
-            const statusContainer = status.ownership?.handles?.container;
+            const observed = status.ownership?.handles?.container;
             if (status.identity?.instance !== identity.instance
-                || status.state !== 'running-initialized'
-                || !statusContainer?.id
+                || status.ownership?.state !== 'owned'
+                || !observed?.id || observed.id !== container.id
                 || !status.ownership?.engine?.name
-                || ownership?.handles?.container?.id !== statusContainer.id) return;
-            selection = agentLibContractFromContainer(statusContainer);
-            revalidateAgentLibSource(selection, {
+                || status.ownership.engine.identity !== ownership.engine?.identity) {
+                throw new Error('Box identity changed during inspection');
+            }
+            if (status.state === 'running-uninitialized') return;
+            if (status.state !== 'running-initialized') {
+                throw new Error(`Box status is ${status.state}${status.detail ? `: ${status.detail}` : ''}`);
+            }
+            selection = agentLibContractFromContainer(observed);
+            revalidateMountedAgentLibSource(selection, {
                 engine: status.ownership.engine,
-                containerId: statusContainer.id,
+                containerId: observed.id,
                 runner,
             });
-            hostPort = Number(statusContainer.labels?.[BOX_LABELS.routerHostPort]);
-            mediaHostPort = Number(statusContainer.labels?.[BOX_LABELS.mediaHostPort]);
-        } catch (_) {
-            return;
+        } catch (error) {
+            throw supervisorError(`Box profile preflight could not safely inspect the running Box: ${error.message}`, 'PLOINKY_BOX_PROFILE_PREFLIGHT_FAILED');
         }
+        const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
+        const mediaHostPort = Number(container.labels?.[BOX_LABELS.mediaHostPort]);
         const profile = requestedProfileFromCoreArgs(coreArgs);
         const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
         await runCoreCommand(

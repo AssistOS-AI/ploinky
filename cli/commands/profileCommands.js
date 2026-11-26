@@ -192,7 +192,12 @@ function handleAssertProfile(args) {
     }
     const start = startArgs ? parseStartArgs(startArgs) : {};
     requestedProfile = start.profile || requestedProfile;
-    assertProdProfileConsistency({ requestedProfile });
+    try {
+        assertProdProfileConsistency({ requestedProfile });
+    } catch (error) {
+        if (error?.code === 'PLOINKY_PROD_PROFILE_MISMATCH') error.message = `${error.code}: ${error.message}`;
+        throw error;
+    }
     const prod = readProd();
     dryCaptureProdGates({ prod, routes: collectProdGateRoutes({
         staticAgentArg: start.staticAgent || undefined,
