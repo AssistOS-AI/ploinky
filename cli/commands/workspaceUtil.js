@@ -3038,50 +3038,62 @@ export function printStartResultSummary(result, { log = console.log } = {}) {
 
 // Restart only the listener against the already published generation. The
 // active profile must be provable before the old listener is stopped.
-export async function restartRouterOnly({ killRouterIfRunning }) {
-  const lease = await acquireSettledWorkspaceMutationLease({ operation: 'router-restart' });
+export async function restartRouterOnly({ killRouterIfRunning }, {
+  acquireLease = acquireSettledWorkspaceMutationLease,
+  runWithLease = runWithWorkspaceMutationLease,
+  releaseLease = releaseWorkspaceStartLock,
+  readCapture = readCapturedProdGates,
+  loadGeneration = loadActiveEdgeRoutingGeneration,
+  readPort = resolvePersistedRouterPort,
+  waitForListener = waitForRouterReady,
+  ensureReady = ensureRouterGenerationReady,
+  spawnRouter = (port) => {
+    fs.mkdirSync(RUNNING_DIR, { recursive: true });
+    const pidFile = path.join(RUNNING_DIR, 'router.pid');
+    const child = spawnWatchdog(path.resolve(__dirname, '../server/Watchdog.js'), port, pidFile);
+    try { fs.writeFileSync(pidFile, String(child.pid)); } catch (_) {}
+    child.unref();
+    return child;
+  },
+  routerEnvironment = buildRouterEnv,
+  readHealth = readRouterGenerationHealth,
+} = {}) {
+  const lease = await acquireLease({ operation: 'router-restart' });
   try {
-    return await runWithWorkspaceMutationLease(lease, async () => {
-    const capture = readCapturedProdGates();
-    if (capture.unavailable || !['default', 'dev', 'qa', 'prod'].includes(capture.workspaceProfile)) {
-      throw new Error('restart router: active runtime policy identity is unavailable; run a whole restart first.');
-    }
-    const active = loadActiveEdgeRoutingGeneration();
-    const port = parseRouterPort(active.generation.routing.port, { source: 'active Router generation port' });
-    if (resolvePersistedRouterPort() !== port) {
-      throw new Error('restart router: persisted Router port differs from the active generation; run a whole restart first.');
-    }
-    await killRouterIfRunning();
-    const deadline = Date.now() + 15000;
-    let stopped = false;
-    while (Date.now() < deadline) {
-      try { await waitForRouterReady(port, null, 100); }
-      catch (_) { stopped = true; break; }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    if (!stopped) throw new Error('restart router: the previous Router is still listening.');
-    const routerHealthSocket = buildRouterEnv().PLOINKY_ROUTER_HEALTH_SOCKET
-      || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
-    await ensureRouterGenerationReady({
-      waitForListener: (child, timeoutMs) => waitForRouterReady(port, child, timeoutMs),
-      readHealth: () => readRouterGenerationHealth({ socketPath: routerHealthSocket }),
-      spawnRouter: () => {
-        fs.mkdirSync(RUNNING_DIR, { recursive: true });
-        const pidFile = path.join(RUNNING_DIR, 'router.pid');
-        const child = spawnWatchdog(path.resolve(__dirname, '../server/Watchdog.js'), port, pidFile);
-        try { fs.writeFileSync(pidFile, String(child.pid)); } catch (_) {}
-        child.unref();
-        return child;
-      },
-    });
-    const current = loadActiveEdgeRoutingGeneration();
-    if (current.selector.generation !== active.selector.generation
-        || current.selector.activationId !== active.selector.activationId) {
-      throw new Error('restart router: active routing generation changed during restart.');
-    }
+    return await runWithLease(lease, async () => {
+      const capture = readCapture();
+      if (capture.unavailable || !['default', 'dev', 'qa', 'prod'].includes(capture.workspaceProfile)) {
+        throw new Error('restart router: active runtime policy identity is unavailable; run a whole restart first.');
+      }
+      const active = loadGeneration();
+      const port = parseRouterPort(active.generation.routing.port, { source: 'active Router generation port' });
+      if (readPort() !== port) {
+        throw new Error('restart router: persisted Router port differs from the active generation; run a whole restart first.');
+      }
+      await killRouterIfRunning();
+      const deadline = Date.now() + 15000;
+      let stopped = false;
+      while (Date.now() < deadline) {
+        try { await waitForListener(port, null, 100); }
+        catch (_) { stopped = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (!stopped) throw new Error('restart router: the previous Router is still listening.');
+      const routerHealthSocket = routerEnvironment().PLOINKY_ROUTER_HEALTH_SOCKET
+        || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
+      await ensureReady({
+        waitForListener: (child, timeoutMs) => waitForListener(port, child, timeoutMs),
+        readHealth: () => readHealth({ socketPath: routerHealthSocket }),
+        spawnRouter: () => spawnRouter(port),
+      });
+      const current = loadGeneration();
+      if (current.selector.generation !== active.selector.generation
+          || current.selector.activationId !== active.selector.activationId) {
+        throw new Error('restart router: active routing generation changed during restart.');
+      }
     });
   } finally {
-    releaseWorkspaceStartLock(lease);
+    releaseLease(lease);
   }
 }
 
