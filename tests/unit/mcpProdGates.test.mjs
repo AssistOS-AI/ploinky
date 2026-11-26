@@ -358,7 +358,8 @@ test('AC8: start and whole restart run the dry capture before their first mutati
     }
     // `restart router` passes no capture.
     const routerRestart = cli.slice(cli.indexOf("target.toLowerCase() === 'router'"), cli.indexOf('if (target) {', cli.indexOf("target.toLowerCase() === 'router'")));
-    assert.ok(routerRestart.includes('startWorkspace('));
+    assert.ok(routerRestart.includes('restartRouterOnly('));
+    assert.equal(routerRestart.includes('startWorkspace('), false);
     assert.equal(routerRestart.includes('prodCapture'), false);
     assert.equal(routerRestart.includes('dryCaptureProdGates'), false);
     // A Router-only restart preserves the capture already in force.

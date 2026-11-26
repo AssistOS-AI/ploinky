@@ -15,6 +15,7 @@ import { activeForegroundSignal } from './foregroundCommand.js';
 import {
     collectProdGateRoutes,
     startWorkspace,
+    restartRouterOnly,
     retireAbandonedStartPreparationBeforeStop,
     settleWorkspaceBeforeRestart,
     runCli,
@@ -465,16 +466,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
                     throw new Error('restart router: start is not configured. Run: start <staticAgent> <port> first.');
                 }
-                await settleWorkspaceBeforeRestart();
-                inactivateEdgeRoutingGeneration('cli-router-restart');
                 console.log('[restart] Restarting RoutingServer (containers untouched)...');
-                resolvePersistedRouterPort();
-                killRouterIfRunning();
-                await startWorkspace(undefined, undefined, {
-                    announce: false,
-                    enableAgent,
-                    killRouterIfRunning: () => { },
-                });
+                await restartRouterOnly({ killRouterIfRunning });
                 console.log('[restart] RoutingServer restarted.');
                 break;
             }

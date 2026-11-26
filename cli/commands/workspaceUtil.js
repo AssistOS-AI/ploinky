@@ -48,12 +48,11 @@ import { acquireSettledWorkspaceMutationLease, inspectLiveNoWaitWorkers } from '
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
-import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import { getActiveProfile, getProfileConfig, getRuntimePolicyEnvironment, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
 import { PROD_ENV } from '../utils/prodMode.mjs';
 import {
-  capturedProdOrClosed,
   dryCaptureProdGates,
   readCapturedProdGates,
   writeProdGates,
@@ -119,6 +118,7 @@ import {
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
   isActiveBoundPreparationLease,
+  loadActiveEdgeRoutingGeneration,
   prepareHostModeCapabilityForInactiveGeneration,
   readEdgeRoutingPreparationOwner,
   readEdgeRoutingSelection,
@@ -316,7 +316,7 @@ export function buildRouterEnv({ managedBox } = {}) {
   // through the secrets spread), then set it from the capture. An unavailable
   // capture is PROD true (fail closed).
   delete routerEnvironment[PROD_ENV];
-  routerEnvironment[PROD_ENV] = capturedProdOrClosed() ? 'true' : 'false';
+  routerEnvironment[PROD_ENV] = getRuntimePolicyEnvironment().prod ? 'true' : 'false';
   return routerEnvironment;
 }
 
@@ -1106,6 +1106,7 @@ function computeRetainedManagedEnvHash(node, record, profileConfig, runtimeNetwo
     return computeAgentEnvHash(node.manifest, profileConfig, {
       agentName: node.shortAgentName,
       repoName: node.repoName,
+      profileName: node.profile || 'default',
       runtimeNetworkPlan,
       generatedRouter: {
         payload,
@@ -1357,7 +1358,7 @@ export function graphNodeRuntimeReplacementReason(plan, {
       node.manifest,
       profileResolution.profileConfig,
       routerEndpoint?.env || {},
-      { agentName: node.shortAgentName, repoName: node.repoName },
+      { agentName: node.shortAgentName, repoName: node.repoName, profileName: profileResolution.resolvedProfileName },
     );
     if (desired && desired !== String(record.envHash || '')) {
       plan.runtimeReasonDetail = hashMismatchDetail('envHash', record.envHash, desired);
@@ -1378,6 +1379,7 @@ export function graphNodeRuntimeReplacementReason(plan, {
   const baseEnvHash = computeAgentEnvHash(node.manifest, profileResolution.profileConfig, {
     agentName: node.shortAgentName,
     repoName: node.repoName,
+    profileName: profileResolution.resolvedProfileName,
     runtimeNetworkPlan,
     runtimeRouterEnv,
   }, computeEnvHashImpl);
@@ -3030,6 +3032,52 @@ export function printStartResultSummary(result, { log = console.log } = {}) {
     log(`[start] Required agents are ready; ${pending} no-wait agent(s) are still starting in the background.`);
   } else {
     log('[start] All selected agents are ready.');
+  }
+}
+
+// Restart only the listener against the already published generation. The
+// active profile must be provable before the old listener is stopped.
+export async function restartRouterOnly({ killRouterIfRunning }) {
+  const lease = await acquireSettledWorkspaceMutationLease({ operation: 'router-restart' });
+  try {
+    return await runWithWorkspaceMutationLease(lease, async () => {
+    const capture = readCapturedProdGates();
+    if (capture.unavailable || !['default', 'dev', 'qa', 'prod'].includes(capture.workspaceProfile)) {
+      throw new Error('restart router: active runtime policy identity is unavailable; run a whole restart first.');
+    }
+    const active = loadActiveEdgeRoutingGeneration();
+    const port = resolvePersistedRouterPort();
+    await killRouterIfRunning();
+    const deadline = Date.now() + 15000;
+    let stopped = false;
+    while (Date.now() < deadline) {
+      try { await waitForRouterReady(port, null, 100); }
+      catch (_) { stopped = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (!stopped) throw new Error('restart router: the previous Router is still listening.');
+    const routerHealthSocket = buildRouterEnv().PLOINKY_ROUTER_HEALTH_SOCKET
+      || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
+    await ensureRouterGenerationReady({
+      waitForListener: (child, timeoutMs) => waitForRouterReady(port, child, timeoutMs),
+      readHealth: () => readRouterGenerationHealth({ socketPath: routerHealthSocket }),
+      spawnRouter: () => {
+        fs.mkdirSync(RUNNING_DIR, { recursive: true });
+        const pidFile = path.join(RUNNING_DIR, 'router.pid');
+        const child = spawnWatchdog(path.resolve(__dirname, '../server/Watchdog.js'), port, pidFile);
+        try { fs.writeFileSync(pidFile, String(child.pid)); } catch (_) {}
+        child.unref();
+        return child;
+      },
+    });
+    const current = loadActiveEdgeRoutingGeneration();
+    if (current.selector.generation !== active.selector.generation
+        || current.selector.activationId !== active.selector.activationId) {
+      throw new Error('restart router: active routing generation changed during restart.');
+    }
+    });
+  } finally {
+    releaseWorkspaceStartLock(lease);
   }
 }
 

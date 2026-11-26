@@ -1218,6 +1218,7 @@ function buildManagedControlEnv(manifest) {
 function computeAgentEnvHash(manifest, profileConfig, {
     agentName,
     repoName,
+    profileName,
     runtimeNetworkPlan,
     runtimeRouterEnv = {},
     generatedRouter = null,
@@ -1236,7 +1237,7 @@ function computeAgentEnvHash(manifest, profileConfig, {
             PLOINKY_AGENT_INSTANCE_ID: generatedRouter.instanceId,
             PLOINKY_AGENT_ENABLE_GENERATION: generatedRouter.enableGeneration,
         } : {}),
-    }, { agentName, repoName });
+    }, { agentName, repoName, profileName });
 }
 
 function inspectImageEntrypoint(runtime, image, spawn = spawnSync) {
@@ -1718,7 +1719,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         networkMode: runtimeNetworkPlan.mode,
     });
     const envHash = computeAgentEnvHash(manifest, profileConfig, {
-        agentName, repoName, runtimeNetworkPlan, runtimeRouterEnv,
+        agentName, repoName, profileName: activeProfile, runtimeNetworkPlan, runtimeRouterEnv,
     });
 
     // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
@@ -2293,6 +2294,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const computeSemanticEnvHash = (payload) => computeAgentEnvHash(manifest, profileConfig, {
         agentName,
         repoName,
+        profileName: activeProfile,
         runtimeNetworkPlan,
         generatedRouter: {
             payload,
@@ -4003,6 +4005,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             const desiredEnvHash = computeEnvHash(manifest, profileConfig, routerEndpoint?.env || {}, {
                 agentName,
                 repoName,
+                profileName: activeProfile,
             });
             const currentEnvHash = String(existingRecord.envHash || '');
             let sandboxRecreateReason = forceRecreate
@@ -4226,7 +4229,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     });
     const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
     const computeContainerEnvHash = () => computeAgentEnvHash(manifest, profileConfig, {
-        agentName, repoName, runtimeNetworkPlan, runtimeRouterEnv,
+        agentName, repoName, profileName: activeProfile, runtimeNetworkPlan, runtimeRouterEnv,
     });
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);

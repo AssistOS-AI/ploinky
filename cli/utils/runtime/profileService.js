@@ -9,7 +9,8 @@ import { effectiveManifestNetwork, validateManifestNetworks } from '../../sandbo
 import { mergeProfileHardwareLimits } from '../../sandbox/hardwareLimits/declaredLimits.mjs';
 import { assertProdProfileConsistency, PROD_ENV } from '../prodMode.mjs';
 import { withImmediateWorkspaceMutationLease } from './maintenanceLocks.js';
-import { capturedProdOrClosed } from './mcpProdGates.mjs';
+import { capturedProdOrClosed, readCapturedProdGates } from './mcpProdGates.mjs';
+import { currentRuntimePolicyEnvironment } from './runtimePolicyContext.mjs';
 import { ENVIRONMENT_PROFILES, isEnvironmentProfile } from './profileFollow.mjs';
 
 // Workspace profile names are exactly the four environment names (PD8), valid
@@ -514,6 +515,18 @@ export function getProfileEnvironment(profile) {
     return profile;
 }
 
+// Runtime identity belongs to the activated generation, not the stored selection.
+export function getRuntimePolicyEnvironment() {
+    const scoped = currentRuntimePolicyEnvironment();
+    if (scoped) return scoped;
+    const capture = readCapturedProdGates();
+    return {
+        prod: capture.unavailable ? capturedProdOrClosed() : capture.prod,
+        workspaceProfile: isEnvironmentProfile(capture.workspaceProfile)
+            ? capture.workspaceProfile : getActiveProfile(),
+    };
+}
+
 /**
  * Get all profile-related environment variables.
  * @param {string} agentName - The agent name
@@ -523,12 +536,13 @@ export function getProfileEnvironment(profile) {
  * @returns {object} Environment variables map
  */
 export function getProfileEnvVars(agentName, repoName, profile, containerInfo = {}) {
+    const policy = getRuntimePolicyEnvironment();
     return {
         PLOINKY_PROFILE: profile,
-        PLOINKY_PROFILE_ENV: getProfileEnvironment(isEnvironmentProfile(profile) ? profile : getActiveProfile()),
+        PLOINKY_PROFILE_ENV: getProfileEnvironment(policy.workspaceProfile),
         // Agents get the captured value only, read-only. An unavailable capture
         // is PROD true (fail closed); a manifest env named PROD is refused.
-        [PROD_ENV]: capturedProdOrClosed() ? 'true' : 'false',
+        [PROD_ENV]: policy.prod ? 'true' : 'false',
         PLOINKY_AGENT_NAME: agentName,
         PLOINKY_REPO_NAME: repoName,
         PLOINKY_WORKSPACE_ROOT,
