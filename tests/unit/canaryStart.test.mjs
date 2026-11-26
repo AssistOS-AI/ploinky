@@ -404,6 +404,9 @@ test('an active canary on another route refuses start and leaves both receipts u
 });
 
 test('start publishes both members only after the exact runtime passes readiness and probe', async t => {
+    const capture = path.join(configRoot, '.ploinky/data/mcp-prod-gates.json');
+    write(capture, JSON.stringify({ schema: 1, prod: true, workspaceProfile: 'prod', routes: {} }));
+    t.after(() => fs.rmSync(capture, { force: true }));
     const { startCanary, changeCanary, abortCanary } = await import('../../cli/sandbox/canary/start.mjs');
     const { updateReceipt } = await import('../../cli/sandbox/canary/receipt.mjs');
     const { f, deps, receipt, active, old, calls, args, nextId, nextLaunch } = await activeFixture(t, { primaryProfile: 'prod', manifest: { canary: { probe }, profiles: { default: {}, prod: {} } } });

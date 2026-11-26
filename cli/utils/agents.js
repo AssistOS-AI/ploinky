@@ -34,7 +34,7 @@ import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { getActiveProfile, resolveManifestRuntimeProfile } from './runtime/profileService.js';
 import { followWorkspaceProfile, isEnvironmentProfile } from './runtime/profileFollow.mjs';
-import { capturedProdIfCaptured, mergeEnabledRouteGates } from './runtime/mcpProdGates.mjs';
+import { capturedProdIfCaptured, dryCaptureProdGates, mergeEnabledRouteGates, readCapturedProdGates, stageProdGates } from './runtime/mcpProdGates.mjs';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from './runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
@@ -1056,7 +1056,8 @@ export function assertEnableProfileRules({ agentName, mode, repoNameParam, authO
         const found = findAgent(normalized.agentName);
         manifestPath = found.manifestPath;
         agentRef = `${found.repo}/${found.shortAgentName}`;
-    } catch (_) {
+    } catch (error) {
+        if (prod) throw error;
         // The candidate preparation reports an unresolvable agent itself.
         return;
     }
@@ -1073,8 +1074,8 @@ export function assertEnableProfileRules({ agentName, mode, repoNameParam, authO
         let manifest;
         try {
             manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-        } catch (_) {
-            return;
+        } catch (error) {
+            throw error;
         }
         followWorkspaceProfile(manifest, requested, workspaceProfile, { prod, agentRef });
     }
@@ -1099,6 +1100,19 @@ export function mergeEnableRouteGates({ agentName, mode, repoNameParam, aliasPar
     return merge(routeKey, { agentDir });
 }
 
+function captureEnableRouteGates(request) {
+    const existing = readCapturedProdGates();
+    if (existing.unavailable) {
+        if (existing.reason === 'absent') return null;
+        throw Object.assign(new Error('Captured production policy is unavailable'), { code: 'PLOINKY_PROD_POLICY_UNAVAILABLE' });
+    }
+    const normalized = normalizeEnableArgs(request.agentName, request.mode, request.repoNameParam);
+    const found = findAgent(normalized.agentName);
+    const routeKey = normalizeAlias(request.aliasParam) || found.shortAgentName;
+    const route = dryCaptureProdGates({ prod: existing.prod, routes: [{ routeKey, agentDir: path.dirname(found.manifestPath) }] });
+    return { ...existing, routes: { ...existing.routes, ...route.routes } };
+}
+
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
     // Enabling mutates the registry and admits a runtime: hold the workspace
     // mutation lease (reusing one this process already holds) for the whole
@@ -1106,9 +1120,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
     // the network lifecycle lock) only after the lease is held.
     return withHeldOrAcquiredWorkspaceMutationLease({ operation: 'agent-enable' }, async () => {
     const request = { agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions };
-    return withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
     assertEnableProfileRules(request);
-    mergeEnableRouteGates(request);
+    captureEnableRouteGates(request);
+    return withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{
@@ -1145,6 +1159,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
     } = plan;
 
     let started = null;
+    let activated = false;
     try {
         return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
             console.log(`Starting agent '${shortAgentName}' from repo '${repoName}'...`);
@@ -1199,6 +1214,18 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             const finalLease = started?.preparationLease
                 || prepared.preparedGeneration?.preparationLease;
             await mps.verifyMpsRuntimeReady(started);
+            const capture = captureEnableRouteGates(request);
+            let stagedPolicy;
+            const policyOptions = capture ? {
+                beforeSelectorCommit() {
+                    stagedPolicy = stageProdGates(capture);
+                    return () => stagedPolicy.rollback();
+                },
+                afterSelectorCommit() {
+                    activated = true;
+                    stagedPolicy.finalize();
+                },
+            } : { afterSelectorCommit() { activated = true; } };
             withEdgeGenerationApplyLock((applyLockCapability) => {
                 // Additive and withdrawn leases keep their active predecessor
                 // selected until this commit publishes the ready runtime.
@@ -1207,6 +1234,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                         routing: finalRouting,
                         agents: finalAgents,
                         applyLockCapability,
+                        ...policyOptions,
                     });
                     return;
                 }
@@ -1221,6 +1249,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                     preparationLease: finalLease,
                     applyLockCapability,
                     networkLifecycleCapability,
+                    ...policyOptions,
                 });
             }, { preparationLease: finalLease });
 
@@ -1234,6 +1263,9 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
         });
     } catch (error) {
+        if (activated || error.edgeSelectorCommitted) {
+            throw wrapLifecycleError(`enable agent: '${shortAgentName}' activated; settlement requires recovery: ${error?.message || error}`, error);
+        }
         const failedCandidate = started || error?.ploinkyRestartCandidate || null;
         if (failedCandidate?.containerName
             && failedCandidate?.cleanupReceipt

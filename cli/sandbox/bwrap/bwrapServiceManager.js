@@ -1014,7 +1014,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envHash = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
+    const envHash = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName, profileName: activeProfile });
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
     const sharedDir = ensureSharedHostDir();
 
@@ -1372,7 +1372,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
     // Check if already running
     if (exactRuntimeRunning) {
         // Compare env hash
-        const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
+        const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName, profileName: activeProfile });
         const current = existingRecord.envHash || '';
         // The AgentLib selection is not derivable from the manifest or profile,
         // so a changed source is invisible to the env hash and must be compared

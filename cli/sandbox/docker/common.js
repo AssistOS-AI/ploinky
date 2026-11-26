@@ -19,6 +19,7 @@ import { isHostSandboxDisabled } from '../../utils/runtime/sandboxRuntime.js';
 import { intervalsOverlap, parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 import { selectedBoxMediaPort } from '../routerPort.js';
+import { getProfileEnvVars } from '../../utils/runtime/profileService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -675,6 +676,8 @@ function computeEnvHash(manifest, profileConfig, extraEnv = {}, options = {}) {
                 repoName: options.repoName,
             }),
             ...(extraEnv && typeof extraEnv === 'object' && !Array.isArray(extraEnv) ? extraEnv : {}),
+            ...Object.fromEntries(Object.entries(getProfileEnvVars(options.agentName, options.repoName, options.profileName || 'default'))
+                .filter(([key]) => ['PROD', 'PLOINKY_PROFILE', 'PLOINKY_PROFILE_ENV'].includes(key))),
         };
         const network = resolveNetworkConfigForHash(manifest, profileConfig || null);
         const sorted = Object.keys(map).sort().reduce((acc, key) => {

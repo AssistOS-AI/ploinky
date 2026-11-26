@@ -270,15 +270,16 @@ test('agent injection: PROD in the agent environment is the captured value, not 
     reset();
     writeSecretsFile({ PROD: 'true' });
     process.env.PROD = 'true';
-    writeCapture({ schema: 1, prod: false, routes: {} });
+    writeCapture({ schema: 1, prod: false, workspaceProfile: 'qa', routes: {} });
     const off = getProfileEnvVars('agent-x', 'repo-x', 'qa', { containerName: 'c', containerId: 'c' });
     assert.equal(off.PROD, 'false');
     assert.equal(off.PLOINKY_PROFILE, 'qa');
     assert.equal(off.PLOINKY_PROFILE_ENV, 'qa');
-    writeCapture({ schema: 1, prod: true, routes: {} });
+    writeCapture({ schema: 1, prod: true, workspaceProfile: 'prod', routes: {} });
     const on = getProfileEnvVars('agent-x', 'repo-x', 'prod', { containerName: 'c', containerId: 'c' });
     assert.equal(on.PROD, 'true');
     assert.equal(on.PLOINKY_PROFILE_ENV, 'prod');
+    writeCapture({ schema: 1, prod: false, workspaceProfile: 'dev', routes: {} });
     // PD13: default and dev are the development environment.
     assert.equal(getProfileEnvVars('a', 'r', 'default').PLOINKY_PROFILE_ENV, 'development');
     assert.equal(getProfileEnvVars('a', 'r', 'dev').PLOINKY_PROFILE_ENV, 'development');

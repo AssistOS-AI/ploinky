@@ -271,6 +271,21 @@ test('additive preparation and failed commit preserve the exact active predecess
     abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: fixture.workspace });
 });
 
+test('inactive apply publishes before the final callback and preserves the active selector on callback failure', (t) => {
+    const fixture = createFixture(t);
+    let before = false;
+    assert.throws(() => applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        beforeSelectorCommit() { before = true; return () => { before = false; }; },
+        afterSelectorCommit({ selector }) {
+            assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).selector.activationId, selector.activationId);
+            throw new Error('settlement failed');
+        },
+    }), (error) => error.message === 'settlement failed' && error.edgeSelectorCommitted === true);
+    assert.equal(before, true);
+    assert.equal(loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace }).selector.state, 'active');
+});
+
 test('additive commit rejects manifest byte drift without changing active routing', (t) => {
     const fixture = createFixture(t);
     const predecessor = applyEdgeRoutingGeneration({

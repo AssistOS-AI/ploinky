@@ -607,7 +607,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     const routerEndpoint = resolveSeatbeltRouterEndpoint(options, profileResolution.network.mode);
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envHash = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
+    const envHash = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName, profileName: activeProfile });
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
     const sharedDir = ensureSharedHostDir();
 
@@ -998,7 +998,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
 
     // Check if already running
     if (exactRuntimeRunning) {
-        const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
+        const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName, profileName: activeProfile });
         const current = existingRecord.envHash || '';
         // Seatbelt regenerates its profile from the source path, which does not
         // change when the same directory's content does, so the selection is

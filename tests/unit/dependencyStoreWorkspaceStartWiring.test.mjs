@@ -108,6 +108,7 @@ function startFixture(t) {
         // The production capture is outside what this wiring observes: no capture is carried or written.
         resolveStartProd: () => false,
         commitProdCapture: () => {},
+        runWithRuntimePolicyEnvironment: (_policy, fn) => fn(),
         preflightWorkspaceStartRuntimeCapabilities: () => ({ admissions: ['admitted'], graph, registry, additionalNodes: [] }),
         resetPreinstallRunInProcess: () => {},
         preflightStartLinkedRepositories: (admitted, options) => { calls.push(['linkPreflight', admitted, options]); return []; },
