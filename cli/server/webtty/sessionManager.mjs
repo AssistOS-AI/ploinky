@@ -1,3 +1,4 @@
+import { createTerminalQueryStripper } from '../../../core-services/webtty/terminal-queries.mjs';
 import crypto from 'node:crypto';
 import { isAdminUser } from '../auth/localService.js';
 
@@ -1710,7 +1711,9 @@ export class WebttySessionManager {
             return;
         }
         session.lastSequence = message.sequence;
-        session.replay.push({ sequence: message.sequence, encoded, bytes });
+        session.stripReplayQueries ||= createTerminalQueryStripper();
+        const replayEncoded = this.encodeSse('output', { data: session.stripReplayQueries(message.data) }, message.sequence);
+        session.replay.push({ sequence: message.sequence, encoded: replayEncoded, bytes });
         session.replayBytes += bytes;
         while (session.replay.length > this.limits.outputReplayEvents
             || session.replayBytes > this.limits.outputReplayBytes) {

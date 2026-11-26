@@ -3,18 +3,26 @@ import path from 'node:path';
 
 import { listCodingSessionProviders } from '../utils/codingSessionProviders.mjs';
 import { ListMenu } from '../utils/codingSessionsMenu.mjs';
+import { createSupervisionCourier } from '../utils/supervisionCourier.mjs';
+import { RELAY_EXIT_REASONS, relayStatus, supervisionTabs } from '../utils/supervisionFlow.mjs';
+import { storePath } from '../utils/supervisedSessions.mjs';
 import {
     LocalRouterClient, RELAY_KEY_LABELS, RouterRequestError, TerminalRelay, terminalDimensions,
 } from '../utils/webttyCliClient.mjs';
+import { createSupervisedScreen } from './supervisedSessionsScreen.js';
 
 // `ploinky cs` (`ploinky coding-sessions`): a menu of the coding sessions an
 // enabled agent provides in the caller's folder. The person picks a robot (the
 // default robot is preselected), then one of its coding agents, then a session:
 // a running one to attach, an earlier conversation to resume, or a new one.
+// Shift+Tab switches to supervised sessions, where one coding agent supervises
+// another through two files in the folder.
 // The Router owns every terminal, so sessions are also listed in Live
 // Sessions. Leaving a terminal in any way detaches it and it keeps running;
 // Ctrl+] detaches back to the menu. Exiting the agent, or a kill from the menu
 // or Live Sessions, ends it.
+
+const PAIR_REFRESH_MS = 5_000;
 
 export function codingSessionsError(message, code = 'PLOINKY_CODING_SESSIONS_FAILED') {
     return Object.assign(new Error(message), { code });
@@ -56,14 +64,14 @@ export function describeFailure(error, provider) {
     return error.message;
 }
 
-// `<robot>.<environment>.<coding agent>[.r-<id>|.n-<id>]`: the profile names the
+// `<robot>.<environment>.<coding agent>[.r-<id>|.n-<id>|.p-<launch-id>]`: the profile names the
 // robot, the coding agent and, when known, the native conversation.
 export function parseSessionProfile(profileId) {
     const parts = typeof profileId === 'string' ? profileId.split('.') : [];
     if (parts.length < 3 || parts.length > 4) return null;
-    const conversation = parts[3]?.match(/^[rn]-([A-Za-z0-9_-]+)$/u);
+    const conversation = parts[3]?.match(/^([rnp])-([A-Za-z0-9_-]+)$/u);
     if (parts.length === 4 && !conversation) return null;
-    return { robotId: parts[0], codingAgent: parts[2], nativeSessionId: conversation?.[1] || null };
+    return { robotId: parts[0], codingAgent: parts[2], nativeSessionId: conversation && conversation[1] !== 'p' ? conversation[2] : null };
 }
 
 export function codingSessionApi(client, provider) {
@@ -152,8 +160,6 @@ export function sessionItems({ live, history, now = Date.now() }) {
     ];
 }
 
-const RELAY_EXIT_REASONS = new Set(['signal', 'input_closed']);
-
 export async function runCodingSessionsCommand({
     env = process.env,
     input = process.stdin,
@@ -165,6 +171,8 @@ export async function runCodingSessionsCommand({
     createClient = options => new LocalRouterClient(options),
     createRelay = options => new TerminalRelay(options),
     createMenu = options => new ListMenu(options),
+    createCourier = createSupervisionCourier,
+    pairRefreshMs = PAIR_REFRESH_MS,
     now = () => Date.now(),
 } = {}) {
     const workspaceRoot = env.PLOINKY_WORKSPACE_ROOT;
@@ -184,18 +192,52 @@ export async function runCodingSessionsCommand({
     const api = codingSessionApi(client, provider);
     const menu = createMenu({ input, output });
     const folder = directory || 'workspace root';
+    // The absolute folder the agents and the courier both see.
+    const folderPath = directory ? path.join(workspaceRoot, ...directory.split('/')) : workspaceRoot;
     const keyHelp = `${RELAY_KEY_LABELS.detach} detach`;
     const failure = error => describeFailure(error, provider);
 
+    let mode = 'coding';
     let level = 'robots';
     let robot = null;
     let codingAgent = null;
     let status = '';
     const remembered = { robots: null, agents: null, sessions: 0 };
+    const openTerminal = launched => openSessionTerminal(client, provider, launched, { directory, output });
+    const supervised = createSupervisedScreen({
+        menu, client, api, directory, folder, folderPath,
+        openTerminal,
+        attachTerminal: attachSessionTerminal,
+        createRelay,
+        createCourier,
+        input,
+        output,
+        errorOutput,
+        storeFile: () => storePath(workspaceRoot),
+        now,
+        refreshMs: pairRefreshMs,
+    });
+    const supervisedState = {
+        level: 'pairs',
+        status: '',
+        draft: { supervisor: {}, worker: {} },
+        remembered: { pairs: 0, roles: 0 },
+        supervised: '',
+    };
+
     try {
         while (true) {
+            if (mode === 'supervised') {
+                const outcome = await supervised.screen(supervisedState);
+                if (outcome.mode) {
+                    mode = outcome.mode;
+                    level = 'robots';
+                }
+                if (outcome.quit) return 0;
+                continue;
+            }
             if (level === 'robots') {
-                const header = { title: [`Coding sessions — ${folder}`, 'Choose a robot'] };
+                const header = { ...supervisionTabs(mode), title: [`Coding sessions — ${folder}`, 'Choose a robot'] };
                 let robots;
                 try { robots = (await menu.busy(header, () => api('robots', {}))).robots || []; }
                 catch (error) { throw codingSessionsError(failure(error)); }
@@ -203,8 +245,10 @@ export async function runCodingSessionsCommand({
                 const items = robots.map(entry => ({ label: entry.name, detail: entry.default ? 'default' : entry.id, entry }));
                 const previous = robots.findIndex(entry => entry.id === remembered.robots);
                 const selected = previous >= 0 ? previous : Math.max(0, robots.findIndex(entry => entry.default));
-                const choice = await menu.select({ ...header, items, status, help: '↑/↓ select · Enter choose · q quit' }, { selected });
+                const choice = await menu.select({ ...header, items, status,
+                    help: '↑/↓ select · Enter choose · Shift+Tab supervised · q quit' }, { selected });
                 status = '';
+                if (choice.action === 'tab') { mode = 'supervised'; continue; }
                 if (choice.action !== 'enter') return 0;
                 robot = items[choice.index].entry;
                 remembered.robots = robot.id;
@@ -212,7 +256,8 @@ export async function runCodingSessionsCommand({
                 continue;
             }
             if (level === 'agents') {
-                const header = { title: [`Coding sessions — ${folder}`, `Robot ${robot.name} › choose a coding agent`] };
+                const header = { ...supervisionTabs(mode), title: [`Coding sessions — ${folder}`,
+                    `Robot ${robot.name} › choose a coding agent`] };
                 let listed;
                 try { listed = await menu.busy(header, () => api('agents', { robot: robot.id })); }
                 catch (error) { status = failure(error); level = 'robots'; continue; }
@@ -220,9 +265,11 @@ export async function runCodingSessionsCommand({
                 if (!names.length) { status = `Robot ${robot.name} has no coding agent enabled.`; level = 'robots'; continue; }
                 const items = names.map(name => ({ label: name, detail: name === listed.active ? 'active' : '' }));
                 const preferred = remembered.agents && names.includes(remembered.agents) ? remembered.agents : listed.active;
-                const choice = await menu.select({ ...header, items, status, help: '↑/↓ select · Enter choose · Backspace robots · q quit' },
-                    { selected: Math.max(0, names.indexOf(preferred)) });
+                const choice = await menu.select({ ...header, items, status,
+                    help: '↑/↓ select · Enter choose · Backspace robots · Shift+Tab supervised · q quit' },
+                { selected: Math.max(0, names.indexOf(preferred)) });
                 status = '';
+                if (choice.action === 'tab') { mode = 'supervised'; continue; }
                 if (choice.action === 'quit') return 0;
                 if (choice.action === 'back') { level = 'robots'; continue; }
                 codingAgent = names[choice.index];
@@ -231,7 +278,7 @@ export async function runCodingSessionsCommand({
                 level = 'sessions';
                 continue;
             }
-            const header = { title: [`Coding sessions — ${folder}`, `Robot ${robot.name} › ${codingAgent}`] };
+            const header = { ...supervisionTabs(mode), title: [`Coding sessions — ${folder}`, `Robot ${robot.name} › ${codingAgent}`] };
             let items;
             try {
                 const [live, history] = await menu.busy(header, () => Promise.all([
@@ -241,10 +288,12 @@ export async function runCodingSessionsCommand({
                 items = sessionItems({ live, history, now: now() });
             } catch (error) { status = failure(error); level = 'agents'; continue; }
             const view = { ...header, items, status,
-                help: `↑/↓ select · Enter open · n new · k kill · r refresh · Backspace agents · q quit · in a session: ${keyHelp}` };
+                help: `↑/↓ select · Enter open · n new · k kill · r refresh · Backspace agents · Shift+Tab supervised · `
+                    + `q quit · in a session: ${keyHelp}` };
             const choice = await menu.select(view, { selected: remembered.sessions, actions: { n: 'new', k: 'kill', delete: 'kill', r: 'refresh' } });
             status = '';
             remembered.sessions = choice.index;
+            if (choice.action === 'tab') { mode = 'supervised'; continue; }
             if (choice.action === 'quit') return 0;
             if (choice.action === 'back') { level = 'agents'; continue; }
             if (choice.action === 'refresh') continue;
@@ -269,15 +318,11 @@ export async function runCodingSessionsCommand({
             errorOutput.write(`\r\n${codingAgent} for robot ${robot.name} in ${folder}. ${keyHelp}; `
                 + 'it is also in Explorer > Live Sessions.\r\n');
             const result = await createRelay({ client, ...terminal, input, output }).run();
-            if (RELAY_EXIT_REASONS.has(result.reason)) return 0;
-            status = result.error || {
-                detached: 'Detached: the session keeps running.',
-                exited: 'The session ended.',
-                ended: 'The session ended.',
-                view_ended: 'This view was closed from another window; the session keeps running.',
-            }[result.reason] || '';
+            if (RELAY_EXIT_REASONS.includes(result.reason)) return 0;
+            status = result.error || relayStatus(result.reason);
         }
     } finally {
         menu.close();
+        supervised.stop();
     }
 }

@@ -93,6 +93,7 @@ test('a session profile names the robot, the coding agent and the native convers
     assert.deepEqual(parseSessionProfile('ana-1.default.codex'), { robotId: 'ana-1', codingAgent: 'codex', nativeSessionId: null });
     assert.deepEqual(parseSessionProfile('ana-1.default.claude.n-abc-1'), { robotId: 'ana-1', codingAgent: 'claude', nativeSessionId: 'abc-1' });
     assert.deepEqual(parseSessionProfile('ana-1.default.opencode.r-ses_1'), { robotId: 'ana-1', codingAgent: 'opencode', nativeSessionId: 'ses_1' });
+    assert.deepEqual(parseSessionProfile('ana-1.default.codex.p-launch-1'), { robotId: 'ana-1', codingAgent: 'codex', nativeSessionId: null });
     for (const value of [null, 'ana-1.default', 'ana-1.default.codex.x-1', 'a.b.c.r-1.e']) assert.equal(parseSessionProfile(value), null);
 });
 
@@ -398,7 +399,8 @@ test('the relay writes output, forwards keystrokes, takes the size with a redraw
     input.emit('data', Buffer.from('ls\r'));
     const result = await running;
     assert.deepEqual(result, { reason: 'exited', detail: 'terminal_exit' });
-    assert.deepEqual(written, ['hello', ' world']);
+    assert.deepEqual(written.slice(0, 2), ['hello', ' world']);
+    assert.ok(written.at(-1).startsWith(TERMINAL_INPUT_RESET));
     assert.deepEqual(input.raw, [true, false]);
     assert.deepEqual(client.posts.filter(entry => entry[0] === 'STREAM').map(entry => entry[2]), ['', '1']);
     assert.ok(client.posts.some(entry => entry[0] === 'POST' && entry[1] === `${base}/input` && entry[2].data === 'ls\r'));
