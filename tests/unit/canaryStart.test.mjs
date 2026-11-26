@@ -262,7 +262,7 @@ test('network preflight rejects the alias of an existing or stopped member befor
     assert.equal(preflight().alias, alias);
 });
 
-async function activeFixture(t, { withSibling = false, ...sourceOptions } = {}) {
+async function activeFixture(t, { withSibling = false, primaryProfile, ...sourceOptions } = {}) {
     const f = fixture(t, sourceOptions);
     const edge = await import('../../cli/sandbox/edgeGeneration.js');
     const { readReceipt } = await import('../../cli/sandbox/canary/receipt.mjs');
@@ -270,6 +270,7 @@ async function activeFixture(t, { withSibling = false, ...sourceOptions } = {}) 
         type: 'agent', runtime: 'podman', repoName: 'fixtures', agentName: 'alpha',
         instanceId: 'instance-old', enableGeneration: 'enabled-old', auth: { mode: 'sso' },
         containerId: 'a'.repeat(64), launchId: 'launch-old', hostPort: 42101,
+        ...(primaryProfile && { profile: primaryProfile }),
     };
     const route = { repo: 'fixtures', agent: 'alpha', container: 'primary', hostPath: f.agentPath, hostPort: old.hostPort };
     const data = path.join(f.workspaceRoot, '.ploinky');
@@ -299,7 +300,21 @@ async function activeFixture(t, { withSibling = false, ...sourceOptions } = {}) 
     const deps = {
         observePrimary: () => observed, admission: () => accepted, runtimeForAgent: () => 'podman',
         withNetwork: async fn => fn({}),
-        async ensureService(name, _manifest, _dir, options) {
+        async ensureService(name, launchManifest, _dir, options) {
+            assert.deepEqual(launchManifest, JSON.parse(fs.readFileSync(path.join(f.agentPath, 'manifest.json'), 'utf8')));
+            assert.equal(options.profileName, old.profile);
+            assert.equal(options.preparedRegistryRecord.profile, old.profile);
+            if (old.profile) {
+                assert.equal(options.profileResolution.resolvedProfileName, old.profile);
+                const { getProfileEnvVars } = await import('../../cli/utils/runtime/profileService.js');
+                const primaryEnv = getProfileEnvVars(name, old.repoName, old.profile);
+                const candidateEnv = getProfileEnvVars(name, old.repoName, options.profileResolution.resolvedProfileName);
+                for (const key of ['PROD', 'PLOINKY_PROFILE_ENV', 'PLOINKY_PROFILE']) {
+                    assert.equal(candidateEnv[key], primaryEnv[key]);
+                }
+                assert.equal(candidateEnv.PROD, 'true');
+                assert.equal(candidateEnv.PLOINKY_PROFILE_ENV, 'prod');
+            }
             calls.push('create');
             const r = receipt();
             assert.equal(r.oldCommit, f.oldCommit);
@@ -391,7 +406,7 @@ test('an active canary on another route refuses start and leaves both receipts u
 test('start publishes both members only after the exact runtime passes readiness and probe', async t => {
     const { startCanary, changeCanary, abortCanary } = await import('../../cli/sandbox/canary/start.mjs');
     const { updateReceipt } = await import('../../cli/sandbox/canary/receipt.mjs');
-    const { f, deps, receipt, active, old, calls, args, nextId, nextLaunch } = await activeFixture(t);
+    const { f, deps, receipt, active, old, calls, args, nextId, nextLaunch } = await activeFixture(t, { primaryProfile: 'prod', manifest: { canary: { probe }, profiles: { default: {}, prod: {} } } });
     try {
         const rolloutId = await startCanary(args, deps);
         assert.deepEqual(calls, ['create', 'readiness', 'probe']);
@@ -409,6 +424,7 @@ test('start publishes both members only after the exact runtime passes readiness
         assert.equal(active().agents[field.container].launchId, nextLaunch);
         assert.equal(active().agents[field.container].hostPort, 42102);
         assert.equal(active().agents[field.container].canaryOf, f.routeKey);
+        assert.equal(active().agents[field.container].profile, active().agents.primary.profile);
         assert.equal(field.hostPort, undefined);
         await assert.rejects(startCanary(args, deps), /already has a canary/);
         const status = state => async () => ({ rollouts: [{ routeKey: f.routeKey, rolloutId, state, exposureVersion: 'epoch:4' }] });

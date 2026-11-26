@@ -335,16 +335,34 @@ test('ordinary start persists an explicit profile before reporting a missing sta
     assert.deepEqual(effects, []);
 });
 
+test('PROD profile refusal leaves a published canary and its runtime untouched', async t => {
+    const effects = fixture(true);
+    const previousKey = process.env.PLOINKY_MASTER_KEY;
+    process.env.PLOINKY_MASTER_KEY = 'a'.repeat(64);
+    t.after(() => {
+        if (previousKey === undefined) delete process.env.PLOINKY_MASTER_KEY;
+        else process.env.PLOINKY_MASTER_KEY = previousKey;
+    });
+    const { writeSecretsFile } = await import('../../cli/utils/security/encryptedSecretsFile.js');
+    writeSecretsFile({ PROD: 'true' });
+    for (const args of [['start', '--profile', 'qa'], ['restart']]) {
+        await assert.rejects(handleCommand(args), error => error.code === 'PLOINKY_PROD_PROFILE_MISMATCH');
+        assert.deepEqual(effects, []);
+        assert.equal(readReceipt('alpha', { workspaceRoot }).terminal, null);
+        assert.ok(JSON.parse(fs.readFileSync(path.join(metadata, 'routing.json'))).routes.alpha.canary);
+    }
+});
+
 test('start finishes canary teardown before persisting an explicit profile', async t => {
     fixture(true);
     inactivateEdgeRoutingGeneration('cold-start-fixture', { workspaceRoot });
     const atProfileWrite = [];
-    const writeFile = fs.writeFileSync;
-    t.mock.method(fs, 'writeFileSync', (file, ...args) => {
-        if (file === path.join(metadata, 'profile')) {
+    const rename = fs.renameSync;
+    t.mock.method(fs, 'renameSync', (source, destination) => {
+        if (destination === path.join(metadata, 'profile')) {
             atProfileWrite.push(readReceipt('alpha', { workspaceRoot }).terminal?.reason);
         }
-        return writeFile(file, ...args);
+        return rename(source, destination);
     });
     await assert.rejects(handleCommand(['start', '--profile', 'default']), /fixture reached start repository preparation/);
     assert.deepEqual(atProfileWrite, ['start']);

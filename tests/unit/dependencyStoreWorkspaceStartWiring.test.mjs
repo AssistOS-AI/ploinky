@@ -105,6 +105,9 @@ function startFixture(t) {
         prepareManifestRepositories: async () => {},
         getActiveProfile: () => 'default',
         getProfileConfig: () => ({}),
+        // The production capture is outside what this wiring observes: no capture is carried or written.
+        resolveStartProd: () => false,
+        commitProdCapture: () => {},
         preflightWorkspaceStartRuntimeCapabilities: () => ({ admissions: ['admitted'], graph, registry, additionalNodes: [] }),
         resetPreinstallRunInProcess: () => {},
         preflightStartLinkedRepositories: (admitted, options) => { calls.push(['linkPreflight', admitted, options]); return []; },

@@ -16,6 +16,7 @@ import { registerCanaryPreparation } from '../sandbox/canary/preparation.mjs';
 import { runCanaryCommand } from './canaryCommand.js';
 import { activeForegroundSignal } from './foregroundCommand.js';
 import {
+    collectProdGateRoutes,
     startWorkspace,
     retireAbandonedStartPreparationBeforeStop,
     settleWorkspaceBeforeRestart,
@@ -87,6 +88,8 @@ import {
 import { handleDefaultSkillsCommand } from './skillsCommands.js';
 import { runSettingsMenu } from './settingsMenu.js';
 import { handleProfileCommand } from './profileCommands.js';
+import { assertProdProfileConsistency, readProd } from '../utils/prodMode.mjs';
+import { dryCaptureProdGates } from '../utils/runtime/mcpProdGates.mjs';
 import {
     cleanupSessionContainers,
     destroyAll,
@@ -446,6 +449,21 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
         }
         case 'start': {
             const startParsed = parseStartArgs(options);
+            // Before the first mutation, including the profile write below: a
+            // PROD/profile mismatch must leave the workspace untouched.
+            assertProdProfileConsistency({ requestedProfile: startParsed.profile || undefined });
+            // The dry capture reads every route's mcp-config and, under PROD,
+            // refuses a dirty, untracked or non-git one, still before any
+            // mutation. startWorkspace writes the result.
+            const prod = readProd();
+            const prodCapture = dryCaptureProdGates({
+                prod,
+                routes: collectProdGateRoutes({
+                    prod,
+                    staticAgentArg: startParsed.staticAgent || undefined,
+                    workspaceProfile: startParsed.profile || undefined,
+                }),
+            });
             const withCanariesReconciled = mutate => withCanarySafePreparation('start', mutate);
             if (startParsed.profile) {
                 await withCanariesReconciled(() => {
@@ -461,6 +479,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 killRouterIfRunning,
                 branchPolicy: startParsed.branchPolicy,
                 withCanariesReconciled,
+                prodCapture,
             });
             break;
         }
@@ -749,6 +768,10 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
                     throw new Error('restart: start is not configured. Run: start <staticAgent> <port>');
                 }
+                // Before the first mutation: nothing is stopped on a refusal.
+                assertProdProfileConsistency();
+                const prod = readProd();
+                const prodCapture = dryCaptureProdGates({ prod, routes: collectProdGateRoutes({ prod }) });
                 resolvePersistedRouterPort();
                 // The generic settler refuses an abandoned additive lease.
                 // Recover a canary-owned publication before asking it to
@@ -770,6 +793,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     enableAgent,
                     killRouterIfRunning,
                     withCanariesReconciled,
+                    prodCapture,
                 });
                 console.log('[restart] Done.');
             }

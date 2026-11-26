@@ -754,6 +754,69 @@ export function createBoxSupervisor({
         };
     }
 
+    // The `--profile` a start asks for, so the in-Box consistency check sees
+    // the profile this transaction is about to select.
+    function requestedProfileFromCoreArgs(coreArgs) {
+        if (!Array.isArray(coreArgs)) return '';
+        for (let index = 0; index < coreArgs.length; index += 1) {
+            const arg = String(coreArgs[index]);
+            if (arg === '--profile') return String(coreArgs[index + 1] ?? '').trim().toLowerCase();
+            if (arg.startsWith('--profile=')) return arg.slice('--profile='.length).trim().toLowerCase();
+        }
+        return '';
+    }
+
+    // PROD true requires workspace profile `prod`. On a running, initialized Box,
+    // ask the in-Box core (inspect-only `profile assert`) before this transaction
+    // touches the Box, ahead of `settleHardwareTransitions`. A Box that is absent,
+    // stopped, uninitialized, not inspectable or about to be replaced has nothing
+    // to ask here; the in-Box start and restart repeat the check before their own
+    // first mutation, so this is the host's early refusal, not the only one.
+    async function assertInBoxProdProfile(identity, ownership, coreArgs) {
+        let status;
+        let selection;
+        let hostPort;
+        let mediaHostPort;
+        try {
+            status = inspectBoxStatus();
+            const statusContainer = status.ownership?.handles?.container;
+            if (status.identity?.instance !== identity.instance
+                || status.state !== 'running-initialized'
+                || !statusContainer?.id
+                || !status.ownership?.engine?.name
+                || ownership?.handles?.container?.id !== statusContainer.id) return;
+            selection = agentLibContractFromContainer(statusContainer);
+            revalidateAgentLibSource(selection, {
+                engine: status.ownership.engine,
+                containerId: statusContainer.id,
+                runner,
+            });
+            hostPort = Number(statusContainer.labels?.[BOX_LABELS.routerHostPort]);
+            mediaHostPort = Number(statusContainer.labels?.[BOX_LABELS.mediaHostPort]);
+        } catch (_) {
+            return;
+        }
+        const profile = requestedProfileFromCoreArgs(coreArgs);
+        const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+        await runCoreCommand(
+            status.ownership.engine,
+            status.ownership.handles.container.id,
+            ['profile', 'assert', ...(profile ? ['--profile', profile] : []),
+                ...(coreArgs[0] === 'start' ? ['--start-args', JSON.stringify(coreArgs.slice(1))] : [])],
+            hostPort,
+            mediaHostPort,
+            runner,
+            {
+                workspaceRoot: identity.workspaceRoot,
+                stdout,
+                stderr,
+                hostReachableIpv4,
+                agentLib: selection,
+                skillScopeEnv: buildHostSkillScope(identity.workspaceRoot, launchCwd),
+            },
+        );
+    }
+
     // Recover any pending downgrade first, then journal an actual gate-on to
     // gate-off downgrade. First enable and on-to-on use no barrier.
     async function settleHardwareTransitions(identity, lock, ownership, gate, operation) {
@@ -1349,6 +1412,7 @@ export function createBoxSupervisor({
             // A start that must reuse an exact existing Box keeps its source.
             const reposSource = existing ? undefined : requestedReposSource();
             const hardwareGate = existing ? null : selectHardwareGateForOperation(identity, 'start', lock);
+            await assertInBoxProdProfile(identity, ownership, coreArgs);
             if (!existing) ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'start');
             const hardware = existing ? existing.hardware : hardwareWiringFor(identity, hardwareGate.enabled, ownership);
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
@@ -1470,6 +1534,7 @@ export function createBoxSupervisor({
             await assertNoUpdateRecoveryBarrier(identity, ownership);
             const reposSource = requestedReposSource();
             const hardwareGate = selectHardwareGateForOperation(identity, 'restart', lock);
+            await assertInBoxProdProfile(identity, ownership, coreArgs);
             ownership = await settleHardwareTransitions(identity, lock, ownership, hardwareGate, 'restart');
             const hardware = hardwareWiringFor(identity, hardwareGate.enabled, ownership);
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);

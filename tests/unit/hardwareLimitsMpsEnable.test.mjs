@@ -70,6 +70,9 @@ function realEnableWithDependencies(f, { failReadiness = false } = {}) {
     const bindings = {
         // enableAgent runs under the workspace lease it holds or acquires; the lease is not what this lifecycle test observes.
         withHeldOrAcquiredWorkspaceMutationLease: async (_options, callback) => callback({}),
+        // The profile rules and the production-gate merge are outside what this lifecycle test observes.
+        assertEnableProfileRules: () => {},
+        mergeEnableRouteGates: () => ({ merged: false }),
         registeredRuntimeTuple: () => null,
         withMpsEnablePreparation: (request, stage) => withMpsEnablePreparation(request, stage, f.deps),
         prepareAgentEnableBatch: () => { f.events.push('prepare'); return { plans: [f.plan], preparedGeneration: { preparationLease: lease, generation: { agents: {}, routing: { routes: {} } } } }; },

@@ -3,6 +3,9 @@ import { showHelp } from './help.js';
 import * as envSvc from '../utils/security/secretVars.js';
 import { findAgent } from '../utils/utils.js';
 import { VAR_STDIN_MAX_BYTES, decodeVarStdinValue } from './varStdinValue.js';
+import { PROD_ENV, assertProdProfileConsistency, parseProd, readProd } from '../utils/prodMode.mjs';
+import { withImmediateWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import { capturedProdIfCaptured } from '../utils/runtime/mcpProdGates.mjs';
 import {
     assertActiveEdgeRoutingSourcesCurrent,
     inactivateEdgeRoutingGeneration,
@@ -42,6 +45,18 @@ function setVarValue(varName, valueOrAlias) {
     if (!varName || typeof valueOrAlias !== 'string' || valueOrAlias.length === 0) {
         showHelp();
         throw new Error('Usage: var <VAR> <value|$OTHER>');
+    }
+    if (varName.trim() === PROD_ENV) {
+        // Strict parse (an invalid value leaves the store unchanged), then the
+        // consistency check against the value being set: the stored value is
+        // not read, so `var PROD true|false` repairs a legacy invalid value.
+        const requestedProd = parseProd(valueOrAlias);
+        withImmediateWorkspaceMutationLease('set-production-mode', () => {
+            assertProdProfileConsistency({ requestedProd });
+            envSvc.setEnvVar(PROD_ENV, valueOrAlias);
+        });
+        console.log(`✓ Set variable '${varName}'. It applies at the next start or whole restart.`);
+        return;
     }
     envSvc.setEnvVar(varName, valueOrAlias);
     console.log(`✓ Set variable '${varName}'.`);
@@ -106,7 +121,22 @@ function handleEchoCommand(options = []) {
     console.log(output);
 }
 
+// `expose` rewrites an agent's manifest.json, which a production deployment
+// never does: its code changes only through the deploy. It refuses under the
+// stored PROD (an unreadable or invalid stored value refuses too, fail closed)
+// and under the captured PROD.
+function assertExposeAllowed() {
+    if (readProd() || capturedProdIfCaptured()) {
+        const error = new Error(
+            `expose is refused while ${PROD_ENV} is true: it edits an agent manifest, and production agent code changes only through the deploy workflow.`,
+        );
+        error.code = 'PLOINKY_PROD_EXPOSE_REFUSED';
+        throw error;
+    }
+}
+
 function handleExposeCommand(options = []) {
+    assertExposeAllowed();
     if (!options[0]) { showHelp(); throw new Error('Usage: expose <EXPOSED_NAME> [<$VAR|value>] [agentName]'); }
     const assignment = parseInlineAssignmentToken(options[0]);
     const normalized = expandInlineAssignment(options).filter(item => item !== undefined);

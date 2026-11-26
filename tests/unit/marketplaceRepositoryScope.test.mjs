@@ -7,6 +7,7 @@ import { Readable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { execFileSync } from 'node:child_process';
 import { installGitFixture, until } from '../helpers/repositoryGitFixture.mjs';
+import { writeProdCapture } from '../helpers/prodCapture.mjs';
 
 const base = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'marketplace-scope-'));
 const physical = path.join(base, 'physical');
@@ -18,6 +19,8 @@ const previousKey = process.env.PLOINKY_MASTER_KEY;
 process.env.PLOINKY_WORKSPACE_ROOT = root;
 process.env.PLOINKY_MASTER_KEY = '5'.repeat(64);
 fs.mkdirSync(path.join(root, '.ploinky/repos'), { recursive: true });
+// The handler reads the captured PROD; a workspace without a capture is PROD true.
+writeProdCapture(root);
 const { handleMarketplaceRoutes } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
 const { listAgentRepositoryNames, runWithRepositoryResolutionScope } = await import('../../cli/utils/agentRepositorySource.mjs');
 const { setAgentRepositoryRegistered } = await import('../../cli/utils/agentRepositoryRegistration.mjs');
@@ -287,6 +290,8 @@ test('new requests observe origin, source and global configuration changes immed
 test('retargeted workspace symlink selects the new canonical source on the next catalog request', async t => {
     const next = path.join(base, 'next-physical');
     fs.mkdirSync(path.join(next, '.ploinky/repos'), { recursive: true });
+    // The retargeted workspace carries its own captured PROD.
+    writeProdCapture(next);
     const url = 'https://example.test/team/next-skills.git';
     gitCheckout('next-development', url, { workspace: next, skill: true });
     fs.writeFileSync(path.join(next, '.ploinky/repo_sources.json'), JSON.stringify({ 'next-skills': { url, kind: 'skills' } }));

@@ -261,6 +261,43 @@ hashes none of its files.
 
 Automatic repository bootstrap prepares `AchillesIDE`, `AchillesCLI`, and `copilot-agents`, reusing matching workspace checkouts before cloning missing repositories into `.ploinky/repos`. Explorer's manifest declares its additional repositories and uses `webmeet/liveKitServerAgent` for LiveKit (the WebMeet agents live in the `webmeet` repository; `multimedia`, `soplangAgent`, `tasksAgent` and `webAssist` live in `legacy-agents`; `soul-gateway` and `roboTeamAgent` live in `AchillesIDE`). The `basic` repository is optional: install it explicitly with `ploinky install repo basic` when needed.
 
+### Production switch (`PROD`)
+
+`PROD` is a `ploinky var` (`true` or `false`, default `false`) kept in the controller-only encrypted store (`.ploinky/data/.secrets`), which agents cannot write. It switches production-gated features off for a deployment. It is independent of `PLOINKY_REPOS_SOURCE` and of the workspace profile, with one coupling: `PROD true` requires the workspace profile `prod`.
+
+```sh
+ploinky profile prod
+ploinky var PROD true     # stored now; active after the next start or whole restart
+ploinky restart
+```
+
+- `ploinky var PROD` accepts exactly `true` or `false`. Any other value (`True`, `1`, `'true '`, an empty or oversized value) is refused with `PLOINKY_PROD_INVALID` and the store is unchanged. A value that is already stored but invalid makes `start` and a whole `restart` refuse before anything is stopped; `ploinky var PROD true|false` repairs it.
+- `ploinky var PROD true` with another profile selected, `ploinky profile <name>` or `ploinky start --profile <name>` with `PROD true` stored and a profile other than `prod`, all refuse with `PLOINKY_PROD_PROFILE_MISMATCH` before any mutation. `ploinky var PROD false` first lifts the coupling. Profile `prod` with `PROD false` only warns.
+- The stored value takes effect only when a deploy-path command captures it: `start` and a whole `restart` write the captured value to the controller-only file `.ploinky/data/mcp-prod-gates.json`. The Router, the Marketplace and every agent use only that captured value, so a stored change never takes effect at a Router-only restart (`ploinky restart router`), a watchdog respawn or per call. `ploinky profile show` prints `PROD` (stored) and `PROD (active)` (captured).
+- The workspace `.env`, the caller's `PROD` environment variable and a manifest `env` entry named `PROD` never select it: the first two are ignored (the Router environment drops them) and the manifest entry is a validation error.
+- Agents receive the captured value as a read-only `PROD` environment variable; a manifest `secrets` entry named `PROD` reads as missing. An unreadable or missing capture is treated as `true` (fail closed). What `PROD true` switches off is listed under [Production-gated features](#production-gated-features).
+- A host `ploinky start` or `ploinky restart` on a running Box first runs the inspect-only in-Box `profile assert`, so a mismatch is refused before the Box is touched.
+
+### Production-gated features
+
+While the captured `PROD` is true, the Router refuses these features. The gates act on the value captured by `start` or a whole `restart`, never on the stored var (see [Production switch](#production-switch-prod)).
+
+- **MCP tools.** A tool in an agent's `mcp-config.json` that carries the `prod-disabled` tag (a modifier: it never changes the tool's `authenticated`, `admin` or `internal` class) is refused with `403 PROD_DISABLED` and omitted from `tools/list`, for users and agents alike, and no persisted policy entry re-enables it. `start` and a whole `restart` read every enabled and graph route's `mcp-config.json` and record the tagged tool names per route in `.ploinky/data/mcp-prod-gates.json`. Under `PROD true` every captured route's `mcp-config.json` must be tracked and identical to git `HEAD` (tagged or not): a modified, staged, untracked, symlinked or non-git file refuses with `PLOINKY_PROD_GATES_DIRTY` before anything is stopped, so a deploy cannot capture a gate set it did not review. Editing the file afterwards changes nothing until the next start or whole restart. `ploinky restart router` and a watchdog respawn reuse the captured file. An enable (CLI, Marketplace or agent) merges only its own route into it, runs the same check under PROD, and never changes the captured `prod` value. An absent or unreadable capture is treated as `PROD true` and answers MCP calls with `503 PROD_POLICY_UNAVAILABLE`.
+- **Marketplace.** A non-`GET` request to a resource other than `repos`, `agents`, `cache` or `hardware-limits` is refused with `403 {"error":"disabled_in_production"}` before authentication. For `repos` and `agents` the action is checked right after the request body is parsed: `install`, `remove`, `install_repo` and `uninstall_repo` are disabled, `enable_agent` and `disable_agent` stay allowed, and any other action (including the Restart and Reinstall actions another feature adds) is refused. `cache` and `hardware-limits` keep their own handling. `GET /api/marketplace/agents` reports `permissions: { canManage, canRestart, canReinstall, production }`; under PROD `canRestart` and `canReinstall` are false. The tables live in `cli/server/authHandlers/marketplaceMutations.mjs`.
+- **WebTTY.** The Box shell target is refused at launch and by the periodic session check; agent targets are unaffected.
+- **`ploinky expose`** edits an agent manifest and is refused while the stored or the captured `PROD` is true.
+
+### Environment profiles
+
+The workspace profile is exactly one of `default`, `dev`, `qa` and `prod`, valid whatever the installed manifests declare (`ploinky profile prod` works before any repository exists). Local work uses `default`; `dev` is for a named shared development deployment. A manifest declares all four under `profiles`; `qa`, `dev` and `prod` are `{}` when they add nothing to `default`. A name that is not one of the four, such as a role name like `embedded`, is refused by `ploinky profile` and by `ploinky start --profile`; a stored role or unknown name in `.ploinky/profile` is read as `default` with one warning.
+
+- Profiles are single-select. An agent record or an `enable` pin that names an environment (`default`, `dev`, `qa`, `prod`) follows the workspace profile: its own name when the manifest declares it, otherwise `default`. At the next `start` or whole `restart` a record whose profile changes gets a new runtime identity and its predecessor is removed, for enabled agents inside and outside the start graph alike. A role pin (`embedded`, `explorer`, ...) names a purpose rather than an environment and stays explicit.
+- Targeted `ploinky restart <agent>`, watchdog recovery and `ploinky update` keep the recorded profile. A profile switch takes effect only through `start`, a whole `restart` or `enable`.
+- `ploinky enable agent` refuses an operator-supplied per-agent environment profile that differs from the workspace profile (`PLOINKY_PROFILE_ENVIRONMENT_SCOPE`).
+- Under the captured `PROD` every agent must declare `prod`: an agent without it refuses at `start`, whole `restart` and `enable` (`PLOINKY_PROFILE_NOT_FOUND`).
+- `PLOINKY_PROFILE` keeps the resolved name; `PLOINKY_PROFILE_ENV` is `development` (for `default` and `dev`), `qa` or `prod`.
+- `ploinky profile check [--require a,b]` checks that every enabled agent and every agent in the static agent's dependency graph declares each required profile (default `default,dev,qa,prod`) as an object; it exits non-zero on any failure and when no agent is enabled. `node cli/tools/checkManifestProfiles.mjs [--require a,b] <repoRoot>...` applies the same rules to repository roots: exit 0 when at least one manifest was found and all pass, 1 when any fails, 2 when no manifest was found (never a pass).
+
 ### Agent repositories in the workspace
 
 You can keep agent repositories directly inside your [workspace](docs/wiki.html#definition-workspace). Every operation that selects an agent repository's source prefers the matching workspace checkout over `.ploinky/repos/<repository>`. This includes discovery, installed/active lists, Marketplace inventory, manifest and dependency preparation, and source selection for new runtimes.

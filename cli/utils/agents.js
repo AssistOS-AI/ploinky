@@ -32,7 +32,9 @@ import {
 } from '../sandbox/bwrap/bwrapFleet.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
-import { resolveManifestRuntimeProfile } from './runtime/profileService.js';
+import { getActiveProfile, resolveManifestRuntimeProfile } from './runtime/profileService.js';
+import { followWorkspaceProfile, isEnvironmentProfile } from './runtime/profileFollow.mjs';
+import { capturedProdIfCaptured, mergeEnabledRouteGates } from './runtime/mcpProdGates.mjs';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from './runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
@@ -1036,6 +1038,67 @@ export async function withMpsEnablePreparation(request, stage, {
     });
 }
 
+// Profile rules for an operator-driven enable, applied before anything is
+// prepared. Graph staging reaches `prepareAgentEnableBatch` directly with the
+// profile the graph resolved, so this check never refuses a graph node.
+//  - Under the captured PROD an agent without a `prod` profile refuses.
+//  - A per-agent environment name that differs from the workspace profile
+//    refuses: profiles are single-select, so an agent never runs another
+//    environment's profile than the workspace. A role name stays allowed.
+export function assertEnableProfileRules({ agentName, mode, repoNameParam, authOptions = {} }, {
+    workspaceProfile = getActiveProfile(),
+    prod = capturedProdIfCaptured(),
+} = {}) {
+    let manifestPath;
+    let agentRef;
+    try {
+        const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
+        const found = findAgent(normalized.agentName);
+        manifestPath = found.manifestPath;
+        agentRef = `${found.repo}/${found.shortAgentName}`;
+    } catch (_) {
+        // The candidate preparation reports an unresolvable agent itself.
+        return;
+    }
+    const requested = typeof authOptions?.profile === 'string' ? authOptions.profile.trim().toLowerCase() : '';
+    if (requested && isEnvironmentProfile(requested) && requested !== workspaceProfile) {
+        const error = new Error(
+            `[profile] ${agentRef}: environment profile '${requested}' differs from the workspace profile '${workspaceProfile}'. `
+            + `Select the workspace profile with 'ploinky profile ${requested}' instead of a per-agent choice.`,
+        );
+        error.code = 'PLOINKY_PROFILE_ENVIRONMENT_SCOPE';
+        throw error;
+    }
+    if (prod) {
+        let manifest;
+        try {
+            manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        } catch (_) {
+            return;
+        }
+        followWorkspaceProfile(manifest, requested, workspaceProfile, { prod, agentRef });
+    }
+}
+
+// An enable captures and merges only its own route into the existing production
+// capture, before anything is prepared. Under the captured PROD that route's
+// mcp-config must be tracked and identical to git HEAD, or the enable refuses;
+// it never changes the captured `prod` value.
+export function mergeEnableRouteGates({ agentName, mode, repoNameParam, aliasParam }, { merge = mergeEnabledRouteGates } = {}) {
+    let routeKey;
+    let agentDir;
+    try {
+        const normalized = normalizeEnableArgs(agentName, mode, repoNameParam);
+        const found = findAgent(normalized.agentName);
+        routeKey = normalizeAlias(aliasParam) || found.shortAgentName;
+        agentDir = path.dirname(found.manifestPath);
+    } catch (_) {
+        // The candidate preparation reports an unresolvable agent itself.
+        return { merged: false };
+    }
+    return merge(routeKey, { agentDir });
+}
+
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
     // Enabling mutates the registry and admits a runtime: hold the workspace
     // mutation lease (reusing one this process already holds) for the whole
@@ -1044,6 +1107,8 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
     return withHeldOrAcquiredWorkspaceMutationLease({ operation: 'agent-enable' }, async () => {
     const request = { agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions };
     return withMpsEnablePreparation(request, async ({ mps, mpsLaunch }) => {
+    assertEnableProfileRules(request);
+    mergeEnableRouteGates(request);
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{

@@ -765,12 +765,12 @@ test('applyManifestDirectives: profile enable auto-installs missing prefixed rep
     const barePath = createBareAgentRepo('profileAutoRepo', 'worker', { branches: ['feature-profile'] });
     writeRepoSource('profileAutoRepo', barePath);
     fs.mkdirSync(path.join(tempDir, '.ploinky'), { recursive: true });
-    fs.writeFileSync(path.join(tempDir, '.ploinky', 'profile'), 'embedded');
+    fs.writeFileSync(path.join(tempDir, '.ploinky', 'profile'), 'qa');
     writeAgentManifest('staticProfile', 'app', {
         container: 'node:20',
         profiles: {
             default: {},
-            embedded: {
+            qa: {
                 enable: ['profileAutoRepo/worker'],
             },
         },
@@ -796,7 +796,8 @@ test('applyManifestDirectives: profile enable auto-installs missing prefixed rep
 test('manifestEnableEntries: default profile enable is used when active profile is absent', (t) => {
     const profilePath = path.join(tempDir, '.ploinky', 'profile');
     fs.mkdirSync(path.dirname(profilePath), { recursive: true });
-    fs.writeFileSync(profilePath, 'embedded');
+    // A workspace profile the manifest does not declare.
+    fs.writeFileSync(profilePath, 'qa');
     t.after(() => fs.writeFileSync(profilePath, 'default'));
 
     const entries = manifestEnableEntries({
@@ -1322,4 +1323,19 @@ test.after(() => {
     } catch (_) {}
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('repository preparation follows the workspace environment through nested role pins', async () => {
+    writeAgentManifest('profilePrep', 'root', {
+        profiles: { default: {}, prod: { enable: [{ agent: 'child', profile: 'embedded' }] } },
+    });
+    writeAgentManifest('profilePrep', 'child', {
+        profiles: { default: {}, embedded: { enable: [{ agent: 'grandchild', profile: 'default' }] } },
+    });
+    writeAgentManifest('profilePrep', 'grandchild', {
+        profiles: { default: {}, prod: { enable: ['missing-prod-only'] } },
+    });
+    const errors = [];
+    await prepareManifestRepositories('profilePrep/root', { profile: 'prod', logError: message => errors.push(message) });
+    assert.ok(errors.some(message => message.includes('missing-prod-only')), errors.join('\n'));
 });

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+import { writeProdCapture } from '../helpers/prodCapture.mjs';
 
 const workspace = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'marketplace-public-'));
 const previousCwd = process.cwd();
@@ -11,6 +12,8 @@ const previousKey = process.env.PLOINKY_MASTER_KEY;
 process.chdir(workspace);
 process.env.PLOINKY_MASTER_KEY = '4'.repeat(64);
 fs.mkdirSync('.ploinky');
+// The handler reads the captured PROD; a workspace without a capture is PROD true.
+writeProdCapture(workspace);
 const { handleMarketplaceRoutes } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
 const { mintSessionJwt, getSession } = await import('../../cli/server/auth/localService.js');
 const { authService, SSO_AUTH_COOKIE_NAME } = await import('../../cli/server/authHandlers/shared.js');

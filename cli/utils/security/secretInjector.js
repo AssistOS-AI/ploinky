@@ -9,6 +9,13 @@ export function isPublicationHandle(name) {
     return String(name).startsWith('publication/');
 }
 
+// PROD is the controller-owned production switch. An agent receives only the
+// value captured by a start or whole restart, so a manifest `secrets` entry can
+// never pull the stored (possibly newer) value in: it reads as missing.
+function isProdSwitch(name) {
+    return String(name) === 'PROD';
+}
+
 /**
  * Load secrets from the .ploinky/data/.secrets file.
  * File format is KEY=VALUE, one per line, with # comments.
@@ -30,7 +37,7 @@ export function loadSecretsFile() {
  * @returns {string|undefined} The secret value or undefined
  */
 export function getSecret(secretName) {
-    if (isPublicationHandle(secretName)) return undefined;
+    if (isPublicationHandle(secretName) || isProdSwitch(secretName)) return undefined;
     // First check environment
     if (process.env[secretName] !== undefined) {
         return process.env[secretName];
@@ -58,7 +65,7 @@ export function getSecrets(secretNames) {
     const envSecrets = loadEnvFile();
 
     for (const name of secretNames) {
-        if (isPublicationHandle(name)) continue;
+        if (isPublicationHandle(name) || isProdSwitch(name)) continue;
         // Environment takes precedence
         if (process.env[name] !== undefined) {
             secrets[name] = process.env[name];
@@ -88,7 +95,7 @@ export function validateSecrets(requiredSecrets) {
     const envSecrets = loadEnvFile();
 
     for (const name of requiredSecrets) {
-        if (isPublicationHandle(name)) {
+        if (isPublicationHandle(name) || isProdSwitch(name)) {
             missing.push(name);
         } else if (process.env[name] !== undefined) {
             source[name] = 'environment';

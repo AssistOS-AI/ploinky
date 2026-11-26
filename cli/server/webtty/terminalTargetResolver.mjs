@@ -15,6 +15,7 @@ import {
     IMMUTABLE_CONTAINER_ID,
 } from '../../sandbox/docker/containerOwnership.js';
 import { NETWORK_LABELS, workspaceNetworkIdentity } from '../../sandbox/networkIdentity.js';
+import { capturedProdOrClosed } from '../../utils/runtime/mcpProdGates.mjs';
 
 export const TERMINAL_TARGET_DISCOVERY_LIMITS = Object.freeze({
     candidates: 63,
@@ -571,7 +572,11 @@ export class TerminalTargetResolver {
         isTargetQuarantined = () => false,
         fsApi = fs,
         limits = TERMINAL_TARGET_DISCOVERY_LIMITS,
+        // The production state captured by the start or whole restart that is
+        // running now; unavailable counts as PROD true.
+        readProd = () => capturedProdOrClosed(),
     } = {}) {
+        this.readProd = readProd;
         this.directoryResolver = directoryResolver;
         this.inspectContainer = inspectContainer;
         this.workspaceIdentity = workspaceIdentity;
@@ -595,6 +600,15 @@ export class TerminalTargetResolver {
             () => this.inspectContainer(runtime, containerId, options),
             { signal: options.signal },
         );
+    }
+
+    // Under the captured PROD the Box shell target is refused: it reaches the
+    // whole workspace runtime, which production code changes must not use. The
+    // launch record contract still lists the Box row first, so the refusal is
+    // at revalidation, which every launch and every periodic session check
+    // passes through. Agent targets are unaffected.
+    boxTargetsAllowed() {
+        return this.readProd() !== true;
     }
 
     async discover({ routePlan, requestedDirectory, agentProviderAvailable = true, home = null, live = false } = {}) {
@@ -709,6 +723,7 @@ export class TerminalTargetResolver {
             }
         }
         if (target.kind === 'box') {
+            if (!this.boxTargetsAllowed()) throw targetError('WEBTTY_TARGET_PROD_DISABLED');
             if (home && target.home.translatedHome !== home.absolutePath) throw targetError('WEBTTY_TARGET_STALE');
             routeSnapshot(routePlan);
             const box = boxProfileTarget(directory, home);

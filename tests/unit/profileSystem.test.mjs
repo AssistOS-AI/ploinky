@@ -488,7 +488,7 @@ test('createAgentWorkDir creates agent workspace folder', () => {
     const workDir = createAgentWorkDir(agentName);
 
     assert.strictEqual(workDir, getAgentWorkDir(agentName));
-    assert.strictEqual(workDir, path.join(fs.realpathSync(tempDir), '.data', agentName));
+    assert.strictEqual(workDir, path.join(fs.realpathSync(tempDir), '.data', 'agents', agentName));
     assert.ok(fs.statSync(workDir).isDirectory());
 });
 
@@ -514,7 +514,7 @@ test('isValidProfile rejects unknown profiles when no manifest declares them', (
     assert.strictEqual(isValidProfile('canary'), false);
 });
 
-test('isValidProfile accepts manifest-declared semantic profiles', () => {
+test('isValidProfile accepts exactly the four environment names, never a manifest-declared role', () => {
     writeManifest('proxies', 'soul-gateway', {
         profiles: {
             default: { env: {} },
@@ -523,12 +523,15 @@ test('isValidProfile accepts manifest-declared semantic profiles', () => {
         },
     });
 
-    assert.strictEqual(isValidProfile('embedded'), true);
-    assert.strictEqual(isValidProfile('standalone'), true);
+    for (const name of ['default', 'dev', 'qa', 'prod']) assert.strictEqual(isValidProfile(name), true, name);
+    // A role names one agent's purpose; declaring it in a manifest does not
+    // make it a workspace profile.
+    assert.strictEqual(isValidProfile('embedded'), false);
+    assert.strictEqual(isValidProfile('standalone'), false);
     assert.strictEqual(isValidProfile('nonexistent'), false);
 });
 
-test('getValidProfiles includes manifest-declared profiles', () => {
+test('getValidProfiles is the four environment names whatever the manifests declare', () => {
     writeManifest('semantic', 'test-agent', {
         profiles: {
             default: {},
@@ -536,12 +539,10 @@ test('getValidProfiles includes manifest-declared profiles', () => {
         },
     });
 
-    const valid = getValidProfiles();
-    assert.ok(valid.includes('default'));
-    assert.ok(valid.includes('embedded'));
+    assert.deepStrictEqual(getValidProfiles(), ['default', 'dev', 'qa', 'prod']);
 });
 
-test('setActiveProfile accepts manifest-declared semantic profiles', () => {
+test('setActiveProfile refuses a manifest-declared role and keeps the stored profile', () => {
     writeManifest('semantic-set', 'agent-set', {
         profiles: {
             default: {},
@@ -549,9 +550,11 @@ test('setActiveProfile accepts manifest-declared semantic profiles', () => {
         },
     });
 
+    const before = getActiveProfile();
     const result = setActiveProfile('embedded');
-    assert.strictEqual(result.success, true);
-    assert.strictEqual(getActiveProfile(), 'embedded');
+    assert.strictEqual(result.success, false);
+    assert.match(result.message, /Valid profiles are: default, dev, qa, prod/);
+    assert.strictEqual(getActiveProfile(), before);
 });
 
 test('getProfileConfig merges default with semantic profile', () => {

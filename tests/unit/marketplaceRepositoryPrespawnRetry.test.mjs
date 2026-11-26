@@ -7,6 +7,7 @@ import { Readable } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { procFixture } from './marketplaceRepositoryProcFixtures.mjs';
+import { writeProdCapture } from '../helpers/prodCapture.mjs';
 
 // Reproduces the router latch on an incomplete pre-spawn census with the real
 // process observer over an in-memory /proc, through the real Marketplace route.
@@ -19,6 +20,8 @@ fs.mkdirSync(path.join(workspace, '.ploinky/repos'), { recursive: true });
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 process.env.PLOINKY_MASTER_KEY = '6'.repeat(64);
 process.chdir(invocation);
+// The handler reads the captured PROD; a workspace without a capture is PROD true.
+writeProdCapture(workspace);
 const { handleMarketplaceRoutes } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
 const { mintSessionJwt, getSession } = await import('../../cli/server/auth/localService.js');
 const { mintAdminCsrfToken } = await import('../../cli/server/adminControlSecurity.js');

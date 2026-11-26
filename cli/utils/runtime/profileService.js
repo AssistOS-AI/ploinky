@@ -1,41 +1,22 @@
 import fs from 'fs';
-import { listAgentRepositoryNames, resolveAgentRepositoryPath } from '../agentRepositorySource.mjs';
+import { randomUUID } from 'node:crypto';
 import path from 'path';
-import { PROFILE_FILE, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_DIR } from '../config.js';
+import { PROFILE_FILE, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import { validateSecrets } from '../security/secretInjector.js';
 import { collectManifestEnv, validateManifestEnvProfileCompleteness } from '../security/secretVars.js';
 import { debugLog, findAgent } from '../utils.js';
 import { effectiveManifestNetwork, validateManifestNetworks } from '../../sandbox/networkContract.js';
 import { mergeProfileHardwareLimits } from '../../sandbox/hardwareLimits/declaredLimits.mjs';
+import { assertProdProfileConsistency, PROD_ENV } from '../prodMode.mjs';
+import { withImmediateWorkspaceMutationLease } from './maintenanceLocks.js';
+import { capturedProdOrClosed } from './mcpProdGates.mjs';
+import { ENVIRONMENT_PROFILES, isEnvironmentProfile } from './profileFollow.mjs';
 
-// Discover all valid profile names from installed agent manifests.
-// Any profile name declared in a manifest's "profiles" section is valid.
-// "default" is always valid — it's the base profile every agent must have.
-function discoverManifestProfiles() {
-    const discovered = new Set(['default']);
-    try {
-        for (const repo of listAgentRepositoryNames()) {
-            const repoDir = resolveAgentRepositoryPath(repo);
-            if (!fs.statSync(repoDir).isDirectory()) continue;
-            for (const agent of fs.readdirSync(repoDir)) {
-                const manifestPath = path.join(repoDir, agent, 'manifest.json');
-                try {
-                    if (!fs.existsSync(manifestPath)) continue;
-                    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-                    if (manifest?.profiles && typeof manifest.profiles === 'object') {
-                        for (const profileName of Object.keys(manifest.profiles)) {
-                            discovered.add(profileName);
-                        }
-                    }
-                } catch (_) {}
-            }
-        }
-    } catch (_) {}
-    return discovered;
-}
-
+// Workspace profile names are exactly the four environment names (PD8), valid
+// whatever the installed manifests declare. A role name such as `embedded`
+// pins one agent; it is never a workspace profile.
 function isValidProfile(profileName) {
-    return discoverManifestProfiles().has(profileName);
+    return isEnvironmentProfile(profileName);
 }
 
 // Hook names in execution order
@@ -192,9 +173,20 @@ export function mergeProfiles(defaultProfile, activeProfile) {
     return mergeProfileHardwareLimits(merged, defaultProfile, activeProfile);
 }
 
+const warnedStoredProfiles = new Set();
+
+function warnOnceInvalidStoredProfile(profile) {
+    if (warnedStoredProfiles.has(profile)) return;
+    warnedStoredProfiles.add(profile);
+    console.error(
+        `[profile] The stored workspace profile '${profile}' is not one of ${ENVIRONMENT_PROFILES.join(', ')}; using 'default'. `
+        + "Run 'ploinky profile <name>' to select one.",
+    );
+}
+
 /**
  * Get the currently active profile.
- * @returns {string} The active profile name (defaults to 'dev')
+ * @returns {string} The workspace profile (one of the four environment names)
  */
 export function getActiveProfile() {
     try {
@@ -203,6 +195,9 @@ export function getActiveProfile() {
             if (profile && isValidProfile(profile)) {
                 return profile;
             }
+            // A stored role or unknown name (an older workspace) is never a
+            // workspace profile: default plus one warning per process.
+            if (profile) warnOnceInvalidStoredProfile(profile);
         }
     } catch (_) {}
     return 'default';
@@ -303,7 +298,7 @@ export function resolveManifestRuntimeProfile(manifest, {
  * @returns {{ success: boolean, message: string }}
  */
 export function setActiveProfile(profileName) {
-    const normalizedProfile = profileName.toLowerCase().trim();
+    const normalizedProfile = String(profileName ?? '').toLowerCase().trim();
 
     if (!isValidProfile(normalizedProfile)) {
         return {
@@ -312,23 +307,36 @@ export function setActiveProfile(profileName) {
         };
     }
 
-    try {
-        // Ensure .ploinky directory exists
-        if (!fs.existsSync(PLOINKY_DIR)) {
-            fs.mkdirSync(PLOINKY_DIR, { recursive: true });
-        }
+    return withImmediateWorkspaceMutationLease('set-workspace-profile', () => {
+        // PROD true requires profile `prod`. A mismatch throws (it keeps
+        // PLOINKY_PROD_PROFILE_MISMATCH) so a caller cannot read it as a soft
+        // refusal; nothing is written.
+        assertProdProfileConsistency({ requestedProfile: normalizedProfile });
 
-        fs.writeFileSync(PROFILE_FILE, normalizedProfile);
-        return {
-            success: true,
-            message: `Profile set to '${normalizedProfile}'`
-        };
-    } catch (err) {
-        return {
-            success: false,
-            message: `Failed to set profile: ${err.message}`
-        };
-    }
+        try {
+            // Ensure .ploinky directory exists
+            if (!fs.existsSync(PLOINKY_DIR)) {
+                fs.mkdirSync(PLOINKY_DIR, { recursive: true });
+            }
+
+            const temp = `${PROFILE_FILE}.${randomUUID()}.tmp`;
+            fs.writeFileSync(temp, normalizedProfile, { mode: 0o600, flag: 'wx' });
+            try {
+                fs.renameSync(temp, PROFILE_FILE);
+            } finally {
+                fs.rmSync(temp, { force: true });
+            }
+            return {
+                success: true,
+                message: `Profile set to '${normalizedProfile}'`
+            };
+        } catch (err) {
+            return {
+                success: false,
+                message: `Failed to set profile: ${err.message}`
+            };
+        }
+    });
 }
 
 /**
@@ -502,7 +510,7 @@ export function getDefaultMountModes(profile) {
  * @returns {string} Environment identifier
  */
 export function getProfileEnvironment(profile) {
-    if (profile === 'default') return 'development';
+    if (profile === 'default' || profile === 'dev') return 'development';
     return profile;
 }
 
@@ -517,7 +525,10 @@ export function getProfileEnvironment(profile) {
 export function getProfileEnvVars(agentName, repoName, profile, containerInfo = {}) {
     return {
         PLOINKY_PROFILE: profile,
-        PLOINKY_PROFILE_ENV: getProfileEnvironment(profile),
+        PLOINKY_PROFILE_ENV: getProfileEnvironment(isEnvironmentProfile(profile) ? profile : getActiveProfile()),
+        // Agents get the captured value only, read-only. An unavailable capture
+        // is PROD true (fail closed); a manifest env named PROD is refused.
+        [PROD_ENV]: capturedProdOrClosed() ? 'true' : 'false',
         PLOINKY_AGENT_NAME: agentName,
         PLOINKY_REPO_NAME: repoName,
         PLOINKY_WORKSPACE_ROOT,
@@ -532,7 +543,7 @@ export function getProfileEnvVars(agentName, repoName, profile, containerInfo = 
  * @returns {string[]} Array of valid profile names
  */
 export function getValidProfiles() {
-    return [...discoverManifestProfiles()];
+    return [...ENVIRONMENT_PROFILES];
 }
 
 export { isValidProfile };

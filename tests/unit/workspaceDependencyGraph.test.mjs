@@ -2827,16 +2827,16 @@ test('AssistOSExplorer-shaped wiring routes the LiveKit AI worker as no-wait whi
     assert.match(errors[0], /Dependency cycle detected:/);
 });
 
-test('resolveWorkspaceDependencyGraph resolves profile-specific enable[] for semantic profiles', () => {
+test('resolveWorkspaceDependencyGraph resolves profile-specific enable[] for environment profiles', () => {
     const profilePath = path.join(tempDir, '.ploinky', 'profile');
     fs.mkdirSync(path.dirname(profilePath), { recursive: true });
-    fs.writeFileSync(profilePath, 'embedded');
+    fs.writeFileSync(profilePath, 'qa');
 
     writeManifest('proxies', 'soul-gateway', {
         container: 'node:20-slim',
         profiles: {
             default: {},
-            embedded: {},
+            qa: {},
         },
     });
     writeManifest('AchillesIDE', 'explorer-semantic', {
@@ -2844,7 +2844,7 @@ test('resolveWorkspaceDependencyGraph resolves profile-specific enable[] for sem
         enable: ['demo/leaf'],
         profiles: {
             default: {},
-            embedded: {
+            qa: {
                 enable: ['proxies/soul-gateway'],
             },
         },

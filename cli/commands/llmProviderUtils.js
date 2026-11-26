@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { debugLog } from '../utils/utils.js';
 import { resolveAgentLibPath } from '../../agentlib/runtime.mjs';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
+import { PROD_ENV } from '../utils/prodMode.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -140,6 +141,8 @@ function populateProcessEnvFromEnvFile(envPath) {
     Object.entries(envVars).forEach(([keyName, fileValue]) => {
         // The workspace .env is agent-writable; it never selects the repository source.
         if (keyName === REPOS_SOURCE_ENV) return;
+        // Likewise PROD: only the captured controller value selects it.
+        if (keyName === PROD_ENV) return;
         if (typeof fileValue === 'string' && fileValue.trim().length > 0) {
             if (!process.env[keyName] || !process.env[keyName].trim().length) {
                 //console.log(`Set var: ${keyName}=${fileValue}`)

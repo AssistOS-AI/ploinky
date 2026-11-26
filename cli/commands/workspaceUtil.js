@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import * as utils from '../utils/utils.js';
+import { readAgentRegistrySnapshot } from '../utils/agentRegistrySnapshot.js';
 import * as agentsSvc from '../utils/agents.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import * as dockerSvc from '../sandbox/docker/index.js';
@@ -52,6 +53,14 @@ import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, res
 import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
+import { PROD_ENV } from '../utils/prodMode.mjs';
+import {
+  capturedProdOrClosed,
+  dryCaptureProdGates,
+  readCapturedProdGates,
+  writeProdGates,
+} from '../utils/runtime/mcpProdGates.mjs';
+import { followWorkspaceProfile } from '../utils/runtime/profileFollow.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../utils/publicRouterHosts.mjs';
 import {
@@ -299,10 +308,18 @@ export function buildRouterEnv({ managedBox } = {}) {
   // Likewise the repository source: only the process (Box) environment selects it.
   const { [PUBLIC_ROUTER_HOSTS_ENV]: _envFileHosts, [REPOS_SOURCE_ENV]: _envFileSource, ...fileEnvironment } = envFile;
   const { [PUBLIC_ROUTER_HOSTS_ENV]: _secretHosts, [REPOS_SOURCE_ENV]: _secretSource, ...secretEnvironment } = secrets;
-  return sanitizeRouterEnvironment(
+  const routerEnvironment = sanitizeRouterEnvironment(
     { ...fileEnvironment, ...secretEnvironment, ...process.env },
     { managedBox },
   );
+  // PROD comes only from the value captured by a start or whole restart. The
+  // workspace .env, the stored var and the caller's environment never select
+  // it for the Router: strip all three sources (the stored value also arrives
+  // through the secrets spread), then set it from the capture. An unavailable
+  // capture is PROD true (fail closed).
+  delete routerEnvironment[PROD_ENV];
+  routerEnvironment[PROD_ENV] = capturedProdOrClosed() ? 'true' : 'false';
+  return routerEnvironment;
 }
 
 export function workspaceRouterHealthSocket() {
@@ -1482,7 +1499,10 @@ function admitGraphNodeHardwareDescriptor(node, profileResolution, { runtime, re
   }
 }
 
-function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = dockerSvc.getAgentContainerName) {
+function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = dockerSvc.getAgentContainerName, {
+  workspaceProfile = getActiveProfile(),
+  prod = false,
+} = {}) {
   const graphRegistryNames = new Set();
   for (const node of graph?.nodes?.values?.() || []) {
     const existing = findRegistryEntryForGraphNode(reg, node, getAgentContainerName);
@@ -1521,12 +1541,87 @@ function resolveExtraEnabledRuntimeNodes(graph, reg, getAgentContainerName = doc
         alias: record.alias || '',
         manifest,
         manifestPath: resolved.manifestPath,
-        profile: record.profile || '',
+        // The single change site for out-of-graph records (PD5): a record that
+        // names an environment follows the workspace profile, and a role pin
+        // stays. The existing profileChanged logic then rotates the identity
+        // and removes the predecessor, so a profile switch reaches these
+        // agents without a second code path.
+        profile: followWorkspaceProfile(manifest, record.profile, workspaceProfile, { prod, agentRef: ref }),
         repoName: resolved.repo,
         shortAgentName: resolved.shortAgentName,
       }];
     });
   return { nodes, skipped };
+}
+
+// Every route the capture covers (PD7): the enabled registry plus the static
+// agent's dependency graph, as `{ routeKey, agentDir }`. A registry entry whose
+// source is missing is left out (an unknown route is ignored). `graph` is
+// resolved best-effort when it is not given: on a fresh workspace nothing is
+// installed yet, and startWorkspace extends the capture once the repositories
+// are prepared and the graph exists.
+export function collectProdGateRoutes({
+  registry = readAgentRegistrySnapshot(),
+  graph = null,
+  additionalNodes = [],
+  staticAgentArg,
+  workspaceProfile = getActiveProfile(),
+  prod = false,
+} = {}) {
+  const routes = [];
+  for (const [key, record] of Object.entries(registry || {})) {
+    if (key === '_config' || record?.type !== 'agent') continue;
+    const ref = record.repoName ? `${record.repoName}/${record.agentName}` : String(record.agentName || '');
+    try {
+      const { manifestPath } = utils.findAgent(ref);
+      if (prod) {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        followWorkspaceProfile(manifest, record.profile, workspaceProfile, { prod, agentRef: ref });
+      }
+      routes.push({ routeKey: String(record.alias || record.agentName || ''), agentDir: path.dirname(manifestPath) });
+    } catch (error) {
+      if (prod) throw error;
+    }
+  }
+  let resolvedGraph = graph;
+  if (!resolvedGraph) {
+    const retained = registry?._config?.static?.agent;
+    const staticAgent = String(staticAgentArg || retained || '').trim();
+    if (staticAgent) {
+      try {
+        resolvedGraph = resolveWorkspaceDependencyGraph({
+          staticAgentRef: staticAgent, registry, workspaceProfile, prod,
+          onUnresolvedDependency: () => {},
+        });
+      } catch (error) {
+        // A fresh start prepares its repositories after this inspection. Only
+        // missing sources can be deferred; the admitted graph is checked again.
+        const missing = /not found\.|No repos found\./.test(String(error.message));
+        if (prod && (retained || !missing)) throw error;
+      }
+    }
+  }
+  const nodes = [...(resolvedGraph?.nodes?.values?.() || []), ...additionalNodes];
+  for (const node of nodes) {
+    if (node?.agentPath) routes.push({ routeKey: String(node.alias || node.shortAgentName || ''), agentDir: node.agentPath });
+  }
+  return routes;
+}
+
+// The PROD value a start acts on: the capture a start or whole restart carries,
+// otherwise (`restart router`) the value already captured. Only an explicit true
+// makes profile resolution strict.
+export function resolveStartProd(prodCapture) {
+  return prodCapture ? prodCapture.prod === true : readCapturedProdGates().prod === true;
+}
+
+// Completes the dry capture with the routes of the graph the start resolved and
+// writes it. Without a capture (`restart router`) nothing is written and the
+// existing file stays in force.
+export function commitProdCapture(prodCapture, start) {
+  if (!prodCapture) return;
+  const routes = collectProdGateRoutes({ registry: start.registry, graph: start.graph, additionalNodes: start.additionalNodes, prod: prodCapture.prod });
+  writeProdGates(dryCaptureProdGates({ prod: prodCapture.prod, routes }));
 }
 
 function loadRegistryManifest(record) {
@@ -2877,7 +2972,7 @@ export function preflightStartLinkedRepositories(admittedStart, {
   return preflight(nodes.map((node) => node.manifest), { ...options, workspaceRoot, branchPolicy });
 }
 
-export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { hardwareContext, boxMarkerOptions } = {}) {
+export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { hardwareContext, boxMarkerOptions, prod = false } = {}) {
   const configured = workspaceSvc.getConfig()?.static?.agent || '';
   let staticAgent = String(staticAgentArg || configured || '').trim();
   if (!staticAgent) {
@@ -2899,12 +2994,14 @@ export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { har
   const graph = resolveWorkspaceDependencyGraph({
     staticAgentRef: staticAgent,
     registry,
+    prod,
     onUnresolvedDependency: (report) => unresolvedDependencies.push(report),
   });
   const { nodes: additionalNodes, skipped: skippedEnabledAgents } = resolveExtraEnabledRuntimeNodes(
     graph,
     registry,
     dockerSvc.getAgentContainerName,
+    { workspaceProfile: getActiveProfile(), prod },
   );
   const admissions = admitWorkspaceGraphRuntimeCapabilities(graph, {
     additionalNodes,
@@ -2937,7 +3034,12 @@ async function startWorkspace(staticAgentArg, portArg, {
   withCanariesReconciled,
   restarting = false,
   announce = true,
+  // The dry capture `start` or a whole `restart` computed before its first
+  // mutation. Only a start that carries one writes the captured file;
+  // `restart router` carries none and reuses the existing file.
+  prodCapture = null,
 } = {}) {
+  const startProd = resolveStartProd(prodCapture);
   // Acquire every declared dependency source before resolving the complete
   // graph. A fresh workspace cannot admit repositories that do not exist yet.
   // Repository preparation remains ahead of authoritative workspace mutation,
@@ -2967,7 +3069,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   };
   if (withCanariesReconciled) await withCanariesReconciled(prepareSources);
   else await prepareSources();
-  const admittedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  const admittedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { prod: startProd });
   // The workspace mutation lease covers source initialization, candidate
   // writes, both inactive prelaunch preparations, and every subsequent start.
   // Only the final post-provider lease may authorize runtime targets.
@@ -2999,7 +3101,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Superseding ${supersededNoWaitRuns.length} live no-wait worker(s) of an earlier start: ${supersededNoWaitRuns
       .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
   }
-  const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg, { prod: startProd });
   // A missing source is reported once and skipped; it never stops the restart.
   // The registry record of a skipped enabled agent is kept, so installing its
   // repository brings it back on the next restart.
@@ -3009,6 +3111,11 @@ async function startWorkspace(staticAgentArg, portArg, {
   for (const unresolved of lockedStart.unresolvedDependencies || []) {
     console.error(`[start] Skipping dependency '${unresolved.rawDependency}' of '${unresolved.parentRef}': ${unresolved.message}`);
   }
+  // The graph now exists, including agents the repository preparation just
+  // installed or updated. Recapture every admitted route from its final source,
+  // including routes whose branch changed during preparation. The result is
+  // written, before the first selector, route, config or Router write.
+  commitProdCapture(prodCapture, lockedStart);
   // `--branch` reaches link-install repositories here, for the whole admitted
   // graph including no-wait agents, before any mutation, wave or worker.
   preflightStartLinkedRepositories(lockedStart, { workspaceRoot: PLOINKY_WORKSPACE_ROOT, branchPolicy });

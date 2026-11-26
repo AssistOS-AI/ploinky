@@ -386,6 +386,20 @@ async function withHeldOrAcquiredWorkspaceMutationLease(options, fn) {
     return withWorkspaceMutationLease(options, fn);
 }
 
+// Synchronous configuration setters may be called by the CLI or imported by a
+// deployment. Use the lifecycle lease and refuse a competing writer immediately.
+export function withImmediateWorkspaceMutationLease(operation, fn) {
+    if (heldWorkspaceMutationLease()) return fn();
+    const lease = createWorkspaceMutationLease({ operation });
+    try {
+        return runWithWorkspaceMutationLease(lease, fn);
+    } finally {
+        if (!releaseWorkspaceMutationLease(lease)) {
+            throw new Error(`Could not release the workspace lease for ${operation}.`);
+        }
+    }
+}
+
 /**
  * The workspace mutation lease the current operation holds, validated against
  * the live lock file, or null. Never acquires anything.

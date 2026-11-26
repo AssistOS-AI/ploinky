@@ -8,6 +8,7 @@ import { PolicyAuditLog } from './PolicyAuditLog.js';
 import { FileSystemPolicyAuditSink } from './FileSystemPolicyAuditSink.js';
 import { HttpRouteAccessPolicy } from './HttpRouteAccessPolicy.js';
 import { McpToolPolicy } from './McpToolPolicy.js';
+import { readCapturedProdGates } from '../../utils/runtime/mcpProdGates.mjs';
 import { Caller } from './Caller.js';
 import { HttpShareAuthorizer } from './HttpShareAuthorizer.js';
 import { PolicyCommandRegistry } from './PolicyCommandRegistry.js';
@@ -37,7 +38,9 @@ import {
 const repository = new PolicyStateRepository({ store: new FileSystemPolicyStateStore() });
 const auditLog = new PolicyAuditLog({ sink: new FileSystemPolicyAuditSink() });
 const httpRouteAccessPolicy = new HttpRouteAccessPolicy({ repository });
-const mcpToolPolicy = new McpToolPolicy({ repository });
+// The Router acts on the production state captured by a start or whole restart,
+// never on the stored PROD var, .env or process.env.
+const mcpToolPolicy = new McpToolPolicy({ repository, readProdGates: () => readCapturedProdGates() });
 const shareAuthorizer = new HttpShareAuthorizer();
 
 const registry = new PolicyCommandRegistry()

@@ -17,19 +17,29 @@ import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mj
 
 const ACCESS_TAGS = new Set(['authenticated', 'internal', 'admin']);
 
+// A modifier tag does not choose an access class. `prod-disabled` marks a tool
+// that is refused while the captured PROD is true (the capture lists it per
+// route at the start that captured PROD; the tag is never read per call).
+const MODIFIER_TAGS = new Set(['prod-disabled']);
+
 export class McpToolPolicy {
-    constructor({ repository }) {
+    // `readProdGates` returns the captured production state (`{ prod, routes }`
+    // or `{ unavailable: true }`). The composition root passes the Router's
+    // reader; a policy built without one applies no production gating.
+    constructor({ repository, readProdGates = null }) {
         this._repo = repository;
+        this._readProdGates = typeof readProdGates === 'function' ? readProdGates : null;
     }
 
-    // Classify a tool's tags. Only access tags are recognized; any other tag is
-    // invalid (fail closed). `internal`+`admin` is invalid. Empty → authenticated.
+    // Classify a tool's tags. Only access tags and the `prod-disabled` modifier
+    // are recognized; any other tag is invalid (fail closed). `internal`+`admin`
+    // is invalid. No access tag → authenticated.
     accessFromTags(tags) {
         const list = Array.isArray(tags)
             ? tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean)
             : [];
         for (const tag of list) {
-            if (!ACCESS_TAGS.has(tag)) {
+            if (!ACCESS_TAGS.has(tag) && !MODIFIER_TAGS.has(tag)) {
                 return { invalid: true, reason: `unknown tag '${tag}'` };
             }
         }
@@ -133,10 +143,15 @@ export class McpToolPolicy {
     // The decision for an already-resolved policy entry (`null` = no entry,
     // `{ corrupt: true }` = unreadable policy). Shared by `evaluate` and
     // `filterTools` so both apply exactly the same rules.
-    _decide(entry, { tool, caller }) {
+    _decide(entry, { agent, tool, caller }) {
         if (entry && entry.corrupt) {
             return { allow: false, code: 'POLICY_PERSISTENCE_ERROR', status: 500 };
         }
+        // The captured production gates come before every persisted entry: an
+        // `authenticated` entry never re-enables a gated tool, and an
+        // unavailable capture is PROD true for every tool (fail closed).
+        const prodDecision = this._prodDecision(agent, tool);
+        if (prodDecision) return prodDecision;
         if (!entry || entry.enabled === false) {
             return { allow: false, code: 'AGENT_POLICY_DENIED', status: 403 };
         }
@@ -168,6 +183,18 @@ export class McpToolPolicy {
             return { allow: false, code: 'AGENT_POLICY_DENIED', status: 403 };
         }
         return { allow: false, code: 'AUTH_REQUIRED', status: 401 };
+    }
+
+    _prodDecision(agent, tool) {
+        if (!this._readProdGates) return null;
+        const captured = this._readProdGates();
+        if (!captured || captured.unavailable) {
+            return { allow: false, code: 'PROD_POLICY_UNAVAILABLE', status: 503 };
+        }
+        const gated = captured.prod
+            && Object.hasOwn(captured.routes || {}, String(agent))
+            && captured.routes[String(agent)].tools.includes(String(tool));
+        return gated ? { allow: false, code: 'PROD_DISABLED', status: 403 } : null;
     }
 
     // Decide whether `caller` may read/list MCP resources. Resources are not in

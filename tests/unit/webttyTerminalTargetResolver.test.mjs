@@ -101,6 +101,9 @@ function resolver(root, inspectContainer, options = {}) {
         directoryResolver: (requested) => resolveWorkspaceDirectory(requested, { workspaceRoot: root }),
         inspectContainer,
         workspaceIdentity: () => ({ hash: WORKSPACE_HASH, canonical: root }),
+        // These cases are about target resolution, not production gating: the
+        // captured PROD is injected as false (an absent capture is PROD true).
+        readProd: () => false,
         ...options,
     });
 }
@@ -979,4 +982,49 @@ test('create-time revalidation repeats the profile HOME identity and translation
             (error) => error.code === 'WEBTTY_TARGET_STALE',
         );
     }
+});
+
+test('under the captured PROD the Box target is refused at launch revalidation and in session checks; agent targets are unaffected', async (t) => {
+    const { root } = fixture(t);
+    const record = agentRecord();
+    let prod = false;
+    const targetResolver = resolver(root, async () => inspectedAgent(root, CONTAINER_NAME, record), { readProd: () => prod });
+    const plan = routePlan({ [CONTAINER_NAME]: record });
+    const discovery = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    const [box, agent] = discovery.targets;
+    assert.equal(box.kind, 'box');
+    assert.equal(agent.kind, 'agent');
+    // Without PROD both revalidate.
+    assert.equal((await targetResolver.revalidate({ routePlan: plan, target: box })).kind, 'box');
+    assert.equal((await targetResolver.revalidate({ routePlan: plan, target: agent })).kind, 'agent');
+    // Under PROD only the Box is refused, with its own code.
+    prod = true;
+    await assert.rejects(
+        targetResolver.revalidate({ routePlan: plan, target: box }),
+        (error) => error.code === 'WEBTTY_TARGET_PROD_DISABLED',
+    );
+    assert.equal((await targetResolver.revalidate({ routePlan: plan, target: agent })).kind, 'agent');
+    // Discovery still returns the launch-record shape (Box first); the refusal is at launch.
+    const underProd = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    assert.deepEqual(underProd.targets.map((target) => target.kind), ['box', 'agent']);
+    // Back to PROD false: the same Box target is accepted again.
+    prod = false;
+    assert.equal((await targetResolver.revalidate({ routePlan: plan, target: box })).kind, 'box');
+});
+
+test('the default production reader is the captured file and an unavailable capture refuses the Box target', async (t) => {
+    const { root } = fixture(t);
+    const targetResolver = new TerminalTargetResolver({
+        workspaceRoot: root,
+        inspectContainer: async () => null,
+        workspaceIdentity: () => ({ hash: WORKSPACE_HASH, canonical: root }),
+    });
+    const plan = routePlan({});
+    const discovery = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    const [box] = discovery.targets;
+    // No capture exists in this process's workspace: PROD true, fail closed.
+    await assert.rejects(
+        targetResolver.revalidate({ routePlan: plan, target: box }),
+        (error) => error.code === 'WEBTTY_TARGET_PROD_DISABLED',
+    );
 });

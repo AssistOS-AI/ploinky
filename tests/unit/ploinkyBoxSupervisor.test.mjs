@@ -2278,3 +2278,86 @@ for (const running of [true, false]) {
         assert.equal(fs.readFileSync(layout, 'utf8'), '{"version":2}');
     });
 }
+
+// The host asks a running, initialized Box for the inspect-only PROD/profile
+// assertion before it touches the Box (ahead of the hardware transitions); the
+// in-Box start and restart repeat the check before their own first mutation.
+function prodAssertSupervisor(t, { running = true, initialized = true, assertFails = false } = {}) {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity, { running });
+    ownership.handles.container.labels[BOX_LABELS.routerHostPort] = '8080';
+    ownership.handles.container.labels[BOX_LABELS.mediaHostPort] = '7882';
+    const events = [];
+    const coreCalls = [];
+    const supervisor = createBoxSupervisor({
+        hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
+        env: {},
+        platform: 'linux',
+        resolveIdentity: () => identity,
+        launchCwd: identity.workspaceRoot,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: {
+            run(_command, args) { events.push(`run:${args.join(' ')}`); },
+            query: () => ({ ok: true, status: 0, stdout: JSON.stringify({ state: 'running', initialized, routingConfigured: true, trackedAgents: 1, runningAgents: 1, warnings: [] }) }),
+        },
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        inspectBoxData: () => ({ fingerprints: {} }),
+        revalidateAgentLibSource: () => {},
+        resolveHostReachableIpv4: async () => '192.168.1.12',
+        captureCoreStartArgv: () => Object.freeze(['start', 'explorer', '8080']),
+        runCoreCommand: async (_engine, containerId, argv, hostPort, mediaHostPort) => {
+            coreCalls.push({ containerId, argv: [...argv], hostPort, mediaHostPort });
+            events.push(`core:${argv.join(' ')}`);
+            if (assertFails) throw new Error('In-box profile failed with status 1');
+        },
+        // Reached only after the assertion and the hardware transitions: the sentinel ends the transaction.
+        selectAgentLib: async () => { events.push('select-agentlib'); throw new Error('sentinel: past the profile assertion'); },
+    });
+    return { supervisor, events, coreCalls, ownership };
+}
+
+for (const [label, invoke, expectedProfile] of [
+    ['start', (supervisor) => supervisor.runStartTransaction(['start', 'explorer', '8080', '--profile', 'PROD']), ['--profile', 'prod']],
+    ['start without --profile', (supervisor) => supervisor.runStartTransaction(['start', 'explorer', '8080']), []],
+    ['start with --profile=', (supervisor) => supervisor.runStartTransaction(['start', 'explorer', '--profile=qa']), ['--profile', 'qa']],
+    ['restart', (supervisor) => supervisor.runRestartTransaction(['restart']), []],
+]) {
+    test(`the host asks a running initialized Box for profile assert before ${label} touches it`, async (t) => {
+        const { supervisor, events, coreCalls, ownership } = prodAssertSupervisor(t);
+        await assert.rejects(() => invoke(supervisor), /sentinel: past the profile assertion/);
+        assert.equal(coreCalls.length, 1, events.join(' | '));
+        assert.deepEqual(coreCalls[0].argv.slice(0, 2 + expectedProfile.length), ['profile', 'assert', ...expectedProfile]);
+        if (label.startsWith('start')) {
+            assert.equal(coreCalls[0].argv[2 + expectedProfile.length], '--start-args');
+            assert.equal(JSON.parse(coreCalls[0].argv[3 + expectedProfile.length])[0], 'explorer');
+        }
+        assert.equal(coreCalls[0].containerId, ownership.handles.container.id);
+        assert.equal(coreCalls[0].hostPort, 8080);
+        assert.equal(coreCalls[0].mediaHostPort, 7882);
+        assert.ok(events.findIndex((event) => event.startsWith('core:profile assert')) < events.indexOf('select-agentlib'));
+    });
+}
+
+test('a refused profile assertion stops the transaction before any hardware transition or AgentLib selection', async (t) => {
+    for (const invoke of [
+        (supervisor) => supervisor.runStartTransaction(['start', 'explorer', '--profile', 'qa']),
+        (supervisor) => supervisor.runRestartTransaction(['restart']),
+    ]) {
+        const { supervisor, events, coreCalls } = prodAssertSupervisor(t, { assertFails: true });
+        await assert.rejects(() => invoke(supervisor), /In-box profile failed with status 1/);
+        assert.equal(coreCalls.length, 1);
+        assert.equal(events.includes('select-agentlib'), false, events.join(' | '));
+    }
+});
+
+test('a stopped or uninitialized Box is not asked for the profile assertion', async (t) => {
+    for (const options of [{ running: false }, { initialized: false }]) {
+        const { supervisor, coreCalls } = prodAssertSupervisor(t, options);
+        await assert.rejects(() => supervisor.runRestartTransaction(['restart']), /sentinel: past the profile assertion/);
+        assert.deepEqual(coreCalls, [], JSON.stringify(options));
+    }
+});
