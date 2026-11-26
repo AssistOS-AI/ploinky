@@ -17,15 +17,13 @@ import { AGENT_PORT_ROUTE, parseAgentPortSelector } from '../server/agentPortCon
 //   robots   {}                                       -> {robots: [{id, name, default}]}
 //   agents   {robot}                                  -> {robot: {id, name}, active, codingAgents: [name]}
 //   history  {robot, codingAgent, directory}          -> {sessions: [{id, title, createdAt, updatedAt}]}
-//   launch   {robot, codingAgent, directory, resume, role?, skill?}
+//   launch   {robot, codingAgent, directory, resume, systemPrompt?, skill?}
 //                                                     -> {profile, robot: {id, name}, codingAgent, nativeSessionId, skill}
 // `robot` is an id, a name or null for the default robot; `directory` is the
 // workspace-relative folder, '' for the root; `resume` is a native session id
-// or null. `role` names the part a terminal plays and `skill` ships the
-// instructions it should start with, as `{name, text}`; a provider that installs
-// them where the chosen coding agent discovers its own skills answers `skill:
-// true`, and the caller then opens the terminal without a protocol prompt. Both
-// keys are optional, and a provider that ignores them answers without `skill`. `launch` answers a WebTTY home profile of the same agent, which
+// or null. `systemPrompt` configures native instructions without submitting a user turn.
+// `skill` optionally ships a named skill; the provider reports whether it installed it.
+// `launch` answers a WebTTY home profile of the same agent, which
 // Ploinky opens in that folder. A refusal is a non-2xx answer whose `error` the
 // user sees.
 

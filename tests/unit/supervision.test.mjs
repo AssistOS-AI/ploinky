@@ -1,3 +1,4 @@
+import { supervisionSystemPrompt } from '../../cli/utils/supervisionRoles.mjs';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
@@ -6,6 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { runCodingSessionsCommand } from '../../cli/commands/codingSessionsCommand.js';
+import { createSupervisedScreen } from '../../cli/commands/supervisedSessionsScreen.js';
 import { ListMenu, parseKeys, renderMenu } from '../../cli/utils/codingSessionsMenu.mjs';
 import {
     emptyStore, findSession, MAX_SUPERVISED_SESSIONS, readStore, removeSession, sanitizeStore, storePath,
@@ -17,7 +19,7 @@ import {
     relativeAge, rolesToKill, runningTerminals, supervisionTabs,
 } from '../../cli/utils/supervisionFlow.mjs';
 import {
-    supervisionIntro, supervisionRoleText, supervisionSkillIntro, SUPERVISION_SKILL_NAME, taskDelivery,
+    supervisionRoleText, taskDelivery,
 } from '../../cli/utils/supervisionRoles.mjs';
 import {
     parseTaskRevision, prepareSupervisedFolder, readTaskRevision, supervisedPaths, SUPERVISED_DIRECTORY,
@@ -51,22 +53,23 @@ test('the role instructions ship with the command and name the two files', () =>
     assert.match(worker, /rev:/u);
     assert.match(worker, /Never write to `tasks\.md`/u);
     assert.throws(() => supervisionRoleText('reviewer'), /Unknown supervision role/u);
-    assert.match(supervisionIntro('supervisor', { folder: '/work', peerAgent: 'codex' }), /Read \.\/\.supervised\/supervisor\.md now/u);
-    assert.match(supervisionIntro('worker', { folder: '/work', peerAgent: 'claude' }), /wait for a \[supervisor\] rev N prompt/u);
     assert.match(taskDelivery(3), /rev 3: read \.\/tasks\.md/u);
 });
 
-test('a session folder gets its generated role files and never its task files', (t) => {
+test('a session folder gets managed role skills and preserves its task files', (t) => {
     const folder = scratch(t);
     const paths = supervisedPaths(folder);
     assert.equal(paths.directory, path.join(folder, SUPERVISED_DIRECTORY));
     prepareSupervisedFolder(folder);
-    assert.deepEqual(fs.readdirSync(paths.directory).sort(), ['supervisor.md', 'worker.md']);
+    assert.deepEqual(fs.readdirSync(paths.directory).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
     // A second start refreshes the generated text and keeps the task files.
     fs.writeFileSync(paths.tasks, 'rev: 1\ngoal: x\n');
     prepareSupervisedFolder(folder);
-    assert.deepEqual(fs.readdirSync(paths.directory).sort(), ['supervisor.md', 'worker.md']);
-    assert.equal(fs.statSync(paths.directory).mode & 0o777, 0o755);
+    assert.deepEqual(fs.readdirSync(paths.directory).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
+    assert.ok(fs.lstatSync(path.dirname(paths.supervisor)).isSymbolicLink());
+    assert.ok(fs.realpathSync(paths.supervisor).startsWith(folder + path.sep));
+    assert.equal(fs.readFileSync(paths.tasks, 'utf8'), 'rev: 1\ngoal: x\n');
+    assert.equal(fs.existsSync(path.join(folder, '.supervised')), false);
     assert.equal(fs.statSync(paths.supervisor).mode & 0o777, 0o644);
 });
 
@@ -156,7 +159,7 @@ function fakeApi(calls = [], answers = {}) {
     };
 }
 
-test('both terminals start in the folder, each role is briefed, and a failure closes what it opened', async (t) => {
+test('both terminals start in the folder, no prompt is submitted, and a failure closes what it opened', async (t) => {
     const folder = scratch(t);
     const calls = [];
     const inputs = [];
@@ -168,22 +171,17 @@ test('both terminals start in the folder, each role is briefed, and a failure cl
         openTerminal: async (launched) => { opened.push(launched.profile); return { sessionId: `terminal-${opened.length}`.padEnd(32, 'p'), viewId: 'v'.repeat(32) }; },
         supervisor: { robotId: 'ana-1', robotName: 'Ana', codingAgent: 'claude' },
         worker: { robotId: 'bob-1', robotName: 'Bob', codingAgent: 'codex' },
-        settle: async () => {}, settleMs: 0, now: () => 5_000,
+        now: () => 5_000,
     });
     assert.deepEqual(opened, ['ana-1.default.claude', 'bob-1.default.codex']);
     assert.deepEqual(calls.map(call => call[1].resume), [null, null]);
-    // Each launch carries its role and the instructions the agent should start with.
-    assert.deepEqual(calls.map(call => call[1].role), ['supervisor', 'worker']);
-    assert.deepEqual(calls.map(call => call[1].skill.name), [`${SUPERVISION_SKILL_NAME}-supervisor`, `${SUPERVISION_SKILL_NAME}-worker`]);
-    assert.match(calls[0][1].skill.text, /^# Supervisor of a supervised coding session/mu);
-    assert.match(calls[1][1].skill.text, /^# Worker of a supervised coding session/mu);
+    // Each launch names its role; instructions are workspace skills.
+    assert.deepEqual(calls.map(call => call[1].systemPrompt), ['supervisor', 'worker'].map(supervisionSystemPrompt));
+    assert.ok(calls.every(([, body]) => !('skill' in body)), 'skills are installed in cwd, never in robot homes');
     assert.equal(pair.supervisor.codingAgent, 'claude');
     assert.equal(pair.worker.nativeSessionId, 'native-launch-2');
-    assert.deepEqual(fs.readdirSync(path.join(folder, SUPERVISED_DIRECTORY)).sort(), ['supervisor.md', 'worker.md']);
-    assert.equal(inputs.length, 2);
-    assert.match(inputs[0][2].data, /^You are the supervisor of a supervised coding session/u);
-    assert.match(inputs[1][2].data, /^You are the worker of a supervised coding session/u);
-    assert.ok(inputs[1][2].data.endsWith('\r'));
+    assert.deepEqual(fs.readdirSync(path.join(folder, SUPERVISED_DIRECTORY)).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
+    assert.deepEqual(inputs, [], 'opening the pair does not submit a model request');
 
     const deleted = [];
     await assert.rejects(createSupervisedPair({
@@ -193,21 +191,21 @@ test('both terminals start in the folder, each role is briefed, and a failure cl
         openTerminal: async () => ({ sessionId: 'o'.repeat(32), viewId: 'v'.repeat(32) }),
         directory: 'project', folder: scratch(t),
         supervisor: { robotId: 'ana-1', codingAgent: 'claude' }, worker: { robotId: 'bob-1', codingAgent: 'codex' },
-        settle: async () => {},
     }), /no worker robot/u);
     assert.deepEqual(deleted, [['DELETE', `/webtty/sessions/${'o'.repeat(32)}`]]);
 });
 
-test('attaching a role resumes its native conversation when its terminal is gone', async () => {
+test('attaching a role resumes its native conversation when its terminal is gone', async (t) => {
+    const folder = scratch(t);
     const calls = [];
     const api = fakeApi(calls, { launch: { ok: true, profile: 'bob-1.default.codex.r-native-2', nativeSessionId: 'native-2' } });
     const resumed = await attachRole({
         client: { json: async () => ({ ok: true }) }, api,
         attachTerminal: async () => { throw new Error('attaching to an ended terminal'); },
         openTerminal: async launched => ({ sessionId: 'new'.padEnd(32, 'n'), viewId: 'v'.repeat(32), profile: launched.profile }),
-        session: record(), role: 'worker', directory: 'project', output: {}, live: [],
+        session: record({ folder }), role: 'worker', directory: 'project', output: {}, live: [],
     });
-    assert.deepEqual(calls[0], ['launch', { robot: 'bob-1', codingAgent: 'codex', directory: 'project', resume: 'native-2' }]);
+    assert.deepEqual(calls[0], ['launch', { robot: 'bob-1', codingAgent: 'codex', directory: 'project', resume: 'native-2', systemPrompt: supervisionSystemPrompt('worker') }]);
     assert.equal(resumed.record.terminalId, 'new'.padEnd(32, 'n'));
     assert.equal(resumed.record.nativeSessionId, 'native-2');
 
@@ -215,10 +213,19 @@ test('attaching a role resumes its native conversation when its terminal is gone
         client: { json: async () => ({ ok: true }) }, api,
         attachTerminal: async (client, row) => ({ sessionId: row.id, viewId: 'v'.repeat(32) }),
         openTerminal: async () => { throw new Error('a running terminal is attached, not opened'); },
-        session: record(), role: 'supervisor', directory: 'project', output: {},
+        session: record({ folder }), role: 'supervisor', directory: 'project', output: {},
         live: [{ id: 's'.repeat(32), source: 'webtty', status: 'detached' }],
     });
     assert.equal(attached.terminal.sessionId, 's'.repeat(32));
+
+    const inputRequests = [];
+    await attachRole({
+        client: { json: async (...args) => inputRequests.push(args) }, api,
+        openTerminal: async () => ({ sessionId: 'fresh-terminal', viewId: 'view' }),
+        session: record({ folder, worker: { ...record().worker, nativeSessionId: null } }),
+        role: 'worker', directory: 'project', output: {}, live: [],
+    });
+    assert.deepEqual(inputRequests, [], 'a fresh replacement without native history also receives no prompt');
 });
 
 test('killing a role ends its terminal and tolerates one that is already gone', async () => {
@@ -394,7 +401,6 @@ test('a supervised session is created, switched with Ctrl+\\, killed and left wi
         input: tty, output: tty, errorOutput: { write: text => errors.push(text) },
         routerPort: 8080, mintSessionToken: () => 'jwt', now: () => 10_000,
         createClient: () => client, createMenu: menu.factory,
-        settleSupervision: async () => {}, supervisionSettleMs: 0,
         createCourier: options => { const entry = { options, started: false, stopped: false,
             start() { this.started = true; }, stop() { this.stopped = true; }, status: () => '' }; couriers.push(entry); return entry; },
         createRelay: options => ({ run: async () => { relays.push(options); return { reason: relayReasons.shift() || 'detached' }; } }),
@@ -404,13 +410,11 @@ test('a supervised session is created, switched with Ctrl+\\, killed and left wi
     const launches = calls.filter(call => call[1] === `${API}/launch`).map(call => call[2]);
     assert.deepEqual(launches.map(call => [call.codingAgent, call.resume, call.directory]),
         [['claude', null, 'project'], ['claude', null, 'project']]);
-    // The role instructions landed in the folder before the terminals were briefed.
+    // The role instructions landed in the folder before the terminals started.
     const folder = path.join(root, 'project', SUPERVISED_DIRECTORY);
-    assert.deepEqual(fs.readdirSync(folder).sort(), ['supervisor.md', 'worker.md']);
+    assert.deepEqual(fs.readdirSync(folder).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
     const briefings = calls.filter(call => call[1].endsWith('/input'));
-    assert.equal(briefings.length, 2);
-    assert.match(briefings[0][2].data, /You are the supervisor/u);
-    assert.match(briefings[1][2].data, /You are the worker/u);
+    assert.deepEqual(briefings, []);
     // The pair was recorded, and one courier supervises the worker terminal.
     const stored = readStore(storePath(root));
     assert.equal(stored.sessions.length, 1);
@@ -457,7 +461,7 @@ test('Shift+Tab and the horizontal arrows both move between the two menus', asyn
     assert.deepEqual(await choice, { action: 'quit', index: 0 });
 });
 
-test('a provider that installs the role skill briefs the terminal without the protocol', async (t) => {
+test('workspace role skills are used regardless of provider home-skill support', async (t) => {
     const folder = scratch(t);
     const calls = [];
     const inputs = [];
@@ -472,19 +476,12 @@ test('a provider that installs the role skill briefs the terminal without the pr
         openTerminal: async () => ({ sessionId: 's'.repeat(32), viewId: 'v'.repeat(32) }),
         supervisor: { robotId: 'ana-1', codingAgent: 'claude' },
         worker: { robotId: 'bob-1', codingAgent: 'claude' },
-        settle: async () => {}, settleMs: 0,
     });
     assert.equal(pair.supervisor.terminalId, 's'.repeat(32));
-    // The role skill travels with the launch, and nothing is left in the folder.
-    assert.deepEqual(fs.readdirSync(path.join(folder, SUPERVISED_DIRECTORY)), []);
-    assert.equal(inputs.length, 2);
-    assert.equal(inputs[0][2].data, `${supervisionSkillIntro('supervisor', { folder,
-        peerAgent: 'claude' })}\r`);
-    assert.match(inputs[0][2].data, /^You are the supervisor of a supervised coding session in /u);
-    assert.match(inputs[0][2].data, new RegExp(`Follow the ${SUPERVISION_SKILL_NAME}-supervisor skill`, 'u'));
-    assert.doesNotMatch(inputs[0][2].data, /Read \.\/\.supervised\/supervisor\.md/u);
-    assert.match(inputs[1][2].data, /You write \.\/results\.md and read \.\/tasks\.md/u);
-    // A provider that refuses the skill keeps the full briefing and the role file.
+    // Both workspace skills are installed regardless of provider capabilities.
+    assert.deepEqual(fs.readdirSync(path.join(folder, SUPERVISED_DIRECTORY)).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
+    assert.deepEqual(inputs, []);
+    // A provider without home-skill support receives the same workspace skill paths.
     const mixedFolder = scratch(t);
     const mixed = [];
     await createSupervisedPair({
@@ -494,9 +491,8 @@ test('a provider that installs the role skill briefs the terminal without the pr
         openTerminal: async () => ({ sessionId: 'x'.repeat(32), viewId: 'v'.repeat(32) }),
         supervisor: { robotId: 'ana-1', codingAgent: 'claude' },
         worker: { robotId: 'bob-1', codingAgent: 'codex' },
-        settle: async () => {}, settleMs: 0,
     });
-    assert.deepEqual(fs.readdirSync(path.join(mixedFolder, SUPERVISED_DIRECTORY)), ['worker.md']);
+    assert.deepEqual(fs.readdirSync(path.join(mixedFolder, SUPERVISED_DIRECTORY)), ['supervised-session-supervisor', 'supervised-session-worker']);
 });
 
 test('only a supervised view silences mouse and focus reports; other views are unchanged', () => {
@@ -523,4 +519,87 @@ test('only a supervised view silences mouse and focus reports; other views are u
     assert.equal(filter('\x1b[?2004h'), '\x1b[?2004h');
     assert.equal(filter('\x1b[?1000$p'), '\x1b[?1000$p');
     assert.equal(filter('\x1b[?1004l'), '\x1b[?1004l');
+});
+
+test('new pair conflicts and launch failures never restart the robot selection wizard', async t => {
+    const folder = scratch(t);
+    const file = path.join(folder, 'pairs.json');
+    const existing = record({ folder });
+    writeStore(file, upsertSession(emptyStore(), existing));
+    let live = [{ id: existing.supervisor.terminalId, source: 'webtty', status: 'detached' }];
+    let action = 'new';
+    let failLaunch = false;
+    const requests = [];
+    const views = [];
+    const draft = { supervisor: { robotId: 'robot-a', robotName: 'A', codingAgent: 'claude' },
+        worker: { robotId: 'robot-b', robotName: 'B', codingAgent: 'claude' } };
+    const state = { level: 'pairs', status: '', draft, remembered: { pairs: 0, roles: 0 } };
+    const screen = createSupervisedScreen({
+        folderPath: folder, folder, directory: '', storeFile: () => file, now: () => 1000,
+        labels: { supervisor: 'Supervisor', worker: 'Worker' },
+        menu: { busy: async (_, op) => op(), select: async view => { views.push(view); return { action, index: 0 }; } },
+        client: { json: async () => ({ sessions: live }) },
+        api: async route => {
+            requests.push(route);
+            if (route === 'launch' && failLaunch) throw new Error('Provider is not ready');
+            return { codingAgents: ['claude'], active: 'claude' };
+        },
+        createCourier: () => ({ start() {}, stop() {} }),
+    });
+    t.after(() => screen.stop());
+    await screen.screen(state);
+    assert.equal(state.level, 'pair');
+    assert.equal(state.supervised, existing.id);
+    assert.match(state.status, /still running/);
+    assert.deepEqual(requests, [], 'a detached existing process is detected before robot selection');
+
+    state.level = 'worker-agent';
+    action = 'enter';
+    await screen.screen(state);
+    assert.equal(state.level, 'pair', 'a pair started during selection also opens the existing pair');
+    assert.equal(requests.includes('launch'), false);
+
+    live = [];
+    state.level = 'worker-agent';
+    state.status = '';
+    failLaunch = true;
+    await screen.screen(state);
+    assert.equal(state.level, 'worker-agent');
+    assert.equal(state.draft, draft, 'the selected robots and agents survive a launch failure');
+    assert.match(state.status, /Provider is not ready/);
+    action = 'quit';
+    await screen.screen(state);
+    assert.ok(views.at(-1).title.some(line => line.includes('Provider is not ready')));
+
+    state.level = 'pairs';
+    action = 'refresh';
+    await screen.screen(state);
+    assert.equal(state.level, 'pairs', 'refresh on New must not open the wizard');
+});
+
+test('supervision skills use managed exports and preserve unrelated or conflicting local skills', t => {
+    const folder = scratch(t);
+    const skills = path.join(folder, '.agents', 'skills');
+    const local = path.join(skills, 'my-local-skill');
+    fs.mkdirSync(local, { recursive: true });
+    fs.writeFileSync(path.join(local, 'SKILL.md'), '# Local instructions\n');
+    const paths = prepareSupervisedFolder(folder);
+    const ledger = JSON.parse(fs.readFileSync(path.join(folder, '.agents', '.ploinky-skill-exports.json'), 'utf8'));
+    for (const role of ['supervisor', 'worker']) {
+        const name = `supervised-session-${role}`;
+        assert.equal(ledger.entries[name].owner, 'builtin:supervised-sessions');
+        assert.ok(fs.lstatSync(path.dirname(paths[role])).isSymbolicLink());
+        assert.match(fs.readFileSync(paths[role], 'utf8'), new RegExp(`^---\\nname: ${name}\\ndescription: `));
+    }
+    assert.equal(fs.readFileSync(path.join(local, 'SKILL.md'), 'utf8'), '# Local instructions\n');
+    assert.equal(fs.realpathSync(path.join(folder, '.claude', 'skills')), fs.realpathSync(skills));
+    assert.equal(fs.existsSync(paths.tasks), false);
+    assert.equal(fs.existsSync(paths.results), false);
+
+    const conflicting = scratch(t);
+    const custom = path.join(conflicting, '.agents', 'skills', 'supervised-session-supervisor');
+    fs.mkdirSync(custom, { recursive: true });
+    fs.writeFileSync(path.join(custom, 'SKILL.md'), '# My supervisor\n');
+    assert.throws(() => prepareSupervisedFolder(conflicting), /unrecorded-output-preserved/);
+    assert.equal(fs.readFileSync(path.join(custom, 'SKILL.md'), 'utf8'), '# My supervisor\n');
 });

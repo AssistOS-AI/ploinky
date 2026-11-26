@@ -21,7 +21,7 @@ export function createSupervisedScreen({
     menu, client, api, directory, folder, folderPath,
     openTerminal, attachTerminal, createRelay, createCourier,
     input, output, errorOutput, storeFile, now,
-    settle, settleMs, refreshMs,
+    refreshMs,
     labels = SUPERVISION_ROLE_LABELS,
 }) {
     const couriers = new Map();
@@ -108,13 +108,26 @@ export function createSupervisedScreen({
         }
     }
 
+    function showExistingPair(state, sessions, live) {
+        const existing = sessions.find(session => session.folder === folderPath
+            && (findLiveRow(live, session.worker.terminalId) || findLiveRow(live, session.supervisor.terminalId)));
+        if (!existing) return false;
+        state.supervised = existing.id;
+        state.remembered.roles = 0;
+        state.level = 'pair';
+        state.status = 'A pair is still running here. Stop its running roles with k before creating another.';
+        return true;
+    }
+
     async function pairsScreen(state, { tabs, status }) {
         const header = { title: [`Supervised sessions — ${folder}`, 'Choose a session'], ...tabs };
         let items;
+        let live;
         try {
             items = await menu.busy(header, async () => {
                 sync();
-                return pairItems({ sessions: read().sessions.filter(session => session.folder === folderPath), live: await runningTerminals(client), now: now() });
+                live = await runningTerminals(client);
+                return pairItems({ sessions: read().sessions.filter(session => session.folder === folderPath), live, now: now() });
             });
         } catch (error) {
             throw new Error(failure(error));
@@ -126,6 +139,7 @@ export function createSupervisedScreen({
         state.status = '';
         if (choice.action === 'tab') return { mode: 'coding' };
         if (choice.action === 'quit') return { quit: true };
+        if (choice.action === 'refresh') return {};
         const item = items[choice.index];
         if (choice.action === 'delete') {
             if (item?.kind !== 'pair') { state.status = 'Only a saved session can be forgotten.'; return {}; }
@@ -137,6 +151,7 @@ export function createSupervisedScreen({
             return {};
         }
         if (choice.action === 'new' || item?.kind !== 'pair') {
+            if (showExistingPair(state, read().sessions, live)) return {};
             state.draft = { supervisor: {}, worker: {} };
             state.level = nextLevel('supervisor', 'robot');
             return {};
@@ -179,7 +194,7 @@ export function createSupervisedScreen({
 
     async function agentScreen(state, role, { tabs, status }) {
         const header = { ...tabs, title: [`Supervised sessions — ${folder}`,
-            `${labels[role]} robot ${state.draft[role].robotName} › choose a coding agent`] };
+            `${labels[role]} robot ${state.draft[role].robotName} › choose a coding agent`, ...(status ? [status] : [])] };
         let listed;
         try { listed = await menu.busy(header, () => api('agents', { robot: state.draft[role].robotId })); }
         catch (error) { state.status = failure(error); state.level = nextLevel(role, 'robot'); return {}; }
@@ -204,21 +219,18 @@ export function createSupervisedScreen({
         let record;
         try {
             const live = await runningTerminals(client);
-            if (read().sessions.some(session => session.folder === folderPath
-                && (findLiveRow(live, session.worker.terminalId) || findLiveRow(live, session.supervisor.terminalId)))) {
-                throw new Error('A supervised pair is already running in this folder. Open it or stop it first.');
-            }
+            if (showExistingPair(state, read().sessions, live)) return {};
             mutate(store => ({ ...store, sessions: store.sessions.map(session => session.folder === folderPath
                 ? { ...session, phase: 'ended' } : session) }));
             sync();
             record = await menu.busy({ ...header, status: 'Starting both sessions…' }, () => createSupervisedPair({
                 api, client, openTerminal, directory, folder: folderPath,
                 supervisor: state.draft.supervisor, worker: state.draft.worker,
-                settle, settleMs, now,
+                now,
             }));
         } catch (error) {
-            state.status = `${failure(error)} Both terminals were closed again.`;
-            state.level = nextLevel('supervisor', 'robot');
+            state.status = `Could not start the pair: ${failure(error)}`;
+            state.level = nextLevel('worker', 'agent');
             return {};
         }
         mutate(store => upsertSession(store, record));
@@ -240,7 +252,7 @@ export function createSupervisedScreen({
     async function pairScreen(state, { tabs, status }) {
         const record = findSession(read(), state.supervised);
         if (!record) { state.level = ENTRY_LEVEL; state.status = 'That session is no longer saved.'; return {}; }
-        const header = { ...tabs, title: [`Supervised sessions — ${folder}`, `${record.label || record.folder} › choose a session`] };
+        const header = { ...tabs, title: [`Supervised sessions — ${folder}`, `${record.label || record.folder} › choose a session`, ...(status ? [status] : [])] };
         const load = async () => ({
             items: pairRoleItems(record, await runningTerminals(client), now()),
             status: [state.status, courierStatus.get(record.id) || ''].filter(Boolean).join(' · '),

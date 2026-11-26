@@ -93,6 +93,7 @@ test('a session profile names the robot, the coding agent and the native convers
     assert.deepEqual(parseSessionProfile('ana-1.default.codex'), { robotId: 'ana-1', codingAgent: 'codex', nativeSessionId: null });
     assert.deepEqual(parseSessionProfile('ana-1.default.claude.n-abc-1'), { robotId: 'ana-1', codingAgent: 'claude', nativeSessionId: 'abc-1' });
     assert.deepEqual(parseSessionProfile('ana-1.default.opencode.r-ses_1'), { robotId: 'ana-1', codingAgent: 'opencode', nativeSessionId: 'ses_1' });
+    assert.deepEqual(parseSessionProfile('ana-1.default.codex.p-launch-1'), { robotId: 'ana-1', codingAgent: 'codex', nativeSessionId: null });
     for (const value of [null, 'ana-1.default', 'ana-1.default.codex.x-1', 'a.b.c.r-1.e']) assert.equal(parseSessionProfile(value), null);
 });
 

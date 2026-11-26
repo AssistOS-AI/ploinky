@@ -1,18 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { SUPERVISION_ROLES, supervisionRoleText } from './supervisionRoles.mjs';
+import { installSupervisionSkills } from './supervisionSkills.mjs';
 
-// The two agents share a folder, so the task files and the role instructions
-// live in one hidden directory inside it. `.ploinky` is masked from a terminal
-// sandbox, and `.roboteam` is masked inside the working folder, so neither can
-// carry them.
-export const SUPERVISED_DIRECTORY = '.supervised';
+// Role skills live under .agents/skills; tasks.md and results.md stay in the working folder.
+export const SUPERVISED_DIRECTORY = '.agents/skills';
 export const SUPERVISION_FILES = Object.freeze({
     tasks: 'tasks.md',
     results: 'results.md',
-    supervisor: 'supervisor.md',
-    worker: 'worker.md',
 });
 const REVISION = /^rev:[ \t]*(\d{1,9})[ \t]*$/mu;
 
@@ -22,27 +17,15 @@ export function supervisedPaths(folder) {
         directory,
         tasks: path.join(folder, SUPERVISION_FILES.tasks),
         results: path.join(folder, SUPERVISION_FILES.results),
-        supervisor: path.join(directory, SUPERVISION_FILES.supervisor),
-        worker: path.join(directory, SUPERVISION_FILES.worker),
+        supervisor: path.join(directory, 'supervised-session-supervisor', 'SKILL.md'),
+        worker: path.join(directory, 'supervised-session-worker', 'SKILL.md'),
     });
 }
 
-// The role files are generated from this command, so a stale copy is replaced
-// on every session start; the task files are never created or touched here.
-// They stay world readable: a terminal runs as its own container user, which may
-// not be the user that runs this command.
-// `roles` names the roles whose instructions this folder still has to carry: an
-// agent whose CLI reads the role as a skill needs no file here.
-export function prepareSupervisedFolder(folder, {
-    roles = SUPERVISION_ROLES,
-    roleText = supervisionRoleText,
-    write = (file, value) => fs.writeFileSync(file, value, { mode: 0o644 }),
-    mkdir = (directory, options) => fs.mkdirSync(directory, options),
-} = {}) {
-    const paths = supervisedPaths(folder);
-    mkdir(paths.directory, { recursive: true, mode: 0o755 });
-    for (const role of roles) write(paths[role], roleText(role));
-    return paths;
+// Use the same transaction and ownership rules as other Ploinky skill exports.
+export function prepareSupervisedFolder(folder) {
+    installSupervisionSkills(folder);
+    return supervisedPaths(folder);
 }
 
 export function parseTaskRevision(text) {

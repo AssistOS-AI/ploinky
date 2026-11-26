@@ -1,7 +1,6 @@
 import { newSessionId } from './supervisedSessions.mjs';
 import {
-    SUPERVISION_ROLE_LABELS, SUPERVISION_ROLES, SUPERVISION_SKILL_NAME, supervisionIntro, supervisionRoleText,
-    supervisionSkillIntro,
+    SUPERVISION_ROLE_LABELS, SUPERVISION_ROLES, supervisionSystemPrompt,
 } from './supervisionRoles.mjs';
 import { readTaskRevision, prepareSupervisedFolder } from './supervisionWorkspace.mjs';
 
@@ -99,8 +98,7 @@ export function pairRoleItems(session, live = [], now = Date.now()) {
     ];
 }
 
-// Opens both terminals in the chosen folder and starts each role with its own
-// instructions. A half-opened pair is closed again, so a failure never leaves a
+// Installs the role skills and opens both terminals without submitting input. A half-opened pair is closed again, so a failure never leaves a
 // stray terminal behind.
 export async function createSupervisedPair({
     api,
@@ -111,15 +109,10 @@ export async function createSupervisedPair({
     supervisor,
     worker,
     prepareFolder = prepareSupervisedFolder,
-    roleText = supervisionRoleText,
-    intro = supervisionIntro,
-    skillIntro = supervisionSkillIntro,
-    settle = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
-    settleMs = 1_500,
     now = () => Date.now(),
 } = {}) {
     const plans = { supervisor, worker };
-    prepareFolder(folder, { roles: [] });
+    prepareFolder(folder);
     const createdAt = now();
     const record = {
         id: newSessionId(),
@@ -133,24 +126,18 @@ export async function createSupervisedPair({
         worker: {},
     };
     const opened = [];
-    const skilled = {};
     try {
         for (const role of SUPERVISION_ROLES) {
             const plan = plans[role];
-            // The role skill lets an agent whose CLI reads skills start already
-            // knowing its job; a provider that cannot install it says so, and the
-            // briefing below then carries the protocol instead.
             const launched = await api('launch', {
                 robot: plan.robotId,
                 codingAgent: plan.codingAgent,
                 directory,
                 resume: null,
-                role,
-                skill: { name: `${SUPERVISION_SKILL_NAME}-${role}`, text: `---\nname: ${SUPERVISION_SKILL_NAME}-${role}\ndescription: Instructions for the ${role} in an explicitly requested supervised coding session.\n---\n\n${roleText(role)}` },
+                systemPrompt: supervisionSystemPrompt(role),
             });
             const terminal = await openTerminal(launched);
             opened.push(terminal);
-            skilled[role] = launched.skill === true;
             record[role] = {
                 robotId: plan.robotId,
                 robotName: plan.robotName || plan.robotId,
@@ -158,17 +145,6 @@ export async function createSupervisedPair({
                 nativeSessionId: launched.nativeSessionId || null,
                 terminalId: terminal.sessionId,
             };
-        }
-        // The role file is only written for a role whose agent did not take the skill.
-        const fallback = SUPERVISION_ROLES.filter(role => !skilled[role]);
-        if (fallback.length) prepareFolder(folder, { roles: fallback });
-        // A terminal needs a moment before its agent reads typed input.
-        await settle(settleMs);
-        for (const role of SUPERVISION_ROLES) {
-            const peer = role === 'supervisor' ? 'worker' : 'supervisor';
-            const compose = skilled[role] ? skillIntro : intro;
-            const text = compose(role, { folder, peerAgent: plans[peer].codingAgent });
-            await client.json('POST', `/webtty/sessions/${record[role].terminalId}/input`, { data: `${text}\r` });
         }
         return record;
     } catch (error) {
@@ -192,6 +168,7 @@ export async function attachRole({
     output,
     live = [],
 } = {}) {
+    prepareSupervisedFolder(session.folder);
     const record = session[role];
     const row = findLiveRow(live, record.terminalId);
     if (row) return { terminal: await attachTerminal(client, row, { output }), record };
@@ -200,15 +177,9 @@ export async function attachRole({
         codingAgent: record.codingAgent,
         directory,
         resume: record.nativeSessionId || null,
+        systemPrompt: supervisionSystemPrompt(role),
     });
     const terminal = await openTerminal(launched);
-    if (!record.nativeSessionId) {
-        prepareSupervisedFolder(session.folder, { roles: [role] });
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        await client.json('POST', `/webtty/sessions/${terminal.sessionId}/input`, {
-            data: `${supervisionIntro(role, { folder: session.folder })}\r`,
-        });
-    }
     return {
         terminal,
         record: {

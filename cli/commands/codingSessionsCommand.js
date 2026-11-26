@@ -64,14 +64,14 @@ export function describeFailure(error, provider) {
     return error.message;
 }
 
-// `<robot>.<environment>.<coding agent>[.r-<id>|.n-<id>]`: the profile names the
+// `<robot>.<environment>.<coding agent>[.r-<id>|.n-<id>|.p-<launch-id>]`: the profile names the
 // robot, the coding agent and, when known, the native conversation.
 export function parseSessionProfile(profileId) {
     const parts = typeof profileId === 'string' ? profileId.split('.') : [];
     if (parts.length < 3 || parts.length > 4) return null;
-    const conversation = parts[3]?.match(/^[rn]-([A-Za-z0-9_-]+)$/u);
+    const conversation = parts[3]?.match(/^([rnp])-([A-Za-z0-9_-]+)$/u);
     if (parts.length === 4 && !conversation) return null;
-    return { robotId: parts[0], codingAgent: parts[2], nativeSessionId: conversation?.[1] || null };
+    return { robotId: parts[0], codingAgent: parts[2], nativeSessionId: conversation && conversation[1] !== 'p' ? conversation[2] : null };
 }
 
 export function codingSessionApi(client, provider) {
@@ -172,8 +172,6 @@ export async function runCodingSessionsCommand({
     createRelay = options => new TerminalRelay(options),
     createMenu = options => new ListMenu(options),
     createCourier = createSupervisionCourier,
-    settleSupervision = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
-    supervisionSettleMs = 2_000,
     pairRefreshMs = PAIR_REFRESH_MS,
     now = () => Date.now(),
 } = {}) {
@@ -217,8 +215,6 @@ export async function runCodingSessionsCommand({
         errorOutput,
         storeFile: () => storePath(workspaceRoot),
         now,
-        settle: settleSupervision,
-        settleMs: supervisionSettleMs,
         refreshMs: pairRefreshMs,
     });
     const supervisedState = {
