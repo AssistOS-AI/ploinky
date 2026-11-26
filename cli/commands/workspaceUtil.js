@@ -3046,7 +3046,10 @@ export async function restartRouterOnly({ killRouterIfRunning }) {
       throw new Error('restart router: active runtime policy identity is unavailable; run a whole restart first.');
     }
     const active = loadActiveEdgeRoutingGeneration();
-    const port = resolvePersistedRouterPort();
+    const port = parseRouterPort(active.generation.routing.port, { source: 'active Router generation port' });
+    if (resolvePersistedRouterPort() !== port) {
+      throw new Error('restart router: persisted Router port differs from the active generation; run a whole restart first.');
+    }
     await killRouterIfRunning();
     const deadline = Date.now() + 15000;
     let stopped = false;
