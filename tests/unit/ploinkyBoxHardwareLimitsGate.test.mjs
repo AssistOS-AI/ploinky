@@ -1,3 +1,5 @@
+import { ensureWorkspaceDataPaths } from '../../ploinky-box/workspace-data.mjs';
+import { preflightImageQuery, assertProfileCommand } from '../helpers/boxPreflightFixture.mjs';
 import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -36,7 +38,7 @@ function fixture(t) {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
     const home = path.join(root, 'home');
-    fs.mkdirSync(path.join(workspace, '.ploinky'), { recursive: true });
+    fs.mkdirSync(path.join(workspace, '.ploinky', 'data'), { recursive: true });
     fs.mkdirSync(home);
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     return { root, workspace, home, identity, gateStore: createHardwareGateStore() };
@@ -78,7 +80,7 @@ function owned(identity, { running = true, id = 'a'.repeat(64), labels = {} } = 
         handles: {
             container: {
                 id,
-                labels: { ...agentLibFixtureLabels(agentLib), [BOX_LABELS.imageRef]: BOX_IMAGE_REFERENCE, ...labels },
+                labels: { ...agentLibFixtureLabels(agentLib), [BOX_LABELS.imageRef]: BOX_IMAGE_REFERENCE, [BOX_LABELS.routerHostPort]: '8080', [BOX_LABELS.mediaHostPort]: '7882', ...labels },
                 runtime: { running, status: running ? 'running' : 'exited', imageId: 'b'.repeat(64), mounts: agentLibFixtureMounts(agentLib, identity.workspaceRoot) },
             },
         },
@@ -88,18 +90,22 @@ function owned(identity, { running = true, id = 'a'.repeat(64), labels = {} } = 
 // A start supervisor whose every mutation is recorded. Reconciliation is the
 // first Box mutation, so "no mutation" means no reconcile/start event.
 function startSupervisor(state, { env = {}, events = [] } = {}) {
-    const ownership = owned(state.identity);
-    const agentLib = agentLibFixture(state.identity.workspaceRoot);
+    const box = completeBoxFixture(state);
+    box.dataFingerprints = ensureWorkspaceDataPaths({ identity: state.identity, lock: lockFor(state.identity) }).fingerprints;
+    const ownership = { state: 'owned', engine: { name: 'podman', identity: 'engine' }, handles: { container: completeHandle(box, null) } };
+    const agentLib = box.agentLib;
     const supervisor = createBoxSupervisor({
         hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
         env,
         resolveIdentity: () => state.identity,
         launchCwd: state.identity.workspaceRoot,
+        repositoryRoot: box.root,
         selectAgentLib: async () => { events.push('select-agentlib'); return { selection: agentLib, mode: 'local' }; },
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
         platform: 'linux',
-        runner: { run(_command, args) { events.push(`run:${args[0]}`); } },
+        runner: { run(_command, args) { events.push(`run:${args[0]}`); }, query(_command, args) { return preflightImageQuery(args) || { ok: true, stdout: INBOX_READY }; } },
+        runCoreCommand: async (...args) => assertProfileCommand(...args),
         reconcile: async () => {
             events.push('reconcile');
             return { action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882 };
@@ -524,8 +530,8 @@ function completeHandle(box, hardware, {
             [BOX_LABELS.routerHostPort]: '8090',
             [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
             [BOX_LABELS.seccompFingerprint]: nestedPodmanSeccompProfileContract(box.root).fingerprint,
-            [BOX_LABELS.dependenciesFingerprint]: 'd'.repeat(64),
-            [BOX_LABELS.imagesFingerprint]: 'f'.repeat(64),
+            [BOX_LABELS.dependenciesFingerprint]: box.dataFingerprints?.dependencies || 'd'.repeat(64),
+            [BOX_LABELS.imagesFingerprint]: box.dataFingerprints?.images || 'f'.repeat(64),
             ...(hardware ? { [BOX_LABELS.hardwareLimits]: hardware.fingerprint } : {}),
         },
         runtime: {
@@ -620,7 +626,7 @@ test('G.targeted-gate-change', async (t) => {
         launchCwd: state.identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
-        runner: { run(_c, args) { events.push(`run:${args[0]}`); }, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+        runner: { run(_c, args) { events.push(`run:${args[0]}`); }, query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; } },
         selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
         reconcile: async (options) => {
             reconciledHardware = options.hardware;
@@ -668,7 +674,7 @@ test('G.every-final-generation', async (t) => {
         discover: () => ownership,
         runner: {
             run(_c, args) { events.push(`run:${args[0]}`); },
-            query() { return { ok: true, status: 0, stdout: INBOX_READY }; },
+            query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; },
         },
         selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
         updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),
@@ -727,7 +733,7 @@ test('G.every-final-generation', async (t) => {
         launchCwd: state.identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, rollbackEvents),
         discover: () => owned(state.identity),
-        runner: { run(_c, args) { rollbackEvents.push(`run:${args[0]}`); }, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+        runner: { run(_c, args) { rollbackEvents.push(`run:${args[0]}`); }, query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; } },
         selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
         reconcile: async (options) => ({
             action: 'replaced', ownership: owned(state.identity, { id: '1'.repeat(64) }), hostPort: 8080, mediaHostPort: 7882,
@@ -785,14 +791,18 @@ test('G.every-final-generation', async (t) => {
         ['update', (supervisor) => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true })],
     ]) {
         const events = [];
+        const box = completeBoxFixture(state);
+        box.dataFingerprints = ensureWorkspaceDataPaths({ identity: state.identity, lock: lockFor(state.identity) }).fingerprints;
+        const ownership = { state: 'owned', engine: { name: 'podman', identity: 'engine' }, handles: { container: completeHandle(box, null) } };
         const supervisor = createBoxSupervisor({
             hostStateGuard: PERMISSIVE_HOST_STATE_GUARD,
             env: { PLOINKY_BOX_HARDWARE_LIMITS: 'on' },
             resolveIdentity: () => state.identity,
             launchCwd: state.identity.workspaceRoot,
             lockManager: fakeLockManager(state.root, events),
-            discover: () => owned(state.identity),
-            runner: { run() {}, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+            discover: () => ownership,
+            repositoryRoot: box.root,
+            runner: { run() {}, query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; } },
             selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
             updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),
             updateWorkspacePloinky: async () => ({ found: false }),
@@ -807,7 +817,11 @@ test('G.every-final-generation', async (t) => {
             },
             captureCoreStartArgv: () => ['start', 'explorer', '8080'],
             readEdgeDesired: () => null,
-            runCoreCommand: async (_engine, id, argv) => { events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`); },
+            runCoreCommand: async (...args) => {
+                const [engine, id, argv] = args;
+                if (argv[0] === 'profile') assertProfileCommand(...args);
+                events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`);
+            },
             // The restart and update of the Box run through master's bounded runners; the same recorder plays the in-Box core.
             runRestartCore: fakeRestartCore(async (_engine, id, argv) => { events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`); }),
             runUpdateCore: fakeUpdateCore({ onCall: ({ engine, containerId, argv, hostPort, mediaHostPort, options }) => (async (_engine, id, argv) => { events.push(`core:${id.slice(0, 4)}:${argv.join(' ')}`); })(engine, containerId, argv, hostPort, mediaHostPort, null, options) }),
@@ -856,7 +870,7 @@ function realSupervisor(state, { env = {}, events = [], ownership = owned(state.
         launchCwd: state.identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
-        runner: { run(_command, args) { events.push(`run:${args.slice(0, 2).join(' ')}`); }, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+        runner: { run(_command, args) { events.push(`run:${args.slice(0, 2).join(' ')}`); }, query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; } },
         selectAgentLib: async () => { events.push('select-agentlib'); return { selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }; },
         reconcile: async (options) => { events.push('reconcile'); return { action: 'reused', ownership: reconciled, hostPort: 8080, mediaHostPort: 7882, hardware: options.hardware }; },
         readEdgeDesired: () => null,
@@ -1061,6 +1075,8 @@ function downgradeWorld(t, {
             return { ok: true, status: 0, stdout: '' };
         },
         query(_command, args) {
+            const image = preflightImageQuery(args);
+            if (image) return image;
             const id = args[args.length - 1];
             if (args[0] === 'container' && args[1] === 'logs') return { ok: true, status: 0, stdout: containers.get(id)?.logs || '', stderr: '' };
             if (args[0] === 'container' && args[1] === 'inspect' && args.includes('{{.State.Status}}')) {
@@ -1256,7 +1272,7 @@ function preservedRecoveryWorld(t, { removalFailures = 1 } = {}) {
             }
             return { ok: true, status: 0, stdout: '' };
         },
-        query() { return { ok: true, status: 0, stdout: INBOX_READY }; },
+        query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; },
         async stream() { return { ok: true, status: 0, stdout: '', stderr: '' }; },
     };
     const seams = {
@@ -1707,7 +1723,7 @@ test('G.update-recovers-stale-lock', async (t) => {
         launchCwd: state.identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
         discover: () => absent,
-        runner: { run(_command, args) { events.push(`run:${args.slice(0, 2).join(' ')}`); }, query() { return { ok: true, status: 0, stdout: INBOX_READY }; } },
+        runner: { run(_command, args) { events.push(`run:${args.slice(0, 2).join(' ')}`); }, query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; } },
         selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
         updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),
         updateWorkspacePloinky: async () => ({ found: false }),
@@ -1850,7 +1866,7 @@ function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null,
         discover: () => owned(state.identity),
         runner: {
             run(_command, args) { if (args.includes('ploinky-local')) events.push(`graph-stop:${settled ? 'after-settlement' : 'before-settlement'}`); },
-            query() { return { ok: true, status: 0, stdout: INBOX_READY }; },
+            query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; },
         },
         selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
         updateAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), changed: false, previous: null }),

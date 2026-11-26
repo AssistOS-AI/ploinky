@@ -1,3 +1,5 @@
+import { ensureWorkspaceDataPaths } from '../../ploinky-box/workspace-data.mjs';
+import { preflightImageQuery, assertProfileCommand } from '../helpers/boxPreflightFixture.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -1015,8 +1017,8 @@ function containerHandle(state, { id = OLD_ID, imageId = OLD_IMAGE, hostPort = 8
             [BOX_LABELS.routerHostPort]: String(hostPort),
             [BOX_LABELS.mediaHostPort]: '7882',
             [BOX_LABELS.seccompFingerprint]: nestedPodmanSeccompProfileContract(state.root).fingerprint,
-            [BOX_LABELS.dependenciesFingerprint]: DATA_FINGERPRINTS.dependencies,
-            [BOX_LABELS.imagesFingerprint]: DATA_FINGERPRINTS.images,
+            [BOX_LABELS.dependenciesFingerprint]: (state.dataFingerprints || DATA_FINGERPRINTS).dependencies,
+            [BOX_LABELS.imagesFingerprint]: (state.dataFingerprints || DATA_FINGERPRINTS).images,
             ...(gpu ? { [BOX_LABELS.gpuGrant]: gpu.fingerprint } : {}),
         },
         runtime: {
@@ -1357,6 +1359,7 @@ function graphBox(t, { gpu = null, running = true } = {}) {
     }));
     const scopeEnv = buildHostSkillScope(state.identity.workspaceRoot, state.identity.workspaceRoot);
     writeGraphSkillScope(state.identity, scopeEnv, { assertHeld(instance) { assert.equal(instance, state.identity.instance); } });
+    state.dataFingerprints = ensureWorkspaceDataPaths({ identity: state.identity, lock: state.lock }).fingerprints;
     const container = containerHandle(state, { gpu: gpu ? gpu(state) : null, running });
     return { ...state, scopeEnv, container, ownership: { state: 'owned', engine: { name: 'podman', identity: 'engine' }, handles: { container } } };
 }
@@ -1377,12 +1380,13 @@ function gpuSupervisor(box, events, overrides = {}) {
                 events.push(`stream:${args.at(-1)}`);
                 return { ok: true, status: 0 };
             },
-            query() {
-                return { ok: true, status: 0, stdout: JSON.stringify({
+            query(_command, args) {
+                return preflightImageQuery(args) || { ok: true, status: 0, stdout: JSON.stringify({
                     state: 'running', initialized: true, routingConfigured: true, trackedAgents: 1, runningAgents: 1, warnings: [],
                 }) };
             },
         },
+        runCoreCommand: async (...args) => assertProfileCommand(...args),
         gpuGrantStore: memoryGpuStore(events),
         discoverGpuDevices: () => fakeHost().discover(),
         routerBindingStore: { read: () => null, write: () => assert.fail('GPU grants never save a Router binding'), restore() {} },
@@ -2555,7 +2559,7 @@ test('D14 first start: by default the no-wait launches are counted with pgrep in
                     pgrepCalls.push(args);
                     return counts.shift();
                 }
-                return { ok: true, status: 0, stdout: JSON.stringify({
+                return preflightImageQuery(args) || { ok: true, status: 0, stdout: JSON.stringify({
                     state: 'running', initialized: true, routingConfigured: true, trackedAgents: 1, runningAgents: 1, warnings: [],
                 }) };
             },
@@ -2680,7 +2684,7 @@ function reapplySupervisor(t, {
         captureCoreStartArgv: () => ['start', 'explorer', '8080'],
         // The inspect-only `profile assert` the transaction runs on a running initialized Box is not
         // the graph core: it installs nothing.
-        runCoreCommand: async (_engine, _containerId, argv) => { if (argv?.[0] !== 'profile') install('core'); },
+        runCoreCommand: async (...args) => { if (args[2]?.[0] === 'profile') assertProfileCommand(...args); else install('core'); },
         runRestartCore: fakeRestartCore(async () => { install('restart-core'); }),
         runUpdateCore: fakeUpdateCore({ onCall: () => { install('update-core'); } }),
         validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
