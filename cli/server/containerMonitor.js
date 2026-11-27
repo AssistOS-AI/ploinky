@@ -2276,6 +2276,17 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             });
             return;
         }
+        // An unsettled activation barrier (Q30) defers like a busy workspace;
+        // the next failure or health tick tries again.
+        if (error?.code === 'PLOINKY_ACTIVATION_RECOVERY_REQUIRED') {
+            target.isRestarting = false;
+            logEvent(monitor, 'warn', 'container_restart_deferred_activation_recovery', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+            });
+            return;
+        }
         target.isRestarting = false;
         throw error;
     }

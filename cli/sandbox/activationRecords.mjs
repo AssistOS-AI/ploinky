@@ -599,6 +599,9 @@ export const ACTIVATION_BARRIER_ADMIT = Object.freeze([
     'shell:*',
     'dependency-preparation',
     'policy-write',
+    // The Router publishes the routes of the selector that is active: serving
+    // the kept version, not changing it (Q30 live probe).
+    'cloudflare-publication:*',
     // The Router's recovery-only latcher of terminal no-wait availability
     // slots: it records outcomes of the kept graph and never activates one.
     'hardware-availability-latch',

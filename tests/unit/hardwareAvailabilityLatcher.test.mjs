@@ -219,6 +219,8 @@ test('NW1.S-the-latcher-resolves-terminal-slots-fail-fast-in-one-rename-with-fen
     const deferrals = {
         PLOINKY_WORKSPACE_MUTATION_BUSY: { behaviors: { createLease: () => { throw codeError('PLOINKY_WORKSPACE_MUTATION_BUSY'); } }, leased: false },
         PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED: { behaviors: { createLease: () => { throw codeError('PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED'); } }, leased: false },
+        // Q30: an in-Box activation barrier refusal defers like busy.
+        PLOINKY_ACTIVATION_RECOVERY_REQUIRED: { behaviors: { createLease: () => { throw codeError('PLOINKY_ACTIVATION_RECOVERY_REQUIRED'); } }, leased: false },
         PLOINKY_NETWORK_LIFECYCLE_BUSY: { behaviors: { network: () => { throw codeError('PLOINKY_NETWORK_LIFECYCLE_BUSY'); } }, leased: true },
         EDGE_PREPARATION_BUSY: { behaviors: { apply: () => { throw codeError('EDGE_PREPARATION_BUSY'); } }, leased: true },
         EDGE_GENERATION_BUSY: { behaviors: {}, leased: true, realHold: true },

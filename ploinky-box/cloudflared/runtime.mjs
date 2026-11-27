@@ -657,16 +657,43 @@ export function startCloudflarePublicationRuntime({
         scheduledRetry = null;
     }
 
+    // Lease refusals that only postpone publication: another workspace
+    // mutation, or an in-Box activation barrier the host has not settled yet
+    // (Q30). Either way the next scan or retry tries again.
+    let leaseDeferral = '';
     function acquirePublicationLease(activationId) {
+        const operation = `cloudflare-publication:${String(activationId || 'unknown')}`;
         try {
-            return createWorkspaceLease({
-                operation: `cloudflare-publication:${String(activationId || 'unknown')}`,
-            });
+            const lease = createWorkspaceLease({ operation });
+            leaseDeferral = '';
+            return lease;
         } catch (error) {
             if (error?.code === 'PLOINKY_WORKSPACE_MUTATION_BUSY') return null;
+            if (error?.code === 'PLOINKY_ACTIVATION_RECOVERY_REQUIRED') {
+                if (leaseDeferral !== error.code) {
+                    leaseDeferral = error.code;
+                    audit('cloudflare-workspace-lease-deferred', { operation, code: error.code });
+                }
+                return null;
+            }
             throw error;
         }
     }
+
+    // The polling loop never lets a scan or retry failure escape: in the
+    // Router an unhandled rejection is a crash, and the Watchdog stops
+    // restarting a Router that keeps crashing.
+    function runGuarded(task, label) {
+        return Promise.resolve().then(task).catch((error) => {
+            try {
+                audit(label, {
+                    code: error?.code || 'CLOUDFLARE_PUBLICATION_ERROR',
+                    message: String(error?.message || error).slice(0, 1024),
+                });
+            } catch (_) {}
+        });
+    }
+    const runScan = () => runGuarded(() => scan(), 'cloudflare-publication-scan-failed');
 
     function releasePublicationLease(lease) {
         return releaseExactPublicationLease(lease, {
@@ -709,13 +736,13 @@ export function startCloudflarePublicationRuntime({
             timer: null,
         };
         scheduledRetry = retry;
-        retry.timer = setTimeout(async () => {
+        retry.timer = setTimeout(() => { void runGuarded(async () => {
             if (scheduledRetry !== retry || stopped) return;
             scheduledRetry = null;
             try {
                 const selected = loadActive({ workspaceRoot });
                 if (selected.selector.activationId !== activationId) {
-                    void scan();
+                    void runScan();
                     return;
                 }
             } catch (error) {
@@ -769,9 +796,9 @@ export function startCloudflarePublicationRuntime({
             } finally {
                 inFlight = null;
                 await releasePublicationLease(workspaceLease);
-                if (superseded && !stopped) void scan();
+                if (superseded && !stopped) void runScan();
             }
-        }, delayMs);
+        }, 'cloudflare-publication-retry-failed'); }, delayMs);
         retry.timer.unref?.();
     }
 
@@ -871,9 +898,9 @@ export function startCloudflarePublicationRuntime({
     }
 
     claimRestartHandoff();
-    const timer = setInterval(() => { void scan(); }, Math.max(100, Number(pollIntervalMs) || 500));
+    const timer = setInterval(() => { void runScan(); }, Math.max(100, Number(pollIntervalMs) || 500));
     timer.unref?.();
-    void scan();
+    void runScan();
     return Object.freeze({
         getStatus: () => controller.getStatus(),
         scan,
