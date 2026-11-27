@@ -133,7 +133,20 @@ test('the Watchdog defers a restart whose lease the activation barrier refuses',
 
 // --- Delta review 2: R1 and R3 ------------------------------------------------
 
-function publicationRuntime(t, { createWorkspaceLease, reconcile = async () => {}, pollIntervalMs = 60_000 }) {
+function selectedRetryGeneration() {
+    return {
+        selector: { generation: GENERATION, activationId: 'activation-retry', publicationState: 'reconciling' },
+        generation: { desired: { cloudflare: { tunnelId: 'fixture' }, hosts: {} } },
+    };
+}
+
+function publicationRuntime(t, {
+    createWorkspaceLease,
+    reconcile = async () => {},
+    pollIntervalMs = 60_000,
+    loadActive = selectedRetryGeneration,
+    inactivateInvalidGeneration,
+}) {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-q30-publication-r-'));
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
     const audits = [];
@@ -143,10 +156,8 @@ function publicationRuntime(t, { createWorkspaceLease, reconcile = async () => {
         pollIntervalMs,
         retryInitialDelayMs: 1,
         retryMaximumDelayMs: 4,
-        loadActive: () => ({
-            selector: { generation: GENERATION, activationId: 'activation-retry', publicationState: 'reconciling' },
-            generation: { desired: { cloudflare: { tunnelId: 'fixture' }, hosts: {} } },
-        }),
+        loadActive,
+        ...(inactivateInvalidGeneration ? { inactivateInvalidGeneration } : {}),
         createWorkspaceLease,
         releaseWorkspaceLease: () => true,
         routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
@@ -210,4 +221,78 @@ test('R3: a barrier deferral is audited again after an intervening busy lease', 
     await runtime.scan();
     await runtime.scan();
     assert.equal(audits.filter((entry) => entry.event === 'cloudflare-workspace-lease-deferred').length, 2);
+});
+
+// --- Final revision: retry load failures -------------------------------------
+
+const grantedLease = () => ({ token: 'lease', operation: 'cloudflare-publication:activation-retry' });
+
+// The first reconcile fails, which schedules a retry. `onRetryLoad(n)` sees
+// the n-th loadActive call made by the retry timers (retryActivationFor's own
+// load, made while scheduling, is skipped) and may throw.
+function failingFirstReconcile(onRetryLoad) {
+    const state = { reconciliations: 0, retryLoads: 0, armed: false, skipped: false };
+    state.reconcile = async () => {
+        state.reconciliations += 1;
+        if (state.reconciliations === 1) {
+            state.armed = true;
+            throw Object.assign(new Error('publication failed once'), { code: 'CLOUDFLARE_API' });
+        }
+    };
+    state.loadActive = () => {
+        if (state.armed) {
+            if (!state.skipped) { state.skipped = true; return selectedRetryGeneration(); }
+            state.retryLoads += 1;
+            onRetryLoad(state.retryLoads);
+        }
+        return selectedRetryGeneration();
+    };
+    return state;
+}
+
+test('a transient selector load error in a retry is retried, audited once, and the activation then publishes', async (t) => {
+    // Retry loads 1..5 are the pre-lease load of five consecutive retries.
+    const state = failingFirstReconcile((n) => {
+        if (n <= 5) throw Object.assign(new Error('selector read failed'), { code: 'EIO' });
+    });
+    const { audits } = publicationRuntime(t, {
+        createWorkspaceLease: grantedLease, reconcile: state.reconcile, loadActive: state.loadActive,
+    });
+    assert.equal(await until(() => state.reconciliations >= 2), true, 'the retry was rescheduled and published');
+    assert.ok(state.retryLoads >= 7, `retry loads ${state.retryLoads}`);
+    const loadErrors = audits.filter((entry) => entry.event === 'cloudflare-generation-load-error');
+    assert.equal(loadErrors.length, 1, `audited ${loadErrors.length} times`);
+    assert.equal(loadErrors[0].value.code, 'EIO');
+});
+
+test('an inactive selector in a retry still proceeds to reconcile, as before', async (t) => {
+    const inactive = () => Object.assign(new Error('inactive'), { code: 'EDGE_GENERATION_INACTIVE' });
+    // Both loads of the first retry report an inactive selector.
+    const state = failingFirstReconcile((n) => { if (n <= 2) throw inactive(); });
+    const { audits } = publicationRuntime(t, {
+        createWorkspaceLease: grantedLease, reconcile: state.reconcile, loadActive: state.loadActive,
+    });
+    assert.equal(await until(() => state.reconciliations >= 2), true);
+    assert.equal(state.retryLoads, 2, 'one retry, no reschedule');
+    assert.equal(audits.some((entry) => entry.event === 'cloudflare-generation-load-error'), false);
+});
+
+test('a retry whose invalid-generation inactivation fails is retried and then publishes', async (t) => {
+    // Retry load 2 is the first retry's load under the lease.
+    const state = failingFirstReconcile((n) => {
+        if (n === 2) throw Object.assign(new Error('selector read failed under the lease'), { code: 'EIO' });
+    });
+    let inactivations = 0;
+    const { audits } = publicationRuntime(t, {
+        createWorkspaceLease: grantedLease,
+        reconcile: state.reconcile,
+        loadActive: state.loadActive,
+        inactivateInvalidGeneration: () => {
+            inactivations += 1;
+            throw Object.assign(new Error('selector write failed'), { code: 'EIO' });
+        },
+    });
+    assert.equal(await until(() => state.reconciliations >= 2), true, 'the retry was rescheduled and published');
+    assert.equal(inactivations, 1);
+    assert.ok(audits.some((entry) => entry.event === 'cloudflare-generation-inactivation-error'));
 });

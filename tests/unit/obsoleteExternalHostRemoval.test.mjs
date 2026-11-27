@@ -40,8 +40,9 @@ const BASE_FILES = {
     'cli/server/authHandlers/authContext.js': 'dcb5d78b57d66df43e3c01a55c6428d93bed7a9988f74b966e2395d737be474c',
     // Re-pinned for the Q30 publication lease deferral under an activation
     // barrier (no unhandled rejection from a scan or retry; a retry whose
-    // lease fails unexpectedly reschedules; repeated scan errors audit once).
-    'ploinky-box/cloudflared/runtime.mjs': '118549ab6091854d0cdddbff0a42d285d30732d91a00eff87becc0c5e36cff77',
+    // lease or selector load fails unexpectedly, or whose invalid-generation
+    // inactivation fails, reschedules; repeated errors audit once).
+    'ploinky-box/cloudflared/runtime.mjs': 'f8d5981092018c3f31be04e15e5c61021477a9b2c3fe1adfdb5df44bd508f5c0',
     'ploinky-box/cloudflared/status.mjs': '34e5055dddf9073890e5643ada17176295014225b5a9d183439f4cb94636b2a0',
     'ploinky-box/cloudflared/journal.mjs': '4969c853c230668265cc05f7276d95e3ee677ae2e77de969881295de7622799a',
     'ploinky-box/cloudflared/managedTunnelRegistry.mjs': '6203d1e05581cac8f33b28f7c826562ac7309489681318a67ac62e53d60d2a26',

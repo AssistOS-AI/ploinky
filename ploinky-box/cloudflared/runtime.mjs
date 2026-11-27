@@ -709,6 +709,9 @@ export function startCloudflarePublicationRuntime({
         });
     }
     const runScan = () => runGuarded(() => scan(), 'cloudflare-publication-scan-failed', { dedupe: true });
+    // The same for a retry's selector load: a failure repeated unchanged by
+    // consecutive retries is audited once, until a load succeeds.
+    let lastRetryLoadFailure = '';
 
     function releasePublicationLease(lease) {
         return releaseExactPublicationLease(lease, {
@@ -754,24 +757,34 @@ export function startCloudflarePublicationRuntime({
         retry.timer = setTimeout(() => { void runGuarded(async () => {
             if (scheduledRetry !== retry || stopped) return;
             scheduledRetry = null;
+            // The scan fast path skips a handled activation, so a retry that
+            // ends without publishing or rescheduling would stall publication
+            // for good. An unexpected selector load or lease failure backs
+            // off and tries again; a different selected activation goes back
+            // to scan(), which has not handled it.
             try {
                 const selected = loadActive({ workspaceRoot });
+                lastRetryLoadFailure = '';
                 if (selected.selector.activationId !== activationId) {
                     void runScan();
                     return;
                 }
             } catch (error) {
                 if (error?.code !== 'EDGE_GENERATION_INACTIVE') {
-                    audit('cloudflare-generation-load-error', {
+                    const entry = {
                         code: error?.code || 'EDGE_GENERATION_LOAD_FAILED',
                         message: String(error?.message || error).slice(0, 1024),
-                    });
+                    };
+                    const key = `${entry.code}:${entry.message}`;
+                    if (key !== lastRetryLoadFailure) {
+                        lastRetryLoadFailure = key;
+                        audit('cloudflare-generation-load-error', entry);
+                    }
+                    scheduleRetry({ activationId, input: retry.input, attempt: attempt + 1 });
                     return;
                 }
+                lastRetryLoadFailure = '';
             }
-            // The scan fast path skips a handled activation, so a retry that
-            // ends without rescheduling would stall publication for good. An
-            // unexpected lease failure backs off and tries again.
             let workspaceLease;
             try {
                 workspaceLease = acquirePublicationLease(activationId);
@@ -803,9 +816,19 @@ export function startCloudflarePublicationRuntime({
                             code: error?.code || 'EDGE_GENERATION_LOAD_FAILED',
                             message: String(error?.message || error).slice(0, 1024),
                         });
+                        // Fail closed: an inactivated selector has nothing
+                        // left to publish. If the inactivation itself fails,
+                        // the handled activation may still be selected, so
+                        // back off and try again.
                         try {
                             inactivateInvalidGeneration('publication-generation-invalid', { workspaceRoot });
-                        } catch (_) {}
+                        } catch (inactivationError) {
+                            audit('cloudflare-generation-inactivation-error', {
+                                code: inactivationError?.code || 'EDGE_GENERATION_INACTIVATION_FAILED',
+                                message: String(inactivationError?.message || inactivationError).slice(0, 1024),
+                            });
+                            scheduleRetry({ activationId, input: retry.input, attempt: attempt + 1 });
+                        }
                         return;
                     }
                 }
