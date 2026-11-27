@@ -224,25 +224,29 @@ function scriptedMenu(choices, confirms = []) {
     };
 }
 
-test('the command walks robots, agents and sessions, opens, detaches back, and goes back with Backspace', async (t) => {
+test('the command lists folder sessions first, resumes directly and selects robot and agent only for New', async (t) => {
     const root = workspace(t, { robots: { agent: 'robots', repo: 'Repo' } }, { robots: MANIFEST });
     fs.mkdirSync(path.join(root, 'project'));
     const client = fakeClient({
         [`POST ${API}/robots`]: { ok: true, robots: [{ id: 'bob-1', name: 'Bob', default: false }, { id: 'def-1', name: 'default', default: true }] },
         [`POST ${API}/agents`]: { ok: true, robot: { id: 'def-1', name: 'default' }, active: 'claude', codingAgents: ['codex', 'claude'] },
         [`POST ${API}/history`]: { ok: true, sessions: [{ id: 'old', title: 'Old chat', updatedAt: 0 }] },
+        'POST /webtty/coding-sessions': { ok: true, running: [], sessions: [{ id: 'old', title: 'Old chat', updatedAt: 0, robotId: 'def-1', robotName: 'default', codingAgent: 'claude' }] },
         [`POST ${API}/launch`]: body => ({ ok: true, profile: `def-1.default.claude${body.resume ? `.r-${body.resume}` : ''}`, nativeSessionId: body.resume }),
         'GET /webtty/live-sessions': { ok: true, sessions: [] },
         'POST /webtty/target-discoveries': { ok: true, discovery: { id: 'd'.repeat(32), targets: [{ launch: 'l'.repeat(32), kind: 'agent', detail: 'Repo/robots', access: 'rw' }] } },
         'POST /webtty/sessions': { ok: true, session: { id: 's'.repeat(32) }, view: { id: 'v'.repeat(32) } },
     });
     const menu = scriptedMenu([
-        { action: 'enter', index: 1 },   // robot: default (preselected)
-        { action: 'enter', index: 1 },   // agent: claude (active, preselected)
-        { action: 'enter', index: 1 },   // resume "Old chat"
-        { action: 'back', index: 0 },    // back to agents
-        { action: 'back', index: 1 },    // back to robots
-        { action: 'quit', index: 1 },
+        { action: 'enter', index: 1 }, // resume directly from the folder list
+        { action: 'new', index: 0 },
+        { action: 'enter', index: 1 }, // default robot
+        { action: 'back', index: 0 }, // agent -> robots
+        { action: 'back', index: 0 }, // robots -> sessions
+        { action: 'new', index: 0 },
+        { action: 'enter', index: 1 },
+        { action: 'enter', index: 1 }, // launch new immediately after agent selection
+        { action: 'quit', index: 0 },
     ]);
     const relays = [];
     const tty = { isTTY: true, columns: 100, rows: 30, write() {} };
@@ -255,15 +259,18 @@ test('the command walks robots, agents and sessions, opens, detaches back, and g
     });
     assert.equal(code, 0);
     const selects = menu.views.filter(entry => entry[0] === 'select');
-    assert.equal(selects[0][2].selected, 1, 'the default robot is preselected');
-    assert.equal(selects[1][2].selected, 1, 'the active coding agent is preselected');
-    assert.deepEqual(selects[2][1].items.map(item => item.label), ['+ New session', '  Old chat']);
-    assert.deepEqual(client.calls.find(call => call[1] === `${API}/history`)[2], { robot: 'def-1', codingAgent: 'claude', directory: 'project' });
-    assert.deepEqual(client.calls.find(call => call[1] === `${API}/launch`)[2], { robot: 'def-1', codingAgent: 'claude', directory: 'project', resume: 'old' });
-    assert.deepEqual([relays.length, relays[0].sessionId, relays[0].viewId], [1, 's'.repeat(32), 'v'.repeat(32)]);
-    assert.match(selects[3][1].status, /Detached: the session keeps running/);
+    assert.deepEqual(selects[0][1].items.map(item => item.label), ['+ New session', '  Old chat']);
+    assert.equal(selects[2][2].selected, 1, 'the default robot is preselected');
+    assert.equal(selects[3][2].selected, 1, 'the active coding agent is preselected');
+    assert.equal(selects[5][1].title[1], 'Choose a session');
+    assert.equal(client.calls.some(call => call[1] === `${API}/history`), false);
+    assert.deepEqual(client.calls.filter(call => call[1] === `${API}/launch`).map(call => call[2]), [
+        { robot: 'def-1', codingAgent: 'claude', directory: 'project', resume: 'old' },
+        { robot: 'def-1', codingAgent: 'claude', directory: 'project', resume: null },
+    ]);
+    assert.equal(relays.length, 2);
+    assert.match(selects[1][1].status, /Detached: the session keeps running/);
     assert.match(errors.join(''), /Ctrl\+\] detach;/);
-    assert.equal(selects[4][1].title[1], 'Robot default › choose a coding agent');
     assert.equal(menu.views.at(-1)[0], 'close');
 });
 
@@ -275,12 +282,12 @@ test('the command kills a running session after confirmation and exits when the 
         [`POST ${API}/agents`]: { ok: true, active: 'claude', codingAgents: ['claude'] },
         [`POST ${API}/history`]: { ok: true, sessions: [] },
         'GET /webtty/live-sessions': { ok: true, sessions: [liveRow()] },
+        'POST /webtty/coding-sessions': { ok: true, running: [{ ...liveRow(), robotId: 'ana-1', robotName: 'default', codingAgent: 'claude' }], sessions: [] },
         [`DELETE /webtty/sessions/${'l'.repeat(32)}`]: { ok: true },
         [`POST /webtty/live-sessions/${'l'.repeat(32)}/attach-tokens`]: { ok: true, attach: 't'.repeat(32) },
         'POST /webtty/attachments': { ok: true, session: { id: 'l'.repeat(32) }, view: { id: 'v'.repeat(32) } },
     });
     const menu = scriptedMenu([
-        { action: 'enter', index: 0 }, { action: 'enter', index: 0 },
         { action: 'kill', index: 0 },    // the new-session row cannot be killed
         { action: 'kill', index: 1 },    // declined
         { action: 'kill', index: 1 },    // confirmed
@@ -295,9 +302,9 @@ test('the command kills a running session after confirmation and exits when the 
     });
     assert.equal(code, 0);
     const selects = menu.views.filter(entry => entry[0] === 'select');
-    assert.match(selects[3][1].status, /Only a running session can be killed/);
+    assert.match(selects[1][1].status, /Only a running session can be killed/);
     assert.equal(client.calls.filter(call => call[0] === 'DELETE').length, 1);
-    assert.match(selects[5][1].status, /Session killed/);
+    assert.match(selects[3][1].status, /Session killed/);
 });
 
 test('the command needs a provider and an interactive terminal', async () => {

@@ -152,9 +152,10 @@ async function execute(manager, req, routePlan, body) {
     if (body.action === 'pairs') {
         const { robots = [] } = await api('robots', {});
         const robotNames = new Map(robots.map(robot => [robot.id, robot.name]));
-        return { ok: true, pairs: pairs.map(pair => ({ id: pair.id, createdAt: pair.createdAt,
+        return { ok: true, pairs: pairs.map(pair => ({ id: pair.id, createdAt: pair.createdAt, updatedAt: pair.updatedAt,
             roles: ['supervisor', 'worker'].map(role => ({ role, robotId: pair[role].robotId, robotName: robotNames.get(pair[role].robotId) || pair[role].robotName || pair[role].robotId,
                 codingAgent: pair[role].codingAgent, terminalId: pair[role].terminalId,
+                lastActivityAt: running.find(row => row.id === pair[role].terminalId)?.lastActivityAt,
                 running: running.some(row => row.id === pair[role].terminalId),
             })),
         })) };
