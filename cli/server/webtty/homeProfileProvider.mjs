@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { codingSessionDeclaration } from '../../utils/codingSessionProviders.mjs';
 import http from 'node:http';
 import path from 'node:path';
 
@@ -352,8 +353,20 @@ export class WebttyHomeProfileProvider {
         return Object.freeze({ relativePath, absolutePath: resolved.absolutePath, identity });
     }
 
-    async callProvider({ req, routePlan, snapshot, provider, id, mode }) {
-        const resolvePath = provider.declaration.resolve;
+    async callControl({ req, routePlan, providerName, expectedProvider, operation, body }) {
+        if (!isAdminUser(req?.user)) throw profileError('administrator');
+        if (!['poll', 'close'].includes(operation)) throw profileError('control_operation');
+        const snapshot = currentSnapshot(routePlan);
+        const provider = findHomeProfileProvider(snapshot, providerName);
+        if (!provider || (expectedProvider && !sameProvider(provider, expectedProvider))) throw profileError('provider');
+        const declaration = codingSessionDeclaration(snapshot.manifests?.[provider.routeKey], provider.routeKey);
+        if (!declaration) throw profileError('control_declaration');
+        return this.callProvider({ req, routePlan, snapshot, provider,
+            control: { path: `${declaration.api}/control-${operation}`, body } });
+    }
+
+    async callProvider({ req, routePlan, snapshot, provider, id, mode, control }) {
+        const resolvePath = control ? control.path : provider.declaration.resolve;
         let plan;
         try {
             plan = this.planAgentPort({
@@ -382,7 +395,7 @@ export class WebttyHomeProfileProvider {
             || !providerRouteAdmitsCaller(plan, req, snapshot)) {
             throw profileError('route');
         }
-        const body = Buffer.from(JSON.stringify(mode === 'live-agent'
+        const body = Buffer.from(JSON.stringify(control ? control.body : mode === 'live-agent'
             ? { version: 2, action: 'resolve', id, mode } : { version: 1, id }), 'utf8');
         const bodyHash = sha256RawBodyHash(body);
         let authInfo;
@@ -409,7 +422,14 @@ export class WebttyHomeProfileProvider {
         } catch (_) {
             throw profileError('signature');
         }
-        const response = await this.exchange({ plan: finalized, lease: routePlan.lease, headers, body, bodyHash });
+        const response = await this.exchange({ plan: finalized, lease: routePlan.lease, headers, body, bodyHash,
+            ...(control ? { responseBytes: 100000 } : {}) });
+        if (control) {
+            if (currentSnapshot(routePlan) !== snapshot || response.statusCode !== 200) throw profileError('control_response');
+            const answer = JSON.parse(response.body.toString('utf8'));
+            if (answer?.ok !== true) throw profileError('control_response');
+            return answer;
+        }
         const answer = validateHomeProfileResponse(response.statusCode, response.body, id, mode);
         if (!answer) throw profileError('response');
         return answer;
@@ -417,9 +437,9 @@ export class WebttyHomeProfileProvider {
 
     // One buffered request over the private relay with a single total
     // deadline. Every exit closes the checkout, agent, request and timer.
-    exchange({ plan, lease, headers, body, bodyHash }) {
+    exchange({ plan, lease, headers, body, bodyHash, responseBytes = this.limits.responseBytes }) {
         const relayManager = this.relayManager;
-        const limits = this.limits;
+        const limits = { ...this.limits, responseBytes };
         const setTimer = this.setTimer;
         const clearTimer = this.clearTimer;
         return new Promise((resolve, reject) => {

@@ -1208,3 +1208,47 @@ test('retained view refusals keep the existing 401/403/503 mapping with the real
     assert.equal(res.body, EXIT_EVENT);
     assert.equal(f.record().closure, 'proven');
 });
+
+test('worker output tail requires watch authorization and bounds clean UTF-8 output', async () => {
+    const routePlan = plan();
+    const url = `/webtty/sessions/${'a'.repeat(32)}/output`;
+    const res = new MockResponse();
+    await handleWebtty(request({ routePlan, url, method: 'GET' }).req, res, new URL(url, 'https://app.example.test'), {
+        routePlan, manager: manager({
+            async authorize(_req, _plan, _id, mode) {
+                assert.equal(mode, 'watch');
+                return { recentOutput: '\u001b[31m' + ('old\n'.repeat(110)) + 'ü'.repeat(12000) + '\u001b[0m', lastOutputAt: 1000 };
+            }, now: () => 12000,
+        }),
+    });
+    assert.equal(res.statusCode, 200);
+    const result = JSON.parse(res.body);
+    assert.equal(result.running, true);
+    assert.equal(result.silentForSeconds, 11);
+    assert.equal(result.truncated, true);
+    assert.ok(Buffer.byteLength(result.recentOutput) <= 16384);
+    assert.ok(result.recentOutput.split('\n').length <= 100);
+    assert.ok(!/[\u001b\ufffd]/u.test(result.recentOutput));
+    const denied = new MockResponse();
+    await handleWebtty(request({ routePlan, url, method: 'GET' }).req, denied, new URL(url, 'https://app.example.test'), {
+        routePlan, manager: manager({ async authorize() { throw Object.assign(new Error('private'), { code: 'WEBTTY_SESSION_NOT_FOUND' }); } }),
+    });
+    assert.equal(denied.statusCode, 404);
+    assert.ok(!denied.body.includes('recentOutput'));
+});
+
+test('server supervision registration requires the normal mutation proof and delegates only after admission', async () => {
+    const routePlan = plan();
+    const url = '/webtty/supervised-pairs';
+    let registered = 0;
+    const value = { id: 'pair', supervisor: 's'.repeat(32), worker: 'w'.repeat(32), controlId: 'c', interruptInput: null };
+    const service = manager({ supervisedPairs: { async register(_req, _plan, body) {
+        registered++; assert.deepEqual(body, value); return { ok: true };
+    } } });
+    for (const csrf of [false, true]) {
+        const res = new MockResponse();
+        await handleWebtty(request({ routePlan, url, body: value, csrf }).req, res, new URL(url, 'https://app.example.test'), { manager: service, routePlan });
+        assert.equal(res.statusCode, csrf ? 200 : 403);
+    }
+    assert.equal(registered, 1);
+});

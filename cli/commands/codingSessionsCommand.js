@@ -3,7 +3,6 @@ import path from 'node:path';
 
 import { listCodingSessionProviders } from '../utils/codingSessionProviders.mjs';
 import { ListMenu } from '../utils/codingSessionsMenu.mjs';
-import { createSupervisionCourier } from '../utils/supervisionCourier.mjs';
 import { RELAY_EXIT_REASONS, relayStatus, supervisionTabs } from '../utils/supervisionFlow.mjs';
 import { storePath } from '../utils/supervisedSessions.mjs';
 import {
@@ -171,7 +170,6 @@ export async function runCodingSessionsCommand({
     createClient = options => new LocalRouterClient(options),
     createRelay = options => new TerminalRelay(options),
     createMenu = options => new ListMenu(options),
-    createCourier = createSupervisionCourier,
     pairRefreshMs = PAIR_REFRESH_MS,
     now = () => Date.now(),
 } = {}) {
@@ -209,7 +207,6 @@ export async function runCodingSessionsCommand({
         openTerminal,
         attachTerminal: attachSessionTerminal,
         createRelay,
-        createCourier,
         input,
         output,
         errorOutput,

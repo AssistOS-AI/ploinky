@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import path from 'node:path';
 
 import { installSupervisionSkills } from './supervisionSkills.mjs';
@@ -9,7 +8,6 @@ export const SUPERVISION_FILES = Object.freeze({
     tasks: 'tasks.md',
     results: 'results.md',
 });
-const REVISION = /^rev:[ \t]*(\d{1,9})[ \t]*$/mu;
 
 export function supervisedPaths(folder) {
     const directory = path.join(folder, SUPERVISED_DIRECTORY);
@@ -26,21 +24,4 @@ export function supervisedPaths(folder) {
 export function prepareSupervisedFolder(folder) {
     installSupervisionSkills(folder);
     return supervisedPaths(folder);
-}
-
-export function parseTaskRevision(text) {
-    const match = typeof text === 'string' ? text.match(REVISION) : null;
-    return match ? Number(match[1]) : null;
-}
-
-// A missing task file is normal: the supervisor has not written it yet.
-export function readTaskRevision(folder, { read = file => fs.readFileSync(file, 'utf8') } = {}) {
-    let text;
-    try {
-        text = read(supervisedPaths(folder).tasks);
-    } catch (error) {
-        if (error?.code === 'ENOENT') return { rev: null, text: '', missing: true };
-        throw error;
-    }
-    return { rev: parseTaskRevision(text), text, missing: false };
 }

@@ -917,3 +917,35 @@ test('real relay: the signed resolve crosses the real relay manager and helper a
     }
     assert.equal(server.received.length, 3);
 });
+
+test('background control uses the declared provider route and signs each exact poll without login credentials', async t => {
+    const manifest = keeperManifest();
+    manifest.webtty.codingSessions = { version: 1, api: '/base-agent-additional-server/keeper/7001/api/coding-sessions' };
+    const fx = workspaceFixture(t, manifest);
+    const server = await providerServer(t, ({ req, res, body }) => {
+        const url = new URL(req.url, 'http://agent.local');
+        const verified = verifyHttpRouteAuthInfoFromHeaders(req.headers, {
+            env: agentEnv(), replayCache: createMemoryReplayCache(), method: req.method, path: url.pathname, query: url.search, body,
+        });
+        assert.equal(verified.ok, true);
+        assert.ok(verified.payload.actor.roles.includes('admin'));
+        assert.equal(req.url, '/api/coding-sessions/control-poll');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, requests: [] }));
+        return true;
+    });
+    const relay = tcpRelayManager(server.port);
+    const client = provider(fx, relay);
+    const routePlan = fx.webttyPlan();
+    const expectedProvider = findHomeProfileProvider(routePlan.snapshot, 'keeper');
+    const body = { id: 'channel', results: [], profile: 'supervisor-profile', validateOnly: true };
+    await client.callControl({ req: ADMIN_REQ, routePlan, providerName: 'keeper', expectedProvider, operation: 'poll', body });
+    assert.equal(server.received.length, 1);
+    assert.deepEqual(JSON.parse(server.received[0].body), body);
+    assert.equal(server.received[0].headers.cookie, undefined);
+    assert.equal(server.received[0].headers.authorization, undefined);
+    await assert.rejects(client.callControl({ req: ADMIN_REQ, routePlan, providerName: 'keeper',
+        expectedProvider: { ...expectedProvider, containerId: 'replaced' }, operation: 'poll', body }));
+    await assert.rejects(client.callControl({ req: ADMIN_REQ, routePlan, providerName: 'keeper', expectedProvider, operation: 'launch', body }));
+    assert.equal(server.received.length, 1);
+});
