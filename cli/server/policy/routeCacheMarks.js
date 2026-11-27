@@ -1,15 +1,9 @@
 import { HttpRouteAccessPath } from './HttpRouteAccessPath.js';
 import { normalizeManifestHttpRouteAccess } from './HttpRouteProviders.js';
+import { isRouteCacheClass, isRouteCacheMark } from './routeCacheMarkValues.js';
 
-// The classes a response can be cached under.
-export function isRouteCacheClass(value) {
-    return value === 'page' || value === 'immutable';
-}
-
-// Every value a manifest may carry in `cache`. `never` forbids caching a route.
-export function isRouteCacheMark(value) {
-    return isRouteCacheClass(value) || value === 'never';
-}
+// Kept here for existing importers; the import-free definitions live in routeCacheMarkValues.js.
+export { isRouteCacheClass, isRouteCacheMark };
 
 // JSON object form uses the key as the path and also accepts an access string.
 export function manifestHttpRouteSpecs(routes) {
