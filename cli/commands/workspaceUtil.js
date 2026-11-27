@@ -60,7 +60,7 @@ import {
   readCapturedProdGates,
   stageProdGates,
 } from '../utils/runtime/mcpProdGates.mjs';
-import { activationCommitHooks, pruneActivationRecords } from '../sandbox/activationRecords.mjs';
+import { ACTIVATION_CONTEXT_ENV, activationCommitHooks, pruneActivationRecords } from '../sandbox/activationRecords.mjs';
 import { runWithRuntimePolicyEnvironment } from '../utils/runtime/runtimePolicyContext.mjs';
 import { followWorkspaceProfile } from '../utils/runtime/profileFollow.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
@@ -310,12 +310,17 @@ export function buildRouterEnv({ managedBox } = {}) {
   // Trusted outer-host aliases come only from the host-created Box environment.
   // Workspace .env and secret files are writable through agent workspace mounts.
   // Likewise the repository source: only the process (Box) environment selects it.
-  const { [PUBLIC_ROUTER_HOSTS_ENV]: _envFileHosts, [REPOS_SOURCE_ENV]: _envFileSource, ...fileEnvironment } = envFile;
-  const { [PUBLIC_ROUTER_HOSTS_ENV]: _secretHosts, [REPOS_SOURCE_ENV]: _secretSource, ...secretEnvironment } = secrets;
+  // And the host-issued activation context (Q30), which only the exec the
+  // host launched may carry; the Router, Watchdog and WebChat shell never do.
+  const { [PUBLIC_ROUTER_HOSTS_ENV]: _envFileHosts, [REPOS_SOURCE_ENV]: _envFileSource,
+    [ACTIVATION_CONTEXT_ENV]: _envFileContext, ...fileEnvironment } = envFile;
+  const { [PUBLIC_ROUTER_HOSTS_ENV]: _secretHosts, [REPOS_SOURCE_ENV]: _secretSource,
+    [ACTIVATION_CONTEXT_ENV]: _secretContext, ...secretEnvironment } = secrets;
   const routerEnvironment = sanitizeRouterEnvironment(
     { ...fileEnvironment, ...secretEnvironment, ...process.env },
     { managedBox },
   );
+  delete routerEnvironment[ACTIVATION_CONTEXT_ENV];
   // PROD comes only from the value captured by a start or whole restart. The
   // workspace .env, the stored var and the caller's environment never select
   // it for the Router: strip all three sources (the stored value also arrives
