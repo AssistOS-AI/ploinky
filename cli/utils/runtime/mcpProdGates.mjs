@@ -223,7 +223,10 @@ export function dryCaptureProdGates({ prod = readProd(), routes, workspaceProfil
 }
 
 // Stage a policy no weaker than either generation while the selector changes.
-// An unavailable predecessor stays unavailable until the new selector exists.
+// An unavailable predecessor stays unavailable until the new selector exists,
+// except an absent one under a PROD capture: lease-less readers (the Router,
+// Marketplace) must see PROD before the new selector does, so the capture
+// itself is staged and its rollback removes it again.
 export function stageProdGates(capture, { file = PROD_GATES_FILE } = {}) {
     let previousBytes;
     try { previousBytes = fs.readFileSync(file); } catch (error) {
@@ -245,20 +248,56 @@ export function stageProdGates(capture, { file = PROD_GATES_FILE } = {}) {
         else delete stagedCapture.workspaceProfile;
         writeProdGates(stagedCapture, { file });
         staged = true;
+    } else if (previousBytes === null && capture?.prod === true) {
+        writeProdGates(capture, { file });
+        staged = true;
     }
     return {
+        staged,
         rollback() {
             if (!staged) return;
+            if (previousBytes === null) {
+                fs.rmSync(file, { force: true });
+                fsyncDirectory(path.dirname(file));
+                return;
+            }
             const temporary = `${file}.${process.pid}.${Date.now()}.restore.tmp`;
-            fs.writeFileSync(temporary, previousBytes, { mode: 0o600 });
+            writeDurable(temporary, previousBytes);
             fs.renameSync(temporary, file);
+            fsyncDirectory(path.dirname(file));
         },
         finalize() { writeProdGates(capture, { file }); },
     };
 }
 
-// Atomic write into controller-only state. An identical file is left alone so
-// its identity, and the Router's cached read, stay put.
+function fsyncDirectory(directory) {
+    let fd;
+    try {
+        fd = fs.openSync(directory, fs.constants.O_RDONLY);
+        fs.fsyncSync(fd);
+    } catch (error) {
+        // Not every host filesystem syncs directories; the file fsync and the
+        // rename remain authoritative there.
+        if (!['EINVAL', 'ENOTSUP', 'EISDIR', 'EBADF'].includes(error?.code)) throw error;
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch (_) {}
+        }
+    }
+}
+
+function writeDurable(file, bytes) {
+    const fd = fs.openSync(file, 'w', 0o600);
+    try {
+        fs.writeFileSync(fd, bytes);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+// Atomic, durable write into controller-only state. An identical file is left
+// alone so its identity, and the Router's cached read, stay put.
 export function writeProdGates(capture, { file = PROD_GATES_FILE } = {}) {
     const text = `${JSON.stringify(capture, null, 2)}\n`;
     try {
@@ -266,8 +305,9 @@ export function writeProdGates(capture, { file = PROD_GATES_FILE } = {}) {
     } catch (_) { /* absent or unreadable: write it */ }
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(temporary, text, { encoding: 'utf8', mode: 0o600 });
+    writeDurable(temporary, text);
     fs.renameSync(temporary, file);
+    fsyncDirectory(path.dirname(file));
     return { written: true };
 }
 

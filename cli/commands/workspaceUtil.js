@@ -60,6 +60,7 @@ import {
   readCapturedProdGates,
   stageProdGates,
 } from '../utils/runtime/mcpProdGates.mjs';
+import { activationCommitHooks, pruneActivationRecords } from '../sandbox/activationRecords.mjs';
 import { runWithRuntimePolicyEnvironment } from '../utils/runtime/runtimePolicyContext.mjs';
 import { followWorkspaceProfile } from '../utils/runtime/profileFollow.mjs';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
@@ -3105,6 +3106,10 @@ async function startWorkspace(staticAgentArg, portArg, {
   // mutation. Only a start that carries one writes the captured file;
   // `restart router` carries none and reuses the existing file.
   prodCapture = null,
+  // The host-issued activation request this command read at entry (Q30):
+  // `activate` and `settle` write the intent before the selector rename;
+  // `restore` (the host's rollback start) and null write nothing.
+  activationRequest = null,
 } = {}) {
   if (workspaceMutationLease && heldWorkspaceMutationLease() !== workspaceMutationLease) {
     throw new Error('start: the supplied workspace lease is not held');
@@ -3160,6 +3165,9 @@ async function startWorkspace(staticAgentArg, portArg, {
   // follow a killed start at once: wait out only that dead owner's stale
   // network-lock grace, never a live owner.
   if (prodCapture) assertDeploySettingsCurrent(prodCapture);
+  if (['activate', 'settle'].includes(activationRequest?.purpose)) {
+    pruneActivationRecords({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+  }
   return await runWithRuntimePolicyEnvironment({ prod: startProd, workspaceProfile: prodCapture?.workspaceProfile || getActiveProfile() }, () => runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
   // A rollout may have started while this start waited for no-wait workers.
@@ -3725,7 +3733,6 @@ async function startWorkspace(staticAgentArg, portArg, {
     // remains exact. Persist it once, after all capability-sensitive launches
     // have completed, so one wave cannot invalidate the selector-bound host
     // launch token needed by a later wave.
-    let stagedPolicy;
     await mergeRoutingConfig((current, { applyLockCapability, networkLifecycleCapability: mergeNetworkLifecycleCapability } = {}) => {
       workspaceSvc.saveAgents(reg, { coordinate: false });
       // D2S.13 site S: the blocking runtimes this start verified ready publish their registry tuple here, before
@@ -3742,16 +3749,13 @@ async function startWorkspace(staticAgentArg, portArg, {
     }, {
       reason: 'workspace-runtime-graph-ready',
       preparationLease: workspacePreparationLease,
-      ...(finalProdCapture ? {
-        beforeSelectorCommit() {
-          stagedPolicy = stageProdGates(finalProdCapture);
-          return () => stagedPolicy.rollback();
-        },
-        afterSelectorCommit() {
-          workspaceActivated = true;
-          stagedPolicy.finalize();
-        },
-      } : { afterSelectorCommit() { workspaceActivated = true; } }),
+      ...activationCommitHooks({
+        prodCapture: finalProdCapture,
+        activationRequest,
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+        stageProdGates,
+        onActivated() { workspaceActivated = true; },
+      }),
     });
     workspacePreparationLease = null;
     for (const runtimeResult of workspaceMpsRuntimes) {

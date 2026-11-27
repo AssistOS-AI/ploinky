@@ -91,6 +91,7 @@ import { runSettingsMenu } from './settingsMenu.js';
 import { handleProfileCommand } from './profileCommands.js';
 import { assertDeploySettingsCurrent, assertProdProfileConsistency, readProd } from '../utils/prodMode.mjs';
 import { dryCaptureProdGates } from '../utils/runtime/mcpProdGates.mjs';
+import { ACTIVATION_CONTEXT_INVALID, readActivationRequest } from '../sandbox/activationRecords.mjs';
 import {
     cleanupSessionContainers,
     destroyAll,
@@ -450,6 +451,9 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             break;
         }
         case 'start': {
+            // The host's activation context is read and removed before the
+            // first mutation, so no child inherits it.
+            const activationRequest = readActivationRequest(process.env, { command: 'start' });
             const startParsed = parseStartArgs(options);
             // Before the first mutation, including the profile write below: a
             // PROD/profile mismatch must leave the workspace untouched.
@@ -484,6 +488,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 branchPolicy: startParsed.branchPolicy,
                 withCanariesReconciled,
                 prodCapture,
+                activationRequest,
             });
             break;
         }
@@ -528,7 +533,15 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             throw new Error('Usage: network status [--json] | network prune');
         }
         case 'restart': {
+            // Read (and remove) the host's activation context before anything
+            // else, so no child inherits it. Only a whole restart carries one.
+            const activationRequest = readActivationRequest(process.env, { command: 'restart' });
             const { target, acceptedFailedDrain } = parseTargetedRestartArguments(options);
+            if (target && activationRequest) {
+                const error = new Error('restart: an activation context applies only to a whole-workspace restart');
+                error.code = ACTIVATION_CONTEXT_INVALID;
+                throw error;
+            }
             if (target && target.toLowerCase() === 'router') {
                 const cfg = workspaceSvc.getConfig();
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
@@ -794,6 +807,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                         withCanariesReconciled,
                         prodCapture,
                         workspaceMutationLease,
+                        activationRequest,
                     });
                 });
                 console.log('[restart] Done.');

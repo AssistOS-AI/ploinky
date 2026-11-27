@@ -3144,7 +3144,11 @@ export function applyEdgeRoutingGeneration(options = {}) {
         const topology = writeTopologyForGeneration(paths, generation, publicationState, options);
         const beforeSelectorCommit = options.beforeSelectorCommit || options.testHooks?.beforeSelectorCommit;
         if (typeof beforeSelectorCommit === 'function') {
-            beforeSelectorRollback = beforeSelectorCommit({ paths, generation, topology, selector }) || null;
+            // The predecessor is the inactive selector this commit replaces; an
+            // activation intent names both before the rename (Q30).
+            beforeSelectorRollback = beforeSelectorCommit({
+                paths, generation, topology, selector, predecessorSelector: inactiveSelector,
+            }) || null;
             if (beforeSelectorRollback && typeof beforeSelectorRollback !== 'function') throw edgeError('invalid pre-selector rollback', 'EDGE_ADDITIVE_CALLBACK_INVALID');
         }
         // The selector is the transaction's sole authorization commit point and
@@ -3154,6 +3158,7 @@ export function applyEdgeRoutingGeneration(options = {}) {
             throw edgeError('edge selector changed before authorization commit', 'EDGE_GENERATION_RACE');
         }
         if (preparationLease) removePreparationLease(paths, preparationLease);
+        options.testHooks?.beforeSelectorWrite?.({ paths, selector, predecessor: inactiveSelector });
         intendedSelector = selector;
         priorSelector = inactiveSelector;
         selectorWriteAttempted = true;

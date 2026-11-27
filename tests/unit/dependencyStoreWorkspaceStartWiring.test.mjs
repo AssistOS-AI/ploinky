@@ -30,6 +30,7 @@ import { RUN_STARTED_AT_MS, containerOf, entryFor, makeWorld } from './hardwareA
 import { DRIVER as RETIREMENT_DRIVER, runRetirementDriver } from './hardwareAvailabilityRetirementHarness.mjs';
 import { stageNoWaitAvailabilitySlots } from '../../cli/commands/noWaitAvailabilitySlots.js';
 import { withEdgeGenerationApplyLock } from '../../cli/sandbox/edgeGeneration.js';
+import { activationCommitHooks } from '../../cli/sandbox/activationRecords.mjs';
 import { createHardwareAvailabilityResolverCache } from '../../cli/server/hardwareAvailabilityResolver.mjs';
 import { createHardwareAvailabilityLatcher } from '../../cli/server/hardwareAvailabilityLatcher.mjs';
 import {
@@ -108,6 +109,10 @@ function startFixture(t) {
         // The production capture is outside what this wiring observes: no capture is carried or written.
         resolveStartProd: () => false,
         commitProdCapture: () => {},
+        // Q30: the real commit hooks; with no capture and no activation
+        // request they only mark the workspace activated, as before.
+        activationCommitHooks,
+        stageProdGates: () => { throw new Error('this wiring stages no production capture'); },
         runWithRuntimePolicyEnvironment: (_policy, fn) => fn(),
         preflightWorkspaceStartRuntimeCapabilities: () => ({ admissions: ['admitted'], graph, registry, additionalNodes: [] }),
         resetPreinstallRunInProcess: () => {},

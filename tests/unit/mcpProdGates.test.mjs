@@ -539,3 +539,40 @@ test('P7: ploinky expose is refused under the stored or the captured PROD, and n
     fs.writeFileSync(manifestFile, manifestText);
     assert.doesNotMatch(message(attempt), /PLOINKY_PROD/);
 });
+
+// Q30 AC3: lease-less readers never see a weaker policy than PROD while the
+// selector changes, even with no captured predecessor, and every staged or
+// rolled-back policy is durable before the selector moves.
+test('with no predecessor a PROD capture is staged itself and its rollback removes it again', (t) => {
+    reset();
+    assert.equal(fs.existsSync(captureFile), false);
+    const next = { schema: 1, prod: true, workspaceProfile: 'prod', routes: { a: { tools: ['tag'], sha256: null } } };
+    const fsyncs = t.mock.method(fs, 'fsyncSync');
+    const transition = gates.stageProdGates(next);
+    assert.equal(transition.staged, true);
+    assert.equal(gates.readCapturedProdGates().prod, true);
+    assert.deepEqual(gates.readCapturedProdGates().routes.a.tools, ['tag']);
+    assert.ok(fsyncs.mock.callCount() >= 2, 'the staged file and its directory were fsynced');
+    const before = fsyncs.mock.callCount();
+    transition.rollback();
+    assert.equal(fs.existsSync(captureFile), false, 'rollback restores the absence');
+    assert.ok(fsyncs.mock.callCount() > before, 'the rollback was fsynced');
+    // PROD false with no predecessor still stages nothing (today's behaviour).
+    const relaxed = gates.stageProdGates({ ...next, prod: false });
+    assert.equal(relaxed.staged, false);
+    assert.equal(fs.existsSync(captureFile), false);
+});
+
+test('a staged transition and its rollback are fsynced, and the rollback restores the exact predecessor bytes', (t) => {
+    reset();
+    const old = { schema: 1, prod: true, workspaceProfile: 'prod', routes: { a: { tools: ['old'], sha256: null } } };
+    gates.writeProdGates(old);
+    const bytes = fs.readFileSync(captureFile);
+    const fsyncs = t.mock.method(fs, 'fsyncSync');
+    const transition = gates.stageProdGates({ ...old, prod: false, routes: { a: { tools: ['new'], sha256: null } } });
+    assert.ok(fsyncs.mock.callCount() >= 2);
+    const staged = fsyncs.mock.callCount();
+    transition.rollback();
+    assert.ok(fsyncs.mock.callCount() >= staged + 2, 'the restored file and its directory were fsynced');
+    assert.deepEqual(fs.readFileSync(captureFile), bytes);
+});
