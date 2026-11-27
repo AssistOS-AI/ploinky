@@ -5,6 +5,7 @@ import { debugLog } from '../utils/utils.js';
 import { resolveAgentLibPath } from '../../agentlib/runtime.mjs';
 import { REPOS_SOURCE_ENV } from '../utils/reposSource.mjs';
 import { PROD_ENV } from '../utils/prodMode.mjs';
+import { ACTIVATION_CONTEXT_ENV } from '../sandbox/activationRecords.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -143,6 +144,9 @@ function populateProcessEnvFromEnvFile(envPath) {
         if (keyName === REPOS_SOURCE_ENV) return;
         // Likewise PROD: only the captured controller value selects it.
         if (keyName === PROD_ENV) return;
+        // Nor the host-issued activation context (Q30): a forged one would admit
+        // a start under the activation barrier marker.
+        if (keyName === ACTIVATION_CONTEXT_ENV) return;
         if (typeof fileValue === 'string' && fileValue.trim().length > 0) {
             if (!process.env[keyName] || !process.env[keyName].trim().length) {
                 //console.log(`Set var: ${keyName}=${fileValue}`)

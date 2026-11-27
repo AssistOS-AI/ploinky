@@ -4,6 +4,7 @@ import { readSecretsFile } from './encryptedSecretsFile.js';
 import { findEnvFile, loadEnvFile } from './masterKey.js';
 import { debugLog } from '../utils.js';
 import { REPOS_SOURCE_ENV } from '../reposSource.mjs';
+import { ACTIVATION_CONTEXT_ENV } from '../../sandbox/activationRecords.mjs';
 
 export function isPublicationHandle(name) {
     return String(name).startsWith('publication/');
@@ -224,6 +225,8 @@ export function injectSecretsToEnv(secrets) {
     for (const [name, value] of Object.entries(secrets)) {
         // Secrets never select the repository source; only the process environment does.
         if (name === REPOS_SOURCE_ENV) continue;
+        // Nor the activation context: only the host's exec environment carries it (Q30).
+        if (name === ACTIVATION_CONTEXT_ENV) continue;
         if (value !== undefined && value !== null) {
             process.env[name] = String(value);
         }
