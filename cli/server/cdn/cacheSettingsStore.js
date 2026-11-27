@@ -34,7 +34,7 @@ export function validCacheRoute(value) {
     return plainObject(value) && Object.keys(value).sort().join() === 'at,by,entry,setting'
         && routeSettings.includes(value.setting)
         && typeof value.at === 'string' && /^\d{4}-\d\d-\d\dT/.test(value.at) && Number.isFinite(Date.parse(value.at))
-        && typeof value.by === 'string' && value.by.trim().length > 0 && Buffer.byteLength(value.by) <= 256
+        && typeof value.by === 'string' && value.by.trim().length > 0 && value.by.length <= 256
         && plainObject(value.entry) && Object.keys(value.entry).sort().join() === 'access,manifest'
         && value.entry.access === 'public' && routeManifestMarks.includes(value.entry.manifest);
 }
