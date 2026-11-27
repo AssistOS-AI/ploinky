@@ -21,7 +21,9 @@ function anonymousCdnHeader(effective, state) {
 
 function choicesFor(entry, overlay) {
     if (entry.mark === 'never' || entry.neverBy !== null) return [];
-    if (entry.record !== null) return ['default'];
+    // Only a bound setting shapes this row. An unbound one is listed on its own stale row, which
+    // offers the reset, so this row offers what applies to the route now.
+    if (entry.bound) return ['default'];
     if (entry.source === 'manifest') return ['off'];
     return entry.mark === null && overlay.hasNever && !entry.publicProtocol ? ['page'] : [];
 }

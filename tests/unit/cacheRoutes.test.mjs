@@ -466,16 +466,26 @@ test('GET lists every public entry with its mark, class, source, CDN header and 
     const record = (setting, manifest) => ({ setting, at: since, by: 'older', entry: { access: 'public', manifest } });
     await setCacheRoute(site, '/site/plain', record('page', 'page'), { dataDir: f.dataDir });
     await setCacheRoute(site, '/site/gone', record('off', 'immutable'), { dataDir: f.dataDir });
+    // An old `off` made when the route was immutable: the route is cached as a page now.
+    await setCacheRoute(site, '/site/page', record('off', 'immutable'), { dataDir: f.dataDir });
     application = await f.site();
-    assert.deepEqual(row(application, '/site/plain').choices, ['default']);
-    assert.equal(row(application, '/site/plain').setting, null);
+    // The entry's own row ignores the unbound setting and offers what applies to the route now.
+    assert.deepEqual(['/site/plain', '/site/page'].map(path => [row(application, path).setting, row(application, path).effective,
+        row(application, path).choices]), [[null, null, ['page']], [null, 'page', ['off']]]);
+    assert.equal(row(application, '/site/page').cdnHeader, 'max-age=120, stale-if-error=900', 'an unbound off does not stop caching');
     const staleRows = application.publicRoutes.filter(entry => entry.stale);
-    assert.deepEqual(staleRows.map(entry => entry.path), ['/site/gone', '/site/plain']);
+    assert.deepEqual(staleRows.map(entry => entry.path), ['/site/gone', '/site/page', '/site/plain']);
     assert.deepEqual(staleRows[0], { path: '/site/gone', manifest: null, neverBy: null, publicProtocol: false,
         setting: { setting: 'off', at: since, by: 'older' }, stale: true, effective: null, source: null, cdnHeader: 'no-store',
         choices: ['default'], checkable: false });
-    assert.equal(staleRows[1].manifest, null);
-    assert.equal(application.publicRoutes.length, 9 + 2);
+    assert.deepEqual(staleRows.slice(1).map(entry => [entry.manifest, entry.choices]), [['page', ['default']], [null, ['default']]]);
+    assert.equal(application.publicRoutes.length, 9 + 3);
+    // Taking the live row's choice replaces the stale setting with a bound one.
+    const taken = await f.request(route('off', '/site/page'));
+    assert.equal(taken.status, 200);
+    const now = row(taken.body.application, '/site/page');
+    assert.deepEqual([now.setting.setting, now.effective, now.choices], ['off', null, ['default']]);
+    assert.deepEqual(taken.body.application.publicRoutes.filter(entry => entry.stale).map(entry => entry.path), ['/site/gone', '/site/plain']);
 });
 
 test('route accepts only what the manifest marks allow and answers each refusal with its own code', async t => {
