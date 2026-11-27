@@ -331,7 +331,10 @@ test('CDN cache policy through the Router HTTP listeners', async t => {
                 assert.deepEqual([headers[cdn], headers[browser], headers.etag], [pagePolicy(60), 'no-cache', undefined]);
                 // An exact unmarked entry still shadows the wildcard.
                 assert.equal((await answer('/shared/own'))[cdn], 'no-store');
-                // A page choice on a public wildcard does not reach a nested guest or authenticated entry.
+                // With a page choice on a public wildcard, the answers from a nested guest or authenticated
+                // entry still reach the CDN as no-store. These answers are not clean 200s (a redirect, a
+                // refusal or a Set-Cookie), so this checks the whole path only; the access check on its own
+                // is covered by "non-public access leaves browser policy to S0" in cdnCacheHeaders.test.mjs.
                 await choose('/static/*', choice('page', null));
                 assert.equal((await answer('/static/a.css'))[cdn], pagePolicy(60));
                 for (const nested of ['/static/guest/x', '/static/secret/x']) {
