@@ -385,16 +385,62 @@ test('a restore start is admitted under the marker; an unadmitted start and a re
     assert.ok(fs.existsSync(activationMarkerPath(workspace)), 'the restore never removes the marker');
 });
 
-// The static inventory. Every call of a lease function under cli/ must name
-// an operation the classifier knows. Sites whose operation is not a literal
-// are resolved below; a new unresolved site fails the scan.
-const LEASE_FUNCTIONS = [
+// The static inventory. Every call of a workspace lease entry point, or of
+// any alias of one, under cli/ and ploinky-box/ must name an operation the
+// classifier knows. Aliases are discovered from the source (injected
+// defaults, `||` fallbacks, object properties, destructuring renames and
+// `this.` fields), so a new alias is scanned without being listed here. Sites
+// whose operation is not a literal are resolved below; a new unresolved site
+// fails the scan.
+const LEASE_ENTRY_POINTS = [
     'createWorkspaceMutationLease', 'acquireWorkspaceMutationLease', 'withHeldOrAcquiredWorkspaceMutationLease',
-    'acquireSettledWorkspaceMutationLease', 'withWorkspaceMutationLease', '_createWorkspaceLease', 'withLease',
-    'acquireWorkspaceLease', 'acquireLease', 'lease', 'withWorkspaceLease', 'createLease', 'withLeaseFn',
-    'withRepositoryLease', 'withImmediateWorkspaceMutationLease',
+    'acquireSettledWorkspaceMutationLease', 'withWorkspaceMutationLease', 'withImmediateWorkspaceMutationLease',
+    'createWorkspaceStartLock',
+    // Repository wrapper whose first argument is the operation.
+    'withRepositoryLease',
 ];
 const FIRST_ARGUMENT_FUNCTIONS = new Set(['withImmediateWorkspaceMutationLease', 'withRepositoryLease']);
+const SCAN_ROOTS = ['cli', 'ploinky-box'];
+
+// Aliases are read from the exact entry points first (assignments,
+// defaults, `||` fallbacks, object properties, destructuring renames,
+// `as` imports and `this.` fields), then followed through plain `=` and
+// `this.` chains. A short generic name (`lease`) is scanned as an alias but
+// never followed, so ordinary code is not swept in.
+function discoverLeaseAliases(sources) {
+    const identifier = /^[A-Za-z_][A-Za-z0-9_]*$/;
+    const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const names = new Set(LEASE_ENTRY_POINTS);
+    const add = (name) => {
+        if (!identifier.test(name) || names.has(name)) return false;
+        names.add(name);
+        return true;
+    };
+    const fromEntries = LEASE_ENTRY_POINTS.map(escape).join('|');
+    const rounds = [
+        [
+            new RegExp(`(?<![\\w$.])([A-Za-z_][\\w]*)\\s*=\\s*(?:[\\w$.?]+\\s*\\|\\|\\s*)?(?:${fromEntries})\\b(?!\\s*\\()`, 'g'),
+            new RegExp(`(?<![\\w$.])([A-Za-z_][\\w]*)\\s*:\\s*(?:[\\w$.?]+\\s*\\|\\|\\s*)?(?:${fromEntries})\\b(?!\\s*\\()`, 'g'),
+            new RegExp(`\\b(?:${fromEntries})\\s*(?::|\\bas\\b)\\s*([A-Za-z_][\\w]*)\\b`, 'g'),
+            new RegExp(`this\\.([A-Za-z_][\\w]*)\\s*=\\s*(?:${fromEntries})\\b(?!\\s*\\()`, 'g'),
+        ],
+    ];
+    for (const source of sources) {
+        for (const pattern of rounds[0]) for (const match of source.matchAll(pattern)) add(match[1]);
+    }
+    for (let changed = true; changed;) {
+        changed = false;
+        const followed = [...names].filter((name) => name.length >= 8).map(escape).join('|');
+        const chains = [
+            new RegExp(`(?<![\\w$.])([A-Za-z_][\\w]*)\\s*=\\s*(?:[\\w$.?]+\\s*\\|\\|\\s*)?(?:${followed})\\b(?!\\s*\\()`, 'g'),
+            new RegExp(`this\\.([A-Za-z_][\\w]*)\\s*=\\s*(?:${followed})\\b(?!\\s*\\()`, 'g'),
+        ];
+        for (const source of sources) {
+            for (const pattern of chains) for (const match of source.matchAll(pattern)) changed = add(match[1]) || changed;
+        }
+    }
+    return names;
+}
 
 // file -> { args (normalized first argument) -> resolution }. A resolution is
 // a list of operations, or 'pass-through' for a wrapper whose callers are
@@ -402,12 +448,20 @@ const FIRST_ARGUMENT_FUNCTIONS = new Set(['withImmediateWorkspaceMutationLease',
 const DYNAMIC_SITES = {
     'cli/utils/runtime/maintenanceLocks.js': {
         lockOptions: 'pass-through', options: 'pass-through', '{ operation }': 'pass-through',
+        '{ ...options, operation: \'workspace-start\' }': { literal: 'workspace-start' },
     },
     'cli/commands/noWaitRunSettlement.js': { '{ operation }': 'pass-through' },
     'cli/commands/repoAgentCommands.js': { options: 'pass-through' },
-    'cli/utils/repositoryUninstall.mjs': { leaseOptions: { literal: 'repositories-uninstall' } },
+    'cli/utils/repositoryUninstall.mjs': { leaseOptions: { literal: 'repositories-uninstall' }, 'options': 'pass-through' },
     'cli/commands/skillsCommands.js': { leaseOptions: { literal: 'repositories-prepare' } },
     'cli/utils/agents.js': { leaseOptions: { caller: /withAgentDisableRetry\('([a-z-]+)'/g } },
+    // The publication lease names its operation through a local constant.
+    'ploinky-box/cloudflared/runtime.mjs': {
+        '{ operation }': { defaultTemplate: /const operation = `(cloudflare-publication:)\$\{/ },
+    },
+    // A browser-session auth lease of the same name: accepted only while the
+    // file references no workspace lease at all.
+    'cli/server/webtty/sessionManager.mjs': { req: 'unrelated' },
     'cli/commands/noWaitWorker.js': {
         '{ operation, waitTimeoutMs: remainingMs, retryIntervalMs: Math.min(1000, boundedPollIntervalMs), }': {
             defaultTemplate: /operation = `(no-wait-runtime:)\$\{/,
@@ -467,14 +521,18 @@ function resolveValue(value, source) {
     return null;
 }
 
-function scanLeaseOperations() {
-    const call = new RegExp(`(?<![\\w.$])(?:this\\.|locks\\.)?(${LEASE_FUNCTIONS.join('|')})\\s*\\(`, 'g');
+function scanLeaseOperations({ root = repoRoot, roots = SCAN_ROOTS } = {}) {
+    const files = roots.flatMap((name) => sourceFiles(path.join(root, name)));
+    const texts = new Map(files.map((file) => [file, fs.readFileSync(file, 'utf8')]));
+    const names = discoverLeaseAliases([...texts.values()].map(stripComments));
+    const call = new RegExp(`(?<![\\w$])(?:[\\w$]+\\.)?(${[...names].join('|')})\\s*\\(`, 'g');
     const operations = new Set();
     const unresolved = [];
-    const cliSource = fs.readFileSync(path.join(repoRoot, 'cli/commands/cli.js'), 'utf8');
-    for (const file of sourceFiles(path.join(repoRoot, 'cli'))) {
-        const relative = path.relative(repoRoot, file).split(path.sep).join('/');
-        const raw = fs.readFileSync(file, 'utf8');
+    const cliFile = path.join(root, 'cli/commands/cli.js');
+    const cliSource = fs.existsSync(cliFile) ? fs.readFileSync(cliFile, 'utf8') : '';
+    for (const file of files) {
+        const relative = path.relative(root, file).split(path.sep).join('/');
+        const raw = texts.get(file);
         const source = stripComments(raw);
         for (const match of source.matchAll(call)) {
             if (/function\s*$/.test(source.slice(Math.max(0, match.index - 16), match.index))) continue;
@@ -504,6 +562,7 @@ function scanLeaseOperations() {
             if (!resolved) {
                 const known = DYNAMIC_SITES[relative]?.[first];
                 if (known === 'pass-through') continue;
+                if (known === 'unrelated' && !/WorkspaceMutationLease|maintenanceLocks/.test(raw)) continue;
                 if (known?.literal && raw.includes(`operation: '${known.literal}'`)) resolved = [known.literal];
                 else if (known?.caller) resolved = [...raw.matchAll(known.caller)].map((caller) => caller[1]);
                 else if (known?.defaultTemplate && known.defaultTemplate.test(raw)) resolved = [`${known.defaultTemplate.exec(raw)[1]}*`];
@@ -512,10 +571,10 @@ function scanLeaseOperations() {
             else resolved.forEach((operation) => operations.add(operation));
         }
     }
-    return { operations: [...operations].sort(), unresolved };
+    return { operations: [...operations].sort(), unresolved, aliases: [...names].sort() };
 }
 
-test('the static lease inventory of cli/ is complete and fully classified', (t) => {
+test('the static lease inventory of cli/ and ploinky-box/ is complete and fully classified', (t) => {
     const { operations, unresolved } = scanLeaseOperations();
     const expected = [...ACTIVATION_BARRIER_DENY, ...ACTIVATION_BARRIER_ADMIT].sort();
     const report = `expected (DENY + ADMIT): ${JSON.stringify(expected)}\ncurrent (lease call sites): ${JSON.stringify(operations)}`;
@@ -547,4 +606,31 @@ test('a malformed marker is refused with M9 wording that points at stop, not at 
         assert.doesNotMatch(error.message, /Run `ploinky restart`/);
         return true;
     });
+});
+
+// P2 negative control: the same scan over a fixture tree with a planted lease
+// behind an injected alias must fail on its unclassified and its unresolved
+// operation.
+test('the inventory scan fails on a planted unclassified or unresolved lease behind an alias', (t) => {
+    const fixture = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-lease-scan-control-')));
+    t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(fixture, 'cli'), { recursive: true });
+    fs.mkdirSync(path.join(fixture, 'ploinky-box', 'daemon'), { recursive: true });
+    fs.writeFileSync(path.join(fixture, 'ploinky-box', 'daemon', 'planted.mjs'), [
+        "import { createWorkspaceMutationLease } from '../../cli/utils/runtime/maintenanceLocks.js';",
+        'export function startDaemon({ takeLease = createWorkspaceMutationLease } = {}) {',
+        "    takeLease({ operation: `q30-planted-daemon:${Date.now()}` });",
+        '}',
+        'class Store {',
+        '    constructor() { this._leaseOf = takeLease; }',
+        '    write(name) { return this._leaseOf({ operation: name }); }',
+        '}',
+        '',
+    ].join('\n'));
+    const { operations, unresolved, aliases } = scanLeaseOperations({ root: fixture });
+    assert.ok(aliases.includes('takeLease'), 'the injected default alias is discovered');
+    assert.ok(aliases.includes('_leaseOf'), 'the field alias is followed');
+    assert.ok(operations.includes('q30-planted-daemon:*'));
+    assert.equal(classifyLeaseOperation('q30-planted-daemon:sample'), 'unknown', 'it would fail the inventory');
+    assert.deepEqual(unresolved, ['ploinky-box/daemon/planted.mjs:7 _leaseOf({ operation: name })']);
 });
