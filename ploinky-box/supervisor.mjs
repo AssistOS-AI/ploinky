@@ -1121,7 +1121,7 @@ export function createBoxSupervisor({
             // Box is reconciled.
             const guarded = activationGuard(identity, lock, ownership);
             if (guarded) {
-                if (!readOnly) throw guarded.unreadable ? unreadableBarrierRefusal(guarded.unreadable) : activationBarrierRefusal(guarded);
+                if (!readOnly) throw guarded.unreadable ? unreadableBarrierRefusal(identity, guarded.unreadable) : activationBarrierRefusal(guarded);
                 return inspectOnlyGenericBox(identity, ownership, {
                     reason: guarded.unreadable
                         ? `the activation recovery record could not be read (${guarded.unreadable.message})`
@@ -2234,35 +2234,49 @@ export function createBoxSupervisor({
 
     // After an admitted settle restart: remove the barrier it settled, only
     // if it is still that barrier (the in-Box commit removed the marker).
+    // The host record goes only once no in-Box guard is left: while the record
+    // stays, `ploinky stop` can still unlink the marker. No marker may outlive
+    // every host-side remover.
     function settleActivationBarrier(identity, settled, { engine, containerId } = {}) {
+        let current;
         try {
-            const current = updateStore(identity).read('update-recovery', identity.instance);
-            if (!isActivationBarrier(current, identity) || current.operationId !== settled.operationId) {
-                stderr?.write?.('[ploinky] Warning: the activation recovery record changed during the settle restart; it was kept\n');
+            current = updateStore(identity).read('update-recovery', identity.instance);
+        } catch (error) {
+            stderr?.write?.(`[ploinky] Warning: the settled activation recovery record could not be read: ${error.message}\n`);
+            return;
+        }
+        if (!isActivationBarrier(current, identity) || current.operationId !== settled.operationId) {
+            stderr?.write?.('[ploinky] Warning: the activation recovery record changed during the settle restart; it was kept\n');
+            return;
+        }
+        // The in-Box commit removes the settled marker. The record names only
+        // this barrier, so any marker still present is stale: the settled one
+        // (its removal failed) or a writer marker of a converted settle.
+        // Remove it through the Box by its own operation id.
+        const marker = readActivationBarrierMarker({ workspaceRoot: identity.workspaceRoot });
+        const kept = (what) => stderr?.write?.(`[ploinky] Warning: ${what}; the activation recovery record was kept; run \`ploinky stop\` `
+            + 'to clear both\n');
+        if (marker.state === 'malformed') {
+            kept('an unreadable in-Box activation guard remains');
+            return;
+        }
+        if (marker.state === 'present') {
+            const problem = removeActivationBarrierMarkerThroughBox({
+                runner, engine, containerId, workspaceRoot: identity.workspaceRoot, operationId: marker.marker.operationId,
+            });
+            if (problem) {
+                kept(`the in-Box guard ${shortId(marker.marker.operationId)} could not be removed (${problem})`);
                 return;
             }
+        }
+        try {
             updateStore(identity).remove('update-recovery', identity.instance);
-            stdout?.write?.(`[ploinky] Activation recovery settled: the earlier ${settled.operation} (${shortId(settled.operationId)}) `
-                + 'was superseded by this restart.\n');
         } catch (error) {
             stderr?.write?.(`[ploinky] Warning: the settled activation recovery record could not be removed: ${error.message}\n`);
             return;
         }
-        // The in-Box commit removes the settled marker. If it could not (its
-        // removal failed, or a conversion left a writer marker), remove the
-        // marker of exactly this operation through the Box.
-        const marker = readActivationBarrierMarker({ workspaceRoot: identity.workspaceRoot });
-        if (marker.state === 'present' && marker.marker.operationId === settled.operationId) {
-            const problem = removeActivationBarrierMarkerThroughBox({
-                runner, engine, containerId, workspaceRoot: identity.workspaceRoot, operationId: settled.operationId,
-            });
-            if (problem) {
-                stderr?.write?.(`[ploinky] Warning: the settled in-Box guard could not be removed (${problem}); in-Box changes stay `
-                    + 'refused until `ploinky stop`\n');
-            }
-        } else if (marker.state === 'malformed') {
-            stderr?.write?.('[ploinky] Warning: an unreadable in-Box activation guard remains; in-Box changes stay refused until `ploinky stop`\n');
-        }
+        stdout?.write?.(`[ploinky] Activation recovery settled: the earlier ${settled.operation} (${shortId(settled.operationId)}) `
+            + 'was superseded by this restart.\n');
     }
 
     // M4.
@@ -2324,11 +2338,13 @@ export function createBoxSupervisor({
         }
     }
 
-    function unreadableBarrierRefusal(error) {
+    function unreadableBarrierRefusal(identity, error) {
+        const recordFile = path.join(identity.hostStateRoot || path.join(identity.workspaceRoot, '.ploinky-box'),
+            'update-recovery', `${identity.instance}.json`);
         const refusal = new PloinkyBoxError(
             `The workspace's activation recovery record could not be read (${error?.message || error}); no new mutation was `
-            + 'started. Repair or remove the record, or run `ploinky stop`, then run the command again. '
-            + `[${ACTIVATION_RECOVERY_CODE}]`,
+            + `started. \`ploinky stop\` does not clear an unreadable record: repair or remove ${recordFile} by hand, then run the `
+            + `command again. [${ACTIVATION_RECOVERY_CODE}]`,
             { code: ACTIVATION_RECOVERY_CODE },
         );
         refusal.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
@@ -2501,8 +2517,24 @@ export function createBoxSupervisor({
         const settled = isActivationBarrier(activation.settles, identity) ? activation.settles : null;
         if (decision.verdict === 'rollback' && settled) {
             // A settle restart that did not publish leaves the barrier it was
-            // settling in force: put barrier and marker back (S2-F2).
-            const barrierProblem = writeActivationBarrier(identity, settled);
+            // settling in force (S2-F2). Restore it on the writer's live Box,
+            // which a replacement may have changed: first its marker, through
+            // that Box (it replaces the settle's writer marker), then the
+            // record naming that Box. Until both are back the writer record
+            // stays, so `ploinky stop` can still clear the marker.
+            const restored = { ...settled, containerId: barrier.containerId };
+            const markerProblem = installActivationMarker(identity, ownership.engine, restored, settled.state);
+            if (markerProblem) {
+                const error = new PloinkyBoxError(
+                    `An earlier settle restart (${shortId(activation.operationId)}) is confirmed stopped, but the in-Box guard of the `
+                    + `earlier ${settled.operation} (${shortId(settled.operationId)}) could not be restored (${markerProblem}); no new `
+                    + 'mutation was started. Run `ploinky stop`, then run the command again.',
+                    { code: 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED' },
+                );
+                error.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
+                throw error;
+            }
+            const barrierProblem = writeActivationBarrier(identity, restored);
             if (barrierProblem) {
                 const error = new PloinkyBoxError(
                     `An earlier settle restart (${shortId(activation.operationId)}) is confirmed stopped, but the activation recovery `
@@ -2513,14 +2545,12 @@ export function createBoxSupervisor({
                 error.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
                 throw error;
             }
-            const markerProblem = installActivationMarker(identity, ownership.engine, settled, settled.state);
             return Object.freeze({
                 verdict: 'settle-not-published',
-                record: settled,
+                record: restored,
                 warning: `an earlier settle restart (${shortId(activation.operationId)}) that could not be proven stopped is now `
                     + `confirmed stopped and had not published; the earlier ${settled.operation} (${shortId(settled.operationId)}) `
-                    + 'still needs settling'
-                    + (markerProblem ? `, and its in-Box guard could not be restored (${markerProblem})` : ''),
+                    + 'still needs settling',
             });
         }
         if (decision.verdict === 'rollback') {

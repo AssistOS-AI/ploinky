@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { writeActivationIntent, writeActivationReceipt } from '../../cli/sandbox/activationRecords.mjs';
+import { buildActivationBarrierMarker, writeActivationIntent, writeActivationReceipt } from '../../cli/sandbox/activationRecords.mjs';
 import { sealEdgeSelector, selectorIdentity } from '../../cli/sandbox/edgeSelectorRecord.mjs';
 import { classifyFailedActivation, postStopSelectorBound, readActivationEvidence } from '../../ploinky-box/activationRecovery.mjs';
 import { isReadOnlyGeneric } from '../../ploinky-box/command/route.mjs';
@@ -285,6 +285,7 @@ function world(t, {
         // The workspace's currently owned Box and the engine status of each id.
         ownedId: BOX,
         statusOf: null,
+        markerExecFails: null,
     };
     const ownership = (running, id = state.ownedId) => ({
         state: 'owned',
@@ -326,9 +327,20 @@ function world(t, {
             if (args.includes('/opt/ploinky/ploinky-box/entrypoint/activation-barrier-marker.mjs')) {
                 const action = args.at(-1);
                 const payload = JSON.parse(options.input);
-                events.push(['marker', action, payload.state ?? null, payload.operationId]);
-                if (action === 'write') fs.writeFileSync(markerFile, options.input, { mode: 0o600 });
-                else fs.rmSync(markerFile, { force: true });
+                const execBox = args[args.indexOf('node') - 1];
+                events.push(['marker', action, payload.state ?? null, payload.operationId, execBox]);
+                if (state.markerExecFails?.(execBox)) return { ok: false, status: 125, stderr: 'Error: no such container' };
+                if (action === 'write') {
+                    fs.writeFileSync(markerFile, options.input, { mode: 0o600 });
+                } else if (fs.existsSync(markerFile)) {
+                    // As the entrypoint: only the named operation's marker is removed.
+                    let current = null;
+                    try { current = JSON.parse(fs.readFileSync(markerFile, 'utf8')); } catch (_) {}
+                    if (current?.operationId !== payload.operationId) {
+                        return { ok: false, status: 1, stderr: 'The activation barrier marker belongs to another operation; it was kept' };
+                    }
+                    fs.rmSync(markerFile, { force: true });
+                }
                 return { ok: true, stdout: `${JSON.stringify({ digest: crypto.createHash('sha256').update(options.input).digest('hex') })}\n` };
             }
             return { ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: state.graph.configured }) };
@@ -607,7 +619,7 @@ test('H9: an unconfirmed writer leaves a writer barrier that converts, refuses, 
     assert.equal(converted.schema, 'ploinky-activation-recovery');
     assert.equal(converted.state, 'activated');
     assert.equal(converted.operationId, writer.nonce);
-    assert.deepEqual(markerCalls(fixture.events, 'write').at(-1).slice(2), ['activated', writer.nonce]);
+    assert.deepEqual(markerCalls(fixture.events, 'write').at(-1).slice(2, 4), ['activated', writer.nonce]);
     assert.equal(coreCalls(fixture.events).length, before);
     // A later start is refused; a whole restart settles.
     await assert.rejects(fixture.supervisor.runStartTransaction(['start', 'agent']), { code: CODE });
@@ -1090,4 +1102,104 @@ test('status prints the activation signal for a writer barrier that carries an a
     const plain = { ...writer, activation: undefined };
     assert.equal(formatUpdateStateLines({ recoveryBarrier: plain }).some((line) => line.startsWith('Activation recovery required:')), false);
     assert.equal(isActivationRecoveryBarrier(plain), false);
+});
+
+// --- Delta review D1: no in-Box marker may outlive every host-side remover --
+
+function uncertainSettle() {
+    return ({ workspace }) => {
+        writeLive(workspace, inactive({ generation: GEN_OLD, previousGeneration: GEN_NEW, reason: 'cli-workspace-restart' }));
+        return exitRun(1, { quiescence: 'uncertain' });
+    };
+}
+
+function placeMarker(fixture, { operationId, state = 'writer' }) {
+    const marker = buildActivationBarrierMarker({ operation: 'restart', operationId, state, containerId: BOX });
+    fs.writeFileSync(fixture.markerFile, JSON.stringify(marker), { mode: 0o600 });
+}
+
+test('D1: an uncertain settle that replaced the Box restores barrier A on the live Box, and the settle leaves no marker', async (t) => {
+    const fixture = await heldBarrier(t);
+    const held = structuredClone(barrierOf(fixture));
+    fixture.prepared.action = 'replaced';
+    fixture.prepared.ownership = { ...fixture.prepared.ownership, handles: { container: { id: REPLACED_BOX, runtime: { running: true, status: 'running' } } } };
+    fixture.state.inBox = uncertainSettle();
+    await assert.rejects(fixture.supervisor.runRestartTransaction(['restart']), { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' });
+    const writer = barrierOf(fixture);
+    assert.equal(writer.containerId, REPLACED_BOX);
+    assert.equal(writer.activation.settles.operationId, held.operationId);
+    // The old Box is gone; the replacement is the workspace's running Box.
+    fixture.state.ownedId = REPLACED_BOX;
+    fixture.state.statusOf = (id) => (id === REPLACED_BOX ? 'running' : 'absent');
+    fixture.state.markerExecFails = (id) => id !== REPLACED_BOX;
+    await assert.rejects(fixture.supervisor.runStartTransaction(['start', 'agent']), { code: CODE });
+    assert.equal(barrierOf(fixture).operationId, held.operationId);
+    assert.equal(barrierOf(fixture).containerId, REPLACED_BOX, 'barrier A now names the live Box');
+    assert.equal(JSON.parse(fs.readFileSync(fixture.markerFile, 'utf8')).operationId, held.operationId, 'marker A was installed through the live Box');
+    fixture.state.inBox = inBoxPublishes({ status: 0 });
+    await fixture.supervisor.runRestartTransaction(['restart']);
+    assert.equal(coreCalls(fixture.events).at(-1)[2].settlesOperationId, held.operationId);
+    assert.equal(barrierOf(fixture), null);
+    assert.equal(fs.existsSync(fixture.markerFile), false, 'no marker outlives the settled record');
+});
+
+test('D1: a failed marker exec while restoring barrier A keeps the writer record, so stop still clears the marker', async (t) => {
+    const fixture = await heldBarrier(t);
+    fixture.state.inBox = uncertainSettle();
+    await assert.rejects(fixture.supervisor.runRestartTransaction(['restart']), { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' });
+    const writer = structuredClone(barrierOf(fixture));
+    fixture.state.markerExecFails = () => true;
+    await assert.rejects(fixture.supervisor.runStartTransaction(['start', 'agent']), (error) => {
+        assert.equal(error.code, 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED');
+        assert.match(error.message, /the in-Box guard of the earlier restart \([0-9a-f]{8}\) could not be restored/);
+        return true;
+    });
+    assert.deepEqual(barrierOf(fixture), writer, 'the writer record is kept');
+    assert.ok(fs.existsSync(fixture.markerFile));
+    fixture.state.discoveredRunning = true;
+    fixture.state.boxStatus = 'exited';
+    await fixture.supervisor.runStopTransaction();
+    assert.equal(barrierOf(fixture), null);
+    assert.equal(fs.existsSync(fixture.markerFile), false);
+});
+
+test('D1: a settle removes a leftover marker of another operation, or keeps its record so stop can clear it', async (t) => {
+    const removable = await heldBarrier(t);
+    placeMarker(removable, { operationId: '8'.repeat(32) });
+    removable.state.inBox = inBoxPublishes({ status: 0 });
+    await removable.supervisor.runRestartTransaction(['restart']);
+    assert.deepEqual(markerCalls(removable.events, 'remove').map((event) => event[3]), ['8'.repeat(32)]);
+    assert.equal(fs.existsSync(removable.markerFile), false);
+    assert.equal(barrierOf(removable), null);
+    assert.match(removable.stdout.value(), /Activation recovery settled/);
+
+    for (const [label, prepare] of [
+        ['unremovable', (fixture) => { placeMarker(fixture, { operationId: '8'.repeat(32) }); fixture.state.markerExecFails = () => true; }],
+        ['malformed', (fixture) => { fs.writeFileSync(fixture.markerFile, 'not json', { mode: 0o600 }); }],
+    ]) {
+        const fixture = await heldBarrier(t);
+        const held = structuredClone(barrierOf(fixture));
+        prepare(fixture);
+        fixture.state.inBox = inBoxPublishes({ status: 0 });
+        await fixture.supervisor.runRestartTransaction(['restart']);
+        assert.deepEqual(barrierOf(fixture), held, `${label}: the record is kept while the marker remains`);
+        assert.match(fixture.stderr.value(), /the activation recovery record was kept; run `ploinky stop`/, label);
+        assert.doesNotMatch(fixture.stdout.value(), /Activation recovery settled/, label);
+        fixture.state.discoveredRunning = true;
+        fixture.state.boxStatus = 'exited';
+        await fixture.supervisor.runStopTransaction();
+        assert.equal(barrierOf(fixture), null, label);
+        assert.equal(fs.existsSync(fixture.markerFile), false, `${label}: stop unlinked it`);
+    }
+});
+
+test('the unreadable-record refusal names the record file to repair', async (t) => {
+    const backing = createMemoryUpdateHostState();
+    const store = { ...backing, read(kind, name) { if (kind === 'update-recovery') throw new Error('corrupt'); return backing.read(kind, name); } };
+    const fixture = world(t, { store });
+    await assert.rejects(fixture.supervisor.prepareBoxForCommand(), (error) => {
+        assert.match(error.message, /\.ploinky-box\/update-recovery\/ploinky-box-[^ ]+\.json/);
+        assert.doesNotMatch(error.message, /run `ploinky stop`, then run the command again/);
+        return true;
+    });
 });
