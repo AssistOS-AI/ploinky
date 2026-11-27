@@ -1,3 +1,5 @@
+import { browserCodingSessions, validateCodingSessionRequest, codingSessionReadiness } from '../webtty/codingSessions.mjs';
+import { workerOutput } from '../webtty/supervisedPairs.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -134,7 +136,7 @@ function validateDimensions(cols, rows) {
 }
 
 function sessionPath(pathname) {
-    const match = pathname.match(/^\/webtty\/sessions\/([A-Za-z0-9_-]{16,128})(?:\/(stream|input|resize|close-policy|close-intents))?$/);
+    const match = pathname.match(/^\/webtty\/sessions\/([A-Za-z0-9_-]{16,128})(?:\/(stream|input|resize|close-policy|close-intents|output))?$/);
     return match ? { id: match[1], operation: match[2] || '' } : null;
 }
 
@@ -223,7 +225,45 @@ export async function handleWebtty(req, res, parsedUrl, {
         return true;
     }
 
+    if (pathname === '/webtty/coding-sessions/readiness' && method === 'GET') {
+        if (parsedUrl.search) { sendError(res, 400, 'invalid_readiness_request'); return true; }
+        try { sendJson(res, 200, await codingSessionReadiness(manager, req, routePlan)); }
+        catch (error) { mapOperationError(res, error); }
+        return true;
+    }
+
     if (!requireAvailable(manager, res)) return true;
+
+    if (pathname === '/webtty/coding-sessions' && method === 'POST') {
+        if (!verifyMutationBeforeBody(req, res, routePlan)) return true;
+        try {
+            const body = await readJsonBody(req, 8192);
+            if (parsedUrl.search || !validateCodingSessionRequest(body)) {
+                sendError(res, 400, 'invalid_coding_session_request'); return true;
+            }
+            const result = await browserCodingSessions(manager, req, routePlan, body);
+            sendJson(res, 200, result);
+        } catch (error) {
+            if (error.code?.startsWith('CODING_SESSIONS_')) sendJson(res, 409, { ok: false, error: error.code, message: error.message });
+            else mapOperationError(res, error);
+        }
+        return true;
+    }
+
+    if (pathname === '/webtty/supervised-pairs' && method === 'POST') {
+        if (!verifyMutationBeforeBody(req, res, routePlan)) return true;
+        try {
+            const body = await readJsonBody(req, 2048);
+            if (parsedUrl.search) { sendError(res, 400, 'invalid_supervised_request'); return true; }
+            if (!commitMutation(routePlan, res)) return true;
+            const result = exactBodyKeys(body, ['remove']) && typeof body.remove === 'string'
+                ? await manager.supervisedPairs.remove(req, routePlan, body.remove)
+                : await manager.supervisedPairs.register(req, routePlan, body);
+            sendJson(res, 200, result);
+        } catch (error) { mapOperationError(res, error); }
+        return true;
+    }
+
 
     const attachTokenPath = pathname.match(/^\/webtty\/live-sessions\/([A-Za-z0-9_-]{32})\/attach-tokens$/);
     if ((attachTokenPath || pathname === '/webtty/attachments') && method === 'POST') {
@@ -420,6 +460,16 @@ export async function handleWebtty(req, res, parsedUrl, {
         if (!attached && !res.writableEnded && !res.destroyed) {
             try { res.end(); } catch (_) { }
         }
+        return true;
+    }
+
+    if (selected.operation === 'output' && method === 'GET') {
+        try {
+            const session = await manager.authorize(req, routePlan, selected.id, 'watch');
+            if (!session) { sendError(res, 404, 'not_found'); return true; }
+            if (!commitMutation(routePlan, res)) return true;
+            sendJson(res, 200, workerOutput(session, manager.now()));
+        } catch (error) { mapOperationError(res, error); }
         return true;
     }
 

@@ -106,7 +106,7 @@ Use a new export directory if those output files already exist; exports refuse t
 
 The written per-row review of the 2026-10-08 router source reference additions is [router-reference-review-2026-10-08.md](router-reference-review-2026-10-08.md). The 2026-10-22 additions for WebTTY home profiles, server views and close policy are reviewed in [router-reference-review-2026-10-22.md](router-reference-review-2026-10-22.md). The 2026-10-26 additions for `RoutingServer.js`, `marketplaceRoutes.js` and the new `edgeRoutePlan.js` family, including the merged marketplace source, are reviewed in [router-reference-review-2026-10-26.md](router-reference-review-2026-10-26.md).
 
-The 2026-11-24 master drift, Cloudflare cache and browser entry registrations are recorded in [router-reference-review-2026-11-24.md](router-reference-review-2026-11-24.md). The combined canary and master registrations are recorded in [router-reference-review-2026-11-24-canary-merge.md](router-reference-review-2026-11-24-canary-merge.md).
+The 2026-11-24 master drift, Cloudflare cache and browser entry registrations are recorded in [router-reference-review-2026-11-24.md](router-reference-review-2026-11-24.md). The combined canary and master registrations are recorded in [router-reference-review-2026-11-24-canary-merge.md](router-reference-review-2026-11-24-canary-merge.md). The 2026-11-27 canary and master merge registrations are recorded in [router-reference-review-2026-11-27-canary-merge.md](router-reference-review-2026-11-27-canary-merge.md).
 
 The [2026-11-23 review](router-reference-review-2026-11-23.md) records the canary status authorization and the five source mappings reviewed with it.
 

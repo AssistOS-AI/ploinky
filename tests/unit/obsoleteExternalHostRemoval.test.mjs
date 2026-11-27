@@ -37,7 +37,10 @@ const SEARCH_ROOTS = ['cli', 'ploinky-box', 'tests/unit', 'README.md'];
 const BASE_FILES = {
     // Includes the authenticated-request event wiring and the S1 primary-only
     // auth-owner lookup. Keep the exact-file guard for the reviewed source.
-    'cli/server/authHandlers/authContext.js': 'dcb5d78b57d66df43e3c01a55c6428d93bed7a9988f74b966e2395d737be474c',
+    // Re-pinned for the merged master change: persistent SSO cookie renewal,
+    // the lease commit before an SSO session is admitted, and the session-aware
+    // cookie max age.
+    'cli/server/authHandlers/authContext.js': 'aa85b282657be89fa944dbad21d2d59e7f05e367ceee7253813cf08c6ad841f7',
     // Re-pinned for the Q30 publication lease deferral under an activation
     // barrier (no unhandled rejection from a scan or retry; a retry whose
     // lease or selector load fails unexpectedly, or whose invalid-generation

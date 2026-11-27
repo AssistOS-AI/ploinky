@@ -3121,7 +3121,7 @@ const SHELL_ROW_KEYS = [
     'isOwner', 'ownerLabel', 'viewerCount', 'startedAt', 'lastActivityAt', 'capabilities', 'attach',
 ];
 const SHELL_OPTIONAL_KEYS = [
-    'endedAt', 'exitReason', 'closePolicy', 'pendingStopUntil', 'ownerViewOpen', 'profileLabel',
+    'lastOutputAt', 'endedAt', 'exitReason', 'closePolicy', 'pendingStopUntil', 'ownerViewOpen', 'profileLabel',
     'profileProvider', 'profileId', 'cwd', 'closure', 'closureScope', 'recordCleanup',
 ];
 
@@ -5027,4 +5027,24 @@ test('startup cancellation after the directory receipt journals the mutation, st
         assert.equal(manager.quarantinedAgentTargets.size, released ? 0 : 1, label);
         assert.equal(manager.agentProviderReady, true, label);
     }
+});
+
+
+test('worker output clock excludes input, resize and empty output', async t => {
+    let clock = 3000;
+    const worker = new FakeWorker();
+    const manager = await createManager(t, { now: () => clock, workerFactory: () => worker });
+    await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+    const session = [...manager.sessions.values()][0];
+    assert.equal(session.lastOutputAt, null);
+    clock++;
+    worker.emit('output', { sequence: 1, data: 'working' });
+    assert.equal(session.lastOutputAt, 3001);
+    clock++;
+    await manager.input(session, 'hello');
+    await manager.resize(session, 100, 30);
+    worker.emit('output', { sequence: 2, data: '' });
+    assert.equal(session.lastOutputAt, 3001);
+    assert.equal(session.lastActivityAt, clock);
+    assert.equal(manager.displayRow(session, session.owner.principal).lastOutputAt, 3001);
 });

@@ -1208,3 +1208,76 @@ test('retained view refusals keep the existing 401/403/503 mapping with the real
     assert.equal(res.body, EXIT_EVENT);
     assert.equal(f.record().closure, 'proven');
 });
+
+test('worker output tail requires watch authorization and bounds clean UTF-8 output', async () => {
+    const routePlan = plan();
+    const url = `/webtty/sessions/${'a'.repeat(32)}/output`;
+    const res = new MockResponse();
+    await handleWebtty(request({ routePlan, url, method: 'GET' }).req, res, new URL(url, 'https://app.example.test'), {
+        routePlan, manager: manager({
+            async authorize(_req, _plan, _id, mode) {
+                assert.equal(mode, 'watch');
+                return { recentOutput: '\u001b[31m' + ('old\n'.repeat(110)) + 'ü'.repeat(12000) + '\u001b[0m', lastOutputAt: 1000 };
+            }, now: () => 12000,
+        }),
+    });
+    assert.equal(res.statusCode, 200);
+    const result = JSON.parse(res.body);
+    assert.equal(result.running, true);
+    assert.equal(result.silentForSeconds, 11);
+    assert.equal(result.truncated, true);
+    assert.ok(Buffer.byteLength(result.recentOutput) <= 16384);
+    assert.ok(result.recentOutput.split('\n').length <= 100);
+    assert.ok(!/[\u001b\ufffd]/u.test(result.recentOutput));
+    const denied = new MockResponse();
+    await handleWebtty(request({ routePlan, url, method: 'GET' }).req, denied, new URL(url, 'https://app.example.test'), {
+        routePlan, manager: manager({ async authorize() { throw Object.assign(new Error('private'), { code: 'WEBTTY_SESSION_NOT_FOUND' }); } }),
+    });
+    assert.equal(denied.statusCode, 404);
+    assert.ok(!denied.body.includes('recentOutput'));
+});
+
+test('server supervision registration requires the normal mutation proof and delegates only after admission', async () => {
+    const routePlan = plan();
+    const url = '/webtty/supervised-pairs';
+    let registered = 0;
+    const value = { id: 'pair', supervisor: 's'.repeat(32), worker: 'w'.repeat(32), controlId: 'c', interruptInput: null };
+    const service = manager({ supervisedPairs: { async register(_req, _plan, body) {
+        registered++; assert.deepEqual(body, value); return { ok: true };
+    } } });
+    for (const csrf of [false, true]) {
+        const res = new MockResponse();
+        await handleWebtty(request({ routePlan, url, body: value, csrf }).req, res, new URL(url, 'https://app.example.test'), { manager: service, routePlan });
+        assert.equal(res.statusCode, csrf ? 200 : 403);
+    }
+    assert.equal(registered, 1);
+});
+
+test('browser coding-session endpoint refuses non-admins, missing mutation proof and invalid bodies', async () => {
+    const routePlan = plan();
+    for (const mode of ['member', 'proof', 'body']) {
+        const input = request({ routePlan, url: '/webtty/coding-sessions', body: { action: 'robots', dir: '', extra: true }, csrf: mode !== 'proof' });
+        if (mode === 'member') input.req.user = { id: 'member', roles: ['user'] };
+        const res = new MockResponse();
+        await handleWebtty(input.req, res, new URL('https://app.example.test/webtty/coding-sessions'), {
+            routePlan, manager: manager({ validatedLease() { assert.fail('invalid request reached orchestration'); } }),
+        });
+        assert.equal(res.statusCode, mode === 'body' ? 400 : 403);
+        if (mode !== 'body') assert.equal(input.wasConsumed(), false);
+    }
+});
+
+test('coding readiness returns a normal waiting response during startup and remains admin-only', async () => {
+    const routePlan = plan();
+    const url = '/webtty/coding-sessions/readiness';
+    const { req } = request({ method: 'GET', url, routePlan, csrf: false });
+    const unavailable = manager({ validatedLease: async () => ({}), availability: () => ({ ok: false }) });
+    const res = new MockResponse();
+    await handleWebtty(req, res, new URL(url, 'https://app.example.test'), { manager: unavailable, routePlan });
+    assert.equal(res.statusCode, 200);
+    assert.equal(JSON.parse(res.body).ready, false);
+    req.user.roles = ['user'];
+    const denied = new MockResponse();
+    await handleWebtty(req, denied, new URL(url, 'https://app.example.test'), { manager: unavailable, routePlan });
+    assert.equal(denied.statusCode, 403);
+});

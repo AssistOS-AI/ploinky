@@ -2,13 +2,24 @@ import { hasHardwareBearer } from './hardwareLimitsRoutes.mjs';
 import { isSessionRevoked } from '../auth/sessionRevocations.js';
 import { readEdgeRoutingSelection } from '../../sandbox/edgeGeneration.js';
 import { cachePublishedHosts, configuredCacheHosts } from '../cdn/cachePurgeConfig.js';
-import { isApplicationHeld, markedApplications } from '../cdn/cacheHold.js';
-import { readCacheSettings, setCacheApplication, validCacheApplication } from '../cdn/cacheSettingsStore.js';
+import { isApplicationHeld, markedApplications, routeOrigin } from '../cdn/cacheHold.js';
+import { readCacheSettings, setCacheApplication, setCacheRoute, validCacheApplication, validCachePath } from '../cdn/cacheSettingsStore.js';
 import { purgeCacheHost, readLastPurge } from '../cdn/cachePurge.js';
+import { applicationOverlay, publicRouteRows } from '../cdn/cacheRouteModel.js';
+import { applicationCacheState } from '../cdn/cacheSettings.js';
+import { checkCacheRoute, takeCheckSlot } from '../cdn/cacheCheck.js';
+import { resolveEdgeRoutePlan } from '../edgeRoutePlan.js';
+
+const routeSettingValues = ['off', 'page', 'default'];
 
 function validRequest(body) {
     if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
     if (body.op === 'purge') return Object.keys(body).length === 2 && typeof body.host === 'string' && body.host.length > 0;
+    if (body.op === 'route' || body.op === 'check') {
+        return Object.keys(body).length === (body.op === 'route' ? 4 : 3)
+            && typeof body.agent === 'string' && body.agent.length > 0 && validCachePath(body.path)
+            && (body.op === 'check' || routeSettingValues.includes(body.setting));
+    }
     return body.op === 'set' && Object.keys(body).length === 4
         && typeof body.agent === 'string' && body.agent.length > 0
         && validCacheApplication(body);
@@ -30,17 +41,32 @@ function configuredHosts(listConfigured, generation, published, strict) {
     }
 }
 
-function applicationEntry({ agent, routes }, settings, hosts, generation, getCanaryHold) {
+function applicationEntry({ agent, routes }, settings, hosts, generation, getCanaryHold, checkable) {
     const { enabled, pageSeconds } = settings.applications[agent] || { enabled: false, pageSeconds: 300 };
     const hold = settings.held[agent] || (isApplicationHeld(agent, { generation, settings }) ? getCanaryHold() : null);
+    const overlay = applicationOverlay(generation, agent, settings);
     return { agent, enabled, pageSeconds, held: hold ? { since: hold.since, by: hold.by } : null,
-        routes: routes.map(({ path, cache }) => ({ path, cache })), hosts };
+        routes: routes.map(({ path, cache }) => ({ path, cache })), hosts,
+        adminChoices: overlay.hasNever,
+        publicRoutes: publicRouteRows(overlay, settings, agent, generation, checkable) };
+}
+
+// True when the application could have been cached before a write: its switch was
+// on and some route's class was immutable, or page while the application was not held.
+function couldHaveCached(agent, settings, generation, only) {
+    const state = applicationCacheState(agent, settings, generation);
+    if (!state.enabled) return false;
+    return applicationOverlay(generation, agent, settings).entries.some(entry =>
+        (only === undefined || entry.path === only)
+        && (entry.effective === 'immutable' || (entry.effective === 'page' && !state.held)));
 }
 
 export async function handleCacheRoutes(req, res, parsedUrl, {
     routePlan, ensureAdmin, verifyMutation, readBody, readSelection = readEdgeRoutingSelection,
     listPublished = cachePublishedHosts, listConfigured = configuredCacheHosts, listMarked = markedApplications,
     readSettings = readCacheSettings, setApplication = setCacheApplication, lastPurge = readLastPurge, purge = purgeCacheHost,
+    setRoute = setCacheRoute, planRequest = resolveEdgeRoutePlan, checkOrigin = checkCacheRoute,
+    checkSlot = takeCheckSlot, publicPort = 8080,
 }) {
     const send = (status, body) => {
         res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -94,10 +120,19 @@ export async function handleCacheRoutes(req, res, parsedUrl, {
         }
         const published = listPublished(generation);
         const configuredFor = strict => configuredHosts(listConfigured, generation, published, strict);
+        // Whether the check operation can reach this exact route through a published host.
+        const checkable = entry => {
+            try {
+                return routeOrigin({ policyPath: entry.path, routeKey: entry.routeKey }, published, generation, planRequest) !== null;
+            } catch {
+                return false;
+            }
+        };
         if (method === 'GET') {
             const settings = readSettings();
             const configured = configuredFor(false);
-            const applications = listMarked(generation).map(mark => applicationEntry(mark, settings, configured, generation, getCanaryHold));
+            const applications = listMarked(generation)
+                .map(mark => applicationEntry(mark, settings, configured, generation, getCanaryHold, checkable));
             const hosts = published.map(host => {
                 const record = lastPurge(host);
                 return { host, purgeConfigured: configured.includes(host),
@@ -113,17 +148,59 @@ export async function handleCacheRoutes(req, res, parsedUrl, {
             return success({ purge: { host, outcome, ...(outcome === 'cooldown' ? { retryAfterSeconds } : {}) } });
         }
         const app = listMarked(generation).find(({ agent }) => agent === body.agent);
-        if (!app) return send(404, { error: 'unknown_application' });
-        const { settings, previous } = await setApplication(body.agent, { enabled: body.enabled, pageSeconds: body.pageSeconds }, { assertCurrent });
-        const configured = configuredFor(false);
-        const purges = [];
-        if (previous.enabled && !body.enabled) {
-            for (const host of configured) {
+        const purgeConfigured = async () => {
+            const purges = [];
+            for (const host of configuredFor(false)) {
                 const { outcome } = await clear(host);
                 purges.push({ host, outcome });
             }
+            return purges;
+        };
+        if (body.op === 'check') {
+            if (body.path.endsWith('/*')) return send(400, { error: 'wildcard_path' });
+            const row = app && applicationOverlay(generation, body.agent, readSettings()).entries
+                .find(entry => entry.path === body.path);
+            if (!row) return send(404, { error: 'unknown_route' });
+            const target = routeOrigin({ policyPath: row.path, routeKey: row.routeKey }, published, generation, planRequest);
+            if (!target) return send(409, { error: 'no_published_host' });
+            if (!checkSlot(String(req.sessionId || by))) return send(429, { error: 'rate_limited', retryAfterSeconds: 1 });
+            const { status, cdnHeader, cacheControl } = await checkOrigin({ ...target, publicPort });
+            return success({ check: { host: target.host, path: target.path, status, cdnHeader, cacheControl } });
         }
-        return success({ application: applicationEntry(app, settings, configured, generation, getCanaryHold), purges });
+        if (!app) return send(404, { error: 'unknown_application' });
+        if (body.op === 'route') {
+            const before = structuredClone(readSettings());
+            const overlay = applicationOverlay(generation, body.agent, before);
+            let record = null;
+            if (body.setting !== 'default') {
+                const row = overlay.entries.find(entry => entry.path === body.path);
+                if (!row) return send(404, { error: 'unknown_route' });
+                if (row.mark === 'never' || row.neverBy !== null) return send(400, { error: 'route_never' });
+                if (body.setting === 'off' && row.effective === null) return send(400, { error: 'route_uncached' });
+                if (body.setting === 'page') {
+                    if (row.mark !== null) return send(400, { error: 'route_marked' });
+                    if (!overlay.hasNever || row.publicProtocol) return send(400, { error: 'route_not_choosable' });
+                }
+                record = { setting: body.setting, at: new Date().toISOString(), by,
+                    entry: { access: 'public', manifest: row.mark } };
+            }
+            const result = await setRoute(body.agent, body.path, record, { assertCurrent });
+            // The state the write was computed from: the old record decides what the write removed.
+            const prior = result.before ?? before;
+            const removedCaching = result.changed !== false && couldHaveCached(body.agent, prior, generation, body.path)
+                && (body.setting === 'off'
+                    || (body.setting === 'default' && applicationOverlay(generation, body.agent, prior).entries
+                        .some(entry => entry.path === body.path && entry.source === 'administrator')));
+            const purges = removedCaching ? await purgeConfigured() : [];
+            return success({ application: applicationEntry(app, result.settings, configuredFor(false), generation, getCanaryHold, checkable),
+                purges });
+        }
+        const prior = structuredClone(readSettings());
+        const result = await setApplication(body.agent, { enabled: body.enabled, pageSeconds: body.pageSeconds }, { assertCurrent });
+        const configured = configuredFor(false);
+        const purges = result.previous.enabled && !body.enabled && couldHaveCached(body.agent, result.before ?? prior, generation)
+            ? await purgeConfigured() : [];
+        return success({ application: applicationEntry(app, result.settings, configured, generation, getCanaryHold, checkable), purges });
     } catch (error) {
         if (error === stale) return send(503, { ok: false, error: 'edge_generation_changed' });
         if (error === denied) return send(403, { ok: false, error: denied.message });

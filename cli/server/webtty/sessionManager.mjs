@@ -1,3 +1,4 @@
+import { SupervisedPairs } from './supervisedPairs.mjs';
 import { createTerminalQueryStripper } from '../../../core-services/webtty/terminal-queries.mjs';
 import crypto from 'node:crypto';
 import { isAdminUser } from '../auth/localService.js';
@@ -187,6 +188,7 @@ export class WebttySessionManager {
         this.validationStartIndex = 0;
         this.routerEpoch = randomId(18);
         this.sessions = new Map();
+        this.supervisedPairs = new SupervisedPairs(this);
         this.pendingCreations = new Map();
         this.tombstones = new Map();
         this.userCounts = new Map();
@@ -597,6 +599,7 @@ export class WebttySessionManager {
             isOwner, ownerLabel: displayText(session.owner.label, 128),
             viewerCount: live ? session.viewers.size : 0,
             startedAt: session.createdAt, lastActivityAt: session.lastActivityAt,
+            lastOutputAt: session.lastOutputAt ?? null,
             ...(live ? {} : { endedAt, exitReason: displayText(session.closeReason, 128) }),
             closePolicy: this.closePolicyOf(session),
             pendingStopUntil: live ? session.pendingStop?.deadline ?? null : null,
@@ -1117,6 +1120,7 @@ export class WebttySessionManager {
             cleanupFailureScope: '',
             createdAt,
             lastActivityAt: createdAt,
+            lastOutputAt: null,
             worker,
             recordHandle: null,
             releaseQuota,
@@ -1710,6 +1714,8 @@ export class WebttySessionManager {
             void this.closeSession(session, 'output_limit');
             return;
         }
+        if (message.data.length) session.lastOutputAt = this.now();
+        session.recentOutput = ((session.recentOutput || '') + message.data).slice(-32768);
         session.lastSequence = message.sequence;
         session.stripReplayQueries ||= createTerminalQueryStripper();
         const replayEncoded = this.encodeSse('output', { data: session.stripReplayQueries(message.data) }, message.sequence);
@@ -1805,11 +1811,22 @@ export class WebttySessionManager {
         return true;
     }
 
+    // Called after an explicit coding-session launch or authenticated supervision registration.
+    // A background worker has no viewer; keep its real detached state and normal lifetime limits.
+    retainDetachedForSupervision(session) {
+        if (this.sessions.get(session.id) !== session || session.closed || session.closing) {
+            throw errorWithCode('WEBTTY_SESSION_NOT_FOUND');
+        }
+        session.backgroundAdmitted = true;
+        clearTimeout(session.detachTimer);
+        session.detachTimer = null;
+    }
+
     scheduleDetachedClose(session, reason) {
         clearTimeout(session.detachTimer);
         session.detachTimer = setTimeout(() => {
             session.detachTimer = null;
-            if (!session.everAttached) void this.closeSession(session, reason);
+            if (!session.everAttached && !session.backgroundAdmitted) void this.closeSession(session, reason);
         }, this.limits.streamDetachGraceMs);
         session.detachTimer.unref?.();
     }
@@ -2363,6 +2380,7 @@ export class WebttySessionManager {
     }
 
     async closeAll(reason = 'router_shutdown') {
+        this.supervisedPairs.close();
         if (!this.closed) {
             this.closed = true;
             this.ready = false;

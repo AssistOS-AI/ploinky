@@ -25,6 +25,11 @@ export const SSO_AUTH_COOKIE_NAME = 'ploinky_sso';
 export const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
 export const AUTH_COOKIE_NAME = SSO_AUTH_COOKIE_NAME;
 export const authService = createAuthService();
+export function renewPersistentSsoCookie(req, res, sessionId, session) {
+    const maxAge = authService.getSessionCookieMaxAge(session);
+    if (maxAge === authService.getSessionCookieMaxAge()) return;
+    appendSetCookie(res, buildCookie(SSO_AUTH_COOKIE_NAME, sessionId, req, '/', { maxAge, sameSite: 'Lax' }));
+}
 export const sessionTokenService = new SessionTokenService({
     mintUserSession: mintSessionJwt,
     mintGuestSession: mintGuestSessionJwt,

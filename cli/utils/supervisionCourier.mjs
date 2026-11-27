@@ -1,25 +1,21 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { supervisedPaths } from './supervisionWorkspace.mjs';
-import { stallNudge, taskDelivery } from './supervisionRoles.mjs';
-import { readTaskRevision } from './supervisionWorkspace.mjs';
 
 // The courier is the only part of a supervised session that writes into a
-// terminal on its own: it turns a new revision of `tasks.md` into a prompt for
-// the worker, and it reports a worker that has gone quiet. It never writes a
-// task file, never closes a terminal and never decides that a revision is done.
+// terminal on its own: it reports results and a worker that has gone quiet.
+// Task delivery belongs exclusively to the supervisor through worker_send. It never writes a
+// task file, never closes a terminal and never derives task state from history files.
 export const SUPERVISION_COURIER_DEFAULTS = Object.freeze({
     intervalMs: 2_000,
     activityMs: 15_000,
-    stallMs: 300_000,
+    stallMs: 600_000,
 });
 
 export function createSupervisionCourier({
     folder,
     pairId = '',
     workerTerminalId,
-    readRevision = readTaskRevision,
-    deliver,
     notifySupervisor,
     readResults = folder => {
         try { return fs.readFileSync(supervisedPaths(folder).results, 'utf8'); }
@@ -27,8 +23,6 @@ export function createSupervisionCourier({
     },
     activity,
     onStatus = () => {},
-    onDelivered = () => {},
-    startRev = null,
     now = () => Date.now(),
     intervalMs = SUPERVISION_COURIER_DEFAULTS.intervalMs,
     activityMs = SUPERVISION_COURIER_DEFAULTS.activityMs,
@@ -36,15 +30,15 @@ export function createSupervisionCourier({
     setTimer = (callback, milliseconds) => setTimeout(callback, milliseconds),
     clearTimer = timer => clearTimeout(timer),
 } = {}) {
-    if (typeof deliver !== 'function') throw new Error('A supervision courier needs a delivery channel');
     let stopped = true;
     let timer = null;
-    let currentRev = Number.isSafeInteger(startRev) && startRev >= 0 ? startRev : null;
-    let nudgedRev = null;
+    let monitoring = false;
+    let alertedActivity = null;
+    let deliveredAt = now();
     let lastActivityCheck = 0;
     let status = '';
     let lastError = '';
-    let resultHash = '';
+    let resultHash = null;
     let inFlight = null;
 
     const publish = (value) => {
@@ -53,46 +47,51 @@ export function createSupervisionCourier({
         try { onStatus(value); } catch (_) { /* A display failure never stops delivery. */ }
     };
 
-    async function checkRevision() {
-        const { rev, missing } = await readRevision(folder);
-        if (missing) { publish('tasks.md does not exist yet'); return; }
-        if (rev === null) { publish('tasks.md has no rev: line, nothing delivered'); return; }
-        if (currentRev !== null && rev <= currentRev) return;
-        await deliver(taskDelivery(rev));
-        currentRev = rev;
-        try { onDelivered(rev); } catch (_) { /* the record is a convenience, not the delivery */ }
-        publish(`rev ${rev} delivered to the worker`);
+    async function sent() {
+        monitoring = true;
+        deliveredAt = now();
+        alertedActivity = null;
+        // Existing history is not a report about the newly sent instructions.
+        try { resultHash = crypto.createHash('sha256').update(await readResults(folder)).digest('hex'); }
+        catch { resultHash = null; }
+        publish('instructions delivered by supervisor through MCP');
     }
 
     async function checkActivity() {
         if (typeof activity !== 'function') return;
         const row = await activity(workerTerminalId);
         if (!row) { publish('the worker terminal is not running'); return; }
-        if (currentRev === null || nudgedRev === currentRev) return;
-        const silence = now() - (Number.isFinite(row.lastActivityAt) ? row.lastActivityAt : now());
-        if (silence < stallMs) return;
-        const minutes = Math.max(1, Math.round(silence / 60_000));
-        await deliver(stallNudge(minutes));
-        if (notifySupervisor) await notifySupervisor(`[worker status] Worker terminal silent for ${minutes} minutes on rev ${currentRev}. Inspect results.md and report progress or blockers to the user.`);
-        nudgedRev = currentRev;
-        publish(`worker silent for ${minutes}m, one nudge sent`);
+        if (!monitoring || typeof notifySupervisor !== 'function') return;
+        // Input, resize and attach activity cannot postpone an output-silence alarm.
+        // An older server without this field cannot provide a reliable output clock.
+        if (!Object.hasOwn(row, 'lastOutputAt')) { publish('worker output monitoring requires an updated terminal server'); return; }
+        const lastOutput = Math.max(deliveredAt, Number.isFinite(row.lastOutputAt) ? row.lastOutputAt : deliveredAt);
+        const silence = now() - lastOutput;
+        if (silence < stallMs || alertedActivity === lastOutput) return;
+        const minutes = Math.max(1, Math.floor(silence / 60_000));
+        await notifySupervisor(`[worker status] No worker terminal output for ${minutes} minutes after instructions were sent. `
+            + 'Inspect results.md, the current code and any available worker status to determine whether it is blocked or still working. '
+            + 'Silence alone is not proof of a block. If it is blocked, interrupt its current execution through an available worker control, '
+            + 'then append the corrective instructions to tasks.md and send a different approach through worker_send. If no worker control is available, ask the user to interrupt it. '
+            + 'Report your findings and action to the user.');
+        alertedActivity = lastOutput;
+        publish(`worker silent for ${minutes}m, supervisor notified`);
     }
 
-    // One pass over the task file and the worker's activity. A manual pass runs
+    // One pass over the results file and the worker's activity. A manual pass runs
     // even after `stop()`; only the scheduled loop stops.
     async function checkResults() {
-        if (!notifySupervisor || currentRev === null) return;
+        if (!notifySupervisor || !monitoring) return;
         const text = await readResults(folder);
-        if (!text || !text.includes(`rev: ${currentRev}`)) return;
         const hash = crypto.createHash('sha256').update(text).digest('hex');
+        if (resultHash === null) { resultHash = hash; return; }
         if (hash === resultHash) return;
-        await notifySupervisor(`[worker results] results.md changed for rev ${currentRev}. Read it, report progress to the user, and review the actual diff and tests before accepting completion. Request corrections through a new tasks.md revision if needed.`);
+        await notifySupervisor('[worker results] results.md history changed. Read the new entries, report progress to the user, and inspect the actual code and tests. Historical entries do not establish the current task state. Send any corrective instructions through worker_send and append them to tasks.md.');
         resultHash = hash;
     }
 
     async function pass() {
         try {
-            await checkRevision();
             await checkResults();
             if (now() - lastActivityCheck >= activityMs) {
                 lastActivityCheck = now();
@@ -120,6 +119,7 @@ export function createSupervisionCourier({
 
     return {
         pairId,
+        sent,
         start() {
             if (!stopped) return;
             stopped = false;
@@ -131,7 +131,6 @@ export function createSupervisionCourier({
             timer = null;
         },
         status: () => status,
-        deliveredRev: () => currentRev,
         once,
         tick,
         get stopped() { return stopped; },

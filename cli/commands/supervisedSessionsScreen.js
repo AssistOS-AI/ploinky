@@ -1,5 +1,5 @@
 import {
-    attachRole, createSupervisedPair, findLiveRow, killRoles, pairItems, pairRoleItems, runningTerminals,
+    rememberRoleConversations, attachRole, createSupervisedPair, registerSupervisedPair, findLiveRow, killRoles, pairItems, pairRoleItems, runningTerminals,
     RELAY_EXIT_REASONS, relayStatus, supervisionTabs,
 } from '../utils/supervisionFlow.mjs';
 import { SUPERVISION_ROLE_LABELS } from '../utils/supervisionRoles.mjs';
@@ -9,9 +9,9 @@ import {
 import { DETACH_KEY, RELAY_KEY_LABELS, SWITCH_KEY } from '../utils/webttyCliClient.mjs';
 
 // The supervised tab of `ploinky cs`: a list of pairs, one pair's two sessions,
-// and the couriers that carry each new revision to the worker.
+// and registration of each pair with server-owned control and monitoring.
 // The command owns the event loop; this module owns one screen at a time.
-const MAX_COURIERS = 8;
+const MAX_PAIRS = 8;
 const ENTRY_LEVEL = 'pairs';
 const SESSION_KEYS = `${RELAY_KEY_LABELS.switch} switch · ${RELAY_KEY_LABELS.detach} detach`;
 
@@ -19,12 +19,11 @@ const nextLevel = (role, kind) => `${role}-${kind}`;
 
 export function createSupervisedScreen({
     menu, client, api, directory, folder, folderPath,
-    openTerminal, attachTerminal, createRelay, createCourier,
+    openTerminal, attachTerminal, createRelay,
     input, output, errorOutput, storeFile, now,
     refreshMs,
     labels = SUPERVISION_ROLE_LABELS,
 }) {
-    const couriers = new Map();
     const courierStatus = new Map();
     const read = () => readStore(storeFile());
     const mutate = (change) => {
@@ -34,44 +33,32 @@ export function createSupervisedScreen({
     };
     const failure = error => error?.message || String(error);
 
-    // One courier per running pair, so a revision the supervisor writes reaches
-    // the worker even while the command shows another screen.
-    function sync() {
-        const active = read().sessions
-            .filter(session => session.folder === folderPath && session.phase === 'running' && session.worker.terminalId)
-            .slice(0, MAX_COURIERS);
-        const wanted = new Set(active.map(session => session.id));
-        for (const [id, courier] of couriers) {
-            const record = active.find(session => session.id === id);
-            if (wanted.has(id) && courier.workerTerminalId === record.worker.terminalId
-                && courier.supervisorTerminalId === record.supervisor.terminalId) continue;
-            courier.stop();
-            couriers.delete(id);
-            courierStatus.delete(id);
+    // Reconcile UI records with server-owned supervision. Leaving the CLI never revokes it.
+    async function sync() {
+        const live = await runningTerminals(client);
+        for (let session of read().sessions.filter(value => value.folder === folderPath && value.phase === 'running').slice(0, MAX_PAIRS)) {
+            try {
+                const patch = await rememberRoleConversations({ api, session, directory });
+                if (Object.keys(patch).length) {
+                    mutate(store => updateSession(store, session.id, () => patch, now));
+                    session = { ...session, ...patch };
+                }
+            } catch (error) { courierStatus.set(session.id, `Conversation identification unavailable: ${failure(error)}`); }
+            if (!session.supervisor.controlId || !findLiveRow(live, session.supervisor.terminalId)
+                || !findLiveRow(live, session.worker.terminalId)) continue;
+            try {
+                const result = await registerSupervisedPair(client, session);
+                courierStatus.set(session.id, result.status || 'Server supervision active');
+            } catch (error) { courierStatus.set(session.id, `Server supervision unavailable: ${failure(error)}`); }
         }
-        for (const session of active) {
-            if (couriers.has(session.id)) continue;
-            const courier = createCourier({
-                folder: session.folder,
-                pairId: session.id,
-                workerTerminalId: session.worker.terminalId,
-                startRev: session.deliveredRev,
-                deliver: text => client.json('POST', `/webtty/sessions/${encodeURIComponent(session.worker.terminalId)}/input`,
-                    { data: `${text}\r` }),
-                notifySupervisor: text => client.json('POST', `/webtty/sessions/${encodeURIComponent(session.supervisor.terminalId)}/input`,
-                    { data: `${text}\r` }),
-                activity: async id => findLiveRow(await runningTerminals(client), id),
-                onStatus: value => courierStatus.set(session.id, value),
-                onDelivered: (rev) => {
-                    mutate(store => updateSession(store, session.id, () => ({ deliveredRev: rev }), now));
-                },
-                now,
-            });
-            courier.workerTerminalId = session.worker.terminalId;
-            courier.supervisorTerminalId = session.supervisor.terminalId;
-            courier.start();
-            couriers.set(session.id, courier);
-        }
+    }
+
+    async function chooseResume(candidates, role) {
+        const choice = await menu.select({ title: [`Resume ${labels[role]}`, 'Select its original conversation'],
+            items: candidates.map(entry => ({ label: entry.title || entry.id, detail: entry.id })),
+            help: '↑/↓ select · Enter resume · Backspace cancel' });
+        menu.close();
+        return choice.action === 'enter' ? candidates[choice.index]?.id : null;
     }
 
     // Ctrl+\ attaches the other role of the same pair; every other way out
@@ -80,29 +67,30 @@ export function createSupervisedScreen({
         let role = initialRole;
         let session = findSession(read(), pairId);
         if (!session) throw new Error('That supervised session is no longer saved.');
-        const remember = (name, record) => {
+        const remember = async (name, record) => {
             if (record.terminalId === session[name].terminalId) return;
             mutate(store => updateSession(store, pairId, () => ({ [name]: record, phase: 'running' }), now));
-            sync();
+            await sync();
         };
         const first = await attachRole({
             client, api, attachTerminal, openTerminal,
-            session, role, directory, output, live: await runningTerminals(client),
+            session, role, directory, output, chooseResume, live: await runningTerminals(client),
         });
-        remember(role, first.record);
+        await remember(role, first.record);
         let terminal = first.terminal;
         while (true) {
             const result = await createRelay({ client, ...terminal, input, output,
                 keys: { detach: DETACH_KEY, switch: SWITCH_KEY }, stripReports: true }).run();
+            await sync();
             if (result.reason !== 'switch') return result;
             const other = role === 'supervisor' ? 'worker' : 'supervisor';
             session = findSession(read(), pairId);
             if (!session) return { reason: 'ended' };
             const switched = await attachRole({
                 client, api, attachTerminal, openTerminal,
-                session, role: other, directory, output, live: await runningTerminals(client),
+                session, role: other, directory, output, chooseResume, live: await runningTerminals(client),
             });
-            remember(other, switched.record);
+            await remember(other, switched.record);
             role = other;
             terminal = switched.terminal;
         }
@@ -125,7 +113,7 @@ export function createSupervisedScreen({
         let live;
         try {
             items = await menu.busy(header, async () => {
-                sync();
+                await sync();
                 live = await runningTerminals(client);
                 return pairItems({ sessions: read().sessions.filter(session => session.folder === folderPath), live, now: now() });
             });
@@ -145,8 +133,10 @@ export function createSupervisedScreen({
             if (item?.kind !== 'pair') { state.status = 'Only a saved session can be forgotten.'; return {}; }
             if (!await menu.confirm({ ...header, items, selected: choice.index },
                 `Forget ${item.session.label || item.session.folder}? Its terminals stay open.`)) return {};
+            await client.json('POST', '/webtty/supervised-pairs', { remove: item.session.id });
+            if (item.session.supervisor.controlId) await api('control-close', { id: item.session.supervisor.controlId }).catch(() => {});
             mutate(store => removeSession(store, item.session.id));
-            sync();
+            await sync();
             state.status = 'Session forgotten.';
             return {};
         }
@@ -222,7 +212,7 @@ export function createSupervisedScreen({
             if (showExistingPair(state, read().sessions, live)) return {};
             mutate(store => ({ ...store, sessions: store.sessions.map(session => session.folder === folderPath
                 ? { ...session, phase: 'ended' } : session) }));
-            sync();
+            await sync();
             record = await menu.busy({ ...header, status: 'Starting both sessions…' }, () => createSupervisedPair({
                 api, client, openTerminal, directory, folder: folderPath,
                 supervisor: state.draft.supervisor, worker: state.draft.worker,
@@ -234,7 +224,7 @@ export function createSupervisedScreen({
             return {};
         }
         mutate(store => upsertSession(store, record));
-        sync();
+        await sync();
         state.supervised = record.id;
         state.remembered.roles = 0;
         state.draft = { supervisor: {}, worker: {} };
@@ -281,7 +271,7 @@ export function createSupervisedScreen({
                 await killRoles(client, record, item.role);
                 if (!items.some(other => other.role !== item.role && other.row)) {
                     mutate(store => updateSession(store, record.id, () => ({ phase: 'ended' }), now));
-                    sync();
+                    await sync();
                 }
                 state.status = `Killed ${labels[item.role]}.`;
             } catch (error) { state.status = `Kill failed: ${failure(error)}`; }
@@ -321,11 +311,8 @@ export function createSupervisedScreen({
     return {
         screen,
         sync,
-        stop() {
-            for (const courier of couriers.values()) courier.stop();
-            couriers.clear();
-        },
+        stop() {}, // Terminal control and monitoring belong to the server.
         statusFor: id => courierStatus.get(id) || '',
-        courierCount: () => couriers.size,
+        courierCount: () => 0,
     };
 }

@@ -31,13 +31,14 @@ const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
 const MUTATING_COMMANDS = new Set(['http.route.set', 'http.route.remove', 'mcp.policy.set']);
 
 export class PolicyCommandInvoker {
-    constructor({ registry, auditLog, getSession, isAdminUser, allowLocalSession = () => false, getProviderSession = async () => null, verifyMutationRequest = verifyAdminMutationRequest }) {
+    constructor({ registry, auditLog, getSession, isAdminUser, allowLocalSession = () => false, getProviderSession = async () => null, renewProviderCookie = () => {}, verifyMutationRequest = verifyAdminMutationRequest }) {
         this._registry = registry;
         this._audit = auditLog;
         this._getSession = getSession;
         this._isAdminUser = isAdminUser;
         this._allowLocalSession = allowLocalSession;
         this._getProviderSession = getProviderSession;
+        this._renewProviderCookie = renewProviderCookie;
         this._verifyMutationRequest = verifyMutationRequest;
     }
 
@@ -69,6 +70,11 @@ export class PolicyCommandInvoker {
             sendJson(res, 401, { ok: false, error: { code: 'AUTH_REQUIRED', message: 'Authentication is required.' } });
             return true;
         }
+        if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+            sendJson(res, 503, { ok: false, error: { code: 'EDGE_GENERATION_CHANGED', message: 'The routing generation changed.' } });
+            return true;
+        }
+        if (authMode === 'sso') this._renewProviderCookie(req, res, cookie, session);
         const user = session.user;
         req.user = user;
         req.session = session;

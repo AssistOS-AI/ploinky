@@ -9,6 +9,7 @@ import {
     hashSessionId,
     SSO_SESSIONS_DEFAULT_MAX_FILE_BYTES,
     SSO_SESSIONS_FILE_VERSION,
+    SSO_SESSIONS_ENVELOPE_PREFIX,
 } from './sessionPersistence.js';
 
 const DEFAULT_SESSION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
@@ -20,6 +21,11 @@ const REPAIR_TIMED_ATTEMPTS = 30;
 // removed); the write guard then cannot compare and lets the next write
 // replace whatever is there.
 const UNKNOWN_FILE_DIGEST = 'unknown';
+export const DURABLE_LIFETIME = 'until-revoked-v1';
+
+export function isDurableSession(session) {
+    return session?.sessionLifetime === DURABLE_LIFETIME && session.expiresAt === null;
+}
 const SESSION_KEY = /^[a-f0-9]{64}$/;
 
 export const SSO_SESSION_STORE_UNAVAILABLE = 'SSO_SESSION_STORE_UNAVAILABLE';
@@ -49,7 +55,8 @@ function restoreRecord(key, entry, now) {
     const user = entry.user;
     if (!isPlainObject(user) || typeof user.id !== 'string' || !user.id) return null;
     if (typeof entry.providerAgent !== 'string' || !entry.providerAgent.trim()) return null;
-    if (typeof entry.expiresAt !== 'number' || !Number.isFinite(entry.expiresAt) || entry.expiresAt <= now) return null;
+    const durable = entry.sessionLifetime === DURABLE_LIFETIME && entry.expiresAt === null;
+    if (!durable && (typeof entry.expiresAt !== 'number' || !Number.isFinite(entry.expiresAt) || entry.expiresAt <= now)) return null;
     const record = {
         providerAgent: entry.providerAgent,
         user,
@@ -59,6 +66,7 @@ function restoreRecord(key, entry, now) {
         expiresAt: entry.expiresAt,
         refreshExpiresAt: entry.refreshExpiresAt ?? null,
     };
+    if (durable) record.sessionLifetime = DURABLE_LIFETIME;
     if (isPlainObject(entry.providerSession)) record.providerSession = entry.providerSession;
     return record;
 }
@@ -82,6 +90,9 @@ function createSessionStore({
     const clock = typeof nowOption === 'function' ? nowOption : () => Date.now();
     const sessions = new Map();
     const pending = new Map();
+    const pendingDowngrades = new WeakSet();
+    const recordSizes = new Map();
+    let recordsBytes = 0;
     let sweepIterator = null;
     let state = 'memory';
     let persist = null;
@@ -91,6 +102,34 @@ function createSessionStore({
     let repair = null;
     let repairTimer = null;
     let repairAttempts = 0;
+
+    function recordSize(session) {
+        // Reserve room for key, separators and timestamp changes on reads.
+        return Buffer.byteLength(JSON.stringify(session)) + 160;
+    }
+
+    function fits(key, session) {
+        if (!persist) return true;
+        const previousSize = recordSizes.get(key) || 0;
+        const nextSize = recordSize(session);
+        if (previousSize && nextSize <= previousSize) return true;
+        const bytes = recordsBytes - previousSize + nextSize;
+        // JSON envelope, GCM IV/tag, base64 expansion, prefix and newline.
+        return SSO_SESSIONS_ENVELOPE_PREFIX.length + 1 + 4 * Math.ceil((bytes + 128 + 28) / 3) <= persist.maxFileBytes;
+    }
+
+    function account(key, session) {
+        recordsBytes -= recordSizes.get(key) || 0;
+        const size = recordSize(session);
+        recordSizes.set(key, size);
+        recordsBytes += size;
+    }
+
+    function remove(key) {
+        recordsBytes -= recordSizes.get(key) || 0;
+        recordSizes.delete(key);
+        return sessions.delete(key);
+    }
 
     function usable() {
         return state === 'memory' || state === 'open';
@@ -111,8 +150,8 @@ function createSessionStore({
                 if (next.done) break;
             }
             const [key, session] = next.value;
-            if (session.expiresAt && now > session.expiresAt) {
-                sessions.delete(key);
+            if (session.expiresAt && now >= session.expiresAt) {
+                remove(key);
                 markDirty();
             }
         }
@@ -130,8 +169,8 @@ function createSessionStore({
     function cleanupSessions() {
         const now = clock();
         for (const [key, session] of sessions.entries()) {
-            if (session.expiresAt && now > session.expiresAt) {
-                sessions.delete(key);
+            if (session.expiresAt && now >= session.expiresAt) {
+                remove(key);
                 markDirty();
             }
         }
@@ -161,7 +200,7 @@ function createSessionStore({
         // Expired entries are omitted; load drops them again anyway.
         for (const [key, session] of sessions) {
             const expiresAt = session.expiresAt;
-            if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= now) continue;
+            if (!isDurableSession(session) && (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= now)) continue;
             out[key] = {
                 providerAgent: session.providerAgent,
                 user: session.user,
@@ -171,6 +210,7 @@ function createSessionStore({
                 updatedAt: session.updatedAt,
                 expiresAt,
                 refreshExpiresAt: session.refreshExpiresAt ?? null,
+                ...(isDurableSession(session) ? { sessionLifetime: DURABLE_LIFETIME } : {}),
             };
         }
         return { version: SSO_SESSIONS_FILE_VERSION, savedAt: now, sessions: out };
@@ -265,7 +305,7 @@ function createSessionStore({
             // is ours, so the guard must not mistake it for a foreign write.
             if (error?.renamed === true && error.digest) knownDigest = error.digest;
             emit('sso_session_store_write_failed', { reason, code: errorCode(error) });
-            return { ok: false, tripped: false };
+            return { ok: false, tripped: false, renamed: error?.renamed === true };
         }
         dirty = false;
         clearFlushTimer();
@@ -334,6 +374,8 @@ function createSessionStore({
 
     function rejectLoad(reason, bytes) {
         sessions.clear();
+        recordSizes.clear();
+        recordsBytes = 0;
         emit('sso_session_store_load_rejected', { level: 'error', reason });
         knownDigest = Buffer.isBuffer(bytes) ? digestBytes(bytes) : UNKNOWN_FILE_DIGEST;
         // Removed before the store reports open: a rejected file left behind
@@ -381,6 +423,7 @@ function createSessionStore({
                 continue;
             }
             sessions.set(key, record);
+            account(key, record);
             restored += 1;
         }
         knownDigest = digestBytes(read.bytes);
@@ -394,6 +437,7 @@ function createSessionStore({
         const file = createSessionFile({ directory: config.directory, fsApi: config.fsApi || undefined, maxFileBytes });
         persist = {
             file,
+            maxFileBytes,
             deriveKey: typeof config.deriveKey === 'function' ? config.deriveKey : defaultDeriveSessionsKey,
             flushDelayMs: Number.isSafeInteger(config.flushDelayMs) && config.flushDelayMs >= 0
                 ? config.flushDelayMs
@@ -463,7 +507,9 @@ function createSessionStore({
         const fields = { ...record };
         // The record never carries the raw cookie value.
         delete fields.id;
-        const expiresAt = fields.expiresAt || (now + sessionTtlMs);
+        const durable = isDurableSession(fields);
+        if (!durable) delete fields.sessionLifetime;
+        const expiresAt = durable ? null : (fields.expiresAt || (now + sessionTtlMs));
         const session = {
             ...fields,
             user: fields.user,
@@ -473,12 +519,19 @@ function createSessionStore({
             expiresAt,
             refreshExpiresAt: fields.refreshExpiresAt || null
         };
+        if (!fits(key, session)) throw storeUnavailableError();
         sessions.set(key, session);
+        account(key, session);
         if (state === 'open') {
             // A lost create only ends the session earlier; the next flush retries.
             const outcome = writeSnapshot('create');
             if (outcome.tripped) {
-                sessions.delete(key);
+                remove(key);
+                throw storeUnavailableError();
+            }
+            if (!outcome.ok && durable) {
+                remove(key);
+                if (outcome.renamed) persistDelete('create_rollback');
                 throw storeUnavailableError();
             }
             if (!outcome.ok) markDirty();
@@ -492,8 +545,8 @@ function createSessionStore({
         const key = hashSessionId(sessionId);
         const session = sessions.get(key);
         if (!session) return null;
-        if (session.expiresAt && clock() > session.expiresAt) {
-            sessions.delete(key);
+        if (session.expiresAt && clock() >= session.expiresAt) {
+            remove(key);
             markDirty();
             return null;
         }
@@ -501,32 +554,53 @@ function createSessionStore({
         return session;
     }
 
-    function updateSession(sessionId, updates) {
+    function updateSession(sessionId, updates, { replaceTokens = false } = {}) {
         const session = getSession(sessionId);
         if (!session) return null;
+        // A previous admission narrowed the in-memory lifetime, but the disk
+        // still allowed this login indefinitely. Finish that repair first.
+        if (pendingDowngrades.has(session)) {
+            if (repair && !persistDelete('expiry_decrease')) throw storeUnavailableError();
+            pendingDowngrades.delete(session);
+        }
         const previousExpiresAt = session.expiresAt;
-        if (updates.tokens) {
-            session.tokens = { ...session.tokens, ...updates.tokens };
+        const wasDurable = isDurableSession(session);
+        const next = { ...session, updatedAt: clock() };
+        if (updates.tokens) next.tokens = replaceTokens ? updates.tokens : { ...session.tokens, ...updates.tokens };
+        if (updates.user && typeof updates.user === 'object') next.user = updates.user;
+        if (updates.providerSession && typeof updates.providerSession === 'object') next.providerSession = updates.providerSession;
+        if (updates.refreshExpiresAt !== undefined) next.refreshExpiresAt = updates.refreshExpiresAt;
+        if (isDurableSession(updates)) {
+            next.sessionLifetime = DURABLE_LIFETIME;
+            next.expiresAt = null;
+        } else if (typeof updates.expiresAt === 'number' && Number.isFinite(updates.expiresAt) && updates.expiresAt > 0) {
+            next.expiresAt = updates.expiresAt;
+            delete next.sessionLifetime;
         }
-        if (updates.expiresAt) {
-            session.expiresAt = updates.expiresAt;
-        }
-        if (updates.refreshExpiresAt !== undefined) {
-            session.refreshExpiresAt = updates.refreshExpiresAt;
-        }
-        if (updates.user && typeof updates.user === 'object') {
-            session.user = updates.user;
-        }
-        if (updates.providerSession && typeof updates.providerSession === 'object') {
-            session.providerSession = updates.providerSession;
-        }
-        session.updatedAt = clock();
+        const key = hashSessionId(sessionId);
+        if (!fits(key, next)) throw storeUnavailableError();
+        const previous = { ...session };
+        Object.assign(session, next);
+        if (!isDurableSession(next)) delete session.sessionLifetime;
+        account(key, session);
         if (state === 'open') {
-            // Disk expiry must never exceed memory expiry: anything but an
-            // extension is written before returning; the rest is batched.
-            const extendedOrSame = session.expiresAt === previousExpiresAt || session.expiresAt > previousExpiresAt;
-            if (extendedOrSame) markDirty();
-            else persistDelete('expiry_decrease');
+            const shortened = (wasDurable && !isDurableSession(session))
+                || (!wasDurable && !isDurableSession(session) && session.expiresAt < previousExpiresAt);
+            if (shortened) {
+                if (!persistDelete('expiry_decrease') && wasDurable) {
+                    pendingDowngrades.add(session);
+                    throw storeUnavailableError();
+                }
+            } else if (!wasDurable && isDurableSession(session)) {
+                const outcome = writeSnapshot('lifetime_upgrade');
+                if (!outcome.ok) {
+                    Object.assign(session, previous);
+                    delete session.sessionLifetime;
+                    account(key, session);
+                    if (outcome.renamed && !persistDelete('upgrade_rollback')) pendingDowngrades.add(session);
+                    throw storeUnavailableError();
+                }
+            } else markDirty();
         }
         return session;
     }
@@ -536,7 +610,7 @@ function createSessionStore({
     function deleteSession(sessionId) {
         if (!usable()) throw storeUnavailableError();
         if (!sessionId) return { existed: false, persisted: true };
-        const existed = sessions.delete(hashSessionId(sessionId));
+        const existed = remove(hashSessionId(sessionId));
         if (state !== 'open' || !existed) return { existed, persisted: true };
         return { existed, persisted: persistDelete() };
     }
@@ -548,7 +622,7 @@ function createSessionStore({
         let removed = 0;
         for (const [key, session] of sessions.entries()) {
             if (predicate(session, key)) {
-                sessions.delete(key);
+                remove(key);
                 removed += 1;
             }
         }

@@ -24,6 +24,11 @@ export function createProvider() {
             return { authorizationUrl: 'https://identity.test/login?state=fixture', providerState: 'fixture' };
         },
         async sso_handle_callback() {
+            if (globalThis.__persistentCookieFixture) return {
+                user: { id: 'sso:admin', username: 'admin', roles: ['user', 'admin'], capabilities: ['admin.users.manage'] },
+                sessionLifetime: 'until-revoked-v1',
+                providerSession: { userId: 'sso:admin', expiresAt: null },
+            };
             return {
                 user: { id: 'sso:admin', username: 'admin', roles: ['user', 'admin'] },
                 providerSession: { userId: 'sso:admin', expiresAt: Date.now() + 60_000 },
@@ -79,6 +84,7 @@ test.after(() => {
         else process.env[name] = value;
     }
     delete globalThis.__ssoAvailabilityFixture;
+    delete globalThis.__persistentCookieFixture;
     fs.rmSync(workspace, { recursive: true, force: true });
 });
 
@@ -577,6 +583,71 @@ const adminSurfaces = [
         return { res, code: JSON.parse(res.body).error?.code };
     }],
 ];
+
+test('persistent SSO cookies roll across HTTP entry points while proof cookies stay short', async () => {
+    const cookieLines = res => [].concat(res.getHeader('set-cookie') || []).map(String);
+    const cookie = (res, name) => cookieLines(res).find(line => line.startsWith(`${name}=`));
+    const assertPersistent = res => assert.match(cookie(res, 'ploinky_sso') || '', /Max-Age=34560000(?:;|$)/);
+    globalThis.__persistentCookieFixture = true;
+    const started = request({ url: '/auth/login' });
+    const startedRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(started, startedRes, new URL(started.url, 'http://localhost'), { routePlan: controlPlan() });
+    const binding = cookieLines(startedRes).find(line => line.startsWith('ploinky_sso_login_')).split(';')[0];
+    const state = binding.split('=')[0].slice('ploinky_sso_login_'.length);
+    const callback = request({ url: `/auth/callback?code=fixture&state=${state}`, cookie: binding });
+    const callbackRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(callback, callbackRes, new URL(callback.url, 'http://localhost'), { routePlan: controlPlan() });
+    assert.equal(callbackRes.statusCode, 302, callbackRes.body);
+    assertPersistent(callbackRes);
+    assert.match(cookie(callbackRes, 'ploinky_browser_csrf'), /Max-Age=14400(?:;|$)/);
+    const sessionId = cookie(callbackRes, 'ploinky_sso').split(';')[0].split('=')[1];
+    delete globalThis.__persistentCookieFixture;
+    provider(providerSession => ({
+        user: { id: 'sso:admin', username: 'admin', roles: ['user', 'admin'], capabilities: ['admin.users.manage'] },
+        sessionLifetime: 'until-revoked-v1', providerSession: { ...providerSession, expiresAt: null },
+    }));
+    const normal = await protectedRoute(sessionId);
+    assert.equal(normal.result.ok, true);
+    assertPersistent(normal.res);
+    assert.match(cookie(normal.res, 'ploinky_browser_csrf'), /Max-Age=14400(?:;|$)/);
+    const guestReq = request({ url: '/webAssist/', cookie: `ploinky_sso=${sessionId}` });
+    const guestRes = new MockResponse();
+    assert.equal((await authHandlers.ensureHttpRouteAccess(guestReq, guestRes, new URL(guestReq.url, 'http://localhost'),
+        { access: 'guest', routeKey: 'webAssist' }, { routePlan: controlPlan() })).ok, true);
+    assertPersistent(guestRes);
+    const tokenReq = request({ url: '/auth/token', cookie: `ploinky_sso=${sessionId}` });
+    const tokenRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(tokenReq, tokenRes, new URL(tokenReq.url, 'http://localhost'), { routePlan: controlPlan() });
+    assert.equal(tokenRes.statusCode, 200, tokenRes.body);
+    assertPersistent(tokenRes);
+    const proof = cookie(tokenRes, 'ploinky_browser_csrf').split(';')[0].split('=')[1];
+    const post = request({ method: 'POST', url: '/auth/token', cookie: `ploinky_sso=${sessionId}; ploinky_browser_csrf=${proof}`,
+        body: { csrfToken: proof }, headers: { origin: 'http://localhost' } });
+    const postRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(post, postRes, new URL(post.url, 'http://localhost'), { routePlan: controlPlan() });
+    assert.equal(postRes.statusCode, 200, postRes.body);
+    assertPersistent(postRes);
+    assert.match(cookie(postRes, 'ploinky_browser_csrf'), /Max-Age=14400(?:;|$)/);
+    for (const [surface, , call] of adminSurfaces) {
+        const { res } = await call(sessionId);
+        assertPersistent(res, surface);
+    }
+    const stalePlan = controlPlan();
+    let commits = 0;
+    stalePlan.lease.commit = () => ++commits === 1;
+    const staleReq = request({ url: '/explorer/', cookie: `ploinky_sso=${sessionId}` });
+    const staleRes = new MockResponse();
+    assert.equal((await authHandlers.ensureHttpRouteAccess(staleReq, staleRes, new URL(staleReq.url, 'http://localhost'),
+        { access: 'authenticated', routeKey: 'explorer' }, { routePlan: stalePlan })).ok, false);
+    assert.equal(cookie(staleRes, 'ploinky_sso'), undefined);
+    const legacyId = await login();
+    provider(providerSession => described(providerSession));
+    const legacyReq = request({ url: '/auth/token', cookie: `ploinky_sso=${legacyId}` });
+    const legacyRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(legacyReq, legacyRes, new URL(legacyReq.url, 'http://localhost'), { routePlan: controlPlan() });
+    assert.equal(legacyRes.statusCode, 200, legacyRes.body);
+    assert.equal(cookie(legacyRes, 'ploinky_sso'), undefined, 'legacy GET does not reissue the session cookie');
+});
 
 for (const [surface, refusalStatus, call] of adminSurfaces) {
     test(`${surface} answers a provider outage with a retryable 503 and keeps the session`, async () => {

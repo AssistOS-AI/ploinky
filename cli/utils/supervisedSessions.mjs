@@ -33,7 +33,11 @@ function sanitizeRole(value, fallbackRobotId = '') {
         robotId,
         robotName: typeof value.robotName === 'string' ? value.robotName.slice(0, 80) : '',
         codingAgent,
+        controlId: text(value.controlId, /^[a-f0-9-]{36}$/u, '') || null,
+        interruptInput: value.interruptInput === '\u001b' ? value.interruptInput : null,
+        sessionBinding: text(value.sessionBinding, /^[a-f0-9-]{36}$/u, '') || null,
         nativeSessionId: text(value.nativeSessionId, NATIVE_SESSION, '') || null,
+        historyBefore: Array.isArray(value.historyBefore) ? [...new Set(value.historyBefore.filter(id => typeof id === 'string' && NATIVE_SESSION.test(id)))].slice(0, 50) : null,
         terminalId: text(value.terminalId, ID, '') || null,
     };
 }
@@ -52,7 +56,6 @@ function sanitizeSession(value) {
         label: typeof value.label === 'string' ? value.label.slice(0, 120) : path.basename(folder) || folder,
         createdAt: count(value.createdAt),
         updatedAt: count(value.updatedAt) || count(value.createdAt),
-        deliveredRev: Number.isSafeInteger(value.deliveredRev) && value.deliveredRev >= 0 ? value.deliveredRev : null,
         phase: value.phase === 'ended' ? 'ended' : 'running',
         supervisor,
         worker,

@@ -917,3 +917,75 @@ test('real relay: the signed resolve crosses the real relay manager and helper a
     }
     assert.equal(server.received.length, 3);
 });
+
+test('background control uses the declared provider route and signs each exact poll without login credentials', async t => {
+    const manifest = keeperManifest();
+    manifest.webtty.codingSessions = { version: 1, api: '/base-agent-additional-server/keeper/7001/api/coding-sessions' };
+    const fx = workspaceFixture(t, manifest);
+    const server = await providerServer(t, ({ req, res, body }) => {
+        const url = new URL(req.url, 'http://agent.local');
+        const verified = verifyHttpRouteAuthInfoFromHeaders(req.headers, {
+            env: agentEnv(), replayCache: createMemoryReplayCache(), method: req.method, path: url.pathname, query: url.search, body,
+        });
+        assert.equal(verified.ok, true);
+        assert.ok(verified.payload.actor.roles.includes('admin'));
+        assert.equal(req.url, '/api/coding-sessions/control-poll');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, requests: [] }));
+        return true;
+    });
+    const relay = tcpRelayManager(server.port);
+    const client = provider(fx, relay);
+    const routePlan = fx.webttyPlan();
+    const expectedProvider = findHomeProfileProvider(routePlan.snapshot, 'keeper');
+    const body = { id: 'channel', results: [], profile: 'supervisor-profile', validateOnly: true };
+    await client.callControl({ req: ADMIN_REQ, routePlan, providerName: 'keeper', expectedProvider, operation: 'poll', body });
+    assert.equal(server.received.length, 1);
+    assert.deepEqual(JSON.parse(server.received[0].body), body);
+    assert.equal(server.received[0].headers.cookie, undefined);
+    assert.equal(server.received[0].headers.authorization, undefined);
+    await assert.rejects(client.callControl({ req: ADMIN_REQ, routePlan, providerName: 'keeper',
+        expectedProvider: { ...expectedProvider, containerId: 'replaced' }, operation: 'poll', body }));
+    await assert.rejects(client.callControl({ req: ADMIN_REQ, routePlan, providerName: 'keeper', expectedProvider, operation: 'launch', body }));
+    assert.equal(server.received.length, 1);
+});
+
+test('browser coding session calls use only declared routes and verified administrator identity', async t => {
+    const manifest = keeperManifest();
+    manifest.webtty.codingSessions = { version: 1, api: '/base-agent-additional-server/keeper/7001/api/coding-sessions' };
+    const fx = workspaceFixture(t, manifest);
+    const server = await providerServer(t, ({ req, res, body }) => {
+        const url = new URL(req.url, 'http://agent.local');
+        const verified = verifyHttpRouteAuthInfoFromHeaders(req.headers, {
+            env: agentEnv(), replayCache: createMemoryReplayCache(), method: req.method, path: url.pathname, query: url.search, body,
+        });
+        assert.equal(verified.ok, true);
+        assert.ok(verified.payload.actor.roles.includes('admin'));
+        assert.equal(req.url, '/api/coding-sessions/robots');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, robots: [] }));
+        return true;
+    });
+    const client = provider(fx, tcpRelayManager(server.port));
+    const options = { req: ADMIN_REQ, routePlan: fx.webttyPlan(), providerName: 'keeper', operation: 'robots', body: {} };
+    assert.deepEqual(await client.callCodingSession(options), { ok: true, robots: [] });
+    await assert.rejects(client.callCodingSession({ ...options, operation: '../run' }));
+    await assert.rejects(client.callCodingSession({ ...options, req: { user: MEMBER } }));
+    assert.equal(server.received.length, 1);
+});
+
+test('native history gets a bounded helper deadline without extending ordinary profile calls', async t => {
+    const manifest = keeperManifest();
+    manifest.webtty.codingSessions = { version: 1, api: '/base-agent-additional-server/keeper/7001/api/coding-sessions' };
+    const fx = workspaceFixture(t, manifest);
+    const client = provider(fx, {});
+    const deadlines = [];
+    client.exchange = async options => {
+        deadlines.push(options.deadlineMs);
+        return { statusCode: 200, body: Buffer.from(JSON.stringify({ ok: true, sessions: [] })) };
+    };
+    const options = { req: ADMIN_REQ, routePlan: fx.webttyPlan(), providerName: 'keeper', body: {} };
+    await client.callCodingSession({ ...options, operation: 'history' });
+    await client.callCodingSession({ ...options, operation: 'robots' });
+    assert.deepEqual(deadlines, [15000, client.limits.deadlineMs]);
+});

@@ -19,10 +19,10 @@ import {
     relativeAge, rolesToKill, runningTerminals, supervisionTabs,
 } from '../../cli/utils/supervisionFlow.mjs';
 import {
-    supervisionRoleText, taskDelivery,
+    supervisionRoleText,
 } from '../../cli/utils/supervisionRoles.mjs';
 import {
-    parseTaskRevision, prepareSupervisedFolder, readTaskRevision, supervisedPaths, SUPERVISED_DIRECTORY,
+    prepareSupervisedFolder, supervisedPaths, SUPERVISED_DIRECTORY,
 } from '../../cli/utils/supervisionWorkspace.mjs';
 import { createMouseReportFilter, SWITCH_KEY, TerminalRelay } from '../../cli/utils/webttyCliClient.mjs';
 
@@ -38,7 +38,6 @@ const record = (overrides = {}) => ({
     label: 'project',
     createdAt: 1_000,
     updatedAt: 1_000,
-    deliveredRev: null,
     phase: 'running',
     supervisor: { robotId: 'ana-1', robotName: 'Ana', codingAgent: 'claude', nativeSessionId: 'native-1', terminalId: 's'.repeat(32) },
     worker: { robotId: 'bob-1', robotName: 'Bob', codingAgent: 'codex', nativeSessionId: 'native-2', terminalId: 'w'.repeat(32) },
@@ -50,10 +49,9 @@ test('the role instructions ship with the command and name the two files', () =>
     const worker = supervisionRoleText('worker');
     assert.match(supervisor, /tasks\.md/u);
     assert.match(supervisor, /results\.md/u);
-    assert.match(worker, /rev:/u);
+    assert.match(worker, /histories/u);
     assert.match(worker, /Never write to `tasks\.md`/u);
     assert.throws(() => supervisionRoleText('reviewer'), /Unknown supervision role/u);
-    assert.match(taskDelivery(3), /rev 3: read \.\/tasks\.md/u);
 });
 
 test('a session folder gets managed role skills and preserves its task files', (t) => {
@@ -63,30 +61,16 @@ test('a session folder gets managed role skills and preserves its task files', (
     prepareSupervisedFolder(folder);
     assert.deepEqual(fs.readdirSync(paths.directory).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
     // A second start refreshes the generated text and keeps the task files.
-    fs.writeFileSync(paths.tasks, 'rev: 1\ngoal: x\n');
+    fs.writeFileSync(paths.tasks, 'Requested change: x\n');
     prepareSupervisedFolder(folder);
     assert.deepEqual(fs.readdirSync(paths.directory).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
     assert.ok(fs.lstatSync(path.dirname(paths.supervisor)).isSymbolicLink());
     assert.ok(fs.realpathSync(paths.supervisor).startsWith(folder + path.sep));
-    assert.equal(fs.readFileSync(paths.tasks, 'utf8'), 'rev: 1\ngoal: x\n');
+    assert.equal(fs.readFileSync(paths.tasks, 'utf8'), 'Requested change: x\n');
     assert.equal(fs.existsSync(path.join(folder, '.supervised')), false);
     assert.equal(fs.statSync(paths.supervisor).mode & 0o777, 0o644);
 });
 
-test('the worker task revision is read from the file the supervisor writes', (t) => {
-    const folder = scratch(t);
-    const paths = supervisedPaths(folder);
-    assert.deepEqual(readTaskRevision(folder), { rev: null, text: '', missing: true });
-    fs.mkdirSync(paths.directory, { recursive: true });
-    fs.writeFileSync(paths.tasks, 'goal: no revision yet\n');
-    assert.deepEqual(readTaskRevision(folder).rev, null);
-    fs.writeFileSync(paths.tasks, 'rev: 7\ngoal: ship it\n');
-    assert.equal(readTaskRevision(folder).rev, 7);
-    assert.equal(parseTaskRevision('  rev: 7'), null);
-    assert.equal(parseTaskRevision('rev: 1234567890'), null);
-    assert.equal(parseTaskRevision('rev : 2'), null);
-    assert.equal(parseTaskRevision('rev:3'), 3);
-});
 
 test('the pair store tolerates a missing or corrupt file and never keeps a malformed record', (t) => {
     const root = scratch(t);
@@ -111,8 +95,8 @@ test('the newest pair comes first, the list is capped, and an update moves the p
     }
     assert.equal(store.sessions.length, MAX_SUPERVISED_SESSIONS);
     assert.equal(store.sessions[0].createdAt, MAX_SUPERVISED_SESSIONS + 2);
-    const updated = updateSession(store, store.sessions[1].id, () => ({ deliveredRev: 4 }), () => 99_000);
-    assert.equal(findSession(updated, store.sessions[1].id).deliveredRev, 4);
+    const updated = updateSession(store, store.sessions[1].id, () => ({ label: 'updated' }), () => 99_000);
+    assert.equal(findSession(updated, store.sessions[1].id).label, 'updated');
     assert.equal(updated.sessions[0].id, store.sessions[1].id);
     assert.equal(updated.sessions[0].updatedAt, 99_000);
     assert.equal(removeSession(updated, updated.sessions[0].id).sessions.length, MAX_SUPERVISED_SESSIONS - 1);
@@ -155,7 +139,8 @@ test('only running WebTTY terminals of the workspace are candidates', async () =
 function fakeApi(calls = [], answers = {}) {
     return async (route, body) => {
         calls.push([route, body]);
-        return answers[route] || { ok: true, profile: `${body.robot}.default.${body.codingAgent}`, nativeSessionId: `native-${route}-${calls.length}` };
+        if (route === 'control-create') return { ok: true, id: '11111111-1111-4111-8111-111111111111' };
+        return answers[route] || { ok: true, profile: `${body.robot}.default.${body.codingAgent}`, nativeSessionId: `native-${route}-${calls.filter(call => call[0] === route).length}` };
     };
 }
 
@@ -174,14 +159,15 @@ test('both terminals start in the folder, no prompt is submitted, and a failure 
         now: () => 5_000,
     });
     assert.deepEqual(opened, ['ana-1.default.claude', 'bob-1.default.codex']);
-    assert.deepEqual(calls.map(call => call[1].resume), [null, null]);
+    assert.deepEqual(calls.filter(call => call[0] === 'launch').map(call => call[1].resume), [null, null]);
     // Each launch names its role; instructions are workspace skills.
-    assert.deepEqual(calls.map(call => call[1].systemPrompt), ['supervisor', 'worker'].map(supervisionSystemPrompt));
+    assert.deepEqual(calls.filter(call => call[0] === 'launch').map(call => call[1].systemPrompt), ['supervisor', 'worker'].map(supervisionSystemPrompt));
     assert.ok(calls.every(([, body]) => !('skill' in body)), 'skills are installed in cwd, never in robot homes');
     assert.equal(pair.supervisor.codingAgent, 'claude');
     assert.equal(pair.worker.nativeSessionId, 'native-launch-2');
     assert.deepEqual(fs.readdirSync(path.join(folder, SUPERVISED_DIRECTORY)).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
-    assert.deepEqual(inputs, [], 'opening the pair does not submit a model request');
+    assert.deepEqual(inputs.filter(call => call[1].endsWith('/input')), [], 'opening the pair does not submit a model request');
+    assert.equal(inputs[0][1], '/webtty/supervised-pairs');
 
     const deleted = [];
     await assert.rejects(createSupervisedPair({
@@ -219,13 +205,15 @@ test('attaching a role resumes its native conversation when its terminal is gone
     assert.equal(attached.terminal.sessionId, 's'.repeat(32));
 
     const inputRequests = [];
-    await attachRole({
+    const fresh = await attachRole({
         client: { json: async (...args) => inputRequests.push(args) }, api,
         openTerminal: async () => ({ sessionId: 'fresh-terminal', viewId: 'view' }),
         session: record({ folder, worker: { ...record().worker, nativeSessionId: null } }),
         role: 'worker', directory: 'project', output: {}, live: [],
     });
-    assert.deepEqual(inputRequests, [], 'a fresh replacement without native history also receives no prompt');
+    assert.equal(calls.filter(([operation]) => operation === 'launch').at(-1)[1].resume, null);
+    assert.equal(fresh.record.nativeSessionId, 'native-2', 'persist the new ID assigned by the provider');
+    assert.deepEqual(inputRequests, [], 'no prompt is injected into the new terminal');
 });
 
 test('killing a role ends its terminal and tolerates one that is already gone', async () => {
@@ -240,70 +228,26 @@ test('killing a role ends its terminal and tolerates one that is already gone', 
     assert.deepEqual(await killRoles(client, record({ worker: { ...record().worker, terminalId: null } }), 'worker'), []);
 });
 
-test('the courier delivers each revision once and nudges a silent worker once', async () => {
-    let clock = 0;
+test('editing tasks.md never delivers a prompt; monitoring starts only after worker_send', async () => {
+    let clock = 1000;
     const delivered = [];
-    const statuses = [];
-    const revisions = [{ rev: 1 }, { rev: 1 }, { rev: 2 }, { rev: 2 }];
-    let activityAt = 0;
-    const courier = createSupervisionCourier({
-        folder: '/work/project',
-        workerTerminalId: 'w'.repeat(32),
-        readRevision: async () => revisions.shift() || { rev: 2 },
-        deliver: async text => { delivered.push(text); },
-        activity: async () => ({ lastActivityAt: activityAt }),
-        onStatus: value => statuses.push(value),
-        now: () => clock,
-        intervalMs: 1_000, activityMs: 0, stallMs: 60_000,
-        setTimer: () => null, clearTimer: () => {},
-    });
-    await courier.once();
-    assert.equal(delivered.length, 1);
-    assert.match(delivered[0], /rev 1: read/u);
-    await courier.once();
-    assert.equal(delivered.length, 1);
-    clock = 10_000;
-    await courier.once();
-    assert.equal(delivered.length, 2);
-    assert.match(delivered[1], /rev 2: read/u);
-    // A revision open for longer than the stall threshold gets exactly one nudge.
-    activityAt = 0;
-    clock = 120_000;
-    await courier.once();
-    await courier.once();
-    assert.equal(delivered.length, 3);
-    assert.match(delivered[2], /worker terminal silent for 2 minutes/u);
-    assert.ok(statuses.some(status => /worker silent for 2m/u.test(status)));
-    assert.equal(courier.deliveredRev(), 2);
-    courier.stop();
-    await courier.once();
-    assert.equal(delivered.length, 3);
-});
-
-test('the courier never delivers without a revision and reports why', async () => {
-    const statuses = [];
-    const delivered = [];
-    const courier = createSupervisionCourier({
-        folder: '/work', readRevision: async () => ({ rev: null, missing: true }), deliver: async text => delivered.push(text),
-        onStatus: value => statuses.push(value), setTimer: () => null, clearTimer: () => {},
-    });
-    await courier.once();
+    const alerts = [];
+    const monitor = createSupervisionCourier({ folder: '/unused', now: () => clock, activityMs: 0,
+        deliver: text => delivered.push(text),
+        readResults: async () => '', activity: async () => ({ lastOutputAt: null }),
+        notifySupervisor: async text => alerts.push(text) });
+    await monitor.once();
+    clock += 700000;
+    await monitor.once();
     assert.deepEqual(delivered, []);
-    assert.match(statuses[0], /tasks\.md does not exist yet/u);
-    // A revision already delivered by a previous run is not delivered again.
-    const restarted = createSupervisionCourier({
-        folder: '/work', startRev: 4, readRevision: async () => ({ rev: 4 }), deliver: async text => delivered.push(text),
-        setTimer: () => null, clearTimer: () => {},
-    });
-    await restarted.once();
+    assert.deepEqual(alerts, []);
+    await monitor.sent();
+    clock += 600000;
+    await monitor.once();
+    await monitor.once();
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0], /instructions were sent/u);
     assert.deepEqual(delivered, []);
-    // A delivery failure is reported instead of thrown.
-    const failing = createSupervisionCourier({
-        folder: '/work', readRevision: async () => ({ rev: 5 }), deliver: async () => { throw new Error('terminal is gone'); },
-        onStatus: value => statuses.push(value), setTimer: () => null, clearTimer: () => {},
-    });
-    await failing.once();
-    assert.match(statuses.at(-1), /delivery failed: terminal is gone/u);
 });
 
 test('Shift+Tab is the tab key, the tab line names both menus, and a live screen refreshes', () => {
@@ -415,14 +359,12 @@ test('a supervised session is created, switched with Ctrl+\\, killed and left wi
     assert.deepEqual(fs.readdirSync(folder).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
     const briefings = calls.filter(call => call[1].endsWith('/input'));
     assert.deepEqual(briefings, []);
-    // The pair was recorded, and one courier supervises the worker terminal.
+    // The pair was recorded and registered on the server; no CLI courier is started.
     const stored = readStore(storePath(root));
     assert.equal(stored.sessions.length, 1);
     assert.deepEqual([stored.sessions[0].supervisor.terminalId, stored.sessions[0].worker.terminalId], [supervisor, worker]);
-    assert.equal(couriers.length, 1);
-    assert.equal(couriers[0].started, true);
-    assert.equal(couriers[0].options.workerTerminalId, worker);
-    assert.equal(couriers[0].options.folder, path.join(root, 'project'));
+    assert.equal(couriers.length, 0);
+    assert.ok(calls.some(call => call[1] === '/webtty/supervised-pairs' && call[2].worker === worker));
     // Ctrl+\ switched to the other role and Ctrl+] came back to the pair screen.
     assert.deepEqual(relays.map(relay => relay.sessionId), [supervisor, worker]);
     assert.deepEqual(relays.map(relay => relay.keys.switch), [SWITCH_KEY, SWITCH_KEY]);
@@ -439,7 +381,6 @@ test('a supervised session is created, switched with Ctrl+\\, killed and left wi
     assert.equal(selects[7][1].activeTab, 1);
     assert.equal(selects[8][1].activeTab, 0);
     assert.match(errors.join(''), /Ctrl\+\\ switch/u);
-    assert.equal(couriers[0].stopped, true);
     assert.equal(menu.views.at(-1)[0], 'close');
 });
 
@@ -469,6 +410,7 @@ test('workspace role skills are used regardless of provider home-skill support',
     const pair = await createSupervisedPair({
         api: async (route, body) => {
             calls.push([route, body]);
+        if (route === 'control-create') return { ok: true, id: '11111111-1111-4111-8111-111111111111' };
             // The provider installed the skill for both roles.
             return { ok: true, profile: 'p.default.agent', nativeSessionId: null, skill: true };
         },
@@ -480,7 +422,7 @@ test('workspace role skills are used regardless of provider home-skill support',
     assert.equal(pair.supervisor.terminalId, 's'.repeat(32));
     // Both workspace skills are installed regardless of provider capabilities.
     assert.deepEqual(fs.readdirSync(path.join(folder, SUPERVISED_DIRECTORY)).sort(), ['supervised-session-supervisor', 'supervised-session-worker']);
-    assert.deepEqual(inputs, []);
+    assert.deepEqual(inputs.filter(call => call[1].endsWith('/input')), []);
     // A provider without home-skill support receives the same workspace skill paths.
     const mixedFolder = scratch(t);
     const mixed = [];
@@ -602,4 +544,133 @@ test('supervision skills use managed exports and preserve unrelated or conflicti
     fs.writeFileSync(path.join(custom, 'SKILL.md'), '# My supervisor\n');
     assert.throws(() => prepareSupervisedFolder(conflicting), /unrecorded-output-preserved/);
     assert.equal(fs.readFileSync(path.join(custom, 'SKILL.md'), 'utf8'), '# My supervisor\n');
+});
+
+
+test('silence follows terminal output while results remain history, not task state', async () => {
+    let clock = 1_000_000;
+    let output = null;
+    let results = '';
+    let failNotify = false;
+    const alerts = [];
+    const courier = createSupervisionCourier({ folder: '/unused', workerTerminalId: 'worker',
+        now: () => clock, activityMs: 0,
+        deliver: async () => {}, readResults: async () => results,
+        activity: async () => ({ lastOutputAt: output, lastActivityAt: clock }),
+        notifySupervisor: async text => { if (failNotify) throw new Error('temporarily unavailable'); alerts.push(text); },
+    });
+    await courier.sent();
+    await courier.once();
+    clock += 599_999;
+    await courier.once();
+    assert.equal(alerts.length, 0);
+    clock++;
+    failNotify = true;
+    await courier.once();
+    failNotify = false;
+    await courier.once();
+    assert.equal(alerts.length, 1, 'failed notification is retried');
+    await courier.once();
+    assert.equal(alerts.length, 1, 'no repeated alert for the same silence');
+    output = ++clock;
+    await courier.once();
+    clock += 600_000;
+    await courier.once();
+    assert.equal(alerts.length, 2, 'new silence after resumed output triggers another alert');
+    results = '## Parser fix\nFinished the requested change. Checks passed.\n';
+    await courier.once();
+    assert.equal(alerts.length, 3, 'new history entries notify the supervisor');
+    await courier.once();
+    assert.equal(alerts.length, 3, 'unchanged history does not repeat notifications');
+    output = ++clock;
+    await courier.once();
+    clock += 600_000;
+    await courier.once();
+    assert.equal(alerts.length, 4, 'historical completion does not decide current task state');
+    await courier.sent();
+    await courier.once();
+    assert.equal(alerts.length, 4, 'a new assignment does not report existing history as new results');
+});
+
+for (const codingAgent of ['opencode', 'codex', 'pi', 'omp', 'claude', 'vibe', 'agy']) {
+    test(`${codingAgent}: an ended supervised role resumes its native history instead of opening a new conversation`, async t => {
+        const folder = scratch(t);
+        const calls = [];
+        const session = record({ folder, worker: { ...record().worker, codingAgent, nativeSessionId: null, historyBefore: ['old'] } });
+        const result = await attachRole({
+            session, role: 'worker', directory: 'project', output: {}, live: [],
+            client: { json: async () => ({ ok: true }) },
+            api: async (operation, body) => {
+                calls.push([operation, body]);
+                return operation === 'history' ? { sessions: [{ id: 'old' }, { id: 'original' }] }
+                    : { profile: 'resumed', nativeSessionId: body.resume };
+            },
+            openTerminal: async () => ({ sessionId: 't'.repeat(32) }),
+        });
+        assert.equal(calls.find(([operation]) => operation === 'launch')[1].resume, 'original');
+        assert.equal(result.record.nativeSessionId, 'original');
+    });
+}
+
+test('legacy shared catalogs cannot assign the supervisor conversation to the worker, even through a picker', async t => {
+    const folder = scratch(t);
+    const supervisor = { ...record().supervisor, nativeSessionId: null, historyBefore: [] };
+    const session = record({ folder, supervisor, worker: { ...supervisor, terminalId: 'w'.repeat(32) } });
+    const calls = [];
+    const options = { session, role: 'worker', directory: 'project', output: {}, live: [],
+        client: { json: async () => ({ ok: true }) },
+        api: async (operation, body) => {
+            calls.push([operation, body]);
+            return operation === 'history' ? { sessions: [{ id: 'conversation-a' }, { id: 'conversation-b' }] }
+                : { profile: 'resumed', nativeSessionId: body.resume };
+        }, openTerminal: async () => ({ sessionId: 't'.repeat(32) }) };
+    await assert.rejects(attachRole(options), /no verified conversation ownership/u);
+    await assert.rejects(attachRole({ ...options, chooseResume: () => assert.fail('shared history is not ownership evidence') }), /no verified conversation ownership/u);
+    assert.equal(calls.some(([operation]) => operation === 'launch'), false);
+    session.worker.nativeSessionId = 'conversation-a';
+    await assert.rejects(attachRole(options), /no verified conversation ownership/u);
+});
+
+test('native conversation bindings are unique per role and persist before the first user message', async t => {
+    const folder = scratch(t);
+    const calls = [];
+    const pair = await createSupervisedPair({ folder, directory: '',
+        supervisor: { robotId: 'same', codingAgent: 'vibe' }, worker: { robotId: 'same', codingAgent: 'vibe' },
+        api: async (route, body) => {
+            calls.push([route, body]);
+            if (route === 'history') return { sessions: [], sessionBindingSupported: true };
+            if (route === 'control-create') return { id: '11111111-1111-4111-8111-111111111111' };
+            return { profile: 'profile', nativeSessionId: null };
+        },
+        client: { json: async () => ({}) }, openTerminal: async () => ({ sessionId: `t${calls.length}`.padEnd(32, 'x') }),
+    });
+    const stored = sanitizeStore({ version: 1, sessions: [pair] }).sessions[0];
+    assert.ok(stored.supervisor.sessionBinding);
+    assert.notEqual(stored.supervisor.sessionBinding, stored.worker.sessionBinding);
+    const launches = calls.filter(([route]) => route === 'launch');
+    for (const [i, role] of ['supervisor', 'worker'].entries()) {
+        assert.ok(launches[i][1].systemPrompt.includes(`Session binding: ${stored[role].sessionBinding}`));
+        assert.equal(stored[role].nativeSessionId, null);
+    }
+    const { rememberRoleConversations, resolveSupervisedResume } = await import('../../cli/utils/supervisionFlow.mjs');
+    const history = { sessions: [
+        { id: 'supervisor-conversation', sessionBinding: stored.supervisor.sessionBinding },
+        { id: 'worker-conversation', sessionBinding: stored.worker.sessionBinding },
+        { id: 'unrelated-conversation', sessionBinding: '33333333-3333-4333-8333-333333333333' },
+    ] };
+    const api = async () => history;
+    const patch = await rememberRoleConversations({ api, session: stored, directory: '' });
+    assert.equal(patch.supervisor.nativeSessionId, 'supervisor-conversation');
+    assert.equal(patch.worker.nativeSessionId, 'worker-conversation');
+    for (const role of ['supervisor', 'worker']) {
+        assert.equal(await resolveSupervisedResume({ api, session: stored, role, directory: '',
+            chooseResume: () => assert.fail('must not ask the user to identify ownership') }), `${role}-conversation`);
+    }
+    history.sessions = history.sessions.filter(entry => entry.id !== 'worker-conversation');
+    assert.equal(await resolveSupervisedResume({ api, session: stored, role: 'worker', directory: '' }), null);
+    const mapped = { ...stored, worker: { ...stored.worker, nativeSessionId: 'worker-conversation' } };
+    assert.equal(await resolveSupervisedResume({ api, session: mapped, role: 'worker', directory: '' }), 'worker-conversation');
+    const corrupt = { ...stored, worker: { ...stored.worker, nativeSessionId: 'supervisor-conversation' } };
+    history.sessions.push({ id: 'worker-conversation', sessionBinding: stored.worker.sessionBinding });
+    await assert.rejects(resolveSupervisedResume({ api, session: corrupt, role: 'worker', directory: '' }), /does not match/u);
 });

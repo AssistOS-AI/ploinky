@@ -1,5 +1,5 @@
 import { getSession, isAdminUser } from '../auth/localService.js';
-import { authService } from '../authHandlers/shared.js';
+import { authService, renewPersistentSsoCookie } from '../authHandlers/shared.js';
 import { localSessionAllowedForRoutePlan } from '../authHandlers/authContext.js';
 
 import { PolicyStateRepository } from './PolicyStateRepository.js';
@@ -55,6 +55,7 @@ const registry = new PolicyCommandRegistry()
 const commandInvoker = new PolicyCommandInvoker({
     registry, auditLog, getSession, isAdminUser,
     allowLocalSession: localSessionAllowedForRoutePlan,
+    renewProviderCookie: renewPersistentSsoCookie,
     getProviderSession: (id) => authService.isConfigured()
         ? authService.validateSession(id, { reportUnavailable: true })
         : null,

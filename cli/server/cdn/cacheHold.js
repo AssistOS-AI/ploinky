@@ -7,7 +7,9 @@ import { normalizeManifestHttpRouteAccess } from '../policy/HttpRouteProviders.j
 import { parseAgentPortSelector } from '../agentPortConvention/parseSelector.js';
 import { configuredCacheEntries } from './cachePurgeConfig.js';
 import { purgeCacheHost } from './cachePurge.js';
-import { setCacheHold } from './cacheSettingsStore.js';
+import { matchOverlayEntry } from '../policy/routeCacheMarks.js';
+import { applicationOverlay } from './cacheRouteModel.js';
+import { readCacheSettings, setCacheHold } from './cacheSettingsStore.js';
 export { isApplicationHeld } from './cacheSettings.js';
 
 const changing = new Map();
@@ -20,7 +22,7 @@ function markedRoutes(generation) {
         const raw = generation.manifests?.[routeKey]?.routerAccess?.httpRoutes;
         const specs = Array.isArray(raw) ? raw : Object.entries(raw || {}).map(([path, value]) => ({ path, ...value }));
         for (const spec of specs) {
-            if (spec?.enabled === false || !['immutable', 'page'].includes(spec?.cache)) continue;
+            if (spec?.enabled === false || !['immutable', 'page', 'never'].includes(spec?.cache)) continue;
             const normalized = normalizeManifestHttpRouteAccess(spec, { routeKey });
             if (normalized.ok && normalized.access === 'public') {
                 rows.push({ agent, routeKey, path: spec.path, cache: spec.cache, policyPath: normalized.path });
@@ -35,27 +37,37 @@ export function markedApplications(generation) {
     for (const { agent, path, cache } of markedRoutes(generation)) {
         if (!apps.has(agent)) apps.set(agent, { agent, routes: [] });
         const { routes } = apps.get(agent);
-        if (!routes.some(route => route.path === path && route.cache === cache)) routes.push({ path, cache });
+        // `never` makes an application listed but is not a cached route.
+        if (cache !== 'never' && !routes.some(route => route.path === path && route.cache === cache)) routes.push({ path, cache });
     }
     return [...apps.values()].sort((a, b) => a.agent.localeCompare(b.agent));
 }
 
-function selectProbe(pages, hosts, generation, planRequest) {
-    for (const { policyPath, routeKey } of pages) {
-        // Wildcard marks can also cover their prefix; the origin must actually serve it.
-        const canonical = policyPath.endsWith('/*') ? policyPath.slice(0, -1) : policyPath;
-        const selector = parseAgentPortSelector(canonical);
-        for (const host of hosts) {
-            const root = generation.compiled.hosts[host].rootApplication;
-            const path = selector && root?.routeKey === routeKey && root.port === selector.port
-                ? selector.suffix : canonical;
-            const plan = planRequest({ req: { url: path, method: 'GET', headers: { host } }, listener: 'public' });
-            if (plan.ok && ['agent-port', 'agent-root'].includes(plan.kind) && plan.routeKey === routeKey
-                && plan.canonicalPath === canonical && (plan.decision ?? plan.access)?.access === 'public'
-                && plan.responsePolicy?.cacheClass === 'page') {
-                return { host, path };
-            }
+// The public host and request path that reach one policy path on this Router, or
+// null. A root-application route is requested at its suffix on the root host, any
+// other at its path. `accept` may refuse a plan the Router resolved.
+export function routeOrigin({ policyPath, routeKey }, hosts, generation, planRequest, accept = () => true) {
+    // Wildcard marks can also cover their prefix; the origin must actually serve it.
+    const canonical = policyPath.endsWith('/*') ? policyPath.slice(0, -1) : policyPath;
+    const selector = parseAgentPortSelector(canonical);
+    for (const host of hosts) {
+        const root = generation.compiled.hosts[host]?.rootApplication;
+        const path = selector && root?.routeKey === routeKey && root.port === selector.port
+            ? selector.suffix : canonical;
+        const plan = planRequest({ req: { url: path, method: 'GET', headers: { host } }, listener: 'public' });
+        if (plan.ok && ['agent-port', 'agent-root'].includes(plan.kind) && plan.routeKey === routeKey
+            && plan.canonicalPath === canonical && (plan.decision ?? plan.access)?.access === 'public'
+            && accept(plan)) {
+            return { host, path };
         }
+    }
+    return null;
+}
+
+function selectProbe(pages, hosts, generation, planRequest, accept) {
+    for (const page of pages) {
+        const target = routeOrigin(page, hosts, generation, planRequest, accept);
+        if (target) return target;
     }
     return null;
 }
@@ -83,8 +95,9 @@ export async function changeCacheHold({ op, agent, by, assertCurrent, publicPort
     // An overlapping release must never erase a newer hold while its purge is in flight.
     const operation = (changing.get(agent) ?? Promise.resolve()).then(async () => {
         assertCurrent();
-        const routes = markedRoutes(generation).filter(row => row.agent === agent);
-        if (!routes.length) throw new Error('unknown_application');
+        if (!markedApplications(generation).some(application => application.agent === agent)) {
+            throw new Error('unknown_application');
+        }
         if (op === 'hold') {
             await setCacheHold(agent, { since: new Date().toISOString(), by }, { dataDir, assertCurrent });
         }
@@ -107,12 +120,16 @@ export async function changeCacheHold({ op, agent, by, assertCurrent, publicPort
             // last scope comparison through the settings store's atomic rename.
             await withConfigLock(() => setCacheHold(agent, null, { dataDir, assertCurrent: assertPurgeScope }));
         } else if (success) {
-            const pages = routes.filter(row => row.cache === 'page');
+            // Effective page routes: manifest marks and administrator choices, as the Router serves them.
+            const overlay = applicationOverlay(generation, agent, readCacheSettings({ dataDir }));
+            const pages = overlay.entries.filter(entry => entry.effective === 'page')
+                .map(({ path, routeKey }) => ({ policyPath: path, routeKey }));
             if (!pages.length) {
                 assertPurgeScope();
                 return { success, purges, probeSkipped: 'no_page_marks' };
             }
-            const target = selectProbe(pages, hosts, generation, planRequest);
+            const target = selectProbe(pages, hosts, generation, planRequest,
+                plan => matchOverlayEntry(overlay, plan.canonicalPath)?.effective === 'page');
             success = Boolean(target) && await probe({ ...target, publicPort });
             assertPurgeScope();
         }

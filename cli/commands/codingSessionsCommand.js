@@ -3,7 +3,6 @@ import path from 'node:path';
 
 import { listCodingSessionProviders } from '../utils/codingSessionProviders.mjs';
 import { ListMenu } from '../utils/codingSessionsMenu.mjs';
-import { createSupervisionCourier } from '../utils/supervisionCourier.mjs';
 import { RELAY_EXIT_REASONS, relayStatus, supervisionTabs } from '../utils/supervisionFlow.mjs';
 import { storePath } from '../utils/supervisedSessions.mjs';
 import {
@@ -12,9 +11,9 @@ import {
 import { createSupervisedScreen } from './supervisedSessionsScreen.js';
 
 // `ploinky cs` (`ploinky coding-sessions`): a menu of the coding sessions an
-// enabled agent provides in the caller's folder. The person picks a robot (the
-// default robot is preselected), then one of its coding agents, then a session:
-// a running one to attach, an earlier conversation to resume, or a new one.
+// enabled agent provides in the caller's folder. The folder list comes first:
+// attach a running terminal, resume a saved conversation, or choose New and
+// then select a robot and coding agent.
 // Shift+Tab switches to supervised sessions, where one coding agent supervises
 // another through two files in the folder.
 // The Router owns every terminal, so sessions are also listed in Live
@@ -160,6 +159,18 @@ export function sessionItems({ live, history, now = Date.now() }) {
     ];
 }
 
+export function folderSessionItems({ running = [], sessions = [] }, now = Date.now()) {
+    return [
+        { kind: 'new', label: '+ New session' },
+        ...running.map(row => ({ kind: 'live', row,
+            label: `● ${row.title || 'new session'}`,
+            detail: `robot: ${row.robotName || row.robotId} · ${row.codingAgent} · ${row.status} · ${ago(row.lastActivityAt, now)}` })),
+        ...sessions.map(session => ({ kind: 'history', session,
+            label: `  ${session.title || session.id}`,
+            detail: `robot: ${session.robotName || session.robotId} · ${session.codingAgent} · ${ago(session.updatedAt, now)}` })),
+    ];
+}
+
 export async function runCodingSessionsCommand({
     env = process.env,
     input = process.stdin,
@@ -171,7 +182,6 @@ export async function runCodingSessionsCommand({
     createClient = options => new LocalRouterClient(options),
     createRelay = options => new TerminalRelay(options),
     createMenu = options => new ListMenu(options),
-    createCourier = createSupervisionCourier,
     pairRefreshMs = PAIR_REFRESH_MS,
     now = () => Date.now(),
 } = {}) {
@@ -198,7 +208,7 @@ export async function runCodingSessionsCommand({
     const failure = error => describeFailure(error, provider);
 
     let mode = 'coding';
-    let level = 'robots';
+    let level = 'sessions';
     let robot = null;
     let codingAgent = null;
     let status = '';
@@ -209,7 +219,6 @@ export async function runCodingSessionsCommand({
         openTerminal,
         attachTerminal: attachSessionTerminal,
         createRelay,
-        createCourier,
         input,
         output,
         errorOutput,
@@ -231,7 +240,7 @@ export async function runCodingSessionsCommand({
                 const outcome = await supervised.screen(supervisedState);
                 if (outcome.mode) {
                     mode = outcome.mode;
-                    level = 'robots';
+                    level = 'sessions';
                 }
                 if (outcome.quit) return 0;
                 continue;
@@ -246,9 +255,10 @@ export async function runCodingSessionsCommand({
                 const previous = robots.findIndex(entry => entry.id === remembered.robots);
                 const selected = previous >= 0 ? previous : Math.max(0, robots.findIndex(entry => entry.default));
                 const choice = await menu.select({ ...header, items, status,
-                    help: '↑/↓ select · Enter choose · Shift+Tab supervised · q quit' }, { selected });
+                    help: '↑/↓ select · Enter choose · Backspace sessions · Shift+Tab supervised · q quit' }, { selected });
                 status = '';
-                if (choice.action === 'tab') { mode = 'supervised'; continue; }
+                if (choice.action === 'tab') { mode = 'supervised'; supervisedState.level = 'pairs'; continue; }
+                if (choice.action === 'back') { level = 'sessions'; continue; }
                 if (choice.action !== 'enter') return 0;
                 robot = items[choice.index].entry;
                 remembered.robots = robot.id;
@@ -269,42 +279,44 @@ export async function runCodingSessionsCommand({
                     help: '↑/↓ select · Enter choose · Backspace robots · Shift+Tab supervised · q quit' },
                 { selected: Math.max(0, names.indexOf(preferred)) });
                 status = '';
-                if (choice.action === 'tab') { mode = 'supervised'; continue; }
+                if (choice.action === 'tab') { mode = 'supervised'; supervisedState.level = 'pairs'; continue; }
                 if (choice.action === 'quit') return 0;
                 if (choice.action === 'back') { level = 'robots'; continue; }
                 codingAgent = names[choice.index];
                 remembered.agents = codingAgent;
                 remembered.sessions = 0;
-                level = 'sessions';
-                continue;
+                level = 'launch';
             }
-            const header = { ...supervisionTabs(mode), title: [`Coding sessions — ${folder}`, `Robot ${robot.name} › ${codingAgent}`] };
-            let items;
-            try {
-                const [live, history] = await menu.busy(header, () => Promise.all([
-                    listLiveSessions(client, provider, { robotId: robot.id, codingAgent, directory }),
-                    api('history', { robot: robot.id, codingAgent, directory }).then(result => result.sessions || []),
-                ]));
-                items = sessionItems({ live, history, now: now() });
-            } catch (error) { status = failure(error); level = 'agents'; continue; }
-            const view = { ...header, items, status,
-                help: `↑/↓ select · Enter open · n new · k kill · r refresh · Backspace agents · Shift+Tab supervised · `
-                    + `q quit · in a session: ${keyHelp}` };
-            const choice = await menu.select(view, { selected: remembered.sessions, actions: { n: 'new', k: 'kill', delete: 'kill', r: 'refresh' } });
-            status = '';
-            remembered.sessions = choice.index;
-            if (choice.action === 'tab') { mode = 'supervised'; continue; }
-            if (choice.action === 'quit') return 0;
-            if (choice.action === 'back') { level = 'agents'; continue; }
-            if (choice.action === 'refresh') continue;
-            const item = choice.action === 'new' ? items[0] : items[choice.index];
-            if (choice.action === 'kill') {
-                if (item.kind !== 'live') { status = 'Only a running session can be killed.'; continue; }
-                if (!await menu.confirm({ ...view, selected: choice.index }, `Kill ${item.label.slice(2)}? Its conversation stays resumable.`)) continue;
-                try { await client.json('DELETE', `/webtty/sessions/${encodeURIComponent(item.row.id)}`); status = 'Session killed.'; }
-                catch (error) { status = failure(error); }
-                continue;
+            const header = { ...supervisionTabs(mode), title: [`Coding sessions — ${folder}`, 'Choose a session'] };
+            let item = { kind: 'new' };
+            if (level !== 'launch') {
+                let items;
+                try {
+                    const result = await menu.busy(header, () => client.json('POST', '/webtty/coding-sessions', { action: 'overview', dir: directory }));
+                    items = folderSessionItems(result, now());
+                } catch (error) { status = failure(error); items = [{ kind: 'new', label: '+ New session' }]; }
+                const view = { ...header, items, status,
+                    help: `↑/↓ select · Enter open · n new · k kill · r refresh · Shift+Tab supervised · q quit · in a session: ${keyHelp}` };
+                const choice = await menu.select(view, { selected: remembered.sessions, actions: { n: 'new', k: 'kill', delete: 'kill', r: 'refresh' } });
+                status = '';
+                remembered.sessions = choice.index;
+                if (choice.action === 'tab') { mode = 'supervised'; supervisedState.level = 'pairs'; continue; }
+                if (choice.action === 'quit' || choice.action === 'back') return 0;
+                if (choice.action === 'refresh') continue;
+                item = choice.action === 'new' ? items[0] : items[choice.index];
+                if (choice.action === 'kill') {
+                    if (item.kind !== 'live') { status = 'Only a running session can be killed.'; continue; }
+                    if (!await menu.confirm({ ...view, selected: choice.index }, `Kill ${item.label.slice(2)}? Its conversation stays resumable.`)) continue;
+                    try { await client.json('DELETE', `/webtty/sessions/${encodeURIComponent(item.row.id)}`); status = 'Session killed.'; }
+                    catch (error) { status = failure(error); }
+                    continue;
+                }
+                if (item.kind === 'new') { level = 'robots'; continue; }
+                const entry = item.row || item.session;
+                robot = { id: entry.robotId, name: entry.robotName || entry.robotId };
+                codingAgent = entry.codingAgent;
             }
+            level = 'sessions';
             let terminal;
             try {
                 terminal = await menu.busy({ ...header, status: item.kind === 'live' ? 'Attaching…' : 'Starting…' }, async () => {

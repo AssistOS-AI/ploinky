@@ -462,6 +462,9 @@ const DYNAMIC_SITES = {
     // A browser-session auth lease of the same name: accepted only while the
     // file references no workspace lease at all.
     'cli/server/webtty/sessionManager.mjs': { req: 'unrelated' },
+    // Supervised pairs call the manager's browser-session auth adapter
+    // (manager.auth.createLease); the file imports no workspace lease.
+    'cli/server/webtty/supervisedPairs.mjs': { req: 'unrelated' },
     'cli/commands/noWaitWorker.js': {
         '{ operation, waitTimeoutMs: remainingMs, retryIntervalMs: Math.min(1000, boundedPollIntervalMs), }': {
             defaultTemplate: /operation = `(no-wait-runtime:)\$\{/,
