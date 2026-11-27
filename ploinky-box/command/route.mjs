@@ -308,5 +308,25 @@ export function routeOuterCommand(parsed, options = {}) {
         kind: parsed.dryRun ? 'dry-run' : 'generic',
         coreArgv: parsed.forwardingArgv,
         ...(stdinValue ? { stdinValue: true } : {}),
+        ...(isReadOnlyGeneric(parsed.command, parsed.commandArgs) ? { readOnly: true } : {}),
     });
+}
+
+// Generic commands that only read workspace state. While an activation
+// barrier is held these alone are forwarded, to the running Box and without
+// reconciling it (Q30). `var` writes in every form and `vars` may write
+// APP_NAME, so neither is here; `profile NAME` sets the profile.
+export const READ_ONLY_GENERIC = Object.freeze({
+    list: Object.freeze(['agents', 'repos', 'routes']),
+    profile: Object.freeze(['list', 'show', 'current', 'validate', 'check']),
+});
+
+export function isReadOnlyGeneric(command, args = []) {
+    const words = Array.isArray(args) ? args : [];
+    if (command === 'list') return words.length === 1 && READ_ONLY_GENERIC.list.includes(words[0]);
+    if (command === 'echo') return words.length === 1;
+    if (command === 'profile') {
+        return words.length === 0 || READ_ONLY_GENERIC.profile.includes(String(words[0]).toLowerCase());
+    }
+    return false;
 }

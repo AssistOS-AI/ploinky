@@ -34,7 +34,9 @@ import {
     formatGpuGrantResult,
     formatGpuGrantStatus,
     formatRouterBindingLines,
+    formatActivationRecoveryLine,
     formatUpdateStateLines,
+    isActivationRecoveryBarrier,
 } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
@@ -595,6 +597,8 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     // Both logs and canary status inspect the Box before forwarding.
     if (route.kind === 'logs') {
         const status = selectedSupervisor.inspectBoxStatus();
+        // M5 goes to stderr here: `canary status --json` stdout stays one JSON document.
+        writeActivationRecoveryNotice(selectedSupervisor, status.identity, errorOutput);
         const container = status.ownership?.handles?.container;
         const engine = status.ownership?.engine;
         if (status.state !== 'running-initialized' || !container?.id || !engine?.name) {
@@ -642,7 +646,7 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
         });
     }
 
-    const prepared = await selectedSupervisor.prepareBoxForCommand();
+    const prepared = await selectedSupervisor.prepareBoxForCommand({ readOnly: route.readOnly === true });
     if (route.kind === 'bash') {
         return executePrepared(prepared, [], {
             execute,
@@ -686,7 +690,21 @@ const UPDATE_FAILURE_WORDING = Object.freeze({
         + 'so the workspace graph and its registered repositories were left as they were.',
     'source-mismatch': 'Update did not start in this workspace: its Box runs another Ploinky checkout, so no '
         + 'source checkout was pulled and the workspace graph was left as it was.',
+    'kept-activated': 'Update activated the new workspace version but could not settle it; it was left running and was '
+        + 'not rolled back. Run `ploinky restart` to settle it.',
+    'kept-indeterminate': 'Update failed after it may have activated a new workspace version; the workspace was left as '
+        + 'it is and was not rolled back. Run `ploinky restart` to settle it.',
 });
+
+// The activation recovery line (M5) for commands whose stdout is consumed as
+// data. Reading host update state never probes, locks or clears anything.
+function writeActivationRecoveryNotice(supervisor, identity, errorOutput) {
+    if (typeof supervisor.inspectUpdateState !== 'function') return;
+    try {
+        const barrier = supervisor.inspectUpdateState(identity)?.recoveryBarrier;
+        if (isActivationRecoveryBarrier(barrier)) errorOutput.write(`${formatActivationRecoveryLine(barrier)}\n`);
+    } catch (_) {}
+}
 
 function describeRecord(record) {
     return `${record.phase} ${record.id}: ${record.outcome}${record.code ? ` [${record.code}]` : ''}`;

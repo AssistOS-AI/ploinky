@@ -492,6 +492,20 @@ Other refusals and protections:
 | Router | Router-served workspace files never include `.ploinky-box`, at any depth |
 | First-use quarantine | Described above |
 
+### Activation recovery after a failed start, restart or update
+
+A `ploinky start`, a whole `ploinky restart` or a full `ploinky update` can fail after its in-Box command has already published the new routing selector, for example when a later start step, the Router health check or the admission of the new version fails. The new version is then already serving, so the host keeps it running instead of stopping it and restoring the old one. Before it publishes, the in-Box command durably writes a write-once intent under `.ploinky/data/edge-routing/activations/` that names the exact selector it is about to publish, the Box and the workspace. After a failure the host waits until the engine has proven the in-Box command stopped, then compares the live selector with that intent. It rolls back only when the previous version is provably still in force; in every other case it keeps the graph and holds an activation barrier. A false barrier costs one `ploinky restart`; a false rollback would stop a serving version.
+
+| Outcome | What you see | What to do |
+| --- | --- | --- |
+| Kept | The command exits 1 with a message ending in `[PLOINKY_BOX_ACTIVATION_RECOVERY_REQUIRED]`. `ploinky status` prints a line that starts with `Activation recovery required:` | Run `ploinky restart` to settle it, or `ploinky stop` |
+| Rolled back | The previous version was restored and passed its checks, as before | Nothing; fix the cause and retry |
+| In-Box command not proven stopped | A recovery record blocks new mutations until the engine confirms it stopped, as before | Wait, or run `ploinky stop` |
+
+While the barrier is held, `start`, full and targeted `update`, single-agent `restart`, `bind`, `gpu grant`/`gpu revoke`, `edge set` and `limits clear` are refused without touching the Box. Other forwarded commands are refused too, except the read-only `list agents|repos|routes`, `echo VAR` and the read forms of `profile`, which only use the running Box as it is. Inside the Box a controller-only marker, `.ploinky/data/edge-routing/activation-barrier.json`, makes configuration and graph changes refuse with `[PLOINKY_ACTIVATION_RECOVERY_REQUIRED]`: Marketplace enable and repository changes, agent enable and disable, canary actions other than `status`, `reinstall`, `update`, and `var PROD` or profile changes. `stop`, `shutdown`, `destroy`, canary status and teardown, Watchdog restarts, no-wait workers, Router restarts, shells and Router policy writes still run.
+
+`ploinky restart` is the settle step: it restarts the whole graph and, once that is admitted, removes the barrier and prints `Activation recovery settled: …`. If the settle restart fails before it publishes, the kept version is restored and the barrier stays; if it fails after publishing, a new barrier replaces the old one. `ploinky stop` ends the barrier once the engine reports the Box stopped or gone; a paused Box keeps it. `ploinky logs` and `ploinky canary status` print the `Activation recovery required:` line on stderr, so `canary status --json` keeps one JSON document on stdout. Automation that deploys onward should look for that line in `ploinky status` and run `ploinky restart` first. The captured PROD policy is never weakened on this path: with no captured policy yet and `PROD` on, the capture itself is staged before the new selector is published.
+
 ### Recovering stuck locks with `ploinky unlock`
 
 ```sh

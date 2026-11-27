@@ -18,6 +18,7 @@ import { fakeRestartCore, fakeUpdateCore, verifiedRecord } from '../helpers/fake
 import { createOperationRecord } from '../../cli/commands/updateOutcome.js';
 import { createUpdateCancellation } from '../../cli/commands/updateCancellation.js';
 import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
+import { isInBoxStop, writeInBoxStopSelector } from '../helpers/fakeInBoxStop.mjs';
 
 const CONTAINER_ID = 'a'.repeat(64);
 
@@ -119,7 +120,11 @@ function harness(t, {
         stderr: { write() {} },
         updateHostState: store,
         runner: {
-            run(_command, args) { events.push(`run:${args.at(-1)}`); },
+            run(_command, args) {
+                events.push(`run:${args.at(-1)}`);
+                // The in-Box stop writes its inactive selector (Q30 binding).
+                if (isInBoxStop(args)) writeInBoxStopSelector(identity.workspaceRoot);
+            },
             query(_command, args) {
                 // The host's own listing of the workspace's running Box containers.
                 if (args?.[0] === 'ps') return { ok: true, stdout: `${CONTAINER_ID}\n` };

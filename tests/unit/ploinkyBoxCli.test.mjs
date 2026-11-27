@@ -1538,3 +1538,90 @@ test('dry-run and invalid arguments cause no preparation or execution', async ()
     }), /range 1..65535/);
     assert.equal(events.length, 1);
 });
+
+// Q30: the activation recovery line (M5) and the kept-update wording (M6).
+function activationBarrierRecord(state = 'activated') {
+    return {
+        schema: 'ploinky-activation-recovery', version: 1,
+        instance: 'ploinky-box-workspace-123456789abc', workspaceRoot: WORKSPACE_ROOT,
+        containerId: 'a'.repeat(64), operation: 'restart', operationId: 'b'.repeat(32), state,
+        intended: null, observed: null, cause: 'Router health failed', createdAt: '2026-11-27T00:00:00.000Z',
+    };
+}
+
+function withBarrier(supervisor, barrier) {
+    return { ...supervisor, inspectUpdateState: () => ({ pendingActivation: null, recoveryBarrier: barrier, errors: [] }) };
+}
+
+test('AC14: canary status --json stays one JSON document on stdout while M5 goes to stderr', async () => {
+    const events = [];
+    const output = bufferStream();
+    const errorOutput = bufferStream();
+    const code = await runOuterCli(['canary', 'status', 'bizanso/bizanso', '--json'], {
+        env: { PATH: '/bin', HOME: '/tmp' },
+        input: { isTTY: false }, output, errorOutput,
+        supervisor: withBarrier(fakeSupervisor(events, { statusState: 'running-initialized' }), activationBarrierRecord()),
+        execute() { throw new Error('canary status must use the streaming primitive'); },
+        executeStreaming(_command, args) {
+            // The in-Box command writes its JSON to the inherited stdout.
+            events.push(['stream', args.slice(-4)]);
+            output.write('{"rollouts":[]}\n');
+            return 0;
+        },
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(JSON.parse(output.value()), { rollouts: [] });
+    assert.match(errorOutput.value(), /^Activation recovery required: an earlier restart \(bbbbbbbb\) activated a new version whose settlement failed \(Router health failed\)\. It is left running\./m);
+    assert.deepEqual(events.filter((event) => event === 'prepare'), []);
+});
+
+test('AC15: ploinky status prints the stable activation signal on stdout only while a barrier is held', async () => {
+    for (const [barrier, expected] of [[activationBarrierRecord('indeterminate'), true], [null, false]]) {
+        const output = bufferStream();
+        const code = await runOuterCli(['status'], {
+            env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
+            supervisor: withBarrier(fakeSupervisor([], { statusState: 'absent' }), barrier),
+        });
+        assert.equal(code, 0);
+        assert.equal(/^Activation recovery required: /m.test(output.value()), expected);
+        if (expected) assert.match(output.value(), /may have activated a new version/);
+    }
+});
+
+test('M6: a kept update activation is worded as kept, not rolled back', async () => {
+    for (const [outcome, wording] of [
+        ['kept-activated', /^Update activated the new workspace version but could not settle it; it was left running and was not rolled back\. Run `ploinky restart` to settle it\.$/m],
+        ['kept-indeterminate', /^Update failed after it may have activated a new workspace version; the workspace was left as it is and was not rolled back\. Run `ploinky restart` to settle it\.$/m],
+    ]) {
+        const supervisor = fakeSupervisor([], { statusState: 'running-initialized' });
+        supervisor.runUpdateTransaction = async () => {
+            const error = new Error('kept');
+            error.code = 'PLOINKY_BOX_ACTIVATION_RECOVERY_REQUIRED';
+            error.activation = { outcome, graphMutated: true, boxRollback: null };
+            throw error;
+        };
+        const output = bufferStream();
+        await assert.rejects(runOuterCli(['update'], {
+            env: {}, cwd: () => WORKSPACE_ROOT, input: { isTTY: false }, output, errorOutput: bufferStream(),
+            supervisor, repositoryRoot: '/source/ploinky',
+            async updateHostSource() { return { updated: false }; },
+            execute() { throw new Error('the supervisor owns the update'); },
+            relaunch() { throw new Error('no relaunch'); },
+        }), { code: 'PLOINKY_BOX_ACTIVATION_RECOVERY_REQUIRED' });
+        assert.match(output.value(), wording, outcome);
+    }
+});
+
+test('a read-only generic command is forwarded with readOnly; a mutating one is not', async () => {
+    for (const [argv, readOnly] of [[['list', 'agents'], true], [['echo', 'X'], true], [['enable', 'agent', 'x'], false], [['var', 'X', '1'], false]]) {
+        const calls = [];
+        const supervisor = fakeSupervisor([]);
+        const prepared = await supervisor.prepareBoxForCommand();
+        supervisor.prepareBoxForCommand = async (options) => { calls.push(options); return prepared; };
+        await runOuterCli(argv, {
+            env: {}, cwd: () => WORKSPACE_ROOT, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            supervisor, execute() { return 0; },
+        });
+        assert.deepEqual(calls, [{ readOnly }], argv.join(' '));
+    }
+});

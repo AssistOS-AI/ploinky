@@ -33,6 +33,7 @@ import {
 } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
+import { isInBoxStop, writeInBoxStopSelector } from '../helpers/fakeInBoxStop.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
@@ -1379,7 +1380,11 @@ test('a failed replacement restores and health-checks the prior Box graph before
         lockManager: fakeLockManager(state.root, events),
         discover: () => oldOwnership,
         runner: {
-            run(_command, args) { events.push(`run:${args.join(' ')}`); },
+            run(_command, args) {
+                events.push(`run:${args.join(' ')}`);
+                // The candidate's in-Box stop writes its inactive selector (Q30 binding).
+                if (isInBoxStop(args)) writeInBoxStopSelector(identity.workspaceRoot);
+            },
             query: () => ({ ok: true, stdout: '{\"initialized\":true}' }),
         },
         selectAgentLib: async () => ({ selection: candidateAgentLib, mode: 'local' }),

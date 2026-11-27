@@ -32,6 +32,7 @@ import {
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
 import { fakeRestartCore, fakeUpdateCore, verifiedRecord } from '../helpers/fakeUpdateCore.mjs';
+import { isInBoxStop, writeInBoxStopSelector } from '../helpers/fakeInBoxStop.mjs';
 
 function fixture(t) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hwl-gate-')));
@@ -673,7 +674,11 @@ test('G.every-final-generation', async (t) => {
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
         runner: {
-            run(_c, args) { events.push(`run:${args[0]}`); },
+            run(_c, args) {
+                events.push(`run:${args[0]}`);
+                // The in-Box stop writes its inactive selector (Q30 binding).
+                if (isInBoxStop(args)) writeInBoxStopSelector(state.identity.workspaceRoot);
+            },
             query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; },
         },
         selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
@@ -733,7 +738,14 @@ test('G.every-final-generation', async (t) => {
         launchCwd: state.identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, rollbackEvents),
         discover: () => owned(state.identity),
-        runner: { run(_c, args) { rollbackEvents.push(`run:${args[0]}`); }, query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; } },
+        runner: {
+            run(_c, args) {
+                rollbackEvents.push(`run:${args[0]}`);
+                // The in-Box stop writes its inactive selector (Q30 binding).
+                if (isInBoxStop(args)) writeInBoxStopSelector(state.identity.workspaceRoot);
+            },
+            query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; },
+        },
         selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),
         reconcile: async (options) => ({
             action: 'replaced', ownership: owned(state.identity, { id: '1'.repeat(64) }), hostPort: 8080, mediaHostPort: 7882,
@@ -1865,7 +1877,11 @@ function gateAdmissionWorld(t, { action, failWrite = false, failFinalize = null,
         lockManager: fakeLockManager(state.root, events),
         discover: () => owned(state.identity),
         runner: {
-            run(_command, args) { if (args.includes('ploinky-local')) events.push(`graph-stop:${settled ? 'after-settlement' : 'before-settlement'}`); },
+            run(_command, args) {
+                if (args.includes('ploinky-local')) events.push(`graph-stop:${settled ? 'after-settlement' : 'before-settlement'}`);
+                // The in-Box stop writes its inactive selector (Q30 binding).
+                if (isInBoxStop(args)) writeInBoxStopSelector(state.identity.workspaceRoot);
+            },
             query(_command, args) { return preflightImageQuery(args) || { ok: true, status: 0, stdout: INBOX_READY }; },
         },
         selectAgentLib: async () => ({ selection: agentLibFixture(state.identity.workspaceRoot), mode: 'local' }),

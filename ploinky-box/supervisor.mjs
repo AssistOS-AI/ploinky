@@ -362,8 +362,45 @@ const NO_WAIT_WORKER_SCRIPT = '/opt/ploinky/cli/commands/noWaitWorker.js';
 const NO_WAIT_SETTLE_TIMEOUT_MS = 31 * 60 * 1000;
 const NO_WAIT_POLL_MS = 5000;
 
+const ACTIVATION_BARRIER_SCHEMA = 'ploinky-activation-recovery';
+const ACTIVATION_RECOVERY_CODE = 'PLOINKY_BOX_ACTIVATION_RECOVERY_REQUIRED';
+const ACTIVATION_REFUSALS = 'Until then start, update, single-agent restart, bind and GPU changes are refused.';
+const ACTIVATION_INSPECT_ONLY_MESSAGE = 'An activation recovery barrier is held, so this command may only read the '
+    + 'running Box and never creates, starts, repairs or replaces it; run `ploinky restart` to settle the barrier, or '
+    + '`ploinky stop`';
+
+// The default engine runner. A supervisor built with an injected runner
+// (fixtures) keeps every engine call inside that runner.
+const DEFAULT_PROCESS_RUNNERS = new WeakSet();
+function defaultProcessRunner() {
+    const created = createProcessRunner({ env: buildEngineProcessEnvironment() });
+    DEFAULT_PROCESS_RUNNERS.add(created);
+    return created;
+}
+
+// An injected start seam keeps its own contract under the activation
+// discipline: its return is a confirmed clean exit, its throw a confirmed
+// failed one that keeps the original error.
+function injectedStartAsActivation(startCore) {
+    return async (...args) => {
+        const end = {
+            signal: null,
+            clientExited: true,
+            escalation: null,
+            tails: { stdout: '', stderr: '' },
+            quiescence: { state: 'confirmed', method: 'injected-start' },
+        };
+        try {
+            await startCore(...args);
+            return { ...end, cause: 'exited', status: 0 };
+        } catch (error) {
+            return { ...end, cause: 'exited', status: 1, thrown: error };
+        }
+    };
+}
+
 export function createBoxSupervisor({
-    runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
+    runner = defaultProcessRunner(),
     lockManager = createMutationLockManager(),
     resolveIdentity = () => resolveWorkspaceIdentity(),
     discover = defaultDiscovery,
@@ -375,6 +412,10 @@ export function createBoxSupervisor({
     validateExistingImage = inspectAndValidateExistingImage,
     validateContainer = validateContainerConfiguration,
     startCore = runBoundedCoreStart,
+    // The in-Box start of start transactions (Q30). Unset, it is the bounded
+    // activation runner, or the injected start seam or runner when a fixture
+    // supplies one.
+    startActivationCore = null,
     runCoreCommand = runBoundedCoreCommand,
     runUpdateCore = runBoundedUpdateCommand,
     runRestartCore = runBoundedRestartCommand,
@@ -436,10 +477,18 @@ export function createBoxSupervisor({
     allowHostProcesses = [],
     // The host-state checks of every locked transaction (hostState/guard.mjs).
     hostStateGuard = null,
+    // Q30: the post-stop selector binding of a decided rollback, and the
+    // verified evidence reader (test seams).
+    checkPostStopSelector = postStopSelectorBound,
+    readEvidence = readActivationEvidence,
 } = {}) {
     const guard = hostStateGuard || createHostStateGuard({
         runner, platform, repositoryRoot, allowHostProcesses, stderr,
     });
+    const activationStart = startActivationCore
+        || (startCore !== runBoundedCoreStart || !DEFAULT_PROCESS_RUNNERS.has(runner)
+            ? injectedStartAsActivation(startCore)
+            : runBoundedActivationStart);
 
     function inspect(identity) {
         return discover(identity, runner, platform, env);
@@ -1062,8 +1111,21 @@ export function createBoxSupervisor({
         explicitMediaPort,
         branchPolicy = null,
         imageRef = resolveBoxImageReference(env),
+        readOnly = false,
     } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            // Q30: while an activation barrier is held, a generic command may
+            // only read the running Box; anything else is refused before the
+            // Box is reconciled.
+            const guarded = activationGuard(identity, lock, ownership);
+            if (guarded) {
+                if (!readOnly) throw activationBarrierRefusal(guarded);
+                return inspectOnlyGenericBox(identity, ownership, {
+                    reason: `an activation recovery barrier is held for ${guarded.operation} ${shortId(guarded.operationId)}`,
+                    code: ACTIVATION_RECOVERY_CODE,
+                    message: ACTIVATION_INSPECT_ONLY_MESSAGE,
+                });
+            }
             // U16: with hardware state (saved on gate, initialized store or
             // stored entries, or unknown metadata) a generic command only uses
             // an already-running compatible Box; it never creates, starts,
@@ -1085,7 +1147,7 @@ export function createBoxSupervisor({
                 identity, gateStore: hardwareGateStore,
             });
             if (hardwareState.hasHardwareState) {
-                return inspectOnlyGenericBox(identity, ownership, hardwareState);
+                return inspectOnlyGenericBox(identity, ownership, { reason: hardwareState.reason });
             }
             // An existing Box keeps its publication for ad hoc commands; only a
             // Box created here needs the saved binding.
@@ -1141,8 +1203,13 @@ export function createBoxSupervisor({
     }
 
     // Adopt only an already-running, compatible, initialized Box for a
-    // generic command in a workspace with hardware state (plan U16).
-    function inspectOnlyGenericBox(identity, ownership, hardwareState) {
+    // generic command in a workspace with hardware state (plan U16), or for a
+    // read-only command while an activation barrier is held (Q30).
+    function inspectOnlyGenericBox(identity, ownership, {
+        reason,
+        code = 'PLOINKY_BOX_HARDWARE_INSPECT_ONLY',
+        message = GENERIC_INSPECT_ONLY_MESSAGE,
+    } = {}) {
         const status = inspectBoxStatus();
         const container = status.ownership?.handles?.container;
         const engine = status.ownership?.engine;
@@ -1151,10 +1218,7 @@ export function createBoxSupervisor({
             || !container?.id || !engine?.name
             || ownership.handles?.container?.id !== container.id
             || ownership.engine?.identity !== engine.identity) {
-            throw supervisorError(
-                `${GENERIC_INSPECT_ONLY_MESSAGE} (state: ${status.state || 'unknown'}; ${hardwareState.reason})`,
-                'PLOINKY_BOX_HARDWARE_INSPECT_ONLY',
-            );
+            throw supervisorError(`${message} (state: ${status.state || 'unknown'}; ${reason})`, code);
         }
         const selection = agentLibContractFromContainer(container);
         const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
@@ -1190,6 +1254,21 @@ export function createBoxSupervisor({
         const validatedSkillScope = validateGraphSkillScope(identity, skillScopeEnv);
         revalidateMountedAgentLibSource(agentLib, { engine, containerId, runner });
         const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+        // Q30: the restore is a plain start of the prior graph. Under an
+        // activation barrier its in-Box workspace-start lease is admitted only
+        // with this host-issued restore context; a restore writes no intent or
+        // receipt and never removes the marker, so any barrier stays.
+        const activationContext = Object.freeze({
+            schema: ACTIVATION_CONTEXT_SCHEMA,
+            version: ACTIVATION_RECORD_VERSION,
+            operation: 'start',
+            purpose: 'restore',
+            settlesOperationId: null,
+            operationId: createReportNonce(),
+            instance: identity.instance,
+            containerId,
+            workspaceRoot: identity.workspaceRoot,
+        });
         await runCoreCommand(
             engine,
             containerId,
@@ -1204,6 +1283,7 @@ export function createBoxSupervisor({
                 hostReachableIpv4,
                 agentLib,
                 skillScopeEnv: validatedSkillScope,
+                activationContext,
             },
         );
         await healthCheck(hostPort, { routerBinding });
@@ -1231,7 +1311,14 @@ export function createBoxSupervisor({
         restoreStopped = false,
         afterRollback = null,
         priorGraphActive = false,
+        // Q30, passed only by a decided activation rollback: the decision's
+        // selector is checked again just before the stop, and the selector
+        // after the stop must be the one this stop wrote.
+        preStopCheck = null,
+        postStopCheck = null,
+        onUnboundStop = null,
     }) {
+        if (preStopCheck) await preStopCheck();
         const failures = [];
         let candidateStopError = null;
         if (stopGraph) {
@@ -1256,7 +1343,11 @@ export function createBoxSupervisor({
         }
         let graphRestored = false;
         let stoppedBoxRestored = false;
-        if (restoreGraph && outerRollback?.agentLib && failures.length === 0) {
+        // An in-Box stop that threw keeps today's handling: the outer rollback
+        // above decides, and the post-stop selector is not judged.
+        const unboundStop = Boolean(restoreGraph && outerRollback?.agentLib && failures.length === 0
+            && postStopCheck && !candidateStopError && !postStopCheck());
+        if (restoreGraph && outerRollback?.agentLib && failures.length === 0 && !unboundStop) {
             try {
                 // A restored gate-on generation is prepared before its graph
                 // is restored (§6.5 Rollback restoration, U11).
@@ -1290,6 +1381,9 @@ export function createBoxSupervisor({
             } catch (stateError) {
                 failures.push(stateError.message);
             }
+        }
+        if (unboundStop) {
+            await onUnboundStop({ boxRollback: outerRollback?.action || null, containerId: outerRollback?.containerId || containerId });
         }
         // Name what actually happened: a prior graph that was rebuilt and
         // passed its checks, an untouched prior graph, or a disrupted graph
@@ -1475,7 +1569,7 @@ export function createBoxSupervisor({
             if (requiredId !== null) ownership = authorize(inspect(identity));
             const existing = requiredId === null ? null
                 : observeBoxConfiguration(identity, ownership, repositoryRoot, ownership.engine);
-            await assertNoUpdateRecoveryBarrier(identity, ownership);
+            await assertNoUpdateRecoveryBarrier(identity, ownership, { lock });
             // A start that must reuse an exact existing Box keeps its source.
             const reposSource = existing ? undefined : requestedReposSource();
             const hardwareGate = existing ? null : selectHardwareGateForOperation(identity, 'start', lock);
@@ -1523,6 +1617,7 @@ export function createBoxSupervisor({
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
             let admission = null;
+            let attempt = null;
             try {
                 if (existing) prepared.validate?.();
                 await prepareGateOnGeneration(identity, ownership.engine, containerId, prepared.hardware);
@@ -1541,24 +1636,12 @@ export function createBoxSupervisor({
                     });
                 }
                 const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+                attempt = beginActivation(identity, { operation: 'start', containerId });
                 graphMutated = true;
-                await startCore(
-                    ownership.engine,
-                    containerId,
-                    coreArgs,
-                    prepared.hostPort,
-                    prepared.mediaHostPort,
-                    runner,
-                    {
-                        workspaceRoot: identity.workspaceRoot,
-                        stdout,
-                        stderr,
-                        hostReachableIpv4,
-                        agentLib: selection,
-                        skillScopeEnv,
-                        routerBinding: prepared.routerBinding,
-                    },
-                );
+                await executeBoundedActivation({
+                    identity, engine: ownership.engine, containerId, prepared, selection, skillScopeEnv, hostReachableIpv4,
+                    coreArgv: coreArgs, attempt, runCore: activationStart, routerBinding: prepared.routerBinding,
+                });
                 admission = await completeGraphAdmission({
                     identity, lock, prepared, selection, skillScopeEnv,
                     routerBindingUpdate: existing ? null : savedRouterBindingUpdate(savedBinding, prepared),
@@ -1567,19 +1650,19 @@ export function createBoxSupervisor({
                     hardwareGate,
                 });
             } catch (error) {
-                await rollbackPreparedGraph({
-                    identity,
-                    prepared,
-                    ownership,
-                    containerId,
-                    error,
+                // A Box whose start writer may still run, or a kept
+                // activation, is never rolled back.
+                if (error?.skipRollback) throw error;
+                const rollback = {
                     stopGraph: graphMutated,
                     restoreGraph: !existing && Boolean(prepared.previousAgentLib)
                         && Boolean(priorCoreStartArgv)
                         && (graphMutated || prepared.action === 'replaced'),
                     restoreCoreArgv: priorCoreStartArgv,
                     restoreSkillScopeEnv: priorSkillScopeEnv,
-                });
+                };
+                if (attempt) await settleFailedActivation({ identity, ownership, prepared, containerId, error, attempt, rollback });
+                await rollbackPreparedGraph({ identity, prepared, ownership, containerId, error, ...rollback });
             }
             reportSettled(prepared.routerBinding, admission?.warnings);
             // A GPU reapplication may have replaced the Box: the result names
@@ -1598,7 +1681,9 @@ export function createBoxSupervisor({
 
     async function runRestartTransaction(coreArgs = ['restart'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
-            await assertNoUpdateRecoveryBarrier(identity, ownership);
+            // A whole restart is the settle step of a held activation barrier.
+            const { warnings: barrierWarnings, settles } = await admitRecoveryBarrier(identity, ownership, { operation: 'restart', lock });
+            for (const warning of barrierWarnings) stderr?.write?.(`[ploinky] Warning: ${warning}\n`);
             const reposSource = requestedReposSource();
             const hardwareGate = selectHardwareGateForOperation(identity, 'restart', lock);
             await assertInBoxProdProfile(identity, ownership, coreArgs, { allowRecovery: true });
@@ -1638,6 +1723,7 @@ export function createBoxSupervisor({
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
             let admission = null;
+            let attempt = null;
             try {
                 await prepareGateOnGeneration(identity, ownership.engine, containerId, prepared.hardware);
                 await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
@@ -1645,12 +1731,18 @@ export function createBoxSupervisor({
                     ? ['restart']
                     : coreArgs;
                 const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+                attempt = beginActivation(identity, {
+                    operation: 'restart',
+                    containerId,
+                    purpose: settles ? 'settle' : 'activate',
+                    settlesOperationId: settles?.operationId ?? null,
+                });
                 graphMutated = true;
                 // The exec client ending never ends the in-Box restart, so it
                 // runs under the bounded restart discipline an update uses.
-                await executeBoundedRestart({
+                await executeBoundedActivation({
                     identity, engine: ownership.engine, containerId, prepared, selection, skillScopeEnv, hostReachableIpv4,
-                    coreArgv: effectiveArgs,
+                    coreArgv: effectiveArgs, attempt,
                 });
                 admission = await completeGraphAdmission({
                     identity, lock, prepared, selection, skillScopeEnv, operation: 'restart',
@@ -1658,22 +1750,21 @@ export function createBoxSupervisor({
                     hardwareGate,
                 });
             } catch (error) {
-                // A Box whose restart writer may still run is never rolled back.
+                // A Box whose restart writer may still run, or a kept
+                // activation, is never rolled back.
                 if (error?.skipRollback) throw error;
-                await rollbackPreparedGraph({
-                    identity,
-                    prepared,
-                    ownership,
-                    containerId,
-                    error,
+                const rollback = {
                     stopGraph: graphMutated,
                     restoreGraph: Boolean(prepared.previousAgentLib)
                         && Boolean(priorCoreStartArgv)
                         && (graphMutated || prepared.action === 'replaced'),
                     restoreCoreArgv: priorCoreStartArgv,
                     restoreSkillScopeEnv: priorSkillScopeEnv,
-                });
+                };
+                if (attempt) await settleFailedActivation({ identity, ownership, prepared, containerId, error, attempt, rollback });
+                await rollbackPreparedGraph({ identity, prepared, ownership, containerId, error, ...rollback });
             }
+            if (settles) settleActivationBarrier(identity, settles);
             reportSettled(prepared.routerBinding, admission?.warnings);
             // A GPU reapplication may have replaced the Box: the result names
             // the generation that exists.
@@ -1709,7 +1800,7 @@ export function createBoxSupervisor({
             }
         }
         return lockedMutation(async (identity, lock, ownership) => {
-            await assertNoUpdateRecoveryBarrier(identity, ownership);
+            await assertNoUpdateRecoveryBarrier(identity, ownership, { lock });
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const status = inspectBoxStatus();
             const container = status.ownership?.handles?.container;
@@ -1915,57 +2006,312 @@ export function createBoxSupervisor({
         }
     }
 
-    // A previous update whose in-Box writer could not be proven stopped blocks
-    // every new graph mutation until the engine confirms it ended. A dead host
-    // process is never taken as that proof.
-    // Returns '' when the durable barrier was written, otherwise why not.
-    function isRecoveryBarrier(barrier, identity) {
-        return barrier?.schema === 'ploinky-update-recovery' && barrier.version === 1
-            && barrier.instance === identity.instance && barrier.workspaceRoot === identity.workspaceRoot
-            && /^[a-f0-9]{64}$/.test(String(barrier.containerId || ''))
-            && typeof barrier.nonce === 'string' && barrier.nonce.length > 0;
+    // --- Q30 activation recovery --------------------------------------------
+    //
+    // A start, whole restart or full update that fails after its in-Box
+    // command published the new edge selector keeps that version running
+    // behind an activation barrier instead of rolling it back. The host
+    // decides only after the in-Box writer is proven stopped, from the
+    // write-once intent the command wrote before the rename, and rolls back
+    // only when the predecessor is proven in force (activationRecovery.mjs).
+
+    function activationCause(error) {
+        return sanitizeReason(String(error?.message || error || 'unknown failure'), { limit: 500 });
     }
 
-    function recordRecoveryBarrier(identity, { operation, containerId, nonce, marker, cause, detail, reportPath = null }) {
+    function isActivationBarrier(barrier, identity) {
+        return barrier?.schema === ACTIVATION_BARRIER_SCHEMA && barrier.version === 1
+            && barrier.instance === identity.instance && barrier.workspaceRoot === identity.workspaceRoot
+            && /^[a-f0-9]{64}$/.test(String(barrier.containerId || ''))
+            && /^[a-f0-9]{32}$/.test(String(barrier.operationId || ''))
+            && ['start', 'restart', 'update'].includes(barrier.operation)
+            && ['activated', 'indeterminate'].includes(barrier.state);
+    }
+
+    // The `activation` field of a writer barrier: the activation whose
+    // in-Box writer could not be proven stopped. Once quiescent it converts
+    // through the decision table.
+    function writerActivation(barrier) {
+        const activation = barrier?.schema === 'ploinky-update-recovery' ? barrier.activation : null;
+        return activation && /^[a-f0-9]{32}$/.test(String(activation.operationId || ''))
+            && ['start', 'restart', 'update'].includes(activation.operation) && activation.context
+            ? activation : null;
+    }
+
+    // The barrier view a refusal names: an activation barrier, or the
+    // activation of a writer barrier.
+    function guardedActivation(barrier, identity) {
+        if (isActivationBarrier(barrier, identity)) return barrier;
+        const activation = writerActivation(barrier);
+        return activation ? Object.freeze({
+            operation: activation.operation, operationId: activation.operationId, state: 'writer',
+            containerId: barrier.containerId,
+        }) : null;
+    }
+
+    // The host-issued context of one in-Box activation, validated before any
+    // launch, and the live selector just before it (the baseline).
+    function beginActivation(identity, { operation, containerId, purpose = 'activate', settlesOperationId = null }) {
+        const operationId = createReportNonce();
+        const context = Object.freeze({
+            schema: ACTIVATION_CONTEXT_SCHEMA,
+            version: ACTIVATION_RECORD_VERSION,
+            operation,
+            purpose,
+            settlesOperationId: purpose === 'settle' ? settlesOperationId : null,
+            operationId,
+            instance: identity.instance,
+            containerId,
+            workspaceRoot: identity.workspaceRoot,
+        });
+        parseActivationContext(JSON.stringify(context));
+        const baseline = baselineFromEvidence(readEvidence(identity, null, null));
+        return Object.freeze({ operation, purpose, operationId, context, baseline, containerId });
+    }
+
+    function activationBarrierRecord(identity, attempt, { state, evidence, error, containerId = attempt.containerId }) {
+        return {
+            schema: ACTIVATION_BARRIER_SCHEMA,
+            version: 1,
+            instance: identity.instance,
+            workspaceRoot: identity.workspaceRoot,
+            containerId,
+            operation: attempt.operation,
+            operationId: attempt.operationId,
+            state,
+            intended: evidence?.intent?.state === 'valid' ? evidence.intent.value.intended : null,
+            observed: evidence?.live?.state === 'valid' ? selectorIdentityOf(evidence.live.value) : null,
+            cause: activationCause(error),
+            createdAt: new Date().toISOString(),
+        };
+    }
+
+    function selectorIdentityOf(selector) {
+        return selector ? Object.freeze({
+            state: selector.state, generation: selector.generation ?? null,
+            activationId: selector.activationId, selectorDigest: selector.selectorDigest,
+        }) : null;
+    }
+
+    function writeActivationBarrier(identity, record) {
         try {
-            updateStore(identity).write('update-recovery', identity.instance, {
-                schema: 'ploinky-update-recovery',
-                version: 1,
-                operation,
-                instance: identity.instance,
-                workspaceRoot: identity.workspaceRoot,
-                containerId,
-                nonce,
-                marker,
-                cause,
-                detail,
-                reportPath,
-                createdAt: new Date().toISOString(),
-            });
+            updateStore(identity).write('update-recovery', identity.instance, record);
             return '';
         } catch (writeError) {
             return writeError?.message || String(writeError);
         }
     }
 
+    // The host writes the in-Box marker only after its own barrier is durable.
+    function installActivationMarker(identity, engine, { operation, operationId, containerId }, state) {
+        try {
+            const marker = buildActivationBarrierMarker({ operation, operationId, state, containerId });
+            return writeActivationBarrierMarkerThroughBox({
+                runner, engine, containerId, workspaceRoot: identity.workspaceRoot, marker,
+            });
+        } catch (error) {
+            return error?.message || String(error);
+        }
+    }
+
+    function barrierProblemSuffix(barrierProblem, markerProblem) {
+        if (barrierProblem) {
+            return ` No durable recovery record could be written (${barrierProblem}); run \`ploinky restart\` or \`ploinky stop\` before any other mutation.`;
+        }
+        if (markerProblem) {
+            return ` The in-Box guard could not be installed (${markerProblem}); Marketplace and in-Box changes are not blocked until \`ploinky restart\` or \`ploinky stop\`.`;
+        }
+        return '';
+    }
+
+    function shortGeneration(generation) {
+        return String(generation || '').replace(/^sha256:/, '').slice(0, 12) || 'unknown';
+    }
+
+    // M1 (kept-activated) and M2 (kept-indeterminate): no stop, no rollback,
+    // no policy call. The host writes the barrier, installs the marker, and
+    // exits nonzero without a rollback.
+    function keepFailedActivation(identity, ownership, attempt, { verdict, reason, evidence, error }) {
+        const state = verdict === 'kept-activated' ? 'activated' : 'indeterminate';
+        const record = activationBarrierRecord(identity, attempt, { state, evidence, error });
+        const barrierProblem = writeActivationBarrier(identity, record);
+        const markerProblem = barrierProblem ? '' : installActivationMarker(identity, ownership?.engine, record, state);
+        const cause = activationCause(error);
+        const main = verdict === 'kept-activated'
+            ? `The workspace ${attempt.operation} activated the new version (edge generation ${shortGeneration(record.intended?.generation)}, `
+                + `activation ${shortId(record.intended?.activationId)}) but failed while settling it: ${cause}. The new version was left `
+                + 'running; nothing was stopped or rolled back. Run `ploinky restart` to settle it, or `ploinky stop` to stop it. '
+                + ACTIVATION_REFUSALS
+            : `The workspace ${attempt.operation} failed after it may have activated a new version (${reason}): ${cause}. The workspace `
+                + 'was left as it is; nothing was stopped or rolled back. Run `ploinky restart` to settle it, or `ploinky stop` to stop it. '
+                + ACTIVATION_REFUSALS;
+        const kept = new PloinkyBoxError(`${main}${barrierProblemSuffix(barrierProblem, markerProblem)} [${ACTIVATION_RECOVERY_CODE}]`,
+            { code: ACTIVATION_RECOVERY_CODE, cause: error });
+        kept.activation = Object.freeze({ outcome: verdict, graphMutated: true, boxRollback: null });
+        kept.skipRollback = true;
+        if (error?.updateRecords) kept.updateRecords = error.updateRecords;
+        if (error?.admission) kept.admission = error.admission;
+        return kept;
+    }
+
     /**
-     * Restart the graph (a workspace `restart` or an update's activation) with
-     * the same bounded discipline as the in-Box update: finite TERM -> KILL
-     * escalation, an engine proof that the restart writer stopped, and a
-     * durable recovery barrier (with no rollback) when that proof is missing.
-     * Signals are held as for the in-Box update; the failure of a restart that
-     * did not end normally reports one, and after a normal end one keeps its
-     * default action.
+     * Decide a failed in-Box activation once its writer is proven stopped.
+     * A rollback verdict runs today's rollback with two extra checks: the
+     * decision's selector again just before the stop, and, when the in-Box
+     * stop did not throw, the selector after it must be the one this stop
+     * wrote. Every other verdict keeps the graph behind a barrier.
      */
-    async function executeBoundedRestart({ identity, engine, containerId, prepared, selection, skillScopeEnv,
-        hostReachableIpv4, coreArgv = ['restart'] }) {
-        const operationId = createReportNonce();
+    async function settleFailedActivation({ identity, ownership, prepared, containerId, error, attempt, rollback }) {
+        const evidence = readEvidence(identity, attempt.operationId, attempt.context);
+        const decision = classifyFailedActivation({ evidence, baseline: attempt.baseline });
+        if (decision.verdict !== 'rollback') throw keepFailedActivation(identity, ownership, attempt, { ...decision, evidence, error });
+        const decided = evidence.live;
+        let preStopSelector = null;
+        await rollbackPreparedGraph({
+            identity, prepared, ownership, containerId, error, ...rollback,
+            preStopCheck() {
+                const now = readEvidence(identity, null, null).live;
+                const same = now.state === decided.state
+                    && (now.state !== 'valid' || sameSelectorIdentity(now.value, decided.value));
+                if (!same) {
+                    throw keepFailedActivation(identity, ownership, attempt, {
+                        verdict: 'kept-indeterminate',
+                        reason: 'the routing selector changed before the rollback could stop the graph',
+                        evidence: { ...evidence, live: now },
+                        error,
+                    });
+                }
+                preStopSelector = now.state === 'valid' ? now.value : null;
+            },
+            postStopCheck() {
+                const post = readEvidence(identity, null, null).live;
+                return checkPostStopSelector(preStopSelector, post.state === 'valid' ? post.value : null);
+            },
+            onUnboundStop({ boxRollback, containerId: boxContainerId }) {
+                const after = readEvidence(identity, attempt.operationId, attempt.context);
+                const record = activationBarrierRecord(identity, attempt, {
+                    state: 'indeterminate', evidence: after, error, containerId: boxContainerId,
+                });
+                const barrierProblem = writeActivationBarrier(identity, record);
+                const markerProblem = barrierProblem ? '' : installActivationMarker(identity, ownership?.engine, record, 'indeterminate');
+                const failure = new PloinkyBoxError(
+                    `The workspace ${attempt.operation} failed and its rollback stopped the graph, but the routing selector after that `
+                    + `stop is not the one the stop wrote, so the previous graph was not restored: ${activationCause(error)}. `
+                    + `Run \`ploinky restart\` to settle it, or \`ploinky stop\`. ${ACTIVATION_REFUSALS}`
+                    + `${barrierProblemSuffix(barrierProblem, markerProblem)} [${ACTIVATION_RECOVERY_CODE}]`,
+                    { code: ACTIVATION_RECOVERY_CODE, cause: error },
+                );
+                failure.activation = Object.freeze({ outcome: 'recovery-required', graphMutated: true, boxRollback });
+                if (error?.updateRecords) failure.updateRecords = error.updateRecords;
+                if (error?.admission) failure.admission = error.admission;
+                throw failure;
+            },
+        });
+    }
+
+    // After an admitted settle restart: remove the barrier it settled, only
+    // if it is still that barrier (the in-Box commit removed the marker).
+    function settleActivationBarrier(identity, settled) {
+        try {
+            const current = updateStore(identity).read('update-recovery', identity.instance);
+            if (isActivationBarrier(current, identity) && current.operationId === settled.operationId) {
+                updateStore(identity).remove('update-recovery', identity.instance);
+            }
+            stdout?.write?.(`[ploinky] Activation recovery settled: the earlier ${settled.operation} (${shortId(settled.operationId)}) `
+                + 'was superseded by this restart.\n');
+        } catch (error) {
+            stderr?.write?.(`[ploinky] Warning: the settled activation recovery record could not be removed: ${error.message}\n`);
+        }
+    }
+
+    // M4.
+    function activationBarrierRefusal(barrier) {
+        const state = barrier.state === 'writer' ? 'its writer may still run' : barrier.state;
+        const error = new PloinkyBoxError(
+            `An earlier ${barrier.operation} (${shortId(barrier.operationId)}) left a workspace version whose settlement requires `
+            + `recovery (${state}); no new mutation was started. Run \`ploinky restart\` to settle it, or \`ploinky stop\`. `
+            + `[${ACTIVATION_RECOVERY_CODE}]`,
+            { code: ACTIVATION_RECOVERY_CODE },
+        );
+        error.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
+        return error;
+    }
+
+    // A proven stop ends an activation barrier (or a writer barrier of an
+    // activation): absent by exact id, or a stopped status. The marker is
+    // unlinked on the host first; if that fails the barrier is kept.
+    function clearProvenStoppedActivationBarrier(identity, lock, ownership, barrier) {
+        const proof = ownership?.state === 'absent'
+            ? Object.freeze({ proven: true, state: 'absent' })
+            : proveBoxStopped({ runner, engine: ownership?.engine, containerId: barrier.containerId });
+        if (!proof.proven) return Object.freeze({ cleared: false, proof });
+        const problem = unlinkActivationBarrierMarkerOnHost({ identity, lock });
+        if (problem) return Object.freeze({ cleared: false, proof, problem });
+        updateStore(identity).remove('update-recovery', identity.instance);
+        const view = guardedActivation(barrier, identity) || barrier;
+        return Object.freeze({
+            cleared: true,
+            proof,
+            message: `an earlier ${view.operation} (${shortId(view.operationId)}) left an activation recovery record, but its Box `
+                + `is ${proof.state === 'absent' ? 'gone' : 'stopped'}; the record and its in-Box guard were cleared`,
+        });
+    }
+
+    function readRecoveryBarrier(identity) {
+        try {
+            return updateStore(identity).read('update-recovery', identity.instance);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    // The activation a generic command must respect, after a stop proof.
+    function activationGuard(identity, lock, ownership) {
+        const barrier = readRecoveryBarrier(identity);
+        const guarded = guardedActivation(barrier, identity);
+        if (!guarded) return null;
+        const cleared = clearProvenStoppedActivationBarrier(identity, lock, ownership, barrier);
+        if (cleared.cleared) {
+            stderr?.write?.(`[ploinky] Warning: ${cleared.message}\n`);
+            return null;
+        }
+        return guarded;
+    }
+
+    // `stop`: after the stop, the proof ends the activation barrier; a Box
+    // that is not proven stopped (paused, stopping) keeps both.
+    function clearActivationBarrierAfterStop(identity, lock, ownership) {
+        const barrier = readRecoveryBarrier(identity);
+        if (!guardedActivation(barrier, identity)) return;
+        const cleared = clearProvenStoppedActivationBarrier(identity, lock, ownership, barrier);
+        if (cleared.cleared) {
+            stderr?.write?.(`[ploinky] ${cleared.message}\n`);
+            return;
+        }
+        stderr?.write?.('[ploinky] Warning: the Box could not be proven stopped '
+            + `(${cleared.problem || cleared.proof?.state || 'unknown'}); the activation recovery record and its in-Box guard were kept\n`);
+    }
+
+    /**
+     * Restart the graph (a workspace `restart` or an update's activation) or
+     * run a host start with the same bounded discipline as the in-Box update:
+     * finite TERM -> KILL escalation, an engine proof that the writer
+     * stopped, and a durable recovery barrier (with no rollback) when that
+     * proof is missing. A writer barrier of an activation also carries the
+     * activation and installs a `writer` marker. Signals are held as for the
+     * in-Box update; the failure of a run that did not end normally reports
+     * one, and after a normal end one keeps its default action.
+     */
+    async function executeBoundedActivation({ identity, engine, containerId, prepared, selection, skillScopeEnv,
+        hostReachableIpv4, coreArgv = ['restart'], attempt, runCore = runRestartCore, routerBinding = null }) {
+        const { operationId } = attempt;
         const marker = `${UPDATE_OPERATION_ENV}=${operationId}`;
+        const command = attempt.operation === 'start' ? 'start' : 'restart';
         const signals = createCancellation();
         let reported = true;
         signals.arm();
         try {
-            const run = await runRestartCore(
+            const run = await runCore(
                 engine,
                 containerId,
                 coreArgv,
@@ -1980,22 +2326,31 @@ export function createBoxSupervisor({
                     agentLib: selection,
                     skillScopeEnv,
                     operationId,
+                    activationContext: attempt.context,
+                    ...(routerBinding ? { routerBinding } : {}),
                 },
             );
             const cause = run?.cause || 'unknown';
             if (run?.quiescence?.state !== 'confirmed') {
                 const detail = String(run?.quiescence?.detail || 'in-Box quiescence was not confirmed');
-                const barrierProblem = recordRecoveryBarrier(identity, {
-                    operation: 'restart', containerId, nonce: operationId, marker, cause, detail,
+                const activation = Object.freeze({
+                    operation: attempt.operation, operationId, context: attempt.context, baseline: attempt.baseline,
                 });
+                const barrierProblem = recordRecoveryBarrier(identity, {
+                    operation: command, containerId, nonce: operationId, marker, cause, detail, activation,
+                });
+                const markerProblem = barrierProblem ? ''
+                    : installActivationMarker(identity, engine, { operation: attempt.operation, operationId, containerId }, 'writer');
+                const label = command === 'start' ? 'workspace start' : 'graph restart';
                 const error = new PloinkyBoxError(
-                    `The in-Box graph restart ended abnormally (${cause}) and the engine could not confirm that it `
+                    `The in-Box ${label} ended abnormally (${cause}) and the engine could not confirm that it `
                     + `stopped (${detail}). `
                     + (barrierProblem
                         ? `No durable recovery record could be written (${barrierProblem}); run \`ploinky stop\` `
                             + 'before any other mutation. '
                         : 'A recovery record now blocks new mutations until it is confirmed stopped. ')
-                    + 'The workspace graph state is unknown.',
+                    + 'The workspace graph state is unknown.'
+                    + (markerProblem ? barrierProblemSuffix('', markerProblem) : ''),
                     { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' },
                 );
                 error.activation = Object.freeze({ outcome: 'recovery-required', graphMutated: true, boxRollback: null });
@@ -2003,11 +2358,12 @@ export function createBoxSupervisor({
                 throw error;
             }
             if (cause !== 'exited' || run.signal || run.status !== 0) {
+                if (run?.thrown) throw run.thrown;
                 const tail = String(run?.tails?.stderr || run?.tails?.stdout || '').trim().split('\n').slice(-3).join(' | ');
                 throw supervisorError(
-                    `In-box restart failed (${cause}${run?.signal ? `, ${run.signal}` : ''}`
+                    `In-box ${command} failed (${cause}${run?.signal ? `, ${run.signal}` : ''}`
                     + `${Number.isInteger(run?.status) ? `, status ${run.status}` : ''})${tail ? `: ${tail}` : ''}`,
-                    'PLOINKY_BOX_UPDATE_RESTART_FAILED',
+                    command === 'start' ? 'PLOINKY_BOX_START_FAILED' : 'PLOINKY_BOX_UPDATE_RESTART_FAILED',
                 );
             }
             reported = false;
@@ -2017,16 +2373,122 @@ export function createBoxSupervisor({
         }
     }
 
-    async function assertNoUpdateRecoveryBarrier(identity, ownership) {
+    // A previous update whose in-Box writer could not be proven stopped blocks
+    // every new graph mutation until the engine confirms it ended. A dead host
+    // process is never taken as that proof.
+    function isRecoveryBarrier(barrier, identity) {
+        return barrier?.schema === 'ploinky-update-recovery' && barrier.version === 1
+            && barrier.instance === identity.instance && barrier.workspaceRoot === identity.workspaceRoot
+            && /^[a-f0-9]{64}$/.test(String(barrier.containerId || ''))
+            && typeof barrier.nonce === 'string' && barrier.nonce.length > 0;
+    }
+
+    // Returns '' when the durable barrier was written, otherwise why not.
+    function recordRecoveryBarrier(identity, { operation, containerId, nonce, marker, cause, detail, reportPath = null, activation = null }) {
+        try {
+            updateStore(identity).write('update-recovery', identity.instance, {
+                schema: 'ploinky-update-recovery',
+                version: 1,
+                operation,
+                instance: identity.instance,
+                workspaceRoot: identity.workspaceRoot,
+                containerId,
+                nonce,
+                marker,
+                cause,
+                detail,
+                reportPath,
+                ...(activation ? { activation } : {}),
+                createdAt: new Date().toISOString(),
+            });
+            return '';
+        } catch (writeError) {
+            return writeError?.message || String(writeError);
+        }
+    }
+
+    // A quiescent writer barrier of an activation converts through the
+    // decision table: `rollback` clears it and removes the marker; a kept
+    // verdict becomes an activation barrier and rewrites the marker.
+    function convertWriterBarrier(identity, ownership, barrier, activation) {
+        const attempt = Object.freeze({
+            operation: activation.operation, operationId: activation.operationId,
+            context: activation.context, baseline: activation.baseline ?? 'unknown', containerId: barrier.containerId,
+        });
+        const evidence = readEvidence(identity, attempt.operationId, attempt.context);
+        const decision = classifyFailedActivation({ evidence, baseline: attempt.baseline });
+        if (decision.verdict === 'rollback') {
+            const problem = removeActivationBarrierMarkerThroughBox({
+                runner, engine: ownership.engine, containerId: barrier.containerId,
+                workspaceRoot: identity.workspaceRoot, operationId: attempt.operationId,
+            });
+            if (problem) {
+                const error = new PloinkyBoxError(
+                    `An earlier ${activation.operation} (${shortId(activation.operationId)}) is confirmed stopped, but its in-Box guard `
+                    + `could not be removed (${problem}); no new mutation was started. Run \`ploinky stop\`, then run the command again.`,
+                    { code: 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED' },
+                );
+                error.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
+                throw error;
+            }
+            updateStore(identity).remove('update-recovery', identity.instance);
+            return Object.freeze({ verdict: 'rollback', warning: `an earlier ${activation.operation} (${shortId(activation.operationId)}) `
+                + 'that could not be proven stopped is now confirmed stopped and had not activated a new version; '
+                + 'its recovery record was cleared' });
+        }
+        const state = decision.verdict === 'kept-activated' ? 'activated' : 'indeterminate';
+        const record = activationBarrierRecord(identity, attempt, {
+            state, evidence, error: { message: `${barrier.cause || 'unknown'}${barrier.detail ? `: ${barrier.detail}` : ''}` },
+        });
+        const barrierProblem = writeActivationBarrier(identity, record);
+        if (barrierProblem) {
+            const error = new PloinkyBoxError(
+                `An earlier ${activation.operation} (${shortId(activation.operationId)}) is confirmed stopped, but its recovery record `
+                + `could not be converted (${barrierProblem}); no new mutation was started. Run \`ploinky stop\`, then run the command again.`,
+                { code: 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED' },
+            );
+            error.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
+            throw error;
+        }
+        const markerProblem = installActivationMarker(identity, ownership.engine, record, state);
+        return Object.freeze({
+            verdict: decision.verdict,
+            record,
+            warning: `an earlier ${activation.operation} (${shortId(activation.operationId)}) that could not be proven stopped is now `
+                + `confirmed stopped; its version was kept (${decision.reason})`
+                + (markerProblem ? `, but the in-Box guard could not be installed (${markerProblem})` : ''),
+        });
+    }
+
+    /**
+     * The barrier admission of every graph mutation. Returns
+     * `{ warnings, settles }`, where `settles` is the activation barrier a
+     * whole restart settles. An activation barrier refuses every other
+     * mutation (M4); a writer barrier is probed as before and, for an
+     * activation, converted once quiescent. A proven stop ends either one.
+     * `activationOnly` limits a command that did not check barriers before
+     * (edge set, limits clear) to activation barriers.
+     */
+    async function admitRecoveryBarrier(identity, ownership, { operation = 'mutation', lock = null, activationOnly = false } = {}) {
         const barrier = updateStore(identity).read('update-recovery', identity.instance);
-        if (!barrier) return [];
+        if (!barrier) return { warnings: [], settles: null };
+        const activationSchema = barrier?.schema === ACTIVATION_BARRIER_SCHEMA;
+        if (guardedActivation(barrier, identity)) {
+            const cleared = clearProvenStoppedActivationBarrier(identity, lock, ownership, barrier);
+            if (cleared.cleared) return { warnings: [cleared.message], settles: null };
+        }
+        if (isActivationBarrier(barrier, identity)) {
+            if (operation === 'restart') return { warnings: [], settles: barrier };
+            throw activationBarrierRefusal(barrier);
+        }
+        if (activationOnly && !activationSchema && !writerActivation(barrier)) return { warnings: [], settles: null };
         if (!isRecoveryBarrier(barrier, identity)) {
             // A record this writer did not produce cannot name the writer to
             // probe. Only a stopped or absent Box proves no in-Box writer runs.
             const container = ownership?.handles?.container || null;
             if (!container || container.runtime?.running === false) {
                 updateStore(identity).remove('update-recovery', identity.instance);
-                return ['a malformed update recovery record was cleared because the Box is stopped'];
+                return { warnings: ['a malformed update recovery record was cleared because the Box is stopped'], settles: null };
             }
             const error = new PloinkyBoxError(
                 'The update recovery record for this workspace is malformed, so no earlier in-Box update can be '
@@ -2048,11 +2510,21 @@ export function createBoxSupervisor({
         } catch (error) {
             observed = { ok: false, detail: error.message };
         }
-        const earlier = barrier.operation === 'restart' ? 'graph restart' : 'update';
+        const earlier = { restart: 'graph restart', start: 'workspace start' }[barrier.operation] || 'update';
         if (observed?.ok === true && !(observed.pids || []).length) {
+            const activation = writerActivation(barrier);
+            if (activation) {
+                const converted = convertWriterBarrier(identity, ownership, barrier, activation);
+                if (converted.verdict === 'rollback') return { warnings: [converted.warning], settles: null };
+                if (operation === 'restart') return { warnings: [converted.warning], settles: converted.record };
+                throw activationBarrierRefusal(converted.record);
+            }
             updateStore(identity).remove('update-recovery', identity.instance);
-            return [`an earlier ${earlier} (${String(barrier.nonce).slice(0, 8)}) that could not be proven stopped `
-                + 'is now confirmed stopped by the engine; its recovery record was cleared'];
+            return {
+                warnings: [`an earlier ${earlier} (${String(barrier.nonce).slice(0, 8)}) that could not be proven stopped `
+                    + 'is now confirmed stopped by the engine; its recovery record was cleared'],
+                settles: null,
+            };
         }
         const error = new PloinkyBoxError(
             `An earlier ${earlier} in this workspace may still be running inside the Box `
@@ -2062,6 +2534,10 @@ export function createBoxSupervisor({
         );
         error.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
         throw error;
+    }
+
+    async function assertNoUpdateRecoveryBarrier(identity, ownership, options = {}) {
+        return (await admitRecoveryBarrier(identity, ownership, options)).warnings;
     }
 
     function uncertainCoreRecord(id, code, reason, details = null) {
@@ -2322,7 +2798,7 @@ export function createBoxSupervisor({
     async function runUpdateTransaction(coreArgs = ['update'], options = {}) {
         const plan = updatePlan(coreArgs, options);
         return lockedMutation(async (identity, lock, ownership) => {
-            const barrierWarnings = await assertNoUpdateRecoveryBarrier(identity, ownership);
+            const barrierWarnings = await assertNoUpdateRecoveryBarrier(identity, ownership, { lock });
             // Only the full form may replace the Box, so only it applies a new repository source.
             const reposSource = plan.request.kind === 'all' ? requestedReposSource() : undefined;
             // The folder is re-resolved under the lock before anything is settled or changed, as master does: a scope that
@@ -2443,6 +2919,7 @@ export function createBoxSupervisor({
         let core;
         let decision;
         let outcome;
+        let attempt = null;
         try {
             await prepareGateOnGeneration(identity, ownership.engine, containerId, prepared.hardware);
             await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
@@ -2540,9 +3017,11 @@ export function createBoxSupervisor({
                     lock.assertHeld(identity.instance);
                     prepared.validate?.();
                     const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+                    attempt = beginActivation(identity, { operation: 'update', containerId });
                     graphMutated = true;
-                    await executeBoundedRestart({
+                    await executeBoundedActivation({
                         identity, engine: ownership.engine, containerId, prepared, selection, skillScopeEnv, hostReachableIpv4,
+                        coreArgv: ['restart'], attempt,
                     });
                 }
                 admission = await completeGraphAdmission({
@@ -2568,12 +3047,7 @@ export function createBoxSupervisor({
             if (error && typeof error === 'object' && !error.updateRecords) {
                 error.updateRecords = Object.freeze(inputRecords.slice(plan.hostRecords.length));
             }
-            await rollbackPreparedGraph({
-                identity,
-                prepared,
-                ownership,
-                containerId,
-                error,
+            const rollback = {
                 stopGraph: graphMutated,
                 restoreGraph: activity.active
                     && Boolean(prepared.previousAgentLib)
@@ -2582,7 +3056,23 @@ export function createBoxSupervisor({
                 restoreCoreArgv: priorCoreStartArgv,
                 restoreSkillScopeEnv: priorSkillScopeEnv,
                 priorGraphActive: activity.active,
-            });
+            };
+            if (attempt) {
+                try {
+                    await settleFailedActivation({ identity, ownership, prepared, containerId, error, attempt, rollback });
+                } catch (settled) {
+                    // A kept activation is an uncertain activation record of the update.
+                    const kept = String(settled?.activation?.outcome || '').startsWith('kept-');
+                    if (settled && typeof settled === 'object') {
+                        settled.updateRecords = Object.freeze([
+                            ...(error?.updateRecords || []),
+                            ...(kept ? [activationRecord(settled.activation.outcome, settled.message)] : []),
+                        ]);
+                    }
+                    throw settled;
+                }
+            }
+            await rollbackPreparedGraph({ identity, prepared, ownership, containerId, error, ...rollback });
         }
         if (restart) reportSettled(prepared.routerBinding);
         let reapplied = null;
@@ -2898,7 +3388,7 @@ export function createBoxSupervisor({
      */
     async function runBindTransaction(mapping = null) {
         return lockedMutation(async (identity, lock, ownership) => {
-            await assertNoUpdateRecoveryBarrier(identity, ownership);
+            await assertNoUpdateRecoveryBarrier(identity, ownership, { lock });
             // Every rejection happens before the Box, graph, or preference changes.
             assertNoPendingHardwareTransition(identity, 'bind');
             selectHardwareGateForOperation(identity, 'bind', lock);
@@ -3472,7 +3962,7 @@ export function createBoxSupervisor({
      */
     async function runGpuGrantTransaction({ vendor, agents = [] } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
-            await assertNoUpdateRecoveryBarrier(identity, ownership);
+            await assertNoUpdateRecoveryBarrier(identity, ownership, { lock });
             assertNoPendingHardwareTransition(identity, 'gpu grant');
             selectHardwareGateForOperation(identity, 'gpu-grant', lock);
             const saved = gpuGrantStore.read(identity);
@@ -3509,7 +3999,7 @@ export function createBoxSupervisor({
      */
     async function runGpuRevokeTransaction({ agents = [] } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
-            await assertNoUpdateRecoveryBarrier(identity, ownership);
+            await assertNoUpdateRecoveryBarrier(identity, ownership, { lock });
             assertNoPendingHardwareTransition(identity, 'gpu revoke');
             selectHardwareGateForOperation(identity, 'gpu-revoke', lock);
             const saved = gpuGrantStore.read(identity);
@@ -3674,7 +4164,8 @@ export function createBoxSupervisor({
 
     /** Host recovery: clear one agent's stored limits or every entry. No router needed. */
     async function runLimitsClearTransaction({ agentRef = null, all = false } = {}) {
-        return lockedMutation(async (identity, lock) => {
+        return lockedMutation(async (identity, lock, ownership) => {
+            await assertNoUpdateRecoveryBarrier(identity, ownership, { lock, activationOnly: true });
             const result = runLimitsClear({
                 identity, lock, agentRef, all,
                 inspectBox: () => observeBoxState(identity),
@@ -3717,6 +4208,7 @@ export function createBoxSupervisor({
             if (options.requireExistingContainerId !== undefined) ownership = authorize(inspect(identity));
             const container = ownership.handles?.container;
             if (!container) {
+                clearActivationBarrierAfterStop(identity, lock, ownership);
                 return Object.freeze({ identity, action: 'absent' });
             }
             if (container.runtime.running) {
@@ -3733,11 +4225,13 @@ export function createBoxSupervisor({
                     ]);
                 }
                 if (localStopError) {
+                    clearActivationBarrierAfterStop(identity, lock, ownership);
                     throw supervisorError(
                         `Outer Box stopped after ploinky-local stop reported: ${localStopError.message}`,
                     );
                 }
             }
+            clearActivationBarrierAfterStop(identity, lock, ownership);
             const hostStateQuarantine = guard.retireUnmaskedHostState?.(identity, lock, {
                 container, engine: ownership.engine, observe: () => inspect(identity),
             }) ?? null;
@@ -3926,6 +4420,7 @@ export function createBoxSupervisor({
     // start stages it and activates a routing generation.
     async function runEdgeSetTransaction(bytes) {
         return lockedMutation(async (identity, lock, ownership) => {
+            await assertNoUpdateRecoveryBarrier(identity, ownership, { lock, activationOnly: true });
             const assertHeld = () => lock.assertHeld(identity.instance);
             const container = ownership.handles?.container;
             if (container?.runtime?.running) {
@@ -4458,6 +4953,21 @@ export function formatBindResult(result) {
     return `${lines.join('\n')}\n`;
 }
 
+/**
+ * M5: the one stable signal of a held activation barrier. `ploinky status`
+ * prints it on stdout; logs and canary status print it on stderr.
+ */
+export function formatActivationRecoveryLine(barrier) {
+    const what = barrier?.state === 'activated' ? 'activated a new version' : 'may have activated a new version';
+    return `Activation recovery required: an earlier ${barrier?.operation || 'activation'} (${shortId(barrier?.operationId)}) `
+        + `${what} whose settlement failed (${barrier?.cause || 'unknown cause'}). It is left running. Start, update, `
+        + 'single-agent restart, bind and GPU changes are blocked until `ploinky restart` settles it or `ploinky stop` stops it.';
+}
+
+export function isActivationRecoveryBarrier(barrier) {
+    return barrier?.schema === ACTIVATION_BARRIER_SCHEMA;
+}
+
 export function formatUpdateStateLines(state) {
     const lines = [];
     const pending = state?.pendingActivation;
@@ -4471,7 +4981,9 @@ export function formatUpdateStateLines(state) {
         if (blocked.length) lines.push(`Pending activation was blocked by: ${[...new Set(blocked)].join('; ')}.`);
     }
     const barrier = state?.recoveryBarrier;
-    if (barrier) {
+    if (barrier?.schema === ACTIVATION_BARRIER_SCHEMA) {
+        lines.push(formatActivationRecoveryLine(barrier));
+    } else if (barrier) {
         lines.push(`Update recovery required: an earlier ${barrier.operation || 'update'} may still be running in the Box `
             + `(${barrier.cause || 'unknown cause'}${barrier.detail ? `: ${barrier.detail}` : ''}). `
             + 'New updates, starts, restarts and binds are blocked until the engine confirms it stopped; '
