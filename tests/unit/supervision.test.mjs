@@ -205,13 +205,15 @@ test('attaching a role resumes its native conversation when its terminal is gone
     assert.equal(attached.terminal.sessionId, 's'.repeat(32));
 
     const inputRequests = [];
-    await assert.rejects(attachRole({
+    const fresh = await attachRole({
         client: { json: async (...args) => inputRequests.push(args) }, api,
         openTerminal: async () => ({ sessionId: 'fresh-terminal', viewId: 'view' }),
         session: record({ folder, worker: { ...record().worker, nativeSessionId: null } }),
         role: 'worker', directory: 'project', output: {}, live: [],
-    }), /No saved native conversation/u);
-    assert.deepEqual(inputRequests, [], 'missing history must never silently create a replacement');
+    });
+    assert.equal(calls.filter(([operation]) => operation === 'launch').at(-1)[1].resume, null);
+    assert.equal(fresh.record.nativeSessionId, 'native-2', 'persist the new ID assigned by the provider');
+    assert.deepEqual(inputRequests, [], 'no prompt is injected into the new terminal');
 });
 
 test('killing a role ends its terminal and tolerates one that is already gone', async () => {
@@ -665,7 +667,9 @@ test('native conversation bindings are unique per role and persist before the fi
             chooseResume: () => assert.fail('must not ask the user to identify ownership') }), `${role}-conversation`);
     }
     history.sessions = history.sessions.filter(entry => entry.id !== 'worker-conversation');
-    await assert.rejects(resolveSupervisedResume({ api, session: stored, role: 'worker', directory: '' }), /cannot be identified/u);
+    assert.equal(await resolveSupervisedResume({ api, session: stored, role: 'worker', directory: '' }), null);
+    const mapped = { ...stored, worker: { ...stored.worker, nativeSessionId: 'worker-conversation' } };
+    assert.equal(await resolveSupervisedResume({ api, session: mapped, role: 'worker', directory: '' }), 'worker-conversation');
     const corrupt = { ...stored, worker: { ...stored.worker, nativeSessionId: 'supervisor-conversation' } };
     history.sessions.push({ id: 'worker-conversation', sessionBinding: stored.worker.sessionBinding });
     await assert.rejects(resolveSupervisedResume({ api, session: corrupt, role: 'worker', directory: '' }), /does not match/u);

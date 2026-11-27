@@ -353,6 +353,22 @@ export class WebttyHomeProfileProvider {
         return Object.freeze({ relativePath, absolutePath: resolved.absolutePath, identity });
     }
 
+    async callCodingSession({ req, routePlan, providerName, operation, body }) {
+        if (!isAdminUser(req?.user)) throw profileError('administrator');
+        if (!['robots', 'agents', 'history', 'sync-history', 'launch', 'index', 'control-create', 'control-close'].includes(operation)) {
+            throw profileError('coding_operation');
+        }
+        const snapshot = currentSnapshot(routePlan);
+        const provider = findHomeProfileProvider(snapshot, providerName);
+        const declaration = provider && codingSessionDeclaration(snapshot.manifests?.[provider.routeKey], provider.routeKey);
+        if (!declaration) throw profileError('coding_declaration');
+        return this.callProvider({ req, routePlan, snapshot, provider,
+            control: { path: `${declaration.api}/${operation}`, body },
+            // Native history runs a confined helper; it is not a cheap home-path lookup.
+            ...(['history', 'sync-history'].includes(operation) ? { deadlineMs: 15_000 } : {}),
+            ...(operation === 'index' ? { responseBytes: 8 * 1024 * 1024 } : {}) });
+    }
+
     async callControl({ req, routePlan, providerName, expectedProvider, operation, body }) {
         if (!isAdminUser(req?.user)) throw profileError('administrator');
         if (!['poll', 'close'].includes(operation)) throw profileError('control_operation');
@@ -365,7 +381,7 @@ export class WebttyHomeProfileProvider {
             control: { path: `${declaration.api}/control-${operation}`, body } });
     }
 
-    async callProvider({ req, routePlan, snapshot, provider, id, mode, control }) {
+    async callProvider({ req, routePlan, snapshot, provider, id, mode, control, deadlineMs = this.limits.deadlineMs, responseBytes = 100000 }) {
         const resolvePath = control ? control.path : provider.declaration.resolve;
         let plan;
         try {
@@ -422,8 +438,8 @@ export class WebttyHomeProfileProvider {
         } catch (_) {
             throw profileError('signature');
         }
-        const response = await this.exchange({ plan: finalized, lease: routePlan.lease, headers, body, bodyHash,
-            ...(control ? { responseBytes: 100000 } : {}) });
+        const response = await this.exchange({ plan: finalized, lease: routePlan.lease, headers, body, bodyHash, deadlineMs,
+            ...(control ? { responseBytes } : {}) });
         if (control) {
             if (currentSnapshot(routePlan) !== snapshot || response.statusCode !== 200) throw profileError('control_response');
             const answer = JSON.parse(response.body.toString('utf8'));
@@ -437,9 +453,9 @@ export class WebttyHomeProfileProvider {
 
     // One buffered request over the private relay with a single total
     // deadline. Every exit closes the checkout, agent, request and timer.
-    exchange({ plan, lease, headers, body, bodyHash, responseBytes = this.limits.responseBytes }) {
+    exchange({ plan, lease, headers, body, bodyHash, responseBytes = this.limits.responseBytes, deadlineMs = this.limits.deadlineMs }) {
         const relayManager = this.relayManager;
-        const limits = { ...this.limits, responseBytes };
+        const limits = { ...this.limits, responseBytes, deadlineMs };
         const setTimer = this.setTimer;
         const clearTimer = this.clearTimer;
         return new Promise((resolve, reject) => {

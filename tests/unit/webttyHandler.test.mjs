@@ -1252,3 +1252,32 @@ test('server supervision registration requires the normal mutation proof and del
     }
     assert.equal(registered, 1);
 });
+
+test('browser coding-session endpoint refuses non-admins, missing mutation proof and invalid bodies', async () => {
+    const routePlan = plan();
+    for (const mode of ['member', 'proof', 'body']) {
+        const input = request({ routePlan, url: '/webtty/coding-sessions', body: { action: 'robots', dir: '', extra: true }, csrf: mode !== 'proof' });
+        if (mode === 'member') input.req.user = { id: 'member', roles: ['user'] };
+        const res = new MockResponse();
+        await handleWebtty(input.req, res, new URL('https://app.example.test/webtty/coding-sessions'), {
+            routePlan, manager: manager({ validatedLease() { assert.fail('invalid request reached orchestration'); } }),
+        });
+        assert.equal(res.statusCode, mode === 'body' ? 400 : 403);
+        if (mode !== 'body') assert.equal(input.wasConsumed(), false);
+    }
+});
+
+test('coding readiness returns a normal waiting response during startup and remains admin-only', async () => {
+    const routePlan = plan();
+    const url = '/webtty/coding-sessions/readiness';
+    const { req } = request({ method: 'GET', url, routePlan, csrf: false });
+    const unavailable = manager({ validatedLease: async () => ({}), availability: () => ({ ok: false }) });
+    const res = new MockResponse();
+    await handleWebtty(req, res, new URL(url, 'https://app.example.test'), { manager: unavailable, routePlan });
+    assert.equal(res.statusCode, 200);
+    assert.equal(JSON.parse(res.body).ready, false);
+    req.user.roles = ['user'];
+    const denied = new MockResponse();
+    await handleWebtty(req, denied, new URL(url, 'https://app.example.test'), { manager: unavailable, routePlan });
+    assert.equal(denied.statusCode, 403);
+});

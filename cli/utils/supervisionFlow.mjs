@@ -197,17 +197,21 @@ export async function rememberRoleConversations({ api, session, directory }) {
     return patch;
 }
 
+function resumeError(message) {
+    return Object.assign(new Error(message), { code: 'CODING_SESSIONS_RESUME_UNAVAILABLE' });
+}
+
 export async function resolveSupervisedResume({ api, session, role, directory, chooseResume }) {
     const record = session[role];
     const counterpart = session[role === 'supervisor' ? 'worker' : 'supervisor'];
     if (!record.sessionBinding && record.robotId === counterpart.robotId
         && record.codingAgent === counterpart.codingAgent && !counterpart.nativeSessionId) {
-        throw new Error('This older pair has no verified conversation ownership. Refusing to select from the shared history.');
+        throw resumeError('This older pair has no verified conversation ownership. Refusing to select from the shared history.');
     }
     if (record.nativeSessionId && !record.sessionBinding) {
         const other = session[role === 'supervisor' ? 'worker' : 'supervisor'];
         if (record.robotId === other.robotId && record.codingAgent === other.codingAgent
-            && record.nativeSessionId === other.nativeSessionId) throw new Error('Both roles reference the same native conversation. Refusing to resume.');
+            && record.nativeSessionId === other.nativeSessionId) throw resumeError('Both roles reference the same native conversation. Refusing to resume.');
         return record.nativeSessionId;
     }
     const other = session[role === 'supervisor' ? 'worker' : 'supervisor'];
@@ -215,11 +219,19 @@ export async function resolveSupervisedResume({ api, session, role, directory, c
     const history = await api('history', { robot: record.robotId, codingAgent: record.codingAgent, directory });
     if (record.sessionBinding) {
         const matches = (history.sessions || []).filter(entry => entry.sessionBinding === record.sessionBinding);
+        if (matches.length === 0) {
+            if (record.nativeSessionId && shared && record.nativeSessionId === other.nativeSessionId) {
+                throw resumeError('Both roles reference the same native conversation. Refusing to resume.');
+            }
+            // Vibe can exit before its first message without saving a conversation.
+            // Keep an already associated native ID; otherwise start this role afresh.
+            return record.nativeSessionId || null;
+        }
         if (matches.length !== 1 || (shared && matches[0].id === other.nativeSessionId)) {
-            throw new Error('The original conversation for this role cannot be identified uniquely yet. No replacement session was created.');
+            throw resumeError('The original conversation for this role cannot be identified uniquely yet. No replacement session was created.');
         }
         if (record.nativeSessionId && record.nativeSessionId !== matches[0].id) {
-            throw new Error('The saved conversation does not match this role. Refusing to resume.');
+            throw resumeError('The saved conversation does not match this role. Refusing to resume.');
         }
         return matches[0].id;
     }
@@ -230,12 +242,12 @@ export async function resolveSupervisedResume({ api, session, role, directory, c
     // The person may have used the native agent's own resume menu during the original launch.
     // Keep old conversations selectable in that case, but never infer ownership from them.
     const candidates = fresh.length ? fresh : available;
-    if (!candidates.length) throw new Error('No saved native conversation was found for this role. No replacement session was created.');
+    if (!candidates.length) return null;
     // Another unmapped role can create a conversation in the same catalog at any time.
     // A single row is not ownership evidence in that case, nor for legacy records.
     if (baseline && fresh.length === 1 && (!shared || other.nativeSessionId)) return candidates[0].id;
     const selected = await chooseResume?.(candidates, role);
-    if (!selected || !candidates.some(entry => entry.id === selected)) throw new Error('Choose the original conversation to resume; no replacement session was created.');
+    if (!selected || !candidates.some(entry => entry.id === selected)) throw resumeError('Choose the original conversation to resume; no replacement session was created.');
     return selected;
 }
 
@@ -277,7 +289,7 @@ export async function attachRole({
                 terminalId: terminal.sessionId,
                 interruptInput: launched.interruptInput || null,
                 ...(control ? { controlId: control.id } : {}),
-                nativeSessionId: resume,
+                nativeSessionId: resume || launched.nativeSessionId || null,
             },
         };
     } catch (error) {

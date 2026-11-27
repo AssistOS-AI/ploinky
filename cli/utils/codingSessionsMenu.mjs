@@ -12,10 +12,10 @@ const KEYS = Object.freeze({
 
 // What a coding agent may leave switched on in the terminal when its view
 // detaches: mouse reporting in every encoding, focus reporting, bracketed
-// paste, the kitty keyboard protocol and application cursor keys. The menu
+// paste, color-scheme notifications, the kitty keyboard protocol and application cursor keys. The menu
 // turns them off, so a mouse moving over the terminal never reads as a key.
 export const TERMINAL_INPUT_RESET = `${ESC}[?9l${ESC}[?1009l${ESC}[?1016l${ESC}[?1000l${ESC}[?1001l${ESC}[?1002l${ESC}[?1003l${ESC}[?1005l${ESC}[?1006l`
-    + `${ESC}[?1015l${ESC}[?1004l${ESC}[?2004l${ESC}[<u${ESC}[?1l${ESC}>`;
+    + `${ESC}[?1015l${ESC}[?1004l${ESC}[?2031l${ESC}[?2004l${ESC}[<u${ESC}[?1l${ESC}>`;
 
 // Splits a chunk of raw input into keys. Every escape sequence stays whole: a
 // CSI with any parameters (including private markers such as `<`), an SS3
