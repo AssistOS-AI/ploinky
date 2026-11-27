@@ -297,7 +297,9 @@ test('CDN cache policy through the Router HTTP listeners', async t => {
         const { setCacheRoute } = await import('../../cli/server/cdn/cacheSettingsStore.js');
         const marks = [{ path: '/never/*', access: 'public', cache: 'never' },
             { path: '/never/inner', access: 'public', cache: 'page' },
-            { path: '/shared/*', access: 'public' }, { path: '/shared/own', access: 'public' }];
+            { path: '/shared/*', access: 'public' }, { path: '/shared/own', access: 'public' },
+            { path: '/static/*', access: 'public' }, { path: '/static/guest/*', access: 'guest' },
+            { path: '/static/secret/*', access: 'authenticated' }];
         lease = apply([...manifest, ...marks, ...marks.map(row => ({ ...row, path: portMount + row.path }))]);
         await settings(true, 60);
         await setCacheHold(agent, null);
@@ -329,6 +331,14 @@ test('CDN cache policy through the Router HTTP listeners', async t => {
                 assert.deepEqual([headers[cdn], headers[browser], headers.etag], [pagePolicy(60), 'no-cache', undefined]);
                 // An exact unmarked entry still shadows the wildcard.
                 assert.equal((await answer('/shared/own'))[cdn], 'no-store');
+                // A page choice on a public wildcard does not reach a nested guest or authenticated entry.
+                await choose('/static/*', choice('page', null));
+                assert.equal((await answer('/static/a.css'))[cdn], pagePolicy(60));
+                for (const nested of ['/static/guest/x', '/static/secret/x']) {
+                    const result = await request(publicServer, mount + nested);
+                    assert.equal(result.headers[cdn], 'no-store', nested);
+                }
+                await choose('/static/*', null);
                 // The choice never overrides a credential, a cookie or a hold.
                 upstream.respond({ 'set-cookie': 'app=fixture' });
                 assert.equal((await answer('/shared/a.css'))[cdn], 'no-store');
@@ -366,6 +376,35 @@ test('CDN cache policy through the Router HTTP listeners', async t => {
                 for (const route of ['/shared/*', '/never/*', '/never/inner', '/never/x']) await choose(route, null);
             });
         }
+        lease = apply(manifest);
+    });
+
+    // A root-application host serves the bare suffix; its administrator choices sit on the convention path.
+    await t.test('administrator route choices on a root-application host', async () => {
+        const { setCacheRoute } = await import('../../cli/server/cdn/cacheSettingsStore.js');
+        lease = apply([...manifest, { path: portMount + '/never/*', access: 'public', cache: 'never' },
+            { path: portMount + '/shared/*', access: 'public' }]);
+        await settings(true, 60);
+        await setCacheHold(agent, null);
+        const choose = (route, setting, mark) => setCacheRoute(agent, portMount + route, setting
+            && { setting, at: '2026-11-27T10:00:00.000Z', by: 'admin', entry: { access: 'public', manifest: mark } });
+        const answer = async suffix => {
+            const count = upstream.checkout.mock.callCount();
+            const result = await request(publicServer, suffix, { headers: { host: rootHost } });
+            assert.equal(result.status, 200, result.body);
+            assert.equal(upstream.checkout.mock.callCount(), count + 1);
+            return result.headers[cdn];
+        };
+        upstream.respond({});
+        assert.equal(await answer('/page'), pagePolicy(60));
+        await choose('/page', 'off', 'page');
+        assert.equal(await answer('/page'), 'no-store');
+        await choose('/page', null);
+        assert.equal(await answer('/shared/a.css'), 'no-store');
+        await choose('/shared/*', 'page', null);
+        assert.equal(await answer('/shared/a.css'), pagePolicy(60));
+        await choose('/shared/*', null);
+        assert.equal(await answer('/shared/a.css'), 'no-store');
         lease = apply(manifest);
     });
 

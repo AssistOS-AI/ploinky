@@ -35,11 +35,12 @@ export function getRouteCacheState(plan, access) {
     try {
         const route = plan?.route;
         const snapshot = plan?.snapshot;
-        if (access !== 'public' || !route?.repo || !route?.agent || plan.lease?.isCurrent?.() !== true) return none;
+        if (access !== 'public' || !route?.repo || !route?.agent) return none;
         const agent = `${route.repo}/${route.agent}`;
         const parts = applicationManifests(snapshot, agent);
-        // Most applications carry no mark: answer without reading the settings file.
+        // Most applications carry no mark: answer without a generation check or reading the settings file.
         if (!hasCacheMark(parts)) return none;
+        if (plan.lease?.isCurrent?.() !== true) return none;
         const settings = readCacheSettings();
         const overlay = cacheOverlay({ parts, records: applicationRouteRecords(settings, agent) });
         const cacheClass = matchOverlayEntry(overlay, plan.policyPath ?? plan.canonicalPath)?.effective ?? null;
