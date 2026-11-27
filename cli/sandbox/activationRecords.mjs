@@ -632,12 +632,16 @@ function purposeAdmits(operation, purpose) {
 }
 
 export function activationRecoveryRequiredError(operation, marker) {
-    const unsettled = marker ? `${marker.operation} ${shortId(marker.operationId)}` : 'unknown';
-    const error = new Error(
-        `This workspace has an unsettled activation (${unsettled}); ${operation || 'the workspace mutation'} was refused. `
-        + 'Run `ploinky restart` on the host to settle it, or `ploinky stop`. '
-        + `[${ACTIVATION_RECOVERY_REQUIRED}]`,
-    );
+    const refused = operation || 'the workspace mutation';
+    // A malformed marker names no operation a settle could match, so only the
+    // host's stop proof removes it.
+    const error = new Error(marker
+        ? `This workspace has an unsettled activation (${marker.operation} ${shortId(marker.operationId)}); ${refused} was refused. `
+            + 'Run `ploinky restart` on the host to settle it, or `ploinky stop`. '
+            + `[${ACTIVATION_RECOVERY_REQUIRED}]`
+        : `This workspace has an unreadable activation barrier marker; ${refused} was refused. A restart cannot remove it: `
+            + 'run `ploinky stop` on the host, which removes it once the Box is stopped. '
+            + `[${ACTIVATION_RECOVERY_REQUIRED}]`);
     error.code = ACTIVATION_RECOVERY_REQUIRED;
     return error;
 }

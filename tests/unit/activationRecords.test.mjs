@@ -537,3 +537,14 @@ test('the static lease inventory of cli/ is complete and fully classified', (t) 
         && !operations.some((operation) => operation.endsWith('*') && pattern.startsWith(operation.slice(0, -1))));
     assert.deepEqual(stale, [], `classified operations no lease call site uses:\n${report}`);
 });
+
+test('a malformed marker is refused with M9 wording that points at stop, not at a settle that cannot remove it', () => {
+    fs.writeFileSync(activationMarkerPath(workspace), 'not json');
+    assert.throws(() => locks.createWorkspaceMutationLease({ operation: 'agent-enable' }), (error) => {
+        assert.equal(error.code, 'PLOINKY_ACTIVATION_RECOVERY_REQUIRED');
+        assert.match(error.message, /^This workspace has an unreadable activation barrier marker; agent-enable was refused\./);
+        assert.match(error.message, /run `ploinky stop` on the host/);
+        assert.doesNotMatch(error.message, /Run `ploinky restart`/);
+        return true;
+    });
+});
