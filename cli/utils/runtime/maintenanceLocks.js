@@ -10,6 +10,7 @@ import { assertHostLaunchLockOrder } from '../../sandbox/hostLaunchExclusionStat
 
 import { PLOINKY_WORKSPACE_ROOT, RUNNING_DIR } from '../config.js';
 import { canaryWorkspaceOwner } from '../../sandbox/canary/preparation.mjs';
+import { assertActivationBarrierAdmits } from '../../sandbox/activationRecords.mjs';
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -204,6 +205,10 @@ function createWorkspaceMutationLease({
         throw error;
     }
     if (existing.active) throw workspaceMutationBusy(existing.lock);
+    // Q30: while the host holds an activation barrier, its controller-only
+    // marker refuses configuration and graph changes. Every new lease, and so
+    // every immediate one, passes here; nested work reuses a held lease.
+    assertActivationBarrierAdmits(operation, { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
     const now = Date.now();
     const lock = {
         operation,

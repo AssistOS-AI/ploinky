@@ -6,6 +6,7 @@ import { domainToASCII } from 'node:url';
 import { assertWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import { assertNetworkLifecycleCapability } from './networkLifecycle.js';
 import { recordOwnedEdgeSelection } from './edgeSelectionMutations.mjs';
+import { parseSealedEdgeSelector } from './edgeSelectorRecord.mjs';
 import { isCanaryRecord, validateCanaryField, validateCanaryLinks } from './canaryRecord.mjs';
 
 import {
@@ -1818,39 +1819,7 @@ export function withEdgeGenerationApplyLock(callback, options = {}) {
 
 function readSelector(paths) {
     try {
-        const selector = JSON.parse(fs.readFileSync(paths.activeSelectorFile, 'utf8'));
-        if (!isPlainObject(selector) || selector.schemaVersion !== EDGE_GENERATION_SCHEMA_VERSION) return null;
-        if (!['active', 'inactive'].includes(selector.state)) return null;
-        const allowed = selector.state === 'active'
-            ? new Set([
-                'schemaVersion',
-                'state',
-                'generation',
-                'publicationState',
-                'activationId',
-                'activatedAt',
-                'selectorDigest',
-            ])
-            : new Set([
-                'schemaVersion',
-                'state',
-                'generation',
-                'previousGeneration',
-                'reason',
-                'activationId',
-                'changedAt',
-                'selectorDigest',
-            ]);
-        if (Object.keys(selector).some((key) => !allowed.has(key))) return null;
-        if (selector.state === 'active' && !/^sha256:[a-f0-9]{64}$/.test(String(selector.generation || ''))) return null;
-        if (selector.state === 'inactive'
-            && ((selector.generation !== undefined
-                && !/^sha256:[a-f0-9]{64}$/.test(String(selector.generation || '')))
-                || (selector.previousGeneration
-                    && !/^sha256:[a-f0-9]{64}$/.test(String(selector.previousGeneration))))) return null;
-        const { selectorDigest, ...body } = selector;
-        if (selectorDigest !== sourceDigest(Buffer.from(stableStringify(body)))) return null;
-        return selector;
+        return parseSealedEdgeSelector(fs.readFileSync(paths.activeSelectorFile, 'utf8'));
     } catch (_) {
         return null;
     }
