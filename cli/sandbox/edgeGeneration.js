@@ -13,7 +13,7 @@ import {
     ROUTING_FILE,
 } from '../utils/config.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
-import { isRouteCacheClass, manifestHttpRouteSpecs } from '../server/policy/routeCacheMarks.js';
+import { isRouteCacheMark, manifestHttpRouteSpecs } from '../server/policy/routeCacheMarks.js';
 import { normalizeRequiredCapability } from '../server/authHandlers/requiredCapability.js';
 import { AGENT_PORT_ROUTE, parseAgentPortSelector } from '../server/agentPortConvention/parseSelector.js';
 import { HttpRouteAccessPath } from '../server/policy/HttpRouteAccessPath.js';
@@ -632,8 +632,8 @@ function collectStrictManifestPolicyEntries(routing, manifests) {
                     `manifest(${routeKey}).routerAccess.httpRoutes[${index}] is invalid: ${normalized.error || normalized.code}`,
                 );
             }
-            if (Object.hasOwn(spec, 'cache') && (!isRouteCacheClass(spec.cache) || normalized.access !== 'public')) {
-                throw edgeError(`manifest(${routeKey}).routerAccess.httpRoutes[${index}].cache must be page or immutable on a public entry`);
+            if (Object.hasOwn(spec, 'cache') && (!isRouteCacheMark(spec.cache) || normalized.access !== 'public')) {
+                throw edgeError(`manifest(${routeKey}).routerAccess.httpRoutes[${index}].cache must be page, immutable or never on a public entry`);
             }
             if (spec.enabled === false) continue;
             if (normalized.access === 'public') {
