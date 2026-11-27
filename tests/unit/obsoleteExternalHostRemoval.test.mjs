@@ -38,7 +38,9 @@ const BASE_FILES = {
     // Includes the authenticated-request event wiring and the S1 primary-only
     // auth-owner lookup. Keep the exact-file guard for the reviewed source.
     'cli/server/authHandlers/authContext.js': 'dcb5d78b57d66df43e3c01a55c6428d93bed7a9988f74b966e2395d737be474c',
-    'ploinky-box/cloudflared/runtime.mjs': 'bb50780910dfe09c237f1930eb034947752adc1bb701d6fd5126a5945f886a2a',
+    // Re-pinned for the Q30 publication lease deferral under an activation
+    // barrier (no unhandled rejection from a scan or retry).
+    'ploinky-box/cloudflared/runtime.mjs': 'a9d09273cd0b59fa14f6301958605e550e69033cf8a10d0962638e9aa97ac4cb',
     'ploinky-box/cloudflared/status.mjs': '34e5055dddf9073890e5643ada17176295014225b5a9d183439f4cb94636b2a0',
     'ploinky-box/cloudflared/journal.mjs': '4969c853c230668265cc05f7276d95e3ee677ae2e77de969881295de7622799a',
     'ploinky-box/cloudflared/managedTunnelRegistry.mjs': '6203d1e05581cac8f33b28f7c826562ac7309489681318a67ac62e53d60d2a26',
