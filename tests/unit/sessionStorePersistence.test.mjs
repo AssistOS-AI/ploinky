@@ -478,3 +478,110 @@ test('discarding persisted sessions removes only the session file and never thro
     assert.equal(fs.readFileSync(path.join(sessionFile(directory), 'keep'), 'utf8'), 'x');
     assert.equal(events[0][0], 'sso_session_store_discard_failed');
 });
+
+test('permanent sessions survive restart and downgrade synchronously', () => {
+    const directory = freshDirectory();
+    let now = 1000;
+    const store = storeOn(directory, { now: () => now });
+    store.open({ providerAgent: PROVIDER });
+    const { id } = store.createSession(record(null, { expiresAt: null, sessionLifetime: 'until-revoked-v1' }));
+    now = 1_000_000;
+    assert.equal(store.getSession(id).expiresAt, null);
+    store.close();
+    const restored = storeOn(directory, { now: () => now });
+    assert.equal(restored.open({ providerAgent: PROVIDER }).restored, 1);
+    assert.equal(restored.getSession(id).sessionLifetime, 'until-revoked-v1');
+    restored.updateSession(id, { expiresAt: now + 100, sessionLifetime: undefined });
+    const persisted = decrypted(directory).sessions[hashSessionId(id)];
+    assert.equal(persisted.expiresAt, now + 100);
+    assert.equal(Object.hasOwn(persisted, 'sessionLifetime'), false);
+    now += 101;
+    assert.equal(restored.getSession(id), null);
+    restored.close();
+});
+
+test('capacity rejects growth without losing existing sessions', () => {
+    const directory = freshDirectory();
+    const store = storeOn(directory, { maxFileBytes: 3000 });
+    store.open({ providerAgent: PROVIDER });
+    const { id } = store.createSession(record(null, { expiresAt: null, sessionLifetime: 'until-revoked-v1' }));
+    assert.throws(() => store.createSession(record(null, { expiresAt: null, sessionLifetime: 'until-revoked-v1', user: { id: 'x'.repeat(3000) } })), { code: SSO_SESSION_STORE_UNAVAILABLE });
+    assert.throws(() => store.updateSession(id, { user: { id: 'x'.repeat(3000) } }), { code: SSO_SESSION_STORE_UNAVAILABLE });
+    assert.equal(store.getSession(id).user.id, 'u1');
+    store.close();
+    const restored = storeOn(directory, { maxFileBytes: 3000 });
+    assert.equal(restored.open({ providerAgent: PROVIDER }).restored, 1);
+    assert.equal(restored.getSession(id).user.id, 'u1');
+    restored.close();
+});
+
+test('failed durable creation and promotion preserve the prior snapshot', () => {
+    const directory = freshDirectory();
+    const fail = {};
+    const store = storeOn(directory, { fsApi: faultyFs(fail) });
+    store.open({ providerAgent: PROVIDER });
+    const { id } = store.createSession(record());
+    fail.renameSync = 'EIO';
+    assert.throws(() => store.createSession(record(null, { expiresAt: null, sessionLifetime: 'until-revoked-v1' })), { code: SSO_SESSION_STORE_UNAVAILABLE });
+    assert.throws(() => store.updateSession(id, { expiresAt: null, sessionLifetime: 'until-revoked-v1' }), { code: SSO_SESSION_STORE_UNAVAILABLE });
+    assert.equal(store.getSession(id).expiresAt, 100_000);
+    assert.equal(decrypted(directory).sessions[hashSessionId(id)].expiresAt, 100_000);
+    delete fail.renameSync;
+    store.close();
+});
+
+test('a lifetime downgrade stays unavailable until its old durable record has been retired', () => {
+    const directory = freshDirectory();
+    const fail = {};
+    const store = storeOn(directory, { fsApi: faultyFs(fail) });
+    store.open({ providerAgent: PROVIDER });
+    const { id } = store.createSession(record(null, { sessionLifetime: 'until-revoked-v1' }));
+    const persisted = () => decrypted(directory).sessions[hashSessionId(id)];
+    fail.renameSync = 'EROFS';
+    fail.unlinkSync = 'EROFS';
+    try {
+        assert.throws(() => store.updateSession(id, { expiresAt: 10_000 }), { code: SSO_SESSION_STORE_UNAVAILABLE });
+        assert.equal(store.getSession(id).expiresAt, 10_000);
+        assert.throws(() => store.updateSession(id, { expiresAt: 11_000 }), { code: SSO_SESSION_STORE_UNAVAILABLE });
+        assert.equal(persisted().expiresAt, null);
+        delete fail.renameSync;
+        delete fail.unlinkSync;
+        assert.equal(store.updateSession(id, { expiresAt: 11_000 }).expiresAt, 11_000);
+        assert.ok(persisted().expiresAt > 0);
+        assert.ok(persisted().expiresAt <= 11_000);
+        assert.equal(persisted().sessionLifetime, undefined);
+    } finally {
+        store.close();
+    }
+});
+
+test('a failed promotion that reached disk blocks admission until rollback is durable', () => {
+    const directory = freshDirectory();
+    const fail = {};
+    const fsApi = faultyFs(fail);
+    let failAfterRename = false;
+    fsApi.fsyncSync = (fd) => {
+        if (failAfterRename && fs.fstatSync(fd).isDirectory()) {
+            failAfterRename = false;
+            fail.renameSync = fail.unlinkSync = 'EROFS';
+            throw Object.assign(new Error('directory sync failed'), { code: 'EIO' });
+        }
+        return fs.fsyncSync(fd);
+    };
+    const store = storeOn(directory, { fsApi });
+    store.open({ providerAgent: PROVIDER });
+    const { id } = store.createSession(record());
+    try {
+        failAfterRename = true;
+        assert.throws(() => store.updateSession(id, { expiresAt: null, sessionLifetime: 'until-revoked-v1' }),
+            { code: SSO_SESSION_STORE_UNAVAILABLE });
+        assert.equal(decrypted(directory).sessions[hashSessionId(id)].expiresAt, null);
+        assert.throws(() => store.updateSession(id, { expiresAt: 100_000 }), { code: SSO_SESSION_STORE_UNAVAILABLE });
+        delete fail.renameSync;
+        delete fail.unlinkSync;
+        assert.equal(store.updateSession(id, { expiresAt: 100_000 }).expiresAt, 100_000);
+        assert.equal(decrypted(directory).sessions[hashSessionId(id)].expiresAt, 100_000);
+    } finally {
+        store.close();
+    }
+});

@@ -62,8 +62,9 @@ export function createProvider({ getConfig }) {
                 expiresAt: process.env.__FAKE_PROVIDER_ISO_EXPIRY === '1' ? new Date(Date.now() + 60_000).toISOString() : Date.now() + 60_000
             };
         },
-        async sso_handle_callback({ redirectUri, query, providerState }) {
-            recordCall('sso_handle_callback', { redirectUri, query, providerState });
+        async sso_handle_callback({ redirectUri, query, providerState, supportsSessionLifetimeV1 }) {
+            recordCall('sso_handle_callback', { redirectUri, query, providerState, supportsSessionLifetimeV1 });
+            if (globalThis.__bridgeCallbackFixture) return globalThis.__bridgeCallbackFixture();
             return {
                 user: { id: 'u1', sub: 'u1', username: 'alice', email: 'alice@test', roles: ['dev'], raw: {} },
                 providerSession: {
@@ -78,8 +79,8 @@ export function createProvider({ getConfig }) {
             recordCall('sso_validate_session', { providerSession });
             return { user: { id: 'u1', sub: 'u1', username: 'alice' }, providerSession };
         },
-        async sso_refresh_session({ providerSession, signal }) {
-            recordCall('sso_refresh_session', { providerSession });
+        async sso_refresh_session({ providerSession, signal, supportsSessionLifetimeV1 }) {
+            recordCall('sso_refresh_session', { providerSession, supportsSessionLifetimeV1 });
             if (globalThis.__bridgeValidationFixture) return globalThis.__bridgeValidationFixture(providerSession, { signal });
             if (process.env.__FAKE_PROVIDER_REFRESH_DELAY === '1') {
                 await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1133,4 +1134,50 @@ test('an unopened store reports admissions and callbacks as undecided, never as 
     bridge.closeSessionStore();
     assert.equal(bridge.isSessionStoreAvailable(), false);
     t.after(() => { delete globalThis.__bridgeValidationFixture; });
+});
+
+test('fresh validation upgrades and downgrades durable lifetime only with the complete marker', async (t) => {
+    const { bridge, sessionId, directory } = await persistentFixture(t);
+    const originalExpiry = bridge.getSession(sessionId).expiresAt;
+    globalThis.__bridgeValidationFixture = providerSession => ({
+        ...described({ ...providerSession, expiresAt: null }), sessionLifetime: 'until-revoked-v1',
+    });
+    assert.ok(await bridge.validateSession(sessionId));
+    assert.equal(bridge.getSession(sessionId).expiresAt, null);
+    assert.equal(bridge.getSessionCookieMaxAge(bridge.getSession(sessionId)), 34560000);
+    assert.notEqual(bridge.getSessionCookieMaxAge(), 34560000);
+    globalThis.__bridgeValidationFixture = providerSession => described({ ...providerSession, expiresAt: null });
+    assert.ok(await bridge.validateSession(sessionId));
+    assert.ok(bridge.getSession(sessionId).expiresAt > originalExpiry);
+    assert.equal(bridge.getSession(sessionId).sessionLifetime, undefined);
+    assert.equal(persistedEntry(directory, sessionId).expiresAt, bridge.getSession(sessionId).expiresAt);
+});
+
+
+test('callback opts into durable lifetime and returns the cookie policy input', async (t) => {
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    globalThis.__bridgeCallbackFixture = () => ({
+        user: { id: 'u1' }, providerSession: { expiresAt: null }, sessionLifetime: 'until-revoked-v1',
+    });
+    t.after(() => { delete globalThis.__bridgeCallbackFixture; });
+    const bridge = createGenericAuthBridge();
+    const pending = await bridge.beginLogin({ baseUrl: 'http://localhost:8080' });
+    const result = await bridge.handleCallback({ ...pending, code: 'fixture', baseUrl: 'http://localhost:8080' });
+    assert.equal(result.expiresAt, null);
+    assert.equal(bridge.getSessionCookieMaxAge(result), 34560000);
+    assert.equal(readCalls().at(-1).payload.supportsSessionLifetimeV1, true);
+});
+
+test('a malformed provider deadline cannot retain a previous until-revoked session', async (t) => {
+    for (const expiresAt of [-1, 'invalid', Infinity]) {
+        const { bridge, sessionId } = await freshFixture(t);
+        globalThis.__bridgeValidationFixture = providerSession => ({
+            ...described({ ...providerSession, expiresAt: null }),
+            sessionLifetime: 'until-revoked-v1',
+        });
+        assert.equal((await bridge.validateSession(sessionId)).expiresAt, null);
+        globalThis.__bridgeValidationFixture = providerSession => described({ ...providerSession, expiresAt });
+        assert.equal(await bridge.validateSession(sessionId), null);
+        assert.equal(bridge.getSession(sessionId), null);
+    }
 });

@@ -46,7 +46,7 @@ import { replayRefusalStatus } from '../../../Agent/lib/replayCache.mjs';
 import { MARKETPLACE_ENABLE_RECOVERY_INSTRUCTION, runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { repositoryWorkerEligible, runMarketplaceRepositoryWorker } from '../marketplaceRepositoryWorker.mjs';
 import { diagnosticIdentity } from '../marketplaceRepositoryDiagnostics.mjs';
-import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
+import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, renewPersistentSsoCookie, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
 import { localSessionAllowedForRoutePlan } from './authContext.js';
 import { findHardwareOutcome, formatHardwareOutcome } from '../../sandbox/hardwareLimits/errors.mjs';
 import { handleHardwareLimitsRoutes } from './hardwareLimitsRoutes.mjs';
@@ -834,6 +834,11 @@ async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
             sendMarketplaceError(res, 401, 'not_authenticated', 'Authentication is required for this workspace.');
             return { ok: false };
         }
+        if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+            sendMarketplaceError(res, 503, 'edge_generation_changed');
+            return { ok: false };
+        }
+        renewPersistentSsoCookie(req, res, ssoSessionId, session);
         req.user = session.user;
         req.session = session;
         req.sessionId = ssoSessionId;
@@ -859,6 +864,11 @@ async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
         if (!admission.ok) return { ok: false };
         const { session } = admission;
         if (session?.user && (!session.expiresAt || Date.now() <= session.expiresAt)) {
+            if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+                sendMarketplaceError(res, 503, 'edge_generation_changed');
+                return { ok: false };
+            }
+            renewPersistentSsoCookie(req, res, ssoSessionId, session);
             req.user = session.user;
             req.session = session;
             req.sessionId = ssoSessionId;

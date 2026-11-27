@@ -426,7 +426,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             await waitForAgentRedirectReady(authContext.routeKey || '', { routePlan });
             if (!requireCurrentGeneration(res, routePlan)) return true;
             const cookie = buildCookie(SSO_AUTH_COOKIE_NAME, result.sessionId, req, '/', {
-                maxAge: authService.getSessionCookieMaxAge(),
+                maxAge: authService.getSessionCookieMaxAge(result),
                 sameSite: 'Lax'
             });
             issueBrowserMutationProof(req, res, {
@@ -674,7 +674,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 ? GUEST_SESSION_TTL_SECONDS
                 : authService.getSessionCookieMaxAge();
             const cookie = buildCookie(cookieName, sessionId, req, '/', {
-                maxAge: cookieMaxAge,
+                maxAge: sessionMode === 'sso' ? authService.getSessionCookieMaxAge(session) : cookieMaxAge,
                 sameSite: 'Lax'
             });
             const browserCsrfToken = issueBrowserMutationProof(req, res, {
@@ -683,7 +683,8 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 sessionId,
                 maxAge: cookieMaxAge,
             });
-            if (method === 'POST') appendSetCookie(res, cookie);
+            if (method === 'POST' || (sessionMode === 'sso'
+                && authService.getSessionCookieMaxAge(session) !== cookieMaxAge)) appendSetCookie(res, cookie);
             let adminControl;
             if (isAdminUser(session.user)) {
                 try {

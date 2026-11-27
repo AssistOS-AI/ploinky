@@ -3,7 +3,7 @@ import path from 'path';
 import { timingSafeEqual } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'url';
 
-import { createSessionStore, SSO_SESSION_STORE_UNAVAILABLE } from './sessionStore.js';
+import { createSessionStore, SSO_SESSION_STORE_UNAVAILABLE, DURABLE_LIFETIME, isDurableSession } from './sessionStore.js';
 import { randomId } from './utils.js';
 import { resolveVarValue } from '../../utils/security/secretVars.js';
 import { getConfigSnapshot } from '../../utils/workspace.js';
@@ -37,6 +37,15 @@ export const SSO_VALIDATION_DEADLINE_MS = 5000;
 
 const DENIED = Object.freeze({ session: null, unavailable: false });
 const UNAVAILABLE = Object.freeze({ session: null, unavailable: true });
+const PERSISTENT_COOKIE_MAX_AGE = 400 * 24 * 60 * 60;
+
+function providerSessionDeadline(sessionLifetime, providerSession, fallback) {
+    const expiresAt = providerSession?.expiresAt;
+    if (isDurableSession({ sessionLifetime, expiresAt })) return null;
+    if (expiresAt == null || expiresAt === 0) return fallback;
+    if (!Number.isFinite(expiresAt) || expiresAt < 0) throw new Error('Invalid provider session deadline');
+    return expiresAt;
+}
 
 function __dirname() {
     return path.dirname(fileURLToPath(import.meta.url));
@@ -310,14 +319,16 @@ export function createGenericAuthBridge(options = {}) {
                 query[k] = v;
             }
         }
-        const { user, providerSession } = await provider.sso_handle_callback({
+        const { user, providerSession, sessionLifetime } = await provider.sso_handle_callback({
             redirectUri: pending.redirectUri,
             query,
-            providerState: pending.providerState
+            providerState: pending.providerState,
+            supportsSessionLifetimeV1: true
         });
         if (pending.epoch !== validationEpoch) throw new Error('Authorization configuration changed');
         const now = Date.now();
-        const expiresAt = providerSession?.expiresAt || (now + sessionStore.sessionTtlMs);
+        const expiresAt = providerSessionDeadline(sessionLifetime, providerSession, now + sessionStore.sessionTtlMs);
+        const durable = expiresAt === null;
         const refreshExpiresAt = providerSession?.refreshExpiresAt || null;
         if (!sessionStore.isAvailable()) throw ssoProviderUnavailableError();
         let sessionId;
@@ -327,6 +338,7 @@ export function createGenericAuthBridge(options = {}) {
                 user,
                 tokens: providerSession?.tokens || {},
                 providerSession,
+                ...(durable ? { sessionLifetime } : {}),
                 expiresAt,
                 refreshExpiresAt
             }));
@@ -339,6 +351,7 @@ export function createGenericAuthBridge(options = {}) {
         return {
             sessionId,
             user,
+            ...(durable ? { sessionLifetime, expiresAt: null } : {}),
             redirectTo,
             postLogoutRedirectUri,
             tokens: {
@@ -419,6 +432,7 @@ export function createGenericAuthBridge(options = {}) {
             outcome = await operation({
                 providerSession: structuredClone(session.providerSession || { tokens: session.tokens }),
                 signal,
+                supportsSessionLifetimeV1: true,
             });
         } catch (error) {
             if (!current()) return DENIED;
@@ -444,20 +458,21 @@ export function createGenericAuthBridge(options = {}) {
             }
             const { user, providerSession } = structuredClone(outcome);
             const tokens = providerSession.tokens || {};
+            const expiresAt = providerSessionDeadline(outcome.sessionLifetime, providerSession,
+                session.expiresAt ?? (Date.now() + sessionStore.sessionTtlMs));
             if (typeof tokens !== 'object' || Array.isArray(tokens)) throw new Error('invalid provider tokens');
             const updated = sessionStore.updateSession(sessionId, {
                 user,
                 providerSession,
                 tokens,
-                expiresAt: providerSession?.expiresAt || session.expiresAt,
+                sessionLifetime: expiresAt === null ? DURABLE_LIFETIME : undefined,
+                expiresAt,
                 refreshExpiresAt: providerSession?.refreshExpiresAt ?? session.refreshExpiresAt,
-            });
+            }, { replaceTokens: true });
             if (!updated) return DENIED;
-            // The general store merges tokens; an admission replaces the entire
-            // provider projection so removed metadata cannot survive refresh.
-            updated.tokens = tokens;
             return Object.freeze({ session: structuredClone(updated), unavailable: false });
-        } catch (_) {
+        } catch (error) {
+            if (error?.code === SSO_SESSION_STORE_UNAVAILABLE) return UNAVAILABLE;
             return refuse();
         }
     }
@@ -631,7 +646,8 @@ export function createGenericAuthBridge(options = {}) {
         return Boolean(resolveConfiguredSsoProvider());
     }
 
-    function getSessionCookieMaxAge() {
+    function getSessionCookieMaxAge(session) {
+        if (isDurableSession(session)) return PERSISTENT_COOKIE_MAX_AGE;
         return Math.floor(sessionStore.sessionTtlMs / 1000);
     }
 

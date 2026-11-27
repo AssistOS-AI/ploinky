@@ -253,9 +253,13 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     }
 
     try {
+        if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+            sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
+            return true;
+        }
         const cookieMaxAge = authService.getSessionCookieMaxAge();
         const cookie = buildCookie(cookieName, sessionId, req, '/', {
-            maxAge: cookieMaxAge,
+            maxAge: authService.getSessionCookieMaxAge(session),
             sameSite: 'Lax'
         });
         res.setHeader('Set-Cookie', cookie);

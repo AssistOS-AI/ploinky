@@ -31,6 +31,7 @@ import {
     LOCAL_AUTH_COOKIE_NAME,
     normalizeRelativePath,
     parseCookies,
+    renewPersistentSsoCookie,
     sendJson,
     sessionTokenService,
     SSO_AUTH_COOKIE_NAME,
@@ -1089,6 +1090,11 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
             const { session: ssoSession, unavailable } = await admitSsoRequest(req, ssoCookie);
             if (unavailable) return respondAuthenticationUnavailable(req, res, parsedUrl);
             if (ssoSession) {
+                if (options.routePlan?.lease?.commit && options.routePlan.lease.commit() !== true) {
+                    sendJson(res, 503, { error: 'edge_generation_changed' });
+                    return { ok: false, error: 'edge_generation_changed' };
+                }
+                renewPersistentSsoCookie(req, res, ssoCookie, ssoSession);
                 req.user = ssoSession.user;
                 req.session = ssoSession;
                 req.sessionId = ssoCookie;
@@ -1163,13 +1169,17 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         appendLog('auth_session_invalid', { sessionId: '[redacted]', mode: authContext.mode });
         return respondUnauthenticated(req, res, parsedUrl, authContext, options);
     }
+    if (options.routePlan?.lease?.commit && options.routePlan.lease.commit() !== true) {
+        sendJson(res, 503, { error: 'edge_generation_changed' });
+        return { ok: false, error: 'edge_generation_changed' };
+    }
     req.user = session.user;
     req.session = session;
     req.sessionId = sessionId;
     req.authMode = authContext.mode;
     try {
         const cookie = buildCookie(cookieName, sessionId, req, '/', {
-            maxAge: authService.getSessionCookieMaxAge(),
+            maxAge: authService.getSessionCookieMaxAge(session),
             sameSite: 'Lax'
         });
         appendSetCookie(res, cookie);
