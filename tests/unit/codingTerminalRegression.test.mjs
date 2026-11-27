@@ -81,3 +81,19 @@ test('results wake the supervisor once per change and concurrent polling does no
     await courier.once();
     assert.equal(worker.length, 1, 'an older task must not be replayed');
 });
+
+
+test('relay disables color-scheme notifications on detach, disconnect and process exit', async () => {
+    for (const reason of ['detached', 'disconnected', 'exited', 'signal', 'reset']) {
+        const written = [];
+        const input = Object.assign(new EventEmitter(), { pause() {} });
+        const relay = new TerminalRelay({ input, output: { write: text => written.push(text) },
+            signals: new EventEmitter(), sessionId: 'session', viewId: 'view',
+            client: { json: async () => ({}) } });
+        relay.onData = () => {}; relay.onEnd = () => {}; relay.onSignal = () => {};
+        const completed = new Promise(resolve => { relay.resolve = resolve; });
+        relay.finish({ reason });
+        await completed;
+        assert.ok(written.join('').includes('\x1b[?2031l'), reason);
+    }
+});

@@ -1806,7 +1806,7 @@ export class WebttySessionManager {
         return true;
     }
 
-    // Called only after authenticated supervision registration has admitted both terminals.
+    // Called after an explicit coding-session launch or authenticated supervision registration.
     // A background worker has no viewer; keep its real detached state and normal lifetime limits.
     retainDetachedForSupervision(session) {
         if (this.sessions.get(session.id) !== session || session.closed || session.closing) {

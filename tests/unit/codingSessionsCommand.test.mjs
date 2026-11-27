@@ -201,7 +201,7 @@ test('mouse, focus and keyboard-protocol reports a detached agent left on never 
     menu.open();
     menu.close();
     assert.ok(written[0].startsWith(TERMINAL_INPUT_RESET) && written[1].startsWith(TERMINAL_INPUT_RESET));
-    for (const mode of ['1000', '1002', '1003', '1006', '1004', '2004']) assert.ok(TERMINAL_INPUT_RESET.includes(`\x1b[?${mode}l`), mode);
+    for (const mode of ['1000', '1002', '1003', '1006', '1004', '2031', '2004']) assert.ok(TERMINAL_INPUT_RESET.includes(`\x1b[?${mode}l`), mode);
     // A mouse moving over the menu changes nothing: the selection waits for a real key.
     menu.draw = () => {};
     const choice = menu.select({ title: [], items: [{ label: 'a' }, { label: 'b' }] });
