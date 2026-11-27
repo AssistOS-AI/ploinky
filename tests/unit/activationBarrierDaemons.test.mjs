@@ -130,3 +130,84 @@ test('the Watchdog defers a restart whose lease the activation barrier refuses',
     assert.equal(target.isRestarting, false);
     assert.ok(events.some((entry) => entry.event === 'container_restart_deferred_activation_recovery'));
 });
+
+// --- Delta review 2: R1 and R3 ------------------------------------------------
+
+function publicationRuntime(t, { createWorkspaceLease, reconcile = async () => {}, pollIntervalMs = 60_000 }) {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-q30-publication-r-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const audits = [];
+    const runtime = startCloudflarePublicationRuntime({
+        workspaceRoot: workspace,
+        statusFile: path.join(workspace, 'status.json'),
+        pollIntervalMs,
+        retryInitialDelayMs: 1,
+        retryMaximumDelayMs: 4,
+        loadActive: () => ({
+            selector: { generation: GENERATION, activationId: 'activation-retry', publicationState: 'reconciling' },
+            generation: { desired: { cloudflare: { tunnelId: 'fixture' }, hosts: {} } },
+        }),
+        createWorkspaceLease,
+        releaseWorkspaceLease: () => true,
+        routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
+        controllerFactory: () => ({ reconcile, getStatus: () => ({ state: 'fixture' }), stop: async () => {} }),
+        probeHostname: async () => ({ ok: true }),
+        audit: (event, value) => audits.push({ event, value }),
+    });
+    t.after(() => runtime.stop());
+    return { runtime, audits };
+}
+
+async function until(predicate, timeoutMs = 2_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+        if (Date.now() > deadline) return false;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return true;
+}
+
+test('R1: a retry whose lease fails unexpectedly is retried again and then publishes', async (t) => {
+    let leaseCalls = 0;
+    let reconciliations = 0;
+    const { audits } = publicationRuntime(t, {
+        // The scan's lease succeeds; the first retry's lease hits a transient EIO.
+        createWorkspaceLease: () => {
+            leaseCalls += 1;
+            if (leaseCalls === 2) throw Object.assign(new Error('transient lease read failure'), { code: 'EIO' });
+            return { token: `lease-${leaseCalls}`, operation: 'cloudflare-publication:activation-retry' };
+        },
+        reconcile: async () => {
+            reconciliations += 1;
+            if (reconciliations === 1) throw Object.assign(new Error('publication failed once'), { code: 'CLOUDFLARE_API' });
+        },
+    });
+    assert.equal(await until(() => reconciliations >= 2), true, 'the stalled retry was rescheduled and published');
+    assert.ok(leaseCalls >= 3);
+    assert.ok(audits.some((entry) => entry.event === 'cloudflare-workspace-lease-error' && entry.value.code === 'EIO'));
+});
+
+test('R3: a persistent scan error is audited once, not on every poll', async (t) => {
+    const { audits } = publicationRuntime(t, {
+        createWorkspaceLease: () => { throw Object.assign(new Error('lease store unreadable'), { code: 'EACCES' }); },
+        pollIntervalMs: 100,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    const failures = audits.filter((entry) => entry.event === 'cloudflare-publication-scan-failed');
+    assert.equal(failures.length, 1, `audited ${failures.length} times`);
+});
+
+test('R3: a barrier deferral is audited again after an intervening busy lease', async (t) => {
+    const outcomes = ['refused', 'busy', 'refused'];
+    const { runtime, audits } = publicationRuntime(t, {
+        createWorkspaceLease: () => {
+            const outcome = outcomes.shift() || 'refused';
+            if (outcome === 'busy') throw Object.assign(new Error('busy'), { code: 'PLOINKY_WORKSPACE_MUTATION_BUSY' });
+            throw refusal();
+        },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await runtime.scan();
+    await runtime.scan();
+    assert.equal(audits.filter((entry) => entry.event === 'cloudflare-workspace-lease-deferred').length, 2);
+});

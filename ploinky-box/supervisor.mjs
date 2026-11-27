@@ -153,6 +153,7 @@ import {
     ACTIVATION_CONTEXT_ENV,
     ACTIVATION_CONTEXT_SCHEMA,
     ACTIVATION_RECORD_VERSION,
+    activationMarkerPath,
     buildActivationBarrierMarker,
     parseActivationContext,
     readActivationBarrierMarker,
@@ -2233,7 +2234,8 @@ export function createBoxSupervisor({
     }
 
     // After an admitted settle restart: remove the barrier it settled, only
-    // if it is still that barrier (the in-Box commit removed the marker).
+    // if it is still that barrier. A marker still present (its in-Box
+    // removal failed) is removed through the Box first.
     // The host record goes only once no in-Box guard is left: while the record
     // stays, `ploinky stop` can still unlink the marker. No marker may outlive
     // every host-side remover.
@@ -2341,9 +2343,13 @@ export function createBoxSupervisor({
     function unreadableBarrierRefusal(identity, error) {
         const recordFile = path.join(identity.hostStateRoot || path.join(identity.workspaceRoot, '.ploinky-box'),
             'update-recovery', `${identity.instance}.json`);
+        // The in-Box guard path is resolved here so the operator removes both:
+        // a record removed alone would leave a marker no host step clears.
+        const markerFile = activationMarkerPath(identity.workspaceRoot);
         const refusal = new PloinkyBoxError(
             `The workspace's activation recovery record could not be read (${error?.message || error}); no new mutation was `
-            + `started. \`ploinky stop\` does not clear an unreadable record: repair or remove ${recordFile} by hand, then run the `
+            + 'started. `ploinky stop` does not clear an unreadable record. Run `ploinky stop` first (or confirm the Box is '
+            + `stopped), then repair or remove ${recordFile} and, if present, ${markerFile} by hand, and run the `
             + `command again. [${ACTIVATION_RECOVERY_CODE}]`,
             { code: ACTIVATION_RECOVERY_CODE },
         );

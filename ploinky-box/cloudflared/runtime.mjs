@@ -668,7 +668,12 @@ export function startCloudflarePublicationRuntime({
             leaseDeferral = '';
             return lease;
         } catch (error) {
-            if (error?.code === 'PLOINKY_WORKSPACE_MUTATION_BUSY') return null;
+            if (error?.code === 'PLOINKY_WORKSPACE_MUTATION_BUSY') {
+                // A busy lease ends a barrier deferral episode, so a barrier
+                // seen again afterwards is audited again.
+                leaseDeferral = '';
+                return null;
+            }
             if (error?.code === 'PLOINKY_ACTIVATION_RECOVERY_REQUIRED') {
                 if (leaseDeferral !== error.code) {
                     leaseDeferral = error.code;
@@ -682,18 +687,28 @@ export function startCloudflarePublicationRuntime({
 
     // The polling loop never lets a scan or retry failure escape: in the
     // Router an unhandled rejection is a crash, and the Watchdog stops
-    // restarting a Router that keeps crashing.
-    function runGuarded(task, label) {
-        return Promise.resolve().then(task).catch((error) => {
+    // restarting a Router that keeps crashing. A scan failure that repeats
+    // unchanged on every poll is audited once, until a scan completes.
+    let lastScanFailure = '';
+    function runGuarded(task, label, { dedupe = false } = {}) {
+        return Promise.resolve().then(task).then(() => {
+            if (dedupe) lastScanFailure = '';
+        }, (error) => {
             try {
-                audit(label, {
+                const entry = {
                     code: error?.code || 'CLOUDFLARE_PUBLICATION_ERROR',
                     message: String(error?.message || error).slice(0, 1024),
-                });
+                };
+                if (dedupe) {
+                    const key = `${entry.code}:${entry.message}`;
+                    if (key === lastScanFailure) return;
+                    lastScanFailure = key;
+                }
+                audit(label, entry);
             } catch (_) {}
         });
     }
-    const runScan = () => runGuarded(() => scan(), 'cloudflare-publication-scan-failed');
+    const runScan = () => runGuarded(() => scan(), 'cloudflare-publication-scan-failed', { dedupe: true });
 
     function releasePublicationLease(lease) {
         return releaseExactPublicationLease(lease, {
@@ -754,7 +769,21 @@ export function startCloudflarePublicationRuntime({
                     return;
                 }
             }
-            const workspaceLease = acquirePublicationLease(activationId);
+            // The scan fast path skips a handled activation, so a retry that
+            // ends without rescheduling would stall publication for good. An
+            // unexpected lease failure backs off and tries again.
+            let workspaceLease;
+            try {
+                workspaceLease = acquirePublicationLease(activationId);
+            } catch (error) {
+                audit('cloudflare-workspace-lease-error', {
+                    operation: `cloudflare-publication:${activationId}`,
+                    code: error?.code || 'PLOINKY_WORKSPACE_LEASE_ERROR',
+                    message: String(error?.message || error).slice(0, 1024),
+                });
+                scheduleRetry({ activationId, input: retry.input, attempt: attempt + 1 });
+                return;
+            }
             if (!workspaceLease) {
                 scheduleRetry({ activationId, input: retry.input, attempt });
                 return;

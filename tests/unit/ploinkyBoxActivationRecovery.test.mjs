@@ -1203,3 +1203,15 @@ test('the unreadable-record refusal names the record file to repair', async (t) 
         return true;
     });
 });
+
+test('R2: the unreadable-record refusal says to stop first and to remove the marker with the record', async (t) => {
+    const backing = createMemoryUpdateHostState();
+    const store = { ...backing, read(kind, name) { if (kind === 'update-recovery') throw new Error('corrupt'); return backing.read(kind, name); } };
+    const fixture = world(t, { store });
+    await assert.rejects(fixture.supervisor.prepareBoxForCommand(), (error) => {
+        assert.match(error.message, /Run `ploinky stop` first/);
+        assert.match(error.message, /\.ploinky\/data\/edge-routing\/activation-barrier\.json/);
+        assert.ok(error.message.indexOf('ploinky stop') < error.message.indexOf('update-recovery'), 'stop comes before the removal');
+        return true;
+    });
+});
