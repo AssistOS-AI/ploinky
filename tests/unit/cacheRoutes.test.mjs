@@ -268,7 +268,7 @@ test('the operator clear command and the cache button share the same in-flight h
         const res = response();
         await handleCacheRoutes(req, res, url, {
             routePlan: { snapshot, lease }, ensureAdmin, verifyMutation: verifyAdminMutationRequest, readBody: () => body,
-            listConfigured: generation => configuredCacheHosts(generation, { dataDir }),
+            planRequest: () => ({ ok: false }), listConfigured: generation => configuredCacheHosts(generation, { dataDir }),
             setApplication: (agent, value, options) => setCacheApplication(agent, value, { ...options, dataDir }), purge,
         });
         return res;
@@ -314,7 +314,7 @@ test('an unreadable purge configuration never blocks the switch: set writes firs
         const res = response();
         await handleCacheRoutes({ user: admin, proof: true, method: body === undefined ? 'GET' : 'POST', body }, res, url, {
             routePlan: { snapshot, lease }, ensureAdmin, verifyMutation: req => ({ ok: req.proof === true }), readBody: req => req.body,
-            listConfigured: generation => configuredCacheHosts(generation, { dataDir }),
+            listConfigured: generation => configuredCacheHosts(generation, { dataDir }), planRequest: () => ({ ok: false }),
             readSettings: () => readCacheSettings({ dataDir }), lastPurge: () => null,
             setApplication: (ref, value, options) => setCacheApplication(ref, value, { ...options, dataDir }),
             purge: () => assert.fail('an unreadable purge configuration has no host to purge'),
@@ -511,7 +511,14 @@ test('route accepts only what the manifest marks allow and answers each refusal 
     assert.deepEqual(f.read().routes[site]['/site/page'].entry, { access: 'public', manifest: 'page' });
     assert.equal((await f.request(route('page', '/site/static/*'))).status, 200);
     assert.deepEqual(f.read().routes[site]['/site/static/*'].entry, { access: 'public', manifest: null });
+    // Off needs a class to switch off: a route that is already off is refused.
+    await refuse(route('off', '/site/page'), 400, 'route_uncached');
     assert.equal((await f.request(route('page', portBase + '/info'))).status, 200);
+    // An administrator page is a class too: off replaces that choice.
+    const replaced = await f.request(route('off', '/site/static/*'));
+    assert.equal(replaced.status, 200);
+    assert.deepEqual([row(replaced.body.application, '/site/static/*').setting.setting, row(replaced.body.application, '/site/static/*').effective],
+        ['off', null]);
     await refuse(route('off', '/site/static/*'), 400, 'route_uncached');
 });
 

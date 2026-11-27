@@ -176,7 +176,7 @@ export async function handleCacheRoutes(req, res, parsedUrl, {
                 const row = overlay.entries.find(entry => entry.path === body.path);
                 if (!row) return send(404, { error: 'unknown_route' });
                 if (row.mark === 'never' || row.neverBy !== null) return send(400, { error: 'route_never' });
-                if (body.setting === 'off' && row.mark === null) return send(400, { error: 'route_uncached' });
+                if (body.setting === 'off' && row.effective === null) return send(400, { error: 'route_uncached' });
                 if (body.setting === 'page') {
                     if (row.mark !== null) return send(400, { error: 'route_marked' });
                     if (!overlay.hasNever || row.publicProtocol) return send(400, { error: 'route_not_choosable' });
