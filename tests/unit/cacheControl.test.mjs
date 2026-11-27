@@ -6,8 +6,9 @@ import test from 'node:test';
 import { createCloudflarePublicationApi } from '../../ploinky-box/cloudflared/cloudflareApi.mjs';
 import { cachePublishedHosts, configureCachePurge, configuredCacheHosts } from '../../cli/server/cdn/cachePurgeConfig.js';
 import { purgeCacheHost, readLastPurge } from '../../cli/server/cdn/cachePurge.js';
+import { applicationCacheState } from '../../cli/server/cdn/cacheSettings.js';
 import { isApplicationHeld, markedApplications, changeCacheHold, probeCacheOrigin } from '../../cli/server/cdn/cacheHold.js';
-import { readCacheSettings, setCacheApplication, setCacheHold } from '../../cli/server/cdn/cacheSettingsStore.js';
+import { readCacheSettings, setCacheApplication, setCacheHold, setCacheRoute } from '../../cli/server/cdn/cacheSettingsStore.js';
 
 const dir = new URL('../../', import.meta.url);
 const agent = 'sample/publisher';
@@ -163,6 +164,7 @@ test('Router records acknowledged purges, local overlaps, upstream limits and un
 test('hold persists before purging all hosts, requires a marked public origin 200, and release purges before clearing', async t => {
     const { dataDir, params, config, generation } = fixture(t);
     const events = [];
+    const since = new Date().toISOString();
     const opts = { dataDir, withConfigLock: callback => callback(), async purge({ host: name, assertCurrent }) {
         assertCurrent();
         assert.ok(readCacheSettings({ dataDir }).held[agent]);
@@ -198,8 +200,12 @@ test('hold persists before purging all hosts, requires a marked public origin 20
     assert.ok(isApplicationHeld(agent, snapshot));
     assert.equal((await hold({ probe: () => false })).success, false);
     assert.equal((await hold({ planRequest: () => ({ ok: false }) })).success, false);
-    const unmarked = { ...opts.planRequest({ req: { url: '/info/' } }), responsePolicy: {} };
-    assert.equal((await hold({ planRequest: () => unmarked, probe: () => assert.fail('unmarked page') })).success, false);
+    // The probe follows the effective class: a page the administrator switched off is not probed.
+    const off = { setting: 'off', at: since, by: 'operator', entry: { access: 'public', manifest: 'page' } };
+    await setCacheRoute(agent, policyPath, off, { dataDir });
+    const skipped = await hold({ probe: () => assert.fail('switched-off page') });
+    assert.equal(skipped.probeSkipped, 'no_page_marks');
+    await setCacheRoute(agent, policyPath, null, { dataDir });
     for (const op of [hold, release]) {
         assert.equal((await op({ purge: async ({ host }) => ({ host, outcome: 'cooldown' }),
             probe: () => assert.fail('unexpected probe') })).success, false);
@@ -280,4 +286,121 @@ test('probe uses only the local public listener and requires a successful no-sto
             return req;
         }), expected);
     }
+});
+
+const choice = (setting, manifest) => ({ setting, at: '2026-11-27T10:00:00.000Z', by: 'admin', entry: { access: 'public', manifest } });
+
+test('route choices are written one at a time, kept by other writes, and removing a missing one writes nothing', async t => {
+    const { dataDir } = fixture(t);
+    const opts = { dataDir };
+    const file = path.join(dataDir, 'cache-settings.json');
+    const first = await setCacheRoute(agent, '/sample/a', null, opts);
+    assert.equal(first.changed, false);
+    assert.equal(fs.existsSync(file), false, 'removing a missing choice must not create the file');
+    await Promise.all([
+        setCacheRoute(agent, '/sample/a', choice('off', 'page'), opts),
+        setCacheRoute(agent, '/sample/b/*', choice('page', null), opts),
+        setCacheRoute('other/app', '/sample/a', choice('off', 'immutable'), opts),
+        setCacheApplication(agent, { enabled: true, pageSeconds: 60 }, opts),
+    ]);
+    const stored = readCacheSettings(opts);
+    assert.equal(stored.version, 1);
+    assert.deepEqual(Object.keys(stored.routes[agent]).sort(), ['/sample/a', '/sample/b/*']);
+    assert.deepEqual(stored.routes['other/app']['/sample/a'].entry, { access: 'public', manifest: 'immutable' });
+    assert.equal(stored.applications[agent].enabled, true);
+    assert.ok(Object.isFrozen(stored.routes[agent]['/sample/a'].entry));
+    // The write reports the exact content it started from and the record it replaced.
+    const replaced = await setCacheRoute(agent, '/sample/a', choice('page', null), opts);
+    assert.equal(replaced.previous.setting, 'off');
+    assert.equal(replaced.before.routes[agent]['/sample/a'].setting, 'off');
+    assert.equal(replaced.settings.routes[agent]['/sample/a'].setting, 'page');
+    await setCacheRoute(agent, '/sample/a', null, opts);
+    await setCacheRoute(agent, '/sample/b/*', null, opts);
+    assert.equal(readCacheSettings(opts).routes[agent], undefined);
+    await setCacheRoute('other/app', '/sample/a', null, opts);
+    assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(file, 'utf8')), 'routes'), false, 'an empty routes key is dropped');
+    assert.equal(readCacheSettings(opts).applications[agent].pageSeconds, 60);
+    for (const [route, record] of [['sample/a', choice('off', 'page')], ['/' + 'x'.repeat(512), choice('off', 'page')],
+        ['/a\n', choice('off', 'page')], ['/a', choice('immutable', 'page')], ['/a', choice('off', 'never')],
+        ['/a', choice('off', undefined)], ['/a', { ...choice('off', 'page'), extra: 1 }],
+        ['/a', { ...choice('off', 'page'), at: 'yesterday' }], ['/a', { ...choice('off', 'page'), by: ' ' }],
+        ['/a', { ...choice('off', 'page'), entry: { access: 'guest', manifest: 'page' } }],
+        ['/a', { ...choice('off', 'page'), entry: { access: 'public', manifest: 'page', extra: 1 } }]]) {
+        await assert.rejects(setCacheRoute(agent, route, record, opts), /invalid_request/, route);
+    }
+    await assert.rejects(setCacheRoute('bad agent', '/a', choice('off', 'page'), opts), /invalid_request/);
+    await assert.rejects(setCacheRoute(agent, '/a', choice('off', 'page'), { ...opts, assertCurrent() { throw new Error('stale'); } }), /stale/);
+    assert.equal(readCacheSettings(opts).routes, undefined);
+});
+
+test('malformed route choices turn every application off', async t => {
+    const { dataDir } = fixture(t);
+    const file = path.join(dataDir, 'cache-settings.json');
+    const good = choice('page', null);
+    const application = { enabled: true, pageSeconds: 60 };
+    const warnings = t.mock.method(console, 'warn', () => {});
+    const settingsWith = routes => ({ version: 1, applications: { [agent]: application }, held: {}, routes });
+    fs.writeFileSync(file, JSON.stringify(settingsWith({ [agent]: { '/sample/a': good } })));
+    assert.equal(readCacheSettings({ dataDir }).routes[agent]['/sample/a'].setting, 'page');
+    assert.deepEqual(applicationCacheState(agent, readCacheSettings({ dataDir }), {}), { enabled: true, pageSeconds: 60, held: false });
+    for (const routes of [[], 'x', null, { 'bad agent': {} }, { [agent]: [] }, { [agent]: { 'no-slash': good } },
+        { [agent]: { ['/' + 'x'.repeat(512)]: good } }, { [agent]: { '/sample/a': { ...good, setting: 'immutable' } } },
+        { [agent]: { '/sample/a': { ...good, entry: { access: 'public', manifest: 'never' } } } },
+        { [agent]: { '/sample/a': { ...good, entry: { access: 'public' } } } },
+        { [agent]: { '/sample/a': { ...good, at: 'now' } } }, { [agent]: { '/sample/a': { ...good, by: '' } } },
+        { [agent]: { '/sample/a': { ...good, extra: true } } }, { [agent]: { '/sample/a': 'page' } }]) {
+        fs.writeFileSync(file, JSON.stringify(settingsWith(routes)));
+        const read = readCacheSettings({ dataDir });
+        assert.deepEqual(read.applications, {}, JSON.stringify(routes));
+        assert.equal(applicationCacheState(agent, read, {}).enabled, false);
+        await assert.rejects(setCacheRoute(agent, '/sample/b', good, { dataDir }), /cache_settings_unreadable/);
+    }
+    assert.ok(warnings.mock.callCount() >= 1);
+});
+
+test('hold derives its probe from effective page routes, administrator choices included, and skips when there is none', async t => {
+    const { dataDir, params, config, generation } = fixture(t);
+    const base = '/base-agent-additional-server/web/9123';
+    // A generation's manifests never change in place: every edit below is a new manifest object.
+    let routes = {};
+    const edit = change => {
+        routes = change({ ...routes });
+        generation.manifests.web = { routerAccess: { httpRoutes: routes } };
+    };
+    edit(() => ({ [base + '/static/*']: { access: 'public' }, [base + '/exact']: { access: 'public' },
+        [base + '/version/*']: { access: 'public', cache: 'immutable' } }));
+    config();
+    const probed = [];
+    const opts = { dataDir, withConfigLock: fn => fn(), purge: ({ host: name }) => ({ host: name, outcome: 'accepted' }),
+        planRequest: ({ req }) => ({ ok: true, kind: 'agent-port', routeKey: 'web', access: { access: 'public' },
+            canonicalPath: base + req.url, responsePolicy: { cacheClass: null } }),
+        probe: async target => { probed.push(target); return true; } };
+    const hold = () => changeCacheHold({ ...params, op: 'hold' }, opts);
+    const choose = record => setCacheRoute(agent, base + '/static/*', record, { dataDir });
+    const page = { setting: 'page', at: new Date().toISOString(), by: 'admin', entry: { access: 'public', manifest: null } };
+    // A route the manifest left unmarked and no administrator chose is not a page: nothing to probe.
+    assert.equal((await hold()).probeSkipped, 'no_page_marks');
+    // The choice is stale without a never mark in the manifest.
+    await choose(page);
+    assert.equal((await hold()).probeSkipped, 'no_page_marks');
+    edit(current => ({ ...current, [base + '/never/*']: { access: 'public', cache: 'never' } }));
+    assert.deepEqual((await hold()), { success: true, purges: [{ host, outcome: 'accepted' }] });
+    assert.deepEqual(probed, [{ host, path: '/static/', publicPort: 8080 }]);
+    // An exact unmarked entry shadows the wildcard at the probed path: that choice is not served as a page.
+    edit(current => ({ ...current, [base + '/static/']: { access: 'public' } }));
+    assert.equal((await hold()).success, false);
+    assert.equal(probed.length, 1);
+    edit(({ [base + '/static/']: _, ...current }) => current);
+    // The administrator switching a manifest page off removes it from the probes.
+    await choose(null);
+    edit(current => ({ ...current, [base + '/exact']: { access: 'public', cache: 'page' } }));
+    assert.equal((await hold()).success, true);
+    assert.equal(probed.length, 2);
+    await setCacheRoute(agent, base + '/exact', { ...page, setting: 'off', entry: { access: 'public', manifest: 'page' } }, { dataDir });
+    assert.equal((await hold()).probeSkipped, 'no_page_marks');
+    assert.equal(probed.length, 2);
+    // Applications listed only by a never mark can be held.
+    edit(() => ({ [base + '/never/*']: { access: 'public', cache: 'never' } }));
+    assert.deepEqual(markedApplications(generation), [{ agent, routes: [] }]);
+    assert.equal((await hold()).probeSkipped, 'no_page_marks');
 });

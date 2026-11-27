@@ -1,5 +1,5 @@
 import { publicProtocolCorsAllowHeaders } from '../policy/PublicProtocolPolicy.js';
-import { getApplicationCacheState } from '../cdn/cacheSettings.js';
+import { getRouteCacheState } from '../cdn/cacheSettings.js';
 import { decideAgentAnswer } from '../cdn/cdnCachePolicy.js';
 import { markCdnDecision } from '../cdn/cdnResponseHook.js';
 import { HOP_BY_HOP, isRouterCookie, ROUTER_HEADERS } from './sanitizeRequestHeaders.js';
@@ -139,14 +139,13 @@ export function sanitizeResponseHeaders(headers, plan) {
 export function writeAgentResponseHead(res, upstreamRes, { headers, status, plan, method, access }) {
     if (access === 'public') {
         const policy = plan?.responsePolicy;
-        const route = plan?.route;
+        // The class comes from the manifest marks and the administrator's route
+        // settings together, so the plan's manifest-only class is not consulted.
         // A plan admitted before a generation change can finish serving the
         // client, but it cannot populate a shared cache for its successor.
-        const application = policy?.cacheClass && route?.repo && route?.agent && plan.lease?.isCurrent?.() === true
-            ? getApplicationCacheState(`${route.repo}/${route.agent}`, plan.snapshot)
-            : undefined;
+        const { cacheClass, application } = getRouteCacheState(plan, access);
         const decision = decideAgentAnswer({
-            access, cacheClass: policy?.cacheClass, application, method,
+            access, cacheClass, application, method,
             requestHasCredential: policy?.requestHasCredential,
             status: upstreamRes.statusCode,
             // Include discarded upstream cookies and the final Vary for CORS.
