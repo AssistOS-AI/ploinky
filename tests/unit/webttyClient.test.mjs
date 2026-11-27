@@ -35,6 +35,7 @@ function createHarness({
     deferredAnimationFrames = false,
     deferredTimers = false,
 } = {}) {
+    const clipboardWrites = [];
     const requests = [];
     const sources = [];
     const windowListeners = new Map();
@@ -73,6 +74,8 @@ function createHarness({
     class FakeTerminal {
         constructor(options) {
             this.options = options;
+            this.oscHandlers = new Map();
+            this.parser = { registerOscHandler: (code, handler) => { this.oscHandlers.set(code, handler); } };
             this.cols = initialCols;
             this.rows = initialRows;
             FakeTerminal.instance = this;
@@ -81,6 +84,8 @@ function createHarness({
         open(target) { this.target = target; }
         focus() { this.focused = true; }
         onData(listener) { this.dataListener = listener; }
+        attachCustomKeyEventHandler(handler) { this.keyHandler = handler; }
+        getSelection() { return this.selection || ''; }
         write(data) { this.output = `${this.output || ''}${data}`; }
         reset() { this.resets = (this.resets || 0) + 1; this.output = ''; }
         emitData(data) { this.dataListener(data); }
@@ -194,6 +199,9 @@ function createHarness({
         fetch,
         URLSearchParams,
         TextEncoder,
+        TextDecoder,
+        atob,
+        navigator: { clipboard: { writeText: async text => { clipboardWrites.push(text); } } },
         Date: { now: () => clock },
         encodeURIComponent,
         queueMicrotask,
@@ -219,6 +227,7 @@ function createHarness({
                 callback();
             }
         },
+        clipboardWrites,
         bodyClasses,
         runRecoveryTimer() {
             const entry = [...timers.entries()].find(([, value]) => value.delay > 100);
@@ -993,7 +1002,7 @@ test('A9: an embedded page announces its view only to its parent origin after at
         targetOrigin: 'https://app.example.test',
     }]);
     assert.equal(harness.stored.size, 0, 'embedded pages remember nothing');
-    assert.equal(harness.elements.get('profile').textContent, 'Profile: Robot <A>');
+    assert.equal(harness.elements.get('profile').textContent, 'Robot: Robot <A>');
     assert.equal(harness.elements.get('profile').hidden, false);
     // The page has no policy control, so nothing re-announces or changes the policy.
     harness.windowListeners.get('pagehide')();
@@ -1181,4 +1190,24 @@ test('A9-S: the remembered value is exactly {sessionId, viewId} after an attach 
     assert.doesNotMatch(value, new RegExp(token));
     // A plain attach handoff (Live Sessions attach or pop-out) never claims anything.
     assert.deepEqual(Object.keys(JSON.parse(harness.requests[0].options.body)).sort(), ['attach', 'cols', 'rows']);
+});
+
+test('copy shortcuts preserve Ctrl+C and OSC 52 never answers clipboard reads', () => {
+    const harness = createHarness();
+    harness.windowRef.isSecureContext = true;
+    const terminal = harness.terminal;
+    terminal.selection = 'selected text';
+    let prevented = 0;
+    const key = { type: 'keydown', ctrlKey: true, shiftKey: false, altKey: false, metaKey: false,
+        key: 'c', preventDefault: () => prevented++ };
+    assert.equal(terminal.keyHandler(key), true, 'plain Ctrl+C reaches the terminal');
+    assert.equal(terminal.keyHandler({ ...key, shiftKey: true }), false);
+    assert.equal(prevented, 1);
+    assert.deepEqual(harness.clipboardWrites, ['selected text']);
+    assert.equal(terminal.keyHandler({ ...key, key: 'v', shiftKey: true }), false);
+    const osc = terminal.oscHandlers.get(52);
+    assert.equal(osc('c;?'), true);
+    assert.deepEqual(harness.clipboardWrites, ['selected text']);
+    assert.equal(osc(`c;${Buffer.from('copied ✓').toString('base64')}`), true);
+    assert.deepEqual(harness.clipboardWrites, ['selected text', 'copied ✓']);
 });

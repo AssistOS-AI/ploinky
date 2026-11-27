@@ -152,7 +152,7 @@
 
     function showProfile(label) {
         if (!profileElement) return;
-        profileElement.textContent = label ? `Profile: ${label}` : '';
+        profileElement.textContent = label ? `Robot: ${label}` : '';
         profileElement.hidden = !label;
     }
 
