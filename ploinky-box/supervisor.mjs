@@ -150,6 +150,26 @@ import { listUnresolvedAdmissions, runJournaledAdmission } from './update/admiss
 import { createUpdateHostState } from './update/hostState.mjs';
 import { IN_BOX_NONCE_PROBE_SCRIPT, IN_BOX_OPERATION_WRITERS_PROBE_SCRIPT, runUpdateExec } from './update/coreRunner.mjs';
 import {
+    ACTIVATION_CONTEXT_ENV,
+    ACTIVATION_CONTEXT_SCHEMA,
+    ACTIVATION_RECORD_VERSION,
+    buildActivationBarrierMarker,
+    parseActivationContext,
+    shortId,
+} from '../cli/sandbox/activationRecords.mjs';
+import { sameSelectorIdentity } from '../cli/sandbox/edgeSelectorRecord.mjs';
+import {
+    STOPPED_BOX_STATUSES,
+    baselineFromEvidence,
+    classifyFailedActivation,
+    postStopSelectorBound,
+    proveBoxStopped,
+    readActivationEvidence,
+    removeActivationBarrierMarkerThroughBox,
+    unlinkActivationBarrierMarkerOnHost,
+    writeActivationBarrierMarkerThroughBox,
+} from './activationRecovery.mjs';
+import {
     UPDATE_REPORT_CONTEXT_ENV,
     UPDATE_REPORT_NONCE_ENV,
     createOperationRecord,
@@ -157,6 +177,7 @@ import {
     decideUpdateStatus,
     readUpdateReport,
     removeUpdateReport,
+    sanitizeReason,
 } from '../cli/commands/updateOutcome.js';
 import { commandErrorRecord } from '../cli/commands/updateRecords.js';
 import { UpdateCancelledError, createUpdateCancellation } from '../cli/commands/updateCancellation.js';
@@ -340,8 +361,6 @@ function revalidateMountedAgentLibSource(selection, context) {
 const NO_WAIT_WORKER_SCRIPT = '/opt/ploinky/cli/commands/noWaitWorker.js';
 const NO_WAIT_SETTLE_TIMEOUT_MS = 31 * 60 * 1000;
 const NO_WAIT_POLL_MS = 5000;
-// Engine statuses that name a stopped Box container (no process can run).
-const STOPPED_BOX_STATUSES = new Set(['exited', 'stopped', 'created', 'configured', 'initialized', 'dead']);
 
 export function createBoxSupervisor({
     runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
@@ -4515,6 +4534,15 @@ function boundedCoreEnvironment(
     ];
 }
 
+// The host-issued activation context (Q30) travels next to the operation
+// marker; the in-Box command reads and removes it at entry.
+function activationContextEnvironment(activationContext) {
+    if (!activationContext) return [];
+    const value = JSON.stringify(activationContext);
+    parseActivationContext(value);
+    return ['--env', `${ACTIVATION_CONTEXT_ENV}=${value}`];
+}
+
 export async function runBoundedCoreCommand(
     engine,
     containerId,
@@ -4531,6 +4559,7 @@ export async function runBoundedCoreCommand(
         agentLib = null,
         updateExcludedRepoPath = '',
         skillScopeEnv = {},
+        activationContext = null,
     } = {},
 ) {
     const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
@@ -4550,6 +4579,7 @@ export async function runBoundedCoreCommand(
             skillScopeEnv,
             diagnosticColorEnabled({ stream: stdout }),
         ),
+        ...activationContextEnvironment(activationContext),
         '--user', 'podman',
         ...boxWorkspaceExecOptions(workspaceRoot),
         containerId,
@@ -4681,6 +4711,7 @@ export async function runBoundedRestartCommand(
         agentLib = null,
         skillScopeEnv = {},
         operationId,
+        activationContext = null,
         env = buildEngineProcessEnvironment(),
         runnerOptions = {},
     } = {},
@@ -4699,6 +4730,7 @@ export async function runBoundedRestartCommand(
     const args = [
         ...boundedCoreEnvironment(hostPort, mediaHostPort, agentLib, normalizedHostReachableIpv4, '', skillScopeEnv, diagnosticColorEnabled({ stream: stdout })),
         '--env', marker,
+        ...activationContextEnvironment(activationContext),
         '--user', 'podman',
         ...boxWorkspaceExecOptions(workspaceRoot),
         containerId,
@@ -4750,21 +4782,102 @@ export async function runBoundedCoreStart(
         runner,
         { workspaceRoot, stdout, stderr, timeoutMs, hostReachableIpv4, agentLib, skillScopeEnv },
     );
-    // Core reports the Box public authority: loopback for loopback and
-    // wildcard bindings, or the selected address for a specific binding.
+    assertStartReportedRouter(String(result.stdout || '').split(/\r?\n/), hostPort, routerBinding);
+    return result.status;
+}
+
+const INTERNAL_ROUTER_LINE = '[start] Router: http://127.0.0.1:8080';
+
+// Core reports the Box public authority: loopback for loopback and wildcard
+// bindings, or the selected address for a specific binding.
+function startRouterLine(hostPort, routerBinding) {
     const authority = routerBinding?.address
         ? routerBindingPublicAuthority({ address: routerBinding.address, hostPort: Number(hostPort) })
         : `127.0.0.1:${hostPort}`;
-    const externalRouter = `http://${authority}`;
-    const outputLines = String(result.stdout || '').split(/\r?\n/);
-    if (!outputLines.includes(`[start] Router: ${externalRouter}`)) {
-        throw supervisorError(`In-box start did not report the public Router URL ${externalRouter}`);
+    return Object.freeze({ url: `http://${authority}`, line: `[start] Router: http://${authority}` });
+}
+
+function assertStartReportedRouter(lines, hostPort, routerBinding) {
+    const expected = startRouterLine(hostPort, routerBinding);
+    if (!lines.includes(expected.line)) {
+        throw supervisorError(`In-box start did not report the public Router URL ${expected.url}`);
     }
-    if (Number(hostPort) !== 8080
-        && outputLines.includes('[start] Router: http://127.0.0.1:8080')) {
+    if (Number(hostPort) !== 8080 && lines.includes(INTERNAL_ROUTER_LINE)) {
         throw supervisorError('In-box start advertised its internal-only Router URL');
     }
-    return result.status;
+}
+
+/**
+ * The in-Box start of a host start (Q30), under the bounded discipline of a
+ * graph restart: an operation marker, finite TERM -> KILL escalation and an
+ * engine proof that its writers stopped. It returns every end with its cause
+ * and quiescence; the Router report line is matched on the whole stdout, not
+ * only the bounded tail. A clean exit that did not report the public Router
+ * URL throws.
+ */
+export async function runBoundedActivationStart(
+    engine,
+    containerId,
+    coreArgv,
+    hostPort,
+    mediaHostPort,
+    runner,
+    {
+        workspaceRoot,
+        stdout = process.stdout,
+        stderr = process.stderr,
+        hostReachableIpv4 = '',
+        agentLib = null,
+        skillScopeEnv = {},
+        routerBinding = null,
+        operationId,
+        activationContext = null,
+        env = buildEngineProcessEnvironment(),
+        runnerOptions = {},
+    } = {},
+) {
+    if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
+        throw supervisorError('Bounded core start requires normalized start argv');
+    }
+    if (!/^[0-9a-f]{32}$/.test(String(operationId || ''))) {
+        throw supervisorError('The activation start runner requires an operation id', 'PLOINKY_BOX_UPDATE_REPORT_INVALID');
+    }
+    const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
+    if (normalizedHostReachableIpv4 && !isUsableHostIpv4(normalizedHostReachableIpv4)) {
+        throw supervisorError(
+            `${HOST_REACHABLE_IPV4_ENV} must be a usable canonical literal IPv4 address`,
+            'PLOINKY_BOX_HOST_REACHABLE_IPV4_INVALID',
+        );
+    }
+    const marker = `${UPDATE_OPERATION_ENV}=${operationId}`;
+    const args = [
+        ...boundedCoreEnvironment(hostPort, mediaHostPort, agentLib, normalizedHostReachableIpv4, '', skillScopeEnv, diagnosticColorEnabled({ stream: stdout })),
+        '--env', marker,
+        ...activationContextEnvironment(activationContext),
+        '--user', 'podman',
+        ...boxWorkspaceExecOptions(workspaceRoot),
+        containerId,
+        '/opt/ploinky/bin/ploinky-local',
+        ...coreArgv,
+    ];
+    const run = await runUpdateExec({
+        command: engine.name,
+        args,
+        env,
+        nonce: operationId,
+        stdout,
+        stderr,
+        probe: () => probeInBoxUpdateProcesses(engine, containerId, runner, operationId, { marker }),
+        killInBox: (pids, signal) => runner.query(engine.name, [
+            'container', 'exec', '--user', 'podman', containerId, 'kill', `-${signal}`, ...pids.map(String),
+        ]),
+        lineMatchers: [startRouterLine(hostPort, routerBinding).line, INTERNAL_ROUTER_LINE],
+        ...runnerOptions,
+    });
+    if (run.cause === 'exited' && run.status === 0 && !run.signal && run.quiescence?.state === 'confirmed') {
+        assertStartReportedRouter(run.matchedLines || [], hostPort, routerBinding);
+    }
+    return run;
 }
 
 export function checkBoxHealth(hostPort, {

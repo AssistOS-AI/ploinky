@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 
 import { sanitizeReason } from '../../cli/commands/updateOutcome.js';
 
@@ -31,6 +32,46 @@ function appendTail(tail, chunk, limit) {
 
 const delay = (ms, setTimeoutImpl) => new Promise(resolve => setTimeoutImpl(resolve, ms));
 
+// Exact stdout lines, matched across chunk boundaries. Only the lines named
+// are kept, so a report line is found however much output follows it (the
+// bounded tails keep only the last 16 KiB). A line longer than the partial
+// bound cannot equal a short matcher and is dropped.
+const MATCH_PARTIAL_LIMIT = 64 * 1024;
+
+function createLineMatcher(lineMatchers) {
+    if (!Array.isArray(lineMatchers) || !lineMatchers.length) return null;
+    const wanted = new Set(lineMatchers.map(String));
+    const matched = new Set();
+    const decoder = new StringDecoder('utf8');
+    let partial = '';
+    let overflowed = false;
+    const consider = (line) => {
+        const value = line.endsWith('\r') ? line.slice(0, -1) : line;
+        if (wanted.has(value)) matched.add(value);
+    };
+    return {
+        push(buffer) {
+            partial += decoder.write(buffer);
+            const lines = partial.split('\n');
+            partial = lines.pop();
+            for (const [index, line] of lines.entries()) {
+                if (index === 0 && overflowed) { overflowed = false; continue; }
+                consider(line);
+            }
+            if (partial.length > MATCH_PARTIAL_LIMIT) {
+                partial = '';
+                overflowed = true;
+            }
+        },
+        finish() {
+            partial += decoder.end();
+            if (partial && !overflowed) consider(partial);
+            partial = '';
+            return Object.freeze([...matched]);
+        },
+    };
+}
+
 /**
  * @param {object} options
  * @param {string} options.command engine executable
@@ -61,7 +102,9 @@ export async function runUpdateExec({
     tailBytes = UPDATE_RUNNER_DEFAULTS.tailBytes,
     probeIntervalMs = UPDATE_RUNNER_DEFAULTS.probeIntervalMs,
     probeOnSuccess = false,
+    lineMatchers = null,
 } = {}) {
+    const lineMatcher = createLineMatcher(lineMatchers);
     const client = await new Promise((resolve) => {
         let child;
         let settled = false;
@@ -87,6 +130,7 @@ export async function runUpdateExec({
             cleanup();
             resolve({
                 ...value,
+                ...(lineMatcher ? { matchedLines: lineMatcher.finish() } : {}),
                 cause,
                 escalation,
                 pid: child?.pid ?? null,
@@ -134,6 +178,7 @@ export async function runUpdateExec({
             const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
             outputBytes += buffer.length;
             tails = { ...tails, [name]: appendTail(tails[name], buffer, tailBytes) };
+            if (name === 'stdout') lineMatcher?.push(buffer);
             if (outputBytes > outputLimitBytes) {
                 cancel('output-limit');
                 return;

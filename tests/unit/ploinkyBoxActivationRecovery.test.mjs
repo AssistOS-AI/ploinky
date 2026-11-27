@@ -1,9 +1,19 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { sealEdgeSelector, selectorIdentity } from '../../cli/sandbox/edgeSelectorRecord.mjs';
 import { classifyFailedActivation, postStopSelectorBound } from '../../ploinky-box/activationRecovery.mjs';
+import {
+    runBoundedActivationStart,
+    runBoundedCoreCommand,
+    runBoundedRestartCommand,
+} from '../../ploinky-box/supervisor.mjs';
+import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 
 const GEN_A = `sha256:${'a'.repeat(64)}`;
 const GEN_B = `sha256:${'b'.repeat(64)}`;
@@ -90,4 +100,117 @@ test('the post-stop selector is bound only to the stop this rollback ran', () =>
     // The stop's preserved branch keeps the exact inactive selector.
     assert.equal(postStopSelectorBound(preInactive, preInactive), true);
     assert.equal(postStopSelectorBound(preActive, preActive), false, 'an unchanged active selector was not stopped');
+});
+
+// --- AC11 / H15: the activation start runner ------------------------------
+
+const RUNNER_CONTAINER = 'f'.repeat(64);
+const RUNNER_OPERATION = '9'.repeat(32);
+
+function quietStream() {
+    return { isTTY: false, write() { return true; } };
+}
+
+// A fake exec client: emits the given stdout chunks, then exits.
+function fakeSpawn(chunks, { status = 0 } = {}) {
+    const spawned = [];
+    const spawnImpl = (command, args) => {
+        spawned.push([command, [...args]]);
+        const child = new EventEmitter();
+        child.pid = 4242;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = () => {};
+        setImmediate(() => {
+            for (const chunk of chunks) child.stdout.emit('data', Buffer.from(chunk));
+            child.emit('close', status, null);
+        });
+        return child;
+    };
+    return { spawnImpl, spawned };
+}
+
+function runnerFixture(t) {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-activation-runner-')));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    return { root, agentLib: agentLibFixture(root) };
+}
+
+const activationContext = (root) => ({
+    schema: 'ploinky-activation-context', version: 1, operation: 'start', purpose: 'activate',
+    settlesOperationId: null, operationId: RUNNER_OPERATION, instance: 'ploinky-box-workspace-123456789abc',
+    containerId: RUNNER_CONTAINER, workspaceRoot: root,
+});
+
+function envValues(args) {
+    return args.flatMap((value, index) => (value === '--env' ? [args[index + 1]] : []));
+}
+
+test('H15: the start runner finds the Router line beyond the bounded tail and carries the marker and context', async (t) => {
+    const { root, agentLib } = runnerFixture(t);
+    const routerLine = '[start] Router: http://127.0.0.1:19090';
+    // The line arrives split across two chunks and more than 16 KiB follow it.
+    const { spawnImpl, spawned } = fakeSpawn(['[start] Rout', `er: http://127.0.0.1:19090\n`, `${'x'.repeat(1024)}\n`.repeat(20)]);
+    const run = await runBoundedActivationStart({ name: 'podman' }, RUNNER_CONTAINER, ['start', 'demo', '8080'], 19090, 7882,
+        { query: () => ({ ok: true, stdout: '[]' }) }, {
+            workspaceRoot: root, stdout: quietStream(), stderr: quietStream(), agentLib,
+            operationId: RUNNER_OPERATION, activationContext: activationContext(root),
+            runnerOptions: { spawnImpl, forwardedSignals: [] },
+        });
+    assert.equal(run.status, 0);
+    assert.deepEqual(run.matchedLines, [routerLine]);
+    assert.equal(run.tails.stdout.includes('Router'), false, 'the line is beyond the 16 KiB tail');
+    const env = envValues(spawned[0][1]);
+    assert.ok(env.includes(`PLOINKY_UPDATE_OPERATION=${RUNNER_OPERATION}`));
+    const context = env.find((value) => value.startsWith('PLOINKY_ACTIVATION_CONTEXT='));
+    assert.deepEqual(JSON.parse(context.slice('PLOINKY_ACTIVATION_CONTEXT='.length)), activationContext(root));
+    assert.deepEqual(spawned[0][1].slice(-4), ['/opt/ploinky/bin/ploinky-local', 'start', 'demo', '8080']);
+});
+
+test('H15: a clean start that never reported the public Router URL fails', async (t) => {
+    const { root, agentLib } = runnerFixture(t);
+    const { spawnImpl } = fakeSpawn(['[start] Router: http://127.0.0.1:8080\n', 'done\n']);
+    await assert.rejects(runBoundedActivationStart({ name: 'podman' }, RUNNER_CONTAINER, ['start'], 19090, 7882,
+        { query: () => ({ ok: true, stdout: '[]' }) }, {
+            workspaceRoot: root, stdout: quietStream(), stderr: quietStream(), agentLib,
+            operationId: RUNNER_OPERATION, runnerOptions: { spawnImpl, forwardedSignals: [] },
+        }), /In-box start did not report the public Router URL http:\/\/127\.0\.0\.1:19090/);
+    // A failed start returns its end for the caller to judge; the Router line is not checked.
+    const failed = fakeSpawn(['boom\n'], { status: 1 });
+    const run = await runBoundedActivationStart({ name: 'podman' }, RUNNER_CONTAINER, ['start'], 19090, 7882,
+        { query: () => ({ ok: true, stdout: '[]' }) }, {
+            workspaceRoot: root, stdout: quietStream(), stderr: quietStream(), agentLib,
+            operationId: RUNNER_OPERATION, runnerOptions: { spawnImpl: failed.spawnImpl, forwardedSignals: [], probeIntervalMs: 1 },
+        });
+    assert.equal(run.status, 1);
+    assert.equal(run.quiescence.state, 'confirmed');
+});
+
+test('the restart and generic core runners carry the activation context only when one is given', async (t) => {
+    const { root, agentLib } = runnerFixture(t);
+    const restart = fakeSpawn([]);
+    await runBoundedRestartCommand({ name: 'podman' }, RUNNER_CONTAINER, ['restart'], 8080, 7882,
+        { query: () => ({ ok: true, stdout: '[]' }) }, {
+            workspaceRoot: root, stdout: quietStream(), stderr: quietStream(), agentLib, operationId: RUNNER_OPERATION,
+            activationContext: { ...activationContext(root), operation: 'restart' },
+            runnerOptions: { spawnImpl: restart.spawnImpl, forwardedSignals: [] },
+        });
+    assert.equal(envValues(restart.spawned[0][1]).filter((value) => value.startsWith('PLOINKY_ACTIVATION_CONTEXT=')).length, 1);
+    const streamed = [];
+    const runner = { stream: async (_command, args) => { streamed.push(args); return { ok: true, status: 0, stdout: '' }; } };
+    await runBoundedCoreCommand({ name: 'podman' }, RUNNER_CONTAINER, ['start', 'demo', '8080'], 8080, 7882, runner, {
+        workspaceRoot: root, stdout: quietStream(), stderr: quietStream(), agentLib,
+        activationContext: { ...activationContext(root), purpose: 'restore' },
+    });
+    await runBoundedCoreCommand({ name: 'podman' }, RUNNER_CONTAINER, ['status'], 8080, 7882, runner, {
+        workspaceRoot: root, stdout: quietStream(), stderr: quietStream(), agentLib,
+    });
+    assert.equal(JSON.parse(envValues(streamed[0]).find((value) => value.startsWith('PLOINKY_ACTIVATION_CONTEXT=')).split('=').slice(1).join('=')).purpose, 'restore');
+    assert.equal(envValues(streamed[1]).some((value) => value.startsWith('PLOINKY_ACTIVATION_CONTEXT=')), false);
+    // An invalid context is refused before anything is executed.
+    await assert.rejects(runBoundedCoreCommand({ name: 'podman' }, RUNNER_CONTAINER, ['start'], 8080, 7882, runner, {
+        workspaceRoot: root, stdout: quietStream(), stderr: quietStream(), agentLib,
+        activationContext: { ...activationContext(root), purpose: 'promote' },
+    }), { code: 'PLOINKY_ACTIVATION_CONTEXT_INVALID' });
+    assert.equal(streamed.length, 2);
 });
