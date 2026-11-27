@@ -167,8 +167,17 @@ export function streamProcess(command, args, {
     });
 }
 
+// Runners that really spawn engine commands. A supervisor runs the bounded
+// activation start only through one of these (Q30); a hand-written fixture
+// runner keeps its injected start path.
+const PROCESS_RUNNERS = new WeakSet();
+
+export function isProcessRunner(runner) {
+    return Boolean(runner) && PROCESS_RUNNERS.has(runner);
+}
+
 export function createProcessRunner(options = {}) {
-    return {
+    const runner = {
         query(command, args, queryOptions = {}) {
             return queryProcess(command, args, {
                 ...options,
@@ -188,4 +197,6 @@ export function createProcessRunner(options = {}) {
             });
         },
     };
+    PROCESS_RUNNERS.add(runner);
+    return runner;
 }

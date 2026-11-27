@@ -15,6 +15,9 @@ import { fakeUpdateCore, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
 import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
 
 const BUILD_COMMIT = 'a'.repeat(40);
+// Immutable engine IDs: a start now issues a host activation context naming its Box.
+const EXISTING_BOX = 'e'.repeat(64);
+const CANDIDATE_BOX = 'c'.repeat(64);
 
 function fixture(t, {
     corrupt = false, existingBox = false, bundleCommit = BUILD_COMMIT, env = {}, repositoryRoot,
@@ -31,10 +34,10 @@ function fixture(t, {
     };
     const engine = { name: 'podman', identity: 'engine' };
     const ownership = existingBox
-        ? { state: 'owned', engine, handles: { container: { id: 'existing', runtime: { imageId: bundle.supplyingImageId, running: false } } } }
+        ? { state: 'owned', engine, handles: { container: { id: EXISTING_BOX, runtime: { imageId: bundle.supplyingImageId, running: false } } } }
         : { state: 'absent', engine, handles: {} };
     const preparedOwnership = {
-        ...ownership, state: 'owned', handles: { container: { id: 'candidate', runtime: { imageId: bundle.supplyingImageId } } },
+        ...ownership, state: 'owned', handles: { container: { id: CANDIDATE_BOX, runtime: { imageId: bundle.supplyingImageId } } },
     };
     const calls = [];
     const loads = [];
@@ -107,7 +110,7 @@ for (const [operation, run] of [
         assert.deepEqual(fs.readdirSync(path.join(state.workspace, '.ploinky', 'agentlib')), ['active.json']);
         assert.equal(fs.existsSync(path.join(state.workspace, 'achillesAgentLib')), false);
         assert.ok(state.calls.indexOf('load-image') < state.calls.indexOf('reconcile'));
-        assert.ok(state.calls.indexOf('health') < state.calls.findIndex(call => call.startsWith('exec candidate')));
+        assert.ok(state.calls.indexOf('health') < state.calls.findIndex(call => call.startsWith(`exec ${CANDIDATE_BOX}`)));
         assert.equal(state.calls.at(-1), 'finalize');
     });
 }
@@ -144,7 +147,7 @@ test('H1 an image built from any revision is selected, confirmed and admitted wi
         const result = await state.supervisor.runStartTransaction(['start', 'fixture']);
         assert.equal(result.agentLib.provenance.commit, commit);
         assert.equal(readActiveDescriptor(state.workspace).provenance.commit, commit);
-        const exec = state.calls.find(call => call.startsWith('exec candidate'));
+        const exec = state.calls.find(call => call.startsWith(`exec ${CANDIDATE_BOX}`));
         assert.match(exec, /inspect achillesAgentLib$/);
         assert.doesNotMatch(exec, /expected-commit/);
     }

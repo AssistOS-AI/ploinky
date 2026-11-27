@@ -31,6 +31,7 @@ import { DRIVER as RETIREMENT_DRIVER, runRetirementDriver } from './hardwareAvai
 import { stageNoWaitAvailabilitySlots } from '../../cli/commands/noWaitAvailabilitySlots.js';
 import { withEdgeGenerationApplyLock } from '../../cli/sandbox/edgeGeneration.js';
 import { activationCommitHooks } from '../../cli/sandbox/activationRecords.mjs';
+import { sealEdgeSelector } from '../../cli/sandbox/edgeSelectorRecord.mjs';
 import { createHardwareAvailabilityResolverCache } from '../../cli/server/hardwareAvailabilityResolver.mjs';
 import { createHardwareAvailabilityLatcher } from '../../cli/server/hardwareAvailabilityLatcher.mjs';
 import {
@@ -1006,4 +1007,42 @@ test('NW1.S-no-retirement-site-uses-an-uncoordinated-merge-and-retirement-stays-
     assert.deepEqual(offending(/(entries|slots)\[[^\]]+\]\s*=[^=]/), [], 'SC3');
     // SC4: one commit call, so entries and slots go in one rename.
     assert.equal(offending(/\bcommit\(\{/).length, 1, 'SC4');
+});
+
+// Q30: the host's activation request reaches the start's selector commit.
+test('a start with an activate request prunes its records and hands the intent-writing hooks to the graph commit', async (t) => {
+    for (const purpose of ['activate', 'restore']) {
+        const fixture = startFixture(t);
+        const root = fixture.collaborators.PLOINKY_WORKSPACE_ROOT;
+        fs.mkdirSync(path.join(root, '.ploinky', 'data', 'edge-routing'), { recursive: true, mode: 0o700 });
+        const pruned = [];
+        fixture.collaborators.pruneActivationRecords = (options) => { pruned.push(options); };
+        const operationId = (purpose === 'activate' ? '4' : '5').repeat(32);
+        const context = {
+            schema: 'ploinky-activation-context', version: 1, operation: purpose === 'activate' ? 'restart' : 'start', purpose,
+            settlesOperationId: null, operationId, instance: 'ploinky-box-workspace-123456789abc',
+            containerId: 'a'.repeat(64), workspaceRoot: root,
+        };
+        await sandbox(fixture.collaborators)('repo/demo', '8080', { activationRequest: Object.freeze({ ...context, context }) });
+        const [, options] = fixture.calls.find(([name, opts]) => name === 'mergeRoutingConfig' && opts?.reason === 'workspace-runtime-graph-ready');
+        const intentFile = path.join(root, '.ploinky', 'data', 'edge-routing', 'activations', `${operationId}.intent.json`);
+        if (purpose === 'activate') {
+            // The VM realm builds the options object, so compare its field.
+            assert.deepEqual(pruned.map((options) => options.workspaceRoot), [root], 'records are pruned under the start lease');
+            assert.equal(typeof options.beforeSelectorCommit, 'function');
+            const selector = sealEdgeSelector({
+                schemaVersion: 1, state: 'active', generation: `sha256:${'1'.repeat(64)}`, publicationState: 'ready',
+                activationId: '11111111-1111-4111-8111-111111111111', activatedAt: new Date().toISOString(),
+            });
+            options.beforeSelectorCommit({ selector, predecessorSelector: null });
+            const intent = JSON.parse(fs.readFileSync(intentFile, 'utf8'));
+            assert.equal(intent.operationId, operationId);
+            assert.deepEqual(intent.context, context);
+            assert.equal(intent.intended.selectorDigest, selector.selectorDigest);
+        } else {
+            assert.deepEqual(pruned, [], 'a restore prunes nothing');
+            assert.equal(options.beforeSelectorCommit, undefined, 'a restore without a capture writes no intent');
+            assert.equal(fs.existsSync(intentFile), false);
+        }
+    }
 });

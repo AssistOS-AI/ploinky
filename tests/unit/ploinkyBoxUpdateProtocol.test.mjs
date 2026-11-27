@@ -13,6 +13,7 @@ import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 import { fakeUpdateCore, verifiedRecord, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
 import { PERMISSIVE_HOST_STATE_GUARD } from '../helpers/hostStateFixture.mjs';
+import { isInBoxStop, writeInBoxStopSelector } from '../helpers/fakeInBoxStop.mjs';
 
 const CONTAINER_ID = 'a'.repeat(64);
 
@@ -92,7 +93,8 @@ function scenario(t, {
         stderr: sink(),
         updateHostState: store,
         runner: {
-            run() {},
+            // The in-Box stop writes its inactive selector (Q30 binding).
+            run(_command, args) { if (isInBoxStop(args)) writeInBoxStopSelector(identity.workspaceRoot); },
             query: query || (() => ({ ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: graph.configured }) })),
         },
         captureCoreStartArgv: () => ['start', 'agent', '8080'],

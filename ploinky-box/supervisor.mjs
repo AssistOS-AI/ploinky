@@ -129,7 +129,7 @@ import { unlockWorkspace } from './unlock.mjs';
 import { createHostStateGuard, HOST_STATE_POLICY } from './hostState/guard.mjs';
 import { parseHostPort } from './ports.mjs';
 import { stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
-import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
+import { buildEngineProcessEnvironment, createProcessRunner, isProcessRunner } from './process.mjs';
 import { updateWorkspacePloinkySource } from './command/hostUpdate.mjs';
 import {
     containerCreateArgs,
@@ -369,15 +369,6 @@ const ACTIVATION_INSPECT_ONLY_MESSAGE = 'An activation recovery barrier is held,
     + 'running Box and never creates, starts, repairs or replaces it; run `ploinky restart` to settle the barrier, or '
     + '`ploinky stop`';
 
-// The default engine runner. A supervisor built with an injected runner
-// (fixtures) keeps every engine call inside that runner.
-const DEFAULT_PROCESS_RUNNERS = new WeakSet();
-function defaultProcessRunner() {
-    const created = createProcessRunner({ env: buildEngineProcessEnvironment() });
-    DEFAULT_PROCESS_RUNNERS.add(created);
-    return created;
-}
-
 // An injected start seam keeps its own contract under the activation
 // discipline: its return is a confirmed clean exit, its throw a confirmed
 // failed one that keeps the original error.
@@ -399,8 +390,19 @@ function injectedStartAsActivation(startCore) {
     };
 }
 
+/**
+ * The in-Box start of start transactions: an injected activation seam, else
+ * the bounded activation runner when the engine runner really spawns engine
+ * commands, else the injected start seam or fixture runner, which keeps every
+ * engine call inside what was injected.
+ */
+export function selectActivationStart({ startActivationCore = null, startCore = runBoundedCoreStart, defaultRunner = false } = {}) {
+    if (startActivationCore) return startActivationCore;
+    return startCore === runBoundedCoreStart && defaultRunner ? runBoundedActivationStart : injectedStartAsActivation(startCore);
+}
+
 export function createBoxSupervisor({
-    runner = defaultProcessRunner(),
+    runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
     lockManager = createMutationLockManager(),
     resolveIdentity = () => resolveWorkspaceIdentity(),
     discover = defaultDiscovery,
@@ -485,10 +487,9 @@ export function createBoxSupervisor({
     const guard = hostStateGuard || createHostStateGuard({
         runner, platform, repositoryRoot, allowHostProcesses, stderr,
     });
-    const activationStart = startActivationCore
-        || (startCore !== runBoundedCoreStart || !DEFAULT_PROCESS_RUNNERS.has(runner)
-            ? injectedStartAsActivation(startCore)
-            : runBoundedActivationStart);
+    const activationStart = selectActivationStart({
+        startActivationCore, startCore, defaultRunner: isProcessRunner(runner),
+    });
 
     function inspect(identity) {
         return discover(identity, runner, platform, env);
@@ -2413,7 +2414,11 @@ export function createBoxSupervisor({
     function convertWriterBarrier(identity, ownership, barrier, activation) {
         const attempt = Object.freeze({
             operation: activation.operation, operationId: activation.operationId,
-            context: activation.context, baseline: activation.baseline ?? 'unknown', containerId: barrier.containerId,
+            // A stored null baseline means no selector before the launch; only a
+            // record without the field is unknown.
+            context: activation.context,
+            baseline: Object.hasOwn(activation, 'baseline') ? activation.baseline : 'unknown',
+            containerId: barrier.containerId,
         });
         const evidence = readEvidence(identity, attempt.operationId, attempt.context);
         const decision = classifyFailedActivation({ evidence, baseline: attempt.baseline });

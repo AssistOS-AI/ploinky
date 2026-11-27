@@ -18,8 +18,10 @@ import {
     runBoundedActivationStart,
     runBoundedCoreCommand,
     runBoundedRestartCommand,
+    selectActivationStart,
 } from '../../ploinky-box/supervisor.mjs';
 import { createMemoryUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
+import { createProcessRunner, isProcessRunner } from '../../ploinky-box/process.mjs';
 import { agentLibFixture, agentLibFixtureLabels, agentLibFixtureMounts } from '../helpers/agentlibFixture.mjs';
 import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { isInBoxStop, writeInBoxStopSelector } from '../helpers/fakeInBoxStop.mjs';
@@ -889,4 +891,51 @@ test('H10: a read-only generic command adopts the running Box under a barrier wi
     await assert.rejects(supervisor.prepareBoxForCommand(), { code: CODE });
     assert.equal(events.includes('reconcile'), false);
     assert.ok(store.read('update-recovery', identity.instance), 'the barrier is kept');
+});
+
+test('H13 (update): a full update whose activation exits cleanly but fails its health check keeps the graph', async (t) => {
+    const fixture = world(t, { discoveredRunning: true });
+    fixture.state.inBox = inBoxPublishes({ status: 0 });
+    fixture.state.healthFailures.push(new Error('Router health failed'));
+    await assert.rejects(fixture.supervisor.runUpdateTransaction(['update']), (error) => {
+        assert.equal(error.code, CODE);
+        assert.equal(error.activation.outcome, 'kept-activated');
+        assert.ok(error.updateRecords.some((entry) => entry.phase === 'activation' && entry.code === 'kept-activated'));
+        return true;
+    });
+    assert.equal(stops(fixture.events), 0, 'Q30: host must not stop a kept graph');
+    assert.equal(rollbacks(fixture.events), 0);
+    assert.equal(barrierOf(fixture).operation, 'update');
+});
+
+test('the production start runs the bounded activation runner; an injected seam or runner keeps the injected path', async () => {
+    assert.equal(selectActivationStart({ defaultRunner: true }), runBoundedActivationStart);
+    // Only a runner that really spawns engine commands selects it.
+    assert.equal(isProcessRunner(createProcessRunner()), true);
+    assert.equal(isProcessRunner({ run() {}, query() {}, stream() {} }), false);
+    const injected = async () => {};
+    assert.equal(selectActivationStart({ startActivationCore: injected, defaultRunner: true }), injected);
+    const legacy = selectActivationStart({ defaultRunner: false });
+    assert.notEqual(legacy, runBoundedActivationStart, 'a fixture runner never reaches the real engine spawn');
+    const thrown = new Error('core failed');
+    const failing = selectActivationStart({ startCore: async () => { throw thrown; }, defaultRunner: true });
+    const run = await failing();
+    assert.equal(run.status, 1);
+    assert.equal(run.thrown, thrown);
+    assert.equal(run.quiescence.state, 'confirmed');
+    assert.equal((await selectActivationStart({ startCore: async () => {}, defaultRunner: true })()).status, 0);
+});
+
+test('a converted writer barrier keeps a null baseline, so an absent selector still proves the predecessor', async (t) => {
+    const fixture = world(t);
+    // A first start in a workspace with no selector yet: the baseline is null.
+    fs.rmSync(liveSelectorFile(fixture.workspace));
+    fixture.state.inBox = () => exitRun(1, { quiescence: 'uncertain' });
+    await assert.rejects(fixture.supervisor.runStartTransaction(['start', 'agent']), { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' });
+    assert.equal(barrierOf(fixture).activation.baseline, null);
+    // Quiescent now, with no intent and still no selector: R2a, the barrier is cleared.
+    fixture.state.inBox = inBoxPublishes({ status: 0 });
+    await fixture.supervisor.runStartTransaction(['start', 'agent']);
+    assert.equal(barrierOf(fixture), null);
+    assert.deepEqual(markerCalls(fixture.events, 'remove').map((event) => event[3]), [markerCalls(fixture.events, 'write')[0][3]]);
 });
